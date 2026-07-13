@@ -1,0 +1,48 @@
+# Private planning
+.plan/
+
+# Runtime browser state and credentials
+.runtime/
+user-data-dir/
+profiles/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Playwright artifacts
+playwright-report/
+test-results/
+blob-report/
+screenshots/
+videos/
+traces/
+*.webm
+*.zip
+
+# Runtime output
+*.log
+*.pid
+*.sock
+.DS_Store
+Thumbs.db
+
+# Editors and secrets
+.idea/
+.vscode/
+.env
+.env.*
+!.env.example

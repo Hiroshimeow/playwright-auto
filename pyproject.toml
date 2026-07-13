@@ -1,0 +1,22 @@
+[project]
+name = "playwright-auto"
+version = "0.1.0"
+description = "Persistent CDP browser automation with an interactive viewer"
+requires-python = ">=3.11"
+dependencies = ["playwright>=1.52,<2"]
+
+[project.scripts]
+playwright-auto = "playwright_auto.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8,<9"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/playwright_auto"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
