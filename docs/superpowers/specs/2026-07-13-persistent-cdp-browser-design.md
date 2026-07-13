@@ -18,7 +18,7 @@ The streaming boundary is independent of the browser and automation layers: a fu
 - Bind KasmVNC to `0.0.0.0:9223` for access through `http://<tailscale-ip>:9223/`.
 - Do not configure a KasmVNC password; access control is provided by the private Tailscale network.
 - Do not expose port 9223 using Tailscale Funnel or another public tunnel.
-- Store the reusable profile outside the repository at `~/.local/share/playwright-auto/main-profile`.
+- Store the reusable profile inside the repository at `.runtime/main-profile/` and exclude `.runtime/` from Git.
 - Permit only one Chromium process to use the profile at a time.
 - Support `start --gui`, `start --headless`, `stop`, `restart`, and `status`.
 - GUI start owns the dedicated display and KasmVNC stream; headless start does not run streaming services.
