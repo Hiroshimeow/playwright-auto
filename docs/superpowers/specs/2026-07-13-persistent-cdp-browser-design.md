@@ -6,14 +6,22 @@ Create a standalone Python Playwright automation repository that controls a reus
 
 ## Architecture
 
-A browser lifecycle CLI starts Chromium with a persistent profile and a fixed local-only CDP port. GUI mode is the default for manual login and daily use; headless mode reuses the same profile only after the GUI instance has stopped. Automation clients attach with Playwright over CDP rather than owning the browser process.
+A browser lifecycle CLI starts Chromium with a persistent profile and fixed local-only CDP endpoint at `127.0.0.1:9222`. GUI mode runs Chromium on a dedicated virtual display (`DISPLAY=:100`) so KasmVNC can expose that display at `http://<tailscale-ip>:9223/`. This lets the agent drive Chromium through CDP while the user watches and can intervene with mouse and keyboard in real time.
+
+Headless mode reuses the same profile only after the GUI instance and its display stream have stopped. Automation clients attach with Playwright over CDP rather than owning the browser process.
+
+The streaming boundary is independent of the browser and automation layers: a future Selkies/WebRTC service may consume the same virtual display without changing the CDP endpoint, persistent profile, or Playwright clients.
 
 ## Safety and lifecycle constraints
 
-- Bind CDP only to `127.0.0.1:9222`; never expose it directly to the public Internet.
+- Bind CDP only to `127.0.0.1:9222`; never expose it directly to Tailscale or the public Internet.
+- Bind KasmVNC to `0.0.0.0:9223` for access through `http://<tailscale-ip>:9223/`.
+- Do not configure a KasmVNC password; access control is provided by the private Tailscale network.
+- Do not expose port 9223 using Tailscale Funnel or another public tunnel.
 - Store the reusable profile outside the repository at `~/.local/share/playwright-auto/main-profile`.
 - Permit only one Chromium process to use the profile at a time.
 - Support `start --gui`, `start --headless`, `stop`, `restart`, and `status`.
+- GUI start owns the dedicated display and KasmVNC stream; headless start does not run streaming services.
 - Preserve login state across restarts.
 - Keep Tampermonkey and agent-mcp-gateway out of scope.
 
