@@ -11,6 +11,26 @@ Persistent Chromium automation through local CDP, with a low-latency interactive
 
 Port 9223 is only the visual keyboard/mouse view. Automation connects only to CDP 9222.
 
+CDP clients must disconnect with `playwright.stop()` or `connected_browser(...)`. Do not call `browser.close()` after `connect_over_cdp`; it closes the persistent Chromium process and PM2 will restart it.
+
+## Prerequisites
+
+- Linux with Bash and Python 3.11 or newer.
+- `uv`, Node.js, and PM2.
+- Xvfb and a Chromium-family browser.
+- Tailscale for private remote viewer access.
+- Selkies GStreamer unpacked under `~/.local/opt/selkies-gstreamer`, or set `SELKIES_ROOT`.
+
+Runtime executables are discovered automatically. On nonstandard installations, set:
+
+```bash
+export CHROMIUM_BIN=/path/to/chromium-or-chrome
+export XVFB_BIN=/path/to/Xvfb
+export SELKIES_ROOT=/path/to/selkies-gstreamer
+# Only needed when Selkies has a nonstandard Python package layout:
+export SELKIES_PYTHON_PACKAGE=/path/to/site-packages/selkies_gstreamer
+```
+
 ## Start
 
 ```bash
@@ -20,17 +40,156 @@ pm2 save
 ```
 
 ```bash
-pm2 status playwright-display playwright-selkies playwright-browser
+pm2 status playwright-display playwright-selkies playwright-browser playwright-role-ui
 curl http://127.0.0.1:9222/json/version
 curl -I http://127.0.0.1:9223/
 uv run python scripts/smoke.py
 ```
 
-Stop or restart with `pm2 stop|restart playwright-browser playwright-selkies playwright-display`.
+Stop or restart with `pm2 stop|restart playwright-browser playwright-selkies playwright-display playwright-role-ui`.
 
 Selkies v1.6.2 is unpacked user-locally at `~/.local/opt/selkies-gstreamer`. The viewer has no application password and must stay inside the private Tailscale network. Do not expose port 9223 through Funnel or a public tunnel.
 
 The virtual display is a separate PM2 service, so restarting Selkies does not restart Chrome or affect its profile.
+
+## Run a multi-role task
+
+Open the private viewer and log in to ChatGPT once:
+
+```text
+http://<tailscale-ip>:9223/
+```
+
+Start a task with the default team `PLAN=1, DEV=2, REVIEW=1, TEST=1`:
+
+```bash
+uv run playwright-team "Implement and verify the requested feature"
+```
+
+Override role counts without editing Python:
+
+```bash
+uv run playwright-team \
+  "Implement and verify the requested feature" \
+  --team DEV=3,REVIEW=2,TEST=2
+```
+
+Preview allocation without sending anything:
+
+```bash
+uv run playwright-team "Implement the requested feature" --dry-run
+```
+
+If login or a recoverable runtime interruption blocks the task, the CLI persists its
+manifest and prints the exact resume command:
+
+```bash
+uv run playwright-team --resume <task-id>
+```
+
+Each physical tab displays `⟦ROLE⟧` in its browser title and
+`ROLE · TASK-ID · page-id` in a fixed in-page badge. The same task resumes its
+existing role conversations. A new task uses New Chat after the whole participating
+team passes draft/attachment/dialog/stream preflight.
+
+### Change a tab role manually
+
+No agent, Tampermonkey installation, or `chatgpt_probe.py` rerun is required:
+
+1. Open the viewer on port 9223.
+2. Click the role badge at the top center of the ChatGPT tab.
+3. Enter or select a role such as `DEV`, `DEV1`, `REVIEW`, or any valid custom name.
+4. Click **Apply**. Use **Release** to leave the tab unassigned.
+
+Changing a role preserves the current conversation URL, task ID, page ID, draft, and
+streaming response. A workflow that already leased the old role fails its next ownership
+check instead of continuing on the wrong tab. The next runner attaches the tab using its
+new role. Duplicate role names across physical tabs turn both badges red; rename one role,
+for example `REVIEW` → `REVIEW1`.
+
+`playwright-role-ui` is an always-on PM2 CDP watcher that injects this control into current
+and newly opened ChatGPT tabs and records changes in `.runtime/role-ui-events.jsonl`.
+`uv run python scripts/chatgpt_probe.py --set-role ...` remains only an emergency CLI
+fallback.
+
+New task manifests default to workflow version 2. PLAN returns distinct assignments for
+all DEV instances, REVIEW/TEST verify independently, DEV revises, REVIEW/TEST reverify,
+and PLAN closes out from a deterministic accepted/blocked gate. Existing version-1 task
+manifests continue to resume with their original round graph.
+
+Requests are paced across the team. The known ChatGPT `Too many requests` dialog triggers
+a bounded cooldown, safe `Got it` dismissal, and durable retry without resending an
+already accepted prompt. Unknown dialogs still require manual intervention.
+
+Normal runs require an authenticated profile and fail closed with
+`waiting_for_login`. `--allow-guest` exists only for controlled testing because
+anonymous ChatGPT sessions are not reliable for sustained multi-round work.
+
+### Run a two-role review exchange
+
+Use one Python file when two visible roles must inspect the same repository and challenge
+each other for three sequential turns:
+
+```bash
+uv run python scripts/two_role_review_flow.py \
+  --roles REVIEW REVIEW1 \
+  --repo /absolute/path/to/repository \
+  --task "Review the repository for concrete correctness and operational defects"
+```
+
+The fixed round order is `ROLE_A → ROLE_B → ROLE_A`. The second role receives the first
+report; the final role receives both earlier reports and returns one consolidated verdict.
+The flow is durable, keeps one request ledger per role/round, and resumes completed turns
+without resending them. It reads and tests the target repository but its standard review
+prompt forbids editing, staging, resetting, committing, or deploying. Use `--task-id` to
+provide a stable identity for an explicit resume or audit trail.
+
+## Viewer implementation
+
+Port 9223 uses this path:
+
+```text
+Xvfb :100 → Selkies GStreamer/WebRTC → x264 H.264 → browser viewer
+```
+
+It is not VNC/noVNC. The private Tailscale profile is video-only, uses UDP ICE only
+for loopback/Tailscale/LAN addresses, and keeps port 9223 fixed. Current settings are
+1280×720, 15 FPS, and 1.2 Mbps. The Selkies web and Python runtime patches are
+generated under `.runtime/`; the installed Selkies package is not modified.
+
+## ChatGPT workflows
+
+`ChatGPTPage` wraps one tab. Reusable blocks are composed by `Workflow`:
+
+```python
+workflow = Workflow(
+    "dev-task",
+    [
+        SetRoleBlock("DEV"),
+        NewChatBlock(),
+        SendPromptBlock(lambda ctx: ctx.require("prompt")),
+        WaitStateBlock(ChatGPTState.RESPONDING),
+        StopResponseBlock(),
+    ],
+)
+
+run = await workflow.run(
+    ChatGPTPage(page),
+    variables={"prompt": "Implement phase 1"},
+)
+```
+
+Blocks have stable IDs and can be changed without rewriting the runner:
+
+```python
+workflow.replace("set_role", SetRoleBlock("REVIEW"))
+workflow.insert_after("set_role", CaptureSnapshotBlock("before_prompt"))
+workflow.remove("stop_response")
+```
+
+For restart-safe Send/upload flows, start from `workflows/chatgpt_durable_loop.py`.
+See `docs/chatgpt-workflows.md`, `docs/tampermonkey-edge-cases.md`, and
+`scripts/chatgpt_workflow_example.py`.
 
 ## Headless
 

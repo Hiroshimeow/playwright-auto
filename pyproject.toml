@@ -7,6 +7,8 @@ dependencies = ["playwright>=1.52,<2"]
 
 [project.scripts]
 playwright-auto = "playwright_auto.cli:main"
+playwright-team = "playwright_auto.team_cli:main"
+playwright-role-ui = "playwright_auto.role_ui_daemon:main"
 
 [dependency-groups]
 dev = ["pytest>=8,<9"]

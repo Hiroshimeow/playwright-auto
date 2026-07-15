@@ -1,0 +1,4 @@
+{
+  "iceTransportPolicy": "all",
+  "iceServers": []
+}

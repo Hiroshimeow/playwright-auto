@@ -19,3 +19,32 @@ def test_locator_priority():
 def test_screenshot_options():
     assert screenshot_options(True,None)=={"full_page":True}
     assert screenshot_options(False,"#main")=={"selector":"#main","full_page":False}
+
+
+def test_connected_browser_disconnects_without_closing_remote(monkeypatch):
+    import asyncio
+    import playwright_auto.connection as connection
+
+    events = []
+
+    class FakePlaywright:
+        async def stop(self):
+            events.append("playwright.stop")
+
+    class FakeBrowser:
+        async def close(self):
+            events.append("browser.close")
+
+    fake_browser = FakeBrowser()
+
+    async def fake_connect(_url):
+        return FakePlaywright(), fake_browser
+
+    monkeypatch.setattr(connection, "connect", fake_connect)
+
+    async def scenario():
+        async with connection.connected_browser("http://127.0.0.1:9222") as browser:
+            assert browser is fake_browser
+
+    asyncio.run(scenario())
+    assert events == ["playwright.stop"]
