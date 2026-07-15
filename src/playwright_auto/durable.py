@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -18,6 +17,7 @@ from .chatgpt import (
     SendReceipt,
     validate_page_role,
 )
+from .file_lock import exclusive_file_lock, fsync_parent_directory
 from .upload import FileIdentity
 
 
@@ -121,15 +121,21 @@ def render_prompt(prompt: str, marker: str) -> str:
     return f"{normalized}\n\n{marker}"
 
 
+def _canonical_json_default(value: Any) -> str:
+    if isinstance(value, Path):
+        return value.as_posix()
+    return str(value)
+
+
 def canonical_json_value(value: Any) -> Any:
-    """Return a stable JSON-compatible representation for durable identity."""
+    """Return a stable, cross-platform JSON representation for durable identity."""
     return json.loads(
         json.dumps(
             value,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
-            default=str,
+            default=_canonical_json_default,
         )
     )
 
@@ -272,55 +278,41 @@ class RequestLedger:
     @contextmanager
     def _locked(self) -> Iterator[dict[str, Any]]:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.lock_path.open("a+", encoding="utf-8") as lock_handle:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-            try:
-                if self.path.exists():
-                    raw = json.loads(self.path.read_text(encoding="utf-8"))
-                else:
-                    raw = {"version": self.VERSION, "records": {}}
-                if raw.get("version") != self.VERSION:
-                    raise DurableRequestError("unsupported durable ledger version")
-                if not isinstance(raw.get("records"), dict):
-                    raise DurableRequestError("durable ledger records must be an object")
-                yield raw
-                temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-                payload = json.dumps(
-                    raw, ensure_ascii=False, indent=2, sort_keys=True
-                )
-                with temporary.open("w", encoding="utf-8") as handle:
-                    handle.write(payload)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary, self.path)
-                directory_fd = os.open(self.path.parent, os.O_RDONLY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-            finally:
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        with exclusive_file_lock(self.lock_path):
+            if self.path.exists():
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+            else:
+                raw = {"version": self.VERSION, "records": {}}
+            if raw.get("version") != self.VERSION:
+                raise DurableRequestError("unsupported durable ledger version")
+            if not isinstance(raw.get("records"), dict):
+                raise DurableRequestError("durable ledger records must be an object")
+            yield raw
+            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+            payload = json.dumps(raw, ensure_ascii=False, indent=2, sort_keys=True)
+            with temporary.open("w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+            fsync_parent_directory(self.path)
 
     @contextmanager
     def request_lock(self, request_id: str) -> Iterator[None]:
         lock_path = self.path.with_suffix(
             self.path.suffix + f".{request_id}.request.lock"
         )
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with lock_path.open("a+", encoding="utf-8") as handle:
-            try:
-                fcntl.flock(
-                    handle.fileno(),
-                    fcntl.LOCK_EX | fcntl.LOCK_NB,
-                )
-            except BlockingIOError as exc:
-                raise DurableRequestBusyError(
-                    f"durable request {request_id} is already running"
-                ) from exc
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        manager = exclusive_file_lock(lock_path, blocking=False)
+        try:
+            manager.__enter__()
+        except BlockingIOError as exc:
+            raise DurableRequestBusyError(
+                f"durable request {request_id} is already running"
+            ) from exc
+        try:
+            yield
+        finally:
+            manager.__exit__(None, None, None)
 
     def begin(
         self,

@@ -50,6 +50,7 @@ def test_later_prompts_include_prior_review_evidence(monkeypatch, tmp_path):
     monkeypatch.setenv("PLAYWRIGHT_AUTO_REVIEW_TASK", "Review QMH")
     monkeypatch.setenv("PLAYWRIGHT_AUTO_REVIEW_REPO", str(tmp_path))
     monkeypatch.setenv("PLAYWRIGHT_AUTO_REVIEW_TASK_ID", "qmh-review-test")
+    monkeypatch.setenv("PLAYWRIGHT_AUTO_REVIEW_MCP", "mcp-thinkbook")
     loaded = load_workflow_file(SCRIPT)
     block = loaded.workflow.blocks[0]
     transcript = TeamTranscript()
@@ -64,6 +65,7 @@ def test_later_prompts_include_prior_review_evidence(monkeypatch, tmp_path):
     challenge = asyncio.run(block.rounds[1].prompt(context, "REVIEW1", transcript))
     assert "INITIAL_FINDING" in challenge
     assert "independently verify" in challenge.lower()
+    assert "@mcp-thinkbook" in challenge
 
     transcript.record_success(
         "challenge_review",
@@ -86,3 +88,57 @@ def test_roles_must_be_two_distinct_valid_names():
         module.validate_roles(("REVIEW", "REVIEW"))
 
     assert module.validate_roles(("REVIEW", "REVIEW1")) == ("REVIEW", "REVIEW1")
+
+
+def test_parser_supports_short_form_and_defaults_roles(monkeypatch, tmp_path):
+    module = _load_script_module()
+    monkeypatch.chdir(tmp_path)
+
+    args = module._parser().parse_args(
+        ["Review this repository", "--repo", str(tmp_path)]
+    )
+    task, repo, roles = module.resolve_cli_inputs(args)
+
+    assert task == "Review this repository"
+    assert repo == tmp_path.resolve()
+    assert roles == ("REVIEW", "REVIEW1")
+
+
+def test_parser_keeps_legacy_task_flag_and_custom_roles(tmp_path):
+    module = _load_script_module()
+
+    args = module._parser().parse_args(
+        [
+            "--task",
+            "Implement then review",
+            "--repo",
+            str(tmp_path),
+            "--roles",
+            "DEV",
+            "REVIEW",
+        ]
+    )
+    task, repo, roles = module.resolve_cli_inputs(args)
+
+    assert task == "Implement then review"
+    assert repo == tmp_path.resolve()
+    assert roles == ("DEV", "REVIEW")
+
+
+def test_parser_rejects_two_task_sources(tmp_path):
+    module = _load_script_module()
+    args = module._parser().parse_args(
+        ["positional", "--task", "flag", "--repo", str(tmp_path)]
+    )
+
+    with pytest.raises(ValueError, match="either positional task or --task"):
+        module.resolve_cli_inputs(args)
+
+
+def test_mcp_tool_is_configurable_and_normalized():
+    module = _load_script_module()
+
+    assert module.validate_mcp_tool("@mcp-thinkbook") == "mcp-thinkbook"
+    assert module.validate_mcp_tool("mcp-g8") == "mcp-g8"
+    with pytest.raises(ValueError, match="MCP tool"):
+        module.validate_mcp_tool("bad tool name")

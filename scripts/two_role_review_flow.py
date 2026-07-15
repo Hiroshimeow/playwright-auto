@@ -28,6 +28,8 @@ _REPO_ENV = "PLAYWRIGHT_AUTO_REVIEW_REPO"
 _TASK_ID_ENV = "PLAYWRIGHT_AUTO_REVIEW_TASK_ID"
 _LEDGER_ENV = "PLAYWRIGHT_AUTO_REVIEW_LEDGER"
 _CHECKPOINT_ENV = "PLAYWRIGHT_AUTO_REVIEW_CHECKPOINT"
+_MCP_ENV = "PLAYWRIGHT_AUTO_REVIEW_MCP"
+_MCP_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
 
 
 def validate_roles(roles: tuple[str, ...] | list[str]) -> tuple[str, str]:
@@ -45,6 +47,20 @@ def _roles_from_environment() -> tuple[str, str]:
     if not isinstance(value, list):
         raise TypeError(f"{_ROLES_ENV} must contain a JSON array")
     return validate_roles(tuple(str(item) for item in value))
+
+
+def validate_mcp_tool(value: str) -> str:
+    tool = str(value).strip().lstrip("@")
+    if not _MCP_PATTERN.fullmatch(tool):
+        raise ValueError(
+            "MCP tool must start with a letter and contain only letters, digits, '_' or '-'"
+        )
+    return tool
+
+
+def _mcp_from_environment() -> str:
+    default = "mcp-thinkbook" if os.name == "nt" else "mcp-g8"
+    return validate_mcp_tool(os.environ.get(_MCP_ENV, default))
 
 
 def _repo_from_environment() -> Path:
@@ -75,11 +91,13 @@ WORKSPACE_TIMEOUT_MS = int(os.environ.get("PLAYWRIGHT_AUTO_WORKSPACE_TIMEOUT_MS"
 _REPO_PATH = _repo_from_environment()
 _TASK = _task_from_environment()
 _TASK_ID = _task_id_from_environment(_TASK)
+_MCP_TOOL = _mcp_from_environment()
 
 VARIABLES = {
     "task_id": _TASK_ID,
     "goal": _TASK,
     "repo_path": str(_REPO_PATH),
+    "mcp_tool": _MCP_TOOL,
     "workflow_version": "two-role-review-v1",
 }
 
@@ -92,7 +110,7 @@ REVIEW TASK:
 {ctx.require('goal')}
 
 OPERATING RULES:
-- Use @mcp-g8 and set the working directory to the target repository.
+- Use @{ctx.require('mcp_tool')} and set the working directory to the target repository.
 - Read AGENTS.md before inspecting or running commands.
 - Do not modify, stage, reset, clean, commit, or deploy anything.
 - Preserve all current user and runtime changes.
@@ -139,7 +157,7 @@ async def _final_prompt(ctx: Any, role: str, transcript: Any) -> str:
 FULL REVIEW EXCHANGE:
 {previous}
 
-Re-check disputed or high-severity items with @mcp-g8. Produce one consolidated final
+Re-check disputed or high-severity items with @{ctx.require('mcp_tool')}. Produce one consolidated final
 review, not a summary of opinions. Include only confirmed findings or clearly label items
 that remain unverified. Use this structure:
 1. Findings ordered by severity, each with file:line, evidence, impact, and exact remedy.
@@ -210,35 +228,64 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run one durable three-turn review exchange between two ChatGPT roles"
     )
-    parser.add_argument("--roles", nargs=2, required=True, metavar=("ROLE_A", "ROLE_B"))
-    parser.add_argument("--task", required=True)
-    parser.add_argument("--repo", type=Path, required=True)
+    parser.add_argument(
+        "task_text",
+        nargs="?",
+        help="short form task text; use either this or --task",
+    )
+    parser.add_argument(
+        "--roles",
+        nargs=2,
+        default=("REVIEW", "REVIEW1"),
+        metavar=("ROLE_A", "ROLE_B"),
+    )
+    parser.add_argument("--task", dest="task_option")
+    parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--task-id")
+    parser.add_argument(
+        "--mcp",
+        default=_mcp_from_environment(),
+        help="MCP tool name; defaults to mcp-thinkbook on Windows and mcp-g8 on Unix",
+    )
     parser.add_argument("--cdp", default="http://127.0.0.1:9222")
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
-    roles = validate_roles(tuple(args.roles))
-    repo = args.repo.expanduser().resolve()
-    if not repo.is_dir():
-        raise SystemExit(f"repository does not exist: {repo}")
-    task = args.task.strip()
+def resolve_cli_inputs(args: argparse.Namespace) -> tuple[str, Path, tuple[str, str]]:
+    if args.task_text and args.task_option:
+        raise ValueError("use either positional task or --task, not both")
+    task = str(args.task_option or args.task_text or "").strip()
     if not task:
-        raise SystemExit("task must not be empty")
+        raise ValueError("task must not be empty")
+    repo = Path(args.repo).expanduser().resolve()
+    if not repo.is_dir():
+        raise ValueError(f"repository does not exist: {repo}")
+    roles = validate_roles(tuple(args.roles))
+    return task, repo, roles
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _parser()
+    args = parser.parse_args(argv)
+    try:
+        task, repo, roles = resolve_cli_inputs(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     task_id = args.task_id or _task_id_from_environment(task)
+    mcp_tool = validate_mcp_tool(args.mcp)
 
     os.environ[_ROLES_ENV] = json.dumps(list(roles))
     os.environ[_TASK_ENV] = task
     os.environ[_REPO_ENV] = str(repo)
     os.environ[_TASK_ID_ENV] = task_id
+    os.environ[_MCP_ENV] = mcp_tool
 
     exit_code, payload = asyncio.run(run_chatgpt_loop(Path(__file__), args.cdp))
     payload = dict(payload)
     payload["task_id"] = task_id
     payload["roles"] = list(roles)
     payload["repo_path"] = str(repo)
+    payload["mcp_tool"] = mcp_tool
     payload["final_role"] = roles[0]
     payload["final_report"] = _final_report(payload, roles[0])
     print(json.dumps(payload, ensure_ascii=False, indent=2))

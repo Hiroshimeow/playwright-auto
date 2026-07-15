@@ -11,6 +11,7 @@ from typing import Any, Protocol
 
 from .chatgpt import RateLimitBlockedError
 from .durable_blocks import DurableSendBlock
+from .file_lock import fsync_parent_directory
 from .team import (
     TeamRoundSpec,
     TeamTranscript,
@@ -320,11 +321,7 @@ class TeamConversationBlock(WorkflowBlock[ChatGPTWorkspace]):
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        fsync_parent_directory(path)
 
     def _participating_roles(
         self, context: WorkflowContext[ChatGPTWorkspace]
