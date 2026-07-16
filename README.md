@@ -15,7 +15,8 @@ CDP clients must disconnect with `playwright.stop()` or `connected_browser(...)`
 
 ## Prerequisites
 
-- Linux with Bash and Python 3.11 or newer.
+- Linux with Bash and Python 3.11 or newer. Install the platform Tk package (for
+  example `python3-tk`) to use `playwright-studio`.
 - `uv`, Node.js, and PM2.
 - Xvfb and a Chromium-family browser.
 - Tailscale for private remote viewer access.
@@ -74,6 +75,61 @@ uv run playwright-role-ui
 ```
 
 Use `uv run playwright-role-ui --once` when one-time injection is sufficient.
+
+## AI Multi-Agent Studio
+
+The desktop studio is the primary interactive control surface for existing ChatGPT tabs.
+It uses Tkinter and the current CDP/workflow APIs; it does not embed another browser and
+never closes the persistent Chromium process.
+
+Launch it on Windows or Linux:
+
+```powershell
+uv run playwright-studio
+```
+
+Useful options:
+
+```powershell
+uv run playwright-studio --cdp http://127.0.0.1:9222 --geometry 1480x900
+uv run playwright-studio --runtime-dir .runtime/studio-test --no-auto-connect
+```
+
+Run a read-only discovery gate before opening the UI:
+
+```powershell
+uv run playwright-studio-smoke --pretty
+```
+
+The studio provides:
+
+- Existing ChatGPT tabs as ordered worker cards. Unassigned tabs are visible but disabled
+  until a role is applied and **Use** is selected.
+- Direct role assignment/release, including custom roles.
+- Drag-and-drop ordering. The active and completed prefix stays fixed; reordering during a
+  run changes only workers that have not started.
+- A pulsing green border around the active worker.
+- Global goal, task ID, round count, response timeout, and context-limit controls.
+- Per-worker prompt editing, latest response/history, elapsed time, stop, and release.
+- **Stop & Retry** in the prompt editor for replacing an active worker attempt explicitly.
+- All/System/per-role log tabs on the right, including complete worker responses.
+
+Intervention semantics are deliberately fail-closed:
+
+- **Pause** lets the accepted response finish and prevents the next worker from starting.
+- **Stop** interrupts the active response when possible and skips remaining queued work.
+- Editing a queued prompt applies immediately. Editing an active prompt affects the next
+  attempt unless **Stop & Retry** is selected.
+- The studio never deletes manual drafts, attachments, unknown dialogs, conversations, or
+  unrelated tabs to make a task proceed.
+
+Runtime state is ignored by Git and stored at:
+
+```text
+.runtime/studio/layout.json
+.runtime/studio/events.jsonl
+.runtime/studio/runs/<task-id>.json
+```
 
 ## Run a multi-role task
 
