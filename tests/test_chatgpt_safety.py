@@ -21,6 +21,7 @@ from playwright_auto.chatgpt import (
     exact_prompt_seen,
     new_assistant_turns,
     normalize_visible_text,
+    receipt_user_message_seen,
     visible_text_matches,
 )
 
@@ -38,6 +39,7 @@ def snapshot(
     dialogs=(),
     attachments=(),
     task_id=None,
+    team=None,
 ):
     return ChatGPTSnapshot(
         url="https://chatgpt.com/",
@@ -57,6 +59,7 @@ def snapshot(
         error_texts=(),
         messages=tuple(messages),
         page_task_id=task_id,
+        page_team=team,
     )
 
 
@@ -87,8 +90,20 @@ class DummyPage:
         return DummyLocator(self)
 
     async def evaluate(self, _expression, arg=None):
+        if isinstance(arg, list) and len(arg) == 9 and arg[0] == chatgpt.ROLE_STORAGE_KEY:
+            self.current = replace(
+                self.current,
+                page_role=str(arg[5]),
+                page_id=str(arg[6]),
+                page_task_id=str(arg[7]),
+                page_team=str(arg[8]),
+            )
+            return None
         if isinstance(arg, list) and len(arg) >= 2 and arg[0] == chatgpt.TASK_ID_STORAGE_KEY:
-            self.current = replace(self.current, page_task_id=str(arg[1]))
+            changes = {"page_task_id": str(arg[1])}
+            if len(arg) >= 4 and arg[2] == chatgpt.TEAM_STORAGE_KEY:
+                changes["page_team"] = str(arg[3])
+            self.current = replace(self.current, **changes)
             return None
         return None
 
@@ -202,9 +217,10 @@ def test_send_recovery_rechecks_progress_before_second_click(monkeypatch):
     assert receipt.accepted_via == "post_reload:exact_user_message"
 
 
-def test_wait_response_rejects_unproven_stale_assistant(monkeypatch):
-    stale = MessageSnapshot("assistant", "a2", "t2", "stale", ())
-    page = DummyPage(snapshot(messages=(stale,), state=ChatGPTState.WAITING_PROMPT))
+def test_wait_response_accepts_new_assistant_after_confirmed_send(monkeypatch):
+    user = MessageSnapshot("user", "u2", "t2", "expected prompt", ())
+    response = MessageSnapshot("assistant", "a2", "t2", "{\"route\":\"DEV\"}", ())
+    page = DummyPage(snapshot(messages=(user, response), state=ChatGPTState.WAITING_PROMPT))
     client = ChatGPTPage(page, timeout_ms=20)
     binding = PageBinding("page-1", "DEV")
     client.binding = binding
@@ -214,8 +230,10 @@ def test_wait_response_rejects_unproven_stale_assistant(monkeypatch):
         binding=binding,
         baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
         attempts=1,
-        accepted_via="stop_button",
+        accepted_via="user_message_identity",
         session_id_before=None,
+        user_message_id="u2",
+        user_turn_id="t2",
     )
 
     async def fake_inspect(_page):
@@ -223,12 +241,92 @@ def test_wait_response_rejects_unproven_stale_assistant(monkeypatch):
 
     monkeypatch.setattr(chatgpt, "inspect_chatgpt_page", fake_inspect)
 
-    with pytest.raises(SendRecoveryError, match="stale response rejected"):
-        asyncio.run(
-            client.wait_for_response(
-                receipt, timeout_ms=20, stable_ms=0, poll_ms=1
-            )
+    received = asyncio.run(
+        client.wait_for_response(receipt, timeout_ms=20, stable_ms=0, poll_ms=1)
+    )
+
+    assert received == response
+
+
+def test_rehydrated_user_turn_accepts_changed_message_id_without_visible_text_fallback(monkeypatch):
+    old_user = MessageSnapshot("user", "old-user-dom", "old-user-turn", "old prompt", ())
+    old_assistant = MessageSnapshot("assistant", "old-assistant", "old-assistant-turn", "old answer", ())
+    baseline = capture_message_baseline((old_user, old_assistant))
+    collapsed = MessageSnapshot(
+        "user",
+        "new-user-dom",
+        "stable-user-turn",
+        "expected prompt prefix Show more",
+        (),
+    )
+    final = MessageSnapshot(
+        "assistant",
+        "new-assistant",
+        "new-assistant-turn",
+        '{"route":"DEV","handoff":"report.md"}',
+        (),
+    )
+    page = DummyPage(
+        snapshot(
+            messages=(old_user, old_assistant, collapsed, final),
+            state=ChatGPTState.WAITING_PROMPT,
         )
+    )
+    client = ChatGPTPage(page, timeout_ms=20)
+    binding = PageBinding("page-1", "DEV")
+    client.binding = binding
+    receipt = SendReceipt(
+        prompt="expected prompt whose full rendered text is intentionally unavailable",
+        prompt_sha256=chatgpt.prompt_digest(
+            "expected prompt whose full rendered text is intentionally unavailable"
+        ),
+        binding=binding,
+        baseline=baseline,
+        attempts=1,
+        accepted_via="post_reload:user_message_identity",
+        session_id_before="session-1",
+        user_message_id="old-rehydrated-dom-id",
+        user_turn_id="stable-user-turn",
+    )
+
+    assert receipt_user_message_seen(page.current.messages, receipt) is True
+
+    async def fake_inspect(_page):
+        return page.current
+
+    monkeypatch.setattr(chatgpt, "inspect_chatgpt_page", fake_inspect)
+    received = asyncio.run(
+        client.wait_for_response(
+            receipt,
+            timeout_ms=20,
+            stable_ms=0,
+            poll_ms=1,
+            stale_response_baseline=chatgpt.capture_response_recovery_baseline(
+                (old_user, old_assistant), baseline
+            ),
+        )
+    )
+
+    assert received == final
+
+
+def test_persisted_identity_never_falls_back_to_collapsed_visible_text():
+    receipt = SendReceipt(
+        prompt="expected full prompt",
+        prompt_sha256=chatgpt.prompt_digest("expected full prompt"),
+        binding=PageBinding("page-1", "DEV"),
+        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+        attempts=1,
+        accepted_via="user_message_identity",
+        session_id_before=None,
+        user_message_id="missing-message-id",
+        user_turn_id="missing-turn-id",
+    )
+    messages = (
+        MessageSnapshot("user", "other-message", "other-turn", "expected full prompt", ()),
+    )
+
+    assert receipt_user_message_seen(messages, receipt) is False
 
 
 def test_send_receipt_round_trip_preserves_provenance_and_rejects_tamper():
@@ -294,6 +392,48 @@ def test_new_client_respects_persisted_role_binding(monkeypatch):
     assert assigned == {"page_id": "page-1", "page_role": "DEV"}
     assert client.binding == PageBinding("page-1", "DEV")
 
+
+
+def test_restore_identity_reuses_exact_page_binding_for_controlled_reopen(monkeypatch):
+    page = DummyPage(snapshot(page_id=None, role=None, task_id=None, team=None))
+    client = ChatGPTPage(page)
+
+    async def fake_inspect(_page):
+        return page.current
+
+    monkeypatch.setattr(chatgpt, "inspect_chatgpt_page", fake_inspect)
+
+    restored = asyncio.run(
+        client.restore_identity(
+            page_id="page-closed",
+            role="PLAN2",
+            task_id="TASK-1",
+            team="alpha2",
+        )
+    )
+
+    assert client.binding == PageBinding("page-closed", "PLAN2")
+    assert restored.page_id == "page-closed"
+    assert restored.page_role == "PLAN2"
+    assert restored.page_task_id == "TASK-1"
+    assert restored.page_team == "alpha2"
+
+
+def test_bind_task_identity_persists_task_and_team_without_navigation(monkeypatch):
+    page = DummyPage(snapshot(task_id=None, team=None))
+    client = ChatGPTPage(page)
+    client.binding = PageBinding("page-1", "DEV")
+
+    async def fake_inspect(_page):
+        return page.current
+
+    monkeypatch.setattr(chatgpt, "inspect_chatgpt_page", fake_inspect)
+
+    result = asyncio.run(client.bind_task_identity("TASK-1", "alpha2"))
+
+    assert result == {"task_id": "TASK-1", "team": "alpha2"}
+    assert page.current.page_task_id == "TASK-1"
+    assert page.current.page_team == "alpha2"
 
 
 def test_prepare_task_reuses_same_task_without_new_chat(monkeypatch):

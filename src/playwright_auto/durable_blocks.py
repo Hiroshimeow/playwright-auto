@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,7 @@ from .chatgpt import (
     ChatGPTPage,
     MessageSnapshot,
     capture_message_baseline,
+    unique_new_user_message,
     visible_text_matches,
 )
 from .durable import (
@@ -53,6 +55,8 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
         files: PathsSource = (),
         source_context: ValueSource = None,
         role_prompt_hash: ValueSource = "",
+        request_id: ValueSource = None,
+        render_request_marker: bool = True,
         wait_for_response: bool = True,
         wait_for_stop: bool = True,
         max_attempts: int = 2,
@@ -74,6 +78,8 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
         self.files = files
         self.source_context = source_context
         self.role_prompt_hash = role_prompt_hash
+        self.request_id = request_id
+        self.render_request_marker = bool(render_request_marker)
         self.wait_for_response_enabled = wait_for_response
         self.wait_for_stop = wait_for_stop
         self.max_attempts = max_attempts
@@ -159,6 +165,8 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
         role_prompt_hash = str(
             await _resolve_value(self.role_prompt_hash, context)
         )
+        raw_request_id = await _resolve_value(self.request_id, context)
+        request_id = str(raw_request_id).strip() if raw_request_id is not None else None
         ledger = RequestLedger(self.ledger_path)
         record = ledger.begin(
             role=context.client.binding.role,
@@ -166,6 +174,8 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
             source_context=source_context,
             role_prompt_hash=role_prompt_hash,
             files=identities,
+            request_id=request_id or None,
+            render_request_marker=self.render_request_marker,
         )
         with ledger.request_lock(record.request_id):
             current = ledger.get(record.request_id)
@@ -226,17 +236,35 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
         context.variables[self.recovery_key] = recovery
 
         if recovery is DurableRecoveryState.SENT_WAITING_RESPONSE:
-            receipt = receipt_from_record(record)
+            accepted_user = (
+                unique_new_user_message(snapshot.messages, record.baseline)
+                if record.baseline is not None
+                else None
+            )
+            if record.status is RequestStatus.SENDING:
+                if accepted_user is None:
+                    self._raise_ambiguous(record, DurableRecoveryState.SENT_MARKER_MISSING)
+                if snapshot.manual_input_pending or len(snapshot.attachment_markers) != len(identities):
+                    self._raise_ambiguous(record, DurableRecoveryState.MANUAL_COMPOSER_DIRTY)
+            receipt = receipt_from_record(record, accepted_user=accepted_user)
             if record.status is RequestStatus.SENDING:
                 record = ledger.update(
                     record.request_id,
                     status=RequestStatus.SENT,
+                    accepted_at=record.accepted_at or time.time(),
                     receipt=receipt.to_dict(),
                     error=None,
                 )
-            elif record.status is not RequestStatus.SENT:
+            elif record.status is RequestStatus.SENT:
+                if record.receipt != receipt.to_dict():
+                    record = ledger.update(
+                        record.request_id,
+                        receipt=receipt.to_dict(),
+                        error=None,
+                    )
+            else:
                 raise DurableRequestError(
-                    f"transcript contains marker but ledger status is "
+                    f"transcript contains accepted request but ledger status is "
                     f"{record.status.value}; manual reconciliation required"
                 )
             return await self._complete_from_receipt(
@@ -366,9 +394,21 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
                 error=f"{type(exc).__name__}: {exc}",
             )
             raise
+        if (
+            not self.render_request_marker
+            and not receipt.user_message_id
+            and not receipt.user_turn_id
+        ):
+            error = (
+                "markerless send reached transport progress without accepted "
+                "user-message identity"
+            )
+            ledger.update(record.request_id, error=error)
+            raise DurableRequestError(error)
         record = ledger.update(
             record.request_id,
             status=RequestStatus.SENT,
+            accepted_at=record.accepted_at or time.time(),
             receipt=receipt.to_dict(),
             binding=receipt.binding,
             baseline=receipt.baseline,

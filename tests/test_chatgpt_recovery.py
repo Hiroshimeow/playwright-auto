@@ -8,12 +8,13 @@ from playwright_auto.chatgpt import (
     ChatGPTSnapshot,
     ChatGPTState,
     ChoicePromptBlockedError,
+    IncompleteResponseTimeoutError,
     ManualInputPendingError,
     MessageBaseline,
     MessageSnapshot,
     PageBinding,
     SendReceipt,
-    SendRecoveryError,
+    StableMalformedResponseError,
     looks_incomplete_response,
     prompt_digest,
 )
@@ -29,6 +30,10 @@ def make_snapshot(
     choice_labels=(),
     attachments=(),
     requires_login=False,
+    error_texts=(),
+    response_activity_text="",
+    response_activity_structure="",
+    response_activity_turn_id=None,
     state=ChatGPTState.WAITING_PROMPT,
 ):
     return ChatGPTSnapshot(
@@ -46,9 +51,12 @@ def make_snapshot(
         stop_visible=stop_visible,
         blocking_dialogs=(),
         attachment_markers=tuple(attachments),
-        error_texts=(),
+        error_texts=tuple(error_texts),
         messages=tuple(messages),
         choice_prompt_labels=tuple(choice_labels),
+        response_activity_text=response_activity_text,
+        response_activity_structure=response_activity_structure,
+        response_activity_turn_id=response_activity_turn_id,
     )
 
 
@@ -82,12 +90,24 @@ def receipt(*, accepted_via="exact_user_message"):
     )
 
 
-def conversation(answer: str, *, stop=False, image_count=0):
+def conversation(
+    answer: str,
+    *,
+    stop=False,
+    image_count=0,
+    assistant_message_id="a2",
+    assistant_turn_id="t2",
+):
     return make_snapshot(
         messages=(
             MessageSnapshot("user", "u2", "t2", "expected prompt", ()),
             MessageSnapshot(
-                "assistant", "a2", "t2", answer, (), image_count=image_count
+                "assistant",
+                assistant_message_id,
+                assistant_turn_id,
+                answer,
+                (),
+                image_count=image_count,
             ),
         ),
         stop_visible=stop,
@@ -111,11 +131,202 @@ def install_sequence(monkeypatch, page):
     monkeypatch.setattr(chatgpt, "inspect_chatgpt_page", fake_inspect)
 
 
-def test_incomplete_response_detector_covers_code_fence_and_json():
+def test_incomplete_response_detector_covers_transient_placeholder_code_fence_and_json():
+    assert looks_incomplete_response("Thinking") is True
+    assert looks_incomplete_response("Analyzing…") is True
     assert looks_incomplete_response("```python\nprint('x')") is True
     assert looks_incomplete_response('{"route": "DEV"') is True
     assert looks_incomplete_response('{"route": "DEV"}') is False
     assert looks_incomplete_response("normal final response") is False
+
+
+def test_wait_response_ignores_transient_thinking_placeholder(monkeypatch):
+    page = SequencePage(
+        [
+            conversation("Thinking", stop=True),
+            conversation("Thinking", stop=True),
+            conversation('{"route":"DONE","handoff":"report.md"}'),
+        ]
+    )
+    install_sequence(monkeypatch, page)
+
+    result = asyncio.run(
+        bind(page).wait_for_response(
+            receipt(), timeout_ms=30, stable_ms=0, poll_ms=1
+        )
+    )
+
+    assert result.text == '{"route":"DONE","handoff":"report.md"}'
+    assert page.inspect_calls == 3
+
+
+def _require_route_json(message):
+    if not message.text.startswith('{"route":'):
+        raise ValueError("route JSON not ready")
+
+
+def test_streaming_progress_dom_changes_response_activity_without_assistant_message():
+    baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
+    first = make_snapshot(
+        messages=(MessageSnapshot("user", "u2", "t2", "expected prompt", ()),),
+        stop_visible=True,
+        response_activity_text="Inspecting repository",
+        response_activity_structure="cot-v5-pinned-row|cot-v5-pinned-row-content",
+        response_activity_turn_id="request-live-0",
+        state=ChatGPTState.RESPONDING,
+    )
+    second = make_snapshot(
+        messages=first.messages,
+        stop_visible=True,
+        response_activity_text="Inspecting durable block and searching for functions",
+        response_activity_structure="cot-v5-pinned-row|cot-v5-pinned-row-content",
+        response_activity_turn_id="request-live-0",
+        state=ChatGPTState.RESPONDING,
+    )
+
+    first_signature, first_length = chatgpt.response_activity_signature(first, baseline)
+    second_signature, second_length = chatgpt.response_activity_signature(second, baseline)
+
+    assert first_signature != second_signature
+    assert first_length == len("Inspecting repository")
+    assert second_length == len("Inspecting durable block and searching for functions")
+
+
+def test_invalid_progress_with_stop_visible_waits_for_valid_route(monkeypatch):
+    final = '{"route":"TEST","handoff":"report.md"}'
+    page = SequencePage(
+        [
+            conversation("Inspecting durable block and searching for functions", stop=True),
+            conversation("Inspecting durable block and searching for functions", stop=True),
+            conversation(final),
+            conversation(final),
+        ]
+    )
+    install_sequence(monkeypatch, page)
+
+    result = asyncio.run(
+        bind(page).wait_for_response(
+            receipt(),
+            timeout_ms=40,
+            stable_ms=0,
+            poll_ms=1,
+            candidate_validator=_require_route_json,
+            minimum_samples=2,
+            invalid_grace_ms=0,
+        )
+    )
+
+    assert result.text == final
+    assert page.inspect_calls == 4
+
+
+def test_changing_progress_under_timeout_banner_remains_nonfinal(monkeypatch):
+    final = '{"route":"TEST","handoff":"report.md"}'
+    page = SequencePage(
+        [
+            make_snapshot(
+                messages=conversation("Inspecting repository").messages,
+                error_texts=("Message delivery timed out. Please try again.",),
+                state=ChatGPTState.ERROR,
+            ),
+            make_snapshot(
+                messages=conversation("Inspecting durable block").messages,
+                error_texts=("Message delivery timed out. Please try again.",),
+                state=ChatGPTState.ERROR,
+            ),
+            make_snapshot(
+                messages=conversation("Inspecting durable block").messages,
+                error_texts=("Message delivery timed out. Please try again.",),
+                state=ChatGPTState.ERROR,
+            ),
+            conversation(final),
+            conversation(final),
+        ]
+    )
+    install_sequence(monkeypatch, page)
+
+    result = asyncio.run(
+        bind(page).wait_for_response(
+            receipt(),
+            timeout_ms=50,
+            stable_ms=0,
+            poll_ms=1,
+            candidate_validator=_require_route_json,
+            minimum_samples=2,
+            invalid_grace_ms=0,
+        )
+    )
+
+    assert result.text == final
+    assert page.inspect_calls == 5
+
+
+def test_recent_activity_after_stop_disappears_gets_grace_before_repair(monkeypatch):
+    final = '{"route":"TEST","handoff":"report.md"}'
+    page = SequencePage(
+        [
+            conversation("Thinking", stop=True),
+            conversation("Inspecting final report"),
+            conversation(final),
+            conversation(final),
+        ]
+    )
+    install_sequence(monkeypatch, page)
+
+    result = asyncio.run(
+        bind(page).wait_for_response(
+            receipt(),
+            timeout_ms=50,
+            stable_ms=0,
+            poll_ms=1,
+            candidate_validator=_require_route_json,
+            minimum_samples=2,
+            invalid_grace_ms=5,
+        )
+    )
+
+    assert result.text == final
+
+
+def test_stable_malformed_final_raises_only_after_two_clean_samples(monkeypatch):
+    page = SequencePage([conversation("final prose without route")])
+    install_sequence(monkeypatch, page)
+
+    with pytest.raises(StableMalformedResponseError, match="route JSON not ready") as caught:
+        asyncio.run(
+            bind(page).wait_for_response(
+                receipt(),
+                timeout_ms=20,
+                stable_ms=0,
+                poll_ms=1,
+                candidate_validator=_require_route_json,
+                minimum_samples=2,
+                invalid_grace_ms=0,
+            )
+        )
+
+    assert caught.value.candidate.text == "final prose without route"
+    assert page.inspect_calls == 2
+
+
+def test_valid_route_requires_two_samples_when_validator_is_active(monkeypatch):
+    final = '{"route":"TEST","handoff":"report.md"}'
+    page = SequencePage([conversation(final)])
+    install_sequence(monkeypatch, page)
+
+    result = asyncio.run(
+        bind(page).wait_for_response(
+            receipt(),
+            timeout_ms=20,
+            stable_ms=0,
+            poll_ms=1,
+            candidate_validator=_require_route_json,
+            minimum_samples=2,
+        )
+    )
+
+    assert result.text == final
+    assert page.inspect_calls == 2
 
 
 def test_wait_response_resets_stability_when_text_changes(monkeypatch):
@@ -166,7 +377,11 @@ def test_active_response_reloads_once_then_rejects_first_stale_done(monkeypatch)
             conversation("partial", stop=True),
             conversation("partial growing", stop=True),
             conversation("stale after reload"),
-            conversation("final after reload"),
+            conversation(
+                "final after reload",
+                assistant_message_id="a3",
+                assistant_turn_id="t3",
+            ),
         ]
     )
     install_sequence(monkeypatch, page)
@@ -191,11 +406,74 @@ def test_active_response_reloads_once_then_rejects_first_stale_done(monkeypatch)
     assert page.reload_calls == 1
 
 
-def test_structurally_incomplete_response_is_never_returned(monkeypatch):
+
+def test_pre_refresh_response_remains_stale_by_content_even_with_new_dom_identity(monkeypatch):
+    stale = conversation("completed before refresh")
+    page = SequencePage(
+        [
+            conversation(
+                "completed before refresh",
+                assistant_message_id="a9",
+                assistant_turn_id="t9",
+            ),
+            conversation(
+                "new response after refresh",
+                assistant_message_id="a10",
+                assistant_turn_id="t10",
+            ),
+        ]
+    )
+    install_sequence(monkeypatch, page)
+    baseline = chatgpt.capture_response_recovery_baseline(
+        stale.messages,
+        receipt().baseline,
+    )
+
+    result = asyncio.run(
+        bind(page).wait_for_response(
+            receipt(accepted_via="post_reload:stop_button"),
+            timeout_ms=30,
+            stable_ms=0,
+            poll_ms=1,
+            stale_response_baseline=baseline,
+        )
+    )
+
+    assert result.text == "new response after refresh"
+    assert result.message_id == "a10"
+
+
+def test_only_pre_refresh_response_repeated_after_reload_is_rejected(monkeypatch):
+    stale = conversation("completed before refresh")
+    page = SequencePage(
+        [
+            conversation("completed before refresh"),
+            conversation("completed before refresh"),
+            conversation("completed before refresh"),
+        ]
+    )
+    install_sequence(monkeypatch, page)
+    baseline = chatgpt.capture_response_recovery_baseline(
+        stale.messages,
+        receipt().baseline,
+    )
+
+    with pytest.raises(IncompleteResponseTimeoutError, match="pre-refresh"):
+        asyncio.run(
+            bind(page).wait_for_response(
+                receipt(accepted_via="post_reload:stop_button"),
+                timeout_ms=8,
+                stable_ms=0,
+                poll_ms=1,
+                stale_response_baseline=baseline,
+            )
+        )
+
+def test_structurally_incomplete_exact_response_is_retryable_timeout(monkeypatch):
     page = SequencePage([conversation('{"PLAN": "continue"')])
     install_sequence(monkeypatch, page)
 
-    with pytest.raises(SendRecoveryError, match="structurally complete"):
+    with pytest.raises(IncompleteResponseTimeoutError, match="structurally complete"):
         asyncio.run(
             bind(page).wait_for_response(
                 receipt(), timeout_ms=8, stable_ms=0, poll_ms=1
@@ -349,3 +627,24 @@ def test_send_receipt_rejects_legacy_weak_acceptance_signal():
 
     with pytest.raises(ValueError, match="unsupported acceptance"):
         SendReceipt.from_dict(value)
+
+
+def test_stable_exact_response_can_complete_while_stop_remains_visible(monkeypatch):
+    page = SequencePage([
+        conversation("final route object", stop=True),
+        conversation("final route object", stop=True),
+    ])
+    install_sequence(monkeypatch, page)
+
+    result = asyncio.run(
+        bind(page).wait_for_response(
+            receipt(),
+            timeout_ms=20,
+            stable_ms=0,
+            poll_ms=1,
+            active_reload_after_ms=10_000,
+        )
+    )
+
+    assert result.text == "final route object"
+    assert page.reload_calls == 0

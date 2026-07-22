@@ -6,6 +6,7 @@ Persistent Chromium automation through local CDP, with a low-latency interactive
 
 - CDP: `http://127.0.0.1:9222` (loopback only)
 - Viewer: `http://<tailscale-ip>:9223/` (interactive browser screen)
+- CDPA Kanban: `http://<tailscale-ip>:9224/` (task creation, durable controls, reports, and live telemetry)
 - Profile: `.runtime/main-profile/` (inside this repository, ignored by Git)
 - Display: `:100`
 
@@ -40,13 +41,14 @@ pm2 save
 ```
 
 ```bash
-pm2 status playwright-display playwright-selkies playwright-browser playwright-role-ui
+pm2 status playwright-display playwright-selkies playwright-browser playwright-role-ui playwright-dashboard playwright-cdpa-worker
 curl http://127.0.0.1:9222/json/version
 curl -I http://127.0.0.1:9223/
+curl http://127.0.0.1:9224/health
 uv run python scripts/smoke.py
 ```
 
-Stop or restart with `pm2 stop|restart playwright-browser playwright-selkies playwright-display playwright-role-ui`.
+Stop or restart with `pm2 stop|restart playwright-browser playwright-selkies playwright-display playwright-role-ui playwright-dashboard playwright-cdpa-worker`.
 
 Selkies v1.6.2 is unpacked user-locally at `~/.local/opt/selkies-gstreamer`. The viewer has no application password and must stay inside the private Tailscale network. Do not expose port 9223 through Funnel or a public tunnel.
 
@@ -153,18 +155,30 @@ for example `REVIEW` → `REVIEW1`.
 control after reload/navigation while it is running. `chatgpt_probe.py` remains only an
 emergency low-level fallback.
 
-New task manifests default to workflow version 2. PLAN returns distinct assignments for
-all DEV instances, REVIEW/TEST verify independently, DEV revises, REVIEW/TEST reverify,
-and PLAN closes out from a deterministic accepted/blocked gate. Existing version-1 task
-manifests continue to resume with their original round graph.
+### Submit and control CDPA tasks
 
-Requests are paced across the team. The known ChatGPT `Too many requests` dialog triggers
-a bounded cooldown, safe `Got it` dismissal, and durable retry without resending an
-already accepted prompt. Unknown dialogs still require manual intervention.
+`cdpa` writes one durable manifest and returns immediately; the PM2 worker performs the
+browser work. PLAN is created first, while DEV/TEST/REVIEW/AUDIT tabs are created only when
+a validated route first needs them.
 
-Normal runs require an authenticated profile and fail closed with
-`waiting_for_login`. `--allow-guest` exists only for controlled testing because
-anonymous ChatGPT sessions are not reliable for sustained multi-round work.
+```bash
+uv run cdpa "Implement and verify the requested behavior"
+uv run cdpa "Implement and verify the requested behavior" --team release --new plan,dev
+uv run cdpa "Implement and verify the requested behavior" --new-all
+```
+
+Port `9224` is the compact Kanban creation/control surface. It exposes durable Pause,
+Resume, safe Retry, Stop, Restart role, Open tab, New Chat, Route PLAN, and Clear Team
+requests. Controls are applied by the worker through the manifest state machine; the
+browser endpoint never performs a blind Send. Reports are linked from each task card.
+Keep port `9224` inside the private network because task titles and role state are visible.
+
+```bash
+uv run playwright-dashboard --host 0.0.0.0 --port 9224 --config cdpa.yaml
+uv run cdpa-worker --repository . --config cdpa.yaml
+# or through PM2:
+pm2 start ecosystem.config.cjs --only playwright-dashboard,playwright-cdpa-worker
+```
 
 ### Run a two-role review exchange
 

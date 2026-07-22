@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -15,7 +16,10 @@ from .chatgpt import (
     MessageBaseline,
     PageBinding,
     SendReceipt,
+    exact_prompt_seen,
+    unique_new_user_message,
     validate_page_role,
+    visible_text_matches,
 )
 from .file_lock import exclusive_file_lock, fsync_parent_directory
 from .upload import FileIdentity
@@ -188,6 +192,7 @@ class DurableRequestRecord:
     status: RequestStatus
     created_at: float
     updated_at: float
+    accepted_at: float | None = None
     attempts: int = 0
     source_context: Any = None
     role_prompt_hash: str = ""
@@ -211,6 +216,7 @@ class DurableRequestRecord:
             "status": self.status.value,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "accepted_at": self.accepted_at,
             "attempts": self.attempts,
             "source_context": self.source_context,
             "role_prompt_hash": self.role_prompt_hash,
@@ -236,6 +242,11 @@ class DurableRequestRecord:
             status=RequestStatus(str(value["status"])),
             created_at=float(value["created_at"]),
             updated_at=float(value["updated_at"]),
+            accepted_at=(
+                float(value["accepted_at"])
+                if value.get("accepted_at") is not None
+                else None
+            ),
             attempts=int(value.get("attempts") or 0),
             source_context=value.get("source_context"),
             role_prompt_hash=str(value.get("role_prompt_hash") or ""),
@@ -266,6 +277,9 @@ class DurableRequestRecord:
             response=(dict(value["response"]) if value.get("response") else None),
             error=(str(value["error"]) if value.get("error") else None),
         )
+
+
+_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 class RequestLedger:
@@ -322,6 +336,8 @@ class RequestLedger:
         source_context: Any = None,
         role_prompt_hash: str = "",
         files: Sequence[FileIdentity] = (),
+        request_id: str | None = None,
+        render_request_marker: bool = True,
     ) -> DurableRequestRecord:
         role = validate_page_role(role)
         normalized = normalize_prompt(prompt)
@@ -335,13 +351,22 @@ class RequestLedger:
             role_prompt_hash=role_prompt_hash,
             files=files,
         )
-        request_id = key[:24]
+        explicit_request_id = request_id is not None
+        request_id = str(request_id or key[:24]).strip()
+        if not _REQUEST_ID_PATTERN.fullmatch(request_id):
+            raise ValueError(
+                "request_id must match [A-Za-z0-9][A-Za-z0-9._:-]{0,127}"
+            )
         marker = request_marker(request_id)
         with self._locked() as data:
             existing = data["records"].get(request_id)
             if existing:
                 record = DurableRequestRecord.from_dict(existing)
                 if record.idempotency_key != key:
+                    if explicit_request_id:
+                        raise DurableRequestError(
+                            f"request ID {request_id!r} already belongs to another payload"
+                        )
                     raise DurableRequestError("request ID collision in durable ledger")
                 return record
             now = time.time()
@@ -350,7 +375,11 @@ class RequestLedger:
                 idempotency_key=key,
                 role=role,
                 prompt=normalized,
-                rendered_prompt=render_prompt(normalized, marker),
+                rendered_prompt=(
+                    render_prompt(normalized, marker)
+                    if render_request_marker
+                    else normalized
+                ),
                 marker=marker,
                 status=RequestStatus.NEW,
                 created_at=now,
@@ -386,6 +415,7 @@ class RequestLedger:
                 )
             allowed_fields = {
                 "attempts",
+                "accepted_at",
                 "binding",
                 "baseline",
                 "session_id_before",
@@ -412,11 +442,23 @@ def classify_recovery_state(
 ) -> DurableRecoveryState:
     if record.status is RequestStatus.COMPLETED and record.response:
         return DurableRecoveryState.COMPLETED
-    marker_in_transcript = any(
-        message.role == "user" and record.marker in message.text
-        for message in snapshot.messages
+    if record.status is RequestStatus.SENT and record.receipt:
+        return DurableRecoveryState.SENT_WAITING_RESPONSE
+    marker_is_rendered = record.marker in record.rendered_prompt
+    accepted_user = (
+        unique_new_user_message(snapshot.messages, record.baseline)
+        if record.baseline is not None
+        else None
     )
-    if marker_in_transcript:
+    prompt_in_transcript = accepted_user is not None
+    if not prompt_in_transcript and marker_is_rendered:
+        # Compatibility fallback for ledgers created before baseline/identity
+        # persistence. New sends recover from the accepted user turn identity.
+        prompt_in_transcript = any(
+            message.role == "user" and record.marker in message.text
+            for message in snapshot.messages
+        )
+    if prompt_in_transcript:
         return DurableRecoveryState.SENT_WAITING_RESPONSE
     if record.status in {RequestStatus.SENDING, RequestStatus.SENT}:
         # Once the ledger crosses the send boundary, absence of transcript
@@ -424,10 +466,14 @@ def classify_recovery_state(
         return DurableRecoveryState.SENT_MARKER_MISSING
 
     composer_text = snapshot.composer_text.strip()
-    marker_in_composer = record.marker in composer_text
+    prompt_in_composer = (
+        record.marker in composer_text
+        if marker_is_rendered
+        else visible_text_matches(composer_text, record.rendered_prompt)
+    )
     attachment_count = len(snapshot.attachment_markers)
     expected_files = len(record.files)
-    if marker_in_composer:
+    if prompt_in_composer:
         if expected_files == 0:
             return DurableRecoveryState.COMPOSER_PROMPT_ONLY_PENDING
         if attachment_count >= expected_files:
@@ -442,9 +488,21 @@ def classify_recovery_state(
     return DurableRecoveryState.RECOVERY_MARKER_NOT_FOUND
 
 
-def receipt_from_record(record: DurableRequestRecord) -> SendReceipt:
+def receipt_from_record(
+    record: DurableRequestRecord,
+    *,
+    accepted_user: Any | None = None,
+) -> SendReceipt:
     if record.receipt:
-        return SendReceipt.from_dict(record.receipt)
+        receipt = SendReceipt.from_dict(record.receipt)
+        if receipt.user_message_id or receipt.user_turn_id or accepted_user is None:
+            return receipt
+        return replace(
+            receipt,
+            accepted_via="user_message_identity",
+            user_message_id=accepted_user.message_id,
+            user_turn_id=accepted_user.turn_id,
+        )
     if not record.binding or not record.baseline:
         raise DurableRequestError(
             "cannot recover sent request without persisted binding and baseline"
@@ -457,6 +515,8 @@ def receipt_from_record(record: DurableRequestRecord) -> SendReceipt:
         binding=record.binding,
         baseline=record.baseline,
         attempts=max(1, min(record.attempts or 1, 2)),
-        accepted_via="exact_user_message",
+        accepted_via=("user_message_identity" if accepted_user is not None else "exact_user_message"),
         session_id_before=record.session_id_before,
+        user_message_id=(accepted_user.message_id if accepted_user is not None else None),
+        user_turn_id=(accepted_user.turn_id if accepted_user is not None else None),
     )

@@ -2,20 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import random
 import re
 import time
 import weakref
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlparse
 
+from .observability import record_page_action
 from .role_indicator import WINDOW_NAME_PREFIX, ensure_role_indicator
 
 ROLE_STORAGE_KEY = "playwright-auto:role"
 PAGE_ID_STORAGE_KEY = "playwright-auto:page-id"
 TASK_ID_STORAGE_KEY = "playwright-auto:task-id"
+TEAM_STORAGE_KEY = "playwright-auto:team"
 
 SELECTORS = {
     "composer": '[contenteditable="true"][role="textbox"]',
@@ -39,10 +42,101 @@ SHORTCUTS = {
     "toggle_sidebar": "Control+Shift+S",
     "custom_instructions": "Control+Shift+I",
     "copy_last_code_block": "Control+Shift+;",
-    "delete_chat": "Control+Shift+Backspace",
+    "delete_chat": "Control+Shift+Delete",
 }
 
+# Visible actions are intentionally paced; DOM reads and emergency Stop are not.
+_DEFAULT_ACTION_DELAY_MULTIPLIERS = {
+    "composer_fill": 1.0,
+    "send": 3.0,
+    "new_chat": 4.0,
+    "refresh": 4.0,
+    "open_tab": 4.0,
+    "close_tab": 4.0,
+    "delete_dialog": 4.0,
+    "delete_confirm": 5.0,
+}
+_ACTION_DELAY_MULTIPLIERS = dict(_DEFAULT_ACTION_DELAY_MULTIPLIERS)
+SEND_DELAY_MULTIPLIER = _ACTION_DELAY_MULTIPLIERS["send"]
+NAVIGATION_DELAY_MULTIPLIER = _ACTION_DELAY_MULTIPLIERS["new_chat"]
+DIALOG_DELAY_MULTIPLIER = _ACTION_DELAY_MULTIPLIERS["delete_dialog"]
+DELETE_DELAY_MULTIPLIER = _ACTION_DELAY_MULTIPLIERS["delete_confirm"]
+_RANDOM_DELAY_MIN_SECONDS = 1.0
+_RANDOM_DELAY_MAX_SECONDS = 1.5
+
+
+def configure_random_delay(min_seconds: float = 1.0, max_seconds: float = 1.5) -> None:
+    """Change the process-wide human pacing range used by visible actions."""
+    minimum = float(min_seconds)
+    maximum = float(max_seconds)
+    if minimum <= 0 or maximum <= 0 or minimum > maximum:
+        raise ValueError("random delay requires 0 < min_seconds <= max_seconds")
+    global _RANDOM_DELAY_MIN_SECONDS, _RANDOM_DELAY_MAX_SECONDS
+    _RANDOM_DELAY_MIN_SECONDS = minimum
+    _RANDOM_DELAY_MAX_SECONDS = maximum
+
+
+def configure_action_delays(
+    min_seconds: float = 1.0,
+    max_seconds: float = 1.5,
+    multipliers: Mapping[str, float] | None = None,
+) -> None:
+    """Configure the shared visible-action delay policy for this process."""
+    configure_random_delay(min_seconds, max_seconds)
+    overrides = dict(multipliers or {})
+    unknown = set(overrides) - set(_DEFAULT_ACTION_DELAY_MULTIPLIERS)
+    if unknown:
+        raise ValueError(f"unknown action delay multipliers: {sorted(unknown)!r}")
+    configured = dict(_DEFAULT_ACTION_DELAY_MULTIPLIERS)
+    for action, value in overrides.items():
+        multiplier = float(value)
+        if multiplier <= 0:
+            raise ValueError(f"delay multiplier for {action!r} must be positive")
+        configured[action] = multiplier
+    _ACTION_DELAY_MULTIPLIERS.clear()
+    _ACTION_DELAY_MULTIPLIERS.update(configured)
+    global SEND_DELAY_MULTIPLIER, NAVIGATION_DELAY_MULTIPLIER
+    global DIALOG_DELAY_MULTIPLIER, DELETE_DELAY_MULTIPLIER
+    SEND_DELAY_MULTIPLIER = configured["send"]
+    NAVIGATION_DELAY_MULTIPLIER = configured["new_chat"]
+    DIALOG_DELAY_MULTIPLIER = configured["delete_dialog"]
+    DELETE_DELAY_MULTIPLIER = configured["delete_confirm"]
+
+
+def action_delay_multiplier(action: str) -> float:
+    try:
+        return _ACTION_DELAY_MULTIPLIERS[str(action)]
+    except KeyError as exc:
+        raise ValueError(f"unknown visible action {action!r}") from exc
+
+
+def sample_random_delay(multiplier: float = 1.0) -> float:
+    factor = float(multiplier)
+    if factor <= 0:
+        raise ValueError("delay multiplier must be positive")
+    return random.uniform(
+        _RANDOM_DELAY_MIN_SECONDS,
+        _RANDOM_DELAY_MAX_SECONDS,
+    ) * factor
+
+
+async def random_delay(multiplier: float = 1.0) -> float:
+    """Sleep for one globally configured random delay multiplied by ``multiplier``."""
+    seconds = sample_random_delay(multiplier)
+    await asyncio.sleep(seconds)
+    return seconds
+
+
+async def action_delay(page: Any, action: str, multiplier: float) -> float:
+    """Expose an exact countdown event, then wait before a visible action."""
+    seconds = sample_random_delay(multiplier)
+    await record_page_action(page, action, "delay", delay_seconds=seconds)
+    await asyncio.sleep(seconds)
+    await record_page_action(page, action, "ready", delay_seconds=seconds)
+    return seconds
+
 _ROLE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+_TEAM_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
 def normalize_visible_text(value: Any) -> str:
@@ -88,6 +182,23 @@ class RateLimitBlockedError(UnsafePageStateError):
 
 class SendRecoveryError(ChatGPTAutomationError):
     pass
+
+
+class IncompleteResponseTimeoutError(TimeoutError, ChatGPTAutomationError):
+    """Exact-provenance response exists but remained structurally incomplete."""
+
+
+class StableMalformedResponseError(ChatGPTAutomationError):
+    """A clean, inactive assistant candidate stayed malformed through its grace period."""
+
+    def __init__(
+        self,
+        candidate: "MessageSnapshot",
+        validation_error: BaseException,
+    ) -> None:
+        self.candidate = candidate
+        self.validation_error = validation_error
+        super().__init__(f"stable malformed response: {validation_error}")
 
 
 class ManualInputPendingError(ChatGPTAutomationError):
@@ -217,6 +328,8 @@ class SendReceipt:
     attempts: int
     accepted_via: str
     session_id_before: str | None
+    user_message_id: str | None = None
+    user_turn_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -227,6 +340,8 @@ class SendReceipt:
             "attempts": self.attempts,
             "accepted_via": self.accepted_via,
             "session_id_before": self.session_id_before,
+            "user_message_id": self.user_message_id,
+            "user_turn_id": self.user_turn_id,
         }
 
     @classmethod
@@ -239,7 +354,11 @@ class SendReceipt:
         if attempts not in {1, 2}:
             raise ValueError("send receipt attempts must be 1 or 2")
         accepted_via = str(value["accepted_via"])
-        allowed_acceptance = {"exact_user_message", "stop_button"}
+        allowed_acceptance = {
+            "exact_user_message",
+            "user_message_identity",
+            "stop_button",
+        }
         if accepted_via.startswith("post_reload:"):
             recovered_signal = accepted_via.split(":", 1)[1]
             if recovered_signal not in allowed_acceptance:
@@ -256,6 +375,16 @@ class SendReceipt:
             session_id_before=(
                 str(value["session_id_before"])
                 if value.get("session_id_before") is not None
+                else None
+            ),
+            user_message_id=(
+                str(value["user_message_id"])
+                if value.get("user_message_id") is not None
+                else None
+            ),
+            user_turn_id=(
+                str(value["user_turn_id"])
+                if value.get("user_turn_id") is not None
                 else None
             ),
         )
@@ -281,6 +410,10 @@ class ChatGPTSnapshot:
     messages: tuple[MessageSnapshot, ...]
     choice_prompt_labels: tuple[str, ...] = ()
     page_task_id: str | None = None
+    page_team: str | None = None
+    response_activity_text: str = ""
+    response_activity_structure: str = ""
+    response_activity_turn_id: str | None = None
 
     @property
     def conversation_url(self) -> str | None:
@@ -314,6 +447,10 @@ class ChatGPTSnapshot:
             "page_id": self.page_id,
             "page_role": self.page_role,
             "page_task_id": self.page_task_id,
+            "page_team": self.page_team,
+            "response_activity_text": self.response_activity_text,
+            "response_activity_structure": self.response_activity_structure,
+            "response_activity_turn_id": self.response_activity_turn_id,
             "state": self.state.value,
             "requires_login": self.requires_login,
             "composer_present": self.composer_present,
@@ -388,12 +525,12 @@ def request_marker_from_prompt(prompt: str) -> str | None:
 def exact_prompt_seen(
     messages: Sequence[MessageSnapshot], baseline: MessageBaseline, prompt: str
 ) -> bool:
-    """Prove a new user request by exact text or its unique durable marker.
+    """Prove a new user request by exact text or an optional durable marker.
 
     ChatGPT may append UI-only text such as ``Show more`` to a collapsed long
-    user message. Durable prompts include one unique ``ROLE_REQUEST_ID`` marker,
-    so that marker is stronger provenance than fuzzy text matching while still
-    remaining scoped to a user message created after the captured baseline.
+    user message. Generic durable prompts may include one unique
+    ``ROLE_REQUEST_ID`` marker; markerless callers rely on exact text after the
+    captured baseline and fail closed when the rendered transcript is ambiguous.
     """
     expected = normalize_visible_text(prompt)
     marker = request_marker_from_prompt(prompt)
@@ -406,6 +543,46 @@ def exact_prompt_seen(
         if marker and marker in message.text:
             return True
     return False
+
+
+def unique_new_user_message(
+    messages: Sequence[MessageSnapshot], baseline: MessageBaseline
+) -> MessageSnapshot | None:
+    """Return the one user message created after ``baseline``.
+
+    Rendered text is deliberately irrelevant here. Long ChatGPT messages may be
+    collapsed behind ``Show more``; durable post-send provenance therefore uses
+    message/turn identity and fails closed when the transcript is ambiguous.
+    """
+    candidates = [
+        message
+        for message in messages
+        if message.role == "user"
+        and message.message_id not in baseline.user_message_ids
+        and message.message_id not in baseline.message_ids
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def receipt_user_message_seen(
+    messages: Sequence[MessageSnapshot], receipt: SendReceipt
+) -> bool:
+    candidates = [
+        message
+        for message in messages
+        if message.role == "user"
+        and message.message_id not in receipt.baseline.user_message_ids
+        and message.message_id not in receipt.baseline.message_ids
+    ]
+    message_id = str(receipt.user_message_id or "").strip()
+    turn_id = str(receipt.user_turn_id or "").strip()
+    if message_id or turn_id:
+        return any(
+            (bool(message_id) and message.message_id == message_id)
+            or (bool(turn_id) and message.turn_id == turn_id)
+            for message in candidates
+        )
+    return exact_prompt_seen(messages, receipt.baseline, receipt.prompt)
 
 
 def new_assistant_turns(
@@ -436,9 +613,134 @@ def message_fingerprint(message: MessageSnapshot | None) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def message_content_fingerprint(message: MessageSnapshot | None) -> str:
+    if message is None:
+        return ""
+    payload = f"{message.role}\0{message.text.strip()}\0{message.image_count}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def capture_response_recovery_baseline(
+    messages: Sequence[MessageSnapshot],
+    send_baseline: MessageBaseline,
+) -> dict[str, list[str]]:
+    assistants = new_assistant_turns(messages, send_baseline)
+    return {
+        "assistant_message_ids": sorted(
+            {message.message_id for message in assistants if message.message_id}
+        ),
+        "assistant_turn_ids": sorted(
+            {message.turn_id for message in assistants if message.turn_id}
+        ),
+        "assistant_fingerprints": sorted(
+            {message_content_fingerprint(message) for message in assistants}
+        ),
+    }
+
+
+def merge_response_recovery_baselines(
+    *values: Mapping[str, Any] | None,
+) -> dict[str, list[str]]:
+    keys = (
+        "assistant_message_ids",
+        "assistant_turn_ids",
+        "assistant_fingerprints",
+    )
+    merged = {key: set() for key in keys}
+    for value in values:
+        if not isinstance(value, Mapping):
+            continue
+        for key in keys:
+            merged[key].update(str(item) for item in value.get(key) or [] if item)
+    return {key: sorted(items) for key, items in merged.items()}
+
+
+def response_is_stale(
+    message: MessageSnapshot | None,
+    recovery_baseline: Mapping[str, Any] | None,
+) -> bool:
+    if message is None or not isinstance(recovery_baseline, Mapping):
+        return False
+    return bool(
+        message.message_id in set(recovery_baseline.get("assistant_message_ids") or [])
+        or (
+            message.turn_id
+            and message.turn_id in set(recovery_baseline.get("assistant_turn_ids") or [])
+        )
+        or message_content_fingerprint(message)
+        in set(recovery_baseline.get("assistant_fingerprints") or [])
+    )
+
+
+_TRANSIENT_RESPONSE_MARKERS = (
+    "connection interrupted",
+    "waiting for the complete answer",
+    "message delivery timed out",
+    "please try again",
+)
+
+
+def response_transport_ui_active(snapshot: ChatGPTSnapshot) -> bool:
+    state = getattr(snapshot, "state", ChatGPTState.UNKNOWN)
+    error_texts = tuple(getattr(snapshot, "error_texts", ()) or ())
+    if state is ChatGPTState.ERROR or error_texts:
+        return True
+    assistants = tuple(
+        message
+        for message in tuple(getattr(snapshot, "messages", ()) or ())
+        if message.role == "assistant"
+    )
+    latest = assistants[-1].text.casefold() if assistants else ""
+    activity = str(getattr(snapshot, "response_activity_text", "") or "").casefold()
+    return any(
+        marker in latest or marker in activity
+        for marker in _TRANSIENT_RESPONSE_MARKERS
+    )
+
+
+def response_activity_signature(
+    snapshot: ChatGPTSnapshot,
+    baseline: MessageBaseline,
+) -> tuple[str, int]:
+    assistants = new_assistant_turns(snapshot.messages, baseline)
+    latest = assistants[-1] if assistants else None
+    activity_text = str(getattr(snapshot, "response_activity_text", "") or "")
+    activity_structure = str(
+        getattr(snapshot, "response_activity_structure", "") or ""
+    )
+    activity_turn_id = str(
+        getattr(snapshot, "response_activity_turn_id", "") or ""
+    )
+    length = max(
+        len(latest.text) if latest is not None else 0,
+        len(activity_text),
+    )
+    state = getattr(snapshot, "state", ChatGPTState.UNKNOWN)
+    state_value = state.value if isinstance(state, ChatGPTState) else str(state)
+    payload = "\0".join(
+        (
+            message_fingerprint(latest),
+            str(length),
+            activity_turn_id,
+            activity_text,
+            activity_structure,
+            state_value,
+            "1" if bool(getattr(snapshot, "stop_visible", False)) else "0",
+            "\n".join(tuple(getattr(snapshot, "error_texts", ()) or ())),
+            "\n".join(tuple(getattr(snapshot, "blocking_dialogs", ()) or ())),
+        )
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest(), length
+
+
 def looks_incomplete_response(text: str) -> bool:
     value = str(text or "").strip()
     if not value:
+        return True
+    if re.fullmatch(r"(?is)(?:thinking|analyzing|working)(?:\.{3}|…)?", value):
+        return True
+    lowered = value.casefold()
+    if any(marker in lowered for marker in _TRANSIENT_RESPONSE_MARKERS):
         return True
     if value.count("```") % 2 == 1:
         return True
@@ -562,6 +864,12 @@ async def clear_composer(page: Any, timeout_ms: int = 5_000) -> None:
 
 
 async def set_composer_text(page: Any, text: str, timeout_ms: int = 5_000) -> None:
+    await action_delay(
+        page,
+        "composer_fill",
+        action_delay_multiplier("composer_fill"),
+    )
+    await record_page_action(page, "composer_fill", "start", detail=f"{len(text)} chars")
     composer = page.locator(SELECTORS["composer"]).first
     await composer.wait_for(state="visible", timeout=timeout_ms)
     if text:
@@ -575,12 +883,16 @@ async def set_composer_text(page: Any, text: str, timeout_ms: int = 5_000) -> No
             arg=[SELECTORS["composer"], normalize_visible_text(text)],
             timeout=timeout_ms,
         )
+        await record_page_action(page, "composer_fill", "complete", detail=f"{len(text)} chars")
         return
     await clear_composer(page, timeout_ms=timeout_ms)
+    await record_page_action(page, "composer_fill", "complete", detail="cleared")
 
 
 async def open_new_chat(page: Any, timeout_ms: int = 8_000) -> str:
     """Open a new chat using the live DOM, with direct navigation as fallback."""
+    await action_delay(page, "new_chat", NAVIGATION_DELAY_MULTIPLIER)
+    await record_page_action(page, "new_chat", "click")
     clicked = await page.evaluate(
         """selector => {
           const candidates = [...document.querySelectorAll(selector)];
@@ -608,6 +920,7 @@ async def open_new_chat(page: Any, timeout_ms: int = 8_000) -> str:
                 arg=SELECTORS["composer"],
                 timeout=timeout_ms,
             )
+            await record_page_action(page, "new_chat", "complete", detail="dom")
             return "dom"
         except Exception:
             pass
@@ -616,6 +929,7 @@ async def open_new_chat(page: Any, timeout_ms: int = 8_000) -> str:
     await page.locator(SELECTORS["composer"]).first.wait_for(
         state="visible", timeout=timeout_ms
     )
+    await record_page_action(page, "new_chat", "complete", detail="navigate")
     return "navigate"
 
 
@@ -624,6 +938,8 @@ async def refresh_page(page: Any, timeout_ms: int = 15_000) -> None:
 
 
 async def click_send_button(page: Any, timeout_ms: int = 8_000) -> str:
+    await action_delay(page, "send", SEND_DELAY_MULTIPLIER)
+    await record_page_action(page, "send", "click")
     result = await page.evaluate(
         r"""() => {
           const visible = (element) => Boolean(
@@ -670,10 +986,12 @@ async def click_send_button(page: Any, timeout_ms: int = 8_000) -> str:
         }"""
     )
     if not result.get("ok"):
-        raise UnsafePageStateError(
-            f"Send button could not be clicked: {result.get('method') or 'unknown'}"
-        )
-    return str(result.get("method") or "dom_click")
+        method = str(result.get("method") or "unknown")
+        await record_page_action(page, "send", "error", detail=method)
+        raise UnsafePageStateError(f"Send button could not be clicked: {method}")
+    method = str(result.get("method") or "dom_click")
+    await record_page_action(page, "send", "complete", detail=method)
+    return method
 
 
 async def click_safe_choice_prompt(page: Any) -> str:
@@ -731,7 +1049,57 @@ async def send_prompt(
         )
 
 
+def delete_chat_dialog(page: Any) -> Any:
+    """Return the visible ChatGPT delete-conversation dialog locator."""
+    return page.locator('[role="dialog"]').filter(has_text="Delete chat?")
+
+
+async def wait_for_delete_chat_dialog(page: Any, timeout_ms: int = 8_000) -> Any:
+    dialog = delete_chat_dialog(page)
+    await dialog.wait_for(state="visible", timeout=timeout_ms)
+    return dialog
+
+
+async def open_delete_chat_dialog(page: Any, timeout_ms: int = 8_000) -> str:
+    """Open, but never confirm, the current chat deletion dialog."""
+    if extract_session_id(page.url) is None:
+        raise UnsafePageStateError("current page is not a saved ChatGPT conversation")
+    await action_delay(page, "delete_dialog", DIALOG_DELAY_MULTIPLIER)
+    await record_page_action(page, "delete_dialog", "click")
+    await page.bring_to_front()
+    composer = page.locator(SELECTORS["composer"]).first
+    if await composer.is_visible():
+        await composer.click()
+    await page.keyboard.press(SHORTCUTS["delete_chat"])
+    await wait_for_delete_chat_dialog(page, timeout_ms=timeout_ms)
+    await record_page_action(page, "delete_dialog", "complete", detail="keyboard")
+    return "keyboard"
+
+
+async def confirm_delete_chat(page: Any, timeout_ms: int = 15_000) -> str:
+    """Confirm an already-visible delete dialog after a destructive-action delay."""
+    dialog = await wait_for_delete_chat_dialog(page, timeout_ms=timeout_ms)
+    delete_button = dialog.get_by_role("button", name="Delete", exact=True).last
+    await delete_button.wait_for(state="visible", timeout=timeout_ms)
+    await action_delay(page, "delete_confirm", DELETE_DELAY_MULTIPLIER)
+    await record_page_action(page, "delete_confirm", "click")
+    await delete_button.click(timeout=timeout_ms)
+    await page.wait_for_function(
+        "() => !location.pathname.startsWith('/c/')",
+        timeout=timeout_ms,
+    )
+    await record_page_action(page, "delete_confirm", "complete", detail=page.url)
+    return page.url
+
+
+async def delete_current_chat(page: Any, timeout_ms: int = 15_000) -> str:
+    """Open and explicitly confirm deletion of the current saved conversation."""
+    await open_delete_chat_dialog(page, timeout_ms=timeout_ms)
+    return await confirm_delete_chat(page, timeout_ms=timeout_ms)
+
+
 async def stop_response(page: Any, timeout_ms: int = 5_000) -> str:
+    await record_page_action(page, "stop", "click")
     stop = page.locator(SELECTORS["stop"])
     await stop.wait_for(state="visible", timeout=timeout_ms)
     clicked = await page.evaluate(
@@ -753,6 +1121,7 @@ async def stop_response(page: Any, timeout_ms: int = 5_000) -> str:
         arg=SELECTORS["stop"],
         timeout=timeout_ms,
     )
+    await record_page_action(page, "stop", "complete", detail="dom")
     return "dom"
 
 
@@ -821,18 +1190,20 @@ async def assign_page_role(
 
     assigned = await page.evaluate(
         """
-        ([roleKey, pageIdKey, taskIdKey, windowNamePrefix, role, forceNewPageId]) => {
+        ([roleKey, pageIdKey, taskIdKey, teamKey, windowNamePrefix, role, forceNewPageId]) => {
           let pageId = forceNewPageId ? null : sessionStorage.getItem(pageIdKey);
           if (!pageId) {
             pageId = crypto.randomUUID();
             sessionStorage.setItem(pageIdKey, pageId);
           }
           const taskId = sessionStorage.getItem(taskIdKey);
+          const team = sessionStorage.getItem(teamKey);
           sessionStorage.setItem(roleKey, role);
           window.name = windowNamePrefix + JSON.stringify({
             role,
             pageId,
             taskId: taskId || null,
+            team: team || null,
           });
           return {page_id: pageId, page_role: role};
         }
@@ -841,6 +1212,7 @@ async def assign_page_role(
             ROLE_STORAGE_KEY,
             PAGE_ID_STORAGE_KEY,
             TASK_ID_STORAGE_KEY,
+            TEAM_STORAGE_KEY,
             WINDOW_NAME_PREFIX,
             role,
             force_new_page_id,
@@ -857,7 +1229,7 @@ async def assign_page_role(
 async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
     raw = await page.evaluate(
         r"""
-        ([roleKey, pageIdKey, taskIdKey, windowNamePrefix]) => {
+        ([roleKey, pageIdKey, taskIdKey, teamKey, windowNamePrefix]) => {
           const visible = (element) => Boolean(
             element && (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
           );
@@ -959,6 +1331,21 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
               };
             });
 
+          const activeResponse = [...chatRoot.querySelectorAll('[data-streaming-response-status]')]
+            .filter(visible)
+            .at(-1) || null;
+          const responseActivityText = text(activeResponse);
+          const responseActivityStructure = activeResponse
+            ? [...activeResponse.querySelectorAll('[data-testid]')]
+                .filter(visible)
+                .map((element) => element.getAttribute('data-testid') || '')
+                .filter(Boolean)
+                .join('|')
+            : '';
+          const responseActivityTurnId = activeResponse
+            ?.closest('[data-turn-id]')
+            ?.getAttribute('data-turn-id') || null;
+
           const requiresLogin = location.hostname === 'auth.openai.com' || Boolean(login);
           const authCallbackError = location.hostname === 'chatgpt.com' && location.pathname === '/auth/error';
           const alertError = errorTexts.some((value) => /error|failed|issue|try again/i.test(value));
@@ -966,19 +1353,22 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
           let pageRole = null;
           let pageId = null;
           let pageTaskId = null;
+          let pageTeam = null;
           try {
             pageRole = sessionStorage.getItem(roleKey);
             pageId = sessionStorage.getItem(pageIdKey);
             pageTaskId = sessionStorage.getItem(taskIdKey);
+            pageTeam = sessionStorage.getItem(teamKey);
           } catch (_) {
             // Storage can be unavailable on transient auth/error pages.
           }
-          if ((!pageRole || !pageId) && window.name?.startsWith(windowNamePrefix)) {
+          if ((!pageRole || !pageId || !pageTaskId || !pageTeam) && window.name?.startsWith(windowNamePrefix)) {
             try {
               const binding = JSON.parse(window.name.slice(windowNamePrefix.length));
               pageRole = pageRole || binding.role || null;
               pageId = pageId || binding.pageId || null;
               pageTaskId = pageTaskId || binding.taskId || null;
+              pageTeam = pageTeam || binding.team || null;
             } catch (_) {
               // Invalid or unrelated window.name values are ignored.
             }
@@ -989,6 +1379,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             page_role: pageRole,
             page_id: pageId,
             page_task_id: pageTaskId,
+            page_team: pageTeam,
             requires_login: requiresLogin,
             composer_present: Boolean(composer),
             composer_editable: Boolean(
@@ -1006,6 +1397,9 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             choice_prompt_labels: [...new Set(choicePromptLabels)],
             error_present: Boolean(retry || authCallbackError || alertError),
             error_texts: errorTexts,
+            response_activity_text: responseActivityText,
+            response_activity_structure: responseActivityStructure,
+            response_activity_turn_id: responseActivityTurnId,
             messages,
           };
         }
@@ -1014,6 +1408,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             ROLE_STORAGE_KEY,
             PAGE_ID_STORAGE_KEY,
             TASK_ID_STORAGE_KEY,
+            TEAM_STORAGE_KEY,
             WINDOW_NAME_PREFIX,
         ],
     )
@@ -1038,6 +1433,14 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
         page_id=raw.get("page_id"),
         page_role=raw.get("page_role"),
         page_task_id=raw.get("page_task_id"),
+        page_team=raw.get("page_team"),
+        response_activity_text=str(raw.get("response_activity_text") or ""),
+        response_activity_structure=str(raw.get("response_activity_structure") or ""),
+        response_activity_turn_id=(
+            str(raw.get("response_activity_turn_id"))
+            if raw.get("response_activity_turn_id") is not None
+            else None
+        ),
         state=classify_chatgpt_state(raw_for_state),
         requires_login=bool(raw.get("requires_login")),
         composer_present=bool(raw.get("composer_present")),
@@ -1413,6 +1816,124 @@ class ChatGPTPage:
             "requires_new_chat": True,
         }
 
+    async def restore_identity(
+        self,
+        *,
+        page_id: str,
+        role: str,
+        task_id: str,
+        team: str,
+    ) -> ChatGPTSnapshot:
+        """Restore an exact closed-tab identity on its reopened conversation page."""
+        page_id = str(page_id).strip()
+        role = validate_page_role(role)
+        task_id = str(task_id).strip()
+        team = str(team).strip()
+        if not page_id or len(page_id) > 256:
+            raise ValueError("page_id must contain 1-256 characters")
+        if not task_id or len(task_id) > 256:
+            raise ValueError("task_id must contain 1-256 characters")
+        if not _TEAM_PATTERN.fullmatch(team):
+            raise ValueError("team must match [A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+        async with self.mutation_guard():
+            await self.page.evaluate(
+                """([roleKey, pageIdKey, taskIdKey, teamKey, windowNamePrefix,
+                       role, pageId, taskId, team]) => {
+                  sessionStorage.setItem(roleKey, role);
+                  sessionStorage.setItem(pageIdKey, pageId);
+                  sessionStorage.setItem(taskIdKey, taskId);
+                  sessionStorage.setItem(teamKey, team);
+                  window.name = windowNamePrefix + JSON.stringify({
+                    role,
+                    pageId,
+                    taskId,
+                    team,
+                  });
+                }""",
+                [
+                    ROLE_STORAGE_KEY,
+                    PAGE_ID_STORAGE_KEY,
+                    TASK_ID_STORAGE_KEY,
+                    TEAM_STORAGE_KEY,
+                    WINDOW_NAME_PREFIX,
+                    role,
+                    page_id,
+                    task_id,
+                    team,
+                ],
+            )
+            self.binding = PageBinding(page_id, role)
+            await ensure_role_indicator(
+                self.page,
+                expected_role=role,
+                expected_page_id=page_id,
+                expected_task_id=task_id,
+                expected_team=team,
+            )
+            confirmed = await self.assert_ownership()
+            if confirmed.page_task_id != task_id or confirmed.page_team != team:
+                raise TaskBindingError("restored task/team identity did not persist exactly")
+            return confirmed
+
+    async def bind_task_identity(
+        self,
+        task_id: str,
+        team: str,
+        *,
+        timeout_ms: int | None = None,
+    ) -> dict[str, str]:
+        task_id = str(task_id).strip()
+        team = str(team).strip()
+        if not task_id or len(task_id) > 256:
+            raise ValueError("task_id must contain 1-256 characters")
+        if not _TEAM_PATTERN.fullmatch(team):
+            raise ValueError("team must match [A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+        timeout = timeout_ms or self.timeout_ms
+        async with self.mutation_guard():
+            snapshot = await self.assert_ownership()
+            self._assert_interaction_safe(snapshot)
+            await self.page.evaluate(
+                """([taskIdKey, taskId, teamKey, team, windowNamePrefix]) => {
+                  sessionStorage.setItem(taskIdKey, taskId);
+                  sessionStorage.setItem(teamKey, team);
+                  let binding = {};
+                  if (window.name?.startsWith(windowNamePrefix)) {
+                    try {
+                      binding = JSON.parse(window.name.slice(windowNamePrefix.length)) || {};
+                    } catch (_) {
+                      binding = {};
+                    }
+                  }
+                  window.name = windowNamePrefix + JSON.stringify({
+                    role: binding.role || sessionStorage.getItem('playwright-auto:role'),
+                    pageId: binding.pageId || sessionStorage.getItem('playwright-auto:page-id'),
+                    taskId,
+                    team,
+                  });
+                }""",
+                [
+                    TASK_ID_STORAGE_KEY,
+                    task_id,
+                    TEAM_STORAGE_KEY,
+                    team,
+                    WINDOW_NAME_PREFIX,
+                ],
+            )
+            await ensure_role_indicator(
+                self.page,
+                expected_role=self.binding.role if self.binding else None,
+                expected_page_id=self.binding.page_id if self.binding else None,
+                expected_task_id=task_id,
+                expected_team=team,
+            )
+            confirmed = await self.wait_until_clean_ready(
+                timeout_ms=timeout,
+                poll_ms=100,
+            )
+            if confirmed.page_task_id != task_id or confirmed.page_team != team:
+                raise TaskBindingError("task/team binding did not persist exactly")
+            return {"task_id": task_id, "team": team}
+
     async def prepare_task(
         self,
         task_id: str,
@@ -1482,6 +2003,7 @@ class ChatGPTPage:
                     role: binding.role || sessionStorage.getItem('playwright-auto:role'),
                     pageId: binding.pageId || sessionStorage.getItem('playwright-auto:page-id'),
                     taskId: value,
+                    team: binding.team || sessionStorage.getItem('playwright-auto:team') || null,
                   });
                 }""",
                 [TASK_ID_STORAGE_KEY, task_id, WINDOW_NAME_PREFIX],
@@ -1635,6 +2157,7 @@ class ChatGPTPage:
         self,
         *,
         discard_draft: bool = False,
+        expected_draft_text: str | None = None,
         discard_attachments: bool = False,
         stop_first: bool = False,
         timeout_ms: int | None = None,
@@ -1663,7 +2186,15 @@ class ChatGPTPage:
                     "New chat would discard manual/unowned attachments; "
                     "set discard_attachments=True explicitly"
                 )
-            if snapshot.composer_text.strip() and not discard_draft:
+            actual_draft = normalize_visible_text(snapshot.composer_text)
+            if expected_draft_text is not None:
+                expected_draft = normalize_visible_text(expected_draft_text)
+                if actual_draft != expected_draft:
+                    raise ComposerConflictError(
+                        "New chat draft does not match the exact automated prompt provenance"
+                    )
+                discard_draft = True
+            if actual_draft and not discard_draft:
                 raise ComposerConflictError(
                     "New chat would discard a draft; set discard_draft=True explicitly"
                 )
@@ -1676,6 +2207,37 @@ class ChatGPTPage:
                 raise UnsafePageStateError("New chat did not produce an empty composer")
             self._owned_composer_text = None
             return method
+
+    async def open_delete_dialog(self, *, timeout_ms: int | None = None) -> str:
+        timeout = timeout_ms or self.timeout_ms
+        async with self.mutation_guard():
+            snapshot = await self.assert_ownership()
+            if snapshot.stop_visible:
+                raise UnsafePageStateError("response is active; Stop before deleting chat")
+            if snapshot.composer_text.strip() or snapshot.attachment_markers:
+                raise ComposerConflictError(
+                    "deleting this chat would discard manual draft or attachments"
+                )
+            return await open_delete_chat_dialog(self.page, timeout_ms=timeout)
+
+    async def confirm_delete(self, *, timeout_ms: int | None = None) -> str:
+        timeout = timeout_ms or self.timeout_ms
+        async with self.mutation_guard():
+            await self.assert_ownership()
+            return await confirm_delete_chat(self.page, timeout_ms=timeout)
+
+    async def delete_chat(self, *, timeout_ms: int | None = None) -> str:
+        timeout = timeout_ms or self.timeout_ms
+        async with self.mutation_guard():
+            snapshot = await self.assert_ownership()
+            if snapshot.stop_visible:
+                raise UnsafePageStateError("response is active; Stop before deleting chat")
+            if snapshot.composer_text.strip() or snapshot.attachment_markers:
+                raise ComposerConflictError(
+                    "deleting this chat would discard manual draft or attachments"
+                )
+            await open_delete_chat_dialog(self.page, timeout_ms=timeout)
+            return await confirm_delete_chat(self.page, timeout_ms=timeout)
 
     async def refresh(
         self,
@@ -1698,15 +2260,23 @@ class ChatGPTPage:
         prompt: str,
         *,
         timeout_ms: int,
-    ) -> str | None:
+    ) -> tuple[str, MessageSnapshot | None] | None:
         deadline = time.monotonic() + timeout_ms / 1000
+        stop_seen = False
         while time.monotonic() < deadline:
             snapshot = await self.assert_ownership()
-            if exact_prompt_seen(snapshot.messages, baseline, prompt):
-                return "exact_user_message"
-            if snapshot.stop_visible:
-                return "stop_button"
+            candidate = unique_new_user_message(snapshot.messages, baseline)
+            if candidate is not None:
+                signal = (
+                    "exact_user_message"
+                    if normalize_visible_text(candidate.text) == normalize_visible_text(prompt)
+                    else "user_message_identity"
+                )
+                return signal, candidate
+            stop_seen = stop_seen or snapshot.stop_visible
             await asyncio.sleep(0.05)
+        if stop_seen:
+            return "stop_button", None
         return None
 
     async def _prepare_prompt_locked(
@@ -1783,15 +2353,16 @@ class ChatGPTPage:
                     # Fresh exact checks above intentionally precede the real click.
                     await click_send_button(self.page, timeout_ms=timeout)
                     self._owned_composer_text = None
-                    accepted_via = await self._wait_send_acceptance(
+                    acceptance = await self._wait_send_acceptance(
                         baseline,
                         prompt,
                         timeout_ms=min(timeout, 2_000),
                     )
-                    if accepted_via is None:
+                    if acceptance is None:
                         raise SendRecoveryError(
-                            "send click produced no exact user-prompt or stop evidence"
+                            "send click produced no accepted user-message or stop evidence"
                         )
+                    accepted_via, accepted_user = acceptance
                     if wait_for_stop and accepted_via != "stop_button":
                         # A completed very-fast response is also valid if exact provenance exists.
                         snapshot = await self.assert_ownership()
@@ -1807,6 +2378,8 @@ class ChatGPTPage:
                         attempts=attempt,
                         accepted_via=accepted_via,
                         session_id_before=before.session_id,
+                        user_message_id=(accepted_user.message_id if accepted_user else None),
+                        user_turn_id=(accepted_user.turn_id if accepted_user else None),
                     )
                 except (ComposerConflictError, PageOwnershipError):
                     raise
@@ -1816,12 +2389,13 @@ class ChatGPTPage:
                         break
                     await refresh_page(self.page, timeout_ms=timeout)
                     recovered = await self.assert_ownership()
-                    accepted_via = await self._wait_send_acceptance(
+                    acceptance = await self._wait_send_acceptance(
                         baseline,
                         prompt,
                         timeout_ms=min(timeout, 1_500),
                     )
-                    if accepted_via is not None:
+                    if acceptance is not None:
+                        accepted_via, accepted_user = acceptance
                         return SendReceipt(
                             prompt=prompt,
                             prompt_sha256=prompt_digest(prompt),
@@ -1830,6 +2404,8 @@ class ChatGPTPage:
                             attempts=attempt,
                             accepted_via=f"post_reload:{accepted_via}",
                             session_id_before=before.session_id,
+                            user_message_id=(accepted_user.message_id if accepted_user else None),
+                            user_turn_id=(accepted_user.turn_id if accepted_user else None),
                         )
                     recovered_text = normalize_visible_text(recovered.composer_text)
                     if recovered_text not in {"", normalize_visible_text(prompt)}:
@@ -1857,6 +2433,10 @@ class ChatGPTPage:
         reload_wait_ms: int = 750,
         skeptical_after_reload: bool = True,
         resolve_choice_prompt: bool = False,
+        stale_response_baseline: Mapping[str, Any] | None = None,
+        candidate_validator: Callable[[MessageSnapshot], None] | None = None,
+        minimum_samples: int = 1,
+        invalid_grace_ms: int | None = None,
     ) -> MessageSnapshot:
         timeout = timeout_ms or self.timeout_ms
         if self.binding != receipt.binding:
@@ -1865,6 +2445,11 @@ class ChatGPTPage:
             raise ValueError("poll_ms must be positive")
         if stable_ms < 0:
             raise ValueError("stable_ms must not be negative")
+        if minimum_samples < 1:
+            raise ValueError("minimum_samples must be at least one")
+        malformed_grace_ms = stable_ms if invalid_grace_ms is None else invalid_grace_ms
+        if malformed_grace_ms < 0:
+            raise ValueError("invalid_grace_ms must not be negative")
         if active_reload_after_ms is not None and active_reload_after_ms <= 0:
             raise ValueError("active_reload_after_ms must be positive or None")
 
@@ -1872,12 +2457,16 @@ class ChatGPTPage:
         candidate_fingerprint = ""
         candidate_since: float | None = None
         candidate_samples = 0
+        activity_fingerprint = ""
+        activity_since: float | None = None
+        activity_samples = 0
         first_recovered_fingerprint = ""
         active_since: float | None = None
         reload_used = receipt.accepted_via.startswith("post_reload:")
         recovery_suspected = reload_used and skeptical_after_reload
-        saw_unproven_assistant = False
         saw_incomplete_response = False
+        saw_stale_assistant = False
+        recovery_baseline = merge_response_recovery_baselines(stale_response_baseline)
         manual_input_pending = False
         choice_prompt_pending = False
         last_snapshot: ChatGPTSnapshot | None = None
@@ -1893,6 +2482,7 @@ class ChatGPTPage:
                 await asyncio.sleep(poll_ms / 1000)
                 continue
 
+            now = time.monotonic()
             last_snapshot = snapshot
             limited = rate_limit_dialogs(snapshot)
             if limited:
@@ -1901,6 +2491,17 @@ class ChatGPTPage:
                 )
             manual_input_pending = snapshot.manual_input_pending
             choice_prompt_pending = snapshot.choice_prompt_pending
+
+            current_activity, _activity_length = response_activity_signature(
+                snapshot,
+                receipt.baseline,
+            )
+            if current_activity != activity_fingerprint:
+                activity_fingerprint = current_activity
+                activity_since = now
+                activity_samples = 1
+            else:
+                activity_samples += 1
 
             if choice_prompt_pending:
                 if resolve_choice_prompt:
@@ -1914,87 +2515,128 @@ class ChatGPTPage:
                 continue
 
             if manual_input_pending:
-                # User steering wins. Never reload, clear, or accept completion while
-                # manual text/attachments are present in the composer.
                 await asyncio.sleep(poll_ms / 1000)
                 continue
 
+            user_provenance = receipt_user_message_seen(snapshot.messages, receipt)
             assistants = new_assistant_turns(snapshot.messages, receipt.baseline)
-            prompt_seen = exact_prompt_seen(
-                snapshot.messages, receipt.baseline, receipt.prompt
-            )
             candidate = assistants[-1] if assistants else None
             current_fingerprint = message_fingerprint(candidate)
+            transport_ui_active = response_transport_ui_active(snapshot)
 
-            if assistants and not prompt_seen:
-                saw_unproven_assistant = True
+            candidate_present = candidate is not None and user_provenance
+            if candidate_present and response_is_stale(candidate, recovery_baseline):
+                saw_stale_assistant = True
+                candidate_present = False
 
-            if snapshot.stop_visible:
-                candidate_fingerprint = ""
-                candidate_since = None
-                candidate_samples = 0
-                if active_since is None:
-                    active_since = time.monotonic()
-                if (
-                    active_reload_after_ms is not None
-                    and not reload_used
-                    and (time.monotonic() - active_since) * 1000 >= active_reload_after_ms
-                ):
-                    await refresh_page(self.page, timeout_ms=timeout)
-                    await self.assert_ownership()
-                    reload_used = True
-                    recovery_suspected = skeptical_after_reload
-                    if reload_wait_ms:
-                        await asyncio.sleep(reload_wait_ms / 1000)
-                    active_since = None
-                else:
-                    await asyncio.sleep(poll_ms / 1000)
-                continue
-
-            active_since = None
-            eligible = bool(candidate and prompt_seen)
-            if (
-                eligible
-                and candidate is not None
-                and candidate.image_count == 0
-                and looks_incomplete_response(candidate.text)
-            ):
-                saw_incomplete_response = True
-                eligible = False
-
-            if eligible and candidate is not None:
-                fingerprint = current_fingerprint
-                if recovery_suspected and not first_recovered_fingerprint:
-                    first_recovered_fingerprint = fingerprint
-                if fingerprint != candidate_fingerprint:
-                    candidate_fingerprint = fingerprint
-                    candidate_since = time.monotonic()
+            if candidate_present and candidate is not None:
+                if current_fingerprint != candidate_fingerprint:
+                    candidate_fingerprint = current_fingerprint
+                    candidate_since = now
                     candidate_samples = 1
                 else:
                     candidate_samples += 1
 
                 stable_elapsed_ms = (
-                    (time.monotonic() - candidate_since) * 1000
+                    (now - candidate_since) * 1000
                     if candidate_since is not None
                     else 0
                 )
                 time_stable = stable_ms == 0 or stable_elapsed_ms >= stable_ms
-                if recovery_suspected:
-                    # The first complete-looking snapshot after reload is never
-                    # trusted by itself. Accept only after it changes again or is
-                    # observed unchanged on an additional transcript sample.
-                    progressed_after_recovery = (
-                        fingerprint != first_recovered_fingerprint
+                incomplete = (
+                    candidate.image_count == 0
+                    and looks_incomplete_response(candidate.text)
+                )
+                if incomplete:
+                    saw_incomplete_response = True
+                validation_error: BaseException | None = None
+                if not incomplete and candidate_validator is not None:
+                    try:
+                        candidate_validator(candidate)
+                    except Exception as exc:
+                        validation_error = exc
+
+                if candidate_validator is None and minimum_samples == 1:
+                    required_samples = 2 if snapshot.stop_visible else (
+                        1 if stable_ms == 0 else 2
                     )
-                    confirmed = progressed_after_recovery or candidate_samples >= 2
                 else:
-                    confirmed = candidate_samples >= (1 if stable_ms == 0 else 2)
-                if time_stable and confirmed:
+                    required_samples = minimum_samples
+                if recovery_suspected:
+                    if not first_recovered_fingerprint:
+                        first_recovered_fingerprint = current_fingerprint
+                    progressed_after_recovery = (
+                        current_fingerprint != first_recovered_fingerprint
+                    )
+                    confirmed = progressed_after_recovery or candidate_samples >= max(
+                        2,
+                        required_samples,
+                    )
+                else:
+                    confirmed = candidate_samples >= required_samples
+
+                if (
+                    not incomplete
+                    and validation_error is None
+                    and not transport_ui_active
+                    and time_stable
+                    and confirmed
+                ):
                     return candidate
+
+                if (
+                    not incomplete
+                    and validation_error is not None
+                    and not snapshot.stop_visible
+                    and not transport_ui_active
+                ):
+                    activity_elapsed_ms = (
+                        (now - activity_since) * 1000
+                        if activity_since is not None
+                        else 0
+                    )
+                    if (
+                        activity_samples >= 2
+                        and candidate_samples >= 2
+                        and activity_elapsed_ms >= malformed_grace_ms
+                    ):
+                        raise StableMalformedResponseError(candidate, validation_error)
             else:
                 candidate_fingerprint = ""
                 candidate_since = None
                 candidate_samples = 0
+
+            if snapshot.stop_visible:
+                if active_since is None:
+                    active_since = now
+                if (
+                    active_reload_after_ms is not None
+                    and not reload_used
+                    and (now - active_since) * 1000 >= active_reload_after_ms
+                ):
+                    recovery_baseline = merge_response_recovery_baselines(
+                        recovery_baseline,
+                        capture_response_recovery_baseline(
+                            snapshot.messages,
+                            receipt.baseline,
+                        ),
+                    )
+                    await refresh_page(self.page, timeout_ms=timeout)
+                    await self.assert_ownership()
+                    reload_used = True
+                    recovery_suspected = skeptical_after_reload
+                    candidate_fingerprint = ""
+                    candidate_since = None
+                    candidate_samples = 0
+                    activity_fingerprint = ""
+                    activity_since = None
+                    activity_samples = 0
+                    if reload_wait_ms:
+                        await asyncio.sleep(reload_wait_ms / 1000)
+                    active_since = None
+                    continue
+            else:
+                active_since = None
 
             await asyncio.sleep(poll_ms / 1000)
 
@@ -2011,12 +2653,12 @@ class ChatGPTPage:
             raise TimeoutError(
                 f"assistant response remained active after {timeout} ms"
             )
-        if saw_unproven_assistant:
-            raise SendRecoveryError(
-                "assistant output appeared without the exact new user prompt; stale response rejected"
+        if saw_stale_assistant:
+            raise IncompleteResponseTimeoutError(
+                "only pre-refresh assistant output remained; stale response rejected"
             )
         if saw_incomplete_response:
-            raise SendRecoveryError(
+            raise IncompleteResponseTimeoutError(
                 "assistant output never stabilized as a structurally complete response"
             )
         if last_error is not None:
@@ -2025,7 +2667,7 @@ class ChatGPTPage:
                 f"{type(last_error).__name__}: {last_error}"
             ) from last_error
         raise TimeoutError(
-            f"no exact-provenance assistant response within {timeout} ms"
+            f"no accepted-user-identity assistant response within {timeout} ms"
         )
 
     async def stop(self, *, timeout_ms: int | None = None) -> str:

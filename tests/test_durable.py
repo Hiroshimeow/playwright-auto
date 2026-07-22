@@ -23,7 +23,7 @@ from playwright_auto.durable import (
 )
 from playwright_auto.durable_blocks import DurableSendBlock
 from playwright_auto.upload import UploadReceipt, collect_file_identities
-from playwright_auto.workflow import Workflow
+from playwright_auto.workflow import Workflow, WorkflowContext
 
 
 def snapshot(
@@ -121,8 +121,10 @@ class FakeDurableClient:
             binding=self.binding,
             baseline=baseline,
             attempts=1,
-            accepted_via="exact_user_message",
+            accepted_via="user_message_identity",
             session_id_before="session-1",
+            user_message_id="u1",
+            user_turn_id="t1",
         )
 
     async def wait_for_response(self, receipt, **options):
@@ -154,6 +156,41 @@ def test_ledger_begin_is_stable_for_same_normalized_request(tmp_path):
     assert ledger.get(first.request_id) == first
 
 
+def test_ledger_can_keep_request_marker_internal(tmp_path):
+    ledger = RequestLedger(tmp_path / "ledger.json")
+
+    record = ledger.begin(
+        role="DEV",
+        prompt="hello",
+        request_id="agent-request-internal",
+        render_request_marker=False,
+    )
+
+    assert record.marker == "ROLE_REQUEST_ID: agent-request-internal"
+    assert record.rendered_prompt == "hello"
+    assert record.marker not in record.rendered_prompt
+    assert ledger.begin(
+        role="DEV",
+        prompt="hello",
+        request_id="agent-request-internal",
+        render_request_marker=True,
+    ) == record
+
+
+def test_ledger_accepts_stable_explicit_request_id(tmp_path):
+    ledger = RequestLedger(tmp_path / "ledger.json")
+
+    first = ledger.begin(role="DEV", prompt="hello", request_id="agent-request-1")
+    second = ledger.begin(role="DEV", prompt="hello", request_id="agent-request-1")
+
+    assert first.request_id == "agent-request-1"
+    assert second == first
+    assert "ROLE_REQUEST_ID: agent-request-1" in first.rendered_prompt
+
+    with pytest.raises(DurableRequestError, match="already belongs"):
+        ledger.begin(role="DEV", prompt="different", request_id="agent-request-1")
+
+
 def test_file_content_changes_idempotency_key(tmp_path):
     path = tmp_path / "input.txt"
     path.write_text("one", encoding="utf-8")
@@ -176,6 +213,145 @@ def test_ledger_rejects_invalid_state_transition(tmp_path):
 
     with pytest.raises(DurableRequestError, match="invalid durable transition"):
         ledger.update(record.request_id, status=RequestStatus.COMPLETED)
+
+
+def test_markerless_recovery_uses_exact_new_user_prompt_and_never_resends(tmp_path):
+    ledger = RequestLedger(tmp_path / "ledger.json")
+    record = ledger.begin(
+        role="DEV",
+        prompt="markerless task",
+        render_request_marker=False,
+    )
+    old_user = MessageSnapshot("user", "old-u", "old-t", "older prompt", ())
+    baseline = capture_message_baseline((old_user,))
+    record = ledger.update(
+        record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=PageBinding("page-1", "DEV"),
+        baseline=baseline,
+    )
+
+    accepted = snapshot(
+        messages=(
+            old_user,
+            MessageSnapshot("user", "new-u", "new-t", "markerless task", ()),
+        ),
+        state=ChatGPTState.SUBMITTING,
+    )
+    assert classify_recovery_state(record, accepted) is DurableRecoveryState.SENT_WAITING_RESPONSE
+    assert classify_recovery_state(record, snapshot(messages=(old_user,))) is DurableRecoveryState.SENT_MARKER_MISSING
+
+
+def test_markerless_collapsed_transcript_upgrades_receipt_without_resend(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    ledger = RequestLedger(ledger_path)
+    prompt = "x" * 5262
+    record = ledger.begin(
+        role="DEV",
+        prompt=prompt,
+        request_id="collapsed-hop",
+        render_request_marker=False,
+    )
+    baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=PageBinding("page-1", "DEV"),
+        baseline=baseline,
+        session_id_before="session-1",
+    )
+    client = FakeDurableClient(
+        snapshot(
+            messages=(MessageSnapshot("user", "u-long", "t-long", "x" * 5080 + " Show more", ()),),
+            state=ChatGPTState.SUBMITTING,
+        )
+    )
+
+    result = run_block(
+        DurableSendBlock(
+            prompt,
+            ledger_path=ledger_path,
+            request_id="collapsed-hop",
+            render_request_marker=False,
+            wait_for_response=False,
+        ),
+        client,
+    )
+
+    assert client.send_calls == []
+    receipt = result.context.results["durable_send"]["receipt"]
+    assert receipt["user_message_id"] == "u-long"
+    assert receipt["user_turn_id"] == "t-long"
+    assert RequestLedger(ledger_path).get(record.request_id).receipt == receipt
+
+
+def test_markerless_send_without_user_identity_stays_sending(tmp_path):
+    class IdentitylessClient(FakeDurableClient):
+        async def send(self, *args, **kwargs):
+            receipt = await super().send(*args, **kwargs)
+            return SendReceipt(
+                prompt=receipt.prompt,
+                prompt_sha256=receipt.prompt_sha256,
+                binding=receipt.binding,
+                baseline=receipt.baseline,
+                attempts=receipt.attempts,
+                accepted_via="stop_button",
+                session_id_before=receipt.session_id_before,
+            )
+
+    ledger_path = tmp_path / "ledger.json"
+    block = DurableSendBlock(
+        "markerless prompt",
+        ledger_path=ledger_path,
+        request_id="identityless-markerless",
+        render_request_marker=False,
+        wait_for_response=False,
+    )
+
+    with pytest.raises(DurableRequestError, match="accepted user-message identity"):
+        asyncio.run(block.run(WorkflowContext(IdentitylessClient())))
+
+    record = RequestLedger(ledger_path).get("identityless-markerless")
+    assert record is not None
+    assert record.status is RequestStatus.SENDING
+    assert record.receipt is None
+    assert record.attempts == 1
+
+
+def test_persisted_receipt_recovers_without_transcript_rendering(tmp_path):
+    ledger = RequestLedger(tmp_path / "ledger.json")
+    record = ledger.begin(
+        role="DEV",
+        prompt="markerless accepted",
+        render_request_marker=False,
+    )
+    baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
+    receipt = SendReceipt(
+        prompt="markerless accepted",
+        prompt_sha256=prompt_digest("markerless accepted"),
+        binding=PageBinding("page-1", "DEV"),
+        baseline=baseline,
+        attempts=1,
+        accepted_via="stop_button",
+        session_id_before="session-1",
+    )
+    record = ledger.update(
+        record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=receipt.binding,
+        baseline=baseline,
+        session_id_before="session-1",
+    )
+    record = ledger.update(
+        record.request_id,
+        status=RequestStatus.SENT,
+        receipt=receipt.to_dict(),
+    )
+
+    assert classify_recovery_state(record, snapshot()) is DurableRecoveryState.SENT_WAITING_RESPONSE
 
 
 def test_recovery_classifier_never_resends_after_send_boundary(tmp_path):
@@ -204,6 +380,137 @@ def test_recovery_classifier_never_resends_after_send_boundary(tmp_path):
     assert (
         classify_recovery_state(record, transcript)
         is DurableRecoveryState.SENT_WAITING_RESPONSE
+    )
+
+
+def test_markerless_durable_send_recovers_exact_transcript_without_resend(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(
+        role="DEV",
+        prompt="markerless resume",
+        request_id="markerless-hop-1",
+        render_request_marker=False,
+    )
+    baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=PageBinding("page-1", "DEV"),
+        baseline=baseline,
+        session_id_before="session-1",
+    )
+    client = FakeDurableClient(
+        snapshot(
+            messages=(
+                MessageSnapshot("user", "u1", "t1", "markerless resume", ()),
+            ),
+            state=ChatGPTState.SUBMITTING,
+        )
+    )
+
+    result = run_block(
+        DurableSendBlock(
+            "markerless resume",
+            ledger_path=ledger_path,
+            request_id="markerless-hop-1",
+            render_request_marker=False,
+            wait_for_response=False,
+        ),
+        client,
+    )
+
+    assert client.send_calls == []
+    assert result.context.results["durable_send"]["receipt"]["prompt"] == "markerless resume"
+    assert RequestLedger(ledger_path).get(record.request_id).status is RequestStatus.SENT
+
+
+def test_markerless_durable_send_uses_persisted_receipt_without_resend(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(
+        role="DEV",
+        prompt="markerless persisted",
+        request_id="markerless-hop-2",
+        render_request_marker=False,
+    )
+    baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
+    receipt = SendReceipt(
+        prompt="markerless persisted",
+        prompt_sha256=prompt_digest("markerless persisted"),
+        binding=PageBinding("page-1", "DEV"),
+        baseline=baseline,
+        attempts=1,
+        accepted_via="stop_button",
+        session_id_before="session-1",
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=receipt.binding,
+        baseline=baseline,
+        session_id_before="session-1",
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENT,
+        receipt=receipt.to_dict(),
+    )
+    client = FakeDurableClient(snapshot())
+
+    result = run_block(
+        DurableSendBlock(
+            "markerless persisted",
+            ledger_path=ledger_path,
+            request_id="markerless-hop-2",
+            render_request_marker=False,
+            wait_for_response=False,
+        ),
+        client,
+    )
+
+    assert client.send_calls == []
+    assert result.context.results["durable_send"]["receipt"] == receipt.to_dict()
+
+
+def test_durable_send_uses_explicit_request_id(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    client = FakeDurableClient()
+
+    result = run_block(
+        DurableSendBlock(
+            "perform durable task",
+            ledger_path=ledger_path,
+            request_id="agent-hop-1",
+            stable_ms=0,
+        ),
+        client,
+    )
+
+    assert result.context.variables["durable_request"].request_id == "agent-hop-1"
+    assert "ROLE_REQUEST_ID: agent-hop-1" in client.send_calls[0][0]
+
+
+def test_durable_send_persists_first_acceptance_timestamp(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    client = FakeDurableClient()
+
+    result = run_block(
+        DurableSendBlock(
+            "accepted task",
+            ledger_path=ledger_path,
+            wait_for_response=False,
+        ),
+        client,
+    )
+
+    record = result.context.results["durable_send"]["record"]
+    assert record["status"] == "sent"
+    assert record["created_at"] <= record["accepted_at"] <= record["updated_at"]
+    assert RequestLedger(ledger_path).get(record["request_id"]).accepted_at == (
+        record["accepted_at"]
     )
 
 
@@ -270,9 +577,9 @@ def test_crash_resume_with_transcript_marker_waits_without_resend(tmp_path):
     assert result.context.results["durable_send"]["response"]["text"] == (
         "durable answer"
     )
-    assert RequestLedger(ledger_path).get(record.request_id).status is (
-        RequestStatus.COMPLETED
-    )
+    stored = RequestLedger(ledger_path).get(record.request_id)
+    assert stored.status is RequestStatus.COMPLETED
+    assert stored.accepted_at is not None
 
 
 def test_sending_without_marker_fails_closed_and_never_resends(tmp_path):

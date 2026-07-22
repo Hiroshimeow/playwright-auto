@@ -9,6 +9,9 @@ dependencies = ["playwright>=1.52,<2"]
 playwright-auto = "playwright_auto.cli:main"
 playwright-team = "playwright_auto.team_cli:main"
 playwright-role-ui = "playwright_auto.role_ui_daemon:main"
+playwright-dashboard = "playwright_auto.dashboard:main"
+cdpa = "playwright_auto.cdpa_cli:main"
+cdpa-worker = "playwright_auto.cdpa_worker:main"
 playwright-roles = "playwright_auto.role_cli:main"
 
 [dependency-groups]
