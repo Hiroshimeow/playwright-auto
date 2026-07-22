@@ -56,26 +56,86 @@ The virtual display is a separate PM2 service, so restarting Selkies does not re
 
 ### Windows with an existing CDP browser
 
-The PM2/Xvfb/Selkies stack above is Linux-only. On Windows, point the tools at a Chrome
-instance already running with loopback CDP on port 9222:
+The PM2/Xvfb/Selkies stack above is Linux-only. The Python CDPA dashboard, worker, and CLI
+use cross-platform package entry points and do not require Bash or PM2. These steps assume
+Chrome or Chromium is already running with loopback CDP on port `9222` and ChatGPT is already logged in in that browser profile.
+
+Clone and prepare the repository once:
 
 ```powershell
+git clone --branch develop https://github.com/Hiroshimeow/playwright-auto.git
+cd playwright-auto
 uv sync --frozen
 Invoke-RestMethod http://127.0.0.1:9222/json/version
-uv run playwright-roles --list
 ```
 
-Do not run `uv pip install fcntl`; `fcntl` is a Unix standard-library module, not a PyPI
-package. The durable ledger uses `msvcrt` locks on Windows and `fcntl` locks on Unix.
+The last command must return browser/version information. If it cannot connect, do not
+start CDPA yet; fix the browser's `--remote-debugging-port=9222` launch first.
 
-To keep the visible `SET ROLE` control injected across reloads, leave this running in a
-separate PowerShell window:
+Keep the following two processes running in separate PowerShell windows.
+
+**PowerShell 1 — CDPA dashboard/UI on port 9224:**
 
 ```powershell
+cd <path-to>\playwright-auto
+uv run playwright-dashboard `
+  --host 127.0.0.1 `
+  --port 9224 `
+  --cdp http://127.0.0.1:9222 `
+  --config cdpa.yaml
+```
+
+**PowerShell 2 — persistent CDPA worker:**
+
+```powershell
+cd <path-to>\playwright-auto
+uv run cdpa-worker --repository . --config cdpa.yaml
+```
+
+Open and verify the UI from a third PowerShell window:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:9224/health
+Start-Process http://127.0.0.1:9224/
+```
+
+The health response must report `ok`, `task_store_ready`, and `cdp_connected` as `true`.
+Create a task either from the **Create** dialog in the dashboard or from PowerShell:
+
+```powershell
+cd <path-to>\playwright-auto
+uv run cdpa `
+  "Implement and verify the requested behavior" `
+  --repository . `
+  --config cdpa.yaml
+```
+
+The CLI returns after writing the durable task. Leave the dashboard and worker windows
+running; the worker attaches to the existing `9222` browser, creates/reuses ChatGPT tabs,
+and advances the PLAN/DEV/TEST/REVIEW/AUDIT route. Progress, reports, Pause, Resume, Stop,
+Retry, New Chat, Route PLAN, and Clear Team are available at `http://127.0.0.1:9224/`.
+Task manifests and reports are stored under `.plan/` and survive process restarts.
+
+Useful commands:
+
+```powershell
+# Resume one exact existing nonterminal team without creating another task
+uv run cdpa --team <exact-team-name> --repository . --config cdpa.yaml
+
+# Inspect currently open ChatGPT tabs and their role ownership
+uv run playwright-roles --list
+
+# Optional: keep the visible SET ROLE control injected across reloads
 uv run playwright-role-ui
 ```
 
-Use `uv run playwright-role-ui --once` when one-time injection is sufficient.
+Press `Ctrl+C` in the dashboard or worker window to stop that process. Stopping either
+process does not close the already-running Chrome instance. Use `--host 0.0.0.0` only when
+the dashboard must be reached from another trusted machine, and restrict port `9224` with
+the Windows firewall or a private network.
+
+Do not run `uv pip install fcntl`; `fcntl` is a Unix standard-library module, not a PyPI
+package. The durable ledger uses `msvcrt` locks on Windows and `fcntl` locks on Unix.
 
 ## Run a multi-role task
 
