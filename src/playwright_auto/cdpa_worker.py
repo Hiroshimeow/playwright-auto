@@ -1594,7 +1594,7 @@ async def _run(config: CDPAConfig) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the persistent CDPA task worker")
-    parser.add_argument("--config", default="cdpa.yaml")
+    parser.add_argument("--config", default=None)
     parser.add_argument("--repository", default=".")
     args = parser.parse_args(argv)
     try:

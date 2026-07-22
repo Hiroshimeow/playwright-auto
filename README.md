@@ -54,88 +54,83 @@ Selkies v1.6.2 is unpacked user-locally at `~/.local/opt/selkies-gstreamer`. The
 
 The virtual display is a separate PM2 service, so restarting Selkies does not restart Chrome or affect its profile.
 
-### Windows with an existing CDP browser
+### Windows: install `cdpa` once and use it anywhere
 
-The PM2/Xvfb/Selkies stack above is Linux-only. The Python CDPA dashboard, worker, and CLI
-use cross-platform package entry points and do not require Bash or PM2. These steps assume
-Chrome or Chromium is already running with loopback CDP on port `9222` and ChatGPT is already logged in in that browser profile.
+The PM2/Xvfb/Selkies stack above is Linux-only. On Windows, only the global `cdpa`
+command is required. These steps assume Chrome or Chromium is already running with
+loopback CDP on port `9222` and ChatGPT is logged in in that browser profile.
 
-Clone and prepare the repository once:
+Install the command once from PowerShell:
 
 ```powershell
-git clone --branch develop https://github.com/Hiroshimeow/playwright-auto.git
-cd playwright-auto
-uv sync --frozen
+uv tool install --force "git+https://github.com/Hiroshimeow/playwright-auto.git@develop"
+uv tool update-shell
+```
+
+Open a new PowerShell window after `uv tool update-shell`. There is no need to clone or
+enter the `playwright-auto` repository, and no local `cdpa.yaml` is required. The installed
+package contains the default CDPA configuration, role constructors, dashboard HTML, worker,
+and CLI.
+
+From the repository that CDPA should modify, run only:
+
+```powershell
+cd E:\python_project\target-repository
+cdpa
+```
+
+`cdpa` starts the dashboard and persistent worker for the current directory, opens
+`http://127.0.0.1:9224/`, and remains in the foreground. Keep that PowerShell window open.
+Press `Ctrl+C` to stop the dashboard and worker; the existing Chrome process on port `9222`
+remains open.
+
+Submit tasks from another PowerShell window:
+
+```powershell
+cd E:\python_project\target-repository
+cdpa "Implement and verify the requested behavior"
+```
+
+The current directory is the default target repository, as with Codex or Gemini CLI. To run
+from any other directory, pass the target explicitly:
+
+```powershell
+cdpa start --repository E:\python_project\target-repository
+cdpa "Implement and verify the requested behavior" `
+  --repository E:\python_project\target-repository
+cdpa ui --repository E:\python_project\target-repository
+```
+
+Common commands:
+
+```powershell
+# Start dashboard + worker and open the UI. `cdpa` alone does the same thing.
+cdpa start
+
+# Reopen the UI when the runtime is already running.
+cdpa ui
+
+# Resume one exact existing nonterminal team.
+cdpa --team <exact-team-name>
+
+# Use a repository-specific override when needed.
+cdpa start --config E:\path\to\custom-cdpa.yaml
+```
+
+A `cdpa.yaml` in the target repository automatically overrides the packaged defaults.
+Task manifests and reports remain inside the target repository under `.plan/`. One runtime
+uses port `9224` and is bound to one repository at a time; stop it with `Ctrl+C` before
+starting CDPA for another repository.
+
+The following command is optional troubleshooting only. It checks whether the existing
+browser exposes CDP; it does not configure or start CDPA:
+
+```powershell
 Invoke-RestMethod http://127.0.0.1:9222/json/version
 ```
 
-The last command must return browser/version information. If it cannot connect, do not
-start CDPA yet; fix the browser's `--remote-debugging-port=9222` launch first.
-
-Keep the following two processes running in separate PowerShell windows.
-
-**PowerShell 1 — CDPA dashboard/UI on port 9224:**
-
-```powershell
-cd <path-to>\playwright-auto
-uv run playwright-dashboard `
-  --host 127.0.0.1 `
-  --port 9224 `
-  --cdp http://127.0.0.1:9222 `
-  --config cdpa.yaml
-```
-
-**PowerShell 2 — persistent CDPA worker:**
-
-```powershell
-cd <path-to>\playwright-auto
-uv run cdpa-worker --repository . --config cdpa.yaml
-```
-
-Open and verify the UI from a third PowerShell window:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:9224/health
-Start-Process http://127.0.0.1:9224/
-```
-
-The health response must report `ok`, `task_store_ready`, and `cdp_connected` as `true`.
-Create a task either from the **Create** dialog in the dashboard or from PowerShell:
-
-```powershell
-cd <path-to>\playwright-auto
-uv run cdpa `
-  "Implement and verify the requested behavior" `
-  --repository . `
-  --config cdpa.yaml
-```
-
-The CLI returns after writing the durable task. Leave the dashboard and worker windows
-running; the worker attaches to the existing `9222` browser, creates/reuses ChatGPT tabs,
-and advances the PLAN/DEV/TEST/REVIEW/AUDIT route. Progress, reports, Pause, Resume, Stop,
-Retry, New Chat, Route PLAN, and Clear Team are available at `http://127.0.0.1:9224/`.
-Task manifests and reports are stored under `.plan/` and survive process restarts.
-
-Useful commands:
-
-```powershell
-# Resume one exact existing nonterminal team without creating another task
-uv run cdpa --team <exact-team-name> --repository . --config cdpa.yaml
-
-# Inspect currently open ChatGPT tabs and their role ownership
-uv run playwright-roles --list
-
-# Optional: keep the visible SET ROLE control injected across reloads
-uv run playwright-role-ui
-```
-
-Press `Ctrl+C` in the dashboard or worker window to stop that process. Stopping either
-process does not close the already-running Chrome instance. Use `--host 0.0.0.0` only when
-the dashboard must be reached from another trusted machine, and restrict port `9224` with
-the Windows firewall or a private network.
-
-Do not run `uv pip install fcntl`; `fcntl` is a Unix standard-library module, not a PyPI
-package. The durable ledger uses `msvcrt` locks on Windows and `fcntl` locks on Unix.
+Keep port `9224` on loopback unless a separately reviewed launcher and firewall policy
+are added. Do not install `fcntl`; the durable ledger uses Windows `msvcrt` file locks.
 
 ## Run a multi-role task
 

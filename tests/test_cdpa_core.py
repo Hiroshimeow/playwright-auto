@@ -51,6 +51,16 @@ def write_config(root: Path) -> Path:
     return path
 
 
+def test_packaged_default_config_targets_current_repository_without_local_config(tmp_path: Path):
+    config = load_cdpa_config(None, repository_root=tmp_path)
+
+    assert config.repository_root == tmp_path.resolve()
+    assert config.plans_root == (tmp_path / ".plan").resolve()
+    assert config.config_path.name == "cdpa.json"
+    assert all(path.is_file() for path in config.constructor_paths.values())
+    assert config.response_guide_path.is_file()
+
+
 def test_config_loads_root_json_compatible_yaml_and_validates_defaults(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     assert config.plans_root == (tmp_path / ".plan").resolve()

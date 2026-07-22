@@ -9,6 +9,8 @@ from urllib.parse import urlparse
 from .connection import validate_cdp_url
 
 CDPA_ROLES = ("PLAN", "DEV", "REVIEW", "TEST", "AUDIT")
+DEFAULTS_ROOT = Path(__file__).with_name("cdpa_defaults")
+DEFAULT_CONFIG_PATH = DEFAULTS_ROOT / "cdpa.json"
 CDPA_DELAY_ACTIONS = frozenset(
     {
         "composer_fill",
@@ -77,18 +79,20 @@ class CDPAConfig:
 
 
 def load_cdpa_config(
-    path: str | Path = "cdpa.yaml",
+    path: str | Path | None = None,
     *,
     repository_root: str | Path | None = None,
 ) -> CDPAConfig:
-    config_path = Path(path).expanduser()
-    if repository_root is None:
-        root = (config_path.parent if config_path.is_absolute() else Path.cwd()).resolve()
+    root = Path(repository_root or Path.cwd()).expanduser().resolve()
+    if path is None:
+        local_config = root / "cdpa.yaml"
+        config_path = local_config if local_config.is_file() else DEFAULT_CONFIG_PATH
     else:
-        root = Path(repository_root).expanduser().resolve()
-    if not config_path.is_absolute():
-        config_path = root / config_path
+        config_path = Path(path).expanduser()
+        if not config_path.is_absolute():
+            config_path = root / config_path
     config_path = config_path.resolve()
+    asset_root = DEFAULTS_ROOT.resolve() if config_path == DEFAULT_CONFIG_PATH.resolve() else root
     try:
         raw = json.loads(config_path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
@@ -108,13 +112,13 @@ def load_cdpa_config(
     if roles != CDPA_ROLES:
         raise CDPAConfigError(f"roles must be exactly {list(CDPA_ROLES)!r}")
     constructor_paths = {
-        role: _resolve(root, constructors.get(role), f"paths.constructors.{role}")
+        role: _resolve(asset_root, constructors.get(role), f"paths.constructors.{role}")
         for role in roles
     }
     for role, constructor in constructor_paths.items():
         if not constructor.is_file():
             raise CDPAConfigError(f"constructor prompt for {role} does not exist: {constructor}")
-    guide = _resolve(root, paths.get("response_guide"), "paths.response_guide")
+    guide = _resolve(asset_root, paths.get("response_guide"), "paths.response_guide")
     if not guide.is_file():
         raise CDPAConfigError(f"response guide does not exist: {guide}")
 

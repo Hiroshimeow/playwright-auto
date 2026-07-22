@@ -726,7 +726,7 @@ def main() -> int:
     parser.add_argument("--event-log", default=".runtime/action-events.jsonl")
     parser.add_argument("--poll", type=float, default=None)
     parser.add_argument("--reconnect", type=float, default=2.0)
-    parser.add_argument("--config", default="cdpa.yaml")
+    parser.add_argument("--config", default=None)
     args = parser.parse_args()
     try:
         config = load_cdpa_config(args.config, repository_root=Path.cwd())
