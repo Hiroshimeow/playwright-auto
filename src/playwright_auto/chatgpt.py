@@ -1891,9 +1891,54 @@ class ChatGPTPage:
         timeout = timeout_ms or self.timeout_ms
         async with self.mutation_guard():
             snapshot = await self.assert_ownership()
+            if snapshot.manual_input_pending:
+                raise ComposerConflictError(
+                    "task/team binding blocked by manual draft or attachments"
+                )
             self._assert_interaction_safe(snapshot)
-            await self.page.evaluate(
+            write_result = await self.page.evaluate(
                 """([taskIdKey, taskId, teamKey, team, windowNamePrefix]) => {
+                  const visible = (element) => Boolean(
+                    element && (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
+                  );
+                  const firstVisible = (selector) =>
+                    [...document.querySelectorAll(selector)].find(visible) || null;
+                  const composer = firstVisible('[contenteditable="true"][role="textbox"]');
+                  if (!composer || composer.getAttribute('contenteditable') !== 'true' ||
+                      composer.getAttribute('aria-disabled') === 'true') {
+                    return {written: false, reason: 'composer_unavailable'};
+                  }
+                  if (firstVisible('button[data-testid="stop-button"], button[aria-label*="Stop"]')) {
+                    return {written: false, reason: 'active_response'};
+                  }
+                  if (firstVisible('[role="dialog"], [data-testid^="modal-"]')) {
+                    return {written: false, reason: 'blocking_dialog'};
+                  }
+                  const errorTexts = [...document.querySelectorAll('[role="alert"]')]
+                    .filter(visible)
+                    .map((element) => element.innerText || '')
+                    .filter((value) => /error|failed|issue|try again/i.test(value));
+                  if (firstVisible('[data-testid="regenerate-thread-error-button"]') || errorTexts.length) {
+                    return {written: false, reason: 'error_state'};
+                  }
+                  const composerHost = composer.closest('form') || composer.parentElement;
+                  const attachment = composerHost && [...composerHost.querySelectorAll(
+                    '[data-testid*="attachment"], [data-testid*="file"], button[aria-label], [role="button"][aria-label]'
+                  )].filter(visible).some((element) => {
+                    const label = [
+                      element.innerText || '',
+                      element.getAttribute?.('aria-label') || '',
+                      element.getAttribute?.('data-testid') || '',
+                    ].join(' ').toLowerCase();
+                    return label && !label.includes('composer-plus-btn') &&
+                      !label.includes('add files and more') && [
+                        'remove file', 'open image', 'attached', 'file uploaded',
+                        'uploading', 'remove attachment'
+                      ].some((marker) => label.includes(marker));
+                  });
+                  if ((composer.innerText || '').trim() || attachment) {
+                    return {written: false, reason: 'manual_input_pending'};
+                  }
                   sessionStorage.setItem(taskIdKey, taskId);
                   sessionStorage.setItem(teamKey, team);
                   let binding = {};
@@ -1910,6 +1955,7 @@ class ChatGPTPage:
                     taskId,
                     team,
                   });
+                  return {written: true};
                 }""",
                 [
                     TASK_ID_STORAGE_KEY,
@@ -1919,6 +1965,21 @@ class ChatGPTPage:
                     WINDOW_NAME_PREFIX,
                 ],
             )
+            reason = str((write_result or {}).get("reason") or "")
+            if reason == "manual_input_pending":
+                raise ComposerConflictError(
+                    "task/team binding blocked by manual draft or attachments"
+                )
+            if reason == "active_response":
+                raise UnsafePageStateError("page is already responding")
+            if reason == "blocking_dialog":
+                raise UnsafePageStateError("blocking dialog is open")
+            if reason == "error_state":
+                raise UnsafePageStateError("page is in error state")
+            if reason == "composer_unavailable":
+                raise UnsafePageStateError("composer is not present and editable")
+            if not bool((write_result or {}).get("written")):
+                raise TaskBindingError("task/team binding was not written")
             await ensure_role_indicator(
                 self.page,
                 expected_role=self.binding.role if self.binding else None,

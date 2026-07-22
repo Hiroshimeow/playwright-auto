@@ -85,6 +85,7 @@ class DummyPage:
         self.current = current
         self.clicks = 0
         self.raise_click = False
+        self.before_task_bind = None
 
     def locator(self, _selector):
         return DummyLocator(self)
@@ -102,9 +103,13 @@ class DummyPage:
         if isinstance(arg, list) and len(arg) >= 2 and arg[0] == chatgpt.TASK_ID_STORAGE_KEY:
             changes = {"page_task_id": str(arg[1])}
             if len(arg) >= 4 and arg[2] == chatgpt.TEAM_STORAGE_KEY:
+                if self.before_task_bind is not None:
+                    self.before_task_bind()
+                if self.current.manual_input_pending:
+                    return {"written": False, "reason": "manual_input_pending"}
                 changes["page_team"] = str(arg[3])
             self.current = replace(self.current, **changes)
-            return None
+            return {"written": True}
         return None
 
 
@@ -434,6 +439,35 @@ def test_bind_task_identity_persists_task_and_team_without_navigation(monkeypatc
     assert result == {"task_id": "TASK-1", "team": "alpha2"}
     assert page.current.page_task_id == "TASK-1"
     assert page.current.page_team == "alpha2"
+
+
+def test_bind_task_identity_rejects_draft_inserted_at_write_without_mutation(monkeypatch):
+    page = DummyPage(snapshot(task_id="TASK-OLD", team="old-team"))
+    client = ChatGPTPage(page, timeout_ms=1)
+    client.binding = PageBinding("page-1", "DEV")
+
+    async def fake_inspect(_page):
+        return page.current
+
+    def insert_draft_at_identity_write():
+        page.current = replace(
+            page.current,
+            composer_text="manual draft",
+            state=ChatGPTState.DRAFT,
+        )
+
+    monkeypatch.setattr(chatgpt, "inspect_chatgpt_page", fake_inspect)
+
+    preflight = asyncio.run(client.task_preflight("TASK-NEW"))
+    assert preflight["requires_new_chat"] is True
+    page.before_task_bind = insert_draft_at_identity_write
+
+    with pytest.raises(ComposerConflictError, match="manual draft"):
+        asyncio.run(client.bind_task_identity("TASK-NEW", "new-team"))
+
+    assert page.current.page_task_id == "TASK-OLD"
+    assert page.current.page_team == "old-team"
+    assert page.current.composer_text == "manual draft"
 
 
 def test_prepare_task_reuses_same_task_without_new_chat(monkeypatch):

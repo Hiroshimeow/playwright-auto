@@ -18,6 +18,7 @@ Reusable lessons for CDPA teams. Read before starting a task. Add only evidence-
 - Preserve the persistent Chromium process and profile. Attach/detach through CDP; never call `browser.close()`.
 - Stop is an urgent action and must not receive artificial human delay. Visible non-urgent actions may use the shared delay policy.
 - Controlled reopen or restart must fail closed when the composer contains manual text or attachments; recovery must never discard user input to reclaim a role tab.
+- A Python-side snapshot and mutation lock are not atomic against user or DOM events between browser round trips. When live page safety gates a durable identity write, repeat the minimum predicates and the storage mutation in one synchronous browser callback; a failed predicate must leave the prior identity untouched.
 
 ## Response waiting
 

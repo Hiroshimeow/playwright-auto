@@ -62,6 +62,9 @@ class FakeClient:
         self.page = page
         self.timeout_ms = timeout_ms
         self.binding = None
+        self.preflight_calls = []
+        self.prepare_calls = []
+        self.bind_calls = []
 
     async def snapshot(self):
         error = getattr(self.page, "snapshot_error", None)
@@ -87,13 +90,27 @@ class FakeClient:
         self.page.snapshot_value.page_role = role
         return {"page_id": page_id, "page_role": role}
 
+    async def task_preflight(self, task_id):
+        self.preflight_calls.append(task_id)
+        return {
+            "task_id": task_id,
+            "previous_task_id": self.page.snapshot_value.page_task_id,
+            "requires_new_chat": self.page.snapshot_value.page_task_id != task_id,
+        }
+
     async def bind_task_identity(self, task_id, team):
+        self.bind_calls.append((task_id, team))
         self.page.snapshot_value.page_task_id = task_id
         self.page.snapshot_value.page_team = team
         return {"task_id": task_id, "team": team}
 
-    async def prepare_task(self, _task_id, *, force_new_chat=False):
-        return {"reused": not force_new_chat}
+    async def prepare_task(self, task_id, *, force_new_chat=False):
+        self.prepare_calls.append((task_id, force_new_chat))
+        reused = self.page.snapshot_value.page_task_id == task_id and not force_new_chat
+        if not reused:
+            self.page.url = "https://chatgpt.com/"
+            self.page.snapshot_value.url = self.page.url
+        return {"reused": reused}
 
     async def new_chat(self, *, expected_draft_text=None, **_kwargs):
         if expected_draft_text != self.page.snapshot_value.composer_text:
@@ -213,6 +230,61 @@ def test_matching_clients_skips_free_tabs_and_prefers_latest_terminal_team(tmp_p
     assert len(matches) == 1
     assert matches[0][1].page_id == "newest"
     assert matches[0][0].binding.page_id == "newest"
+
+
+def test_terminal_team_reuse_rebinds_without_new_chat(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    page = FakePage(
+        page_id="terminal-page",
+        role="PLAN",
+        team="old-newest",
+        task_id="task-old",
+    )
+    original_url = page.url
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    actions = CDPATabActions(SimpleNamespace(pages=[page]), config)
+
+    acquired = asyncio.run(actions.acquire(manifest(), "PLAN"))
+
+    assert acquired.page_id == "terminal-page"
+    assert acquired.created is False
+    assert acquired.new_chat is False
+    assert acquired.url == original_url
+    assert acquired.client.preflight_calls == ["task-1"]
+    assert acquired.client.prepare_calls == []
+    assert acquired.client.bind_calls == [("task-1", "new-team")]
+    assert page.snapshot_value.page_task_id == "task-1"
+    assert page.snapshot_value.page_team == "new-team"
+
+
+def test_terminal_team_reuse_with_fresh_flag_opens_new_chat(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    page = FakePage(
+        page_id="terminal-page",
+        role="PLAN",
+        team="old-newest",
+        task_id="task-old",
+    )
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    actions = CDPATabActions(SimpleNamespace(pages=[page]), config)
+    state = manifest()
+    state["roles"]["PLAN"].update(
+        reset_requested=True,
+        reset_applied_generation=0,
+        conversation_generation=1,
+    )
+
+    acquired = asyncio.run(actions.acquire(state, "PLAN"))
+
+    assert acquired.page_id == "terminal-page"
+    assert acquired.created is False
+    assert acquired.new_chat is True
+    assert acquired.client.preflight_calls == []
+    assert acquired.client.prepare_calls == [("task-1", True)]
+    assert acquired.client.bind_calls == [("task-1", "new-team")]
+    assert acquired.url == "https://chatgpt.com/"
+    assert page.snapshot_value.page_task_id == "task-1"
+    assert page.snapshot_value.page_team == "new-team"
 
 
 def test_matching_clients_does_not_claim_role_tab_without_matching_team(tmp_path, monkeypatch):

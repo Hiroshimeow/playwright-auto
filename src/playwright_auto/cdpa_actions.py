@@ -155,9 +155,18 @@ class CDPATabActions:
                 and role_record.get("reset_applied_generation")
                 != role_record.get("conversation_generation")
             )
-            prepared = await client.prepare_task(task_id, force_new_chat=force_new)
-            await client.bind_task_identity(task_id, team)
-            new_chat = not bool(prepared.get("reused"))
+            if (
+                not force_new
+                and snapshot.page_task_id != task_id
+                and snapshot.page_team in (manifest.get("reusable_teams") or ())
+            ):
+                await client.task_preflight(task_id)
+                await client.bind_task_identity(task_id, team)
+                new_chat = False
+            else:
+                prepared = await client.prepare_task(task_id, force_new_chat=force_new)
+                await client.bind_task_identity(task_id, team)
+                new_chat = not bool(prepared.get("reused"))
             snapshot = await client.assert_ownership()
         if snapshot.page_team != team or snapshot.page_task_id != task_id:
             snapshot = await client.assert_ownership()
