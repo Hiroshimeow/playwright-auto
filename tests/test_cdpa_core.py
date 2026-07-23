@@ -26,6 +26,7 @@ def write_config(root: Path) -> Path:
                         role: f"prompts/cdpa/{role}.md"
                         for role in ("PLAN", "DEV", "REVIEW", "TEST", "AUDIT")
                     },
+                    "maintainers_constructor": "prompts/cdpa/MAINTAINERS.md",
                     "response_guide": "prompts/cdpa/RESPONSE_GUIDE.md",
                 },
                 "roles": ["PLAN", "DEV", "REVIEW", "TEST", "AUDIT"],
@@ -33,6 +34,7 @@ def write_config(root: Path) -> Path:
                 "browser": {"cdp_url": "http://127.0.0.1:9222", "workspace_timeout_seconds": 15},
                 "route_repair": {"max_attempts": 3},
                 "response": {"timeout_seconds": 7200, "refresh_after_seconds": 1200, "stable_ms": 1000, "poll_ms": 100},
+                "maintenance": {"timeout_seconds": 300, "refresh_after_seconds": 120, "stable_ms": 1000, "poll_ms": 100},
                 "cleanup": {"terminal_idle_seconds": 3600},
                 "worker": {"poll_seconds": 1},
                 "delays": {"minimum_seconds": 1.0, "maximum_seconds": 1.5, "multipliers": {"send": 3}},
@@ -45,6 +47,9 @@ def write_config(root: Path) -> Path:
         target = root / "prompts" / "cdpa" / f"{role}.md"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(f"# {role}\nConstructor for {role}.\n", encoding="utf-8")
+    (root / "prompts" / "cdpa" / "MAINTAINERS.md").write_text(
+        "# MAINTAINERS\nConstructor for Maintainers.\n", encoding="utf-8"
+    )
     (root / "prompts" / "cdpa" / "RESPONSE_GUIDE.md").write_text(
         "Return only the strict route JSON.\nReport: .plan/<team>/<physical-role>_turn<N>_<task-id>.md", encoding="utf-8"
     )
@@ -1036,3 +1041,107 @@ def test_catalog_status_tracks_manifest_saves_without_becoming_a_manifest(tmp_pa
     assert entries[0]["status"] == "DONE"
     assert Path(updated["manifest_path"]) in store.discover_paths()
     assert config.plans_root / ".cdpa-catalog.json" not in store.discover_paths()
+
+
+def test_maintainers_config_is_dedicated_and_not_a_normal_route(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+
+    assert config.maintainers_constructor_path.name == "MAINTAINERS.md"
+    assert config.maintainers_constructor_path.is_file()
+    assert config.maintenance_timeout_seconds == 300
+    assert config.maintenance_refresh_after_seconds == 120
+    assert config.maintenance_stable_ms == 1000
+    assert config.maintenance_poll_ms == 100
+    assert "MAINTAINERS" not in config.roles
+
+
+def test_optional_maintenance_manifest_state_round_trips(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_task("Task", requested_team="alpha", task_id="task-maint")
+    incident = {
+        "incident_id": "maint-1",
+        "key": "task-maint|BLOCKED|role_offline|1|PLAN|offline|time",
+        "state": "OPEN",
+    }
+    state["maintenance"] = {
+        "active_incident_id": "maint-1",
+        "incidents": [incident],
+        "last_resolved_at": None,
+    }
+
+    saved = store.save(state["manifest_path"], state)
+
+    assert saved["maintenance"]["active_incident_id"] == "maint-1"
+    assert store.load(state["manifest_path"])["maintenance"]["incidents"] == [incident]
+
+
+@pytest.mark.parametrize(
+    "maintenance",
+    [
+        {"active_incident_id": None, "incidents": "bad", "last_resolved_at": None},
+        {
+            "active_incident_id": "maint-1",
+            "incidents": [
+                {"incident_id": "maint-1", "key": "a", "state": "OPEN"},
+                {"incident_id": "maint-1", "key": "b", "state": "RUNNING"},
+            ],
+            "last_resolved_at": None,
+        },
+        {
+            "active_incident_id": "maint-missing",
+            "incidents": [{"incident_id": "maint-1", "key": "a", "state": "OPEN"}],
+            "last_resolved_at": None,
+        },
+        {
+            "active_incident_id": "maint-1",
+            "incidents": [{"incident_id": "maint-1", "key": "a", "state": "RESOLVED"}],
+            "last_resolved_at": None,
+        },
+    ],
+)
+def test_invalid_optional_maintenance_manifest_state_is_rejected(
+    tmp_path: Path, maintenance: object
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_task("Task", requested_team="alpha", task_id="task-invalid-maint")
+    state["maintenance"] = maintenance
+
+    with pytest.raises(ValueError, match="maintenance"):
+        store.save(state["manifest_path"], state)
+
+
+def test_global_maintainers_state_is_excluded_from_task_discovery(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    task = store.create_task("Task", requested_team="alpha", task_id="task-real")
+    global_state = tmp_path / ".plan" / "maintainers" / "state.json"
+    global_state.parent.mkdir(parents=True, exist_ok=True)
+    global_state.write_text(
+        json.dumps({"version": 1, "physical_role": "MAINTAINERS"}),
+        encoding="utf-8",
+    )
+
+    assert store.discover_paths() == [Path(task["manifest_path"])]
+
+
+def test_maintenance_save_merges_only_metadata_and_preserves_newer_task_changes(
+    tmp_path: Path,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    original = store.create_task("Task", requested_team="alpha", task_id="task-maint-merge")
+    path = Path(original["manifest_path"])
+    stale = store.load(path)
+    stale["maintenance"] = {
+        "active_incident_id": "maint-1",
+        "incidents": [{"incident_id": "maint-1", "key": "snapshot", "state": "OPEN"}],
+        "last_resolved_at": None,
+    }
+    newer = store.request_control(path, "pause", reason="operator pause")
+
+    saved = store.save_maintenance(path, stale)
+
+    assert saved["controls"] == newer["controls"]
+    assert saved["maintenance"]["active_incident_id"] == "maint-1"

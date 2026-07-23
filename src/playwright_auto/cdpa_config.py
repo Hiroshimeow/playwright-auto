@@ -59,6 +59,7 @@ class CDPAConfig:
     config_path: Path
     plans_root: Path
     constructor_paths: Mapping[str, Path]
+    maintainers_constructor_path: Path
     response_guide_path: Path
     roles: tuple[str, ...]
     dashboard_url: str
@@ -71,6 +72,10 @@ class CDPAConfig:
     response_refresh_after_seconds: float
     response_stable_ms: int
     response_poll_ms: int
+    maintenance_timeout_seconds: float
+    maintenance_refresh_after_seconds: float
+    maintenance_stable_ms: int
+    maintenance_poll_ms: int
     cleanup_terminal_idle_seconds: float
     worker_poll_seconds: float
     delay_minimum_seconds: float
@@ -118,6 +123,15 @@ def load_cdpa_config(
     for role, constructor in constructor_paths.items():
         if not constructor.is_file():
             raise CDPAConfigError(f"constructor prompt for {role} does not exist: {constructor}")
+    maintainers_constructor = _resolve(
+        asset_root,
+        paths.get("maintainers_constructor"),
+        "paths.maintainers_constructor",
+    )
+    if not maintainers_constructor.is_file():
+        raise CDPAConfigError(
+            f"Maintainers constructor prompt does not exist: {maintainers_constructor}"
+        )
     guide = _resolve(asset_root, paths.get("response_guide"), "paths.response_guide")
     if not guide.is_file():
         raise CDPAConfigError(f"response guide does not exist: {guide}")
@@ -126,6 +140,7 @@ def load_cdpa_config(
     browser = _mapping(root_value.get("browser"), "browser")
     repair = _mapping(root_value.get("route_repair"), "route_repair")
     response = _mapping(root_value.get("response"), "response")
+    maintenance = _mapping(root_value.get("maintenance"), "maintenance")
     cleanup = _mapping(root_value.get("cleanup"), "cleanup")
     worker = _mapping(root_value.get("worker"), "worker")
     delays = _mapping(root_value.get("delays"), "delays")
@@ -172,6 +187,7 @@ def load_cdpa_config(
         config_path=config_path,
         plans_root=_resolve(root, paths.get("plans_root", ".plan"), "paths.plans_root"),
         constructor_paths=constructor_paths,
+        maintainers_constructor_path=maintainers_constructor,
         response_guide_path=guide,
         roles=roles,
         dashboard_url=dashboard_url,
@@ -184,6 +200,21 @@ def load_cdpa_config(
         response_refresh_after_seconds=float(_positive(response.get("refresh_after_seconds", 1200), "response.refresh_after_seconds")),
         response_stable_ms=int(_positive(response.get("stable_ms", 1000), "response.stable_ms", integer=True)),
         response_poll_ms=int(_positive(response.get("poll_ms", 100), "response.poll_ms", integer=True)),
+        maintenance_timeout_seconds=float(
+            _positive(maintenance.get("timeout_seconds", 300), "maintenance.timeout_seconds")
+        ),
+        maintenance_refresh_after_seconds=float(
+            _positive(
+                maintenance.get("refresh_after_seconds", 120),
+                "maintenance.refresh_after_seconds",
+            )
+        ),
+        maintenance_stable_ms=int(
+            _positive(maintenance.get("stable_ms", 1000), "maintenance.stable_ms", integer=True)
+        ),
+        maintenance_poll_ms=int(
+            _positive(maintenance.get("poll_ms", 100), "maintenance.poll_ms", integer=True)
+        ),
         cleanup_terminal_idle_seconds=float(_positive(cleanup.get("terminal_idle_seconds", 3600), "cleanup.terminal_idle_seconds")),
         worker_poll_seconds=float(_positive(worker.get("poll_seconds", 1), "worker.poll_seconds")),
         delay_minimum_seconds=minimum,

@@ -253,6 +253,209 @@ def test_wait_response_accepts_new_assistant_after_confirmed_send(monkeypatch):
     assert received == response
 
 
+def test_wait_response_never_accepts_assistant_after_later_user(monkeypatch):
+    user = MessageSnapshot("user", "u1", "user-turn-1", "expected prompt", ())
+    malformed = MessageSnapshot(
+        "assistant", "a1", "assistant-turn-1", "partial response ``", ()
+    )
+    later_user = MessageSnapshot("user", "u2", "user-turn-2", "later prompt", ())
+    later = MessageSnapshot(
+        "assistant", "a2", "assistant-turn-2", "valid later response", ()
+    )
+    page = DummyPage(
+        snapshot(
+            messages=(user, malformed, later_user, later),
+            state=ChatGPTState.WAITING_PROMPT,
+        )
+    )
+    client = ChatGPTPage(page, timeout_ms=20)
+    binding = PageBinding("page-1", "DEV")
+    client.binding = binding
+    receipt = SendReceipt(
+        prompt="expected prompt",
+        prompt_sha256="digest",
+        binding=binding,
+        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+        attempts=1,
+        accepted_via="user_message_identity",
+        session_id_before=None,
+        user_message_id="u1",
+        user_turn_id="user-turn-1",
+    )
+
+    async def fake_inspect(_page):
+        return page.current
+
+    def validate(candidate):
+        if candidate.message_id == "a1":
+            raise ValueError("malformed accepted response")
+
+    monkeypatch.setattr(chatgpt, "inspect_chatgpt_page", fake_inspect)
+
+    with pytest.raises(chatgpt.StableMalformedResponseError) as captured:
+        asyncio.run(
+            client.wait_for_response(
+                receipt,
+                timeout_ms=20,
+                stable_ms=0,
+                poll_ms=1,
+                candidate_validator=validate,
+                minimum_samples=2,
+                invalid_grace_ms=0,
+            )
+        )
+
+    assert captured.value.candidate == malformed
+
+
+def test_wait_response_selects_expected_assistant_before_later_turn(monkeypatch):
+    user = MessageSnapshot("user", "u1", "user-turn-1", "expected prompt", ())
+    expected = MessageSnapshot(
+        "assistant", "a1", "assistant-turn-1", "valid expected response", ()
+    )
+    later_user = MessageSnapshot("user", "u2", "user-turn-2", "later prompt", ())
+    later = MessageSnapshot(
+        "assistant", "a2", "assistant-turn-2", "valid later response", ()
+    )
+    page = DummyPage(
+        snapshot(
+            messages=(user, expected, later_user, later),
+            state=ChatGPTState.WAITING_PROMPT,
+        )
+    )
+    client = ChatGPTPage(page, timeout_ms=20)
+    binding = PageBinding("page-1", "DEV")
+    client.binding = binding
+    receipt = SendReceipt(
+        prompt="expected prompt",
+        prompt_sha256="digest",
+        binding=binding,
+        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+        attempts=1,
+        accepted_via="user_message_identity",
+        session_id_before=None,
+        user_message_id="u1",
+        user_turn_id="user-turn-1",
+    )
+
+    async def fake_inspect(_page):
+        return page.current
+
+    monkeypatch.setattr(chatgpt, "inspect_chatgpt_page", fake_inspect)
+
+    received = asyncio.run(
+        client.wait_for_response(
+            receipt,
+            timeout_ms=20,
+            stable_ms=0,
+            poll_ms=1,
+            minimum_samples=2,
+            expected_assistant_turn_id="assistant-turn-1",
+            expected_assistant_message_id="a1",
+        )
+    )
+
+    assert received == expected
+
+
+def test_wait_response_malformed_expected_identity_does_not_fall_through(monkeypatch):
+    user = MessageSnapshot("user", "u1", "user-turn-1", "expected prompt", ())
+    malformed = MessageSnapshot(
+        "assistant", "a1", "assistant-turn-1", "partial response ``", ()
+    )
+    later_user = MessageSnapshot("user", "u2", "user-turn-2", "later prompt", ())
+    later = MessageSnapshot(
+        "assistant", "a2", "assistant-turn-2", "valid later response", ()
+    )
+    page = DummyPage(
+        snapshot(
+            messages=(user, malformed, later_user, later),
+            state=ChatGPTState.WAITING_PROMPT,
+        )
+    )
+    client = ChatGPTPage(page, timeout_ms=20)
+    binding = PageBinding("page-1", "DEV")
+    client.binding = binding
+    receipt = SendReceipt(
+        prompt="expected prompt",
+        prompt_sha256="digest",
+        binding=binding,
+        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+        attempts=1,
+        accepted_via="user_message_identity",
+        session_id_before=None,
+        user_message_id="u1",
+        user_turn_id="user-turn-1",
+    )
+
+    async def fake_inspect(_page):
+        return page.current
+
+    def validate(candidate):
+        if candidate.message_id == "a1":
+            raise ValueError("malformed expected response")
+
+    monkeypatch.setattr(chatgpt, "inspect_chatgpt_page", fake_inspect)
+
+    with pytest.raises(chatgpt.StableMalformedResponseError) as captured:
+        asyncio.run(
+            client.wait_for_response(
+                receipt,
+                timeout_ms=20,
+                stable_ms=0,
+                poll_ms=1,
+                candidate_validator=validate,
+                minimum_samples=2,
+                invalid_grace_ms=0,
+                expected_assistant_turn_id="assistant-turn-1",
+                expected_assistant_message_id="a1",
+            )
+        )
+
+    assert captured.value.candidate == malformed
+
+
+def test_wait_response_missing_expected_identity_fails_closed(monkeypatch):
+    user = MessageSnapshot("user", "u1", "user-turn-1", "expected prompt", ())
+    unrelated = MessageSnapshot(
+        "assistant", "a2", "assistant-turn-2", "valid unrelated response", ()
+    )
+    page = DummyPage(
+        snapshot(messages=(user, unrelated), state=ChatGPTState.WAITING_PROMPT)
+    )
+    client = ChatGPTPage(page, timeout_ms=10)
+    binding = PageBinding("page-1", "DEV")
+    client.binding = binding
+    receipt = SendReceipt(
+        prompt="expected prompt",
+        prompt_sha256="digest",
+        binding=binding,
+        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+        attempts=1,
+        accepted_via="user_message_identity",
+        session_id_before=None,
+        user_message_id="u1",
+        user_turn_id="user-turn-1",
+    )
+
+    async def fake_inspect(_page):
+        return page.current
+
+    monkeypatch.setattr(chatgpt, "inspect_chatgpt_page", fake_inspect)
+
+    with pytest.raises(TimeoutError, match="no accepted-user-identity"):
+        asyncio.run(
+            client.wait_for_response(
+                receipt,
+                timeout_ms=10,
+                stable_ms=0,
+                poll_ms=1,
+                expected_assistant_turn_id="assistant-turn-1",
+                expected_assistant_message_id="a1",
+            )
+        )
+
+
 def test_rehydrated_user_turn_accepts_changed_message_id_without_visible_text_fallback(monkeypatch):
     old_user = MessageSnapshot("user", "old-user-dom", "old-user-turn", "old prompt", ())
     old_assistant = MessageSnapshot("assistant", "old-assistant", "old-assistant-turn", "old answer", ())

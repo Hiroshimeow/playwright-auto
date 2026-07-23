@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -535,6 +536,259 @@ def test_durable_send_completes_once_then_returns_cached_response(tmp_path):
     )
     assert stored.status is RequestStatus.COMPLETED
     assert stored.response["text"] == "durable answer"
+
+
+def test_durable_validator_keeps_partial_response_sent_then_accepts_same_turn(
+    tmp_path,
+):
+    ledger_path = tmp_path / "ledger.json"
+    partial = "report JSON {\"action\":\"WAIT\"} ``"
+    final = "report JSON {\"action\":\"WAIT\"}"
+
+    class FinalizingClient(FakeDurableClient):
+        def __init__(self):
+            super().__init__()
+            self.response_text = partial
+
+        async def wait_for_response(self, receipt, **options):
+            self.wait_calls.append((receipt, options))
+            candidate = MessageSnapshot(
+                "assistant", "a1", "assistant-turn-1", self.response_text, ()
+            )
+            messages = tuple(
+                item
+                for item in self.current.messages
+                if not (item.role == "assistant" and item.message_id == "a1")
+            )
+            self.current = snapshot(
+                messages=(*messages, candidate),
+                state=ChatGPTState.WAITING_PROMPT,
+            )
+            options["candidate_validator"](candidate)
+            return candidate
+
+    def validate(candidate):
+        if candidate.text.endswith("``"):
+            raise ValueError("partial maintenance response")
+
+    client = FinalizingClient()
+    block = DurableSendBlock(
+        "validated durable task",
+        ledger_path=ledger_path,
+        stable_ms=0,
+        candidate_validator=validate,
+        minimum_samples=2,
+        invalid_grace_ms=1_000,
+    )
+
+    with pytest.raises(Exception) as captured:
+        run_block(block, client)
+    assert isinstance(captured.value.cause, ValueError)
+    request_id = next(iter(json.loads(ledger_path.read_text())["records"]))
+    stored = RequestLedger(ledger_path).get(request_id)
+    assert stored.status is RequestStatus.SENT
+    assert stored.attempts == 1
+
+    client.response_text = final
+    result = run_block(block, client)
+    stored = RequestLedger(ledger_path).get(stored.request_id)
+
+    assert result.context.results["durable_send"]["response"]["text"] == final
+    assert stored.status is RequestStatus.COMPLETED
+    assert stored.response["message_id"] == "a1"
+    assert stored.response["turn_id"] == "assistant-turn-1"
+    assert stored.attempts == 1
+    assert len(client.send_calls) == 1
+    assert len(client.wait_calls) == 2
+    assert client.wait_calls[-1][1]["minimum_samples"] == 2
+    assert client.wait_calls[-1][1]["invalid_grace_ms"] == 1_000
+
+
+def test_completed_invalid_cache_is_reread_and_upgraded_without_resend(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    partial = "report JSON {\"action\":\"WAIT\"} ``"
+    final = "report JSON {\"action\":\"WAIT\"}"
+
+    class MutableResponseClient(FakeDurableClient):
+        def __init__(self):
+            super().__init__()
+            self.response_text = partial
+
+        async def wait_for_response(self, receipt, **options):
+            self.wait_calls.append((receipt, options))
+            candidate = MessageSnapshot(
+                "assistant", "a1", "assistant-turn-1", self.response_text, ()
+            )
+            messages = tuple(
+                item
+                for item in self.current.messages
+                if not (item.role == "assistant" and item.message_id == "a1")
+            )
+            self.current = snapshot(
+                messages=(*messages, candidate),
+                state=ChatGPTState.WAITING_PROMPT,
+            )
+            validator = options.get("candidate_validator")
+            if validator is not None:
+                validator(candidate)
+            return candidate
+
+    def validate(candidate):
+        if candidate.text.endswith("``"):
+            raise ValueError("partial maintenance response")
+
+    client = MutableResponseClient()
+    initial = run_block(
+        DurableSendBlock(
+            "cached durable task",
+            ledger_path=ledger_path,
+            stable_ms=0,
+        ),
+        client,
+    )
+    request_id = initial.context.variables["durable_request"].request_id
+    cached = RequestLedger(ledger_path).get(request_id)
+    assert cached.status is RequestStatus.COMPLETED
+    assert cached.response["text"] == partial
+
+    client.response_text = final
+    upgraded = run_block(
+        DurableSendBlock(
+            "cached durable task",
+            ledger_path=ledger_path,
+            stable_ms=0,
+            candidate_validator=validate,
+            minimum_samples=2,
+            invalid_grace_ms=1_000,
+        ),
+        client,
+    )
+    stored = RequestLedger(ledger_path).get(request_id)
+
+    assert upgraded.context.results["durable_send"]["cached"] is True
+    assert upgraded.context.results["durable_send"]["response"]["text"] == final
+    assert stored.response["text"] == final
+    assert stored.response["message_id"] == cached.response["message_id"]
+    assert stored.response["turn_id"] == cached.response["turn_id"]
+    assert stored.attempts == 1
+    assert len(client.send_calls) == 1
+    assert len(client.wait_calls) == 2
+
+
+def test_completed_invalid_cache_rejects_different_assistant_identity(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    partial = "report JSON {\"action\":\"WAIT\"} ``"
+    final = "report JSON {\"action\":\"WAIT\"}"
+
+    class IdentityAwareClient(FakeDurableClient):
+        def __init__(self):
+            super().__init__()
+            self.response = MessageSnapshot(
+                "assistant", "old-message", "old-turn", partial, ()
+            )
+
+        async def wait_for_response(self, receipt, **options):
+            self.wait_calls.append((receipt, options))
+            candidate = self.response
+            expected_turn = options.get("expected_assistant_turn_id")
+            expected_message = options.get("expected_assistant_message_id")
+            if expected_turn:
+                if candidate.turn_id != expected_turn:
+                    raise TimeoutError("expected assistant turn not found")
+            elif expected_message and candidate.message_id != expected_message:
+                raise TimeoutError("expected assistant message not found")
+            validator = options.get("candidate_validator")
+            if validator is not None:
+                validator(candidate)
+            return candidate
+
+    def validate(candidate):
+        if candidate.text.endswith("``"):
+            raise ValueError("partial maintenance response")
+
+    client = IdentityAwareClient()
+    initial = run_block(
+        DurableSendBlock(
+            "identity-bound durable task",
+            ledger_path=ledger_path,
+            stable_ms=0,
+        ),
+        client,
+    )
+    request_id = initial.context.variables["durable_request"].request_id
+    cached = RequestLedger(ledger_path).get(request_id)
+    assert cached.response["message_id"] == "old-message"
+    assert cached.response["turn_id"] == "old-turn"
+
+    client.response = MessageSnapshot(
+        "assistant", "different-message", "different-turn", final, ()
+    )
+    with pytest.raises(Exception) as captured:
+        run_block(
+            DurableSendBlock(
+                "identity-bound durable task",
+                ledger_path=ledger_path,
+                stable_ms=0,
+                candidate_validator=validate,
+                minimum_samples=2,
+                invalid_grace_ms=1_000,
+            ),
+            client,
+        )
+
+    assert isinstance(captured.value.cause, TimeoutError)
+    stored = RequestLedger(ledger_path).get(request_id)
+    assert stored.status is RequestStatus.COMPLETED
+    assert stored.response == cached.response
+    assert stored.attempts == 1
+    assert len(client.send_calls) == 1
+    assert len(client.wait_calls) == 2
+    assert client.wait_calls[-1][1]["expected_assistant_turn_id"] == "old-turn"
+    assert client.wait_calls[-1][1]["expected_assistant_message_id"] == "old-message"
+
+
+def test_completed_invalid_cache_without_identity_fails_closed(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    client = FakeDurableClient()
+    initial = run_block(
+        DurableSendBlock(
+            "identityless cached task",
+            ledger_path=ledger_path,
+            stable_ms=0,
+        ),
+        client,
+    )
+    request_id = initial.context.variables["durable_request"].request_id
+    ledger = RequestLedger(ledger_path)
+    cached = ledger.get(request_id)
+    identityless = dict(cached.response)
+    identityless["message_id"] = ""
+    identityless["turn_id"] = None
+    identityless["text"] = "partial response ``"
+    ledger.update(request_id, response=identityless)
+
+    def validate(candidate):
+        if candidate.text.endswith("``"):
+            raise ValueError("partial response")
+
+    with pytest.raises(Exception) as captured:
+        run_block(
+            DurableSendBlock(
+                "identityless cached task",
+                ledger_path=ledger_path,
+                stable_ms=0,
+                candidate_validator=validate,
+            ),
+            client,
+        )
+
+    assert isinstance(captured.value.cause, DurableRequestError)
+    assert "no assistant identity" in str(captured.value.cause)
+    stored = RequestLedger(ledger_path).get(request_id)
+    assert stored.response == identityless
+    assert stored.attempts == 1
+    assert len(client.send_calls) == 1
+    assert len(client.wait_calls) == 1
 
 
 def test_crash_resume_with_transcript_marker_waits_without_resend(tmp_path):

@@ -15,6 +15,7 @@ from playwright_auto.cdpa_actions import (
     TeamCloseError,
 )
 from playwright_auto.cdpa_config import load_cdpa_config
+from playwright_auto.cdpa_maintenance import ensure_maintenance_incident
 from playwright_auto.cdpa_store import TaskStore
 from playwright_auto.cdpa_worker import CDPAWorker, _active_hop
 from playwright_auto.chatgpt import (
@@ -1035,6 +1036,193 @@ def test_later_handoff_prompt_preserves_original_goal_and_source_role(tmp_path: 
         "controller_id", "run_id", "page_id", "created_at",
     ):
         assert forbidden not in dev_hop["prompt"]
+
+
+def test_open_tab_recovers_presend_role_offline_and_sends_original_once(
+    tmp_path: Path, monkeypatch
+):
+    _, store, state, worker = setup_task(
+        tmp_path, task_id="task-open-tab-presend-recovery"
+    )
+    path = Path(state["manifest_path"])
+    hop = _active_hop(state)
+    original_hop_id = hop["hop_id"]
+    original_request_id = hop["request_id"]
+    state.update(
+        status="BLOCKED",
+        kanban_column="BLOCKED",
+        block_code="role_offline",
+        block_retryable=False,
+        block_reason="owned alpha-plan tab is offline",
+        active_action="blocked",
+    )
+    state["roles"]["PLAN"].update(
+        page_id="closed-page",
+        page_url="https://chatgpt.com/c/owned-plan",
+        online=False,
+    )
+    state["controls"] = [
+        {
+            "control_id": 1,
+            "action": "open_tab",
+            "role": "PLAN",
+            "reason": "recover exact owned PLAN tab",
+            "confirmed": False,
+            "status": "requested",
+            "requested_at": "2026-07-23T00:00:00+00:00",
+            "applied_at": None,
+            "result": None,
+        }
+    ]
+    store.save(path, state)
+    sent_prompts: list[str] = []
+
+    class RecoveryClient:
+        async def assert_ownership(self):
+            return SimpleNamespace(
+                conversation_url="https://chatgpt.com/c/owned-plan",
+                url="https://chatgpt.com/c/owned-plan",
+            )
+
+    client = RecoveryClient()
+    acquired = AcquiredRole(
+        client=client,
+        page_id="recovered-page",
+        url="https://chatgpt.com/c/owned-plan",
+        created=False,
+        new_chat=False,
+    )
+
+    class RecoveryActions:
+        def __init__(self):
+            self.recovered = False
+
+        async def locate_owned(self, _state, _role):
+            return acquired if self.recovered else None
+
+        async def reopen(self, _state, _role):
+            self.recovered = True
+            return acquired
+
+        async def open_tab(self, _acquired):
+            self.recovered = True
+
+        async def acquire(self, _state, _role):
+            assert self.recovered is True
+            return acquired
+
+    actions = RecoveryActions()
+    monkeypatch.setattr(
+        worker_module,
+        "CDPATabActions",
+        lambda *_args, **_kwargs: actions,
+    )
+
+    class OneSendBlock:
+        def __init__(self, prompt, **_kwargs):
+            self.prompt = prompt
+
+        async def run(self, _context):
+            sent_prompts.append(self.prompt)
+            receipt = SendReceipt(
+                prompt=self.prompt,
+                prompt_sha256=prompt_digest(self.prompt),
+                binding=PageBinding("recovered-page", "alpha-plan"),
+                baseline=MessageBaseline(
+                    frozenset(), frozenset(), frozenset(), frozenset()
+                ),
+                attempts=1,
+                accepted_via="user_message_identity",
+                session_id_before="owned-plan",
+                user_message_id="user-1",
+                user_turn_id="turn-1",
+            )
+            return {
+                "receipt": receipt.to_dict(),
+                "record": {
+                    "accepted_at": datetime.now(timezone.utc).timestamp(),
+                },
+            }
+
+    monkeypatch.setattr(worker_module, "DurableSendBlock", OneSendBlock)
+    context = SimpleNamespace(pages=[])
+
+    recovered = asyncio.run(worker.advance(path, context))
+    recovered_hop = _active_hop(recovered)
+    assert recovered["status"] == "RUNNING"
+    assert recovered["kanban_column"] == "PLANNING"
+    assert recovered["block_code"] is None
+    assert recovered["block_reason"] is None
+    assert recovered["roles"]["PLAN"]["online"] is True
+    assert recovered["roles"]["PLAN"]["page_id"] == "recovered-page"
+    assert recovered_hop["hop_id"] == original_hop_id
+    assert recovered_hop["request_id"] == original_request_id
+    assert recovered_hop["state"] == "pre_send"
+    assert recovered["controls"][0]["status"] == "applied"
+    assert recovered["controls"][0]["result"]["resumed"] is True
+    assert sent_prompts == []
+
+    prepared = asyncio.run(worker.advance(path, context))
+    assert _active_hop(prepared)["state"] == "sending"
+    assert _active_hop(prepared)["request_id"] == original_request_id
+    assert sent_prompts == []
+
+    sent = asyncio.run(worker.advance(path, context))
+    assert _active_hop(sent)["state"] == "sent"
+    assert _active_hop(sent)["request_id"] == original_request_id
+    assert len(sent["hops"]) == 1
+    assert len(sent_prompts) == 1
+
+    waiting = asyncio.run(worker.advance(path, context))
+    assert _active_hop(waiting)["state"] == "waiting"
+    assert _active_hop(waiting)["request_id"] == original_request_id
+    assert len(sent_prompts) == 1
+
+
+@pytest.mark.parametrize("hop_state", ["sending", "sent", "waiting"])
+def test_open_tab_rejects_inflight_role_offline_without_browser_mutation(
+    tmp_path: Path,
+    hop_state: str,
+):
+    _, _, state, worker = setup_task(
+        tmp_path, task_id=f"task-open-tab-{hop_state}"
+    )
+    hop = _active_hop(state)
+    hop["state"] = hop_state
+    if hop_state in {"sent", "waiting"}:
+        hop["receipt"] = {
+            "request_id": hop["request_id"],
+            "binding": {"page_id": "closed-page"},
+        }
+    state.update(
+        status="BLOCKED",
+        kanban_column="BLOCKED",
+        block_code="role_offline",
+        block_retryable=False,
+        block_reason="owned alpha-plan tab is offline",
+    )
+    state["roles"]["PLAN"].update(page_id="closed-page", online=False)
+    state["controls"] = [
+        {
+            "control_id": 1,
+            "action": "open_tab",
+            "role": "PLAN",
+            "reason": "recover exact owned PLAN tab",
+            "status": "requested",
+        }
+    ]
+
+    class NoBrowserMutation:
+        async def locate_owned(self, *_args, **_kwargs):
+            raise AssertionError("in-flight recovery must reject before browser mutation")
+
+    assert asyncio.run(worker._apply_control(state, NoBrowserMutation())) is True
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "role_offline"
+    assert _active_hop(state)["state"] == hop_state
+    assert state["roles"]["PLAN"]["page_id"] == "closed-page"
+    assert state["controls"][0]["status"] == "rejected"
+    assert "pre_send" in state["controls"][0]["result"]
 
 
 def test_blocked_unsent_restart_abandons_old_hop_and_creates_new_turn(tmp_path: Path):
@@ -2568,3 +2756,240 @@ def test_clear_team_reverifies_and_closes_tab_after_false_cleared_state(tmp_path
     assert result["cleanup"]["verified_empty_at"]
     assert result["controls"][-1]["status"] == "applied"
     assert result["controls"][-1]["result"]["reverified"] is True
+
+
+def test_run_once_passes_locked_task_path_to_global_maintainers(
+    tmp_path: Path, monkeypatch
+):
+    _, store, state, worker = setup_task(
+        tmp_path, task_id="task-maintainer-locked-path"
+    )
+    path = Path(state["manifest_path"])
+    calls = []
+
+    async def locked_advance(_manifest_path, _browser_context):
+        return None
+
+    class FakeCoordinator:
+        async def advance(self, tasks, browser_context):
+            calls.append((tasks, browser_context))
+            return False
+
+    monkeypatch.setattr(worker, "advance", locked_advance)
+    worker.maintainers = FakeCoordinator()
+    browser_context = SimpleNamespace(pages=[])
+
+    results = asyncio.run(worker.run_once(browser_context))
+
+    assert results == [None]
+    assert len(calls) == 1
+    tasks, observed_context = calls[0]
+    assert observed_context is browser_context
+    assert tasks == [(path, {})]
+
+
+def test_run_once_keeps_locked_active_a_serialized_before_b(
+    tmp_path: Path, monkeypatch
+):
+    import hashlib
+
+    import playwright_auto.cdpa_maintenance as maintenance_module
+    from playwright_auto.cdpa_actions import AcquiredRole
+
+    config, store, state_a, worker = setup_task(
+        tmp_path, task_id="task-maintainer-active-a"
+    )
+    state_b = store.create_task(
+        "Blocked task B",
+        requested_team="beta",
+        task_id="task-maintainer-waiting-b",
+    )
+    path_a = Path(state_a["manifest_path"])
+    path_b = Path(state_b["manifest_path"])
+
+    state_a.update(
+        status="BLOCKED",
+        kanban_column="BLOCKED",
+        block_code="role_offline",
+        block_reason="failure A",
+    )
+    state_a = store.save(path_a, state_a)
+    incident_a = ensure_maintenance_incident(state_a)
+    assert incident_a is not None
+    report = tmp_path / ".plan" / "maintainers" / "alpha_turn1_20260723T010203Z.md"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("# Active A report\n", encoding="utf-8")
+    report_sha256 = hashlib.sha256(report.read_bytes()).hexdigest()
+    incident_a.update(
+        state="RUNNING",
+        turn=1,
+        request_id="request-a",
+        decision={
+            "action": "OPEN_ROLE_TAB",
+            "reason": "recover A",
+            "role": "PLAN",
+            "lesson": None,
+            "replacement": None,
+        },
+        report_at="2026-07-23T01:02:03+00:00",
+        report_path=str(report),
+        report_sha256=report_sha256,
+        report_size=report.stat().st_size,
+        applied_snapshot_key=incident_a["key"],
+    )
+    state_a = store.save_maintenance(path_a, state_a)
+    state_a = store.request_control(
+        path_a,
+        "open_tab",
+        role="PLAN",
+        reason="recover A",
+        maintenance_incident_id=incident_a["incident_id"],
+        maintenance_request_id=incident_a["request_id"],
+    )
+    incident_a = next(
+        item
+        for item in state_a["maintenance"]["incidents"]
+        if item["incident_id"] == incident_a["incident_id"]
+    )
+    incident_a["control_id"] = state_a["controls"][-1]["control_id"]
+    state_a = store.save_maintenance(path_a, state_a)
+
+    state_b.update(
+        status="BLOCKED",
+        kanban_column="BLOCKED",
+        block_code="send_failed",
+        block_reason="failure B",
+    )
+    state_b = store.save(path_b, state_b)
+
+    global_state = worker.maintainers.state_store.load()
+    global_state["active_incident"] = worker.maintainers._active_projection(
+        state_a, incident_a
+    )
+    history_entry = worker.maintainers._history_entry(state_a, incident_a)
+    assert history_entry is not None
+    global_state["history"] = [history_entry]
+    worker.maintainers.state_store.save(global_state)
+    sends = []
+
+    class FakeActions:
+        def __init__(self, _context, _config):
+            pass
+
+        async def acquire_global_role(self, role):
+            return AcquiredRole(
+                client=SimpleNamespace(binding=SimpleNamespace(role=role)),
+                page_id="maint-page",
+                url="https://chatgpt.com/c/maint",
+                created=False,
+                new_chat=False,
+            )
+
+    class FakeSendBlock:
+        def __init__(self, prompt, **_kwargs):
+            sends.append(prompt)
+
+        async def run(self, _context):
+            return {
+                "response": {
+                    "text": (
+                        "# Maintenance report\n\nWait.\n\n"
+                        "```json\n"
+                        '{"action":"WAIT","reason":"Wait for changed evidence.",'
+                        '"role":null,"lesson":null,"replacement":null}\n'
+                        "```"
+                    )
+                }
+            }
+
+    monkeypatch.setattr(maintenance_module, "CDPATabActions", FakeActions)
+    monkeypatch.setattr(maintenance_module, "DurableSendBlock", FakeSendBlock)
+
+    with store.task_run_lock(path_a, blocking=True):
+        first = asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
+        second = asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
+
+    assert first[0] is None
+    assert second[0] is None
+    assert sends == []
+    current_a = store.load(path_a)
+    current_b = store.load(path_b)
+    assert current_a["maintenance"]["active_incident_id"] == incident_a["incident_id"]
+    assert current_a["maintenance"]["incidents"][0]["state"] == "RUNNING"
+    assert current_b.get("maintenance") is None
+    assert worker.maintainers.state_store.load()["active_incident"] == global_state["active_incident"]
+
+
+def test_run_once_clears_genuinely_missing_global_task_without_browser(
+    tmp_path: Path, monkeypatch
+):
+    import playwright_auto.cdpa_maintenance as maintenance_module
+
+    _, store, state, worker = setup_task(
+        tmp_path, task_id="task-maintainer-existing-b"
+    )
+    path = Path(state["manifest_path"])
+    state.update(
+        status="BLOCKED",
+        kanban_column="BLOCKED",
+        block_code="send_failed",
+        block_reason="failure B",
+    )
+    store.save(path, state)
+    global_state = worker.maintainers.state_store.load()
+    global_state["active_incident"] = {
+        "task_id": "task-deleted-a",
+        "incident_id": "maint-deleted-a",
+        "turn": 1,
+        "request_id": "request-deleted-a",
+    }
+    worker.maintainers.state_store.save(global_state)
+
+    class NoBrowserWork:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("missing-task reconciliation must not touch browser")
+
+    monkeypatch.setattr(maintenance_module, "CDPATabActions", NoBrowserWork)
+
+    results = asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
+
+    assert len(results) == 1
+    assert worker.maintainers.state_store.load()["active_incident"] is None
+    assert store.load(path).get("maintenance") is None
+
+
+def test_run_once_advances_global_maintainers_after_task_iteration(
+    tmp_path: Path, monkeypatch
+):
+    config, store, state, worker = setup_task(
+        tmp_path, task_id="task-maintainer-run-once"
+    )
+    path = Path(state["manifest_path"])
+    calls = []
+
+    async def fake_advance(manifest_path, _browser_context):
+        current = store.load(manifest_path)
+        current["status"] = "BLOCKED"
+        current["kanban_column"] = "BLOCKED"
+        current["block_code"] = "role_offline"
+        current["block_reason"] = "offline"
+        return store.save(manifest_path, current)
+
+    class FakeCoordinator:
+        async def advance(self, tasks, browser_context):
+            calls.append((tasks, browser_context))
+            return True
+
+    monkeypatch.setattr(worker, "advance", fake_advance)
+    worker.maintainers = FakeCoordinator()
+    browser_context = SimpleNamespace(pages=[])
+
+    results = asyncio.run(worker.run_once(browser_context))
+
+    assert len(results) == 1
+    assert results[0]["status"] == "BLOCKED"
+    assert len(calls) == 1
+    tasks, observed_context = calls[0]
+    assert observed_context is browser_context
+    assert tasks[0][0] == path
+    assert tasks[0][1]["block_code"] == "role_offline"

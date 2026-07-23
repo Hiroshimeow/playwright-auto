@@ -102,6 +102,64 @@ class CDPATabActions:
             return best
         return []
 
+    async def acquire_global_role(self, physical_role: str) -> AcquiredRole:
+        """Reuse exactly one role-only tab or lazily open it without task ownership."""
+        physical = str(physical_role).strip().upper()
+        matches: list[tuple[ChatGPTPage, Any]] = []
+        for page in self.browser_context.pages:
+            if page.is_closed() or not self._supported(page):
+                continue
+            client = ChatGPTPage(
+                page,
+                timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
+            )
+            try:
+                snapshot = await client.snapshot()
+            except Exception as exc:
+                raise RoleOwnershipError(
+                    "cannot inspect a supported ChatGPT page for the global role: "
+                    f"{getattr(page, 'url', '<unknown>')!r}: {type(exc).__name__}: {exc}"
+                ) from exc
+            if snapshot.page_role != physical:
+                continue
+            if not snapshot.page_id:
+                raise RoleOwnershipError("global role tab has no page identity")
+            if snapshot.page_team or snapshot.page_task_id:
+                raise RoleOwnershipError("global role tab must not own a team or task")
+            client.binding = PageBinding(str(snapshot.page_id), physical)
+            matches.append((client, snapshot))
+        if len(matches) > 1:
+            raise RoleOwnershipError(f"multiple global tabs match {physical!r}")
+        if matches:
+            client, snapshot = matches[0]
+            await client.assert_ownership()
+            return AcquiredRole(
+                client=client,
+                page_id=str(snapshot.page_id),
+                url=str(snapshot.url),
+                created=False,
+                new_chat=False,
+            )
+        await random_delay(action_delay_multiplier("open_tab"))
+        workspace = ChatGPTWorkspace()
+        client = await workspace.open_role(
+            self.browser_context,
+            physical,
+            timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
+        )
+        snapshot = await client.assert_ownership()
+        if snapshot.page_team or snapshot.page_task_id:
+            await client.page.close()
+            raise RoleOwnershipError("new global role tab unexpectedly owns a team or task")
+        assert client.binding is not None
+        return AcquiredRole(
+            client=client,
+            page_id=client.binding.page_id,
+            url=str(snapshot.url),
+            created=True,
+            new_chat=False,
+        )
+
     async def locate_owned(
         self,
         manifest: Mapping[str, Any],
@@ -240,6 +298,7 @@ class CDPATabActions:
                 )
             client = ChatGPTPage(page, timeout_ms=timeout)
             assigned = await client.set_role(physical, force_new_page_id=True)
+            await client.wait_until_clean_ready(timeout_ms=timeout)
             await client.bind_task_identity(
                 str(manifest["task_id"]), str(manifest["team"])
             )

@@ -65,6 +65,9 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
         stable_ms: int = 1_000,
         poll_ms: int = 100,
         active_reload_after_ms: int | None = None,
+        candidate_validator: Callable[[MessageSnapshot], None] | None = None,
+        minimum_samples: int = 1,
+        invalid_grace_ms: int | None = None,
         max_total_bytes: int = 20 * 1024 * 1024,
         record_key: str = "durable_request",
         receipt_key: str = "send_receipt",
@@ -88,6 +91,9 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
         self.stable_ms = stable_ms
         self.poll_ms = poll_ms
         self.active_reload_after_ms = active_reload_after_ms
+        self.candidate_validator = candidate_validator
+        self.minimum_samples = minimum_samples
+        self.invalid_grace_ms = invalid_grace_ms
         self.max_total_bytes = max_total_bytes
         self.record_key = record_key
         self.receipt_key = receipt_key
@@ -102,6 +108,8 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
         receipt,
         *,
         cached: bool = False,
+        expected_assistant_turn_id: str | None = None,
+        expected_assistant_message_id: str | None = None,
     ) -> dict[str, Any]:
         context.variables[self.receipt_key] = receipt
         if not self.wait_for_response_enabled:
@@ -119,6 +127,11 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
                 stable_ms=self.stable_ms,
                 poll_ms=self.poll_ms,
                 active_reload_after_ms=self.active_reload_after_ms,
+                candidate_validator=self.candidate_validator,
+                minimum_samples=self.minimum_samples,
+                invalid_grace_ms=self.invalid_grace_ms,
+                expected_assistant_turn_id=expected_assistant_turn_id,
+                expected_assistant_message_id=expected_assistant_message_id,
             )
         except Exception as exc:
             ledger.update(
@@ -212,6 +225,23 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
 
             receipt = SendReceipt.from_dict(record.receipt)
             response = MessageSnapshot.from_dict(record.response)
+            if self.candidate_validator is not None:
+                try:
+                    self.candidate_validator(response)
+                except Exception:
+                    if not response.turn_id and not response.message_id:
+                        raise DurableRequestError(
+                            "invalid cached response has no assistant identity; refusing unbound reread"
+                        )
+                    return await self._complete_from_receipt(
+                        context,
+                        ledger,
+                        record,
+                        receipt,
+                        cached=True,
+                        expected_assistant_turn_id=response.turn_id,
+                        expected_assistant_message_id=response.message_id,
+                    )
             context.variables[self.receipt_key] = receipt
             context.variables[self.response_key] = response
             context.variables[self.record_key] = record

@@ -27,6 +27,7 @@ _TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _TASK_STATUSES = frozenset({"INBOX", "RUNNING", "PAUSED", "BLOCKED", "DONE", "STOPPED"})
 _HOP_STATES = frozenset({"pre_send", "sending", "sent", "waiting", "responded", "routed", "abandoned"})
 _CLEANUP_STATES = frozenset({"ACTIVE", "CLEARING", "CLEARED"})
+_MAINTENANCE_STATES = frozenset({"OPEN", "RUNNING", "RESOLVED", "ESCALATED"})
 
 
 def utc_now() -> str:
@@ -360,6 +361,37 @@ class TaskStore:
         for key, expected_type in typed_fields.items():
             if not isinstance(state.get(key), expected_type):
                 return f"task manifest field {key!r} has invalid type"
+
+        maintenance = state.get("maintenance")
+        if maintenance is not None:
+            if not isinstance(maintenance, Mapping):
+                return "maintenance must be an object"
+            incidents = maintenance.get("incidents")
+            if not isinstance(incidents, list):
+                return "maintenance incidents must be a list"
+            incident_by_id: dict[str, Mapping[str, Any]] = {}
+            for incident in incidents:
+                if not isinstance(incident, Mapping):
+                    return "maintenance incident must be an object"
+                incident_id = incident.get("incident_id")
+                if not isinstance(incident_id, str) or not incident_id.strip():
+                    return "maintenance incident_id must be a non-empty string"
+                if incident_id in incident_by_id:
+                    return "maintenance incident IDs must be unique"
+                if not isinstance(incident.get("key"), str) or not str(incident.get("key")).strip():
+                    return "maintenance incident key must be a non-empty string"
+                if str(incident.get("state") or "").upper() not in _MAINTENANCE_STATES:
+                    return "maintenance incident state is invalid"
+                incident_by_id[incident_id] = incident
+            active_incident_id = maintenance.get("active_incident_id")
+            if active_incident_id is not None:
+                if not isinstance(active_incident_id, str) or not active_incident_id.strip():
+                    return "maintenance active_incident_id must be null or a non-empty string"
+                active_incident = incident_by_id.get(active_incident_id)
+                if active_incident is None:
+                    return "maintenance active_incident_id does not reference an incident"
+                if str(active_incident.get("state") or "").upper() not in {"OPEN", "RUNNING"}:
+                    return "maintenance active incident must be OPEN or RUNNING"
 
         roles = state["roles"]
         configured_roles = tuple(str(role).upper() for role in self.config.roles)
@@ -720,10 +752,24 @@ class TaskStore:
             raise ValueError(f"invalid CDPA task manifest in {target}: {error}")
         return dict(value)
 
-    def _save_unlocked(self, target: Path, state: Mapping[str, Any]) -> dict[str, Any]:
+    def _save_unlocked(
+        self,
+        target: Path,
+        state: Mapping[str, Any],
+        *,
+        maintenance_write: bool = False,
+    ) -> dict[str, Any]:
         value = json.loads(json.dumps(dict(state), ensure_ascii=False, default=str))
         value["schema_version"] = SCHEMA_VERSION
-        value["updated_at"] = utc_now()
+        previous_updated_at = str(value.get("updated_at") or "")
+        now = utc_now()
+        value["updated_at"] = now
+        maintenance = value.get("maintenance")
+        if maintenance_write and isinstance(maintenance, dict):
+            previous_worker_at = str(maintenance.get("worker_updated_at") or "")
+            if previous_updated_at and previous_updated_at != previous_worker_at:
+                maintenance["observed_task_updated_at"] = previous_updated_at
+            maintenance["worker_updated_at"] = now
         error = self._manifest_value_error(target, value, require_file=False)
         if error is not None:
             raise ValueError(f"refusing to write invalid CDPA task manifest {target}: {error}")
@@ -741,6 +787,40 @@ class TaskStore:
         target = Path(path).expanduser().resolve()
         with exclusive_file_lock(self._lock_path(target)):
             saved = self._save_unlocked(target, state)
+        self._sync_catalog_entry(saved)
+        return saved
+
+    def save_maintenance(
+        self,
+        path: str | Path,
+        state: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Persist only maintenance metadata without hiding task-side changes."""
+        target = Path(path).expanduser().resolve()
+        maintenance = state.get("maintenance")
+        if not isinstance(maintenance, Mapping):
+            raise ValueError("maintenance must be an object")
+        maintenance_value = json.loads(
+            json.dumps(dict(maintenance), ensure_ascii=False, default=str)
+        )
+        with exclusive_file_lock(self._lock_path(target)):
+            current = json.loads(target.read_text(encoding="utf-8"))
+            if not isinstance(current, Mapping):
+                raise ValueError(
+                    f"invalid CDPA task manifest in {target}: root must be an object"
+                )
+            current_error = self._manifest_value_error(target, current)
+            if current_error is not None:
+                raise ValueError(
+                    f"invalid CDPA task manifest in {target}: {current_error}"
+                )
+            merged = dict(current)
+            merged["maintenance"] = maintenance_value
+            saved = self._save_unlocked(
+                target,
+                merged,
+                maintenance_write=True,
+            )
         self._sync_catalog_entry(saved)
         return saved
 
@@ -762,6 +842,30 @@ class TaskStore:
             saved = self._save_unlocked(
                 target,
                 result if result is not None else current,
+            )
+        self._sync_catalog_entry(saved)
+        return saved
+
+    def update_maintenance(
+        self,
+        path: str | Path,
+        mutator: Callable[[dict[str, Any]], Mapping[str, Any] | None],
+    ) -> dict[str, Any]:
+        """Atomically mutate maintenance-owned task state under the manifest lock."""
+        target = Path(path).expanduser().resolve()
+        with exclusive_file_lock(self._lock_path(target)):
+            current = json.loads(target.read_text(encoding="utf-8"))
+            if not isinstance(current, Mapping):
+                raise ValueError(f"invalid CDPA task manifest in {target}: root must be an object")
+            current_error = self._manifest_value_error(target, current)
+            if current_error is not None:
+                raise ValueError(f"invalid CDPA task manifest in {target}: {current_error}")
+            current = dict(current)
+            result = mutator(current)
+            saved = self._save_unlocked(
+                target,
+                result if result is not None else current,
+                maintenance_write=True,
             )
         self._sync_catalog_entry(saved)
         return saved
@@ -1173,6 +1277,66 @@ class TaskStore:
             self._write_catalog_unlocked(catalog)
             return saved
 
+    def _queue_control(
+        self,
+        state: dict[str, Any],
+        action: str,
+        *,
+        role: str | None = None,
+        reason: str | None = None,
+        confirmed: bool = False,
+        maintenance_incident_id: str | None = None,
+        maintenance_request_id: str | None = None,
+    ) -> Mapping[str, Any]:
+        control_role = role
+        if action == "resume" and control_role is None:
+            control_role = str(state.get("active_role") or "PLAN").upper()
+        incident_id = str(maintenance_incident_id or "").strip() or None
+        request_id = str(maintenance_request_id or "").strip() or None
+        if (incident_id is None) != (request_id is None):
+            raise ValueError(
+                "maintenance control provenance requires both incident and request IDs"
+            )
+        normalized_reason = str(reason or "").strip() or None
+        if incident_id is not None:
+            existing = next(
+                (
+                    item
+                    for item in state.get("controls") or []
+                    if isinstance(item, Mapping)
+                    and item.get("maintenance_incident_id") == incident_id
+                    and item.get("maintenance_request_id") == request_id
+                ),
+                None,
+            )
+            if existing is not None:
+                if (
+                    existing.get("action") != action
+                    or existing.get("role") != control_role
+                    or existing.get("reason") != normalized_reason
+                ):
+                    raise ValueError(
+                        "maintenance control provenance already belongs to another payload"
+                    )
+                return existing
+        sequence = len(state.get("controls") or []) + 1
+        control = {
+            "control_id": sequence,
+            "action": action,
+            "role": control_role,
+            "reason": normalized_reason,
+            "confirmed": bool(confirmed),
+            "status": "requested",
+            "requested_at": utc_now(),
+            "applied_at": None,
+            "result": None,
+        }
+        if incident_id is not None:
+            control["maintenance_incident_id"] = incident_id
+            control["maintenance_request_id"] = request_id
+        state.setdefault("controls", []).append(control)
+        return control
+
     def request_control(
         self,
         path: str | Path,
@@ -1181,6 +1345,8 @@ class TaskStore:
         role: str | None = None,
         reason: str | None = None,
         confirmed: bool = False,
+        maintenance_incident_id: str | None = None,
+        maintenance_request_id: str | None = None,
     ) -> dict[str, Any]:
         allowed = {"pause", "resume", "retry", "stop", "restart_role", "open_tab", "new_chat", "route_plan", "clear_team"}
         action = str(action).strip().lower()
@@ -1190,23 +1356,24 @@ class TaskStore:
             role = str(role).strip().upper()
             if role not in self.config.roles:
                 raise ValueError(f"unsupported control role {role!r}")
-        if action == "resume":
+        incident_id = str(maintenance_incident_id or "").strip() or None
+        request_id = str(maintenance_request_id or "").strip() or None
+        if (incident_id is None) != (request_id is None):
+            raise ValueError(
+                "maintenance control provenance requires both incident and request IDs"
+            )
+        if action == "resume" and incident_id is None:
             return self.request_resume(path, reason=reason or "resume requested")
 
         def mutate(state: dict[str, Any]) -> dict[str, Any]:
-            sequence = len(state.get("controls") or []) + 1
-            state.setdefault("controls", []).append(
-                {
-                    "control_id": sequence,
-                    "action": action,
-                    "role": role,
-                    "reason": str(reason or "").strip() or None,
-                    "confirmed": bool(confirmed),
-                    "status": "requested",
-                    "requested_at": utc_now(),
-                    "applied_at": None,
-                    "result": None,
-                }
+            self._queue_control(
+                state,
+                action,
+                role=role,
+                reason=reason,
+                confirmed=confirmed,
+                maintenance_incident_id=incident_id,
+                maintenance_request_id=request_id,
             )
             return state
 

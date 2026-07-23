@@ -8,9 +8,16 @@
       "TEST": "prompts/cdpa/TEST.md",
       "AUDIT": "prompts/cdpa/AUDIT.md"
     },
-    "response_guide": "prompts/cdpa/RESPONSE_GUIDE.md"
+    "response_guide": "prompts/cdpa/RESPONSE_GUIDE.md",
+    "maintainers_constructor": "prompts/cdpa/MAINTAINERS.md"
   },
-  "roles": ["PLAN", "DEV", "REVIEW", "TEST", "AUDIT"],
+  "roles": [
+    "PLAN",
+    "DEV",
+    "REVIEW",
+    "TEST",
+    "AUDIT"
+  ],
   "browser": {
     "cdp_url": "http://127.0.0.1:9222",
     "workspace_timeout_seconds": 15
@@ -46,5 +53,11 @@
       "open_tab": 4,
       "close_tab": 4
     }
+  },
+  "maintenance": {
+    "timeout_seconds": 300,
+    "refresh_after_seconds": 120,
+    "stable_ms": 1000,
+    "poll_ms": 100
   }
 }

@@ -65,6 +65,7 @@ class FakeClient:
         self.preflight_calls = []
         self.prepare_calls = []
         self.bind_calls = []
+        self.clean_ready_calls = []
 
     async def snapshot(self):
         error = getattr(self.page, "snapshot_error", None)
@@ -97,6 +98,10 @@ class FakeClient:
             "previous_task_id": self.page.snapshot_value.page_task_id,
             "requires_new_chat": self.page.snapshot_value.page_task_id != task_id,
         }
+
+    async def wait_until_clean_ready(self, *, timeout_ms=None, **_kwargs):
+        self.clean_ready_calls.append(timeout_ms)
+        return self.page.snapshot_value
 
     async def bind_task_identity(self, task_id, team):
         self.bind_calls.append((task_id, team))
@@ -367,6 +372,9 @@ def test_recorded_offline_role_requires_controlled_reopen(tmp_path, monkeypatch)
     assert reopened.created is True
     assert reopened.client.binding.page_id == "reopened-page"
     assert reopened.url == "https://chatgpt.com/c/exact-conversation"
+    assert reopened.client.clean_ready_calls == [
+        round(config.workspace_timeout_seconds * 1000)
+    ]
     assert reopened.client.page.snapshot_value.page_task_id == "task-1"
     assert reopened.client.page.snapshot_value.page_team == "new-team"
     assert reopened.client.page.front is True
@@ -509,3 +517,50 @@ def test_close_team_counts_only_tabs_observed_closed(tmp_path, monkeypatch):
     assert caught.value.closed_tabs == 1
     assert closed.closed is True
     assert stuck.closed is False
+
+
+def test_global_maintainer_reuses_exactly_one_role_only_tab(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    page = FakePage(page_id="maint-1", role="MAINTAINERS", team=None, task_id=None)
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    actions = CDPATabActions(SimpleNamespace(pages=[page]), config)
+
+    acquired = asyncio.run(actions.acquire_global_role("MAINTAINERS"))
+
+    assert acquired.page_id == "maint-1"
+    assert acquired.created is False
+    assert acquired.new_chat is False
+    assert acquired.client.bind_calls == []
+    assert page.snapshot_value.page_team is None
+    assert page.snapshot_value.page_task_id is None
+
+
+def test_global_maintainer_duplicate_tabs_fail_closed(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    pages = [
+        FakePage(page_id="maint-1", role="MAINTAINERS", team=None, task_id=None),
+        FakePage(page_id="maint-2", role="MAINTAINERS", team=None, task_id=None),
+    ]
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    actions = CDPATabActions(SimpleNamespace(pages=pages), config)
+
+    with pytest.raises(RoleOwnershipError, match="multiple global tabs"):
+        asyncio.run(actions.acquire_global_role("MAINTAINERS"))
+
+
+def test_global_maintainer_opens_role_without_task_binding(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    context = FakeContext()
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    monkeypatch.setattr(actions_module, "ChatGPTWorkspace", FakeWorkspace)
+    monkeypatch.setattr(actions_module, "random_delay", lambda *_args: asyncio.sleep(0))
+    actions = CDPATabActions(context, config)
+
+    acquired = asyncio.run(actions.acquire_global_role("MAINTAINERS"))
+
+    assert acquired.created is True
+    assert acquired.page_id == "fresh-page"
+    assert acquired.client.bind_calls == []
+    assert acquired.client.page.snapshot_value.page_role == "MAINTAINERS"
+    assert acquired.client.page.snapshot_value.page_team is None
+    assert acquired.client.page.snapshot_value.page_task_id is None

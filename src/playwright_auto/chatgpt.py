@@ -564,25 +564,59 @@ def unique_new_user_message(
     return candidates[0] if len(candidates) == 1 else None
 
 
+def _receipt_user_index(
+    messages: Sequence[MessageSnapshot], receipt: SendReceipt
+) -> int | None:
+    message_id = str(receipt.user_message_id or "").strip()
+    turn_id = str(receipt.user_turn_id or "").strip()
+    expected = normalize_visible_text(receipt.prompt)
+    marker = request_marker_from_prompt(receipt.prompt)
+    matches: list[int] = []
+    for index, message in enumerate(messages):
+        if (
+            message.role != "user"
+            or message.message_id in receipt.baseline.user_message_ids
+            or message.message_id in receipt.baseline.message_ids
+        ):
+            continue
+        if message_id or turn_id:
+            matched = (
+                (bool(message_id) and message.message_id == message_id)
+                or (bool(turn_id) and message.turn_id == turn_id)
+            )
+        else:
+            visible = normalize_visible_text(message.text)
+            matched = visible == expected or bool(marker and marker in message.text)
+        if matched:
+            matches.append(index)
+    return matches[0] if len(matches) == 1 else None
+
+
 def receipt_user_message_seen(
     messages: Sequence[MessageSnapshot], receipt: SendReceipt
 ) -> bool:
-    candidates = [
-        message
-        for message in messages
-        if message.role == "user"
-        and message.message_id not in receipt.baseline.user_message_ids
-        and message.message_id not in receipt.baseline.message_ids
-    ]
-    message_id = str(receipt.user_message_id or "").strip()
-    turn_id = str(receipt.user_turn_id or "").strip()
-    if message_id or turn_id:
-        return any(
-            (bool(message_id) and message.message_id == message_id)
-            or (bool(turn_id) and message.turn_id == turn_id)
-            for message in candidates
-        )
-    return exact_prompt_seen(messages, receipt.baseline, receipt.prompt)
+    return _receipt_user_index(messages, receipt) is not None
+
+
+def assistant_turns_for_receipt(
+    messages: Sequence[MessageSnapshot], receipt: SendReceipt
+) -> tuple[MessageSnapshot, ...]:
+    user_index = _receipt_user_index(messages, receipt)
+    if user_index is None:
+        return ()
+    selected: list[MessageSnapshot] = []
+    seen: set[str] = set()
+    for message in messages[user_index + 1 :]:
+        if message.role == "user":
+            break
+        if message.role != "assistant":
+            continue
+        identity = message.turn_id or message.message_id
+        if identity in receipt.baseline.assistant_turn_ids or identity in seen:
+            continue
+        seen.add(identity)
+        selected.append(message)
+    return tuple(selected)
 
 
 def new_assistant_turns(
@@ -2498,6 +2532,8 @@ class ChatGPTPage:
         candidate_validator: Callable[[MessageSnapshot], None] | None = None,
         minimum_samples: int = 1,
         invalid_grace_ms: int | None = None,
+        expected_assistant_turn_id: str | None = None,
+        expected_assistant_message_id: str | None = None,
     ) -> MessageSnapshot:
         timeout = timeout_ms or self.timeout_ms
         if self.binding != receipt.binding:
@@ -2580,8 +2616,21 @@ class ChatGPTPage:
                 continue
 
             user_provenance = receipt_user_message_seen(snapshot.messages, receipt)
-            assistants = new_assistant_turns(snapshot.messages, receipt.baseline)
-            candidate = assistants[-1] if assistants else None
+            assistants = assistant_turns_for_receipt(snapshot.messages, receipt)
+            expected_turn = str(expected_assistant_turn_id or "").strip()
+            expected_message = str(expected_assistant_message_id or "").strip()
+            if expected_turn:
+                candidate = next(
+                    (item for item in assistants if item.turn_id == expected_turn),
+                    None,
+                )
+            elif expected_message:
+                candidate = next(
+                    (item for item in assistants if item.message_id == expected_message),
+                    None,
+                )
+            else:
+                candidate = assistants[-1] if assistants else None
             current_fingerprint = message_fingerprint(candidate)
             transport_ui_active = response_transport_ui_active(snapshot)
 

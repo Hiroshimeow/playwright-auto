@@ -11,6 +11,7 @@ from typing import Any, Mapping
 
 from .cdpa_actions import AcquiredRole, CDPATabActions, RoleOwnershipError, TeamCloseError
 from .cdpa_config import CDPAConfig, load_cdpa_config
+from .cdpa_maintenance import MaintainerCoordinator
 from .cdpa_prompts import PromptBuilder
 from .cdpa_response import (
     begin_refresh,
@@ -107,6 +108,7 @@ class CDPAWorker:
         )
         self.store = store or TaskStore(config)
         self.prompts = PromptBuilder(config)
+        self.maintainers = MaintainerCoordinator(config, store=self.store)
 
     def _block(
         self,
@@ -626,14 +628,40 @@ class CDPAWorker:
                 state["roles"][role]["constructor_sent_generation"] = None
                 result = {"page_id": acquired.page_id, "new_chat": True}
             elif action == "open_tab":
+                blocked_role_recovery = (
+                    state.get("status") == "BLOCKED"
+                    and state.get("block_code") == "role_offline"
+                )
+                if blocked_role_recovery:
+                    if hop is None or str(hop.get("target_role") or "") != role:
+                        raise RuntimeError(
+                            "blocked role reopen requires the active hop to belong to the selected role"
+                        )
+                    if hop_state != "pre_send":
+                        raise RuntimeError(
+                            "blocked role reopen may resume only an unsent pre_send hop"
+                        )
                 acquired = await actions.locate_owned(state, role)
                 recovered = acquired is None
                 if acquired is None:
                     acquired = await actions.reopen(state, role)
-                    self._record_acquired(state, role, acquired)
                 else:
                     await actions.open_tab(acquired)
+                self._record_acquired(state, role, acquired)
                 result = {"page_id": acquired.page_id, "recovered": recovered}
+                if blocked_role_recovery:
+                    state["status"] = "RUNNING"
+                    state["kanban_column"] = _column_for(role)
+                    state["block_code"] = None
+                    state["block_retryable"] = False
+                    state["block_reason"] = None
+                    state["pause_reason"] = None
+                    state["active_action"] = "resuming"
+                    result.update(
+                        resumed=True,
+                        hop_id=hop["hop_id"],
+                        request_id=hop["request_id"],
+                    )
             elif action == "route_plan":
                 if state.get("status") in TERMINAL:
                     raise RuntimeError("cannot route a terminal task to PLAN")
@@ -1558,6 +1586,11 @@ class CDPAWorker:
                 results.append(result)
         if disconnect is not None:
             raise disconnect
+        maintenance_tasks = [
+            (path, result if isinstance(result, dict) else {})
+            for path, result in zip(paths, results, strict=True)
+        ]
+        await self.maintainers.advance(maintenance_tasks, browser_context)
         return results
 
     async def run_forever(self, browser_context: Any) -> None:
