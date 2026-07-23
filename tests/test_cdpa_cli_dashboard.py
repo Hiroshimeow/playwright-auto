@@ -31,7 +31,7 @@ from playwright_auto.dashboard import (
     build_task_timeline,
 )
 
-from test_cdpa_core import write_config
+from test_cdpa_core import install_duplicate_task_graph, write_config
 
 
 class FakeWorkerActions:
@@ -1787,6 +1787,276 @@ def test_dashboard_create_rejects_explicit_invalid_report_mode(
         assert response.status == 400
         assert "report_mode" in payload["error"]
         assert tasks.discover() == []
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_cli_depends_on_flattens_commas_and_preserves_first_seen(monkeypatch, tmp_path: Path):
+    config_path = write_config(tmp_path)
+    captured = {}
+
+    def fake_submit(config, **kwargs):
+        captured.update(kwargs)
+        return {
+            "task_id": "task-child",
+            "team": "child",
+            "manifest_path": str(tmp_path / ".plan" / "child.json"),
+        }
+
+    monkeypatch.setattr(cdpa_cli_module, "submit_task", fake_submit)
+    assert cdpa_cli_module.main([
+        "Child",
+        "--team", "child",
+        "--repository", str(tmp_path),
+        "--config", str(config_path),
+        "--depends-on", "task-a,task-b",
+        "--depends-on", "task-b",
+        "--depends-on", "task-c",
+    ]) == 0
+    assert captured["depends_on_task_ids"] == ("task-a", "task-b", "task-c")
+
+
+def test_cli_rejects_depends_on_in_taskless_resume(monkeypatch, tmp_path: Path, capsys):
+    config_path = write_config(tmp_path)
+    assert cdpa_cli_module.main([
+        "--team", "alpha",
+        "--repository", str(tmp_path),
+        "--config", str(config_path),
+        "--depends-on", "task-a",
+    ]) == 2
+    assert "--depends-on" in capsys.readouterr().err
+
+
+def test_dashboard_create_dependencies_wait_and_reject_missing(tmp_path: Path):
+    config_path = write_config(tmp_path)
+    server, thread, tasks = start_dashboard_server(config_path, tmp_path)
+    try:
+        parent = tasks.create_task("Parent", requested_team="parent", task_id="task-parent")
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        body = json.dumps({
+            "task": "Child",
+            "repository": str(tmp_path),
+            "team": "child",
+            "depends_on_task_ids": ["task-parent"],
+        })
+        connection.request("POST", "/api/tasks", body=body, headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+        assert response.status == 201
+        assert payload["status"] == "WAITING"
+        assert payload["depends_on_task_ids"] == ["task-parent"]
+        assert payload["waiting_on_task_ids"] == ["task-parent"]
+
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        bad = json.dumps({
+            "task": "Missing",
+            "repository": str(tmp_path),
+            "team": "missing",
+            "depends_on_task_ids": ["not-found"],
+        })
+        connection.request("POST", "/api/tasks", body=bad, headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        assert response.status == 400
+        assert "missing dependency" in json.loads(response.read())["error"]
+        assert all(task["task_id"] != "not-found-child" for task in tasks.discover())
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_dashboard_html_exposes_dependency_creation_and_status_projection():
+    html = dashboard_module.DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+    assert 'id="create-dependencies-input"' in html
+    assert "depends_on_task_ids" in html
+    assert "Stopped dependencies" in html
+    assert "Missing dependencies" in html
+    assert "queue_position" in html  # existing placeholder remains only; Phase 5 is not implemented.
+
+
+def test_dashboard_control_recovers_phase4_before_task_lookup(tmp_path: Path, monkeypatch):
+    config_path = write_config(tmp_path)
+    server, thread, tasks = start_dashboard_server(config_path, tmp_path)
+    task = tasks.create_task(
+        "dashboard recovery order",
+        requested_team="alpha",
+        task_id="task-dashboard-recovery-order",
+    )
+    calls: list[str] = []
+    original_recover = tasks.recover_phase4_replacement
+    original_discover = tasks.discover_with_errors
+
+    def recover():
+        calls.append("recover")
+        return original_recover()
+
+    def discover():
+        assert calls and calls[0] == "recover"
+        calls.append("discover")
+        return original_discover()
+
+    monkeypatch.setattr(tasks, "recover_phase4_replacement", recover)
+    monkeypatch.setattr(tasks, "discover_with_errors", discover)
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        connection.request(
+            "POST",
+            f"/api/tasks/{task['task_id']}/controls",
+            body=json.dumps({"action": "pause", "reason": "operator"}),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+        assert response.status == 202, payload
+        assert payload["controls"][-1]["action"] == "pause"
+        assert calls[0:2] == ["recover", "discover"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_dashboard_resume_rejects_replaced_blocked_parent_without_mutation(tmp_path: Path):
+    config_path = write_config(tmp_path)
+    server, thread, tasks = start_dashboard_server(config_path, tmp_path)
+    parent = tasks.create_task("Parent", requested_team="parent", task_id="task-parent")
+    child = tasks.create_task(
+        "Child",
+        requested_team="child",
+        task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+    parent = tasks.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "BLOCKED",
+            "kanban_column": "BLOCKED",
+            "block_code": "send_failed",
+            "block_reason": "unsafe blocked parent",
+            "block_retryable": False,
+        },
+    )
+    result = tasks.replace_task_and_rewire(
+        "task-parent",
+        "Replacement parent",
+        reuse_team=False,
+        rewire_children=True,
+        incident_id="maint-dashboard-resume-immutable",
+    )
+    parent_path = Path(parent["manifest_path"])
+    parent_before = parent_path.read_bytes()
+    catalog_before = tasks.catalog_path.read_bytes()
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        connection.request(
+            "POST",
+            "/api/tasks/resume",
+            body=json.dumps({"repository": str(tmp_path), "team": "parent"}),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+
+        assert response.status == 400
+        assert "immutable history" in payload["error"]
+        assert parent_path.read_bytes() == parent_before
+        assert tasks.catalog_path.read_bytes() == catalog_before
+        assert tasks.load(child["manifest_path"])["depends_on_task_ids"] == [
+            result["replacement"]["task_id"]
+        ]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_missing_task_get_returns_404_without_python_exception_name(tmp_path: Path):
+    config_path = write_config(tmp_path)
+    server, thread, _tasks = start_dashboard_server(config_path, tmp_path)
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        connection.request("GET", "/api/tasks/does-not-exist")
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+
+        assert response.status == 404
+        assert payload == {"error": "task not found"}
+        assert "StopIteration" not in json.dumps(payload)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_dashboard_create_unrelated_task_survives_duplicate_diagnostics(tmp_path: Path):
+    config_path = write_config(tmp_path)
+    server, thread, tasks = start_dashboard_server(config_path, tmp_path)
+    install_duplicate_task_graph(tasks)
+
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        connection.request(
+            "POST",
+            "/api/tasks",
+            body=json.dumps(
+                {
+                    "task": "Dashboard unrelated after duplicate corruption",
+                    "repository": str(tmp_path),
+                    "team": "gamma",
+                }
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+
+        assert response.status == 201, payload
+        assert payload["team"] == "gamma"
+        assert payload["task_id"]
+        discovered, errors = tasks.discover_with_errors()
+        assert {task["task_id"] for task in discovered} == {
+            "unique-task",
+            payload["task_id"],
+        }
+        assert len(errors) == 3
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_duplicate_task_get_returns_409_without_selecting_one_manifest(tmp_path: Path):
+    config_path = write_config(tmp_path)
+    server, thread, tasks = start_dashboard_server(config_path, tmp_path)
+    states = install_duplicate_task_graph(tasks)
+    discovered, errors = tasks.discover_with_errors()
+    assert [task["task_id"] for task in discovered] == ["unique-task"]
+    assert {item["manifest_path"] for item in errors} == {
+        states["alpha"]["manifest_path"],
+        states["beta"]["manifest_path"],
+        states["child"]["manifest_path"],
+    }
+
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        connection.request("GET", "/api/tasks/dup-task")
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+
+        assert response.status == 409
+        assert set(payload) == {"error"}
+        assert "duplicate task ID 'dup-task'" in payload["error"]
+
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        connection.request("GET", "/api/tasks")
+        response = connection.getresponse()
+        listing = json.loads(response.read())
+        assert response.status == 200
+        assert [task["task_id"] for task in listing["tasks"]] == ["unique-task"]
+        assert len(listing["errors"]) == 3
     finally:
         server.shutdown()
         server.server_close()

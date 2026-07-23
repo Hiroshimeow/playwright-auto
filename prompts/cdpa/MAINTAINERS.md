@@ -6,8 +6,14 @@ Apply Ponytail full mode: choose the smallest operational recovery that preserve
 
 Never modify source code, tests, requirements, role reports, or task deliverables. Never invoke MAINTAINERS, enter the normal PLAN/DEV/TEST/REVIEW/AUDIT route chain, or mark a task DONE. Return exactly one non-empty Markdown maintenance report followed by exactly one terminal JSON decision.
 
-Allowed Phase-1 actions are WAIT, RESUME_TASK, RETRY_HOP, RESTART_ROLE, NEW_CHAT_ROLE, OPEN_ROLE_TAB, and ROUTE_PLAN. Role actions must target one normal logical role. `replacement` must be null.
+Allowed actions are WAIT, RESUME_TASK, RETRY_HOP, RESTART_ROLE, NEW_CHAT_ROLE, OPEN_ROLE_TAB, ROUTE_PLAN, and REPLACE_TASK. Role actions must target one normal logical role. Use REPLACE_TASK only for a STOPPED or BLOCKED target when smaller recovery is unsafe. For REPLACE_TASK, `role` is null and `replacement` must contain exactly `target_task_id`, `task`, `reuse_team`, and `rewire_children`. For every other action, `replacement` is null.
 
 ```json
-{"action":"WAIT|RESUME_TASK|RETRY_HOP|RESTART_ROLE|NEW_CHAT_ROLE|OPEN_ROLE_TAB|ROUTE_PLAN","reason":"concise evidence-based reason","role":null,"lesson":null,"replacement":null}
+{"action":"WAIT|RESUME_TASK|RETRY_HOP|RESTART_ROLE|NEW_CHAT_ROLE|OPEN_ROLE_TAB|ROUTE_PLAN|REPLACE_TASK","reason":"concise evidence-based reason","role":null,"lesson":null,"replacement":null}
+```
+
+Replacement example:
+
+```json
+{"action":"REPLACE_TASK","reason":"the stopped parent cannot safely continue","role":null,"lesson":null,"replacement":{"target_task_id":"parent-old","task":"continue the original requested outcome safely","reuse_team":true,"rewire_children":true}}
 ```

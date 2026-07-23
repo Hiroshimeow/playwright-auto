@@ -11,6 +11,7 @@ from typing import Any, Mapping
 
 from .cdpa_actions import AcquiredRole, CDPATabActions, RoleOwnershipError, TeamCloseError
 from .cdpa_config import CDPAConfig, load_cdpa_config
+from .cdpa_dependencies import dependency_readiness
 from .cdpa_maintenance import MaintainerCoordinator
 from .cdpa_prompts import PromptBuilder
 from .cdpa_response import (
@@ -32,7 +33,7 @@ from .cdpa_routes import (
     parse_role_response,
     validate_report,
 )
-from .cdpa_store import TaskStore, report_mode_from_options, utc_now
+from .cdpa_store import TaskStore, normalize_dependency_ids, report_mode_from_options, utc_now
 from .cdpa_team import cleanup_eligible
 from .chatgpt import (
     ChoicePromptBlockedError,
@@ -150,6 +151,93 @@ class CDPAWorker:
             except RuntimeError:
                 pass
         return state
+
+    def _apply_dependency_readiness(
+        self,
+        state: dict[str, Any],
+        tasks: list[Mapping[str, Any]],
+    ) -> bool:
+        dependencies = normalize_dependency_ids(state.get("depends_on_task_ids"))
+        if not dependencies or str(state.get("status") or "").upper() in TERMINAL:
+            return False
+        readiness = dependency_readiness(state, tasks)
+        waiting = state.get("waiting") if isinstance(state.get("waiting"), Mapping) else {}
+        desired = {
+            "reason": None if readiness.ready else "dependency",
+            "waiting_on": list(readiness.waiting_on),
+            "stopped": list(readiness.stopped),
+            "missing": list(readiness.missing),
+            "since": (
+                None
+                if readiness.ready
+                else waiting.get("since") or utc_now()
+            ),
+        }
+        status = str(state.get("status") or "").upper()
+        if readiness.ready:
+            if status != "WAITING" or waiting.get("reason") != "dependency":
+                return False
+            now = utc_now()
+            state.update(
+                status="INBOX",
+                kanban_column="INBOX",
+                active_action="queued",
+                waiting_reason=None,
+                waiting_code=None,
+                waiting=desired,
+            )
+            state.setdefault("dependency_events", []).append(
+                {
+                    "at": now,
+                    "status": "RELEASED",
+                    "message": "All dependencies are DONE; task released to PLAN",
+                    "waiting_on": [],
+                    "stopped": [],
+                    "missing": [],
+                }
+            )
+            return True
+
+        code = (
+            "dependency_missing"
+            if readiness.missing
+            else "dependency_stopped"
+            if readiness.stopped
+            else "dependency"
+        )
+        blocked_ids = [*readiness.waiting_on, *readiness.missing]
+        reason = "Waiting for dependencies: " + ", ".join(blocked_ids)
+        unchanged = (
+            status == "WAITING"
+            and waiting.get("reason") == "dependency"
+            and list(waiting.get("waiting_on") or []) == desired["waiting_on"]
+            and list(waiting.get("stopped") or []) == desired["stopped"]
+            and list(waiting.get("missing") or []) == desired["missing"]
+            and state.get("waiting_code") == code
+            and state.get("waiting_reason") == reason
+        )
+        if unchanged:
+            return False
+        now = utc_now()
+        state.update(
+            status="WAITING",
+            kanban_column="WAITING",
+            active_action="waiting_dependency",
+            waiting_reason=reason,
+            waiting_code=code,
+            waiting=desired,
+        )
+        state.setdefault("dependency_events", []).append(
+            {
+                "at": now,
+                "status": "WAITING",
+                "message": reason,
+                "waiting_on": list(readiness.waiting_on),
+                "stopped": list(readiness.stopped),
+                "missing": list(readiness.missing),
+            }
+        )
+        return True
 
     def _start_wait_budget_from_sent(self, hop: dict[str, Any]) -> None:
         sent_at = parse_time((hop.get("timestamps") or {}).get("sent_at"))
@@ -1493,6 +1581,22 @@ class CDPAWorker:
         try:
             with self.store.task_run_lock(path, blocking=False):
                 state = self.store.load(path)
+                try:
+                    dependency_changed = self._apply_dependency_readiness(
+                        state, self.store.discover_with_errors()[0]
+                    )
+                except Exception as exc:
+                    self._block(
+                        state,
+                        f"{type(exc).__name__}: {exc}",
+                        code="dependency_invalid",
+                        retryable=False,
+                    )
+                    return self.store.save(path, state)
+                if dependency_changed:
+                    return self.store.save(path, state)
+                if state.get("status") == "WAITING":
+                    return state
                 actions = CDPATabActions(browser_context, self.config)
                 if state.get("cleanup", {}).get("state") == "CLEARING":
                     await self._continue_cleanup(state, actions, path)
@@ -1613,7 +1717,9 @@ class CDPAWorker:
                 raise
 
     async def run_once(self, browser_context: Any) -> list[dict[str, Any] | None]:
-        paths = self.store.discover_paths()
+        self.store.recover_phase4_replacement()
+        tasks, _errors = self.store.discover_with_errors()
+        paths = [Path(task["manifest_path"]) for task in tasks]
         raw_results = await asyncio.gather(
             *(self.advance(path, browser_context) for path in paths),
             return_exceptions=True,

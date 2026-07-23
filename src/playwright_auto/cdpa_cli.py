@@ -24,6 +24,17 @@ def parse_new_roles(value: str | None) -> tuple[str, ...]:
     )
 
 
+def parse_dependency_ids(values: Sequence[str] | None) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            part.strip()
+            for value in values or ()
+            for part in str(value).split(",")
+            if part.strip()
+        )
+    )
+
+
 def _read_json(url: str, *, timeout: float) -> Mapping[str, Any]:
     try:
         with urlopen(Request(url, method="GET"), timeout=timeout) as response:
@@ -83,6 +94,7 @@ def submit_task(
     new_roles: Sequence[str],
     new_all: bool,
     report_mode: str = "file",
+    depends_on_task_ids: Sequence[str] = (),
 ) -> Mapping[str, Any]:
     return _post(
         config,
@@ -94,6 +106,7 @@ def submit_task(
             "new_roles": list(new_roles),
             "new_all": bool(new_all),
             "report_mode": str(report_mode),
+            "depends_on_task_ids": list(depends_on_task_ids),
         },
         expected_status=201,
     )
@@ -275,6 +288,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="write role reports from response Markdown instead of agent-created files",
     )
+    parser.add_argument(
+        "--depends-on",
+        action="append",
+        default=[],
+        help="dependency task ID; repeat or separate values with commas",
+    )
     parser.add_argument("--repository", default=".", help="task repository/worktree")
     parser.add_argument(
         "--config",
@@ -319,6 +338,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = load_cdpa_config(args.config, repository_root=repository)
         task = str(args.task or "").strip()
         new_roles = parse_new_roles(args.new_roles)
+        dependencies = parse_dependency_ids(args.depends_on)
         if task:
             state = submit_task(
                 config,
@@ -328,14 +348,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 new_roles=new_roles,
                 new_all=bool(args.new_all),
                 report_mode="inline" if args.inline_report else "file",
+                depends_on_task_ids=dependencies,
             )
             mode = "created"
         else:
             if not args.team:
                 raise ValueError("taskless resume requires --team <exact-existing-team>")
-            if new_roles or args.new_all or args.inline_report:
+            if new_roles or args.new_all or args.inline_report or dependencies:
                 raise ValueError(
-                    "--new, --new-all, and --inline-report are invalid in taskless resume mode"
+                    "--new, --new-all, --inline-report, and --depends-on are invalid in taskless resume mode"
                 )
             state = resume_task(config, repository=repository, team=str(args.team))
             mode = "resumed"

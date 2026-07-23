@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 import re
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from .cdpa_config import CDPAConfig
+from .cdpa_dependencies import dependency_readiness, validate_new_dependencies
 from .cdpa_team import (
     allocate_team,
     normalize_team_base,
@@ -24,7 +26,7 @@ CATALOG_VERSION = 1
 TERMINAL = frozenset({"DONE", "STOPPED"})
 _TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
-_TASK_STATUSES = frozenset({"INBOX", "RUNNING", "PAUSED", "BLOCKED", "DONE", "STOPPED"})
+_TASK_STATUSES = frozenset({"INBOX", "WAITING", "RUNNING", "PAUSED", "BLOCKED", "DONE", "STOPPED"})
 _HOP_STATES = frozenset({"pre_send", "sending", "sent", "waiting", "responded", "routed", "abandoned"})
 _CLEANUP_STATES = frozenset({"ACTIVE", "CLEARING", "CLEARED"})
 _MAINTENANCE_STATES = frozenset({"OPEN", "RUNNING", "RESOLVED", "ESCALATED"})
@@ -46,8 +48,99 @@ def report_mode_from_options(options: Mapping[str, Any]) -> str:
     return normalize_report_mode(options["report_mode"])
 
 
+def normalize_dependency_ids(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("depends_on_task_ids must be a list")
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("dependency IDs must be non-empty strings")
+        task_id = item.strip()
+        if task_id in seen:
+            raise ValueError(f"duplicate dependency ID: {task_id}")
+        seen.add(task_id)
+        result.append(task_id)
+    return tuple(result)
+
+
+def _optional_nonempty_string(value: Any, field: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be null or a non-empty string")
+    return value.strip()
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def retained_report_references(
+    state: Mapping[str, Any], *, limit: int = 20
+) -> list[dict[str, Any]]:
+    reports = state.get("reports")
+    if not isinstance(reports, list) or limit <= 0:
+        return []
+    references: list[dict[str, Any]] = []
+    for report in reports[-limit:]:
+        if not isinstance(report, Mapping):
+            continue
+        path = str(report.get("path") or "").strip()
+        if not path:
+            continue
+        references.append(
+            {
+                "report_id": report.get("report_id"),
+                "physical_role": str(report.get("physical_role") or "") or None,
+                "turn": report.get("turn"),
+                "path": path,
+            }
+        )
+    return references
+
+
+def replacement_continuation_text(
+    target: Mapping[str, Any], recovery_instruction: str
+) -> str:
+    task_id = str(target.get("task_id") or "").strip()
+    original = str(target.get("task_text") or "").strip()
+    repository = str(target.get("repository") or "").strip()
+    instruction = str(recovery_instruction).strip()
+    if not task_id or not original or not repository or not instruction:
+        raise ValueError("replacement continuation context is incomplete")
+    reports = retained_report_references(target)
+    report_lines = [
+        "- "
+        + " ".join(
+            (
+                f"report_id={report['report_id']}",
+                f"role={report['physical_role']}",
+                f"turn={report['turn']}",
+                f"path={report['path']}",
+            )
+        )
+        for report in reports
+    ] or ["- none"]
+    return "\n".join(
+        [
+            f"Continue replaced CDPA task {task_id}.",
+            "",
+            "Maintainers recovery instruction:",
+            instruction,
+            "",
+            "Original requested outcome:",
+            original,
+            "",
+            "Repository/worktree:",
+            repository,
+            "",
+            "Retained role reports from the replaced task:",
+            *report_lines,
+        ]
+    )
 
 
 def slugify(value: str, *, maximum: int = 72) -> str:
@@ -74,6 +167,7 @@ class TaskStore:
         self.root = config.plans_root
         self.allocation_lock = self.root / ".cdpa-allocation.lock"
         self.catalog_path = self.root / ".cdpa-catalog.json"
+        self.phase4_journal_path = self.root / ".cdpa-phase4-replacement.journal"
 
     def _lock_path(self, manifest_path: Path) -> Path:
         return manifest_path.with_suffix(manifest_path.suffix + ".lock")
@@ -276,20 +370,6 @@ class TaskStore:
             if items[0][2]
         }
 
-    def _sync_catalog_entry(self, state: Mapping[str, Any]) -> None:
-        target = Path(str(state.get("manifest_path") or "")).expanduser().resolve()
-        error = self._manifest_value_error(target, state)
-        if error is not None:
-            raise ValueError(f"refusing to catalog invalid CDPA task manifest {target}: {error}")
-        self.root.mkdir(parents=True, exist_ok=True)
-        with exclusive_file_lock(self.allocation_lock):
-            catalog = self._load_catalog_unlocked(reconcile=True)
-            key = self._catalog_key(state["manifest_path"])
-            entry = self._catalog_entry(state)
-            if catalog["entries"].get(key) != entry:
-                catalog["entries"][key] = entry
-                self._write_catalog_unlocked(catalog)
-
     def _manifest_value_error(
         self,
         path: str | Path,
@@ -379,8 +459,38 @@ class TaskStore:
                 return f"task manifest field {key!r} has invalid type"
         try:
             report_mode_from_options(state["options"])
+            dependencies = normalize_dependency_ids(state.get("depends_on_task_ids"))
+            _optional_nonempty_string(state.get("replaces_task_id"), "replaces_task_id")
+            _optional_nonempty_string(
+                state.get("replacement_incident_id"),
+                "replacement_incident_id",
+            )
         except ValueError as exc:
-            return f"task manifest options.{exc}"
+            return f"task manifest {exc}"
+        if task_id in dependencies:
+            return "task cannot depend on itself"
+        dependency_events = state.get("dependency_events")
+        if dependency_events is not None:
+            if not isinstance(dependency_events, list):
+                return "dependency_events must be a list"
+            if any(not isinstance(item, Mapping) for item in dependency_events):
+                return "dependency event must be an object"
+        waiting = state.get("waiting")
+        if waiting is not None:
+            if not isinstance(waiting, Mapping):
+                return "waiting must be an object"
+            if waiting.get("reason") not in {None, "dependency"}:
+                return "waiting reason is invalid"
+            for field in ("waiting_on", "stopped", "missing"):
+                try:
+                    normalize_dependency_ids(waiting.get(field, []))
+                except ValueError as exc:
+                    return f"waiting.{field} {exc}"
+            since = waiting.get("since")
+            if since is not None and (not isinstance(since, str) or not since.strip()):
+                return "waiting.since must be null or a non-empty string"
+        elif status == "WAITING":
+            return "WAITING task must contain waiting state"
 
         maintenance = state.get("maintenance")
         if maintenance is not None:
@@ -680,7 +790,13 @@ class TaskStore:
         return sorted(set(self._filesystem_primary_paths()) | set(self._catalog_existing_paths()))
 
     def discover(self) -> list[dict[str, Any]]:
-        return [self.load(path) for path in self.discover_paths()]
+        tasks: list[dict[str, Any]] = []
+        for path in self.discover_paths():
+            try:
+                tasks.append(self.load(path))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                continue
+        return tasks
 
     def discover_with_errors(
         self,
@@ -761,6 +877,72 @@ class TaskStore:
             )
         return tasks, errors
 
+    def _dependency_states(
+        self,
+        *,
+        target: Path | None = None,
+        state: Mapping[str, Any] | None = None,
+    ) -> list[tuple[Path, Mapping[str, Any]]]:
+        records: list[tuple[Path, Mapping[str, Any]]] = []
+        for candidate in self._filesystem_manifest_like_paths():
+            if target is not None and candidate == target:
+                continue
+            try:
+                value = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(value, Mapping)
+                and self._manifest_value_error(candidate, value) is None
+            ):
+                records.append((candidate, value))
+        if target is not None and state is not None:
+            records.append((target, state))
+        return records
+
+    @staticmethod
+    def _duplicate_dependency_task_ids(
+        records: Sequence[tuple[Path, Mapping[str, Any]]],
+    ) -> set[str]:
+        counts: dict[str, int] = {}
+        for _path, item in records:
+            task_id = str(item.get("task_id") or "")
+            counts[task_id] = counts.get(task_id, 0) + 1
+        return {task_id for task_id, count in counts.items() if task_id and count > 1}
+
+    def duplicate_task_ids(self) -> set[str]:
+        return self._duplicate_dependency_task_ids(self._dependency_states())
+
+    def _dependency_graph_error(
+        self,
+        target: Path,
+        state: Mapping[str, Any],
+    ) -> str | None:
+        records = self._dependency_states(target=target, state=state)
+        duplicate_ids = self._duplicate_dependency_task_ids(records)
+        task_id = str(state.get("task_id") or "")
+        if task_id in duplicate_ids:
+            return f"duplicate task ID {task_id!r}"
+        parent_ids = normalize_dependency_ids(state.get("depends_on_task_ids"))
+        ambiguous = [parent_id for parent_id in parent_ids if parent_id in duplicate_ids]
+        if ambiguous:
+            return f"ambiguous dependency task(s): {ambiguous!r}"
+        tasks = [
+            item
+            for path, item in records
+            if path != target and str(item.get("task_id") or "") not in duplicate_ids
+        ]
+        try:
+            validate_new_dependencies(
+                task_id,
+                parent_ids,
+                tasks,
+                allow_missing=True,
+            )
+        except ValueError as exc:
+            return str(exc)
+        return None
+
     def load(self, path: str | Path) -> dict[str, Any]:
         target = Path(path).expanduser().resolve()
         with exclusive_file_lock(self._lock_path(target)):
@@ -768,6 +950,8 @@ class TaskStore:
         if not isinstance(value, Mapping):
             raise ValueError(f"invalid CDPA task manifest in {target}: root must be an object")
         error = self._manifest_value_error(target, value)
+        if error is None:
+            error = self._dependency_graph_error(target, value)
         if error is not None:
             raise ValueError(f"invalid CDPA task manifest in {target}: {error}")
         return dict(value)
@@ -791,6 +975,8 @@ class TaskStore:
                 maintenance["observed_task_updated_at"] = previous_updated_at
             maintenance["worker_updated_at"] = now
         error = self._manifest_value_error(target, value, require_file=False)
+        if error is None:
+            error = self._dependency_graph_error(target, value)
         if error is not None:
             raise ValueError(f"refusing to write invalid CDPA task manifest {target}: {error}")
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -803,12 +989,90 @@ class TaskStore:
         fsync_parent_directory(target)
         return value
 
+    def _load_current_manifest_unlocked(self, target: Path) -> dict[str, Any]:
+        current = json.loads(target.read_text(encoding="utf-8"))
+        if not isinstance(current, Mapping):
+            raise ValueError(
+                f"invalid CDPA task manifest in {target}: root must be an object"
+            )
+        error = self._manifest_value_error(target, current)
+        if error is not None:
+            raise ValueError(f"invalid CDPA task manifest in {target}: {error}")
+        return dict(current)
+
+    def _assert_manifest_mutable_unlocked(
+        self,
+        target: Path,
+        current: Mapping[str, Any],
+    ) -> None:
+        task_id = str(current.get("task_id") or "")
+        for candidate in self._filesystem_primary_paths():
+            if candidate == target:
+                continue
+            replacement = self._primary_manifest_state(candidate)
+            if replacement is not None and replacement.get("replaces_task_id") == task_id:
+                raise ValueError(
+                    f"task {task_id!r} is immutable history after replacement"
+                )
+
+    def _catalog_saved_manifest_unlocked(self, saved: Mapping[str, Any]) -> None:
+        target = Path(str(saved["manifest_path"])).expanduser().resolve()
+        catalog = self._load_catalog_unlocked(reconcile=True)
+        key = self._catalog_key(target)
+        entry = self._catalog_entry(saved)
+        if catalog["entries"].get(key) != entry:
+            catalog["entries"][key] = entry
+            self._write_catalog_unlocked(catalog)
+
+    def _mutate_manifest(
+        self,
+        target: Path,
+        mutator: Callable[[dict[str, Any]], Mapping[str, Any] | None],
+        *,
+        maintenance_write: bool = False,
+        expected_updated_at: str | None = None,
+    ) -> dict[str, Any]:
+        self.root.mkdir(parents=True, exist_ok=True)
+        with exclusive_file_lock(self.allocation_lock):
+            recovered = self._recover_phase4_replacement_unlocked()
+            with exclusive_file_lock(self._lock_path(target)):
+                current = self._load_current_manifest_unlocked(target)
+                self._assert_manifest_mutable_unlocked(target, current)
+                if (
+                    recovered is not None
+                    and expected_updated_at is not None
+                    and str(current.get("updated_at") or "") != expected_updated_at
+                ):
+                    raise ValueError(
+                        "task changed during Phase-4 recovery; reload before saving"
+                    )
+                result = mutator(current)
+                saved = self._save_unlocked(
+                    target,
+                    result if result is not None else current,
+                    maintenance_write=maintenance_write,
+                )
+            self._catalog_saved_manifest_unlocked(saved)
+            return saved
+
     def save(self, path: str | Path, state: Mapping[str, Any]) -> dict[str, Any]:
         target = Path(path).expanduser().resolve()
-        with exclusive_file_lock(self._lock_path(target)):
-            saved = self._save_unlocked(target, state)
-        self._sync_catalog_entry(saved)
-        return saved
+        replacement = json.loads(json.dumps(dict(state), ensure_ascii=False, default=str))
+
+        def replace_current(current: dict[str, Any]) -> dict[str, Any]:
+            if normalize_dependency_ids(current.get("depends_on_task_ids")) != normalize_dependency_ids(
+                replacement.get("depends_on_task_ids")
+            ):
+                raise ValueError(
+                    "task dependencies changed; reload before saving"
+                )
+            return replacement
+
+        return self._mutate_manifest(
+            target,
+            replace_current,
+            expected_updated_at=str(replacement.get("updated_at") or ""),
+        )
 
     def save_maintenance(
         self,
@@ -823,26 +1087,16 @@ class TaskStore:
         maintenance_value = json.loads(
             json.dumps(dict(maintenance), ensure_ascii=False, default=str)
         )
-        with exclusive_file_lock(self._lock_path(target)):
-            current = json.loads(target.read_text(encoding="utf-8"))
-            if not isinstance(current, Mapping):
-                raise ValueError(
-                    f"invalid CDPA task manifest in {target}: root must be an object"
-                )
-            current_error = self._manifest_value_error(target, current)
-            if current_error is not None:
-                raise ValueError(
-                    f"invalid CDPA task manifest in {target}: {current_error}"
-                )
-            merged = dict(current)
-            merged["maintenance"] = maintenance_value
-            saved = self._save_unlocked(
-                target,
-                merged,
-                maintenance_write=True,
-            )
-        self._sync_catalog_entry(saved)
-        return saved
+
+        def merge(current: dict[str, Any]) -> dict[str, Any]:
+            current["maintenance"] = maintenance_value
+            return current
+
+        return self._mutate_manifest(
+            target,
+            merge,
+            maintenance_write=True,
+        )
 
     def update(
         self,
@@ -850,21 +1104,7 @@ class TaskStore:
         mutator: Callable[[dict[str, Any]], Mapping[str, Any] | None],
     ) -> dict[str, Any]:
         target = Path(path).expanduser().resolve()
-        with exclusive_file_lock(self._lock_path(target)):
-            current = json.loads(target.read_text(encoding="utf-8"))
-            if not isinstance(current, Mapping):
-                raise ValueError(f"invalid CDPA task manifest in {target}: root must be an object")
-            current_error = self._manifest_value_error(target, current)
-            if current_error is not None:
-                raise ValueError(f"invalid CDPA task manifest in {target}: {current_error}")
-            current = dict(current)
-            result = mutator(current)
-            saved = self._save_unlocked(
-                target,
-                result if result is not None else current,
-            )
-        self._sync_catalog_entry(saved)
-        return saved
+        return self._mutate_manifest(target, mutator)
 
     def update_maintenance(
         self,
@@ -873,22 +1113,11 @@ class TaskStore:
     ) -> dict[str, Any]:
         """Atomically mutate maintenance-owned task state under the manifest lock."""
         target = Path(path).expanduser().resolve()
-        with exclusive_file_lock(self._lock_path(target)):
-            current = json.loads(target.read_text(encoding="utf-8"))
-            if not isinstance(current, Mapping):
-                raise ValueError(f"invalid CDPA task manifest in {target}: root must be an object")
-            current_error = self._manifest_value_error(target, current)
-            if current_error is not None:
-                raise ValueError(f"invalid CDPA task manifest in {target}: {current_error}")
-            current = dict(current)
-            result = mutator(current)
-            saved = self._save_unlocked(
-                target,
-                result if result is not None else current,
-                maintenance_write=True,
-            )
-        self._sync_catalog_entry(saved)
-        return saved
+        return self._mutate_manifest(
+            target,
+            mutator,
+            maintenance_write=True,
+        )
 
     @contextmanager
     def task_run_lock(self, path: str | Path, *, blocking: bool = False) -> Iterator[None]:
@@ -896,6 +1125,181 @@ class TaskStore:
         lock = target.with_suffix(target.suffix + ".run.lock")
         with exclusive_file_lock(lock, blocking=blocking):
             yield
+
+    def _initial_task_state(
+        self,
+        *,
+        text: str,
+        requested_team: str | None,
+        task_id: str,
+        repository_path: Path,
+        base: str,
+        team: str,
+        suffix: int,
+        reusable_teams: list[str],
+        target: Path,
+        normalized_new: tuple[str, ...],
+        new_all: bool,
+        normalized_report_mode: str,
+        normalized_dependencies: tuple[str, ...],
+        normalized_replaces: str | None,
+        normalized_incident: str | None,
+        readiness: Any,
+        now: str,
+    ) -> dict[str, Any]:
+        roles = {}
+        for logical in self.config.roles:
+            roles[logical] = {
+                "logical_role": logical,
+                "physical_role": physical_role(logical, base, suffix),
+                "status": "pending" if logical == "PLAN" else "unallocated",
+                "turn": 0,
+                "page_id": None,
+                "page_url": None,
+                "online": False,
+                "conversation_generation": 0,
+                "constructor_sent_generation": None,
+                "reset_requested": bool(new_all or logical in normalized_new),
+                "reset_applied_generation": None,
+                "last_activity_at": None,
+                "last_error": None,
+            }
+        hop = {
+            "hop_id": 1,
+            "parent_hop_id": None,
+            "source_role": None,
+            "target_role": "PLAN",
+            "physical_role": roles["PLAN"]["physical_role"],
+            "turn": 1,
+            "kind": "task",
+            "handoff": text,
+            "state": "pre_send",
+            "request_id": f"{task_id}-hop1",
+            "prompt": None,
+            "prompt_sha256": None,
+            "rendered_prompt_sha256": None,
+            "ledger_path": str((target.parent / "requests.json").resolve()),
+            "receipt": None,
+            "message_identity": None,
+            "response": None,
+            "response_sha256": None,
+            "report_path": None,
+            "report_sha256": None,
+            "report_size": None,
+            "route": None,
+            "repair_attempt": 0,
+            "validation_error": None,
+            "wait": {
+                "started_at": None,
+                "deadline_at": None,
+                "continuous_responding_since": None,
+                "activity_signature": None,
+                "activity_length": 0,
+                "activity_changed_at": None,
+                "activity_observed_at": None,
+                "transport_ui_active": False,
+                "last_stop_visible": False,
+                "refresh_count": 0,
+                "last_refresh_at": None,
+                "refresh_in_progress": None,
+                "recovery_baseline": None,
+            },
+            "timestamps": {"created_at": now},
+            "errors": [],
+        }
+        waiting_ids = [*readiness.waiting_on, *readiness.missing]
+        waiting_reason = (
+            None
+            if readiness.ready
+            else "Waiting for dependencies: " + ", ".join(waiting_ids)
+        )
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "manifest_path": str(target),
+            "task_id": task_id,
+            "task_title": text.splitlines()[0],
+            "task_text": text,
+            "task_slug": slugify(text),
+            "repository": str(repository_path),
+            "requested_team": requested_team,
+            "team_base": base,
+            "team": team,
+            "team_suffix": suffix,
+            "reusable_teams": reusable_teams,
+            "status": "INBOX" if readiness.ready else "WAITING",
+            "kanban_column": "INBOX" if readiness.ready else "WAITING",
+            "terminal_state": None,
+            "active_role": "PLAN",
+            "active_hop_id": 1,
+            "active_action": "queued" if readiness.ready else "waiting_dependency",
+            "pause_reason": None,
+            "waiting_reason": waiting_reason,
+            "waiting_code": None if readiness.ready else (
+                "dependency_missing" if readiness.missing else
+                "dependency_stopped" if readiness.stopped else "dependency"
+            ),
+            "block_code": None,
+            "block_retryable": False,
+            "block_reason": None,
+            "stop_reason": None,
+            "created_at": now,
+            "updated_at": now,
+            "started_at": None,
+            "completed_at": None,
+            "stopped_at": None,
+            "last_role_activity_at": None,
+            "options": {
+                "new_roles": list(normalized_new),
+                "new_all": bool(new_all),
+                "report_mode": normalized_report_mode,
+            },
+            "depends_on_task_ids": list(normalized_dependencies),
+            "replaces_task_id": normalized_replaces,
+            "replacement_incident_id": normalized_incident,
+            "dependency_events": (
+                []
+                if readiness.ready
+                else [{
+                    "at": now,
+                    "status": "WAITING",
+                    "message": waiting_reason,
+                    "waiting_on": list(readiness.waiting_on),
+                    "stopped": list(readiness.stopped),
+                    "missing": list(readiness.missing),
+                }]
+            ),
+            "waiting": {
+                "reason": None if readiness.ready else "dependency",
+                "waiting_on": list(readiness.waiting_on),
+                "stopped": list(readiness.stopped),
+                "missing": list(readiness.missing),
+                "since": None if readiness.ready else now,
+            },
+            "roles": roles,
+            "hops": [hop],
+            "reports": [],
+            "route_timeline": [],
+            "controls": [],
+            "errors": [],
+            "cleanup": {
+                "state": "ACTIVE",
+                "phase": None,
+                "eligible_at": None,
+                "clear_requested_at": None,
+                "cleared_at": None,
+                "verified_empty_at": None,
+                "closed_tabs": 0,
+                "target_tabs": 0,
+                "retry_count": 0,
+                "last_error": None,
+                "last_error_at": None,
+                "status_before": None,
+                "terminal_state_before": None,
+                "active_role": None,
+                "active_hop_id": None,
+                "control_id": None,
+            },
+        }
 
     def create_task(
         self,
@@ -908,6 +1312,9 @@ class TaskStore:
         task_id: str | None = None,
         reserved_team_suffixes: Sequence[int] = (),
         report_mode: str = "file",
+        depends_on_task_ids: Sequence[str] = (),
+        replaces_task_id: str | None = None,
+        replacement_incident_id: str | None = None,
     ) -> dict[str, Any]:
         text = str(task).strip()
         if not text:
@@ -918,10 +1325,15 @@ class TaskStore:
         if unknown:
             raise ValueError(f"unknown --new roles: {sorted(unknown)!r}")
         normalized_report_mode = normalize_report_mode(report_mode)
+        normalized_replaces = _optional_nonempty_string(replaces_task_id, "replaces_task_id")
+        normalized_incident = _optional_nonempty_string(
+            replacement_incident_id, "replacement_incident_id"
+        )
         base = normalize_team_base(requested_team or task_id)
         repository_path = Path(repository or self.config.repository_root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         with exclusive_file_lock(self.allocation_lock):
+            self._recover_phase4_replacement_unlocked()
             catalog = self._load_catalog_unlocked(reconcile=True)
             catalog_entries = [
                 entry
@@ -945,6 +1357,24 @@ class TaskStore:
                 raise ValueError(f"task_id is already reserved by corrupt filesystem state: {task_id}")
 
             manifests = self.discover()
+            requested_dependencies = normalize_dependency_ids(depends_on_task_ids)
+            duplicate_task_ids = self.duplicate_task_ids()
+            ambiguous_dependencies = [
+                parent_id
+                for parent_id in requested_dependencies
+                if parent_id in duplicate_task_ids
+            ]
+            if ambiguous_dependencies:
+                raise ValueError(
+                    f"ambiguous dependency task(s): {ambiguous_dependencies!r}"
+                )
+            normalized_dependencies = validate_new_dependencies(
+                task_id, requested_dependencies, manifests
+            )
+            readiness = dependency_readiness(
+                {"task_id": task_id, "depends_on_task_ids": normalized_dependencies},
+                manifests,
+            )
             actual_paths = {
                 str(Path(item["manifest_path"]).expanduser().resolve())
                 for item in manifests
@@ -999,130 +1429,824 @@ class TaskStore:
             if target.exists():
                 raise FileExistsError(target)
             now = utc_now()
-            roles = {}
-            for logical in self.config.roles:
-                roles[logical] = {
-                    "logical_role": logical,
-                    "physical_role": physical_role(logical, base, suffix),
-                    "status": "pending" if logical == "PLAN" else "unallocated",
-                    "turn": 0,
-                    "page_id": None,
-                    "page_url": None,
-                    "online": False,
-                    "conversation_generation": 0,
-                    "constructor_sent_generation": None,
-                    "reset_requested": bool(new_all or logical in normalized_new),
-                    "reset_applied_generation": None,
-                    "last_activity_at": None,
-                    "last_error": None,
-                }
-            hop = {
-                "hop_id": 1,
-                "parent_hop_id": None,
-                "source_role": None,
-                "target_role": "PLAN",
-                "physical_role": roles["PLAN"]["physical_role"],
-                "turn": 1,
-                "kind": "task",
-                "handoff": text,
-                "state": "pre_send",
-                "request_id": f"{task_id}-hop1",
-                "prompt": None,
-                "prompt_sha256": None,
-                "rendered_prompt_sha256": None,
-                "ledger_path": str((target.parent / "requests.json").resolve()),
-                "receipt": None,
-                "message_identity": None,
-                "response": None,
-                "response_sha256": None,
-                "report_path": None,
-                "report_sha256": None,
-                "report_size": None,
-                "route": None,
-                "repair_attempt": 0,
-                "validation_error": None,
-                "wait": {
-                    "started_at": None,
-                    "deadline_at": None,
-                    "continuous_responding_since": None,
-                    "activity_signature": None,
-                    "activity_length": 0,
-                    "activity_changed_at": None,
-                    "activity_observed_at": None,
-                    "transport_ui_active": False,
-                    "last_stop_visible": False,
-                    "refresh_count": 0,
-                    "last_refresh_at": None,
-                    "refresh_in_progress": None,
-                    "recovery_baseline": None,
-                },
-                "timestamps": {"created_at": now},
-                "errors": [],
-            }
-            state = {
-                "schema_version": SCHEMA_VERSION,
-                "manifest_path": str(target),
-                "task_id": task_id,
-                "task_title": text.splitlines()[0],
-                "task_text": text,
-                "task_slug": title_slug,
-                "repository": str(repository_path),
-                "requested_team": requested_team,
-                "team_base": base,
-                "team": team,
-                "team_suffix": suffix,
-                "reusable_teams": reusable_teams,
-                "status": "INBOX",
-                "kanban_column": "INBOX",
-                "terminal_state": None,
-                "active_role": "PLAN",
-                "active_hop_id": 1,
-                "active_action": "queued",
-                "pause_reason": None,
-                "block_code": None,
-                "block_retryable": False,
-                "block_reason": None,
-                "stop_reason": None,
-                "created_at": now,
-                "updated_at": now,
-                "started_at": None,
-                "completed_at": None,
-                "stopped_at": None,
-                "last_role_activity_at": None,
-                "options": {
-                    "new_roles": list(normalized_new),
-                    "new_all": bool(new_all),
-                    "report_mode": normalized_report_mode,
-                },
-                "roles": roles,
-                "hops": [hop],
-                "reports": [],
-                "route_timeline": [],
-                "controls": [],
-                "errors": [],
-                "cleanup": {
-                    "state": "ACTIVE",
-                    "phase": None,
-                    "eligible_at": None,
-                    "clear_requested_at": None,
-                    "cleared_at": None,
-                    "verified_empty_at": None,
-                    "closed_tabs": 0,
-                    "target_tabs": 0,
-                    "retry_count": 0,
-                    "last_error": None,
-                    "last_error_at": None,
-                    "status_before": None,
-                    "terminal_state_before": None,
-                    "active_role": None,
-                    "active_hop_id": None,
-                    "control_id": None,
-                },
-            }
+            state = self._initial_task_state(
+                text=text,
+                requested_team=requested_team,
+                task_id=task_id,
+                repository_path=repository_path,
+                base=base,
+                team=team,
+                suffix=suffix,
+                reusable_teams=reusable_teams,
+                target=target,
+                normalized_new=normalized_new,
+                new_all=new_all,
+                normalized_report_mode=normalized_report_mode,
+                normalized_dependencies=normalized_dependencies,
+                normalized_replaces=normalized_replaces,
+                normalized_incident=normalized_incident,
+                readiness=readiness,
+                now=now,
+            )
             saved = self._save_unlocked(target, state)
             catalog["entries"][self._catalog_key(target)] = self._catalog_entry(saved)
             self._write_catalog_unlocked(catalog)
             return saved
+
+    @staticmethod
+    def _phase4_bytes(state: Mapping[str, Any]) -> bytes:
+        return json.dumps(
+            dict(state), ensure_ascii=False, indent=2, sort_keys=True
+        ).encode("utf-8")
+
+    @staticmethod
+    def _restore_bytes(path: Path, data: bytes | None) -> None:
+        temporary = path.with_suffix(path.suffix + ".phase4.rollback.tmp")
+        try:
+            if data is None:
+                path.unlink(missing_ok=True)
+                if path.parent.exists():
+                    fsync_parent_directory(path)
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with temporary.open("wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            fsync_parent_directory(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _phase4_encode_bytes(data: bytes | None) -> str | None:
+        if data is None:
+            return None
+        return base64.b64encode(data).decode("ascii")
+
+    @staticmethod
+    def _phase4_decode_bytes(value: Any, field: str) -> bytes | None:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"Phase-4 journal {field} must be base64 or null")
+        try:
+            return base64.b64decode(value.encode("ascii"), validate=True)
+        except (UnicodeEncodeError, ValueError) as exc:
+            raise ValueError(f"Phase-4 journal {field} is invalid base64") from exc
+
+    def _phase4_relative_path(self, path: str | Path) -> str:
+        target = Path(path).expanduser().resolve()
+        try:
+            return target.relative_to(self.root.resolve()).as_posix()
+        except ValueError as exc:
+            raise ValueError(f"Phase-4 journal path escapes plans root: {target}") from exc
+
+    def _phase4_absolute_path(self, value: Any, field: str) -> Path:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"Phase-4 journal {field} must be a non-empty path")
+        relative = PurePosixPath(value)
+        if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+            raise ValueError(f"Phase-4 journal {field} must be a safe relative path")
+        target = (self.root / Path(*relative.parts)).resolve()
+        try:
+            target.relative_to(self.root.resolve())
+        except ValueError as exc:
+            raise ValueError(f"Phase-4 journal {field} escapes plans root") from exc
+        return target
+
+    def _write_phase4_journal_unlocked(self, value: Mapping[str, Any]) -> None:
+        body = json.loads(json.dumps(dict(value), ensure_ascii=False, default=str))
+        body["version"] = 1
+        body["operation"] = "replace_task_and_rewire"
+        temporary = self.phase4_journal_path.with_suffix(".journal.tmp")
+        self.root.mkdir(parents=True, exist_ok=True)
+        try:
+            with temporary.open("w", encoding="utf-8") as handle:
+                json.dump(body, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.phase4_journal_path)
+            fsync_parent_directory(self.phase4_journal_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _load_phase4_journal_unlocked(self) -> dict[str, Any] | None:
+        if not self.phase4_journal_path.exists():
+            return None
+        value = json.loads(self.phase4_journal_path.read_text(encoding="utf-8"))
+        if not isinstance(value, Mapping):
+            raise ValueError("Phase-4 journal root must be an object")
+        if value.get("version") != 1 or value.get("operation") != "replace_task_and_rewire":
+            raise ValueError("unsupported Phase-4 replacement journal")
+        for field in (
+            "incident_id",
+            "target_task_id",
+            "replacement_task_id",
+            "target_manifest_path",
+            "replacement_manifest_path",
+            "target_sha256",
+            "created_at",
+        ):
+            if not isinstance(value.get(field), str) or not str(value.get(field)).strip():
+                raise ValueError(f"Phase-4 journal {field} must be a non-empty string")
+        if not isinstance(value.get("writes"), list) or not value["writes"]:
+            raise ValueError("Phase-4 journal writes must be a non-empty list")
+        if not isinstance(value.get("catalog"), Mapping):
+            raise ValueError("Phase-4 journal catalog must be an object")
+        seen_paths: set[Path] = set()
+        seen_tasks: set[str] = set()
+        replacement_entries = 0
+        for index, item in enumerate(value["writes"]):
+            if not isinstance(item, Mapping):
+                raise ValueError("Phase-4 journal write must be an object")
+            kind = item.get("kind")
+            if kind not in {"replacement", "child"}:
+                raise ValueError("Phase-4 journal write kind is invalid")
+            path = self._phase4_absolute_path(item.get("path"), f"writes[{index}].path")
+            if path in seen_paths:
+                raise ValueError("Phase-4 journal contains duplicate write paths")
+            seen_paths.add(path)
+            task_id = item.get("task_id")
+            if not isinstance(task_id, str) or not task_id.strip():
+                raise ValueError("Phase-4 journal write task_id must be non-empty")
+            if task_id in seen_tasks:
+                raise ValueError("Phase-4 journal contains duplicate task IDs")
+            seen_tasks.add(task_id)
+            self._phase4_decode_bytes(item.get("before"), f"writes[{index}].before")
+            after = self._phase4_decode_bytes(item.get("after"), f"writes[{index}].after")
+            if after is None:
+                raise ValueError("Phase-4 journal write after bytes are required")
+            if hashlib.sha256(after).hexdigest() != item.get("after_sha256"):
+                raise ValueError("Phase-4 journal write after hash is invalid")
+            if kind == "replacement":
+                replacement_entries += 1
+        if replacement_entries != 1:
+            raise ValueError("Phase-4 journal must contain one replacement write")
+        catalog = value["catalog"]
+        self._phase4_decode_bytes(catalog.get("before"), "catalog.before")
+        after_catalog = self._phase4_decode_bytes(catalog.get("after"), "catalog.after")
+        if after_catalog is None:
+            raise ValueError("Phase-4 journal catalog after bytes are required")
+        if hashlib.sha256(after_catalog).hexdigest() != catalog.get("after_sha256"):
+            raise ValueError("Phase-4 journal catalog after hash is invalid")
+        return dict(value)
+
+    def _clear_phase4_journal_unlocked(self) -> None:
+        self.phase4_journal_path.unlink(missing_ok=True)
+        fsync_parent_directory(self.phase4_journal_path)
+
+    def _phase4_parse_manifest_bytes(self, path: Path, data: bytes) -> dict[str, Any]:
+        try:
+            value = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid Phase-4 manifest bytes for {path}") from exc
+        if not isinstance(value, Mapping):
+            raise ValueError(f"invalid Phase-4 manifest root for {path}")
+        error = self._manifest_value_error(path, value, require_file=path.exists())
+        if error is not None:
+            raise ValueError(f"invalid Phase-4 manifest {path}: {error}")
+        return dict(value)
+
+    def _phase4_write_bytes_unlocked(self, path: Path, data: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".phase4.tmp")
+        try:
+            with temporary.open("wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            fsync_parent_directory(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _phase4_catalog_for_states(
+        self,
+        states: Sequence[Mapping[str, Any]],
+        fallback_bytes: bytes,
+    ) -> dict[str, Any]:
+        try:
+            current = json.loads(self.catalog_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            current = json.loads(fallback_bytes.decode("utf-8"))
+        if not isinstance(current, dict) or current.get("version") != CATALOG_VERSION:
+            raise ValueError("Phase-4 recovery catalog is invalid")
+        if not isinstance(current.get("entries"), dict):
+            raise ValueError("Phase-4 recovery catalog entries are invalid")
+        for state in states:
+            current["entries"][self._catalog_key(state["manifest_path"])] = self._catalog_entry(state)
+        return current
+
+    def _verify_phase4_replacement_unlocked(
+        self,
+        journal: Mapping[str, Any],
+        states: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        target_id = str(journal["target_task_id"])
+        replacement_id = str(journal["replacement_task_id"])
+        incident = str(journal["incident_id"])
+        index = {str(item["task_id"]): item for item in states}
+        replacement = index.get(replacement_id)
+        if replacement is None:
+            raise RuntimeError("Phase-4 recovery replacement manifest is missing")
+        if (
+            replacement.get("replaces_task_id") != target_id
+            or replacement.get("replacement_incident_id") != incident
+        ):
+            raise RuntimeError("Phase-4 recovery replacement provenance is invalid")
+        target_path = self._phase4_absolute_path(
+            journal["target_manifest_path"], "target_manifest_path"
+        )
+        if hashlib.sha256(target_path.read_bytes()).hexdigest() != journal["target_sha256"]:
+            raise RuntimeError("Phase-4 recovery mutated immutable parent history")
+        affected_ids = {
+            str(item["task_id"])
+            for item in journal["writes"]
+            if item.get("kind") == "child"
+        }
+        rewired: list[dict[str, Any]] = []
+        for child_id in sorted(affected_ids):
+            child = index.get(child_id)
+            if child is None:
+                raise RuntimeError(f"Phase-4 recovery child is missing: {child_id}")
+            parents = list(normalize_dependency_ids(child.get("depends_on_task_ids")))
+            if target_id in parents or parents.count(replacement_id) != 1:
+                raise RuntimeError(f"Phase-4 recovery child is not fully rewired: {child_id}")
+            rewired.append(dict(child))
+        for state in states:
+            parents = list(normalize_dependency_ids(state.get("depends_on_task_ids")))
+            if target_id in parents:
+                raise RuntimeError(
+                    f"Phase-4 recovery left dependency on old task: {state['task_id']}"
+                )
+        catalog = json.loads(self.catalog_path.read_text(encoding="utf-8"))
+        if not isinstance(catalog, Mapping) or not isinstance(catalog.get("entries"), Mapping):
+            raise RuntimeError("Phase-4 recovery catalog is invalid")
+        for state in states:
+            key = self._catalog_key(state["manifest_path"])
+            if catalog["entries"].get(key) != self._catalog_entry(state):
+                raise RuntimeError(f"Phase-4 recovery catalog mismatch for {state['task_id']}")
+        return {"replacement": dict(replacement), "rewired_children": rewired}
+
+    def _recover_phase4_replacement_unlocked(self) -> dict[str, Any] | None:
+        journal = self._load_phase4_journal_unlocked()
+        if journal is None:
+            return None
+        target_id = str(journal["target_task_id"])
+        replacement_id = str(journal["replacement_task_id"])
+        incident = str(journal["incident_id"])
+        write_entries = [dict(item) for item in journal["writes"]]
+        journal_paths = {
+            self._phase4_absolute_path(item["path"], "write.path")
+            for item in write_entries
+        }
+        canonical_paths = sorted(
+            {
+                Path(item["manifest_path"]).expanduser().resolve()
+                for item in self.discover()
+            }
+            | journal_paths,
+            key=str,
+        )
+        with ExitStack() as stack:
+            for manifest_path in canonical_paths:
+                stack.enter_context(exclusive_file_lock(self._lock_path(manifest_path)))
+            states_by_path: dict[Path, dict[str, Any]] = {}
+            for manifest_path in canonical_paths:
+                if not manifest_path.exists():
+                    continue
+                data = manifest_path.read_bytes()
+                states_by_path[manifest_path] = self._phase4_parse_manifest_bytes(
+                    manifest_path, data
+                )
+
+            replacement_entry = next(
+                item for item in write_entries if item["kind"] == "replacement"
+            )
+            replacement_path = self._phase4_absolute_path(
+                replacement_entry["path"], "replacement.path"
+            )
+            replacement = states_by_path.get(replacement_path)
+            if replacement is None:
+                after = self._phase4_decode_bytes(
+                    replacement_entry["after"], "replacement.after"
+                )
+                assert after is not None
+                self._phase4_write_bytes_unlocked(replacement_path, after)
+                replacement = self._phase4_parse_manifest_bytes(replacement_path, after)
+                states_by_path[replacement_path] = replacement
+            elif (
+                replacement.get("task_id") != replacement_id
+                or replacement.get("replaces_task_id") != target_id
+                or replacement.get("replacement_incident_id") != incident
+            ):
+                raise RuntimeError("Phase-4 recovery found conflicting replacement state")
+
+            affected_paths: set[Path] = set()
+            for item in write_entries:
+                if item["kind"] == "child":
+                    affected_paths.add(
+                        self._phase4_absolute_path(item["path"], "child.path")
+                    )
+            for manifest_path, state in list(states_by_path.items()):
+                if str(state.get("task_id")) in {target_id, replacement_id}:
+                    continue
+                parents = list(normalize_dependency_ids(state.get("depends_on_task_ids")))
+                if target_id not in parents and manifest_path not in affected_paths:
+                    continue
+                if target_id in parents:
+                    if replacement_id in parents:
+                        raise RuntimeError(
+                            f"Phase-4 recovery child contains old and new dependency: {state['task_id']}"
+                        )
+                    updated = json.loads(json.dumps(state, ensure_ascii=False))
+                    updated["depends_on_task_ids"] = [
+                        replacement_id if parent == target_id else parent
+                        for parent in parents
+                    ]
+                    duplicate_event = any(
+                        isinstance(event, Mapping)
+                        and event.get("status") == "REWIRED"
+                        and event.get("incident_id") == incident
+                        and event.get("old_task_id") == target_id
+                        and event.get("new_task_id") == replacement_id
+                        for event in updated.get("dependency_events") or []
+                    )
+                    if not duplicate_event:
+                        updated.setdefault("dependency_events", []).append(
+                            {
+                                "at": utc_now(),
+                                "status": "REWIRED",
+                                "message": (
+                                    f"Dependency rewired from {target_id} to {replacement_id}"
+                                ),
+                                "incident_id": incident,
+                                "old_task_id": target_id,
+                                "new_task_id": replacement_id,
+                            }
+                        )
+                    updated["updated_at"] = utc_now()
+                    data = self._phase4_bytes(updated)
+                    error = self._manifest_value_error(
+                        manifest_path, updated, require_file=True
+                    )
+                    if error is not None:
+                        raise ValueError(
+                            f"invalid Phase-4 recovered child {manifest_path}: {error}"
+                        )
+                    self._phase4_write_bytes_unlocked(manifest_path, data)
+                    states_by_path[manifest_path] = updated
+                else:
+                    if parents.count(replacement_id) != 1:
+                        raise RuntimeError(
+                            f"Phase-4 recovery child lost replacement dependency: {state['task_id']}"
+                        )
+
+            states = list(states_by_path.values())
+            for state in states:
+                validate_new_dependencies(
+                    str(state["task_id"]),
+                    normalize_dependency_ids(state.get("depends_on_task_ids")),
+                    [other for other in states if other is not state],
+                    allow_missing=True,
+                )
+            catalog_after = self._phase4_decode_bytes(
+                journal["catalog"]["after"], "catalog.after"
+            )
+            assert catalog_after is not None
+            catalog = self._phase4_catalog_for_states(states, catalog_after)
+            self._write_catalog_unlocked(catalog)
+            result = self._verify_phase4_replacement_unlocked(journal, states)
+            self._clear_phase4_journal_unlocked()
+            return result
+
+    def recover_phase4_replacement(self) -> dict[str, Any] | None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        with exclusive_file_lock(self.allocation_lock):
+            return self._recover_phase4_replacement_unlocked()
+
+    def replace_task_and_rewire(
+        self,
+        target_task_id: str,
+        replacement_task: str,
+        *,
+        reuse_team: bool,
+        rewire_children: bool,
+        incident_id: str | None = None,
+    ) -> dict[str, Any]:
+        target_id = _validate_task_id(target_task_id)
+        recovery_instruction = str(replacement_task).strip()
+        if not recovery_instruction:
+            raise ValueError("replacement task must not be empty")
+        incident = _optional_nonempty_string(incident_id, "incident_id")
+        if incident is None:
+            raise ValueError("replacement incident_id is required")
+        if not isinstance(reuse_team, bool) or not isinstance(rewire_children, bool):
+            raise ValueError("replacement flags must be booleans")
+        self.root.mkdir(parents=True, exist_ok=True)
+        with exclusive_file_lock(self.allocation_lock):
+            recovered = self._recover_phase4_replacement_unlocked()
+            if recovered is not None and (
+                recovered["replacement"].get("replaces_task_id") == target_id
+                and recovered["replacement"].get("replacement_incident_id") == incident
+            ):
+                return recovered
+            catalog = self._load_catalog_unlocked(reconcile=True)
+            catalog_before = (
+                self.catalog_path.read_bytes() if self.catalog_path.exists() else None
+            )
+            planning = self.discover()
+            canonical_paths = sorted(
+                {
+                    Path(item["manifest_path"]).expanduser().resolve()
+                    for item in planning
+                },
+                key=str,
+            )
+            with ExitStack() as stack:
+                for manifest_path in canonical_paths:
+                    stack.enter_context(
+                        exclusive_file_lock(self._lock_path(manifest_path))
+                    )
+
+                manifests: list[dict[str, Any]] = []
+                for manifest_path in canonical_paths:
+                    value = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    if not isinstance(value, Mapping):
+                        raise ValueError(
+                            f"invalid CDPA task manifest in {manifest_path}: "
+                            "root must be an object"
+                        )
+                    error = self._manifest_value_error(manifest_path, value)
+                    if error is not None:
+                        raise ValueError(
+                            f"invalid CDPA task manifest in {manifest_path}: {error}"
+                        )
+                    manifests.append(dict(value))
+
+                existing = next(
+                    (
+                        item
+                        for item in manifests
+                        if item.get("replaces_task_id") == target_id
+                        and item.get("replacement_incident_id") == incident
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    return {
+                        "replacement": existing,
+                        "rewired_children": [
+                            item
+                            for item in manifests
+                            if existing["task_id"]
+                            in normalize_dependency_ids(
+                                item.get("depends_on_task_ids")
+                            )
+                        ],
+                    }
+
+                target_state = next(
+                    (
+                        item
+                        for item in manifests
+                        if item.get("task_id") == target_id
+                    ),
+                    None,
+                )
+                if target_state is None:
+                    raise ValueError(
+                        f"replacement target does not exist: {target_id}"
+                    )
+                target_status = str(target_state.get("status") or "").upper()
+                if target_status not in {"STOPPED", "BLOCKED"}:
+                    raise ValueError(
+                        "replacement target must be STOPPED or BLOCKED"
+                    )
+                cleanup = target_state.get("cleanup")
+                if isinstance(cleanup, Mapping) and str(
+                    cleanup.get("state") or ""
+                ).upper() in {"CLEARING", "CLEARED"}:
+                    raise ValueError(
+                        "replacement target cleanup is already in progress"
+                    )
+                if reuse_team and target_status != "STOPPED":
+                    raise ValueError(
+                        "reuse_team requires a STOPPED replacement target"
+                    )
+
+                task_text = replacement_continuation_text(
+                    target_state, recovery_instruction
+                )
+                known_ids = {str(item["task_id"]) for item in manifests}
+                replacement_id = generate_task_id(task_text)
+                while replacement_id in known_ids:
+                    replacement_id = generate_task_id(task_text)
+                base = str(
+                    target_state.get("team_base")
+                    or target_state.get("team")
+                    or target_id
+                )
+                if reuse_team:
+                    team = str(target_state["team"])
+                    suffix = int(target_state.get("team_suffix") or 1)
+                    reusable_teams = [team]
+                else:
+                    team, suffix = allocate_team(
+                        base,
+                        manifests,
+                        reserved_suffixes=(
+                            int(target_state.get("team_suffix") or 1),
+                        ),
+                    )
+                    reusable_teams = []
+
+                dependencies = validate_new_dependencies(
+                    replacement_id,
+                    normalize_dependency_ids(
+                        target_state.get("depends_on_task_ids")
+                    ),
+                    manifests,
+                )
+                readiness = dependency_readiness(
+                    {
+                        "task_id": replacement_id,
+                        "depends_on_task_ids": dependencies,
+                    },
+                    manifests,
+                )
+                title_slug = slugify(task_text)
+                replacement_path = (
+                    self.root
+                    / team
+                    / replacement_id
+                    / f"{title_slug}.json"
+                ).resolve()
+                replacement_lock_path = self._lock_path(replacement_path)
+                replacement_directory_existed = replacement_path.parent.exists()
+                success = False
+
+                def cleanup_failed_replacement_directory() -> None:
+                    if success or replacement_directory_existed:
+                        return
+                    replacement_lock_path.unlink(missing_ok=True)
+                    if replacement_path.parent.exists():
+                        try:
+                            replacement_path.parent.rmdir()
+                        except OSError:
+                            pass
+
+                stack.callback(cleanup_failed_replacement_directory)
+                stack.enter_context(exclusive_file_lock(replacement_lock_path))
+                if replacement_path.exists():
+                    raise FileExistsError(replacement_path)
+
+                now = utc_now()
+                report_mode = report_mode_from_options(
+                    target_state.get("options")
+                    if isinstance(target_state.get("options"), Mapping)
+                    else {}
+                )
+                replacement_state = self._initial_task_state(
+                    text=task_text,
+                    requested_team=target_state.get("requested_team"),
+                    task_id=replacement_id,
+                    repository_path=Path(target_state["repository"])
+                    .expanduser()
+                    .resolve(),
+                    base=base,
+                    team=team,
+                    suffix=suffix,
+                    reusable_teams=reusable_teams,
+                    target=replacement_path,
+                    normalized_new=(),
+                    new_all=False,
+                    normalized_report_mode=report_mode,
+                    normalized_dependencies=dependencies,
+                    normalized_replaces=target_id,
+                    normalized_incident=incident,
+                    readiness=readiness,
+                    now=now,
+                )
+                replacement_state["dependency_events"].append(
+                    {
+                        "at": now,
+                        "status": "REPLACEMENT_CREATED",
+                        "message": f"Replacement created for {target_id}",
+                        "incident_id": incident,
+                        "old_task_id": target_id,
+                        "new_task_id": replacement_id,
+                    }
+                )
+
+                updated_by_id: dict[str, dict[str, Any]] = {}
+                if rewire_children:
+                    for item in manifests:
+                        parents = list(
+                            normalize_dependency_ids(
+                                item.get("depends_on_task_ids")
+                            )
+                        )
+                        if target_id not in parents:
+                            continue
+                        updated = json.loads(
+                            json.dumps(item, ensure_ascii=False)
+                        )
+                        updated["depends_on_task_ids"] = [
+                            replacement_id if parent == target_id else parent
+                            for parent in parents
+                        ]
+                        updated.setdefault("dependency_events", []).append(
+                            {
+                                "at": now,
+                                "status": "REWIRED",
+                                "message": (
+                                    f"Dependency rewired from {target_id} "
+                                    f"to {replacement_id}"
+                                ),
+                                "incident_id": incident,
+                                "old_task_id": target_id,
+                                "new_task_id": replacement_id,
+                            }
+                        )
+                        updated["updated_at"] = now
+                        updated_by_id[str(updated["task_id"])] = updated
+
+                writes: dict[Path, dict[str, Any]] = {
+                    replacement_path: replacement_state
+                }
+                for updated in updated_by_id.values():
+                    writes[
+                        Path(updated["manifest_path"])
+                        .expanduser()
+                        .resolve()
+                    ] = updated
+                for manifest_path, value in writes.items():
+                    value["schema_version"] = SCHEMA_VERSION
+                    value["updated_at"] = now
+                    error = self._manifest_value_error(
+                        manifest_path,
+                        value,
+                        require_file=manifest_path.exists(),
+                    )
+                    if error is not None:
+                        raise ValueError(
+                            "refusing invalid replacement graph manifest "
+                            f"{manifest_path}: {error}"
+                        )
+
+                proposed: list[Mapping[str, Any]] = [
+                    updated_by_id.get(str(item["task_id"]), item)
+                    for item in manifests
+                ]
+                proposed.append(replacement_state)
+                for item in proposed:
+                    validate_new_dependencies(
+                        str(item["task_id"]),
+                        normalize_dependency_ids(
+                            item.get("depends_on_task_ids")
+                        ),
+                        [other for other in proposed if other is not item],
+                        allow_missing=True,
+                    )
+
+                next_catalog = json.loads(
+                    json.dumps(catalog, ensure_ascii=False, default=str)
+                )
+                next_catalog["version"] = CATALOG_VERSION
+                next_catalog.setdefault("entries", {})
+                for item in manifests:
+                    manifest_path = Path(item["manifest_path"])
+                    next_catalog["entries"][
+                        self._catalog_key(manifest_path)
+                    ] = self._catalog_entry(item)
+                for manifest_path, value in writes.items():
+                    next_catalog["entries"][
+                        self._catalog_key(manifest_path)
+                    ] = self._catalog_entry(value)
+                next_catalog["updated_at"] = utc_now()
+
+                originals: dict[Path, bytes | None] = {
+                    manifest_path: (
+                        manifest_path.read_bytes()
+                        if manifest_path.exists()
+                        else None
+                    )
+                    for manifest_path in writes
+                }
+                originals[self.catalog_path] = catalog_before
+                catalog_after = json.dumps(
+                    next_catalog,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ).encode("utf-8")
+                journal_writes = []
+                for manifest_path in sorted(writes, key=str):
+                    after = self._phase4_bytes(writes[manifest_path])
+                    journal_writes.append(
+                        {
+                            "kind": (
+                                "replacement"
+                                if manifest_path == replacement_path
+                                else "child"
+                            ),
+                            "task_id": str(writes[manifest_path]["task_id"]),
+                            "path": self._phase4_relative_path(manifest_path),
+                            "before": self._phase4_encode_bytes(
+                                originals[manifest_path]
+                            ),
+                            "after": self._phase4_encode_bytes(after),
+                            "after_sha256": hashlib.sha256(after).hexdigest(),
+                        }
+                    )
+                journal = {
+                    "version": 1,
+                    "operation": "replace_task_and_rewire",
+                    "incident_id": incident,
+                    "target_task_id": target_id,
+                    "replacement_task_id": replacement_id,
+                    "target_manifest_path": self._phase4_relative_path(
+                        target_state["manifest_path"]
+                    ),
+                    "replacement_manifest_path": self._phase4_relative_path(
+                        replacement_path
+                    ),
+                    "target_sha256": hashlib.sha256(
+                        Path(target_state["manifest_path"]).read_bytes()
+                    ).hexdigest(),
+                    "created_at": now,
+                    "writes": journal_writes,
+                    "catalog": {
+                        "before": self._phase4_encode_bytes(catalog_before),
+                        "after": self._phase4_encode_bytes(catalog_after),
+                        "after_sha256": hashlib.sha256(catalog_after).hexdigest(),
+                    },
+                }
+                staged: dict[Path, Path] = {}
+                installed: list[Path] = []
+                try:
+                    for manifest_path in sorted(writes, key=str):
+                        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+                        temporary = manifest_path.with_suffix(
+                            manifest_path.suffix + ".phase4.tmp"
+                        )
+                        staged[manifest_path] = temporary
+                        with temporary.open("wb") as handle:
+                            handle.write(
+                                self._phase4_bytes(writes[manifest_path])
+                            )
+                            handle.flush()
+                            os.fsync(handle.fileno())
+
+                    catalog_temporary = self.catalog_path.with_suffix(
+                        self.catalog_path.suffix + ".phase4.tmp"
+                    )
+                    staged[self.catalog_path] = catalog_temporary
+                    with catalog_temporary.open("wb") as handle:
+                        handle.write(catalog_after)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+
+                    self._write_phase4_journal_unlocked(journal)
+                    durable_journal = self._load_phase4_journal_unlocked()
+                    if durable_journal is None:
+                        raise RuntimeError("Phase-4 journal disappeared before install")
+                    journal = durable_journal
+                    for manifest_path in sorted(writes, key=str):
+                        os.replace(staged[manifest_path], manifest_path)
+                        installed.append(manifest_path)
+                        fsync_parent_directory(manifest_path)
+                    os.replace(
+                        staged[self.catalog_path], self.catalog_path
+                    )
+                    installed.append(self.catalog_path)
+                    fsync_parent_directory(self.catalog_path)
+                    result = self._verify_phase4_replacement_unlocked(
+                        journal, proposed
+                    )
+                    self._clear_phase4_journal_unlocked()
+                    success = True
+                except Exception:
+                    rollback_error: BaseException | None = None
+                    try:
+                        for installed_path in reversed(installed):
+                            self._restore_bytes(
+                                installed_path, originals[installed_path]
+                            )
+                    except BaseException as exc:
+                        rollback_error = exc
+                    if rollback_error is None:
+                        self._clear_phase4_journal_unlocked()
+                    else:
+                        raise rollback_error
+                    raise
+                finally:
+                    for temporary in staged.values():
+                        temporary.unlink(missing_ok=True)
+
+            return result
 
     def _queue_resume(
         self,
@@ -1179,6 +2303,7 @@ class TaskStore:
         team = validate_exact_team(exact_team)
         self.root.mkdir(parents=True, exist_ok=True)
         with exclusive_file_lock(self.allocation_lock):
+            self._recover_phase4_replacement_unlocked()
             try:
                 catalog = self._load_catalog_unlocked(reconcile=False)
             except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
@@ -1295,6 +2420,7 @@ class TaskStore:
                         raise ValueError(
                             f"exact team {team!r} became corrupt while resuming {target}: {error}"
                         )
+                self._assert_manifest_mutable_unlocked(target, current)
                 if str(current.get("status") or "").upper() in TERMINAL:
                     raise ValueError(f"exact team {team!r} became terminal while resuming")
                 queued = self._queue_resume(dict(current), reason=reason or "exact-team resume")

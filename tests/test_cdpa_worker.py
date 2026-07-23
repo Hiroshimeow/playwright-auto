@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import playwright_auto.cdpa_store as store_module
 import playwright_auto.cdpa_worker as worker_module
 from playwright_auto.cdpa_actions import (
     AcquiredRole,
@@ -17,7 +18,7 @@ from playwright_auto.cdpa_actions import (
 from playwright_auto.cdpa_config import load_cdpa_config
 from playwright_auto.cdpa_maintenance import ensure_maintenance_incident
 from playwright_auto.cdpa_routes import RouteContractError
-from playwright_auto.cdpa_store import TaskStore
+from playwright_auto.cdpa_store import TaskStore, utc_now
 from playwright_auto.cdpa_worker import CDPAWorker, _active_hop, _report_mode
 from playwright_auto.chatgpt import (
     ChatGPTSnapshot,
@@ -34,7 +35,11 @@ from playwright_auto.chatgpt import (
 )
 from playwright_auto.durable import RequestLedger, RequestStatus
 
-from test_cdpa_core import write_config
+from test_cdpa_core import (
+    install_cycle_isolation_graph,
+    install_duplicate_task_graph,
+    write_config,
+)
 
 
 class FakeActions:
@@ -3371,3 +3376,421 @@ def test_worker_rejects_explicit_invalid_report_mode(value: object):
 
 def test_worker_defaults_missing_legacy_report_mode_to_file():
     assert _report_mode({"options": {}}) == "file"
+
+
+class ExplodingBrowserContext:
+    @property
+    def pages(self):
+        raise AssertionError("dependency WAITING/release must not inspect browser pages")
+
+
+def test_dependency_waiting_does_not_construct_browser_actions_or_rewrite(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    store.create_task("Parent", requested_team="parent", task_id="task-parent")
+    child = store.create_task(
+        "Child",
+        requested_team="child",
+        task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+    path = Path(child["manifest_path"])
+    before = path.read_bytes()
+    before_events = list(child["dependency_events"])
+
+    result = asyncio.run(CDPAWorker(config, store=store).advance(path, ExplodingBrowserContext()))
+
+    assert result["status"] == "WAITING"
+    assert result["waiting"]["waiting_on"] == ["task-parent"]
+    assert result["hops"][0]["state"] == "pre_send"
+    assert path.read_bytes() == before
+    assert result["dependency_events"] == before_events
+
+
+def test_dependency_release_is_one_durable_transition_without_browser_action(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task("Parent", requested_team="parent", task_id="task-parent")
+    child = store.create_task(
+        "Child",
+        requested_team="child",
+        task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+    store.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+
+    path = Path(child["manifest_path"])
+    result = asyncio.run(CDPAWorker(config, store=store).advance(path, ExplodingBrowserContext()))
+    assert result["status"] == "INBOX"
+    assert result["kanban_column"] == "INBOX"
+    assert result["active_action"] == "queued"
+    assert result["waiting"] == {
+        "reason": None,
+        "waiting_on": [],
+        "stopped": [],
+        "missing": [],
+        "since": None,
+    }
+    assert result["hops"][0]["state"] == "pre_send"
+    assert result["active_hop_id"] == 1
+    assert result["dependency_events"][-1]["status"] == "RELEASED"
+
+    persisted = path.read_bytes()
+    # The next poll would be allowed to acquire PLAN, so only verify the release
+    # transition itself is stable through a worker restart/load.
+    restarted = CDPAWorker(config, store=store)
+    loaded = store.load(path)
+    assert loaded["status"] == "INBOX"
+    assert path.read_bytes() == persisted
+    assert restarted.store is store
+
+
+def test_stopped_and_missing_dependencies_remain_waiting_across_restart(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task("Parent", requested_team="parent", task_id="task-parent")
+    child = store.create_task(
+        "Child",
+        requested_team="child",
+        task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+    store.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "STOPPED",
+            "terminal_state": "STOPPED",
+            "active_role": None,
+            "active_hop_id": None,
+            "stopped_at": utc_now(),
+            "stop_reason": "failed parent",
+        },
+    )
+    path = Path(child["manifest_path"])
+
+    stopped = asyncio.run(CDPAWorker(config, store=store).advance(path, ExplodingBrowserContext()))
+    assert stopped["status"] == "WAITING"
+    assert stopped["waiting"]["stopped"] == ["task-parent"]
+    assert stopped["waiting_code"] == "dependency_stopped"
+
+    parent_path = Path(parent["manifest_path"])
+    parent_path.unlink()
+    missing = asyncio.run(CDPAWorker(config, store=store).advance(path, ExplodingBrowserContext()))
+    assert missing["status"] == "WAITING"
+    assert missing["waiting"]["missing"] == ["task-parent"]
+    assert missing["waiting_code"] == "dependency_missing"
+    assert missing["hops"][0]["state"] == "pre_send"
+    assert store.load(path)["waiting"]["missing"] == ["task-parent"]
+
+
+def test_run_once_never_reclassifies_missing_edge_cycle_as_dependency_missing(
+    tmp_path: Path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    missing_parent = store.create_task(
+        "Missing parent", requested_team="missing-parent", task_id="missing-parent"
+    )
+    a = store.create_task(
+        "A",
+        requested_team="a",
+        task_id="task-a",
+        depends_on_task_ids=("missing-parent",),
+    )
+    store.create_task(
+        "B",
+        requested_team="b",
+        task_id="task-b",
+        depends_on_task_ids=("task-a",),
+    )
+    Path(missing_parent["manifest_path"]).unlink()
+    a_path = Path(a["manifest_path"])
+    raw_a = json.loads(a_path.read_text(encoding="utf-8"))
+    raw_a["depends_on_task_ids"] = ["missing-parent", "task-b"]
+    a_path.write_text(json.dumps(raw_a), encoding="utf-8")
+    worker = CDPAWorker(config, store=store)
+
+    async def forbidden_advance(*_args, **_kwargs):
+        raise AssertionError("cyclic manifests must never enter worker scheduling")
+
+    class FakeCoordinator:
+        async def advance(self, tasks, _browser_context):
+            assert tasks == []
+            return False
+
+    monkeypatch.setattr(worker, "advance", forbidden_advance)
+    worker.maintainers = FakeCoordinator()
+
+    assert asyncio.run(worker.run_once(SimpleNamespace(pages=[]))) == []
+    tasks, errors = store.discover_with_errors()
+    assert tasks == []
+    assert sum("cycle" in item["error"] for item in errors) == 2
+
+
+def test_run_once_isolates_diagnostic_cycle_from_unrelated_tasks(
+    tmp_path: Path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    install_cycle_isolation_graph(store)
+    worker = CDPAWorker(config, store=store)
+    advanced: list[str] = []
+
+    async def no_browser_advance(path, _browser_context):
+        state = store.load(path)
+        advanced.append(state["task_id"])
+        return state
+
+    class FakeCoordinator:
+        async def advance(self, tasks, _browser_context):
+            assert {state["task_id"] for _path, state in tasks} == {
+                "missing-only",
+                "unrelated-task",
+            }
+            return False
+
+    monkeypatch.setattr(worker, "advance", no_browser_advance)
+    worker.maintainers = FakeCoordinator()
+
+    results = asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
+
+    assert {state["task_id"] for state in results if state} == {
+        "missing-only",
+        "unrelated-task",
+    }
+    assert set(advanced) == {"missing-only", "unrelated-task"}
+    _tasks, errors = store.discover_with_errors()
+    assert sum("cycle" in item["error"] for item in errors) == 2
+
+
+def test_run_once_skips_duplicate_identity_manifests_and_advances_unrelated_task(
+    tmp_path: Path,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    states = install_duplicate_task_graph(store)
+    store.update(
+        states["unique"]["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "PAUSED",
+            "kanban_column": "PAUSED",
+            "active_action": "paused",
+            "pause_reason": "test boundary",
+        },
+    )
+    worker = CDPAWorker(config, store=store)
+
+    class FakeCoordinator:
+        async def advance(self, tasks, _browser_context):
+            assert [path for path, _state in tasks] == [
+                Path(states["unique"]["manifest_path"])
+            ]
+            return False
+
+    worker.maintainers = FakeCoordinator()
+
+    results = asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
+
+    assert [result["task_id"] for result in results] == ["unique-task"]
+    assert results[0]["status"] == "PAUSED"
+
+
+def test_run_once_recovers_phase4_journal_with_unrelated_missing_dependency(
+    tmp_path: Path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    missing_parent = store.create_task(
+        "Missing parent", requested_team="missing-parent", task_id="missing-parent"
+    )
+    missing_child = store.create_task(
+        "Missing child",
+        requested_team="missing-child",
+        task_id="missing-child",
+        depends_on_task_ids=("missing-parent",),
+    )
+    target = store.create_task(
+        "Recovery target", requested_team="recovery-target", task_id="recovery-target"
+    )
+    target_child = store.create_task(
+        "Recovery child",
+        requested_team="recovery-child",
+        task_id="recovery-child",
+        depends_on_task_ids=("recovery-target",),
+    )
+    store.update(
+        target["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "STOPPED",
+            "terminal_state": "STOPPED",
+            "active_role": None,
+            "active_hop_id": None,
+            "stopped_at": utc_now(),
+            "stop_reason": "replacement probe",
+        },
+    )
+    original_replace = store_module.os.replace
+    installs = 0
+
+    def interrupt_before_second_manifest(source, target_path):
+        nonlocal installs
+        if Path(source).name.endswith(".json.phase4.tmp"):
+            installs += 1
+            if installs == 2:
+                raise SystemExit("simulated worker recovery interruption")
+        return original_replace(source, target_path)
+
+    monkeypatch.setattr(store_module.os, "replace", interrupt_before_second_manifest)
+    with pytest.raises(SystemExit, match="worker recovery interruption"):
+        store.replace_task_and_rewire(
+            "recovery-target",
+            "Continue recovery target safely",
+            reuse_team=True,
+            rewire_children=True,
+            incident_id="maint-worker-missing-recovery",
+        )
+    monkeypatch.setattr(store_module.os, "replace", original_replace)
+    Path(missing_parent["manifest_path"]).unlink()
+
+    restarted_store = TaskStore(config)
+    worker = CDPAWorker(config, store=restarted_store)
+    advanced: list[str] = []
+
+    async def no_browser_advance(path, _browser_context):
+        state = restarted_store.load(path)
+        advanced.append(state["task_id"])
+        return state
+
+    class FakeCoordinator:
+        async def advance(self, tasks, _browser_context):
+            assert "missing-child" in [state["task_id"] for _path, state in tasks]
+            return False
+
+    monkeypatch.setattr(worker, "advance", no_browser_advance)
+    worker.maintainers = FakeCoordinator()
+
+    results = asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
+
+    replacement = next(
+        state
+        for state in results
+        if state and state.get("replacement_incident_id") == "maint-worker-missing-recovery"
+    )
+    assert "missing-child" in advanced
+    assert restarted_store.load(missing_child["manifest_path"])["depends_on_task_ids"] == [
+        "missing-parent"
+    ]
+    assert restarted_store.load(target_child["manifest_path"])["depends_on_task_ids"] == [
+        replacement["task_id"]
+    ]
+    assert not restarted_store.phase4_journal_path.exists()
+    assert list(restarted_store.root.rglob("*.phase4.tmp")) == []
+    assert list(restarted_store.root.rglob("*.phase4.rollback.tmp")) == []
+
+
+def test_run_once_recovers_phase4_journal_before_task_discovery(tmp_path: Path, monkeypatch):
+    _, store, _state, worker = setup_task(
+        tmp_path, task_id="task-phase4-recovery-order"
+    )
+    calls: list[str] = []
+
+    def recover():
+        calls.append("recover")
+        return None
+
+    def discover_paths():
+        assert calls == ["recover"]
+        calls.append("discover")
+        return []
+
+    class FakeCoordinator:
+        async def advance(self, tasks, _browser_context):
+            assert calls == ["recover", "discover"]
+            assert tasks == []
+            calls.append("maintainers")
+            return False
+
+    monkeypatch.setattr(store, "recover_phase4_replacement", recover)
+    monkeypatch.setattr(store, "discover_paths", discover_paths)
+    worker.maintainers = FakeCoordinator()
+
+    assert asyncio.run(worker.run_once(SimpleNamespace(pages=[]))) == []
+    assert calls == ["recover", "discover", "maintainers"]
+
+
+def test_replacement_plan_first_prompt_contains_immutable_parent_context(tmp_path: Path):
+    import hashlib
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    unique_goal = "ORIGINAL UNIQUE GOAL: migrate customer records and preserve checksum 7f4a"
+    parent = store.create_task(
+        unique_goal,
+        requested_team="parent",
+        task_id="task-parent-context",
+    )
+    report_path = (
+        tmp_path
+        / ".plan"
+        / "parent"
+        / "parent-plan_turn1_task-parent-context.md"
+    )
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_bytes = b"# PLAN checkpoint\n\nValidated 73 of 100 records.\n"
+    report_path.write_bytes(report_bytes)
+    parent = store.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "reports": [
+                {
+                    "report_id": 1,
+                    "physical_role": "parent-plan",
+                    "turn": 1,
+                    "path": str(report_path),
+                    "sha256": hashlib.sha256(report_bytes).hexdigest(),
+                    "size": len(report_bytes),
+                }
+            ],
+            "status": "STOPPED",
+            "terminal_state": "STOPPED",
+            "active_role": None,
+            "active_hop_id": None,
+            "stopped_at": utc_now(),
+            "stop_reason": "parent cannot safely continue",
+        },
+    )
+    result = store.replace_task_and_rewire(
+        parent["task_id"],
+        "Continue the original requested outcome safely",
+        reuse_team=True,
+        rewire_children=True,
+        incident_id="maint-context-preservation",
+    )
+    replacement_path = Path(result["replacement"]["manifest_path"])
+    restarted_store = TaskStore(config)
+    replacement = restarted_store.load(replacement_path)
+    worker = CDPAWorker(config, store=restarted_store)
+    hop = _active_hop(replacement)
+
+    asyncio.run(worker._pre_send(replacement, hop, FakeActions()))
+
+    prompt = str(hop["prompt"])
+    assert "task-parent-context" in prompt
+    assert unique_goal in prompt
+    assert str(report_path) in prompt
+    assert "Continue the original requested outcome safely" in prompt
+    assert hop["handoff"] == replacement["task_text"]

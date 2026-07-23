@@ -13,7 +13,7 @@ from typing import Any, Mapping, Sequence
 from .cdpa_actions import CDPATabActions
 from .cdpa_config import CDPAConfig
 from .cdpa_routes import ReportEvidence
-from .cdpa_store import TaskStore, utc_now
+from .cdpa_store import TaskStore, retained_report_references, utc_now
 from .cdpa_team import validate_exact_team
 from .durable import RequestLedger, RequestStatus
 from .durable_blocks import DurableSendBlock
@@ -31,6 +31,7 @@ _ACTIONS = frozenset(
         "NEW_CHAT_ROLE",
         "OPEN_ROLE_TAB",
         "ROUTE_PLAN",
+        "REPLACE_TASK",
     }
 )
 _ROLE_ACTIONS = frozenset({"RESTART_ROLE", "NEW_CHAT_ROLE", "OPEN_ROLE_TAB"})
@@ -43,6 +44,7 @@ _CONTROL_ACTIONS = {
     "ROUTE_PLAN": "route_plan",
 }
 _DECISION_KEYS = frozenset({"action", "reason", "role", "lesson", "replacement"})
+_REPLACEMENT_KEYS = frozenset({"target_task_id", "task", "reuse_team", "rewire_children"})
 _JSON_FENCE = re.compile(r"```json\s*(\{.*\})\s*```\s*$", re.DOTALL | re.IGNORECASE)
 _JSON_LABEL = re.compile(r"(?:^|\s)json\s*$", re.IGNORECASE)
 
@@ -91,6 +93,9 @@ def _maintenance_operational_key(state: Mapping[str, Any]) -> str | None:
         if code.lower().startswith("maintainer_"):
             return None
         reason = str(state.get("block_reason") or "")
+    elif status == "WAITING" and state.get("waiting_code") == "dependency_missing":
+        code = "dependency_missing"
+        reason = str(state.get("waiting_reason") or "Missing dependency")
     elif status == "STOPPED" and terminal != "DONE":
         code = code or "task_stopped"
         reason = str(state.get("stop_reason") or "")
@@ -195,9 +200,16 @@ def ensure_maintenance_incident(state: dict[str, Any]) -> dict[str, Any] | None:
         "task_id": str(state.get("task_id") or ""),
         "team": str(state.get("team") or ""),
         "trigger_status": str(state.get("status") or "").upper(),
-        "trigger_code": str(state.get("block_code") or "task_stopped"),
+        "trigger_code": str(
+            state.get("block_code")
+            or state.get("waiting_code")
+            or "task_stopped"
+        ),
         "trigger_reason": str(
-            state.get("block_reason") or state.get("stop_reason") or ""
+            state.get("block_reason")
+            or state.get("waiting_reason")
+            or state.get("stop_reason")
+            or ""
         ),
         "source_hop_id": state.get("active_hop_id"),
         "source_role": state.get("active_role"),
@@ -319,8 +331,35 @@ def parse_maintenance_response(
             raise ValueError("role action requires a normal configured role")
     elif role is not None:
         raise ValueError("role is allowed only for role actions")
-    if value.get("replacement") is not None:
-        raise ValueError("replacement must be null in Phase 1")
+    raw_replacement = value.get("replacement")
+    replacement: dict[str, object] | None = None
+    if action == "REPLACE_TASK":
+        if not isinstance(raw_replacement, Mapping):
+            raise ValueError("REPLACE_TASK requires a replacement object")
+        if set(raw_replacement) != _REPLACEMENT_KEYS:
+            raise ValueError(
+                f"replacement must contain exactly {sorted(_REPLACEMENT_KEYS)!r}"
+            )
+        target_task_id = raw_replacement.get("target_task_id")
+        task = raw_replacement.get("task")
+        reuse_team = raw_replacement.get("reuse_team")
+        rewire_children = raw_replacement.get("rewire_children")
+        if not isinstance(target_task_id, str) or not target_task_id.strip():
+            raise ValueError("replacement target_task_id must be a non-empty string")
+        if not isinstance(task, str) or not task.strip():
+            raise ValueError("replacement task must be a non-empty string")
+        if not isinstance(reuse_team, bool):
+            raise ValueError("replacement reuse_team must be a boolean")
+        if not isinstance(rewire_children, bool):
+            raise ValueError("replacement rewire_children must be a boolean")
+        replacement = {
+            "target_task_id": target_task_id.strip(),
+            "task": task.strip(),
+            "reuse_team": reuse_team,
+            "rewire_children": rewire_children,
+        }
+    elif raw_replacement is not None:
+        raise ValueError("replacement must be null unless action is REPLACE_TASK")
     raw_lesson = value.get("lesson")
     lesson = str(raw_lesson).strip() if raw_lesson is not None else None
     if lesson:
@@ -333,7 +372,7 @@ def parse_maintenance_response(
         reason=reason,
         role=role,
         lesson=lesson or None,
-        replacement=None,
+        replacement=replacement,
     )
 
 
@@ -592,6 +631,15 @@ class MaintainerCoordinator:
                         else None
                     ),
                 )
+                if entry is not None and existing is not None:
+                    for field in (
+                        "application_state",
+                        "replacement_task_id",
+                        "resolved_at",
+                        "application_error",
+                    ):
+                        if field in existing:
+                            entry[field] = existing[field]
                 if entry is not None:
                     if existing_index is None:
                         history_by_request[request_id] = len(history)
@@ -606,7 +654,16 @@ class MaintainerCoordinator:
                         and incident.get("prompt_generation") == generation
                     ):
                         recovered_constructor_generation = generation
-                projection = self._active_projection(task, incident)
+                replacement_applied = bool(
+                    existing is not None
+                    and existing.get("application_state") == "RESOLVED"
+                    and existing.get("replacement_task_id")
+                )
+                projection = (
+                    None
+                    if replacement_applied
+                    else self._active_projection(task, incident)
+                )
                 if projection is not None:
                     active_projections.append(projection)
 
@@ -643,9 +700,20 @@ class MaintainerCoordinator:
                 if task is not None
                 else None
             )
+            applied = next(
+                (
+                    item
+                    for item in history
+                    if isinstance(item, Mapping)
+                    and item.get("request_id") == active.get("request_id")
+                    and item.get("application_state") == "RESOLVED"
+                    and item.get("replacement_task_id")
+                ),
+                None,
+            )
             projection = (
                 self._active_projection(task, incident)
-                if task is not None and incident is not None
+                if task is not None and incident is not None and applied is None
                 else None
             )
             if projection is not None:
@@ -690,7 +758,11 @@ class MaintainerCoordinator:
                 reason=str(decision_value.get("reason") or ""),
                 role=decision_value.get("role"),
                 lesson=decision_value.get("lesson"),
-                replacement=None,
+                replacement=(
+                    dict(decision_value["replacement"])
+                    if isinstance(decision_value.get("replacement"), Mapping)
+                    else None
+                ),
             )
             learning_path = self.config.repository_root / "LEARNING.md"
             if learning_path.is_file():
@@ -767,6 +839,99 @@ class MaintainerCoordinator:
             self.store.save_maintenance(path, state)
             self._clear_global_active(str(incident["incident_id"]))
             return True
+        if action == "REPLACE_TASK":
+            replacement = decision.get("replacement")
+            global_state = self.state_store.load()
+            applied = next(
+                (
+                    item
+                    for item in global_state.get("history") or []
+                    if isinstance(item, Mapping)
+                    and item.get("incident_id") == incident.get("incident_id")
+                    and item.get("request_id") == incident.get("request_id")
+                    and item.get("application_state") == "RESOLVED"
+                    and item.get("replacement_task_id")
+                ),
+                None,
+            )
+            if applied is not None:
+                replacement_id = str(applied.get("replacement_task_id") or "")
+                if any(
+                    task.get("task_id") == replacement_id
+                    and task.get("replacement_incident_id") == incident.get("incident_id")
+                    for task in self.store.discover()
+                ):
+                    active = global_state.get("active_incident")
+                    if (
+                        isinstance(active, Mapping)
+                        and active.get("incident_id") == incident.get("incident_id")
+                    ):
+                        global_state["active_incident"] = None
+                        self.state_store.save(global_state)
+                    return False
+            try:
+                if not isinstance(replacement, Mapping):
+                    raise ValueError("replacement decision is missing its payload")
+                parent_before = path.read_bytes()
+                result = self.store.replace_task_and_rewire(
+                    str(replacement.get("target_task_id") or ""),
+                    str(replacement.get("task") or ""),
+                    reuse_team=replacement.get("reuse_team"),
+                    rewire_children=replacement.get("rewire_children"),
+                    incident_id=str(incident.get("incident_id") or ""),
+                )
+                if path.read_bytes() != parent_before:
+                    raise RuntimeError("replacement mutated immutable parent history")
+                history_entry = self._history_entry(state, incident)
+                if history_entry is None:
+                    raise RuntimeError("replacement lost maintenance history provenance")
+                replacement_id = str(result["replacement"]["task_id"])
+                history_entry.update(
+                    application_state="RESOLVED",
+                    replacement_task_id=replacement_id,
+                    resolved_at=utc_now(),
+                    application_error=None,
+                )
+                history = list(global_state.get("history") or [])
+                existing_index = next(
+                    (
+                        index
+                        for index, item in enumerate(history)
+                        if isinstance(item, Mapping)
+                        and item.get("request_id") == incident.get("request_id")
+                    ),
+                    None,
+                )
+                if existing_index is None:
+                    history.append(history_entry)
+                else:
+                    history[existing_index] = history_entry
+                global_state["history"] = history[-100:]
+                global_state["active_incident"] = None
+                global_state["last_error"] = None
+                self.state_store.save(global_state)
+                decision_value = MaintenanceDecision(
+                    action="REPLACE_TASK",
+                    reason=str(decision.get("reason") or ""),
+                    role=None,
+                    lesson=decision.get("lesson"),
+                    replacement=dict(replacement),
+                )
+                append_resolved_lesson(
+                    self.config.repository_root / "LEARNING.md",
+                    {"state": "RESOLVED"},
+                    decision_value,
+                )
+                return True
+            except Exception as exc:
+                incident["state"] = "ESCALATED"
+                state["maintenance"]["suppressed_operational_key"] = current_key
+                incident["last_error"] = f"{type(exc).__name__}: {exc}"
+                incident["updated_at"] = utc_now()
+                state["maintenance"]["active_incident_id"] = None
+                self.store.save_maintenance(path, state)
+                self._clear_global_active(str(incident["incident_id"]))
+                return True
         control_id = incident.get("control_id")
         control = next(
             (
@@ -860,6 +1025,7 @@ class MaintainerCoordinator:
         incident: Mapping[str, Any],
         *,
         include_constructor: bool,
+        tasks: Sequence[Mapping[str, Any]] = (),
     ) -> str:
         active_hop = next(
             (
@@ -870,6 +1036,30 @@ class MaintainerCoordinator:
             ),
             None,
         )
+        task_id = str(task.get("task_id") or "")
+        task_index = {
+            str(item.get("task_id") or ""): item
+            for item in tasks
+            if isinstance(item, Mapping) and str(item.get("task_id") or "")
+        }
+        parents = []
+        for parent_id in task.get("depends_on_task_ids") or ():
+            parent = task_index.get(str(parent_id))
+            parents.append({
+                "task_id": str(parent_id),
+                "status": str(parent.get("status") or "UNKNOWN") if parent else "MISSING",
+                "team": (str(parent.get("team") or "") or None) if parent else None,
+            })
+        children = [
+            {
+                "task_id": str(item.get("task_id") or ""),
+                "status": str(item.get("status") or "UNKNOWN"),
+                "team": str(item.get("team") or "") or None,
+            }
+            for item in tasks
+            if isinstance(item, Mapping)
+            and task_id in [str(parent) for parent in item.get("depends_on_task_ids") or ()]
+        ]
         role_status = {
             str(role): {
                 "physical_role": record.get("physical_role"),
@@ -883,6 +1073,9 @@ class MaintainerCoordinator:
         snapshot = {
             "task_id": task.get("task_id"),
             "team": task.get("team"),
+            "task_text": task.get("task_text"),
+            "repository": task.get("repository"),
+            "retained_reports": retained_report_references(task),
             "status": task.get("status"),
             "block_code": task.get("block_code"),
             "block_reason": task.get("block_reason"),
@@ -896,6 +1089,11 @@ class MaintainerCoordinator:
             "active_hop": active_hop,
             "roles": role_status,
             "cleanup": task.get("cleanup"),
+            "dependencies": {
+                "parents": parents,
+                "children": children,
+                "waiting": task.get("waiting"),
+            },
             "latest_control": (task.get("controls") or [None])[-1],
         }
         sections = [
@@ -1020,8 +1218,22 @@ class MaintainerCoordinator:
 
             if decision.action == "RETRY_HOP" and not current.get("block_retryable"):
                 raise ValueError("RETRY_HOP requires a retryable task block")
+            if decision.action == "REPLACE_TASK":
+                replacement = decision.replacement or {}
+                if replacement.get("target_task_id") != current.get("task_id"):
+                    raise ValueError("replacement target must equal the active incident task")
+                status = str(current.get("status") or "").upper()
+                if status not in {"STOPPED", "BLOCKED"}:
+                    raise ValueError("replacement target must be STOPPED or BLOCKED")
+                cleanup = current.get("cleanup")
+                if isinstance(cleanup, Mapping) and str(cleanup.get("state") or "").upper() in {
+                    "CLEARING", "CLEARED"
+                }:
+                    raise ValueError("replacement target cleanup is already in progress")
+                if replacement.get("reuse_team") is True and status != "STOPPED":
+                    raise ValueError("reuse_team requires a STOPPED replacement target")
             control: Mapping[str, Any] | None = None
-            if decision.action != "WAIT":
+            if decision.action not in {"WAIT", "REPLACE_TASK"}:
                 control = self.store._queue_control(
                     current,
                     _CONTROL_ACTIONS[decision.action],
@@ -1077,7 +1289,7 @@ class MaintainerCoordinator:
         *,
         incident: Mapping[str, Any],
     ) -> dict[str, Any] | None:
-        if decision.action == "WAIT":
+        if decision.action in {"WAIT", "REPLACE_TASK"}:
             return None
         if decision.action == "RETRY_HOP" and not state.get("block_retryable"):
             raise ValueError("RETRY_HOP requires a retryable task block")
@@ -1260,6 +1472,7 @@ class MaintainerCoordinator:
                     state,
                     incident,
                     include_constructor=include_constructor,
+                    tasks=[item for _path, item in loaded],
                 )
                 incident["prompt"] = prompt
                 incident["prompt_sha256"] = hashlib.sha256(

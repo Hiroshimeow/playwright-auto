@@ -189,6 +189,7 @@
       <form id="create-mode-panel" class="grid gap-4">
         <label class="text-xs text-white">Task text<textarea id="create-task-input" class="mt-1 min-h-24 w-full rounded-lg border border-borderDark bg-dark px-3 py-2 text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" required></textarea></label>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-3"><label class="text-xs text-white">Requested team base<input id="create-team-input" class="mt-1 min-h-10 w-full rounded-lg border border-borderDark bg-dark px-3 text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" required autocomplete="off"></label><label class="text-xs text-white">Repository / workspace<input id="create-repository-input" class="mt-1 min-h-10 w-full rounded-lg border border-borderDark bg-dark px-3 text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" required autocomplete="off"></label></div>
+        <label class="text-xs text-white">Dependency task IDs<input id="create-dependencies-input" class="mt-1 min-h-10 w-full rounded-lg border border-borderDark bg-dark px-3 text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" autocomplete="off" placeholder="task-a, task-b"><span class="mt-1 block text-[10px] text-textDim">Optional comma-separated durable task IDs. All must exist and form a DAG.</span></label>
         <fieldset class="rounded-lg border border-borderDark bg-dark p-3"><legend class="px-1 text-xs text-white">Fresh conversation on first use</legend><p class="text-xs text-textDim mb-2">Select logical roles that should lazily start in a fresh conversation.</p><div class="flex flex-wrap gap-2"><label class="min-h-10 inline-flex items-center gap-2 rounded-lg border border-borderDark px-3 text-xs"><input type="checkbox" name="new_role" value="PLAN" class="accent-accent">PLAN</label><label class="min-h-10 inline-flex items-center gap-2 rounded-lg border border-borderDark px-3 text-xs"><input type="checkbox" name="new_role" value="DEV" class="accent-accent">DEV</label><label class="min-h-10 inline-flex items-center gap-2 rounded-lg border border-borderDark px-3 text-xs"><input type="checkbox" name="new_role" value="TEST" class="accent-accent">TEST</label><label class="min-h-10 inline-flex items-center gap-2 rounded-lg border border-borderDark px-3 text-xs"><input type="checkbox" name="new_role" value="REVIEW" class="accent-accent">REVIEW</label><label class="min-h-10 inline-flex items-center gap-2 rounded-lg border border-borderDark px-3 text-xs"><input type="checkbox" name="new_role" value="AUDIT" class="accent-accent">AUDIT</label></div><label class="min-h-10 mt-2 inline-flex items-center gap-2 text-xs text-white"><input id="new-all-input" type="checkbox" class="accent-accent">Fresh conversation for every role on first use</label></fieldset>
         <button type="submit" id="create-submit" class="min-h-10 rounded-lg border border-accent bg-accent text-white font-semibold px-4 disabled:border-borderDark disabled:bg-borderDark disabled:text-textDim">Create task</button>
       </form>
@@ -421,10 +422,13 @@
       }
       function renderDependencySummary(task) {
         const host = byId('dependency-content');
+        const formatEdges = rows => (rows || []).map(item => `${item.task_id} (${item.status})`).join(', ') || 'None';
         const rows = [
-          ['parents', 'Parents', (task.depends_on_task_ids || []).join(', ') || 'None'],
-          ['children', 'Children', (task.child_task_ids || []).join(', ') || 'None'],
+          ['parents', 'Parents', formatEdges(task.parents)],
+          ['children', 'Children', formatEdges(task.children)],
           ['waiting', 'Waiting on', (task.waiting_on_task_ids || []).join(', ') || task.waiting_reason || 'Nothing'],
+          ['stopped', 'Stopped dependencies', (task.stopped_dependency_task_ids || []).join(', ') || 'None'],
+          ['missing', 'Missing dependencies', (task.missing_dependency_task_ids || []).join(', ') || 'None'],
           ['queue', 'Team queue', task.queue_position ? `Position ${task.queue_position}${task.queue_length ? ` of ${task.queue_length}` : ''}` : 'Not queued'],
         ];
         const keys = new Set();
@@ -757,7 +761,9 @@
         const create = mode === 'create';
         const submit = byId(create ? 'create-submit' : 'resume-submit');
         const newRoles = [...document.querySelectorAll('input[name="new_role"]:checked')].map(node => node.value);
+        const dependencies = [...new Set(byId('create-dependencies-input').value.split(',').map(value => value.trim()).filter(Boolean))];
         const body = create ? {task: byId('create-task-input').value.trim(), repository: byId('create-repository-input').value, team: byId('create-team-input').value, new_roles: newRoles, new_all: byId('new-all-input').checked} : {repository: state.repository, team: byId('resume-team-input').value};
+        if (create && dependencies.length) body.depends_on_task_ids = dependencies;
         if (create && (!body.task || !body.repository || !body.team)) { setText(byId('dialog-result'), 'Task text, repository, and requested team base are required.'); return; }
         if (!create && !body.team) { setText(byId('dialog-result'), 'Exact allocated team is required.'); return; }
         submit.disabled = true;

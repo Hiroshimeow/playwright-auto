@@ -647,6 +647,7 @@ def _task_surface(
 def build_task_payload(
     raw: Mapping[str, Any],
     *,
+    tasks: Sequence[Mapping[str, Any]] = (),
     pages: Sequence[Mapping[str, Any]] = (),
     connected: bool = False,
 ) -> dict[str, Any]:
@@ -692,8 +693,47 @@ def build_task_payload(
     latest_maintenance_report = _latest_maintenance_report(raw)
     active_maintenance = _active_maintenance_incident(raw)
     active_maintenance_report = _maintenance_report(raw, active_maintenance)
+    task_id = str(raw.get("task_id") or "")
+    task_index = {
+        str(item.get("task_id") or ""): item
+        for item in tasks
+        if isinstance(item, Mapping) and str(item.get("task_id") or "")
+    }
+    parents = []
+    for parent_id in _string_list(raw.get("depends_on_task_ids")):
+        parent = task_index.get(parent_id)
+        parents.append({
+            "task_id": parent_id,
+            "status": str(parent.get("status") or "UNKNOWN") if parent else "MISSING",
+            "team": str(parent.get("team") or "") or None if parent else None,
+        })
+    children = [
+        {
+            "task_id": str(item.get("task_id") or ""),
+            "status": str(item.get("status") or "UNKNOWN"),
+            "team": str(item.get("team") or "") or None,
+        }
+        for item in tasks
+        if isinstance(item, Mapping)
+        and task_id in _string_list(item.get("depends_on_task_ids"))
+    ]
+    replacement_task = next(
+        (
+            item
+            for item in tasks
+            if isinstance(item, Mapping)
+            and item.get("replaces_task_id") == task_id
+            and active_maintenance is not None
+            and item.get("replacement_incident_id")
+            == active_maintenance.get("incident_id")
+        ),
+        None,
+    )
+    if replacement_task is not None:
+        active_maintenance = None
+        active_maintenance_report = None
     return {
-        "task_id": str(raw.get("task_id") or ""),
+        "task_id": task_id,
         "task_title": task_title,
         "task_text": str(raw.get("task_text") or ""),
         "task_slug": str(raw.get("task_slug") or ""),
@@ -730,9 +770,30 @@ def build_task_payload(
         "active_maintenance_incident": dict(active_maintenance) if active_maintenance is not None else None,
         "active_maintenance_report": active_maintenance_report,
         "latest_maintenance_report": latest_maintenance_report,
+        "maintenance_replacement_task_id": (
+            str(replacement_task.get("task_id") or "")
+            if replacement_task is not None
+            else None
+        ),
         "depends_on_task_ids": _string_list(raw.get("depends_on_task_ids")),
-        "child_task_ids": _string_list(raw.get("child_task_ids")),
-        "waiting_on_task_ids": _string_list(raw.get("waiting_on_task_ids")),
+        "parents": parents,
+        "child_task_ids": [item["task_id"] for item in children],
+        "children": children,
+        "waiting_on_task_ids": _string_list(
+            (raw.get("waiting") or {}).get("waiting_on")
+            if isinstance(raw.get("waiting"), Mapping)
+            else raw.get("waiting_on_task_ids")
+        ),
+        "stopped_dependency_task_ids": _string_list(
+            (raw.get("waiting") or {}).get("stopped")
+            if isinstance(raw.get("waiting"), Mapping)
+            else ()
+        ),
+        "missing_dependency_task_ids": _string_list(
+            (raw.get("waiting") or {}).get("missing")
+            if isinstance(raw.get("waiting"), Mapping)
+            else ()
+        ),
         "queue_position": raw.get("queue_position"),
         "queue_length": raw.get("queue_length"),
         "waiting_reason": raw.get("waiting_reason"),
@@ -971,12 +1032,12 @@ def _validated_maintenance_report_bytes(
 
 
 def _find_task(task_store: TaskStore, task_id: str) -> dict[str, Any]:
+    if task_id in task_store.duplicate_task_ids():
+        raise ValueError(f"duplicate task ID {task_id!r}")
     tasks, _errors = task_store.discover_with_errors()
     matches = [task for task in tasks if task.get("task_id") == task_id]
     if not matches:
         raise KeyError(task_id)
-    if len(matches) > 1:
-        raise ValueError(f"duplicate task ID {task_id!r}")
     return matches[0]
 
 
@@ -1036,7 +1097,12 @@ def _handler(
                 pages = [page for page in live.get("pages") or [] if isinstance(page, Mapping)]
                 connected = bool(live.get("connected"))
                 tasks = [
-                    build_task_payload(task, pages=pages, connected=connected)
+                    build_task_payload(
+                        task,
+                        tasks=raw_tasks,
+                        pages=pages,
+                        connected=connected,
+                    )
                     for task in raw_tasks
                 ]
                 tasks.sort(key=lambda task: _timestamp_key(task.get("effective_activity_at")), reverse=True)
@@ -1057,10 +1123,22 @@ def _handler(
                 task_id = path.removeprefix("/api/tasks/")
                 try:
                     live = store.snapshot()
+                    raw_tasks, _manifest_errors = task_store.discover_with_errors()
+                    if task_id in task_store.duplicate_task_ids():
+                        raise ValueError(f"duplicate task ID {task_id!r}")
+                    matches = [
+                        task
+                        for task in raw_tasks
+                        if str(task.get("task_id") or "") == task_id
+                    ]
+                    if not matches:
+                        raise KeyError(task_id)
+                    selected = matches[0]
                     self._json(
                         200,
                         build_task_payload(
-                            _find_task(task_store, task_id),
+                            selected,
+                            tasks=raw_tasks,
                             pages=[page for page in live.get("pages") or [] if isinstance(page, Mapping)],
                             connected=bool(live.get("connected")),
                         ),
@@ -1147,15 +1225,19 @@ def _handler(
                             body.get("new_roles")
                             or body.get("new_all")
                             or "report_mode" in body
+                            or body.get("depends_on_task_ids")
                         ):
                             raise ValueError(
-                                "new_roles, new_all, and report_mode are invalid when resuming"
+                                "new_roles, new_all, report_mode, and depends_on_task_ids are invalid when resuming"
                             )
                         team = body.get("team")
                         if not isinstance(team, str) or not team:
                             raise ValueError("resume requires an exact team string")
                         task = task_store.resume_team(team, reason="resume requested")
-                        self._json(202, build_task_payload(task))
+                        self._json(
+                            202,
+                            build_task_payload(task, tasks=task_store.discover()),
+                        )
                         return
                     live_snapshot = store.snapshot()
                     live_pages = live_snapshot.get("pages") or []
@@ -1170,6 +1252,7 @@ def _handler(
                             else "file"
                         ),
                         repository=requested_repository,
+                        depends_on_task_ids=tuple(body.get("depends_on_task_ids") or ()),
                         reserved_team_suffixes=_busy_role_suffixes(
                             task_store,
                             [page for page in live_pages if isinstance(page, Mapping)],
@@ -1177,9 +1260,13 @@ def _handler(
                             connected=bool(live_snapshot.get("connected")),
                         ),
                     )
-                    self._json(201, build_task_payload(task))
+                    self._json(
+                        201,
+                        build_task_payload(task, tasks=task_store.discover()),
+                    )
                     return
                 if path.startswith("/api/tasks/") and path.endswith("/controls"):
+                    task_store.recover_phase4_replacement()
                     task_id = path[len("/api/tasks/") : -len("/controls")].strip("/")
                     task = _find_task(task_store, task_id)
                     updated = task_store.request_control(

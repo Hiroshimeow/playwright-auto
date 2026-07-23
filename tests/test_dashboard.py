@@ -905,3 +905,142 @@ def test_maintenance_creation_row_never_back_projects_final_state():
     ]
     assert len({item["key"] for item in maintenance}) == 3
     assert "RESOLVED" not in maintenance[-1]["message"]
+
+
+def test_dependency_projection_derives_parent_child_status_without_mirrored_state():
+    from playwright_auto.dashboard import build_task_payload
+
+    parent = {
+        "task_id": "task-parent",
+        "task_title": "Parent",
+        "task_text": "Parent",
+        "team": "parent",
+        "team_suffix": 1,
+        "status": "STOPPED",
+        "created_at": "2026-07-23T01:00:00+00:00",
+        "updated_at": "2026-07-23T01:01:00+00:00",
+        "roles": {},
+        "hops": [],
+        "reports": [],
+        "controls": [],
+        "route_timeline": [],
+        "errors": [],
+        "depends_on_task_ids": [],
+        "dependency_events": [],
+    }
+    child = {
+        "task_id": "task-child",
+        "task_title": "Child",
+        "task_text": "Child",
+        "team": "child",
+        "team_suffix": 1,
+        "status": "WAITING",
+        "kanban_column": "WAITING",
+        "active_action": "waiting_dependency",
+        "waiting_reason": "Waiting for dependencies: task-parent, task-missing",
+        "waiting_code": "dependency_missing",
+        "waiting": {
+            "reason": "dependency",
+            "waiting_on": ["task-parent"],
+            "stopped": ["task-parent"],
+            "missing": ["task-missing"],
+            "since": "2026-07-23T01:02:00+00:00",
+        },
+        "created_at": "2026-07-23T01:02:00+00:00",
+        "updated_at": "2026-07-23T01:02:00+00:00",
+        "roles": {},
+        "hops": [],
+        "reports": [],
+        "controls": [],
+        "route_timeline": [],
+        "errors": [],
+        "depends_on_task_ids": ["task-parent", "task-missing"],
+        "dependency_events": [{
+            "at": "2026-07-23T01:02:00+00:00",
+            "status": "WAITING",
+            "message": "Waiting for dependencies",
+        }],
+    }
+    tasks = [parent, child]
+
+    child_payload = build_task_payload(child, tasks=tasks)
+    parent_payload = build_task_payload(parent, tasks=tasks)
+
+    assert child_payload["parents"] == [
+        {"task_id": "task-parent", "status": "STOPPED", "team": "parent"},
+        {"task_id": "task-missing", "status": "MISSING", "team": None},
+    ]
+    assert child_payload["children"] == []
+    assert child_payload["stopped_dependency_task_ids"] == ["task-parent"]
+    assert child_payload["missing_dependency_task_ids"] == ["task-missing"]
+    assert child_payload["primary_problem"]["code"] == "dependency_missing"
+    assert parent_payload["child_task_ids"] == ["task-child"]
+    assert parent_payload["children"] == [
+        {"task_id": "task-child", "status": "WAITING", "team": "child"}
+    ]
+    assert "child_task_ids" not in parent
+
+
+def test_replacement_provenance_suppresses_frozen_parent_active_maintenance_projection():
+    from playwright_auto.dashboard import build_task_payload
+
+    incident = {
+        "incident_id": "maint-1",
+        "state": "RUNNING",
+        "turn": 2,
+        "request_id": "maint-1-turn2",
+        "decision": {
+            "action": "REPLACE_TASK",
+            "reason": "replace",
+            "role": None,
+            "lesson": None,
+            "replacement": {
+                "target_task_id": "task-parent",
+                "task": "continue",
+                "reuse_team": True,
+                "rewire_children": True,
+            },
+        },
+        "report_path": "/repo/.plan/maintainers/parent_turn2_report.md",
+        "report_sha256": "a" * 64,
+        "report_size": 12,
+    }
+    parent = {
+        "task_id": "task-parent",
+        "task_title": "Parent",
+        "task_text": "Parent",
+        "team": "parent",
+        "team_suffix": 1,
+        "status": "STOPPED",
+        "created_at": "2026-07-23T01:00:00+00:00",
+        "updated_at": "2026-07-23T01:01:00+00:00",
+        "roles": {},
+        "hops": [],
+        "reports": [],
+        "controls": [],
+        "route_timeline": [],
+        "errors": [],
+        "depends_on_task_ids": [],
+        "dependency_events": [],
+        "maintenance": {
+            "active_incident_id": "maint-1",
+            "incidents": [incident],
+        },
+    }
+    replacement = {
+        **parent,
+        "task_id": "task-replacement",
+        "task_title": "Replacement",
+        "task_text": "Replacement",
+        "status": "INBOX",
+        "replaces_task_id": "task-parent",
+        "replacement_incident_id": "maint-1",
+        "maintenance": None,
+    }
+
+    payload = build_task_payload(parent, tasks=[parent, replacement])
+
+    assert payload["active_maintenance_incident"] is None
+    assert payload["active_maintenance_report"] is None
+    assert payload["latest_maintenance_report"]["incident_id"] == "maint-1"
+    assert payload["maintenance_replacement_task_id"] == "task-replacement"

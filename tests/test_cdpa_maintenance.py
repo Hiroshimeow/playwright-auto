@@ -2465,3 +2465,387 @@ def test_coordinator_propagates_cdp_disconnect_for_worker_reconnect(
 
     with pytest.raises(TargetClosedError):
         asyncio.run(coordinator.advance([(path, state)], SimpleNamespace()))
+
+
+def replacement_response(**overrides):
+    replacement = {
+        "target_task_id": "task-parent",
+        "task": "Continue the parent outcome safely",
+        "reuse_team": True,
+        "rewire_children": True,
+    }
+    replacement.update(overrides.pop("replacement", {}))
+    value = {
+        "action": "REPLACE_TASK",
+        "reason": "The stopped parent cannot safely continue.",
+        "role": None,
+        "lesson": None,
+        "replacement": replacement,
+    }
+    value.update(overrides)
+    return "# Maintenance report\n\nReplacement is the smallest safe recovery.\n\n```json\n" + __import__("json").dumps(value) + "\n```"
+
+
+def test_parse_replace_task_requires_exact_replacement_contract():
+    _report, decision = parse_maintenance_response(replacement_response())
+    assert decision.action == "REPLACE_TASK"
+    assert decision.role is None
+    assert decision.replacement == {
+        "target_task_id": "task-parent",
+        "task": "Continue the parent outcome safely",
+        "reuse_team": True,
+        "rewire_children": True,
+    }
+
+    invalid = [
+        replacement_response(role="DEV"),
+        replacement_response(replacement={"target_task_id": ""}),
+        replacement_response(replacement={"task": ""}),
+        replacement_response(replacement={"reuse_team": "yes"}),
+        replacement_response(replacement={"rewire_children": 1}),
+        replacement_response(replacement={"extra": True}),
+    ]
+    for value in invalid:
+        with pytest.raises(ValueError):
+            parse_maintenance_response(value)
+
+
+def test_waiting_missing_dependency_creates_one_maintenance_incident():
+    state = task_state(status="WAITING", block_code=None, terminal_state=None)
+    state["waiting_code"] = "dependency_missing"
+    state["waiting_reason"] = "Waiting for dependencies: task-missing"
+    state["waiting"] = {
+        "reason": "dependency",
+        "waiting_on": [],
+        "stopped": [],
+        "missing": ["task-missing"],
+        "since": "2026-07-23T01:00:00+00:00",
+    }
+    first = ensure_maintenance_incident(state)
+    second = ensure_maintenance_incident(state)
+    assert first is second
+    assert first is not None
+    assert first["trigger_status"] == "WAITING"
+    assert first["trigger_code"] == "dependency_missing"
+    assert len(state["maintenance"]["incidents"]) == 1
+
+
+def test_reconcile_replace_task_applies_atomic_rewire_once(tmp_path: Path):
+    import playwright_auto.cdpa_maintenance as maintenance_module
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_store import TaskStore, utc_now
+    from test_cdpa_core import write_config
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task("Parent", requested_team="parent", task_id="task-parent")
+    child = store.create_task(
+        "Child", requested_team="child", task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+    parent = store.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "STOPPED",
+            "terminal_state": "STOPPED",
+            "active_role": None,
+            "active_hop_id": None,
+            "stopped_at": utc_now(),
+            "stop_reason": "unsafe to continue",
+        },
+    )
+    incident = ensure_maintenance_incident(parent)
+    assert incident is not None
+    incident.update({
+        "state": "RUNNING",
+        "turn": 1,
+        "request_id": "maint-replace-turn1",
+        "report_path": str(tmp_path / ".plan" / "maintainers" / "report.md"),
+        "report_sha256": "a" * 64,
+        "report_size": 10,
+        "decision": {
+            "action": "REPLACE_TASK",
+            "reason": "stopped parent cannot continue",
+            "role": None,
+            "lesson": None,
+            "replacement": {
+                "target_task_id": "task-parent",
+                "task": "Continue parent safely",
+                "reuse_team": True,
+                "rewire_children": True,
+            },
+        },
+    })
+    parent = store.save_maintenance(parent["manifest_path"], parent)
+    parent_path = Path(parent["manifest_path"])
+    parent_before = parent_path.read_bytes()
+    coordinator = maintenance_module.MaintainerCoordinator(config, store=store)
+
+    assert coordinator._reconcile_active(parent_path, parent) is True
+    assert parent_path.read_bytes() == parent_before
+    current_parent = store.load(parent_path)
+    current_incident = current_parent["maintenance"]["incidents"][0]
+    history = coordinator.state_store.load()["history"]
+    applied = next(item for item in history if item["incident_id"] == incident["incident_id"])
+    replacement_id = applied["replacement_task_id"]
+    replacement = next(task for task in store.discover() if task["task_id"] == replacement_id)
+    current_child = store.load(child["manifest_path"])
+
+    assert current_incident["state"] == "RUNNING"
+    assert current_parent["maintenance"]["active_incident_id"] == incident["incident_id"]
+    assert applied["application_state"] == "RESOLVED"
+    assert replacement["replaces_task_id"] == "task-parent"
+    assert current_child["depends_on_task_ids"] == [replacement_id]
+    assert current_parent["controls"] == []
+    assert coordinator._reconcile_active(parent_path, current_parent) is False
+    assert parent_path.read_bytes() == parent_before
+    loaded = [
+        (Path(task["manifest_path"]), task)
+        for task in store.discover()
+    ]
+    coordinator._reconcile_global_state(loaded)
+    reconciled_global = coordinator.state_store.load()
+    reconciled_applied = next(
+        item for item in reconciled_global["history"]
+        if item["incident_id"] == incident["incident_id"]
+    )
+    assert reconciled_global["active_incident"] is None
+    assert reconciled_applied["application_state"] == "RESOLVED"
+    assert reconciled_applied["replacement_task_id"] == replacement_id
+    assert parent_path.read_bytes() == parent_before
+    assert len([
+        task for task in store.discover()
+        if task.get("replacement_incident_id") == incident["incident_id"]
+    ]) == 1
+
+
+def test_maintainers_prompt_includes_derived_dependency_context_without_mirrored_children(tmp_path: Path):
+    import json
+    import playwright_auto.cdpa_maintenance as maintenance_module
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_store import TaskStore, utc_now
+    from test_cdpa_core import write_config
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task("Parent", requested_team="parent", task_id="task-parent")
+    child = store.create_task(
+        "Child", requested_team="child", task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+    parent = store.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "STOPPED",
+            "terminal_state": "STOPPED",
+            "active_role": None,
+            "active_hop_id": None,
+            "stopped_at": utc_now(),
+            "stop_reason": "unsafe parent",
+        },
+    )
+    incident = ensure_maintenance_incident(parent)
+    assert incident is not None
+    prompt = maintenance_module.MaintainerCoordinator(config, store=store)._prompt(
+        parent,
+        incident,
+        include_constructor=True,
+        tasks=[parent, child],
+    )
+    envelope = json.loads(prompt.split("\n\n", 1)[0].split("\n", 1)[1])
+
+    assert envelope["dependencies"]["parents"] == []
+    assert envelope["dependencies"]["children"] == [
+        {"task_id": "task-child", "status": "WAITING", "team": "child"}
+    ]
+    assert envelope["dependencies"]["waiting"] == parent.get("waiting")
+    assert "child_task_ids" not in envelope
+    repository = Path(__file__).resolve().parents[1]
+    for constructor in (
+        repository / "prompts" / "cdpa" / "MAINTAINERS.md",
+        repository / "src" / "playwright_auto" / "cdpa_defaults" / "prompts" / "cdpa" / "MAINTAINERS.md",
+    ):
+        contract = constructor.read_text(encoding="utf-8")
+        assert "REPLACE_TASK" in contract
+        assert '"rewire_children":true' in contract
+
+
+def test_reconcile_replace_task_does_not_resolve_before_crash_recovery(
+    tmp_path: Path, monkeypatch
+):
+    import playwright_auto.cdpa_maintenance as maintenance_module
+    import playwright_auto.cdpa_store as store_module
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_store import TaskStore, utc_now
+    from test_cdpa_core import write_config
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task(
+        "Parent", requested_team="aaa", task_id="task-parent"
+    )
+    child = store.create_task(
+        "Child",
+        requested_team="zzz",
+        task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+    parent = store.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "STOPPED",
+            "terminal_state": "STOPPED",
+            "active_role": None,
+            "active_hop_id": None,
+            "stopped_at": utc_now(),
+            "stop_reason": "unsafe to continue",
+        },
+    )
+    incident = ensure_maintenance_incident(parent)
+    assert incident is not None
+    incident.update(
+        {
+            "state": "RUNNING",
+            "turn": 1,
+            "request_id": "maint-crash-turn1",
+            "report_path": str(
+                tmp_path / ".plan" / "maintainers" / "crash-report.md"
+            ),
+            "report_sha256": "a" * 64,
+            "report_size": 10,
+            "decision": {
+                "action": "REPLACE_TASK",
+                "reason": "stopped parent cannot continue",
+                "role": None,
+                "lesson": None,
+                "replacement": {
+                    "target_task_id": "task-parent",
+                    "task": "Continue parent safely",
+                    "reuse_team": True,
+                    "rewire_children": True,
+                },
+            },
+        }
+    )
+    parent = store.save_maintenance(parent["manifest_path"], parent)
+    parent_path = Path(parent["manifest_path"])
+    original_replace = store_module.os.replace
+    manifest_installs = 0
+
+    def interrupt_before_second_manifest(source, target):
+        nonlocal manifest_installs
+        if Path(source).name.endswith(".json.phase4.tmp"):
+            manifest_installs += 1
+            if manifest_installs == 2:
+                raise SystemExit("simulated coordinator interruption")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(store_module.os, "replace", interrupt_before_second_manifest)
+    coordinator = maintenance_module.MaintainerCoordinator(config, store=store)
+    with pytest.raises(SystemExit, match="coordinator interruption"):
+        coordinator._reconcile_active(parent_path, parent)
+
+    global_after_crash = coordinator.state_store.load()
+    assert not any(
+        item.get("application_state") == "RESOLVED"
+        and item.get("incident_id") == incident["incident_id"]
+        for item in global_after_crash.get("history") or []
+    )
+    assert store.phase4_journal_path.exists()
+
+    monkeypatch.setattr(store_module.os, "replace", original_replace)
+    restarted_store = TaskStore(config)
+    restarted = maintenance_module.MaintainerCoordinator(
+        config, store=restarted_store
+    )
+    current_parent = restarted_store.load(parent_path)
+    assert restarted._reconcile_active(parent_path, current_parent) is True
+
+    final_global = restarted.state_store.load()
+    applied = next(
+        item
+        for item in final_global["history"]
+        if item["incident_id"] == incident["incident_id"]
+    )
+    replacement_id = applied["replacement_task_id"]
+    assert applied["application_state"] == "RESOLVED"
+    assert restarted_store.load(child["manifest_path"])["depends_on_task_ids"] == [
+        replacement_id
+    ]
+    assert not restarted_store.phase4_journal_path.exists()
+
+
+def test_stopped_maintainers_prompt_includes_original_outcome_repository_and_reports(
+    tmp_path: Path,
+):
+    import hashlib
+    import json
+
+    import playwright_auto.cdpa_maintenance as maintenance_module
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_store import TaskStore, utc_now
+    from test_cdpa_core import write_config
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    unique_goal = "ORIGINAL UNIQUE GOAL: migrate customer records and preserve checksum 7f4a"
+    parent = store.create_task(
+        unique_goal,
+        requested_team="parent",
+        task_id="task-parent-context",
+    )
+    report_path = (
+        tmp_path
+        / ".plan"
+        / "parent"
+        / "parent-plan_turn1_task-parent-context.md"
+    )
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_bytes = b"# PLAN checkpoint\n\nValidated 73 of 100 records.\n"
+    report_path.write_bytes(report_bytes)
+    parent = store.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "reports": [
+                {
+                    "report_id": 1,
+                    "physical_role": "parent-plan",
+                    "turn": 1,
+                    "path": str(report_path),
+                    "sha256": hashlib.sha256(report_bytes).hexdigest(),
+                    "size": len(report_bytes),
+                }
+            ],
+            "status": "STOPPED",
+            "terminal_state": "STOPPED",
+            "active_role": None,
+            "active_hop_id": None,
+            "stopped_at": utc_now(),
+            "stop_reason": "parent cannot safely continue",
+        },
+    )
+    incident = ensure_maintenance_incident(parent)
+    assert incident is not None
+
+    prompt = maintenance_module.MaintainerCoordinator(config, store=store)._prompt(
+        parent,
+        incident,
+        include_constructor=False,
+        tasks=[parent],
+    )
+    snapshot = json.loads(prompt.split("\n\n", 1)[0].split("\n", 1)[1])
+
+    assert snapshot["task_text"] == unique_goal
+    assert snapshot["repository"] == str(tmp_path)
+    assert snapshot["retained_reports"] == [
+        {
+            "report_id": 1,
+            "physical_role": "parent-plan",
+            "turn": 1,
+            "path": str(report_path),
+        }
+    ]

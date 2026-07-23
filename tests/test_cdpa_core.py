@@ -11,7 +11,7 @@ import playwright_auto.cdpa_store as store_module
 from playwright_auto.cdpa_config import CDPAConfigError, load_cdpa_config
 from playwright_auto.cdpa_prompts import PromptBuilder
 from playwright_auto.cdpa_routes import RouteContractError, parse_route_response, validate_report
-from playwright_auto.cdpa_store import TaskStore
+from playwright_auto.cdpa_store import TaskStore, utc_now
 from playwright_auto.cdpa_team import cleanup_eligible, physical_role
 
 
@@ -54,6 +54,66 @@ def write_config(root: Path) -> Path:
         "Return only the strict route JSON.\nReport: .plan/<team>/<physical-role>_turn<N>_<task-id>.md", encoding="utf-8"
     )
     return path
+
+
+def install_cycle_isolation_graph(store: TaskStore) -> dict[str, dict[str, object]]:
+    missing_parent = store.create_task(
+        "Missing parent", requested_team="missing-parent", task_id="missing-parent"
+    )
+    missing_only = store.create_task(
+        "Missing only",
+        requested_team="missing-only",
+        task_id="missing-only",
+        depends_on_task_ids=("missing-parent",),
+    )
+    a = store.create_task("A", requested_team="a", task_id="task-a")
+    b = store.create_task(
+        "B",
+        requested_team="b",
+        task_id="task-b",
+        depends_on_task_ids=("task-a",),
+    )
+    unrelated = store.create_task(
+        "Unrelated", requested_team="unrelated", task_id="unrelated-task"
+    )
+    Path(missing_parent["manifest_path"]).unlink()
+    a_path = Path(a["manifest_path"])
+    raw_a = json.loads(a_path.read_text(encoding="utf-8"))
+    raw_a["depends_on_task_ids"] = ["task-b"]
+    a_path.write_text(json.dumps(raw_a), encoding="utf-8")
+    return {
+        "missing_parent": missing_parent,
+        "missing_only": missing_only,
+        "a": a,
+        "b": b,
+        "unrelated": unrelated,
+    }
+
+
+def install_duplicate_task_graph(store: TaskStore) -> dict[str, dict[str, object]]:
+    alpha = store.create_task("Alpha", requested_team="alpha", task_id="dup-task")
+    alpha_path = Path(alpha["manifest_path"])
+    alpha_bytes = alpha_path.read_bytes()
+    catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    alpha_key, alpha_entry = next(iter(catalog["entries"].items()))
+    alpha_path.unlink()
+    del catalog["entries"][alpha_key]
+    store.catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+
+    beta = store.create_task("Beta", requested_team="beta", task_id="dup-task")
+    unique = store.create_task("Unique", requested_team="unique", task_id="unique-task")
+    child = store.create_task(
+        "Child",
+        requested_team="child",
+        task_id="child-task",
+        depends_on_task_ids=("dup-task",),
+    )
+
+    alpha_path.write_bytes(alpha_bytes)
+    catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    catalog["entries"][alpha_key] = alpha_entry
+    store.catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    return {"alpha": alpha, "beta": beta, "unique": unique, "child": child}
 
 
 def test_packaged_default_config_targets_current_repository_without_local_config(tmp_path: Path):
@@ -1341,3 +1401,1506 @@ def test_inline_repair_redacts_report_path_derivatives(validation_error: str, tm
     assert ".md.lock" not in repair
     assert ".md.abc.tmp" not in repair
     assert "Do not create, edit, or write any role-report file" in repair
+
+
+def test_dependency_creation_waits_and_legacy_manifests_remain_compatible(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task("Parent", requested_team="parent", task_id="task-parent")
+    child = store.create_task(
+        "Child",
+        requested_team="child",
+        task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+
+    assert child["depends_on_task_ids"] == ["task-parent"]
+    assert child["status"] == "WAITING"
+    assert child["kanban_column"] == "WAITING"
+    assert child["active_action"] == "waiting_dependency"
+    assert child["active_hop_id"] == 1
+    assert child["hops"][0]["state"] == "pre_send"
+    assert child["waiting"]["waiting_on"] == ["task-parent"]
+    assert child["waiting"]["stopped"] == []
+    assert child["waiting"]["missing"] == []
+    assert child["waiting"]["since"]
+    assert len(child["dependency_events"]) == 1
+    assert "child_task_ids" not in child
+
+    raw = json.loads(Path(parent["manifest_path"]).read_text(encoding="utf-8"))
+    for key in ("depends_on_task_ids", "replaces_task_id", "replacement_incident_id", "dependency_events", "waiting"):
+        raw.pop(key, None)
+    Path(parent["manifest_path"]).write_text(json.dumps(raw), encoding="utf-8")
+    loaded = store.load(parent["manifest_path"])
+    assert "depends_on_task_ids" not in loaded
+
+
+def test_dependency_creation_ready_when_all_parents_done(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task("Parent", requested_team="parent", task_id="task-parent")
+    store.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": state["updated_at"],
+        },
+    )
+
+    child = store.create_task(
+        "Child",
+        requested_team="child",
+        task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+    assert child["status"] == "INBOX"
+    assert child["waiting"]["reason"] is None
+    assert child["dependency_events"] == []
+
+
+def test_dependency_creation_rejects_missing_self_duplicate_and_cycle_before_write(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    a = store.create_task("A", requested_team="a", task_id="task-a")
+    b = store.create_task(
+        "B", requested_team="b", task_id="task-b", depends_on_task_ids=("task-a",)
+    )
+    before = sorted(str(path) for path in store.discover_paths())
+
+    for task_id, parents, match in (
+        ("task-self", ("task-self",), "itself"),
+        ("task-dup", ("task-a", "task-a"), "duplicate"),
+        ("task-missing", ("absent",), "missing"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            store.create_task(
+                task_id,
+                requested_team=task_id,
+                task_id=task_id,
+                depends_on_task_ids=parents,
+            )
+    assert sorted(str(path) for path in store.discover_paths()) == before
+
+    # Corrupting an existing graph is rejected by the primary manifest validator.
+    raw_a = json.loads(Path(a["manifest_path"]).read_text(encoding="utf-8"))
+    raw_a["depends_on_task_ids"] = ["task-b"]
+    Path(a["manifest_path"]).write_text(json.dumps(raw_a), encoding="utf-8")
+    with pytest.raises(ValueError, match="cycle"):
+        store.load(a["manifest_path"])
+
+
+def test_missing_edge_does_not_mask_cycle_before_atomic_update(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    missing_parent = store.create_task(
+        "Missing parent", requested_team="missing-parent", task_id="missing-parent"
+    )
+    a = store.create_task(
+        "A",
+        requested_team="a",
+        task_id="task-a",
+        depends_on_task_ids=("missing-parent",),
+    )
+    store.create_task(
+        "B",
+        requested_team="b",
+        task_id="task-b",
+        depends_on_task_ids=("task-a",),
+    )
+    Path(missing_parent["manifest_path"]).unlink()
+    a_path = Path(a["manifest_path"])
+    before_manifest = a_path.read_bytes()
+    before_catalog = store.catalog_path.read_bytes()
+
+    with pytest.raises(ValueError, match="cycle"):
+        store.update(
+            a_path,
+            lambda state: {
+                **state,
+                "depends_on_task_ids": ["missing-parent", "task-b"],
+            },
+        )
+
+    assert a_path.read_bytes() == before_manifest
+    assert store.catalog_path.read_bytes() == before_catalog
+    assert store.load(a_path)["depends_on_task_ids"] == ["missing-parent"]
+
+
+def test_missing_edge_cycle_excludes_every_cycle_participant_from_discovery(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    missing_parent = store.create_task(
+        "Missing parent", requested_team="missing-parent", task_id="missing-parent"
+    )
+    a = store.create_task(
+        "A",
+        requested_team="a",
+        task_id="task-a",
+        depends_on_task_ids=("missing-parent",),
+    )
+    b = store.create_task(
+        "B",
+        requested_team="b",
+        task_id="task-b",
+        depends_on_task_ids=("task-a",),
+    )
+    Path(missing_parent["manifest_path"]).unlink()
+    a_path = Path(a["manifest_path"])
+    raw_a = json.loads(a_path.read_text(encoding="utf-8"))
+    raw_a["depends_on_task_ids"] = ["missing-parent", "task-b"]
+    a_path.write_text(json.dumps(raw_a), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="cycle"):
+        store.load(a_path)
+    with pytest.raises(ValueError, match="cycle"):
+        store.load(b["manifest_path"])
+
+    tasks, errors = store.discover_with_errors()
+    assert tasks == []
+    cycle_errors = {
+        Path(item["manifest_path"]).resolve(): item["error"]
+        for item in errors
+        if "cycle" in item["error"]
+    }
+    assert set(cycle_errors) == {
+        a_path.resolve(),
+        Path(b["manifest_path"]).resolve(),
+    }
+    assert all("cycle" in error for error in cycle_errors.values())
+
+
+def test_three_node_cycle_excludes_only_its_dependency_closure(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    a = store.create_task("A", requested_team="a", task_id="task-a")
+    b = store.create_task(
+        "B",
+        requested_team="b",
+        task_id="task-b",
+        depends_on_task_ids=("task-a",),
+    )
+    c = store.create_task(
+        "C",
+        requested_team="c",
+        task_id="task-c",
+        depends_on_task_ids=("task-b",),
+    )
+    unrelated = store.create_task(
+        "Unrelated", requested_team="unrelated", task_id="unrelated-task"
+    )
+    a_path = Path(a["manifest_path"])
+    raw_a = json.loads(a_path.read_text(encoding="utf-8"))
+    raw_a["depends_on_task_ids"] = ["task-c"]
+    a_path.write_text(json.dumps(raw_a), encoding="utf-8")
+
+    for state in (a, b, c):
+        with pytest.raises(ValueError, match="cycle"):
+            store.load(state["manifest_path"])
+    assert store.load(unrelated["manifest_path"])["task_id"] == "unrelated-task"
+
+    tasks, errors = store.discover_with_errors()
+    assert [task["task_id"] for task in tasks] == ["unrelated-task"]
+    assert sum("cycle" in item["error"] for item in errors) == 3
+
+
+def test_unrelated_tasks_remain_operable_with_diagnostic_cycle(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    states = install_cycle_isolation_graph(store)
+    cycle_paths = [Path(states[key]["manifest_path"]) for key in ("a", "b")]
+    cycle_bytes = {path: path.read_bytes() for path in cycle_paths}
+    catalog_before = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    cycle_catalog = {
+        store._catalog_key(path): catalog_before["entries"][store._catalog_key(path)]
+        for path in cycle_paths
+    }
+
+    for key in ("a", "b"):
+        with pytest.raises(ValueError, match="cycle"):
+            store.load(states[key]["manifest_path"])
+    assert store.load(states["unrelated"]["manifest_path"])["task_id"] == "unrelated-task"
+    assert store.load(states["missing_only"]["manifest_path"])["depends_on_task_ids"] == [
+        "missing-parent"
+    ]
+
+    tasks, errors = store.discover_with_errors()
+    assert {task["task_id"] for task in tasks} == {"missing-only", "unrelated-task"}
+    assert {
+        Path(item["manifest_path"]).resolve()
+        for item in errors
+        if "cycle" in item["error"]
+    } == {path.resolve() for path in cycle_paths}
+
+    created = store.create_task(
+        "Later unrelated", requested_team="later", task_id="later-unrelated"
+    )
+    assert created["task_id"] == "later-unrelated"
+    for path, data in cycle_bytes.items():
+        assert path.read_bytes() == data
+    catalog_after_create = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    for key, entry in cycle_catalog.items():
+        assert catalog_after_create["entries"][key] == entry
+
+    before_paths = store.discover_paths()
+    before_catalog = store.catalog_path.read_bytes()
+    with pytest.raises(ValueError, match="missing dependency"):
+        store.create_task(
+            "Invalid cycle dependent",
+            requested_team="invalid-cycle-dependent",
+            task_id="invalid-cycle-dependent",
+            depends_on_task_ids=("task-a",),
+        )
+    assert store.discover_paths() == before_paths
+    assert store.catalog_path.read_bytes() == before_catalog
+
+
+def test_manifest_rejects_invalid_dependency_field_shapes(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_task("Task", requested_team="alpha", task_id="task-a")
+    manifest = Path(state["manifest_path"])
+    base = json.loads(manifest.read_text(encoding="utf-8"))
+    cases = [
+        ("depends_on_task_ids", "task-x"),
+        ("depends_on_task_ids", [""]),
+        ("depends_on_task_ids", ["task-x", "task-x"]),
+        ("replaces_task_id", 3),
+        ("replacement_incident_id", []),
+        ("dependency_events", {}),
+        ("waiting", []),
+    ]
+    for field, value in cases:
+        raw = json.loads(json.dumps(base))
+        raw[field] = value
+        manifest.write_text(json.dumps(raw), encoding="utf-8")
+        with pytest.raises(ValueError):
+            store.load(manifest)
+    manifest.write_text(json.dumps(base), encoding="utf-8")
+
+
+def test_duplicate_task_ids_fail_closed_without_poisoning_unrelated_tasks(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    states = install_duplicate_task_graph(store)
+
+    for key in ("alpha", "beta"):
+        with pytest.raises(ValueError, match="duplicate task ID 'dup-task'"):
+            store.load(states[key]["manifest_path"])
+    assert store.load(states["unique"]["manifest_path"])["task_id"] == "unique-task"
+    with pytest.raises(ValueError, match="ambiguous dependency task.*dup-task"):
+        store.load(states["child"]["manifest_path"])
+
+    tasks, errors = store.discover_with_errors()
+    assert [(task["team"], task["task_id"]) for task in tasks] == [
+        ("unique", "unique-task")
+    ]
+    by_path = {item["manifest_path"]: item["error"] for item in errors}
+    assert "duplicate task ID 'dup-task'" in by_path[states["alpha"]["manifest_path"]]
+    assert "duplicate task ID 'dup-task'" in by_path[states["beta"]["manifest_path"]]
+    assert "ambiguous dependency task" in by_path[states["child"]["manifest_path"]]
+
+
+def test_unrelated_creation_survives_duplicate_identity_diagnostics(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    install_duplicate_task_graph(store)
+
+    created = store.create_task(
+        "Unrelated after duplicate identity corruption",
+        requested_team="gamma",
+        task_id="unrelated-after-duplicate",
+    )
+
+    assert created["team"] == "gamma"
+    assert store.load(created["manifest_path"])["task_id"] == "unrelated-after-duplicate"
+    tasks, errors = store.discover_with_errors()
+    assert {task["task_id"] for task in tasks} == {
+        "unique-task",
+        "unrelated-after-duplicate",
+    }
+    assert len(errors) == 3
+
+
+def test_dependency_creation_rejects_ambiguous_duplicate_parent_without_write(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    install_duplicate_task_graph(store)
+    before_paths = store.discover_paths()
+    before_catalog = store.catalog_path.read_bytes()
+
+    with pytest.raises(ValueError, match="ambiguous dependency task.*dup-task"):
+        store.create_task(
+            "Depends on ambiguous parent",
+            requested_team="gamma",
+            task_id="ambiguous-child-create",
+            depends_on_task_ids=("dup-task",),
+        )
+
+    assert store.discover_paths() == before_paths
+    assert store.catalog_path.read_bytes() == before_catalog
+
+
+def test_existing_missing_dependency_does_not_poison_unrelated_creation(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task(
+        "Missing parent", requested_team="missing-parent", task_id="missing-parent"
+    )
+    child = store.create_task(
+        "Missing child",
+        requested_team="missing-child",
+        task_id="missing-child",
+        depends_on_task_ids=("missing-parent",),
+    )
+    parent_path = Path(parent["manifest_path"])
+    child_path = Path(child["manifest_path"])
+    child_before = child_path.read_bytes()
+    parent_path.unlink()
+    catalog_before = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    child_key = store._catalog_key(child_path)
+    child_catalog_before = catalog_before["entries"][child_key]
+
+    created = store.create_task(
+        "Unrelated valid task",
+        requested_team="unrelated",
+        task_id="unrelated-after-missing",
+    )
+
+    assert created["task_id"] == "unrelated-after-missing"
+    assert store.load(child_path)["depends_on_task_ids"] == ["missing-parent"]
+    assert child_path.read_bytes() == child_before
+    catalog_after = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    assert catalog_after["entries"][child_key] == child_catalog_before
+
+    before_paths = store.discover_paths()
+    before_catalog = store.catalog_path.read_bytes()
+    with pytest.raises(ValueError, match="missing dependency"):
+        store.create_task(
+            "New invalid missing child",
+            requested_team="invalid-missing",
+            task_id="new-invalid-missing",
+            depends_on_task_ids=("missing-parent",),
+        )
+    assert store.discover_paths() == before_paths
+    assert store.catalog_path.read_bytes() == before_catalog
+
+
+def test_existing_missing_dependency_does_not_poison_unrelated_replacement(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    missing_parent = store.create_task(
+        "Missing parent", requested_team="missing-parent", task_id="missing-parent"
+    )
+    missing_child = store.create_task(
+        "Missing child",
+        requested_team="missing-child",
+        task_id="missing-child",
+        depends_on_task_ids=("missing-parent",),
+    )
+    target = store.create_task(
+        "Recovery target", requested_team="recovery-target", task_id="recovery-target"
+    )
+    target_child = store.create_task(
+        "Recovery child",
+        requested_team="recovery-child",
+        task_id="recovery-child",
+        depends_on_task_ids=("recovery-target",),
+    )
+    target = _stop_task(store, target)
+    missing_child_path = Path(missing_child["manifest_path"])
+    target_path = Path(target["manifest_path"])
+    target_child_path = Path(target_child["manifest_path"])
+    missing_child_before = missing_child_path.read_bytes()
+    target_before = target_path.read_bytes()
+    Path(missing_parent["manifest_path"]).unlink()
+    catalog_before = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    missing_child_key = store._catalog_key(missing_child_path)
+    missing_child_catalog_before = catalog_before["entries"][missing_child_key]
+
+    result = store.replace_task_and_rewire(
+        "recovery-target",
+        "Continue recovery target safely",
+        reuse_team=True,
+        rewire_children=True,
+        incident_id="maint-missing-isolation",
+    )
+    replacement = result["replacement"]
+
+    assert target_path.read_bytes() == target_before
+    assert store.load(target_child_path)["depends_on_task_ids"] == [replacement["task_id"]]
+    assert missing_child_path.read_bytes() == missing_child_before
+    assert store.load(missing_child_path)["depends_on_task_ids"] == ["missing-parent"]
+    catalog_after = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    assert catalog_after["entries"][missing_child_key] == missing_child_catalog_before
+
+
+def _stop_task(store: TaskStore, state: dict, reason="stopped parent") -> dict:
+    return store.update(
+        state["manifest_path"],
+        lambda current: {
+            **current,
+            "status": "STOPPED",
+            "terminal_state": "STOPPED",
+            "active_role": None,
+            "active_hop_id": None,
+            "stopped_at": utc_now(),
+            "stop_reason": reason,
+        },
+    )
+
+
+def test_replace_task_and_rewire_preserves_old_parent_and_child_order(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    grandparent = store.create_task("Grandparent", requested_team="gp", task_id="task-gp")
+    store.update(
+        grandparent["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+    parent = store.create_task(
+        "Parent", requested_team="parent", task_id="task-parent",
+        depends_on_task_ids=("task-gp",),
+    )
+    child = store.create_task(
+        "Child", requested_team="child", task_id="task-child",
+        depends_on_task_ids=("task-gp", "task-parent"),
+    )
+    parent = _stop_task(store, parent)
+    old_bytes = Path(parent["manifest_path"]).read_bytes()
+
+    result = store.replace_task_and_rewire(
+        "task-parent",
+        "Continue parent safely",
+        reuse_team=True,
+        rewire_children=True,
+        incident_id="maint-1",
+    )
+    replacement = result["replacement"]
+    updated_child = store.load(child["manifest_path"])
+
+    assert Path(parent["manifest_path"]).read_bytes() == old_bytes
+    assert replacement["task_id"] != "task-parent"
+    assert replacement["team"] == parent["team"]
+    assert replacement["team_suffix"] == parent["team_suffix"]
+    assert replacement["replaces_task_id"] == "task-parent"
+    assert replacement["replacement_incident_id"] == "maint-1"
+    assert replacement["depends_on_task_ids"] == ["task-gp"]
+    assert replacement["hops"][0]["state"] == "pre_send"
+    assert updated_child["depends_on_task_ids"] == ["task-gp", replacement["task_id"]]
+    assert "child_task_ids" not in replacement and "child_task_ids" not in updated_child
+    assert updated_child["dependency_events"][-1]["old_task_id"] == "task-parent"
+    assert updated_child["dependency_events"][-1]["new_task_id"] == replacement["task_id"]
+    assert replacement["dependency_events"][-1]["incident_id"] == "maint-1"
+
+    repeated = store.replace_task_and_rewire(
+        "task-parent",
+        "Continue parent safely",
+        reuse_team=True,
+        rewire_children=True,
+        incident_id="maint-1",
+    )
+    assert repeated["replacement"]["task_id"] == replacement["task_id"]
+    assert store.load(child["manifest_path"])["depends_on_task_ids"] == [
+        "task-gp", replacement["task_id"]
+    ]
+
+
+def test_replace_task_rejects_unsafe_target_and_rolls_back_install_failure(tmp_path: Path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task("Parent", requested_team="parent", task_id="task-parent")
+    child = store.create_task(
+        "Child", requested_team="child", task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+    with pytest.raises(ValueError, match="STOPPED or BLOCKED"):
+        store.replace_task_and_rewire(
+            "task-parent", "Replacement", reuse_team=True,
+            rewire_children=True, incident_id="maint-unsafe",
+        )
+
+    parent = _stop_task(store, parent)
+    before_parent = Path(parent["manifest_path"]).read_bytes()
+    before_child = Path(child["manifest_path"]).read_bytes()
+    before_catalog = store.catalog_path.read_bytes()
+    original_replace = store_module.os.replace
+    calls = 0
+
+    def fail_second_install(source, target):
+        nonlocal calls
+        if str(source).endswith(".phase4.tmp"):
+            calls += 1
+            if calls == 2:
+                raise OSError("injected phase4 install failure")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(store_module.os, "replace", fail_second_install)
+    with pytest.raises(OSError, match="injected"):
+        store.replace_task_and_rewire(
+            "task-parent", "Replacement", reuse_team=True,
+            rewire_children=True, incident_id="maint-rollback",
+        )
+
+    assert Path(parent["manifest_path"]).read_bytes() == before_parent
+    assert Path(child["manifest_path"]).read_bytes() == before_child
+    assert store.catalog_path.read_bytes() == before_catalog
+    replacements = [
+        state for state in store.discover()
+        if state.get("replacement_incident_id") == "maint-rollback"
+    ]
+    assert replacements == []
+
+
+def test_replace_task_rolls_back_manifest_and_catalog_install_failure(tmp_path: Path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task("Parent", requested_team="parent", task_id="task-parent")
+    child = store.create_task(
+        "Child", requested_team="child", task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+    unrelated = store.create_task(
+        "Unrelated", requested_team="other", task_id="task-other"
+    )
+    parent = _stop_task(store, parent)
+    before = {
+        Path(parent["manifest_path"]): Path(parent["manifest_path"]).read_bytes(),
+        Path(child["manifest_path"]): Path(child["manifest_path"]).read_bytes(),
+        Path(unrelated["manifest_path"]): Path(unrelated["manifest_path"]).read_bytes(),
+        store.catalog_path: store.catalog_path.read_bytes(),
+    }
+    original_replace = store_module.os.replace
+    failed = False
+
+    def fail_catalog_install(source, target):
+        nonlocal failed
+        if Path(target).resolve() == store.catalog_path.resolve() and not failed:
+            failed = True
+            raise OSError("injected catalog install failure")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(store_module.os, "replace", fail_catalog_install)
+    with pytest.raises(OSError, match="catalog install"):
+        store.replace_task_and_rewire(
+            "task-parent",
+            "Replacement",
+            reuse_team=True,
+            rewire_children=True,
+            incident_id="maint-catalog-rollback",
+        )
+
+    assert failed is True
+    for path, data in before.items():
+        assert path.read_bytes() == data
+    assert not any(
+        task.get("replacement_incident_id") == "maint-catalog-rollback"
+        for task in store.discover()
+    )
+
+
+def test_replace_task_preserves_concurrent_child_update_and_catalog_exactness(
+    tmp_path: Path, monkeypatch
+):
+    import threading
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task("Parent", requested_team="parent", task_id="task-parent")
+    child = store.create_task(
+        "Child",
+        requested_team="child",
+        task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+    parent = _stop_task(store, parent)
+    child_path = Path(child["manifest_path"])
+    replacement_building = threading.Event()
+    allow_replacement = threading.Event()
+    updater_mutating = threading.Event()
+    original_initial = store._initial_task_state
+
+    def pause_replacement_build(**kwargs):
+        if kwargs.get("normalized_replaces") == "task-parent":
+            replacement_building.set()
+            assert allow_replacement.wait(5)
+        return original_initial(**kwargs)
+
+    monkeypatch.setattr(store, "_initial_task_state", pause_replacement_build)
+    results: dict[str, object] = {}
+    errors: list[BaseException] = []
+
+    def replace():
+        try:
+            results["replacement"] = store.replace_task_and_rewire(
+                "task-parent",
+                "Continue parent safely",
+                reuse_team=True,
+                rewire_children=True,
+                incident_id="maint-concurrent",
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    marker = {
+        "at": "2026-07-23T06:10:00+00:00",
+        "error": "concurrent child update must survive",
+    }
+
+    def update_child():
+        try:
+            def mutate(state):
+                updater_mutating.set()
+                state.setdefault("errors", []).append(marker)
+                return state
+
+            results["updated"] = store.update(child_path, mutate)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    replacement_thread = threading.Thread(target=replace)
+    replacement_thread.start()
+    assert replacement_building.wait(5)
+    updater_thread = threading.Thread(target=update_child)
+    updater_thread.start()
+    try:
+        # The replacement must already own the child manifest lock before it
+        # builds any rewired state. The updater therefore cannot enter its
+        # mutator until the graph transaction releases that lock.
+        assert updater_mutating.wait(0.25) is False
+    finally:
+        allow_replacement.set()
+    replacement_thread.join(5)
+    updater_thread.join(5)
+    assert not replacement_thread.is_alive()
+    assert not updater_thread.is_alive()
+    assert errors == []
+
+    replacement = results["replacement"]["replacement"]
+    current = store.load(child_path)
+    assert marker in current["errors"]
+    assert current["depends_on_task_ids"] == [replacement["task_id"]]
+    catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    key = store._catalog_key(child_path)
+    assert catalog["entries"][key] == store._catalog_entry(current)
+
+
+def test_replace_task_staging_failure_cleans_all_phase4_temporaries(
+    tmp_path: Path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task("Parent", requested_team="parent", task_id="task-parent")
+    child = store.create_task(
+        "Child",
+        requested_team="child",
+        task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+    parent = _stop_task(store, parent)
+    before = {
+        Path(parent["manifest_path"]): Path(parent["manifest_path"]).read_bytes(),
+        Path(child["manifest_path"]): Path(child["manifest_path"]).read_bytes(),
+        store.catalog_path: store.catalog_path.read_bytes(),
+    }
+    original_open = Path.open
+    phase4_opens = 0
+
+    def fail_second_manifest_stage(path, *args, **kwargs):
+        nonlocal phase4_opens
+        if str(path).endswith(".json.phase4.tmp") and path != store.catalog_path.with_suffix(
+            store.catalog_path.suffix + ".phase4.tmp"
+        ):
+            phase4_opens += 1
+            if phase4_opens == 2:
+                raise OSError("injected second stage failure")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_second_manifest_stage)
+    with pytest.raises(OSError, match="second stage"):
+        store.replace_task_and_rewire(
+            "task-parent",
+            "Replacement",
+            reuse_team=True,
+            rewire_children=True,
+            incident_id="maint-stage-cleanup",
+        )
+
+    assert phase4_opens == 2
+    for path, data in before.items():
+        assert path.read_bytes() == data
+    assert list(store.root.rglob("*.phase4.tmp")) == []
+    assert list(store.root.rglob("*.phase4.rollback.tmp")) == []
+    assert {
+        item.name for item in (store.root / "parent").iterdir() if item.is_dir()
+    } == {"task-parent"}
+    assert not any(
+        task.get("replacement_incident_id") == "maint-stage-cleanup"
+        for task in store.discover()
+    )
+
+
+def test_replace_task_catalog_stage_failure_is_preinstall_and_cleans_temporaries(
+    tmp_path: Path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task("Parent", requested_team="parent", task_id="task-parent")
+    child = store.create_task(
+        "Child",
+        requested_team="child",
+        task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+    parent = _stop_task(store, parent)
+    before = {
+        Path(parent["manifest_path"]): Path(parent["manifest_path"]).read_bytes(),
+        Path(child["manifest_path"]): Path(child["manifest_path"]).read_bytes(),
+        store.catalog_path: store.catalog_path.read_bytes(),
+    }
+    catalog_stage = store.catalog_path.with_suffix(
+        store.catalog_path.suffix + ".phase4.tmp"
+    )
+    original_open = Path.open
+
+    def fail_catalog_stage(path, *args, **kwargs):
+        if Path(path).resolve() == catalog_stage.resolve():
+            raise OSError("injected catalog stage failure")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_catalog_stage)
+    with pytest.raises(OSError, match="catalog stage"):
+        store.replace_task_and_rewire(
+            "task-parent",
+            "Replacement",
+            reuse_team=True,
+            rewire_children=True,
+            incident_id="maint-catalog-stage",
+        )
+
+    for path, data in before.items():
+        assert path.read_bytes() == data
+    assert list(store.root.rglob("*.phase4.tmp")) == []
+    assert list(store.root.rglob("*.phase4.rollback.tmp")) == []
+    assert {
+        item.name for item in (store.root / "parent").iterdir() if item.is_dir()
+    } == {"task-parent"}
+    assert not any(
+        task.get("replacement_incident_id") == "maint-catalog-stage"
+        for task in store.discover()
+    )
+
+
+@pytest.mark.parametrize(
+    ("parent_team", "child_team"),
+    (("aaa", "zzz"), ("zzz", "aaa")),
+    ids=("replacement-first", "child-first"),
+)
+def test_replace_task_recovers_after_process_interruption_between_manifest_installs(
+    tmp_path: Path,
+    monkeypatch,
+    parent_team: str,
+    child_team: str,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task(
+        "Parent", requested_team=parent_team, task_id="task-parent"
+    )
+    child = store.create_task(
+        "Child",
+        requested_team=child_team,
+        task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+    parent = _stop_task(store, parent)
+    parent_path = Path(parent["manifest_path"])
+    child_path = Path(child["manifest_path"])
+    parent_before = parent_path.read_bytes()
+    original_replace = store_module.os.replace
+    manifest_installs = 0
+    install_targets: list[Path] = []
+
+    def interrupt_before_second_manifest(source, target):
+        nonlocal manifest_installs
+        source_path = Path(source)
+        target_path = Path(target)
+        if source_path.name.endswith(".json.phase4.tmp"):
+            manifest_installs += 1
+            install_targets.append(target_path)
+            if manifest_installs == 2:
+                raise SystemExit("simulated worker interruption")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(store_module.os, "replace", interrupt_before_second_manifest)
+    with pytest.raises(SystemExit, match="worker interruption"):
+        store.replace_task_and_rewire(
+            "task-parent",
+            "Continue parent safely",
+            reuse_team=True,
+            rewire_children=True,
+            incident_id="maint-crash-recovery",
+        )
+    assert manifest_installs == 2
+    assert parent_path.read_bytes() == parent_before
+
+    monkeypatch.setattr(store_module.os, "replace", original_replace)
+    restarted = TaskStore(config)
+    recovered = restarted.replace_task_and_rewire(
+        "task-parent",
+        "Continue parent safely",
+        reuse_team=True,
+        rewire_children=True,
+        incident_id="maint-crash-recovery",
+    )
+    replacement = recovered["replacement"]
+    current_child = restarted.load(child_path)
+    tasks = restarted.discover()
+
+    assert parent_path.read_bytes() == parent_before
+    assert len(
+        [
+            task
+            for task in tasks
+            if task.get("replacement_incident_id") == "maint-crash-recovery"
+        ]
+    ) == 1
+    assert replacement["replaces_task_id"] == "task-parent"
+    assert current_child["depends_on_task_ids"] == [replacement["task_id"]]
+    assert current_child["depends_on_task_ids"].count(replacement["task_id"]) == 1
+    assert all(
+        replacement["task_id"] not in task.get("depends_on_task_ids", [])
+        or any(item["task_id"] == replacement["task_id"] for item in tasks)
+        for task in tasks
+    )
+    catalog = json.loads(restarted.catalog_path.read_text(encoding="utf-8"))
+    for task in tasks:
+        key = restarted._catalog_key(task["manifest_path"])
+        assert catalog["entries"][key] == restarted._catalog_entry(task)
+    assert not restarted.phase4_journal_path.exists()
+    assert list(restarted.root.rglob("*.phase4.tmp")) == []
+    assert list(restarted.root.rglob("*.phase4.rollback.tmp")) == []
+    assert install_targets[0] != install_targets[1]
+
+
+def test_phase4_recovery_ignores_unrelated_duplicate_diagnostics(
+    tmp_path: Path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    duplicate_states = install_duplicate_task_graph(store)
+    diagnostic_paths = {
+        Path(duplicate_states[key]["manifest_path"])
+        for key in ("alpha", "beta", "child")
+    }
+    diagnostic_bytes = {path: path.read_bytes() for path in diagnostic_paths}
+    catalog_before = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    diagnostic_catalog = {
+        store._catalog_key(path): catalog_before["entries"][store._catalog_key(path)]
+        for path in diagnostic_paths
+    }
+
+    parent = store.create_task(
+        "Recovery target", requested_team="recovery-parent", task_id="recovery-target"
+    )
+    child = store.create_task(
+        "Recovery child",
+        requested_team="recovery-child",
+        task_id="recovery-child",
+        depends_on_task_ids=("recovery-target",),
+    )
+    parent = _stop_task(store, parent)
+    parent_path = Path(parent["manifest_path"])
+    child_path = Path(child["manifest_path"])
+    parent_before = parent_path.read_bytes()
+    original_replace = store_module.os.replace
+    installs = 0
+
+    def interrupt_before_second_manifest(source, target):
+        nonlocal installs
+        if Path(source).name.endswith(".json.phase4.tmp"):
+            installs += 1
+            if installs == 2:
+                raise SystemExit("simulated duplicate-diagnostic recovery interruption")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(store_module.os, "replace", interrupt_before_second_manifest)
+    with pytest.raises(SystemExit, match="duplicate-diagnostic recovery interruption"):
+        store.replace_task_and_rewire(
+            "recovery-target",
+            "Continue recovery target safely",
+            reuse_team=True,
+            rewire_children=True,
+            incident_id="maint-duplicate-diagnostic-recovery",
+        )
+    assert store.phase4_journal_path.exists()
+    assert parent_path.read_bytes() == parent_before
+
+    monkeypatch.setattr(store_module.os, "replace", original_replace)
+    restarted = TaskStore(config)
+    recovered = restarted.recover_phase4_replacement()
+    assert recovered is not None
+    replacement = recovered["replacement"]
+    current_child = restarted.load(child_path)
+
+    assert replacement["replaces_task_id"] == "recovery-target"
+    assert replacement["replacement_incident_id"] == "maint-duplicate-diagnostic-recovery"
+    assert current_child["depends_on_task_ids"] == [replacement["task_id"]]
+    assert current_child["depends_on_task_ids"].count(replacement["task_id"]) == 1
+    assert parent_path.read_bytes() == parent_before
+    for path, data in diagnostic_bytes.items():
+        assert path.read_bytes() == data
+    catalog_after = json.loads(restarted.catalog_path.read_text(encoding="utf-8"))
+    for key, entry in diagnostic_catalog.items():
+        assert catalog_after["entries"][key] == entry
+    for task in restarted.discover():
+        key = restarted._catalog_key(task["manifest_path"])
+        assert catalog_after["entries"][key] == restarted._catalog_entry(task)
+    assert not restarted.phase4_journal_path.exists()
+    assert list(restarted.root.rglob("*.phase4.tmp")) == []
+    assert list(restarted.root.rglob("*.phase4.rollback.tmp")) == []
+
+    later = restarted.create_task(
+        "Unrelated after recovered journal",
+        requested_team="later",
+        task_id="later-after-recovery",
+    )
+    updated = restarted.update(
+        later["manifest_path"],
+        lambda state: {**state, "active_action": "verified_after_recovery"},
+    )
+    assert updated["active_action"] == "verified_after_recovery"
+
+
+def test_phase4_recovery_ignores_unrelated_missing_dependency(
+    tmp_path: Path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    missing_parent = store.create_task(
+        "Missing parent", requested_team="missing-parent", task_id="missing-parent"
+    )
+    missing_child = store.create_task(
+        "Missing child",
+        requested_team="missing-child",
+        task_id="missing-child",
+        depends_on_task_ids=("missing-parent",),
+    )
+    target = store.create_task(
+        "Recovery target", requested_team="recovery-target", task_id="recovery-target"
+    )
+    target_child = store.create_task(
+        "Recovery child",
+        requested_team="recovery-child",
+        task_id="recovery-child",
+        depends_on_task_ids=("recovery-target",),
+    )
+    target = _stop_task(store, target)
+    missing_parent_path = Path(missing_parent["manifest_path"])
+    missing_child_path = Path(missing_child["manifest_path"])
+    target_path = Path(target["manifest_path"])
+    target_child_path = Path(target_child["manifest_path"])
+    missing_child_before = missing_child_path.read_bytes()
+    target_before = target_path.read_bytes()
+    original_replace = store_module.os.replace
+    installs = 0
+
+    def interrupt_before_second_manifest(source, target_path_value):
+        nonlocal installs
+        if Path(source).name.endswith(".json.phase4.tmp"):
+            installs += 1
+            if installs == 2:
+                raise SystemExit("simulated missing-dependency recovery interruption")
+        return original_replace(source, target_path_value)
+
+    monkeypatch.setattr(store_module.os, "replace", interrupt_before_second_manifest)
+    with pytest.raises(SystemExit, match="missing-dependency recovery interruption"):
+        store.replace_task_and_rewire(
+            "recovery-target",
+            "Continue recovery target safely",
+            reuse_team=True,
+            rewire_children=True,
+            incident_id="maint-missing-recovery",
+        )
+    assert store.phase4_journal_path.exists()
+    missing_parent_path.unlink()
+    monkeypatch.setattr(store_module.os, "replace", original_replace)
+
+    restarted = TaskStore(config)
+    recovered = restarted.recover_phase4_replacement()
+    assert recovered is not None
+    replacement = recovered["replacement"]
+
+    assert target_path.read_bytes() == target_before
+    assert restarted.load(target_child_path)["depends_on_task_ids"] == [replacement["task_id"]]
+    assert missing_child_path.read_bytes() == missing_child_before
+    assert restarted.load(missing_child_path)["depends_on_task_ids"] == ["missing-parent"]
+    assert not restarted.phase4_journal_path.exists()
+    assert list(restarted.root.rglob("*.phase4.tmp")) == []
+    assert list(restarted.root.rglob("*.phase4.rollback.tmp")) == []
+
+
+def test_phase4_recovery_rejects_tampered_journal_without_deleting_evidence(
+    tmp_path: Path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task(
+        "Parent", requested_team="aaa", task_id="task-parent"
+    )
+    child = store.create_task(
+        "Child",
+        requested_team="zzz",
+        task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+    parent = _stop_task(store, parent)
+    parent_path = Path(parent["manifest_path"])
+    child_path = Path(child["manifest_path"])
+    original_replace = store_module.os.replace
+    installs = 0
+
+    def interrupt(source, target):
+        nonlocal installs
+        if Path(source).name.endswith(".json.phase4.tmp"):
+            installs += 1
+            if installs == 2:
+                raise SystemExit("simulated interruption")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(store_module.os, "replace", interrupt)
+    with pytest.raises(SystemExit):
+        store.replace_task_and_rewire(
+            "task-parent",
+            "Continue parent safely",
+            reuse_team=True,
+            rewire_children=True,
+            incident_id="maint-tamper",
+        )
+    monkeypatch.setattr(store_module.os, "replace", original_replace)
+    before = {
+        parent_path: parent_path.read_bytes(),
+        child_path: child_path.read_bytes(),
+        store.catalog_path: store.catalog_path.read_bytes(),
+    }
+    journal = json.loads(store.phase4_journal_path.read_text(encoding="utf-8"))
+    journal["writes"][0]["after_sha256"] = "0" * 64
+    store.phase4_journal_path.write_text(
+        json.dumps(journal, indent=2, sort_keys=True), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="after hash"):
+        TaskStore(config).recover_phase4_replacement()
+
+    assert store.phase4_journal_path.exists()
+    for path, data in before.items():
+        assert path.read_bytes() == data
+
+
+def _pending_phase4_operation(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    parent_team: str = "aaa",
+    child_team: str = "zzz",
+    incident_id: str = "maint-writer-preflight",
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task(
+        "Parent", requested_team=parent_team, task_id="task-parent"
+    )
+    child = store.create_task(
+        "Child",
+        requested_team=child_team,
+        task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+    parent = _stop_task(store, parent)
+    parent_path = Path(parent["manifest_path"])
+    child_path = Path(child["manifest_path"])
+    parent_before = parent_path.read_bytes()
+    original_replace = store_module.os.replace
+    installs = 0
+
+    def interrupt_before_second_manifest(source, target):
+        nonlocal installs
+        if Path(source).name.endswith(".json.phase4.tmp"):
+            installs += 1
+            if installs == 2:
+                raise SystemExit("simulated pending Phase-4 operation")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(store_module.os, "replace", interrupt_before_second_manifest)
+    with pytest.raises(SystemExit, match="pending Phase-4"):
+        store.replace_task_and_rewire(
+            "task-parent",
+            "Continue parent safely",
+            reuse_team=True,
+            rewire_children=True,
+            incident_id=incident_id,
+        )
+    monkeypatch.setattr(store_module.os, "replace", original_replace)
+    assert store.phase4_journal_path.exists()
+    return config, TaskStore(config), parent_path, child_path, parent_before
+
+
+@pytest.mark.parametrize(
+    ("parent_team", "child_team", "mutation"),
+    (
+        ("aaa", "zzz", "update"),
+        ("zzz", "aaa", "update"),
+        ("aaa", "zzz", "request_control"),
+        ("zzz", "aaa", "request_control"),
+    ),
+)
+def test_pending_phase4_recovery_precedes_old_parent_mutation(
+    tmp_path: Path,
+    monkeypatch,
+    parent_team: str,
+    child_team: str,
+    mutation: str,
+):
+    config, store, parent_path, child_path, parent_before = _pending_phase4_operation(
+        tmp_path,
+        monkeypatch,
+        parent_team=parent_team,
+        child_team=child_team,
+        incident_id=f"maint-{mutation}-{parent_team}",
+    )
+
+    if mutation == "update":
+        call = lambda: store.update(
+            parent_path,
+            lambda state: {
+                **state,
+                "errors": [*state.get("errors", []), {"at": utc_now(), "error": "late"}],
+            },
+        )
+    else:
+        call = lambda: store.request_control(
+            parent_path,
+            "clear_team",
+            reason="dashboard clear during recovery",
+            confirmed=True,
+        )
+
+    with pytest.raises(ValueError, match="immutable history"):
+        call()
+
+    assert parent_path.read_bytes() == parent_before
+    current_child = store.load(child_path)
+    replacements = [
+        task
+        for task in store.discover()
+        if task.get("replacement_incident_id") == f"maint-{mutation}-{parent_team}"
+    ]
+    assert len(replacements) == 1
+    replacement_id = replacements[0]["task_id"]
+    assert current_child["depends_on_task_ids"] == [replacement_id]
+    assert not store.phase4_journal_path.exists()
+    catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    for task in store.discover():
+        assert catalog["entries"][store._catalog_key(task["manifest_path"])] == store._catalog_entry(task)
+
+
+def test_pending_phase4_recovery_precedes_maintenance_writers_and_preserves_rewire(
+    tmp_path: Path, monkeypatch
+):
+    from playwright_auto.cdpa_maintenance import ensure_maintenance_incident
+
+    config, store, _parent_path, child_path, _parent_before = _pending_phase4_operation(
+        tmp_path,
+        monkeypatch,
+        parent_team="zzz",
+        child_team="aaa",
+        incident_id="maint-maintenance-writers",
+    )
+    child = store.load(child_path)
+    child.update(
+        status="BLOCKED",
+        kanban_column="BLOCKED",
+        block_code="send_failed",
+        block_reason="child failure",
+    )
+    incident = ensure_maintenance_incident(child)
+    assert incident is not None
+    saved = store.save_maintenance(child_path, child)
+    first_updated_at = saved["maintenance"]["worker_updated_at"]
+
+    updated = store.update_maintenance(
+        child_path,
+        lambda current: {
+            **current,
+            "maintenance": {
+                **current["maintenance"],
+                "last_resolved_at": utc_now(),
+            },
+        },
+    )
+
+    replacement = next(
+        task
+        for task in store.discover()
+        if task.get("replacement_incident_id") == "maint-maintenance-writers"
+    )
+    assert updated["depends_on_task_ids"] == [replacement["task_id"]]
+    assert updated["maintenance"]["worker_updated_at"] >= first_updated_at
+    assert updated["maintenance"]["last_resolved_at"]
+    assert not store.phase4_journal_path.exists()
+
+
+def test_pending_phase4_recovery_rejects_stale_full_save_without_overwriting_rewire(
+    tmp_path: Path, monkeypatch
+):
+    config, store, _parent_path, child_path, _parent_before = _pending_phase4_operation(
+        tmp_path,
+        monkeypatch,
+        incident_id="maint-stale-save",
+    )
+    stale = json.loads(child_path.read_text(encoding="utf-8"))
+    stale["errors"].append({"at": utc_now(), "error": "stale full save"})
+
+    with pytest.raises(ValueError, match="reload before saving"):
+        store.save(child_path, stale)
+
+    current = store.load(child_path)
+    replacement = next(
+        task
+        for task in store.discover()
+        if task.get("replacement_incident_id") == "maint-stale-save"
+    )
+    assert current["depends_on_task_ids"] == [replacement["task_id"]]
+    assert not any(item.get("error") == "stale full save" for item in current["errors"])
+    assert not store.phase4_journal_path.exists()
+
+
+def test_failed_pending_phase4_preflight_leaves_public_mutation_target_unchanged(
+    tmp_path: Path, monkeypatch
+):
+    config, store, parent_path, child_path, _parent_before = _pending_phase4_operation(
+        tmp_path,
+        monkeypatch,
+        incident_id="maint-preflight-fail",
+    )
+    journal = json.loads(store.phase4_journal_path.read_text(encoding="utf-8"))
+    journal["writes"][0]["after_sha256"] = "0" * 64
+    store.phase4_journal_path.write_text(
+        json.dumps(journal, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    before = {
+        parent_path: parent_path.read_bytes(),
+        child_path: child_path.read_bytes(),
+        store.catalog_path: store.catalog_path.read_bytes(),
+    }
+
+    with pytest.raises(ValueError, match="after hash"):
+        store.update(
+            parent_path,
+            lambda state: {**state, "errors": [*state["errors"], {"at": utc_now(), "error": "must not persist"}]},
+        )
+
+    for path, data in before.items():
+        assert path.read_bytes() == data
+    assert store.phase4_journal_path.exists()
+
+
+def test_completed_phase4_replacement_rejects_stale_child_full_save(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task(
+        "Parent", requested_team="parent", task_id="task-parent"
+    )
+    child = store.create_task(
+        "Child",
+        requested_team="child",
+        task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+    parent = _stop_task(store, parent)
+    stale = store.load(child["manifest_path"])
+    result = store.replace_task_and_rewire(
+        "task-parent",
+        "Continue parent safely",
+        reuse_team=True,
+        rewire_children=True,
+        incident_id="maint-completed-stale-save",
+    )
+    stale["errors"].append(
+        {"at": utc_now(), "error": "stale child state must not overwrite rewire"}
+    )
+
+    with pytest.raises(ValueError, match="reload before saving"):
+        store.save(child["manifest_path"], stale)
+
+    current = store.load(child["manifest_path"])
+    assert current["depends_on_task_ids"] == [result["replacement"]["task_id"]]
+    assert not any(
+        item.get("error") == "stale child state must not overwrite rewire"
+        for item in current["errors"]
+    )
+
+
+def _block_task_for_replacement(store: TaskStore, state: dict) -> dict:
+    return store.update(
+        state["manifest_path"],
+        lambda current: {
+            **current,
+            "status": "BLOCKED",
+            "kanban_column": "BLOCKED",
+            "block_code": "send_failed",
+            "block_reason": "unsafe blocked parent",
+            "block_retryable": False,
+        },
+    )
+
+
+def test_resume_team_rejects_replaced_blocked_parent_without_mutation(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task("Parent", requested_team="parent", task_id="task-parent")
+    child = store.create_task(
+        "Child",
+        requested_team="child",
+        task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+    parent = _block_task_for_replacement(store, parent)
+    result = store.replace_task_and_rewire(
+        "task-parent",
+        "Replacement parent",
+        reuse_team=False,
+        rewire_children=True,
+        incident_id="maint-resume-immutable",
+    )
+    parent_path = Path(parent["manifest_path"])
+    child_path = Path(child["manifest_path"])
+    parent_before = parent_path.read_bytes()
+    catalog_before = store.catalog_path.read_bytes()
+
+    with pytest.raises(ValueError, match="immutable history"):
+        store.resume_team("parent", reason="must not resume historical parent")
+
+    assert parent_path.read_bytes() == parent_before
+    assert store.catalog_path.read_bytes() == catalog_before
+    assert store.load(child_path)["depends_on_task_ids"] == [
+        result["replacement"]["task_id"]
+    ]
+    replacements = [
+        task
+        for task in store.discover()
+        if task.get("replacement_incident_id") == "maint-resume-immutable"
+    ]
+    assert len(replacements) == 1
+
+
+def test_resume_team_still_works_for_unreplaced_blocked_task(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    task = store.create_task("Blocked", requested_team="alpha", task_id="task-blocked")
+    task = _block_task_for_replacement(store, task)
+
+    resumed = store.resume_team("alpha", reason="normal blocked resume")
+
+    assert resumed["task_id"] == "task-blocked"
+    assert resumed["controls"][-1]["action"] == "resume"
+    assert resumed["controls"][-1]["reason"] == "normal blocked resume"
+
+
+def test_resume_team_recovers_pending_blocked_replacement_then_rejects_history(
+    tmp_path: Path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task("Parent", requested_team="parent", task_id="task-parent")
+    child = store.create_task(
+        "Child",
+        requested_team="child",
+        task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+    parent = _block_task_for_replacement(store, parent)
+    parent_path = Path(parent["manifest_path"])
+    child_path = Path(child["manifest_path"])
+    parent_before = parent_path.read_bytes()
+    original_replace = store_module.os.replace
+    installs = 0
+
+    def interrupt_before_second_manifest(source, target):
+        nonlocal installs
+        if Path(source).name.endswith(".json.phase4.tmp"):
+            installs += 1
+            if installs == 2:
+                raise SystemExit("pending blocked replacement")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(store_module.os, "replace", interrupt_before_second_manifest)
+    with pytest.raises(SystemExit, match="pending blocked replacement"):
+        store.replace_task_and_rewire(
+            "task-parent",
+            "Replacement parent",
+            reuse_team=False,
+            rewire_children=True,
+            incident_id="maint-pending-resume-immutable",
+        )
+    monkeypatch.setattr(store_module.os, "replace", original_replace)
+    restarted = TaskStore(config)
+
+    with pytest.raises(ValueError, match="immutable history"):
+        restarted.resume_team("parent", reason="recover then reject")
+
+    replacement = next(
+        task
+        for task in restarted.discover()
+        if task.get("replacement_incident_id") == "maint-pending-resume-immutable"
+    )
+    assert parent_path.read_bytes() == parent_before
+    assert restarted.load(child_path)["depends_on_task_ids"] == [replacement["task_id"]]
+    assert not restarted.phase4_journal_path.exists()
+    catalog = json.loads(restarted.catalog_path.read_text(encoding="utf-8"))
+    for task in restarted.discover():
+        assert catalog["entries"][restarted._catalog_key(task["manifest_path"])] == restarted._catalog_entry(task)
+
+
+def test_replacement_context_bounds_retained_report_references():
+    from playwright_auto.cdpa_store import (
+        replacement_continuation_text,
+        retained_report_references,
+    )
+
+    reports = [
+        {
+            "report_id": index,
+            "physical_role": "alpha-plan",
+            "turn": index,
+            "path": f"/repo/.plan/alpha/report-{index}.md",
+            "body": f"secret report body {index}",
+        }
+        for index in range(25)
+    ]
+    state = {
+        "task_id": "task-parent",
+        "task_text": "Original outcome",
+        "repository": "/repo",
+        "reports": reports,
+    }
+
+    references = retained_report_references(state)
+    context = replacement_continuation_text(state, "Continue safely")
+
+    assert len(references) == 20
+    assert [item["report_id"] for item in references] == list(range(5, 25))
+    assert "report-4.md" not in context
+    assert "report-5.md" in context
+    assert "report-24.md" in context
+    assert "secret report body" not in context
