@@ -25,12 +25,14 @@ from .cdpa_response import (
     start_wait_budget,
 )
 from .cdpa_routes import (
+    InlineReportMaterializationError,
     RouteContractError,
     expected_report_relative,
-    parse_route_response,
+    materialize_inline_report,
+    parse_role_response,
     validate_report,
 )
-from .cdpa_store import TaskStore, utc_now
+from .cdpa_store import TaskStore, report_mode_from_options, utc_now
 from .cdpa_team import cleanup_eligible
 from .chatgpt import (
     ChoicePromptBlockedError,
@@ -73,6 +75,13 @@ def _column_for(role: str) -> str:
 
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _report_mode(state: Mapping[str, Any]) -> str:
+    options = state.get("options")
+    if not isinstance(options, Mapping):
+        raise ValueError("task options must be a mapping")
+    return report_mode_from_options(options)
 
 
 def _is_cdp_disconnect(error: BaseException) -> bool:
@@ -884,6 +893,7 @@ class CDPAWorker:
                 physical_role=str(hop["physical_role"]),
                 turn=int(hop["turn"]),
                 validation_error=str(hop["validation_error"]),
+                report_mode=_report_mode(state),
             )
             included = False
         else:
@@ -903,6 +913,7 @@ class CDPAWorker:
                     "constructor_sent_generation"
                 ),
                 conversation_generation=generation,
+                report_mode=_report_mode(state),
             )
             prompt = built.text
             included = built.constructor_included
@@ -1019,16 +1030,21 @@ class CDPAWorker:
         response: MessageSnapshot,
     ) -> None:
         role = str(hop["target_role"])
-        decision = parse_route_response(response.text, source_role=role)
-        validate_report(
-            decision.handoff,
-            repository_root=state["repository"],
-            plans_root=self.config.plans_root,
-            team=str(state["team"]),
-            physical_role=str(hop["physical_role"]),
-            turn=int(hop["turn"]),
-            task_id=str(state["task_id"]),
+        parsed = parse_role_response(
+            response.text,
+            source_role=role,
+            report_mode=_report_mode(state),
         )
+        if parsed.inline_report is None:
+            validate_report(
+                parsed.decision.handoff,
+                repository_root=state["repository"],
+                plans_root=self.config.plans_root,
+                team=str(state["team"]),
+                physical_role=str(hop["physical_role"]),
+                turn=int(hop["turn"]),
+                task_id=str(state["task_id"]),
+            )
 
     def _record_response(
         self,
@@ -1344,17 +1360,49 @@ class CDPAWorker:
     def _responded(self, state: dict[str, Any], hop: dict[str, Any]) -> None:
         role = str(hop["target_role"])
         try:
-            decision = parse_route_response(str(hop.get("response") or ""), source_role=role)
-            evidence = validate_report(
-                decision.handoff,
-                repository_root=state["repository"],
-                plans_root=self.config.plans_root,
-                team=str(state["team"]),
-                physical_role=str(hop["physical_role"]),
-                turn=int(hop["turn"]),
-                task_id=str(state["task_id"]),
+            parsed = parse_role_response(
+                str(hop.get("response") or ""),
+                source_role=role,
+                report_mode=_report_mode(state),
             )
-        except (RouteContractError, ValueError) as exc:
+            decision = parsed.decision
+            if parsed.inline_report is None:
+                evidence = validate_report(
+                    decision.handoff,
+                    repository_root=state["repository"],
+                    plans_root=self.config.plans_root,
+                    team=str(state["team"]),
+                    physical_role=str(hop["physical_role"]),
+                    turn=int(hop["turn"]),
+                    task_id=str(state["task_id"]),
+                )
+                routed_handoff = decision.handoff
+            else:
+                try:
+                    evidence = materialize_inline_report(
+                        parsed.inline_report,
+                        expected_report_path=str(hop.get("expected_report_path") or ""),
+                        repository_root=state["repository"],
+                        plans_root=self.config.plans_root,
+                        team=str(state["team"]),
+                        physical_role=str(hop["physical_role"]),
+                        turn=int(hop["turn"]),
+                        task_id=str(state["task_id"]),
+                    )
+                except (RouteContractError, OSError) as exc:
+                    raise InlineReportMaterializationError(
+                        "inline report materialization failed"
+                    ) from exc
+                routed_handoff = str(hop["expected_report_path"])
+        except InlineReportMaterializationError:
+            self._block(
+                state,
+                "inline report materialization failed",
+                code="inline_report_materialization_failed",
+                retryable=False,
+            )
+            return
+        except (RouteContractError, ValueError, OSError) as exc:
             self._repair_route(state, hop, exc)
             return
         self._complete_request_response(hop)
@@ -1413,7 +1461,7 @@ class CDPAWorker:
             state,
             source_role=role,
             target_role=decision.route,
-            handoff=decision.handoff,
+            handoff=routed_handoff,
         )
 
     def _finalize_resume_recheck(

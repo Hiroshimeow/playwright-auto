@@ -29,7 +29,21 @@ class PromptBuilder:
     def naming_rule(self) -> str:
         return f"{self._plans_prefix()}/<team>/<physical-role>_turn<N>_<task-id>.md"
 
-    def _guide(self) -> str:
+    def _guide(self, report_mode: str = "file") -> str:
+        mode = str(report_mode).strip().lower()
+        if mode == "inline":
+            return (
+                "Do not create, edit, or write any role-report file. Return the complete "
+                "Markdown role report only in this response; the worker owns report "
+                "materialization. Follow it with exactly one terminal JSON object:\n\n"
+                "```json\n"
+                '{"route":"PLAN|DEV|TEST|REVIEW|AUDIT|DONE","handoff":"INLINE"}'
+                "\n```\n\n"
+                "The Markdown report must be non-empty. Only PLAN may use `DONE`. "
+                "REVIEW and AUDIT must route clean work back to PLAN."
+            )
+        if mode != "file":
+            raise ValueError("report_mode must be 'file' or 'inline'")
         guide = self.config.response_guide_path.read_text(encoding="utf-8").strip()
         return guide.replace(
             ".plan/<team>/<physical-role>_turn<N>_<task-id>.md",
@@ -52,6 +66,7 @@ class PromptBuilder:
         goal: str,
         constructor_sent_generation: int | None,
         conversation_generation: int,
+        report_mode: str = "file",
     ) -> BuiltPrompt:
         role = str(logical_role).strip().upper()
         if role not in self.config.roles:
@@ -88,15 +103,28 @@ class PromptBuilder:
                 .read_text(encoding="utf-8")
                 .strip()
             )
-        sections.append(self._guide())
+        sections.append(self._guide(report_mode))
         return BuiltPrompt("\n\n".join(sections).strip(), include, generation)
 
-    def _sanitize_validation_error(self, validation_error: str) -> str:
+    def _sanitize_validation_error(
+        self,
+        validation_error: str,
+        *,
+        report_mode: str = "file",
+    ) -> str:
+        mode = str(report_mode).strip().lower()
+        if mode not in {"file", "inline"}:
+            raise ValueError("report_mode must be 'file' or 'inline'")
+        replacement = (
+            "[internal role-report path]"
+            if mode == "inline"
+            else self.naming_rule()
+        )
         cleaned: list[str] = []
         for token in str(validation_error).split():
             bare = token.strip("`'\"()[]{}<>,;:")
-            if "_turn" in bare and bare.endswith(".md"):
-                cleaned.append(self.naming_rule())
+            if "_turn" in bare and ".md" in bare:
+                cleaned.append(replacement)
             else:
                 cleaned.append(token)
         return " ".join(cleaned).strip()
@@ -109,8 +137,13 @@ class PromptBuilder:
         physical_role: str,
         turn: int,
         validation_error: str,
+        report_mode: str = "file",
     ) -> str:
-        error = self._sanitize_validation_error(validation_error)
+        mode = str(report_mode).strip().lower()
+        error = self._sanitize_validation_error(
+            validation_error,
+            report_mode=mode,
+        )
         if not error:
             raise ValueError("repair requires a validation error")
         identity = {
@@ -119,10 +152,18 @@ class PromptBuilder:
             "role": str(physical_role).strip(),
             "turn": int(turn),
         }
+        if mode == "inline":
+            return (
+                "CDPA_ROUTE_REPAIR\n"
+                + json.dumps(identity, ensure_ascii=False, indent=2)
+                + f"\n\nValidation error: {error}\n\n"
+                + "Return corrected inline Markdown followed by the terminal JSON object.\n\n"
+                + self._guide("inline")
+            ).strip()
         return (
             "CDPA_ROUTE_REPAIR\n"
             + json.dumps(identity, ensure_ascii=False, indent=2)
             + f"\n\nValidation error: {error}\n\n"
             + f"Report naming rule: {self.naming_rule()}\n\n"
-            + self._guide()
+            + self._guide(mode)
         ).strip()

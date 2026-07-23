@@ -28,6 +28,22 @@ _TASK_STATUSES = frozenset({"INBOX", "RUNNING", "PAUSED", "BLOCKED", "DONE", "ST
 _HOP_STATES = frozenset({"pre_send", "sending", "sent", "waiting", "responded", "routed", "abandoned"})
 _CLEANUP_STATES = frozenset({"ACTIVE", "CLEARING", "CLEARED"})
 _MAINTENANCE_STATES = frozenset({"OPEN", "RUNNING", "RESOLVED", "ESCALATED"})
+_REPORT_MODES = frozenset({"file", "inline"})
+
+
+def normalize_report_mode(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("report_mode must be 'file' or 'inline'")
+    mode = value.strip().lower()
+    if mode not in _REPORT_MODES:
+        raise ValueError("report_mode must be 'file' or 'inline'")
+    return mode
+
+
+def report_mode_from_options(options: Mapping[str, Any]) -> str:
+    if "report_mode" not in options:
+        return "file"
+    return normalize_report_mode(options["report_mode"])
 
 
 def utc_now() -> str:
@@ -361,6 +377,10 @@ class TaskStore:
         for key, expected_type in typed_fields.items():
             if not isinstance(state.get(key), expected_type):
                 return f"task manifest field {key!r} has invalid type"
+        try:
+            report_mode_from_options(state["options"])
+        except ValueError as exc:
+            return f"task manifest options.{exc}"
 
         maintenance = state.get("maintenance")
         if maintenance is not None:
@@ -887,6 +907,7 @@ class TaskStore:
         repository: str | Path | None = None,
         task_id: str | None = None,
         reserved_team_suffixes: Sequence[int] = (),
+        report_mode: str = "file",
     ) -> dict[str, Any]:
         text = str(task).strip()
         if not text:
@@ -896,6 +917,7 @@ class TaskStore:
         unknown = set(normalized_new) - set(self.config.roles)
         if unknown:
             raise ValueError(f"unknown --new roles: {sorted(unknown)!r}")
+        normalized_report_mode = normalize_report_mode(report_mode)
         base = normalize_team_base(requested_team or task_id)
         repository_path = Path(repository or self.config.repository_root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
@@ -1067,7 +1089,11 @@ class TaskStore:
                 "completed_at": None,
                 "stopped_at": None,
                 "last_role_activity_at": None,
-                "options": {"new_roles": list(normalized_new), "new_all": bool(new_all)},
+                "options": {
+                    "new_roles": list(normalized_new),
+                    "new_all": bool(new_all),
+                    "report_mode": normalized_report_mode,
+                },
                 "roles": roles,
                 "hops": [hop],
                 "reports": [],

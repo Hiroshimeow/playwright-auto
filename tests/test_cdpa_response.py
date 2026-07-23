@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from playwright_auto.cdpa_response import (
     begin_refresh,
     finish_refresh,
@@ -143,3 +145,160 @@ def test_no_progress_refresh_is_allowed_when_stop_disappeared():
         manual_input_pending=True,
         now=start + timedelta(minutes=21),
     )
+
+
+from playwright_auto.cdpa_routes import RouteContractError, parse_role_response
+
+
+INLINE_RESPONSE = """# Final report
+
+Evidence.
+
+```json
+{"route":"DONE","handoff":"INLINE"}
+```
+"""
+
+
+def test_inline_mode_extracts_markdown_before_terminal_json():
+    parsed = parse_role_response(
+        INLINE_RESPONSE, source_role="PLAN", report_mode="inline"
+    )
+    assert parsed.inline_report == "# Final report\n\nEvidence."
+    assert parsed.decision.route == "DONE"
+    assert parsed.decision.handoff == "INLINE"
+
+
+def test_file_mode_rejects_inline_body_and_handoff():
+    with pytest.raises(RouteContractError, match="file report"):
+        parse_role_response(INLINE_RESPONSE, source_role="PLAN", report_mode="file")
+    with pytest.raises(RouteContractError, match="file report"):
+        parse_role_response(
+            '{"route":"DEV","handoff":"INLINE"}',
+            source_role="PLAN",
+            report_mode="file",
+        )
+
+
+@pytest.mark.parametrize(
+    "response, message",
+    [
+        ('```json\n{"route":"DEV","handoff":"INLINE"}\n```', "Markdown report"),
+        ('   \n{"route":"DEV","handoff":"INLINE"}', "Markdown report"),
+        ('# Report\n\n{"route":"DEV","handoff":"wrong"}', 'handoff "INLINE"'),
+        (
+            '# Report\n\n{"route":"DEV","handoff":"INLINE"}\n\ntrailing',
+            "terminal",
+        ),
+        (
+            '# Report\n\n{"route":"TEST","handoff":"INLINE"}\n\n{"route":"DEV","handoff":"INLINE"}',
+            "exactly one terminal",
+        ),
+        (
+            '# Report\n\n```json\n{"route":"DEV","route":"TEST","handoff":"INLINE"}\n```',
+            "duplicate route field",
+        ),
+    ],
+)
+def test_inline_mode_rejects_invalid_or_ambiguous_report_response(response, message):
+    with pytest.raises(RouteContractError, match=message):
+        parse_role_response(response, source_role="PLAN", report_mode="inline")
+
+
+def test_inline_mode_preserves_done_authority():
+    with pytest.raises(RouteContractError, match="only PLAN"):
+        parse_role_response(INLINE_RESPONSE, source_role="DEV", report_mode="inline")
+
+
+def test_parse_role_response_rejects_unknown_report_mode():
+    with pytest.raises(ValueError, match="report_mode"):
+        parse_role_response(
+            '{"route":"DEV","handoff":"x"}',
+            source_role="PLAN",
+            report_mode="other",
+        )
+
+
+def test_inline_mode_allows_unrelated_json_evidence_before_terminal_route():
+    response = """# Report
+
+```json
+{"evidence": true}
+```
+
+```json
+{"route":"DEV","handoff":"INLINE"}
+```
+"""
+
+    parsed = parse_role_response(response, source_role="PLAN", report_mode="inline")
+
+    assert parsed.decision.route == "DEV"
+    assert parsed.inline_report == '# Report\n\n```json\n{"evidence": true}\n```'
+
+
+def test_inline_materializer_rejects_report_symlink_without_external_write(tmp_path):
+    from playwright_auto.cdpa_routes import materialize_inline_report
+
+    target = tmp_path / ".plan" / "alpha" / "alpha-plan_turn1_task-link.md"
+    external = tmp_path / "outside.md"
+    target.parent.mkdir(parents=True)
+    target.symlink_to(external)
+
+    with pytest.raises(RouteContractError, match="symlink"):
+        materialize_inline_report(
+            "# Report",
+            expected_report_path=".plan/alpha/alpha-plan_turn1_task-link.md",
+            repository_root=tmp_path,
+            plans_root=tmp_path / ".plan",
+            team="alpha",
+            physical_role="alpha-plan",
+            turn=1,
+            task_id="task-link",
+        )
+
+    assert not external.exists()
+
+
+def test_inline_materializer_rejects_symlinked_team_directory_before_write(tmp_path):
+    from playwright_auto.cdpa_routes import materialize_inline_report
+
+    plans = tmp_path / ".plan"
+    external = tmp_path / "outside-team"
+    plans.mkdir()
+    external.mkdir()
+    (plans / "alpha").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(RouteContractError, match="escapes|exactly match|symlink"):
+        materialize_inline_report(
+            "# Report",
+            expected_report_path=".plan/alpha/alpha-plan_turn1_task-parent-link.md",
+            repository_root=tmp_path,
+            plans_root=plans,
+            team="alpha",
+            physical_role="alpha-plan",
+            turn=1,
+            task_id="task-parent-link",
+        )
+
+    assert not (external / "alpha-plan_turn1_task-parent-link.md").exists()
+
+
+
+@pytest.mark.parametrize("language", ["json", "JSON", "JsOn"])
+def test_inline_mode_terminal_json_fence_is_case_insensitive(language: str):
+    response = (
+        "# Report\n\n"
+        f"```{language}\n"
+        '{"route":"DEV","handoff":"INLINE"}\n'
+        "```"
+    )
+
+    parsed = parse_role_response(
+        response,
+        source_role="PLAN",
+        report_mode="inline",
+    )
+
+    assert parsed.decision.route == "DEV"
+    assert parsed.inline_report == "# Report"

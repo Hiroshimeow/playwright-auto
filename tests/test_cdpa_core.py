@@ -1145,3 +1145,199 @@ def test_maintenance_save_merges_only_metadata_and_preserves_newer_task_changes(
 
     assert saved["controls"] == newer["controls"]
     assert saved["maintenance"]["active_incident_id"] == "maint-1"
+
+
+
+def test_task_report_mode_defaults_file_and_validates_inline(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+
+    file_task = store.create_task(
+        "File report", requested_team="alpha", task_id="task-file"
+    )
+    inline_task = store.create_task(
+        "Inline report",
+        requested_team="beta",
+        task_id="task-inline",
+        report_mode="inline",
+    )
+
+    assert file_task["options"]["report_mode"] == "file"
+    assert inline_task["options"]["report_mode"] == "inline"
+    assert store.load(inline_task["manifest_path"])["options"]["report_mode"] == "inline"
+    with pytest.raises(ValueError, match="report_mode"):
+        store.create_task(
+            "Bad report mode",
+            requested_team="gamma",
+            task_id="task-bad-report-mode",
+            report_mode="remote",
+        )
+
+
+
+@pytest.mark.parametrize("value", [None, "", False, 0, [], {}, "other"])
+def test_manifest_rejects_explicit_invalid_persisted_report_mode(
+    tmp_path: Path,
+    value: object,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_task(
+        "Inline report",
+        requested_team="alpha",
+        task_id="task-invalid-report-mode",
+        report_mode="inline",
+    )
+    manifest = Path(state["manifest_path"])
+    raw = json.loads(manifest.read_text(encoding="utf-8"))
+    raw["options"]["report_mode"] = value
+    manifest.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="report_mode"):
+        store.load(manifest)
+
+
+@pytest.mark.parametrize("value", [None, "", False, 0, [], {}, "other"])
+def test_create_task_rejects_explicit_invalid_report_mode(
+    tmp_path: Path,
+    value: object,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+
+    with pytest.raises(ValueError, match="report_mode"):
+        store.create_task(
+            "Bad report mode",
+            requested_team="alpha",
+            task_id="task-bad-report-mode",
+            report_mode=value,
+        )
+
+
+
+def test_legacy_manifest_without_report_mode_defaults_to_file(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_task(
+        "Legacy file report",
+        requested_team="alpha",
+        task_id="task-legacy-report-mode",
+    )
+    manifest = Path(state["manifest_path"])
+    raw = json.loads(manifest.read_text(encoding="utf-8"))
+    del raw["options"]["report_mode"]
+    manifest.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = store.load(manifest)
+
+    assert "report_mode" not in loaded["options"]
+
+
+
+def test_inline_first_generation_payload_is_authoritative_for_all_roles():
+    repository = Path(__file__).resolve().parents[1]
+    config = load_cdpa_config(repository / "cdpa.yaml", repository_root=repository)
+    builder = PromptBuilder(config)
+    forbidden = (
+        "write the PLAN report at the expected path",
+        "Write evidence and remaining risks into your own role-turn report",
+        "Record exact commands and results in your own report",
+    )
+
+    for role in config.roles:
+        prompt = builder.build(
+            task_title="Inline contract",
+            task_id="task-inline-contract",
+            team="alpha",
+            logical_role=role,
+            physical_role=f"alpha-{role.lower()}",
+            turn=1,
+            allowed_routes=("PLAN", "DEV", "TEST", "REVIEW", "AUDIT", "DONE"),
+            workspace=str(repository),
+            source_physical_role=None,
+            handoff="inline contract",
+            goal="inline contract",
+            constructor_sent_generation=None,
+            conversation_generation=0,
+            report_mode="inline",
+        ).text
+        assert "Do not create, edit, or write any role-report file" in prompt
+        assert "the worker owns report materialization" in prompt
+        assert '"handoff":"INLINE"' in prompt
+        assert ".plan/alpha/alpha-" not in prompt
+        for phrase in forbidden:
+            assert phrase not in prompt
+
+
+def test_file_mode_response_guide_wording_remains_unchanged():
+    repository = Path(__file__).resolve().parents[1]
+    config = load_cdpa_config(repository / "cdpa.yaml", repository_root=repository)
+    prompt = PromptBuilder(config).build(
+        task_title="File contract",
+        task_id="task-file-contract",
+        team="alpha",
+        logical_role="PLAN",
+        physical_role="alpha-plan",
+        turn=1,
+        allowed_routes=("PLAN", "DEV", "TEST", "REVIEW", "AUDIT", "DONE"),
+        workspace=str(repository),
+        source_physical_role=None,
+        handoff="file contract",
+        goal="file contract",
+        constructor_sent_generation=None,
+        conversation_generation=0,
+        report_mode="file",
+    ).text
+    assert "Write the complete role report to the exact expected Markdown path" in prompt
+    assert '"handoff":".plan/<team>/<physical-role>_turn<N>_<task-id>.md"' in prompt
+
+
+def test_repository_and_packaged_role_contracts_are_report_mode_neutral():
+    repository = Path(__file__).resolve().parents[1]
+    forbidden = (
+        "write the PLAN report at the expected path",
+        "Write evidence and remaining risks into your own role-turn report",
+        "Record exact commands and results in your own report",
+    )
+    for base in (
+        repository / "prompts" / "cdpa",
+        repository / "src" / "playwright_auto" / "cdpa_defaults" / "prompts" / "cdpa",
+    ):
+        for role in ("PLAN", "DEV", "TEST", "REVIEW", "AUDIT"):
+            constructor = (base / f"{role}.md").read_text(encoding="utf-8")
+            for phrase in forbidden:
+                assert phrase not in constructor
+
+    agents = (repository / "AGENTS.md").read_text(encoding="utf-8")
+    assert "In file report mode" in agents
+    assert "In inline report mode" in agents
+    assert "the worker materializes" in agents
+
+
+@pytest.mark.parametrize(
+    "validation_error",
+    [
+        "Permission denied: '/repo/.plan/alpha/alpha-plan_turn1_task-x.md.lock'",
+        "Input/output error: '/repo/.plan/alpha/alpha-plan_turn1_task-x.md.abc.tmp'",
+        (
+            "OSError: [Errno 5] Input/output error: "
+            "'/repo/.plan/alpha/alpha-plan_turn1_task-x.md.abc.tmp' -> "
+            "'/repo/.plan/alpha/alpha-plan_turn1_task-x.md'"
+        ),
+    ],
+)
+def test_inline_repair_redacts_report_path_derivatives(validation_error: str, tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    repair = PromptBuilder(config).repair(
+        task_id="task-x",
+        team="alpha",
+        physical_role="alpha-plan",
+        turn=1,
+        validation_error=validation_error,
+        report_mode="inline",
+    )
+
+    assert "alpha-plan_turn1_task-x.md" not in repair
+    assert ".md.lock" not in repair
+    assert ".md.abc.tmp" not in repair
+    assert "Do not create, edit, or write any role-report file" in repair

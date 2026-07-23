@@ -981,6 +981,7 @@ def test_cli_taskless_resume_requires_exact_team_and_rejects_creation_flags(
     [
         {"new_roles": ["PLAN"]},
         {"new_all": True},
+        {"report_mode": "inline"},
     ],
 )
 def test_dashboard_resume_rejects_creation_only_options(
@@ -1715,6 +1716,77 @@ def test_history_reports_polling_preserves_selection_scroll_and_keyed_nodes(tmp_
             assert after["reportLinks"] == 20
             assert errors == []
             browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+
+def test_cdpa_cli_inline_report_persists_task_option(tmp_path: Path, capsys):
+    config_path = write_config(tmp_path)
+    server, thread, tasks = start_dashboard_server(config_path, tmp_path)
+    try:
+        code = cdpa_main([
+            "inline report task",
+            "--inline-report",
+            "--config", str(config_path),
+            "--repository", str(tmp_path),
+            "--team", "alpha",
+        ])
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+    assert code == 0
+    assert "team=alpha" in capsys.readouterr().out
+    task = tasks.discover()[0]
+    assert task["options"]["report_mode"] == "inline"
+
+
+def test_cdpa_cli_rejects_inline_report_for_taskless_resume(tmp_path: Path, capsys):
+    config_path = write_config(tmp_path)
+    assert cdpa_main([
+        "--team", "alpha",
+        "--inline-report",
+        "--config", str(config_path),
+        "--repository", str(tmp_path),
+    ]) == 2
+    assert "invalid in taskless resume" in capsys.readouterr().err
+
+
+
+@pytest.mark.parametrize("value", [None, "", False, 0, [], {}, "other"])
+def test_dashboard_create_rejects_explicit_invalid_report_mode(
+    tmp_path: Path,
+    value: object,
+):
+    config_path = write_config(tmp_path)
+    server, thread, tasks = start_dashboard_server(config_path, tmp_path)
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        connection.request(
+            "POST",
+            "/api/tasks",
+            body=json.dumps(
+                {
+                    "task": "invalid report mode",
+                    "repository": str(tmp_path),
+                    "team": "alpha",
+                    "new_roles": [],
+                    "new_all": False,
+                    "report_mode": value,
+                }
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+
+        assert response.status == 400
+        assert "report_mode" in payload["error"]
+        assert tasks.discover() == []
     finally:
         server.shutdown()
         server.server_close()

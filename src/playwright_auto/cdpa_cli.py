@@ -82,6 +82,7 @@ def submit_task(
     team: str | None,
     new_roles: Sequence[str],
     new_all: bool,
+    report_mode: str = "file",
 ) -> Mapping[str, Any]:
     return _post(
         config,
@@ -92,6 +93,7 @@ def submit_task(
             "team": team,
             "new_roles": list(new_roles),
             "new_all": bool(new_all),
+            "report_mode": str(report_mode),
         },
         expected_status=201,
     )
@@ -268,6 +270,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--new", dest="new_roles", help="comma-separated roles reset lazily once")
     parser.add_argument("--new-all", action="store_true", help="reset every selected role lazily once")
     parser.add_argument("--team", default=None, help="new-task team base or exact team to resume")
+    parser.add_argument(
+        "--inline-report",
+        action="store_true",
+        help="write role reports from response Markdown instead of agent-created files",
+    )
     parser.add_argument("--repository", default=".", help="task repository/worktree")
     parser.add_argument(
         "--config",
@@ -320,13 +327,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 team=args.team,
                 new_roles=new_roles,
                 new_all=bool(args.new_all),
+                report_mode="inline" if args.inline_report else "file",
             )
             mode = "created"
         else:
             if not args.team:
                 raise ValueError("taskless resume requires --team <exact-existing-team>")
-            if new_roles or args.new_all:
-                raise ValueError("--new and --new-all are invalid in taskless resume mode")
+            if new_roles or args.new_all or args.inline_report:
+                raise ValueError(
+                    "--new, --new-all, and --inline-report are invalid in taskless resume mode"
+                )
             state = resume_task(config, repository=repository, team=str(args.team))
             mode = "resumed"
     except Exception as exc:

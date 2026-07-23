@@ -1143,8 +1143,14 @@ def _handler(
                             "task repository must match the dashboard CDPA repository"
                         )
                     if path == "/api/tasks/resume":
-                        if body.get("new_roles") or body.get("new_all"):
-                            raise ValueError("new_roles and new_all are invalid when resuming")
+                        if (
+                            body.get("new_roles")
+                            or body.get("new_all")
+                            or "report_mode" in body
+                        ):
+                            raise ValueError(
+                                "new_roles, new_all, and report_mode are invalid when resuming"
+                            )
                         team = body.get("team")
                         if not isinstance(team, str) or not team:
                             raise ValueError("resume requires an exact team string")
@@ -1158,6 +1164,11 @@ def _handler(
                         requested_team=str(body.get("team") or "").strip() or None,
                         new_roles=tuple(body.get("new_roles") or ()),
                         new_all=bool(body.get("new_all")),
+                        report_mode=(
+                            body["report_mode"]
+                            if "report_mode" in body
+                            else "file"
+                        ),
                         repository=requested_repository,
                         reserved_team_suffixes=_busy_role_suffixes(
                             task_store,

@@ -16,8 +16,9 @@ from playwright_auto.cdpa_actions import (
 )
 from playwright_auto.cdpa_config import load_cdpa_config
 from playwright_auto.cdpa_maintenance import ensure_maintenance_incident
+from playwright_auto.cdpa_routes import RouteContractError
 from playwright_auto.cdpa_store import TaskStore
-from playwright_auto.cdpa_worker import CDPAWorker, _active_hop
+from playwright_auto.cdpa_worker import CDPAWorker, _active_hop, _report_mode
 from playwright_auto.chatgpt import (
     ChatGPTSnapshot,
     ChatGPTState,
@@ -104,13 +105,14 @@ class FakeActions:
         return len(selected)
 
 
-def setup_task(tmp_path: Path, *, task_id="task-a"):
+def setup_task(tmp_path: Path, *, task_id="task-a", report_mode="file"):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
     state = store.create_task(
         "Implement exact production behavior",
         requested_team="alpha",
         task_id=task_id,
+        report_mode=report_mode,
     )
     return config, store, state, CDPAWorker(config, store=store)
 
@@ -1637,8 +1639,15 @@ def test_routed_parent_without_child_fails_closed_after_restart(tmp_path: Path):
     assert "no durable child" in result["block_reason"]
 
 
-def _prepare_sent_waiting_task(tmp_path: Path, *, task_id: str):
-    _, store, state, worker = setup_task(tmp_path, task_id=task_id)
+def _prepare_sent_waiting_task(
+    tmp_path: Path,
+    *,
+    task_id: str,
+    report_mode: str = "file",
+):
+    _, store, state, worker = setup_task(
+        tmp_path, task_id=task_id, report_mode=report_mode
+    )
     path = Path(state["manifest_path"])
     hop = _active_hop(state)
     asyncio.run(worker._pre_send(state, hop, FakeActions()))
@@ -2993,3 +3002,372 @@ def test_run_once_advances_global_maintainers_after_task_iteration(
     assert observed_context is browser_context
     assert tasks[0][0] == path
     assert tasks[0][1]["block_code"] == "role_offline"
+
+
+
+def _inline_response(route="DONE", body="# Inline report\n\nEvidence."):
+    return f'{body}\n\n```json\n{{"route":"{route}","handoff":"INLINE"}}\n```'
+
+
+def test_inline_pre_send_and_repair_guidance_never_expose_expected_path(tmp_path: Path):
+    _, _, state, worker = setup_task(
+        tmp_path, task_id="task-inline-prompt", report_mode="inline"
+    )
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+
+    assert "Do not create, edit, or write any role-report file" in hop["prompt"]
+    assert "the worker owns report materialization" in hop["prompt"]
+    assert '"handoff":"INLINE"' in hop["prompt"]
+    assert hop["expected_report_path"] not in hop["prompt"]
+    assert "Report naming rule:" not in hop["prompt"]
+
+    hop["response"] = "bad"
+    hop["state"] = "responded"
+    worker._responded(state, hop)
+    repair = _active_hop(state)
+    asyncio.run(worker._pre_send(state, repair, FakeActions()))
+
+    assert "corrected inline Markdown" in repair["prompt"]
+    assert '"handoff":"INLINE"' in repair["prompt"]
+    assert repair["expected_report_path"] not in repair["prompt"]
+    assert "Report naming rule:" not in repair["prompt"]
+
+
+def test_inline_response_materializes_exact_report_and_routes(tmp_path: Path):
+    _, _, state, worker = setup_task(
+        tmp_path, task_id="task-inline-materialize", report_mode="inline"
+    )
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    hop["response"] = _inline_response(route="DEV")
+    hop["state"] = "responded"
+
+    worker._responded(state, hop)
+
+    expected = (tmp_path / hop["expected_report_path"]).resolve()
+    assert expected.read_text(encoding="utf-8") == "# Inline report\n\nEvidence."
+    assert hop["report_path"] == str(expected)
+    assert hop["report_size"] == len(expected.read_bytes())
+    assert hop["report_sha256"] == worker_module.hashlib.sha256(expected.read_bytes()).hexdigest()
+    assert len(state["reports"]) == 1
+    assert state["reports"][0]["path"] == str(expected)
+    next_hop = _active_hop(state)
+    assert next_hop["target_role"] == "DEV"
+    assert next_hop["handoff"] == hop["expected_report_path"]
+
+
+def test_inline_materialization_failure_blocks_operationally_without_path_or_repair(
+    tmp_path: Path, monkeypatch
+):
+    _, _, state, worker = setup_task(
+        tmp_path, task_id="task-inline-write-fail", report_mode="inline"
+    )
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    hop["response"] = _inline_response(route="DEV")
+    hop["state"] = "responded"
+    internal = str((tmp_path / hop["expected_report_path"]).resolve()) + ".lock"
+    monkeypatch.setattr(
+        worker_module,
+        "materialize_inline_report",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            worker_module.InlineReportMaterializationError(
+                f"Permission denied: {internal}"
+            )
+        ),
+    )
+
+    worker._responded(state, hop)
+
+    assert hop["report_path"] is None
+    assert state["reports"] == []
+    assert len(state["hops"]) == 1
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "inline_report_materialization_failed"
+    assert state["block_reason"] == "inline report materialization failed"
+    assert internal not in state["block_reason"]
+    incident = ensure_maintenance_incident(state)
+    assert incident is not None
+    assert incident["trigger_code"] == "inline_report_materialization_failed"
+
+
+
+@pytest.mark.parametrize("failure_point", ["parent_mkdir", "lock_is_symlink"])
+def test_inline_raw_filesystem_failure_blocks_without_route_repair(
+    tmp_path: Path,
+    monkeypatch,
+    failure_point: str,
+):
+    _, _, state, worker = setup_task(
+        tmp_path,
+        task_id=f"task-inline-{failure_point}",
+        report_mode="inline",
+    )
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    response = _inline_response(route="DEV")
+    hop["response"] = response
+    hop["state"] = "responded"
+    target = (tmp_path / hop["expected_report_path"]).resolve()
+
+    if failure_point == "parent_mkdir":
+        original = Path.mkdir
+
+        def fail_parent_mkdir(self, *args, **kwargs):
+            if self == target.parent:
+                raise PermissionError(13, "Permission denied", str(self))
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", fail_parent_mkdir)
+    else:
+        lock = target.with_suffix(target.suffix + ".lock")
+        original = Path.is_symlink
+
+        def fail_lock_is_symlink(self):
+            if self == lock:
+                raise PermissionError(13, "Permission denied", str(self))
+            return original(self)
+
+        monkeypatch.setattr(Path, "is_symlink", fail_lock_is_symlink)
+
+    worker._responded(state, hop)
+
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "inline_report_materialization_failed"
+    assert state["block_reason"] == "inline report materialization failed"
+    assert len(state["hops"]) == 1
+    assert hop["state"] == "responded"
+    assert hop["response"] == response
+    assert hop["report_path"] is None
+    assert state["reports"] == []
+    assert str(target) not in state["block_reason"]
+    assert all(str(target) not in str(item) for item in hop.get("errors") or ())
+
+    first = ensure_maintenance_incident(state)
+    second = ensure_maintenance_incident(state)
+    assert first is second
+    assert first is not None
+    assert first["trigger_code"] == "inline_report_materialization_failed"
+    assert len(state["maintenance"]["incidents"]) == 1
+
+
+@pytest.mark.parametrize("local_failure", ["different_bytes", "target_symlink"])
+def test_inline_local_report_state_failure_preserves_sent_request_and_blocks(
+    tmp_path: Path,
+    local_failure: str,
+):
+    _store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path,
+        task_id=f"task-inline-{local_failure}",
+        report_mode="inline",
+    )
+    response = _inline_response(route="DEV")
+    hop["response"] = response
+    hop["state"] = "responded"
+    target = (tmp_path / hop["expected_report_path"]).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if local_failure == "different_bytes":
+        target.write_text("different existing report", encoding="utf-8")
+    else:
+        outside = tmp_path / "outside-inline-report.md"
+        outside.write_text("outside", encoding="utf-8")
+        target.symlink_to(outside)
+
+    ledger = RequestLedger(hop["ledger_path"])
+    assert ledger.get(hop["request_id"]).status is RequestStatus.SENT
+
+    worker._responded(state, hop)
+
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "inline_report_materialization_failed"
+    assert state["block_reason"] == "inline report materialization failed"
+    assert len(state["hops"]) == 1
+    assert hop["state"] == "responded"
+    assert hop["response"] == response
+    assert hop["report_path"] is None
+    assert state["reports"] == []
+    assert ledger.get(hop["request_id"]).status is RequestStatus.SENT
+    assert str(target) not in state["block_reason"]
+    assert all(str(target) not in str(item) for item in hop.get("errors") or ())
+
+    first = ensure_maintenance_incident(state)
+    second = ensure_maintenance_incident(state)
+    assert first is second
+    assert first is not None
+    assert first["trigger_code"] == "inline_report_materialization_failed"
+    assert len(state["maintenance"]["incidents"]) == 1
+
+def test_inline_materialization_is_restart_idempotent_and_ledger_completes_once(
+    tmp_path: Path
+):
+    _, store, state, worker = setup_task(
+        tmp_path, task_id="task-inline-restart", report_mode="inline"
+    )
+    path = Path(state["manifest_path"])
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    ledger = RequestLedger(hop["ledger_path"])
+    record = ledger.begin(
+        role="alpha-plan",
+        prompt=hop["prompt"],
+        request_id=hop["request_id"],
+        render_request_marker=False,
+    )
+    baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
+    receipt = SendReceipt(
+        prompt=hop["prompt"],
+        prompt_sha256=prompt_digest(hop["prompt"]),
+        binding=PageBinding("page-alpha-plan", "alpha-plan"),
+        baseline=baseline,
+        attempts=1,
+        accepted_via="user_message_identity",
+        session_id_before="inline-restart",
+        user_message_id="u-inline",
+        user_turn_id="t-inline",
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=receipt.binding,
+        baseline=baseline,
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENT,
+        accepted_at=1.0,
+        receipt=receipt.to_dict(),
+    )
+    hop["receipt"] = receipt.to_dict()
+    hop["response"] = _inline_response()
+    hop["response_record"] = {
+        "role": "assistant",
+        "message_id": "a-inline",
+        "turn_id": "ta-inline",
+        "text": hop["response"],
+        "actions": [],
+        "image_count": 0,
+    }
+    hop["state"] = "responded"
+    store.save(path, state)
+
+    expected = (tmp_path / hop["expected_report_path"]).resolve()
+    expected.parent.mkdir(parents=True, exist_ok=True)
+    expected.write_text("# Inline report\n\nEvidence.", encoding="utf-8")
+    before_stat = expected.stat()
+
+    restarted = CDPAWorker(worker.config, store=store)
+    result = asyncio.run(restarted.advance(path, SimpleNamespace(pages=[])))
+
+    assert result["status"] == "DONE"
+    assert len(result["reports"]) == 1
+    assert expected.read_text(encoding="utf-8") == "# Inline report\n\nEvidence."
+    assert expected.stat().st_mtime_ns == before_stat.st_mtime_ns
+    persisted = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
+    assert persisted is not None
+    assert persisted.status is RequestStatus.COMPLETED
+
+    manifest_before = path.read_bytes()
+    result_again = asyncio.run(restarted.advance(path, SimpleNamespace(pages=[])))
+    assert result_again["status"] == "DONE"
+    assert path.read_bytes() == manifest_before
+    assert len(result_again["reports"]) == 1
+    assert expected.stat().st_mtime_ns == before_stat.st_mtime_ns
+
+
+def test_exhausted_inline_validation_block_creates_one_maintenance_incident(tmp_path: Path):
+    _, _, state, worker = setup_task(
+        tmp_path, task_id="task-inline-exhausted", report_mode="inline"
+    )
+    hop = _active_hop(state)
+    hop["repair_attempt"] = worker.config.route_repair_attempts
+    worker._repair_route(state, hop, RouteContractError("inline Markdown report is empty"))
+
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "route_validation_exhausted"
+    first = ensure_maintenance_incident(state)
+    second = ensure_maintenance_incident(state)
+    assert first is second
+    assert first["trigger_code"] == "route_validation_exhausted"
+    assert len(state["maintenance"]["incidents"]) == 1
+
+
+
+def test_waiting_inline_candidate_uses_same_stability_gate_before_materialization(
+    tmp_path: Path,
+):
+    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path,
+        task_id="task-inline-stable-gate",
+        report_mode="inline",
+    )
+    response = MessageSnapshot(
+        "assistant",
+        "a-inline-stable",
+        "ta-inline-stable",
+        _inline_response(route="TEST"),
+        (),
+    )
+    snapshot = SimpleNamespace(
+        state=ChatGPTState.WAITING_PROMPT,
+        stop_visible=False,
+        composer_empty=True,
+        manual_input_pending=False,
+        error_texts=(),
+        blocking_dialogs=(),
+        messages=(MessageSnapshot("user", "u1", "t1", receipt.prompt, ()),),
+    )
+    expected = (tmp_path / hop["expected_report_path"]).resolve()
+
+    class Client:
+        def __init__(self):
+            self.kwargs = None
+
+        async def assert_ownership(self):
+            return snapshot
+
+        async def wait_for_response(self, _receipt, **kwargs):
+            self.kwargs = kwargs
+            kwargs["candidate_validator"](response)
+            assert not expected.exists()
+            return response
+
+    client = Client()
+    acquired = AcquiredRole(
+        client=client,
+        page_id="page-alpha-plan",
+        url="https://chatgpt.com/c/exact",
+        created=False,
+        new_chat=False,
+    )
+
+    class Actions:
+        async def locate_owned(self, _state, _role):
+            return acquired
+
+    asyncio.run(worker._waiting(state, hop, Actions(), path))
+
+    assert client.kwargs["minimum_samples"] == 2
+    assert client.kwargs["invalid_grace_ms"] >= 1_000
+    assert hop["state"] == "responded"
+    assert not expected.exists()
+    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).status is RequestStatus.SENT
+
+    worker._responded(state, hop)
+
+    assert expected.read_text(encoding="utf-8") == "# Inline report\n\nEvidence."
+    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).status is RequestStatus.COMPLETED
+    assert _active_hop(state)["target_role"] == "TEST"
+
+
+
+@pytest.mark.parametrize("value", [None, "", False, 0, [], {}, "other"])
+def test_worker_rejects_explicit_invalid_report_mode(value: object):
+    with pytest.raises(ValueError, match="report_mode"):
+        _report_mode({"options": {"report_mode": value}})
+
+
+
+def test_worker_defaults_missing_legacy_report_mode_to_file():
+    assert _report_mode({"options": {}}) == "file"

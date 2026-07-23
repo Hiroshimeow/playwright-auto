@@ -4,9 +4,12 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from .file_lock import exclusive_file_lock, fsync_parent_directory
 
 ROUTES = frozenset({"PLAN", "DEV", "REVIEW", "TEST", "AUDIT", "DONE"})
 _KEYS = frozenset({"route", "handoff"})
@@ -17,10 +20,20 @@ class RouteContractError(ValueError):
     pass
 
 
+class InlineReportMaterializationError(RouteContractError):
+    pass
+
+
 @dataclass(frozen=True)
 class RouteDecision:
     route: str
     handoff: str
+
+
+@dataclass(frozen=True)
+class ParsedRoleResponse:
+    decision: RouteDecision
+    inline_report: str | None
 
 
 @dataclass(frozen=True)
@@ -71,6 +84,87 @@ def parse_route_response(text: str, *, source_role: str | None = None) -> RouteD
     return RouteDecision(route, handoff)
 
 
+def _contains_route_object(text: str) -> bool:
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(text):
+        if character != "{":
+            continue
+        try:
+            value, _end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and _KEYS.issubset(value):
+            return True
+    return False
+
+
+def _split_inline_response(text: str) -> tuple[str, str]:
+    source = str(text).strip()
+    fence_match = None
+    fence_at = -1
+    openings = re.finditer(r"(?im)(?:^|\n)(```json)", source)
+    for opening in reversed(list(openings)):
+        candidate_at = opening.start(1)
+        candidate = _FENCE.fullmatch(source[candidate_at:])
+        if candidate is not None:
+            fence_at = candidate_at
+            fence_match = candidate
+            break
+    if fence_match is not None:
+        report = source[:fence_at].rstrip()
+        route_source = fence_match.group(1)
+    else:
+        candidates: list[tuple[int, str]] = []
+        for index, character in enumerate(source):
+            if character != "{":
+                continue
+            tail = source[index:].strip()
+            try:
+                value = _decode(tail)
+            except RouteContractError:
+                continue
+            if set(value) == _KEYS:
+                candidates.append((index, tail))
+        if not candidates:
+            raise RouteContractError(
+                "inline response must end with one terminal route JSON object"
+            )
+        index, route_source = candidates[-1]
+        report = source[:index].rstrip()
+    if not report.strip():
+        raise RouteContractError("inline Markdown report must not be empty")
+    if _contains_route_object(report):
+        raise RouteContractError(
+            "inline response must contain exactly one terminal route JSON object"
+        )
+    return report, route_source
+
+
+def parse_role_response(
+    text: str,
+    *,
+    source_role: str,
+    report_mode: str = "file",
+) -> ParsedRoleResponse:
+    mode = str(report_mode).strip().lower()
+    if mode not in {"file", "inline"}:
+        raise ValueError("report_mode must be 'file' or 'inline'")
+    if mode == "file":
+        if re.search(r'"handoff"\s*:\s*"INLINE"', str(text), re.IGNORECASE):
+            raise RouteContractError(
+                "file report mode requires a file report handoff and no inline body"
+            )
+        return ParsedRoleResponse(
+            parse_route_response(text, source_role=source_role),
+            None,
+        )
+    report, route_source = _split_inline_response(text)
+    decision = parse_route_response(route_source, source_role=source_role)
+    if decision.handoff != "INLINE":
+        raise RouteContractError('inline report mode requires handoff "INLINE"')
+    return ParsedRoleResponse(decision, report)
+
+
 def _display_path(path: Path, repository_root: Path) -> str:
     try:
         return path.relative_to(repository_root).as_posix()
@@ -94,7 +188,7 @@ def expected_report_relative(
     return _display_path(expected, root)
 
 
-def validate_report(
+def _validated_report_location(
     handoff: str,
     *,
     repository_root: str | Path,
@@ -103,7 +197,7 @@ def validate_report(
     physical_role: str,
     turn: int,
     task_id: str,
-) -> ReportEvidence:
+) -> tuple[Path, Path, Path]:
     root = Path(repository_root).expanduser().resolve()
     configured = Path(plans_root).expanduser()
     plans = (configured if configured.is_absolute() else root / configured).resolve()
@@ -120,6 +214,28 @@ def validate_report(
         raise RouteContractError(
             f"report path must exactly match {_display_path(expected, root)}"
         )
+    return root, team_root, candidate
+
+
+def validate_report(
+    handoff: str,
+    *,
+    repository_root: str | Path,
+    plans_root: str | Path,
+    team: str,
+    physical_role: str,
+    turn: int,
+    task_id: str,
+) -> ReportEvidence:
+    _root, team_root, candidate = _validated_report_location(
+        handoff,
+        repository_root=repository_root,
+        plans_root=plans_root,
+        team=team,
+        physical_role=physical_role,
+        turn=turn,
+        task_id=task_id,
+    )
     if candidate.is_symlink():
         raise RouteContractError("report path must not be a symlink")
     resolved = candidate.resolve()
@@ -139,3 +255,87 @@ def validate_report(
         raise RouteContractError("report file must not be empty")
     digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
     return ReportEvidence(str(candidate), digest, stat.st_size)
+
+
+
+def materialize_inline_report(
+    report: str,
+    *,
+    expected_report_path: str,
+    repository_root: str | Path,
+    plans_root: str | Path,
+    team: str,
+    physical_role: str,
+    turn: int,
+    task_id: str,
+) -> ReportEvidence:
+    body = str(report)
+    if not body.strip():
+        raise RouteContractError("inline Markdown report must not be empty")
+    expected_relative = expected_report_relative(
+        plans_root=plans_root,
+        repository_root=repository_root,
+        team=team,
+        physical_role=physical_role,
+        turn=turn,
+        task_id=task_id,
+    )
+    if str(expected_report_path).strip() != expected_relative:
+        raise RouteContractError("inline expected report path is inconsistent")
+    _root, team_root, target = _validated_report_location(
+        expected_relative,
+        repository_root=repository_root,
+        plans_root=plans_root,
+        team=team,
+        physical_role=physical_role,
+        turn=turn,
+        task_id=task_id,
+    )
+    if target.is_symlink():
+        raise RouteContractError("report path must not be a symlink")
+    data = body.encode("utf-8")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock = target.with_suffix(target.suffix + ".lock")
+    if lock.is_symlink():
+        raise RouteContractError("report lock path must not be a symlink")
+    temporary: Path | None = None
+    try:
+        with exclusive_file_lock(lock):
+            if target.parent.resolve() != team_root or target.is_symlink():
+                raise RouteContractError("report path must not traverse symlinks")
+            if target.exists():
+                if not target.is_file() or target.read_bytes() != data:
+                    raise RouteContractError(
+                        "inline report path already contains different content"
+                    )
+            else:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    dir=target.parent,
+                    prefix=target.name + ".",
+                    suffix=".tmp",
+                    delete=False,
+                ) as handle:
+                    temporary = Path(handle.name)
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, target)
+                temporary = None
+                fsync_parent_directory(target)
+    except OSError as exc:
+        raise InlineReportMaterializationError(
+            "inline report materialization failed"
+        ) from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return validate_report(
+        expected_relative,
+        repository_root=repository_root,
+        plans_root=plans_root,
+        team=team,
+        physical_role=physical_role,
+        turn=turn,
+        task_id=task_id,
+    )

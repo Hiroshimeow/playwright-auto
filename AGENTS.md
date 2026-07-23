@@ -70,7 +70,7 @@ Do not prescribe a large implementation when the task can state behavior and acc
 - One independent report per role turn:
   `.plan/<team>/<physical-role>_turn<N>_<task-id>.md`.
 - A route handoff references the exact report path instead of embedding a full report.
-- Only the worker/dashboard writes task manifests. Agents write only their own report file.
+- Only the worker/dashboard writes task manifests. In file report mode, agents write only their own role-report file. In inline report mode, agents must not create, edit, or write a role-report file; the worker materializes it from the accepted response Markdown.
 - Every newly formed team must read `LEARNING.md` before planning or implementation.
 - Every role reads `LEARNING.md`. Before routing DONE, PLAN adds only genuinely new, concise, reusable lessons; if there is no new lesson, it leaves the file unchanged. The worker never invents or auto-generates lessons.
 
