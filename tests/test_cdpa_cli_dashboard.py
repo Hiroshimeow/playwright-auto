@@ -28,6 +28,7 @@ from playwright_auto.dashboard import (
     _busy_role_suffixes,
     _handler,
     build_task_payload,
+    build_task_timeline,
 )
 
 from test_cdpa_core import write_config
@@ -127,6 +128,59 @@ def _ui_task(
     cleanup_state: str = "ACTIVE",
     warning: str | None = None,
 ):
+    effective_at = {
+        "inbox": "2026-07-22T14:30:00+00:00",
+        "running": "2026-07-22T14:20:00+00:00",
+        "waiting": "2026-07-22T14:19:00+00:00",
+        "blocked-manual": "2026-07-22T14:18:00+00:00",
+        "blocked-retry": "2026-07-22T14:17:00+00:00",
+    }.get(task_id, "2026-07-22T14:10:00+00:00")
+    block_reason = "manual recovery required" if status == "BLOCKED" and not retryable else "retry transport" if status == "BLOCKED" else None
+    block_code = "manual" if status == "BLOCKED" and not retryable else "transport" if status == "BLOCKED" else None
+    maintenance_report = {
+        "incident_id": "maint-blocked-manual",
+        "state": "RUNNING",
+        "turn": 1,
+        "path": "/repo/.plan/maintainers/team-blocked-manual_turn1.md",
+        "url": "/api/maintenance-reports/blocked-manual/maint-blocked-manual",
+        "at": "2026-07-22T14:18:00+00:00",
+    } if task_id == "blocked-manual" else None
+    active_maintenance = {
+        "incident_id": "maint-blocked-manual",
+        "state": "RUNNING",
+        "trigger_code": block_code,
+        "trigger_reason": block_reason,
+        "decision": {"action": "OPEN_ROLE_TAB", "reason": "Restore the exact role tab."},
+    } if task_id == "blocked-manual" else None
+    timeline = [
+        {"key": f"route:{task_id}", "at": "2026-07-22T14:05:00+00:00", "level": "ROUTE", "source": "PLAN", "message": "PLAN → DEV · route"},
+    ]
+    if task_id == "running":
+        timeline.extend([
+            {"key": "error:running", "at": "2026-07-22T14:06:00+00:00", "level": "ERROR", "source": "DEV", "message": "error-running"},
+            {"key": "control:running", "at": "2026-07-22T14:07:00+00:00", "level": "CONTROL", "source": "pause", "message": "pause · applied"},
+        ])
+    if status == "BLOCKED":
+        timeline.append({"key": f"error:{task_id}", "at": effective_at, "level": "ERROR", "source": "DEV", "message": block_reason})
+    if status == "WAITING":
+        timeline.append({"key": f"dependency:{task_id}", "at": effective_at, "level": "DEPENDENCY", "source": "dependency", "message": "Waiting for task-parent"})
+    timeline.sort(key=lambda item: item["at"], reverse=True)
+    primary_problem = None
+    if status == "BLOCKED":
+        primary_problem = {
+            "kind": "BLOCKED", "code": block_code, "message": block_reason,
+            "role": "DEV", "hop_id": f"hop-{task_id}", "at": effective_at,
+            "recommended": "Inspect the active Maintainers incident and resume the task",
+            "maintenance_incident_id": active_maintenance["incident_id"] if active_maintenance else None,
+            "maintenance_report": maintenance_report,
+        }
+    elif status == "WAITING":
+        primary_problem = {
+            "kind": "WAITING", "code": "dependency_wait", "message": "Waiting for task-parent",
+            "role": "DEV", "hop_id": f"hop-{task_id}", "at": effective_at,
+            "recommended": "Wait for dependencies or queue ownership to become ready",
+            "maintenance_incident_id": None, "maintenance_report": None,
+        }
     return {
         "task_id": task_id,
         "task_title": f"{task_id} title",
@@ -136,6 +190,7 @@ def _ui_task(
         "team": f"team-{task_id}",
         "status": status,
         "column": "WORKING" if status in {"INBOX", "RUNNING"} else status,
+        "effective_activity_at": effective_at,
         "surface": surface,
         "availability": availability,
         "surface_warning": warning,
@@ -144,8 +199,19 @@ def _ui_task(
         "active_hop": {"hop_id": f"hop-{task_id}", "state": "wait_response"} if status not in {"DONE", "STOPPED"} else None,
         "active_action": "wait_response" if status not in {"DONE", "STOPPED"} else None,
         "block_retryable": retryable,
-        "block_reason": "manual recovery required" if status == "BLOCKED" and not retryable else "retry transport" if status == "BLOCKED" else None,
-        "block_code": "manual" if status == "BLOCKED" and not retryable else "transport" if status == "BLOCKED" else None,
+        "block_reason": block_reason,
+        "block_code": block_code,
+        "primary_problem": primary_problem,
+        "active_maintenance_incident": active_maintenance,
+        "active_maintenance_report": maintenance_report if active_maintenance else None,
+        "latest_maintenance_report": maintenance_report,
+        "projection_errors": [],
+        "depends_on_task_ids": ["task-parent"] if status == "WAITING" else [],
+        "child_task_ids": ["task-child"] if task_id == "running" else [],
+        "waiting_on_task_ids": ["task-parent"] if status == "WAITING" else [],
+        "waiting_reason": "Waiting for task-parent" if status == "WAITING" else None,
+        "queue_position": 2 if status == "WAITING" else None,
+        "queue_length": 3 if status == "WAITING" else None,
         "pause_reason": "paused by user" if status == "PAUSED" else None,
         "stop_reason": "stopped by user" if status == "STOPPED" else None,
         "cleanup": {"state": cleanup_state},
@@ -154,6 +220,7 @@ def _ui_task(
             {"logical_role": "DEV", "physical_role": f"team-{task_id}-dev", "status": "running" if status not in {"DONE", "STOPPED"} else "done", "turn": 2, "page_id": f"page-{task_id}", "page_url": f"https://chatgpt.com/c/{task_id}", "conversation_generation": 1, "last_activity_at": "2026-07-22T14:10:00+00:00"},
         ],
         "reports": [{"report_id": "1", "physical_role": "PLAN", "turn": 1, "url": f"/api/reports/{task_id}/1", "path": "report.md"}],
+        "timeline": timeline,
         "route_timeline": [{"hop_id": f"route-{task_id}", "at": "2026-07-22T14:05:00+00:00", "source_role": "PLAN", "route": "DEV", "kind": "route"}],
         "errors": [{"at": "2026-07-22T14:06:00+00:00", "error": f"error-{task_id}"}] if task_id == "running" else [],
         "control_results": [{"control_id": f"control-{task_id}", "action": "pause", "status": "applied", "at": "2026-07-22T14:07:00+00:00"}] if task_id == "running" else [],
@@ -165,6 +232,7 @@ def _ui_payloads():
     tasks = [
         _ui_task("running", "RUNNING"),
         _ui_task("inbox", "INBOX", availability="offline", surface="offline_recoverable"),
+        _ui_task("waiting", "WAITING"),
         _ui_task("blocked-retry", "BLOCKED", retryable=True),
         _ui_task("blocked-manual", "BLOCKED"),
         _ui_task("paused", "PAUSED"),
@@ -221,6 +289,8 @@ def test_v3_dashboard_state_mapping_controls_logs_tabs_and_poll_stability(tmp_pa
             page.goto(f"http://127.0.0.1:{server.server_port}", wait_until="domcontentloaded")
             page.wait_for_selector('[data-task-id="running"]')
             assert page.locator('[data-lane-cards="RUNNING"] [data-task-id]').count() == 2
+            assert page.locator('[data-lane-cards="RUNNING"] [data-task-id]').first.get_attribute("data-task-id") == "inbox"
+            assert page.locator('[data-lane-cards="WAITING"] [data-task-id]').count() == 1
             assert page.locator('[data-lane-cards="BLOCKED"] [data-task-id]').count() == 2
             assert page.locator('[data-lane-cards="PAUSED"] [data-task-id]').count() == 1
             assert page.locator('[data-lane-cards="DONE"] [data-task-id]').count() == 1
@@ -247,6 +317,25 @@ def test_v3_dashboard_state_mapping_controls_logs_tabs_and_poll_stability(tmp_pa
             assert "error-running" in page.locator("#logs-content").text_content()
             assert "matching event" in page.locator("#logs-content").text_content()
             assert "must not leak" not in page.locator("#logs-content").text_content()
+            detail_order = page.eval_on_selector_all(
+                "#primary-problem-section, #maintenance-section, #controls-content, #dependency-summary, #role-table-body, #logs-content, #selected-reports",
+                "nodes => nodes.map(node => node.getBoundingClientRect().top)",
+            )
+            assert detail_order == sorted(detail_order)
+            selected_text = page.evaluate(
+                """() => {
+                    const row = [...document.querySelectorAll('#logs-content [data-key]')].find(node => node.textContent.includes('error-running'));
+                    const selection = window.getSelection();
+                    const range = document.createRange();
+                    range.selectNodeContents(row.querySelector('[data-message]'));
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+                    return selection.toString();
+                }"""
+            )
+            assert selected_text == "error-running"
+            page.wait_for_timeout(1200)
+            assert page.evaluate("window.getSelection().toString()") == "error-running"
             page.locator('[data-role="DEV"]').click()
             task_target = page.locator("#task-control-target").text_content()
             role_target = page.locator("#role-control-target").text_content()
@@ -262,10 +351,19 @@ def test_v3_dashboard_state_mapping_controls_logs_tabs_and_poll_stability(tmp_pa
             assert page.locator('#task-primary [data-action="retry"]').count() == 1
             assert page.locator('#task-secondary [data-action="resume"]').count() == 1
             page.locator('[data-task-id="blocked-manual"]').click()
+            assert page.locator('#primary-problem-section').is_visible()
+            assert "manual recovery required" in page.locator('#primary-problem-section').text_content()
+            assert page.locator('#maintenance-section').is_visible()
+            assert page.locator('#maintenance-report').get_attribute("href") == "/api/maintenance-reports/blocked-manual/maint-blocked-manual"
             assert page.locator('#blocked-guidance').is_visible()
             assert page.locator('#task-primary [data-action="resume"]').count() == 1
             assert page.locator('#task-primary [data-action="retry"]').count() == 0
+            page.locator('[data-task-id="waiting"]').click()
+            assert page.locator('#primary-problem-section').is_visible()
+            assert "Waiting for task-parent" in page.locator('#primary-problem-section').text_content()
+            assert "Position 2 of 3" in page.locator('#dependency-content').text_content()
             page.locator('[data-task-id="done"]').click()
+            assert not page.locator('#primary-problem-section').is_visible()
             assert page.locator('#controls-content [data-action]').count() == 1
             assert page.locator('#controls-content [data-action="clear_team"]').text_content() == "Re-verify cleanup"
             page.locator('[data-history-task-id="history"] button').click()
@@ -326,6 +424,15 @@ def test_v3_create_resume_modal_posts_real_modes_and_preserves_drafts_during_pol
             page.route("**/api/**", api)
             page.goto(f"http://127.0.0.1:{server.server_port}", wait_until="domcontentloaded")
             page.wait_for_selector('[data-task-id="running"]')
+            page.locator('[data-task-id="blocked-manual"]').click()
+            assert page.locator('#primary-problem-section').is_visible()
+            assert page.locator('#maintenance-section').is_visible()
+            problem_bounds = page.locator('#primary-problem-section').bounding_box()
+            maintenance_bounds = page.locator('#maintenance-section').bounding_box()
+            assert problem_bounds is not None and problem_bounds["width"] <= 390
+            assert maintenance_bounds is not None and maintenance_bounds["width"] <= 390
+            page.locator('[data-task-id="waiting"]').click()
+            assert "Position 2 of 3" in page.locator('#dependency-content').text_content()
             create_opener = page.locator("#open-create")
             create_opener.click()
             dialog = page.locator("#task-dialog")
@@ -943,6 +1050,671 @@ def test_cli_and_dashboard_resume_queue_same_durable_transition(tmp_path: Path):
             assert control["status"] == "requested"
         assert cli_state["task_id"] == first["task_id"]
         assert dashboard_state["task_id"] == second["task_id"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+
+def test_phase2_selected_task_layout_is_error_first_and_scroll_bounded():
+    html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+    ordered_ids = [
+        "team-heading",
+        "primary-problem-section",
+        "maintenance-section",
+        "controls-content",
+        "dependency-summary",
+        "role-table-body",
+        "logs-content",
+        "selected-reports",
+    ]
+    positions = [html.index(f'id="{element_id}"') for element_id in ordered_ids]
+    assert positions == sorted(positions)
+    assert 'data-lane="WAITING"' in html
+    assert 'max-h-96 overflow-y-auto' in html
+    assert 'function renderPrimaryProblem' in html
+    assert 'function renderMaintenance' in html
+    assert 'function renderDependencySummary' in html
+    assert 'task.timeline || []' in html
+    assert "effective_activity_at" in html
+
+
+def test_dashboard_serves_validated_maintenance_report_and_rejects_tampering(
+    tmp_path: Path,
+):
+    config_path = write_config(tmp_path)
+    server, thread, tasks = start_dashboard_server(config_path, tmp_path)
+    task = tasks.create_task(
+        "maintenance report task",
+        requested_team="alpha",
+        task_id="task-maintenance-report",
+    )
+    report = tmp_path / ".plan" / "maintainers" / "alpha_turn1_20260723T010203Z.md"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    body = b"# Maintenance report\n\nRecovered exact role ownership.\n"
+    report.write_bytes(body)
+
+    def add_report(state):
+        state["maintenance"] = {
+            "active_incident_id": None,
+            "incidents": [
+                {
+                    "incident_id": "maint-report-1",
+                    "key": "role_offline|snapshot",
+                    "state": "RESOLVED",
+                    "turn": 1,
+                    "report_path": str(report.resolve()),
+                    "report_sha256": hashlib.sha256(body).hexdigest(),
+                    "report_size": len(body),
+                    "created_at": "2026-07-23T01:02:03+00:00",
+                    "updated_at": "2026-07-23T01:03:03+00:00",
+                    "resolved_at": "2026-07-23T01:03:03+00:00",
+                }
+            ],
+            "last_resolved_at": "2026-07-23T01:03:03+00:00",
+        }
+        return state
+
+    tasks.update(task["manifest_path"], add_report)
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        connection.request(
+            "GET",
+            "/api/maintenance-reports/task-maintenance-report/maint-report-1",
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        assert response.getheader("Content-Type") == "text/markdown; charset=utf-8"
+        assert response.read() == body
+
+        report.write_text("tampered", encoding="utf-8")
+        connection.request(
+            "GET",
+            "/api/maintenance-reports/task-maintenance-report/maint-report-1",
+        )
+        tampered = connection.getresponse()
+        payload = json.loads(tampered.read())
+        assert tampered.status == 409
+        assert "content changed after validation" in payload["error"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_selected_timeline_renders_all_rows_and_same_hop_routes_independently(
+    tmp_path: Path,
+):
+    config_path = write_config(tmp_path)
+    server, thread, _tasks = start_dashboard_server(
+        config_path,
+        tmp_path,
+        html=DASHBOARD_HTML_PATH.read_bytes(),
+    )
+    task = _ui_task("long-timeline", "RUNNING")
+    raw_timeline = {
+        "errors": [
+            {
+                "at": f"2026-07-23T{2 + index // 60:02d}:{index % 60:02d}:00+00:00",
+                "error": f"error-{index:03d}",
+            }
+            for index in range(101)
+        ],
+        "route_timeline": [
+            {
+                "hop_id": 7,
+                "at": "2026-07-23T01:00:00+00:00",
+                "source_role": "DEV",
+                "route": "DEV",
+                "kind": "route_repair",
+            },
+            {
+                "hop_id": 7,
+                "at": "2026-07-23T01:01:00+00:00",
+                "source_role": "DEV",
+                "route": "TEST",
+                "kind": "route",
+            },
+        ],
+    }
+    task["timeline"] = build_task_timeline(raw_timeline)
+    tasks_payload = {"tasks": [task], "repository": "/repo", "errors": []}
+    state_payload = {
+        "connected": True,
+        "updated_at": "2026-07-23T04:00:00+00:00",
+        "page_count": 0,
+        "pages": [],
+        "events": [],
+        "error": None,
+    }
+    errors: list[str] = []
+    try:
+        with sync_playwright() as playwright:
+            bundled = Path(playwright.chromium.executable_path)
+            executable = bundled if bundled.is_file() else Path(shutil.which("chromium") or "")
+            assert executable.is_file(), "Chromium executable is required for browser regression"
+            browser = playwright.chromium.launch(headless=True, executable_path=str(executable))
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            page.on(
+                "console",
+                lambda message: errors.append(f"console:{message.type}:{message.text}")
+                if message.type == "error"
+                else None,
+            )
+            page.on("pageerror", lambda error: errors.append(f"page:{error}"))
+
+            def api(route):
+                request = route.request
+                if request.method == "GET" and request.url.endswith("/api/tasks"):
+                    route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps(tasks_payload),
+                    )
+                elif request.method == "GET" and request.url.endswith("/api/state"):
+                    route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps(state_payload),
+                    )
+                else:
+                    route.continue_()
+
+            page.route("**/api/**", api)
+            page.goto(
+                f"http://127.0.0.1:{server.server_port}",
+                wait_until="domcontentloaded",
+            )
+            page.wait_for_selector('[data-task-id="long-timeline"]')
+            page.locator('[data-task-id="long-timeline"]').click()
+
+            timeline_rows = page.locator("#logs-content [data-key]")
+            assert timeline_rows.count() == len(task["timeline"]) == 103
+            text = page.locator("#logs-content").text_content()
+            assert "DEV → DEV · route_repair" in text
+            assert "DEV → TEST · route" in text
+            assert page.locator('#logs-content [data-key^="route:"]').count() == 2
+            assert errors == []
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_dashboard_preserves_active_report_provenance_and_equal_timestamp_rows(
+    tmp_path: Path,
+):
+    config_path = write_config(tmp_path)
+    server, thread, _tasks = start_dashboard_server(
+        config_path,
+        tmp_path,
+        html=DASHBOARD_HTML_PATH.read_bytes(),
+    )
+    stale = _ui_task("stale-report", "BLOCKED")
+    stale["active_maintenance_incident"] = {
+        "incident_id": "maint-new",
+        "state": "OPEN",
+        "trigger_code": "role_offline",
+        "trigger_reason": "Current incident has no report yet.",
+    }
+    stale["active_maintenance_report"] = None
+    stale["latest_maintenance_report"] = {
+        "incident_id": "maint-old",
+        "state": "RESOLVED",
+        "turn": 1,
+        "url": "/api/maintenance-reports/stale-report/maint-old",
+    }
+    stale["primary_problem"] = {
+        "kind": "BLOCKED",
+        "code": "role_offline",
+        "message": "Current incident has no report yet.",
+        "role": "DEV",
+        "hop_id": 7,
+        "at": "2026-07-23T01:00:00+00:00",
+        "recommended": "Open the exact owned role tab",
+        "maintenance_incident_id": "maint-new",
+        "maintenance_report": None,
+    }
+
+    current = _ui_task("current-report", "WAITING")
+    current_report = {
+        "incident_id": "maint-current",
+        "state": "RUNNING",
+        "turn": 2,
+        "url": "/api/maintenance-reports/current-report/maint-current",
+    }
+    current["active_maintenance_incident"] = {
+        "incident_id": "maint-current",
+        "state": "RUNNING",
+        "trigger_code": "dependency_wait",
+        "trigger_reason": "Waiting for repaired parent.",
+    }
+    current["active_maintenance_report"] = current_report
+    current["latest_maintenance_report"] = current_report
+    current["primary_problem"] = {
+        "kind": "WAITING",
+        "code": "dependency_wait",
+        "message": "Waiting for repaired parent.",
+        "role": "DEV",
+        "hop_id": 8,
+        "at": "2026-07-23T01:01:00+00:00",
+        "recommended": "Wait for dependencies or queue ownership to become ready",
+        "maintenance_incident_id": "maint-current",
+        "maintenance_report": current_report,
+    }
+
+    equal = _ui_task("equal-events", "RUNNING")
+    at = "2026-07-23T02:00:00+00:00"
+    equal["timeline"] = build_task_timeline(
+        {
+            "errors": [
+                {"at": at, "error": "first equal error"},
+                {"at": at, "error": "second equal error"},
+            ],
+            "dependency_events": [
+                {"at": at, "message": "first equal dependency"},
+                {"at": at, "message": "second equal dependency"},
+            ],
+        }
+    ) + [
+        {
+            "key": f"filler:{index}",
+            "at": f"2026-07-23T01:{index:02d}:00+00:00",
+            "level": "STATE",
+            "source": "task",
+            "message": f"filler {index}",
+        }
+        for index in range(40)
+    ]
+
+    tasks_payload = {
+        "tasks": [stale, current, equal],
+        "repository": "/repo",
+        "errors": [],
+    }
+    state_payload = {
+        "connected": True,
+        "updated_at": "2026-07-23T03:00:00+00:00",
+        "page_count": 0,
+        "pages": [],
+        "events": [
+            {
+                "task_id": "equal-events",
+                "at": at,
+                "role": "DEV",
+                "action": "send",
+                "phase": "first",
+                "detail": "first equal browser event",
+            },
+            {
+                "task_id": "equal-events",
+                "at": at,
+                "role": "DEV",
+                "action": "send",
+                "phase": "second",
+                "detail": "second equal browser event",
+            },
+        ],
+        "error": None,
+    }
+    errors: list[str] = []
+    try:
+        with sync_playwright() as playwright:
+            bundled = Path(playwright.chromium.executable_path)
+            executable = bundled if bundled.is_file() else Path(shutil.which("chromium") or "")
+            assert executable.is_file(), "Chromium executable is required for browser regression"
+            browser = playwright.chromium.launch(headless=True, executable_path=str(executable))
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            page.on(
+                "console",
+                lambda message: errors.append(f"console:{message.type}:{message.text}")
+                if message.type == "error"
+                else None,
+            )
+            page.on("pageerror", lambda error: errors.append(f"page:{error}"))
+
+            def api(route):
+                request = route.request
+                if request.method == "GET" and request.url.endswith("/api/tasks"):
+                    route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps(tasks_payload),
+                    )
+                elif request.method == "GET" and request.url.endswith("/api/state"):
+                    route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps(state_payload),
+                    )
+                else:
+                    route.continue_()
+
+            page.route("**/api/**", api)
+            page.goto(
+                f"http://127.0.0.1:{server.server_port}",
+                wait_until="domcontentloaded",
+            )
+            page.wait_for_selector('[data-task-id="stale-report"]')
+
+            page.locator('[data-task-id="stale-report"]').click()
+            assert "maint-new" in page.locator("#primary-problem-meta").text_content()
+            assert not page.locator("#primary-problem-report").is_visible()
+            assert not page.locator("#maintenance-report").is_visible()
+
+            page.locator('[data-task-id="current-report"]').click()
+            assert "maint-current" in page.locator("#primary-problem-meta").text_content()
+            assert page.locator("#primary-problem-report").get_attribute("href") == current_report["url"]
+            assert page.locator("#maintenance-report").get_attribute("href") == current_report["url"]
+
+            page.locator('[data-task-id="equal-events"]').click()
+            rows = page.locator("#logs-content [data-key]")
+            assert rows.count() == 46
+            log_text = page.locator("#logs-content").text_content()
+            for message in (
+                "first equal error",
+                "second equal error",
+                "first equal dependency",
+                "second equal dependency",
+                "first equal browser event",
+                "second equal browser event",
+            ):
+                assert message in log_text
+            assert page.locator('#logs-content [data-key^="event:"]').count() == 2
+
+            selected_text = page.evaluate(
+                """() => {
+                    const row = [...document.querySelectorAll('#logs-content [data-key]')]
+                        .find(node => node.textContent.includes('first equal error'));
+                    const selection = window.getSelection();
+                    const range = document.createRange();
+                    range.selectNodeContents(row.querySelector('[data-message]'));
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+                    const host = document.querySelector('#logs-content');
+                    host.scrollTop = Math.max(1, host.scrollHeight - host.clientHeight - 20);
+                    return {selection: selection.toString(), scrollTop: host.scrollTop};
+                }"""
+            )
+            assert selected_text["selection"] == "first equal error"
+            assert selected_text["scrollTop"] > 0
+            page.wait_for_timeout(2200)
+            assert page.evaluate("window.getSelection().toString()") == "first equal error"
+            assert page.locator("#logs-content").evaluate("node => node.scrollTop") > 0
+            assert page.locator("#logs-content [data-key]").count() == 46
+            assert errors == []
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_browser_event_keys_survive_real_rolling_window_shift(tmp_path: Path):
+    config_path = write_config(tmp_path)
+    server, thread, _tasks = start_dashboard_server(
+        config_path,
+        tmp_path,
+        html=DASHBOARD_HTML_PATH.read_bytes(),
+    )
+    task = _ui_task("rolling-events", "RUNNING")
+    tasks_payload = {"tasks": [task], "repository": "/repo", "errors": []}
+    at = "2026-07-23T01:00:00+00:00"
+
+    def browser_event(index: int) -> dict[str, object]:
+        return {
+            "event_id": f"browser-{index:03d}",
+            "task_id": "rolling-events",
+            "at": at,
+            "role": "DEV",
+            "action": "send",
+            "phase": f"phase-{index:03d}",
+            "detail": f"browser event {index:03d}",
+        }
+
+    state_payload = {
+        "connected": True,
+        "updated_at": "2026-07-23T03:00:00+00:00",
+        "page_count": 0,
+        "pages": [],
+        "events": [browser_event(index) for index in range(160)],
+        "error": None,
+    }
+    errors: list[str] = []
+    try:
+        with sync_playwright() as playwright:
+            bundled = Path(playwright.chromium.executable_path)
+            executable = bundled if bundled.is_file() else Path(shutil.which("chromium") or "")
+            assert executable.is_file(), "Chromium executable is required for browser regression"
+            browser = playwright.chromium.launch(headless=True, executable_path=str(executable))
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            page.on(
+                "console",
+                lambda message: errors.append(f"console:{message.type}:{message.text}")
+                if message.type == "error"
+                else None,
+            )
+            page.on("pageerror", lambda error: errors.append(f"page:{error}"))
+
+            def api(route):
+                request = route.request
+                if request.method == "GET" and request.url.endswith("/api/tasks"):
+                    route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps(tasks_payload),
+                    )
+                elif request.method == "GET" and request.url.endswith("/api/state"):
+                    route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps(state_payload),
+                    )
+                else:
+                    route.continue_()
+
+            page.route("**/api/**", api)
+            page.goto(
+                f"http://127.0.0.1:{server.server_port}",
+                wait_until="domcontentloaded",
+            )
+            page.wait_for_selector('[data-task-id="rolling-events"]')
+            page.locator('[data-task-id="rolling-events"]').click()
+            page.wait_for_function(
+                "document.querySelectorAll('#logs-content [data-key^=\"event:\"]').length === 24"
+            )
+
+            before = page.evaluate(
+                """() => {
+                    const row = [...document.querySelectorAll('#logs-content [data-key]')]
+                        .find(node => node.textContent.includes('browser event 150'));
+                    row.dataset.marker = 'kept';
+                    const selection = window.getSelection();
+                    const range = document.createRange();
+                    range.selectNodeContents(row.querySelector('[data-message]'));
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+                    const host = document.querySelector('#logs-content');
+                    host.scrollTop = Math.max(1, host.scrollHeight - host.clientHeight - 20);
+                    return {
+                        key: row.dataset.key,
+                        selection: selection.toString(),
+                        scrollTop: host.scrollTop,
+                    };
+                }"""
+            )
+            assert before["selection"] == "send · phase-150 · browser event 150"
+            assert before["scrollTop"] > 0
+
+            state_payload["events"] = [browser_event(index) for index in range(1, 161)]
+            page.wait_for_function(
+                "[...document.querySelectorAll('#logs-content [data-key]')].some(node => node.textContent.includes('browser event 160'))",
+                timeout=5000,
+            )
+
+            after = page.evaluate(
+                """() => {
+                    const row = [...document.querySelectorAll('#logs-content [data-key]')]
+                        .find(node => node.textContent.includes('browser event 150'));
+                    const host = document.querySelector('#logs-content');
+                    return {
+                        key: row.dataset.key,
+                        marker: row.dataset.marker || null,
+                        selection: window.getSelection().toString(),
+                        scrollTop: host.scrollTop,
+                        eventRows: document.querySelectorAll('#logs-content [data-key^="event:"]').length,
+                    };
+                }"""
+            )
+
+            assert after["key"] == before["key"]
+            assert after["marker"] == "kept"
+            assert after["selection"] == before["selection"]
+            assert after["scrollTop"] == before["scrollTop"]
+            assert after["eventRows"] == 24
+            assert page.locator('#logs-content [data-key^="event:"]').count() == 24
+            assert errors == []
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_history_reports_polling_preserves_selection_scroll_and_keyed_nodes(tmp_path: Path):
+    config_path = write_config(tmp_path)
+    server, thread, _tasks = start_dashboard_server(
+        config_path,
+        tmp_path,
+        html=DASHBOARD_HTML_PATH.read_bytes(),
+    )
+    tasks = []
+    for index in range(20):
+        task = _ui_task(f"history-{index:02d}", "DONE", surface="history", availability="terminal")
+        task["effective_activity_at"] = f"2026-07-23T{index:02d}:00:00+00:00"
+        task["task_title"] = f"History title {index:02d}"
+        task["reports"] = [
+            {
+                "report_id": f"report-{index:02d}",
+                "physical_role": "PLAN",
+                "turn": index + 1,
+                "url": f"/api/reports/history-{index:02d}/report-{index:02d}",
+                "path": f"history-{index:02d}.md",
+            }
+        ]
+        tasks.append(task)
+    tasks_payload = {"tasks": tasks, "repository": "/repo", "errors": []}
+    state_payload = {
+        "connected": True,
+        "updated_at": "2026-07-23T23:00:00+00:00",
+        "page_count": 0,
+        "pages": [],
+        "events": [],
+        "error": None,
+    }
+    errors: list[str] = []
+    try:
+        with sync_playwright() as playwright:
+            bundled = Path(playwright.chromium.executable_path)
+            executable = bundled if bundled.is_file() else Path(shutil.which("chromium") or "")
+            assert executable.is_file(), "Chromium executable is required for browser regression"
+            browser = playwright.chromium.launch(headless=True, executable_path=str(executable))
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            page.on(
+                "console",
+                lambda message: errors.append(f"console:{message.type}:{message.text}")
+                if message.type == "error"
+                else None,
+            )
+            page.on("pageerror", lambda error: errors.append(f"page:{error}"))
+
+            def api(route):
+                request = route.request
+                if request.method == "GET" and request.url.endswith("/api/tasks"):
+                    route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps(tasks_payload),
+                    )
+                elif request.method == "GET" and request.url.endswith("/api/state"):
+                    route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps(state_payload),
+                    )
+                else:
+                    route.continue_()
+
+            page.route("**/api/**", api)
+            page.goto(
+                f"http://127.0.0.1:{server.server_port}",
+                wait_until="domcontentloaded",
+            )
+            page.wait_for_selector('[data-history-task-id="history-10"]')
+
+            order = page.locator("#history-list > article[data-key]").evaluate_all(
+                "nodes => nodes.map(node => node.dataset.historyTaskId)"
+            )
+            assert order == [f"history-{index:02d}" for index in range(19, -1, -1)]
+
+            before = page.evaluate(
+                """() => {
+                    const row = document.querySelector('[data-history-task-id="history-10"]');
+                    const link = row.querySelector('[data-field="reports"] a');
+                    row.dataset.marker = 'row-kept';
+                    link.dataset.marker = 'link-kept';
+                    const selection = window.getSelection();
+                    const range = document.createRange();
+                    range.selectNodeContents(link);
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+                    const host = document.querySelector('#history-list');
+                    host.scrollTop = Math.max(1, host.scrollHeight - host.clientHeight - 40);
+                    return {
+                        selection: selection.toString(),
+                        scrollTop: host.scrollTop,
+                        rowKey: row.dataset.key,
+                        linkKey: link.dataset.key,
+                        href: link.getAttribute('href'),
+                    };
+                }"""
+            )
+            assert before["selection"] == "PLAN turn 11"
+            assert before["scrollTop"] > 0
+            assert before["linkKey"] == "role:report-10"
+            assert before["href"] == "/api/reports/history-10/report-10"
+
+            page.wait_for_timeout(2300)
+
+            after = page.evaluate(
+                """() => {
+                    const row = document.querySelector('[data-history-task-id="history-10"]');
+                    const link = row.querySelector('[data-field="reports"] a[data-key]');
+                    const host = document.querySelector('#history-list');
+                    return {
+                        selection: window.getSelection().toString(),
+                        scrollTop: host.scrollTop,
+                        rowKey: row.dataset.key,
+                        linkKey: link.dataset.key,
+                        rowMarker: row.dataset.marker || null,
+                        linkMarker: link.dataset.marker || null,
+                        href: link.getAttribute('href'),
+                        reportLinks: document.querySelectorAll('#history-list [data-field="reports"] a[data-key]').length,
+                    };
+                }"""
+            )
+            assert after["selection"] == before["selection"]
+            assert after["scrollTop"] == before["scrollTop"]
+            assert after["rowKey"] == before["rowKey"]
+            assert after["linkKey"] == before["linkKey"]
+            assert after["rowMarker"] == "row-kept"
+            assert after["linkMarker"] == "link-kept"
+            assert after["href"] == before["href"]
+            assert after["reportLinks"] == 20
+            assert errors == []
+            browser.close()
     finally:
         server.shutdown()
         server.server_close()

@@ -138,14 +138,471 @@ def dashboard_payload(
     }
 
 
+def _timestamp(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return text
+
+
+def _timestamp_key(value: Any) -> float:
+    text = _timestamp(value)
+    if text is None:
+        return float("-inf")
+    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(item) for item in value if str(item)]
+
+
+def _projection_errors(raw: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
+    maintenance = raw.get("maintenance")
+    if maintenance is not None:
+        if not isinstance(maintenance, Mapping):
+            errors.append("maintenance must be an object")
+        else:
+            incidents = maintenance.get("incidents")
+            if incidents is not None and not isinstance(incidents, list):
+                errors.append("maintenance.incidents must be a list")
+            elif isinstance(incidents, list):
+                incident_ids = {
+                    str(item.get("incident_id") or "")
+                    for item in incidents
+                    if isinstance(item, Mapping) and str(item.get("incident_id") or "")
+                }
+                for index, item in enumerate(incidents):
+                    if not isinstance(item, Mapping):
+                        errors.append(f"maintenance.incidents[{index}] must be an object")
+                        continue
+                    if str(item.get("report_path") or ""):
+                        report_sha = str(item.get("report_sha256") or "")
+                        if len(report_sha) != 64 or any(
+                            character not in "0123456789abcdef" for character in report_sha.lower()
+                        ):
+                            errors.append(
+                                f"maintenance.incidents[{index}].report_sha256 must be a SHA-256 hex digest"
+                            )
+                        try:
+                            report_size = int(item.get("report_size"))
+                        except (TypeError, ValueError):
+                            errors.append(
+                                f"maintenance.incidents[{index}].report_size must be a non-negative integer"
+                            )
+                        else:
+                            if report_size < 0:
+                                errors.append(
+                                    f"maintenance.incidents[{index}].report_size must be a non-negative integer"
+                                )
+                active_id = str(maintenance.get("active_incident_id") or "")
+                if active_id and active_id not in incident_ids:
+                    errors.append("maintenance.active_incident_id does not reference an incident")
+    for field in ("errors", "hops", "route_timeline", "controls", "dependency_events", "queue_events"):
+        value = raw.get(field)
+        if value is not None and not isinstance(value, list):
+            errors.append(f"{field} must be a list")
+    return errors
+
+
+def _maintenance_incidents(raw: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    maintenance = raw.get("maintenance")
+    if not isinstance(maintenance, Mapping):
+        return []
+    incidents = maintenance.get("incidents")
+    if not isinstance(incidents, list):
+        return []
+    return [item for item in incidents if isinstance(item, Mapping)]
+
+
+def _active_maintenance_incident(raw: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    maintenance = raw.get("maintenance")
+    if not isinstance(maintenance, Mapping):
+        return None
+    active_id = str(maintenance.get("active_incident_id") or "")
+    if not active_id:
+        return None
+    return next(
+        (
+            item
+            for item in _maintenance_incidents(raw)
+            if str(item.get("incident_id") or "") == active_id
+        ),
+        None,
+    )
+
+
+def _maintenance_report(
+    raw: Mapping[str, Any], incident: Mapping[str, Any] | None
+) -> dict[str, Any] | None:
+    if incident is None:
+        return None
+    incident_id = str(incident.get("incident_id") or "")
+    report_path = str(incident.get("report_path") or "")
+    report_sha = str(incident.get("report_sha256") or "")
+    try:
+        report_size = int(incident.get("report_size"))
+    except (TypeError, ValueError):
+        return None
+    if (
+        not incident_id
+        or not report_path
+        or len(report_sha) != 64
+        or any(character not in "0123456789abcdef" for character in report_sha.lower())
+        or report_size < 0
+    ):
+        return None
+    try:
+        turn = int(incident.get("turn") or 0)
+    except (TypeError, ValueError):
+        turn = 0
+    return {
+        "incident_id": incident_id,
+        "state": str(incident.get("state") or ""),
+        "turn": turn,
+        "path": report_path,
+        "url": f"/api/maintenance-reports/{str(raw.get('task_id') or '')}/{incident_id}",
+        "at": _timestamp(
+            incident.get("updated_at") or incident.get("resolved_at") or incident.get("created_at")
+        ),
+    }
+
+
+def _latest_maintenance_report(raw: Mapping[str, Any]) -> dict[str, Any] | None:
+    reports = [
+        (item, report)
+        for item in _maintenance_incidents(raw)
+        if (report := _maintenance_report(raw, item)) is not None
+    ]
+    if not reports:
+        return None
+    return max(
+        reports,
+        key=lambda pair: _timestamp_key(
+            pair[0].get("updated_at")
+            or pair[0].get("resolved_at")
+            or pair[0].get("created_at")
+        ),
+    )[1]
+
+
+def build_task_timeline(raw: Mapping[str, Any]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+
+    def add(key: str, at: Any, level: str, source: Any, message: Any) -> None:
+        timestamp = _timestamp(at)
+        text = str(message or "").strip()
+        if timestamp is None or not text:
+            return
+        items.append(
+            {
+                "key": key,
+                "at": timestamp,
+                "level": level,
+                "source": str(source or "task"),
+                "message": text,
+            }
+        )
+
+    for field, message in (
+        ("created_at", "Task created"),
+        ("started_at", "Task started"),
+        ("completed_at", "Task completed"),
+        ("stopped_at", "Task stopped"),
+    ):
+        add(f"task:{field}", raw.get(field), "STATE", "task", message)
+
+    task_errors = raw.get("errors") if isinstance(raw.get("errors"), list) else []
+    error_times: dict[str, list[str]] = {}
+    for index, error in enumerate(task_errors):
+        if isinstance(error, Mapping):
+            message = str(
+                error.get("error") or error.get("message") or error.get("reason") or ""
+            ).strip()
+            at = _timestamp(error.get("at") or error.get("updated_at"))
+            error_identity = error.get("error_id") or error.get("at") or error.get("updated_at") or "untimed"
+            add(
+                f"error:{error_identity}:{index}",
+                at,
+                "ERROR",
+                error.get("role")
+                or error.get("source")
+                or raw.get("active_role")
+                or "task",
+                message,
+            )
+            if message and at:
+                error_times.setdefault(message, []).append(at)
+
+    hops = raw.get("hops") if isinstance(raw.get("hops"), list) else []
+    for index, hop in enumerate(hops):
+        if not isinstance(hop, Mapping):
+            continue
+        hop_id = hop.get("hop_id") or index
+        source = hop.get("target_role") or hop.get("source_role") or "task"
+        timestamps = hop.get("timestamps") if isinstance(hop.get("timestamps"), Mapping) else {}
+        for name, at in timestamps.items():
+            add(
+                f"hop:{hop_id}:{name}",
+                at,
+                "STATE",
+                source,
+                f"Hop {hop_id} {str(name).removesuffix('_at').replace('_', ' ')}",
+            )
+        for error_index, error in enumerate(hop.get("errors") or []):
+            if isinstance(error, Mapping):
+                message = str(
+                    error.get("error")
+                    or error.get("message")
+                    or error.get("reason")
+                    or ""
+                ).strip()
+                at = error.get("at") or error.get("updated_at")
+            else:
+                message = str(error or "").strip()
+                matching = error_times.get(message) or []
+                at = matching[-1] if matching else None
+            add(
+                f"hop-error:{hop_id}:{error_index}",
+                at,
+                "ERROR",
+                source,
+                message,
+            )
+
+    routes = raw.get("route_timeline") if isinstance(raw.get("route_timeline"), list) else []
+    for index, route in enumerate(routes):
+        if not isinstance(route, Mapping):
+            continue
+        source = route.get("source_role") or "route"
+        target = route.get("route") or route.get("target_role") or "—"
+        kind = str(route.get("kind") or "").strip()
+        route_at = route.get("at") or route.get("routed_at")
+        route_identity = route.get("route_id") or route.get("hop_id") or "event"
+        add(
+            f"route:{route_identity}:{route_at or 'untimed'}:{kind or 'route'}:{index}",
+            route_at,
+            "ROUTE",
+            source,
+            f"{source} → {target}{f' · {kind}' if kind else ''}",
+        )
+
+    controls = raw.get("controls") if isinstance(raw.get("controls"), list) else []
+    for index, control in enumerate(controls):
+        if not isinstance(control, Mapping):
+            continue
+        control_id = control.get("control_id") or index
+        action = str(control.get("action") or "control")
+        status = str(control.get("status") or "unknown")
+        result = control.get("result") or control.get("error") or control.get("reason")
+        direct_at = control.get("at") or control.get("updated_at")
+        if direct_at:
+            add(
+                f"control:{control_id}",
+                direct_at,
+                "CONTROL",
+                action,
+                f"{action} · {status}{f' · {result}' if result else ''}",
+            )
+            continue
+        add(
+            f"control:{control_id}:requested",
+            control.get("requested_at"),
+            "CONTROL",
+            action,
+            f"{action} · requested",
+        )
+        add(
+            f"control:{control_id}:applied",
+            control.get("applied_at"),
+            "CONTROL",
+            action,
+            f"{action} · {status}{f' · {result}' if result else ''}",
+        )
+
+    for index, incident in enumerate(_maintenance_incidents(raw)):
+        incident_id = str(incident.get("incident_id") or index)
+        state = str(incident.get("state") or "unknown")
+        code = str(incident.get("trigger_code") or "incident")
+        reason = str(incident.get("trigger_reason") or "").strip()
+        add(
+            f"maintenance:{incident_id}:created",
+            incident.get("created_at"),
+            "MAINTENANCE",
+            "maintainers",
+            f"Opened · {code}{f' · {reason}' if reason else ''}",
+        )
+        if incident.get("updated_at") != incident.get("created_at"):
+            decision = incident.get("decision") if isinstance(incident.get("decision"), Mapping) else {}
+            action = str(decision.get("action") or state)
+            add(
+                f"maintenance:{incident_id}:updated",
+                incident.get("updated_at"),
+                "MAINTENANCE",
+                "maintainers",
+                f"{action} · {code}{f' · {reason}' if reason else ''}",
+            )
+        add(
+            f"maintenance:{incident_id}:resolved",
+            incident.get("resolved_at"),
+            "MAINTENANCE",
+            "maintainers",
+            f"Resolved · {code}",
+        )
+        add(
+            f"maintenance:{incident_id}:error",
+            incident.get("updated_at"),
+            "ERROR",
+            "maintainers",
+            incident.get("last_error"),
+        )
+
+    for field, source in (("dependency_events", "dependency"), ("queue_events", "queue")):
+        events = raw.get(field) if isinstance(raw.get(field), list) else []
+        for index, event in enumerate(events):
+            if not isinstance(event, Mapping):
+                continue
+            event_at = event.get("at") or event.get("updated_at") or event.get("created_at")
+            event_identity = event.get("event_id") or event_at or "untimed"
+            add(
+                f"{source}:{event_identity}:{index}",
+                event_at,
+                "DEPENDENCY",
+                source,
+                event.get("message") or event.get("reason") or event.get("status") or source,
+            )
+
+    items.sort(key=lambda item: (_timestamp_key(item["at"]), item["key"]), reverse=True)
+    return items
+
+
+def primary_task_problem(raw: Mapping[str, Any]) -> dict[str, Any] | None:
+    status = str(raw.get("status") or "").upper()
+    if status in {"DONE", "STOPPED"}:
+        return None
+    active_incident = _active_maintenance_incident(raw)
+    active_report = _maintenance_report(raw, active_incident)
+    if status == "BLOCKED":
+        block_message = str(raw.get("block_reason") or "Task is blocked")
+        candidates = [
+            item["at"]
+            for item in build_task_timeline(raw)
+            if item["level"] == "ERROR" and item["message"] == block_message
+        ]
+        if active_incident is not None:
+            candidates.extend(
+                value
+                for value in (
+                    active_incident.get("updated_at"),
+                    active_incident.get("created_at"),
+                )
+                if _timestamp(value)
+            )
+        at = max(candidates, key=_timestamp_key, default=_timestamp(raw.get("updated_at")))
+        code = str(raw.get("block_code") or "blocked")
+        recommended = (
+            "Open the exact owned role tab"
+            if code == "role_offline"
+            else "Retry the active hop"
+            if raw.get("block_retryable")
+            else "Inspect the active Maintainers incident and resume the task"
+        )
+        return {
+            "kind": "BLOCKED",
+            "code": code,
+            "message": block_message,
+            "role": raw.get("active_role"),
+            "hop_id": raw.get("active_hop_id"),
+            "at": at,
+            "recommended": recommended,
+            "maintenance_incident_id": (
+                active_incident.get("incident_id") if active_incident is not None else None
+            ),
+            "maintenance_report": active_report,
+        }
+    if status == "WAITING":
+        dependency_rows = [
+            item for item in build_task_timeline(raw) if item["level"] == "DEPENDENCY"
+        ]
+        newest = dependency_rows[0] if dependency_rows else None
+        waiting = raw.get("waiting") if isinstance(raw.get("waiting"), Mapping) else {}
+        return {
+            "kind": "WAITING",
+            "code": str(
+                raw.get("waiting_code")
+                or waiting.get("code")
+                or raw.get("active_action")
+                or "waiting"
+            ),
+            "message": str(
+                raw.get("waiting_reason")
+                or waiting.get("reason")
+                or (newest or {}).get("message")
+                or "Task is waiting"
+            ),
+            "role": raw.get("active_role"),
+            "hop_id": raw.get("active_hop_id"),
+            "at": (newest or {}).get("at") or _timestamp(raw.get("updated_at")),
+            "recommended": "Wait for dependencies or queue ownership to become ready",
+            "maintenance_incident_id": (
+                active_incident.get("incident_id") if active_incident is not None else None
+            ),
+            "maintenance_report": active_report,
+        }
+    errors = _projection_errors(raw)
+    if errors:
+        return {
+            "kind": "ERROR",
+            "code": "dashboard_projection_error",
+            "message": errors[0],
+            "role": None,
+            "hop_id": None,
+            "at": _timestamp(raw.get("updated_at")),
+            "recommended": "Repair malformed dashboard projection data",
+            "maintenance_incident_id": None,
+            "maintenance_report": None,
+        }
+    return None
+
+
+def effective_activity_at(raw: Mapping[str, Any]) -> str:
+    status = str(raw.get("status") or "").upper()
+    if status == "BLOCKED":
+        problem = primary_task_problem(raw)
+        return str((problem or {}).get("at") or raw.get("updated_at") or raw.get("created_at") or "")
+    if status == "WAITING":
+        dependency_rows = [
+            item for item in build_task_timeline(raw) if item["level"] == "DEPENDENCY"
+        ]
+        if dependency_rows:
+            return str(dependency_rows[0]["at"])
+        return str(raw.get("waiting_at") or raw.get("updated_at") or raw.get("created_at") or "")
+    if status == "DONE":
+        return str(raw.get("completed_at") or raw.get("updated_at") or raw.get("created_at") or "")
+    if status == "STOPPED":
+        return str(raw.get("stopped_at") or raw.get("updated_at") or raw.get("created_at") or "")
+    return str(raw.get("last_role_activity_at") or raw.get("updated_at") or raw.get("created_at") or "")
+
+
 def _column(raw: Mapping[str, Any]) -> str:
     status = str(raw.get("status") or "INBOX").upper()
     if status in {"DONE", "STOPPED"}:
         return "DONE_STOPPED"
-    if status in {"PAUSED", "BLOCKED"}:
+    if status in {"PAUSED", "BLOCKED", "WAITING"}:
         return status
     value = str(raw.get("kanban_column") or status).upper().replace("/", "_")
-    return value if value in {"INBOX", "PLANNING", "WORKING", "VERIFYING", "PAUSED", "BLOCKED", "DONE_STOPPED"} else "WORKING"
+    return value if value in {"INBOX", "PLANNING", "WORKING", "VERIFYING", "WAITING", "PAUSED", "BLOCKED", "DONE_STOPPED"} else "WORKING"
 
 
 def _task_surface(
@@ -225,9 +682,19 @@ def build_task_payload(
             "url": f"/api/reports/{raw.get('task_id')}/{report.get('report_id') or index}",
         })
     surface, availability = _task_surface(raw, pages, connected=connected)
+    title_lines = str(
+        raw.get("task_text") or raw.get("task_title") or ""
+    ).splitlines()
+    task_title = title_lines[0] if title_lines else ""
+    timeline = build_task_timeline(raw)
+    projection_errors = _projection_errors(raw)
+    primary_problem = primary_task_problem(raw)
+    latest_maintenance_report = _latest_maintenance_report(raw)
+    active_maintenance = _active_maintenance_incident(raw)
+    active_maintenance_report = _maintenance_report(raw, active_maintenance)
     return {
         "task_id": str(raw.get("task_id") or ""),
-        "task_title": str(raw.get("task_text") or raw.get("task_title") or "").splitlines()[0],
+        "task_title": task_title,
         "task_text": str(raw.get("task_text") or ""),
         "task_slug": str(raw.get("task_slug") or ""),
         "repository": str(raw.get("repository") or ""),
@@ -256,6 +723,19 @@ def build_task_payload(
         "completed_at": raw.get("completed_at"),
         "stopped_at": raw.get("stopped_at"),
         "last_role_activity_at": raw.get("last_role_activity_at"),
+        "effective_activity_at": effective_activity_at(raw),
+        "timeline": timeline,
+        "primary_problem": primary_problem,
+        "projection_errors": projection_errors,
+        "active_maintenance_incident": dict(active_maintenance) if active_maintenance is not None else None,
+        "active_maintenance_report": active_maintenance_report,
+        "latest_maintenance_report": latest_maintenance_report,
+        "depends_on_task_ids": _string_list(raw.get("depends_on_task_ids")),
+        "child_task_ids": _string_list(raw.get("child_task_ids")),
+        "waiting_on_task_ids": _string_list(raw.get("waiting_on_task_ids")),
+        "queue_position": raw.get("queue_position"),
+        "queue_length": raw.get("queue_length"),
+        "waiting_reason": raw.get("waiting_reason"),
         "pause_reason": raw.get("pause_reason"),
         "block_code": raw.get("block_code"),
         "block_retryable": bool(raw.get("block_retryable")),
@@ -463,6 +943,33 @@ def _validated_report_bytes(
     return body
 
 
+def _validated_maintenance_report_bytes(
+    task_store: TaskStore,
+    task: Mapping[str, Any],
+    incident_id: str,
+) -> bytes:
+    incident = next(
+        item
+        for item in _maintenance_incidents(task)
+        if str(item.get("incident_id") or "") == incident_id
+    )
+    stored = Path(str(incident.get("report_path") or "")).expanduser()
+    candidate = stored if stored.is_absolute() else task_store.config.repository_root / stored
+    if candidate.is_symlink():
+        raise ValueError("maintenance report provenance mismatch: symlink is not allowed")
+    resolved = candidate.resolve(strict=True)
+    maintainers_root = (task_store.config.plans_root / "maintainers").resolve()
+    resolved.relative_to(maintainers_root)
+    if not resolved.is_file():
+        raise FileNotFoundError(resolved)
+    body = resolved.read_bytes()
+    expected_sha = str(incident.get("report_sha256") or "")
+    expected_size = int(incident.get("report_size") or -1)
+    if len(body) != expected_size or hashlib.sha256(body).hexdigest() != expected_sha:
+        raise ValueError("maintenance report provenance mismatch: content changed after validation")
+    return body
+
+
 def _find_task(task_store: TaskStore, task_id: str) -> dict[str, Any]:
     tasks, _errors = task_store.discover_with_errors()
     matches = [task for task in tasks if task.get("task_id") == task_id]
@@ -532,7 +1039,7 @@ def _handler(
                     build_task_payload(task, pages=pages, connected=connected)
                     for task in raw_tasks
                 ]
-                tasks.sort(key=lambda task: str(task.get("updated_at") or ""), reverse=True)
+                tasks.sort(key=lambda task: _timestamp_key(task.get("effective_activity_at")), reverse=True)
                 self._json(200, {
                     "tasks": tasks,
                     "active": [task for task in tasks if task["surface"] == "active"],
@@ -562,6 +1069,26 @@ def _handler(
                     self._json(404, {"error": "task not found"})
                 except Exception as exc:
                     self._json(409, {"error": f"{type(exc).__name__}: {exc}"})
+                return
+            if path.startswith("/api/maintenance-reports/"):
+                if task_store is None:
+                    self._json(503, {"error": "CDPA task store unavailable"})
+                    return
+                parts = path.strip("/").split("/")
+                if len(parts) != 4:
+                    self._json(404, {"error": "maintenance report not found"})
+                    return
+                _, _, task_id, incident_id = parts
+                try:
+                    task = _find_task(task_store, task_id)
+                    body = _validated_maintenance_report_bytes(
+                        task_store, task, incident_id
+                    )
+                    self._send(200, "text/markdown; charset=utf-8", body)
+                except ValueError as exc:
+                    self._json(409, {"error": str(exc)})
+                except (KeyError, StopIteration, FileNotFoundError):
+                    self._json(404, {"error": "maintenance report not found"})
                 return
             if path.startswith("/api/reports/"):
                 if task_store is None:

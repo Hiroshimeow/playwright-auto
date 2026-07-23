@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 _ACTION_EVENT_LOG = Path(
     os.environ.get("PLAYWRIGHT_AUTO_ACTION_LOG", ".runtime/action-events.jsonl")
@@ -35,6 +37,7 @@ def append_action_event(
 ) -> dict[str, Any]:
     now = time.time()
     payload: dict[str, Any] = {
+        "event_id": f"event-{uuid4().hex}",
         "at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
         "at_epoch": now,
         "pid": os.getpid(),
@@ -68,14 +71,19 @@ def read_recent_action_events(
     target = Path(path) if path is not None else _ACTION_EVENT_LOG
     if not target.exists():
         return []
-    lines = target.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+    all_lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+    start = max(0, len(all_lines) - limit)
     events: list[dict[str, Any]] = []
-    for line in lines:
+    for line_number, line in enumerate(all_lines[start:], start=start + 1):
         try:
             value = json.loads(line)
         except json.JSONDecodeError:
             continue
         if isinstance(value, dict):
+            if not str(value.get("event_id") or "").strip():
+                value["event_id"] = (
+                    f"legacy-{line_number}-{hashlib.sha256(line.encode('utf-8')).hexdigest()[:16]}"
+                )
             events.append(value)
     return events
 

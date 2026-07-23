@@ -70,6 +70,7 @@
         </div>
         <div class="flex gap-4 overflow-x-auto pb-2" data-testid="kanban-scroller" id="kanban-lanes">
           <section class="w-[300px] shrink-0 flex flex-col gap-3" data-lane="RUNNING"><header class="flex justify-between items-center border-b border-borderDark pb-2"><span class="text-accent text-sm font-semibold tracking-wider">RUNNING</span><span class="bg-borderDark text-white px-2 py-0.5 rounded-full text-xs" data-lane-count="RUNNING">0</span></header><div class="flex flex-col gap-3 min-h-28" data-lane-cards="RUNNING"></div><div class="hidden h-28 border border-dashed border-borderDark rounded-lg text-textDim text-xs items-center justify-center" data-lane-empty="RUNNING">No running tasks</div></section>
+          <section class="w-[300px] shrink-0 flex flex-col gap-3" data-lane="WAITING"><header class="flex justify-between items-center border-b border-borderDark pb-2"><span class="text-warning text-sm font-semibold tracking-wider">WAITING</span><span class="bg-borderDark text-white px-2 py-0.5 rounded-full text-xs" data-lane-count="WAITING">0</span></header><div class="flex flex-col gap-3 min-h-28" data-lane-cards="WAITING"></div><div class="hidden h-28 border border-dashed border-borderDark rounded-lg text-textDim text-xs items-center justify-center" data-lane-empty="WAITING">No waiting tasks</div></section>
           <section class="w-[300px] shrink-0 flex flex-col gap-3" data-lane="BLOCKED"><header class="flex justify-between items-center border-b border-borderDark pb-2"><span class="text-danger text-sm font-semibold tracking-wider">BLOCKED</span><span class="bg-borderDark text-white px-2 py-0.5 rounded-full text-xs" data-lane-count="BLOCKED">0</span></header><div class="flex flex-col gap-3 min-h-28" data-lane-cards="BLOCKED"></div><div class="hidden h-28 border border-dashed border-borderDark rounded-lg text-textDim text-xs items-center justify-center" data-lane-empty="BLOCKED">No blocked tasks</div></section>
           <section class="w-[300px] shrink-0 flex flex-col gap-3" data-lane="PAUSED"><header class="flex justify-between items-center border-b border-borderDark pb-2"><span class="text-warning text-sm font-semibold tracking-wider">PAUSED</span><span class="bg-borderDark text-white px-2 py-0.5 rounded-full text-xs" data-lane-count="PAUSED">0</span></header><div class="flex flex-col gap-3 min-h-28" data-lane-cards="PAUSED"></div><div class="hidden h-28 border border-dashed border-borderDark rounded-lg text-textDim text-xs items-center justify-center" data-lane-empty="PAUSED">No paused tasks</div></section>
           <section class="w-[300px] shrink-0 flex flex-col gap-3" data-lane="DONE"><header class="flex justify-between items-center border-b border-borderDark pb-2"><span class="text-textDim text-sm font-semibold tracking-wider">DONE</span><span class="bg-borderDark text-white px-2 py-0.5 rounded-full text-xs" data-lane-count="DONE">0</span></header><div class="flex flex-col gap-3 min-h-28" data-lane-cards="DONE"></div><div class="hidden h-28 border border-dashed border-borderDark rounded-lg text-textDim text-xs items-center justify-center" data-lane-empty="DONE">No recoverable completed tasks</div></section>
@@ -77,46 +78,81 @@
         </div>
       </section>
 
-      <section id="detail-section" class="grid grid-cols-1 lg:grid-cols-12 gap-4 shrink-0" data-testid="detail-grid">
-        <article id="logs-panel" class="lg:col-span-3 bg-panel border border-borderDark rounded-xl p-4 min-w-0" aria-labelledby="logs-title">
-          <div class="border-b border-borderDark pb-2 mb-2"><p class="text-[10px] uppercase tracking-wider text-textDim">Selected task</p><h2 id="logs-title" class="text-white font-medium">Recent Logs / Errors</h2></div>
-          <div id="logs-content" class="grid gap-2"></div>
-        </article>
-
-        <article class="lg:col-span-6 bg-panel border border-borderDark rounded-xl p-4 min-w-0" aria-labelledby="team-title">
-          <div id="team-heading" class="border-b border-borderDark pb-2 mb-3"><p class="text-xs text-textDim">Select a task from Kanban or History.</p></div>
-          <div class="overflow-x-auto">
-            <table class="w-full min-w-[760px] text-left text-xs" data-testid="role-table">
-              <thead class="text-textDim border-b border-borderDark"><tr><th class="pb-2 font-normal">Function</th><th class="pb-2 font-normal">Physical role / Tab</th><th class="pb-2 font-normal">URL</th><th class="pb-2 font-normal">Availability</th><th class="pb-2 font-normal">Status</th><th class="pb-2 font-normal text-right">Actions</th></tr></thead>
-              <tbody id="role-table-body"></tbody>
-            </table>
+      <section id="detail-section" class="shrink-0" data-testid="detail-grid">
+        <article class="bg-panel border border-borderDark rounded-xl p-3 md:p-4 min-w-0" aria-labelledby="team-title">
+          <div id="team-heading" class="border-b border-borderDark pb-3 mb-3">
+            <p class="text-[10px] uppercase tracking-wider text-textDim">Selected team / task</p>
+            <h2 id="team-title" class="text-white text-lg font-semibold break-words">Select a task from Kanban or History.</h2>
+            <p id="team-meta" class="text-xs text-textDim mt-1 break-words"></p>
           </div>
-        </article>
 
-        <article class="lg:col-span-3 bg-panel border border-borderDark rounded-xl p-4 min-w-0" aria-labelledby="controls-title">
-          <div class="border-b border-borderDark pb-2 mb-3"><p class="text-[10px] uppercase tracking-wider text-textDim">Explicit targets</p><h2 id="controls-title" class="text-white font-medium">Controls</h2></div>
-          <div id="controls-content" class="grid gap-4">
-            <section id="task-controls-section">
-              <p class="text-[10px] uppercase tracking-wider text-textDim">Task controls</p>
-              <p id="task-control-target" class="text-[10px] text-textDim mb-2">Target: no selected task</p>
-              <p id="blocked-guidance" class="hidden rounded-lg border border-danger bg-danger/10 p-3 text-xs text-textDim mb-2"></p>
-              <div id="task-primary" class="grid gap-2"></div>
-              <div id="task-secondary" class="grid gap-2 mt-2"></div>
-              <details id="more-actions" data-testid="more-actions" class="hidden group mt-2 rounded-lg border border-borderDark bg-dark">
-                <summary class="min-h-10 cursor-pointer px-3 py-2 text-xs text-textDim hover:text-white">More Actions...</summary>
-                <div class="grid grid-cols-1 gap-2 border-t border-borderDark p-2"><div id="more-action-buttons" class="grid gap-2"></div><div id="clear-confirmation" class="hidden rounded-lg border border-danger bg-danger/10 p-2"><p class="text-xs text-textDim mb-2">Confirm durable ownership cleanup for the selected task.</p><button type="button" data-confirm-clear class="min-h-10 w-full rounded-lg border border-danger bg-danger text-white px-3">Confirm Clear Team</button></div></div>
-              </details>
-              <p id="task-control-result" class="text-[10px] text-textDim mt-2" role="status"></p>
-            </section>
-            <div class="h-px bg-borderDark"></div>
-            <section id="role-controls-section">
-              <p class="text-[10px] uppercase tracking-wider text-textDim">Role / Tab controls</p>
-              <p id="role-control-target" class="text-[10px] text-textDim mb-2">Target: no selected role</p>
-              <div id="role-actions" class="grid gap-2"></div>
-              <p id="role-guidance" class="text-[10px] text-textDim mt-2">Select a role row.</p>
-              <p id="role-control-result" class="text-[10px] text-textDim mt-2" role="status"></p>
-            </section>
-          </div>
+          <section id="primary-problem-section" class="hidden rounded-lg border border-danger bg-danger/10 p-3 mb-3" aria-labelledby="primary-problem-title">
+            <div class="flex flex-wrap items-center justify-between gap-2"><h3 id="primary-problem-title" class="text-sm font-semibold text-danger"></h3><time id="primary-problem-at" class="text-[10px] text-textDim"></time></div>
+            <p id="primary-problem-message" class="text-sm text-white mt-2 break-words"></p>
+            <p id="primary-problem-meta" class="text-xs text-textDim mt-1"></p>
+            <p id="primary-problem-recommended" class="text-xs text-textDim mt-2"></p>
+            <a id="primary-problem-report" class="hidden min-h-10 mt-2 items-center rounded-lg border border-borderDark px-3 text-xs text-white hover:bg-borderDark" target="_blank" rel="noopener">Open Maintainers report</a>
+          </section>
+
+          <section id="maintenance-section" class="hidden rounded-lg border border-borderDark bg-dark p-3 mb-3" aria-labelledby="maintenance-title">
+            <div class="flex flex-wrap items-center justify-between gap-2"><h3 id="maintenance-title" class="text-sm font-semibold text-white">Global Maintainers</h3><span id="maintenance-state" class="text-[10px] text-textDim"></span></div>
+            <p id="maintenance-message" class="text-xs text-textDim mt-2 break-words"></p>
+            <a id="maintenance-report" class="hidden min-h-10 mt-2 items-center rounded-lg border border-borderDark px-3 text-xs text-white hover:bg-borderDark" target="_blank" rel="noopener">Open latest report</a>
+          </section>
+
+          <section class="border-t border-borderDark pt-3 mb-3" aria-labelledby="controls-title">
+            <div class="mb-3"><p class="text-[10px] uppercase tracking-wider text-textDim">Explicit targets</p><h3 id="controls-title" class="text-white font-medium">Controls</h3></div>
+            <div id="controls-content" class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <section id="task-controls-section">
+                <p class="text-[10px] uppercase tracking-wider text-textDim">Task controls</p>
+                <p id="task-control-target" class="text-[10px] text-textDim mb-2">Target: no selected task</p>
+                <p id="blocked-guidance" class="hidden rounded-lg border border-danger bg-danger/10 p-3 text-xs text-textDim mb-2"></p>
+                <div id="task-primary" class="grid gap-2"></div>
+                <div id="task-secondary" class="grid gap-2 mt-2"></div>
+                <details id="more-actions" data-testid="more-actions" class="hidden group mt-2 rounded-lg border border-borderDark bg-dark">
+                  <summary class="min-h-10 cursor-pointer px-3 py-2 text-xs text-textDim hover:text-white">More Actions...</summary>
+                  <div class="grid grid-cols-1 gap-2 border-t border-borderDark p-2"><div id="more-action-buttons" class="grid gap-2"></div><div id="clear-confirmation" class="hidden rounded-lg border border-danger bg-danger/10 p-2"><p class="text-xs text-textDim mb-2">Confirm durable ownership cleanup for the selected task.</p><button type="button" data-confirm-clear class="min-h-10 w-full rounded-lg border border-danger bg-danger text-white px-3">Confirm Clear Team</button></div></div>
+                </details>
+                <p id="task-control-result" class="text-[10px] text-textDim mt-2" role="status"></p>
+              </section>
+              <section id="role-controls-section" class="lg:border-l lg:border-borderDark lg:pl-4">
+                <p class="text-[10px] uppercase tracking-wider text-textDim">Role / Tab controls</p>
+                <p id="role-control-target" class="text-[10px] text-textDim mb-2">Target: no selected role</p>
+                <div id="role-actions" class="grid gap-2"></div>
+                <p id="role-guidance" class="text-[10px] text-textDim mt-2">Select a role row.</p>
+                <p id="role-control-result" class="text-[10px] text-textDim mt-2" role="status"></p>
+              </section>
+            </div>
+          </section>
+
+          <section id="dependency-summary" class="border-t border-borderDark pt-3 mb-3" aria-labelledby="dependency-title">
+            <p class="text-[10px] uppercase tracking-wider text-textDim">Scheduling</p>
+            <h3 id="dependency-title" class="text-white font-medium">Dependencies / Queue</h3>
+            <div id="dependency-content" class="grid grid-cols-1 md:grid-cols-2 gap-2 mt-2 text-xs text-textDim"></div>
+          </section>
+
+          <section class="border-t border-borderDark pt-3 mb-3" aria-labelledby="roles-title">
+            <p class="text-[10px] uppercase tracking-wider text-textDim">Exact ownership</p>
+            <h3 id="roles-title" class="text-white font-medium mb-2">Roles</h3>
+            <div class="overflow-x-auto">
+              <table class="w-full min-w-[760px] text-left text-xs" data-testid="role-table">
+                <thead class="text-textDim border-b border-borderDark"><tr><th class="pb-2 font-normal">Function</th><th class="pb-2 font-normal">Physical role / Tab</th><th class="pb-2 font-normal">URL</th><th class="pb-2 font-normal">Availability</th><th class="pb-2 font-normal">Status</th><th class="pb-2 font-normal text-right">Actions</th></tr></thead>
+                <tbody id="role-table-body"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section id="logs-panel" class="border-t border-borderDark pt-3 mb-3" aria-labelledby="logs-title">
+            <p class="text-[10px] uppercase tracking-wider text-textDim">Real timestamps</p>
+            <h3 id="logs-title" class="text-white font-medium mb-2">Chronological Timeline</h3>
+            <div id="logs-content" class="grid gap-2 max-h-96 overflow-y-auto pr-1"></div>
+          </section>
+
+          <section class="border-t border-borderDark pt-3" aria-labelledby="selected-reports-title">
+            <p class="text-[10px] uppercase tracking-wider text-textDim">Validated artifacts</p>
+            <h3 id="selected-reports-title" class="text-white font-medium mb-2">Reports</h3>
+            <div id="selected-reports" class="flex flex-wrap gap-2 max-h-96 overflow-y-auto"></div>
+          </section>
         </article>
       </section>
 
@@ -127,7 +163,7 @@
 
       <section id="history-section" class="bg-panel border border-borderDark rounded-xl p-4 shrink-0" aria-labelledby="history-title">
         <div class="flex items-center justify-between gap-3 mb-3"><div><p class="text-[10px] uppercase tracking-wider text-textDim">Retained independently</p><h2 id="history-title" class="text-white font-semibold">History / Reports</h2></div><span id="history-count" class="text-xs text-textDim">0 records</span></div>
-        <div id="history-list" class="grid gap-2"></div>
+        <div id="history-list" class="grid gap-2 max-h-96 overflow-y-auto pr-1"></div>
       </section>
     </main>
   </div>
@@ -169,7 +205,7 @@
   <script>
     (() => {
       'use strict';
-      const LANES = ['RUNNING', 'BLOCKED', 'PAUSED', 'DONE', 'STOPPED'];
+      const LANES = ['RUNNING', 'WAITING', 'BLOCKED', 'PAUSED', 'DONE', 'STOPPED'];
       const CONTROL_LABELS = {pause: 'Pause', resume: 'Resume', retry: 'Retry hop', stop: 'Stop', restart_role: 'Restart role', open_tab: 'Open tab', new_chat: 'New Chat', route_plan: 'Route PLAN', clear_team: 'Clear Team'};
       const state = {tasks: [], pages: [], events: [], connected: false, repository: '', selectedTaskId: null, selectedRoleByTask: new Map(), refreshing: false, dialogMode: 'create', dialogOpener: null};
       const byId = id => document.getElementById(id);
@@ -180,6 +216,7 @@
       const field = (parent, name) => parent.querySelector(`[data-field="${name}"]`);
       const validConversationUrl = value => /^https:\/\/chatgpt\.com\/c\/[A-Za-z0-9_-]+$/.test(String(value || ''));
       const formatTime = value => { const date = value ? new Date(value) : null; return date && !Number.isNaN(date.getTime()) ? date.toLocaleTimeString() : '—'; };
+      const activityEpoch = task => { const date = task?.effective_activity_at ? new Date(task.effective_activity_at) : null; return date && !Number.isNaN(date.getTime()) ? date.getTime() : Number.NEGATIVE_INFINITY; };
       const short = (value, count = 18) => String(value || '—').slice(0, count);
       function keyed(container, selector, key, creator) {
         let node = [...container.querySelectorAll(selector)].find(item => item.dataset.key === String(key));
@@ -188,6 +225,10 @@
       }
       function removeStale(container, selector, liveKeys) {
         container.querySelectorAll(selector).forEach(node => { if (!liveKeys.has(node.dataset.key)) node.remove(); });
+      }
+      function placeInOrder(container, node, index) {
+        const reference = container.children[index] || null;
+        if (reference !== node) container.insertBefore(node, reference);
       }
       function laneFor(task) {
         const status = String(task.status || 'INBOX').toUpperCase();
@@ -210,6 +251,7 @@
         const status = laneFor(task);
         if (status === 'RUNNING') return {accent: 'absolute top-0 left-0 w-1 h-full bg-accent', text: 'text-[10px] font-semibold tracking-wider text-accent', phase: 'px-1.5 py-0.5 rounded border border-accent bg-accent/10 text-accent'};
         if (status === 'BLOCKED') return {accent: 'absolute top-0 left-0 w-1 h-full bg-danger', text: 'text-[10px] font-semibold tracking-wider text-danger', phase: 'px-1.5 py-0.5 rounded border border-danger bg-danger/10 text-danger'};
+        if (status === 'WAITING') return {accent: 'absolute top-0 left-0 w-1 h-full bg-warning', text: 'text-[10px] font-semibold tracking-wider text-warning', phase: 'px-1.5 py-0.5 rounded border border-warning bg-warning/10 text-warning'};
         if (status === 'PAUSED') return {accent: 'absolute top-0 left-0 w-1 h-full bg-warning', text: 'text-[10px] font-semibold tracking-wider text-warning', phase: 'px-1.5 py-0.5 rounded border border-warning bg-warning/10 text-warning'};
         return {accent: 'absolute top-0 left-0 w-1 h-full bg-borderDark', text: 'text-[10px] font-semibold tracking-wider text-textDim', phase: 'px-1.5 py-0.5 rounded border border-borderDark bg-panel text-textDim'};
       }
@@ -222,7 +264,7 @@
         const fragment = byId('task-card-template').content.cloneNode(true);
         return fragment.querySelector('[data-task-card]');
       }
-      function upsertTaskCard(task) {
+      function upsertTaskCard(task, position) {
         const lane = laneFor(task);
         const host = document.querySelector(`[data-lane-cards="${lane}"]`);
         let card = document.querySelector(`[data-task-id="${CSS.escape(task.task_id)}"]`);
@@ -253,15 +295,17 @@
         setClass(warning, task.surface_warning ? 'block mt-2 rounded border border-warning bg-warning/10 px-2 py-1 text-[10px] text-textDim' : 'hidden mt-2 rounded border border-warning bg-warning/10 px-2 py-1 text-[10px] text-textDim');
         card.setAttribute('aria-pressed', String(task.task_id === state.selectedTaskId));
         setClass(card, task.task_id === state.selectedTaskId ? 'w-full bg-dark border border-accent rounded-lg p-3 transition cursor-pointer relative overflow-hidden text-left ring-2 ring-accent focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent' : 'w-full bg-dark border border-borderDark rounded-lg p-3 hover:border-textDim transition cursor-pointer relative overflow-hidden text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent');
+        placeInOrder(host, card, position);
         return task.task_id;
       }
       function renderBoard() {
         const live = new Set();
         const counts = Object.fromEntries(LANES.map(lane => [lane, 0]));
-        state.tasks.forEach(task => {
+        [...state.tasks].sort((a, b) => activityEpoch(b) - activityEpoch(a)).forEach(task => {
           if (task.surface === 'history') return;
-          live.add(upsertTaskCard(task));
-          counts[laneFor(task)] += 1;
+          const lane = laneFor(task);
+          live.add(upsertTaskCard(task, counts[lane]));
+          counts[lane] += 1;
         });
         document.querySelectorAll('[data-task-card][data-task-id]').forEach(card => { if (!live.has(card.dataset.taskId)) card.remove(); });
         LANES.forEach(lane => {
@@ -278,35 +322,141 @@
       }
       function createLogRow() {
         const row = make('div', 'rounded-lg border border-borderDark bg-dark px-3 py-2 text-xs');
-        make('div', 'flex flex-wrap gap-2 mb-1', row).dataset.header = 'true';
+        const header = make('div', 'flex flex-wrap gap-2 mb-1', row); header.dataset.header = 'true';
+        make('time', 'text-textDim', header).dataset.field = 'time';
+        make('span', 'text-white font-semibold', header).dataset.field = 'level';
+        make('span', 'text-textDim', header).dataset.field = 'source';
         make('p', 'text-textDim leading-5 break-words', row).dataset.message = 'true';
         return row;
       }
       function renderLogs(task) {
         const host = byId('logs-content');
-        const items = [];
-        if (task.active_hop) items.push({key: `hop:${task.active_hop_id}`, at: task.updated_at, level: 'STATE', source: task.active_role || 'task', message: `Active hop ${task.active_hop_id} · ${task.active_hop.state || task.active_action || 'unknown'}`});
-        (task.errors || []).forEach((error, index) => items.push({key: `error:${error.at || index}`, at: error.at, level: 'ERROR', source: task.active_role || 'task', message: typeof error === 'string' ? error : error.error || JSON.stringify(error)}));
-        (task.control_results || []).forEach((result, index) => items.push({key: `control:${result.control_id || index}`, at: result.at, level: 'CONTROL', source: result.action || 'control', message: `${result.action || 'control'} · ${result.status || 'unknown'}${result.result ? ` · ${typeof result.result === 'string' ? result.result : JSON.stringify(result.result)}` : ''}`}));
-        (task.route_timeline || []).slice(-8).forEach((route, index) => items.push({key: `route:${route.hop_id || index}`, at: route.at, level: 'ROUTE', source: route.source_role || 'route', message: `${route.source_role || '—'} → ${route.route || '—'}${route.kind ? ` · ${route.kind}` : ''}`}));
-        state.events.filter(event => event.task_id === task.task_id).slice(-12).forEach((event, index) => items.push({key: `event:${event.event_id || event.at || index}`, at: event.at, level: 'EVENT', source: event.role || event.action || 'browser', message: `${event.action || 'action'} · ${event.phase || 'state'}${event.detail ? ` · ${event.detail}` : ''}`}));
-        if (task.surface_warning) items.push({key: 'surface-warning', at: task.updated_at, level: 'WARN', source: 'availability', message: task.surface_warning});
-        items.sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')));
-        const keys = new Set();
-        items.slice(0, 20).forEach(item => {
-          keys.add(item.key);
+        const scrollTop = host.scrollTop;
+        const items = [...(task.timeline || [])];
+        state.events.map((event, index) => ({event, index})).filter(item => item.event.task_id === task.task_id).slice(-24).forEach(({event, index}) => items.push({key: event.event_id ? `event:${event.event_id}` : `event:${event.at || 'untimed'}:${event.pid || ''}:${event.page_id || ''}:${event.action || ''}:${event.phase || ''}:${event.detail || ''}:${index}`, at: event.at, level: 'EVENT', source: event.role || event.action || 'browser', message: `${event.action || 'action'} · ${event.phase || 'state'}${event.detail ? ` · ${event.detail}` : ''}`}));
+        if (task.surface_warning) items.push({key: 'surface-warning', at: task.effective_activity_at || task.updated_at, level: 'WARN', source: 'availability', message: task.surface_warning});
+        items.sort((a, b) => {
+          const left = a.at ? new Date(a.at).getTime() : Number.NEGATIVE_INFINITY;
+          const right = b.at ? new Date(b.at).getTime() : Number.NEGATIVE_INFINITY;
+          return right - left;
+        });
+        const keys = new Set(items.map(item => String(item.key)));
+        if (!items.length) keys.add('empty');
+        removeStale(host, '[data-key]', keys);
+        items.forEach((item, index) => {
           const row = keyed(host, '[data-key]', item.key, createLogRow);
-          const header = row.querySelector('[data-header]');
-          clearNode(header);
-          const time = make('time', 'text-textDim', header); setText(time, formatTime(item.at));
-          const levelClass = item.level === 'ERROR' ? 'text-danger font-semibold' : item.level === 'WARN' ? 'text-warning font-semibold' : item.level === 'STATE' ? 'text-accent font-semibold' : 'text-white font-semibold';
-          const level = make('span', levelClass, header); setText(level, item.level);
-          const source = make('span', 'text-textDim', header); setText(source, item.source);
+          setText(field(row, 'time'), formatTime(item.at));
+          const levelClass = item.level === 'ERROR' ? 'text-danger font-semibold' : item.level === 'WARN' || item.level === 'DEPENDENCY' ? 'text-warning font-semibold' : item.level === 'STATE' ? 'text-accent font-semibold' : 'text-white font-semibold';
+          setClass(field(row, 'level'), levelClass);
+          setText(field(row, 'level'), item.level);
+          setText(field(row, 'source'), item.source);
           setText(row.querySelector('[data-message]'), item.message);
+          placeInOrder(host, row, index);
         });
         if (!items.length) {
           const empty = keyed(host, '[data-key]', 'empty', () => make('div', 'rounded-lg border border-dashed border-borderDark bg-dark p-3 text-xs text-textDim'));
-          setText(empty, 'No reliably matched logs or errors for this selected task.');
+          setText(empty, 'No timestamped task activity.');
+        }
+        if (host.scrollTop !== scrollTop) host.scrollTop = scrollTop;
+      }
+      function renderPrimaryProblem(task) {
+        const section = byId('primary-problem-section');
+        const problem = task.primary_problem;
+        if (!problem) {
+          setClass(section, 'hidden rounded-lg border border-danger bg-danger/10 p-3 mb-3');
+          setText(byId('primary-problem-title'), '');
+          setText(byId('primary-problem-message'), '');
+          setText(byId('primary-problem-meta'), '');
+          setText(byId('primary-problem-recommended'), '');
+          setClass(byId('primary-problem-report'), 'hidden min-h-10 mt-2 items-center rounded-lg border border-borderDark px-3 text-xs text-white hover:bg-borderDark');
+          byId('primary-problem-report').removeAttribute('href');
+          return;
+        }
+        const waiting = String(problem.kind || '').toUpperCase() === 'WAITING';
+        setClass(section, waiting ? 'block rounded-lg border border-warning bg-warning/10 p-3 mb-3' : 'block rounded-lg border border-danger bg-danger/10 p-3 mb-3');
+        setClass(byId('primary-problem-title'), waiting ? 'text-sm font-semibold text-warning' : 'text-sm font-semibold text-danger');
+        setText(byId('primary-problem-title'), `${problem.kind || 'ERROR'} · ${problem.code || 'unknown'}`);
+        setText(byId('primary-problem-at'), formatTime(problem.at));
+        setText(byId('primary-problem-message'), problem.message || 'No reason recorded.');
+        setText(byId('primary-problem-meta'), `${problem.role || 'task'} · hop ${problem.hop_id || '—'}${problem.maintenance_incident_id ? ` · ${problem.maintenance_incident_id}` : ''}`);
+        setText(byId('primary-problem-recommended'), problem.recommended ? `Recommended: ${problem.recommended}` : '');
+        const report = problem.maintenance_report;
+        const link = byId('primary-problem-report');
+        if (report?.url) {
+          link.href = report.url;
+          setClass(link, 'inline-flex min-h-10 mt-2 items-center rounded-lg border border-borderDark px-3 text-xs text-white hover:bg-borderDark');
+        } else {
+          link.removeAttribute('href');
+          setClass(link, 'hidden min-h-10 mt-2 items-center rounded-lg border border-borderDark px-3 text-xs text-white hover:bg-borderDark');
+        }
+      }
+      function renderMaintenance(task) {
+        const section = byId('maintenance-section');
+        const incident = task.active_maintenance_incident;
+        const report = incident ? task.active_maintenance_report : task.latest_maintenance_report;
+        const projectionErrors = task.projection_errors || [];
+        if (!incident && !report && !projectionErrors.length) {
+          setClass(section, 'hidden rounded-lg border border-borderDark bg-dark p-3 mb-3');
+          return;
+        }
+        setClass(section, projectionErrors.length ? 'block rounded-lg border border-danger bg-danger/10 p-3 mb-3' : 'block rounded-lg border border-borderDark bg-dark p-3 mb-3');
+        setText(byId('maintenance-state'), incident ? `${incident.state || 'unknown'} · ${incident.incident_id || 'incident'}` : report ? `${report.state || 'reported'} · turn ${report.turn || '—'}` : 'projection error');
+        const decision = incident?.decision || {};
+        const detail = projectionErrors.length ? `Dashboard projection error: ${projectionErrors.join(' · ')}` : incident ? `${incident.trigger_code || 'incident'} · ${decision.action || incident.state || 'unknown'} · ${decision.reason || incident.trigger_reason || 'No reason recorded.'}` : 'Latest Maintainers report is available.';
+        setText(byId('maintenance-message'), detail);
+        const link = byId('maintenance-report');
+        if (report?.url) {
+          link.href = report.url;
+          setClass(link, 'inline-flex min-h-10 mt-2 items-center rounded-lg border border-borderDark px-3 text-xs text-white hover:bg-borderDark');
+        } else {
+          link.removeAttribute('href');
+          setClass(link, 'hidden min-h-10 mt-2 items-center rounded-lg border border-borderDark px-3 text-xs text-white hover:bg-borderDark');
+        }
+      }
+      function createSummaryItem() {
+        const item = make('div', 'rounded-lg border border-borderDark bg-dark px-3 py-2');
+        make('p', 'text-[10px] uppercase tracking-wider text-textDim', item).dataset.field = 'label';
+        make('p', 'text-xs text-white mt-1 break-words', item).dataset.field = 'value';
+        return item;
+      }
+      function renderDependencySummary(task) {
+        const host = byId('dependency-content');
+        const rows = [
+          ['parents', 'Parents', (task.depends_on_task_ids || []).join(', ') || 'None'],
+          ['children', 'Children', (task.child_task_ids || []).join(', ') || 'None'],
+          ['waiting', 'Waiting on', (task.waiting_on_task_ids || []).join(', ') || task.waiting_reason || 'Nothing'],
+          ['queue', 'Team queue', task.queue_position ? `Position ${task.queue_position}${task.queue_length ? ` of ${task.queue_length}` : ''}` : 'Not queued'],
+        ];
+        const keys = new Set();
+        rows.forEach(([key, label, value], index) => {
+          keys.add(key);
+          const item = keyed(host, '[data-key]', key, createSummaryItem);
+          setText(field(item, 'label'), label);
+          setText(field(item, 'value'), value);
+          placeInOrder(host, item, index);
+        });
+        removeStale(host, '[data-key]', keys);
+      }
+      function createReportLink() {
+        const link = make('a', 'min-h-10 inline-flex items-center rounded-lg border border-borderDark px-3 text-xs text-textDim hover:text-white hover:bg-borderDark');
+        link.target = '_blank'; link.rel = 'noopener';
+        return link;
+      }
+      function renderSelectedReports(task) {
+        const host = byId('selected-reports');
+        const reports = (task.reports || []).map((report, index) => ({key: `role:${report.report_id || index}`, url: report.url, label: `${report.physical_role || 'Report'} turn ${report.turn || '—'}`}));
+        if (task.latest_maintenance_report?.url) reports.unshift({key: `maint:${task.latest_maintenance_report.incident_id}`, url: task.latest_maintenance_report.url, label: `Maintainers turn ${task.latest_maintenance_report.turn || '—'}`});
+        const keys = new Set();
+        reports.forEach((report, index) => {
+          keys.add(report.key);
+          const link = keyed(host, 'a[data-key]', report.key, createReportLink);
+          link.href = report.url;
+          setText(link, report.label);
+          placeInOrder(host, link, index);
+        });
+        if (!reports.length) {
+          const empty = keyed(host, '[data-key]', 'empty', () => make('span', 'text-xs text-textDim'));
+          setText(empty, 'No reports.');
           keys.add('empty');
         }
         removeStale(host, '[data-key]', keys);
@@ -447,19 +597,25 @@
       function renderSelectedTask() {
         const task = selectedTask();
         if (!task) {
-          setText(byId('team-heading'), 'No task available.');
-          clearNode(byId('logs-content')); clearNode(byId('role-table-body'));
+          setText(byId('team-title'), 'No task available.');
+          setText(byId('team-meta'), '');
+          clearNode(byId('logs-content')); clearNode(byId('role-table-body')); clearNode(byId('dependency-content')); clearNode(byId('selected-reports'));
+          setClass(byId('primary-problem-section'), 'hidden rounded-lg border border-danger bg-danger/10 p-3 mb-3');
+          setClass(byId('maintenance-section'), 'hidden rounded-lg border border-borderDark bg-dark p-3 mb-3');
           setText(byId('task-control-target'), 'Target: no selected task');
           setText(byId('role-control-target'), 'Target: no selected role');
           syncActionButtons(byId('task-primary'), [], () => {}); syncActionButtons(byId('task-secondary'), [], () => {}); syncActionButtons(byId('more-action-buttons'), [], () => {}); syncActionButtons(byId('role-actions'), [], () => {});
           return;
         }
-        const heading = byId('team-heading');
-        clearNode(heading);
-        const eyebrow = make('p', 'text-[10px] uppercase tracking-wider text-textDim', heading); setText(eyebrow, 'Selected team / task');
-        const title = make('h2', 'text-white text-lg font-semibold break-words', heading); title.id = 'team-title'; setText(title, task.team);
-        const meta = make('p', 'text-xs text-textDim mt-1 break-words', heading); setText(meta, `${task.task_title || task.task_id} · ${task.status} · ${task.column || '—'} · ${task.task_id}`);
-        renderLogs(task); renderRoles(task); renderControls(task);
+        setText(byId('team-title'), task.team || 'Unassigned team');
+        setText(byId('team-meta'), `${task.task_title || task.task_id} · ${task.status} · ${task.column || '—'} · ${task.task_id}`);
+        renderPrimaryProblem(task);
+        renderMaintenance(task);
+        renderControls(task);
+        renderDependencySummary(task);
+        renderRoles(task);
+        renderLogs(task);
+        renderSelectedReports(task);
       }
       function createTabCard() {
         const card = make('article', 'rounded-lg border border-borderDark bg-dark p-3 min-w-0');
@@ -508,22 +664,36 @@
       }
       function renderHistory() {
         const host = byId('history-list');
-        const rows = state.tasks.filter(task => task.surface === 'history' || ['DONE', 'STOPPED'].includes(String(task.status).toUpperCase()));
-        const keys = new Set();
-        rows.forEach(task => {
-          keys.add(task.task_id);
+        const scrollTop = host.scrollTop;
+        const rows = state.tasks.filter(task => task.surface === 'history' || ['DONE', 'STOPPED'].includes(String(task.status).toUpperCase())).sort((a, b) => activityEpoch(b) - activityEpoch(a));
+        const keys = new Set(rows.map(task => String(task.task_id)));
+        if (!rows.length) keys.add('empty');
+        removeStale(host, ':scope > [data-key]', keys);
+        rows.forEach((task, index) => {
           const row = keyed(host, 'article[data-key]', task.task_id, createHistoryRow);
           row.dataset.historyTaskId = task.task_id;
           setText(field(row, 'team'), task.team);
           setText(field(row, 'meta'), ` · ${task.status} · ${task.availability || 'unknown'}`);
           setText(field(row, 'task'), `${task.task_id} · ${task.task_title || ''}`);
           const reports = field(row, 'reports');
-          clearNode(reports);
-          (task.reports || []).forEach(report => { const link = make('a', 'min-h-10 inline-flex items-center rounded-lg border border-borderDark px-3 text-xs text-textDim hover:text-white hover:bg-borderDark', reports); link.href = report.url; link.target = '_blank'; link.rel = 'noopener'; setText(link, `${report.physical_role || 'Report'} turn ${report.turn || '—'}`); });
-          if (!(task.reports || []).length) { const none = make('span', 'text-xs text-textDim', reports); setText(none, 'No reports.'); }
+          const reportRows = (task.reports || []).map((report, reportIndex) => ({key: `role:${report.report_id || reportIndex}`, url: report.url, label: `${report.physical_role || 'Report'} turn ${report.turn || '—'}`}));
+          const reportKeys = new Set(reportRows.map(report => report.key));
+          if (!reportRows.length) reportKeys.add('empty');
+          removeStale(reports, ':scope > [data-key]', reportKeys);
+          reportRows.forEach((report, reportIndex) => {
+            const link = keyed(reports, 'a[data-key]', report.key, createReportLink);
+            if (link.getAttribute('href') !== report.url) link.href = report.url;
+            setText(link, report.label);
+            placeInOrder(reports, link, reportIndex);
+          });
+          if (!reportRows.length) {
+            const none = keyed(reports, ':scope > [data-key]', 'empty', () => make('span', 'text-xs text-textDim'));
+            setText(none, 'No reports.');
+          }
+          placeInOrder(host, row, index);
         });
-        if (!rows.length) { const empty = keyed(host, '[data-key]', 'empty', () => make('div', 'rounded-lg border border-dashed border-borderDark bg-dark p-3 text-xs text-textDim')); setText(empty, 'No terminal history or reports.'); keys.add('empty'); }
-        removeStale(host, '[data-key]', keys);
+        if (!rows.length) { const empty = keyed(host, ':scope > [data-key]', 'empty', () => make('div', 'rounded-lg border border-dashed border-borderDark bg-dark p-3 text-xs text-textDim')); setText(empty, 'No terminal history or reports.'); }
+        if (host.scrollTop !== scrollTop) host.scrollTop = scrollTop;
         setText(byId('history-count'), `${rows.length} record${rows.length === 1 ? '' : 's'}`);
       }
       function ensureSelection() {

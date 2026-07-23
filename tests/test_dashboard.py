@@ -15,7 +15,10 @@ from playwright_auto.dashboard import (
     DASHBOARD_HTML_PATH,
     build_dashboard_page,
     build_task_payload,
+    build_task_timeline,
     dashboard_payload,
+    effective_activity_at,
+    primary_task_problem,
 )
 from playwright_auto.observability import (
     append_action_event,
@@ -112,12 +115,13 @@ def test_dashboard_html_is_cdpa_control_center_tailwind_monitor_surface():
     assert 'data-testid="workspace"' in html
     assert "flex-1 min-h-0 overflow-y-auto overflow-x-hidden" in html
     assert 'data-testid="kanban-scroller"' in html and "overflow-x-auto" in html
-    assert html.count('class="w-[300px] shrink-0') == 5
-    positions = [html.index(f'data-lane="{lane}"') for lane in ("RUNNING", "BLOCKED", "PAUSED", "DONE", "STOPPED")]
+    assert html.count('class="w-[300px] shrink-0') == 6
+    positions = [html.index(f'data-lane="{lane}"') for lane in ("RUNNING", "WAITING", "BLOCKED", "PAUSED", "DONE", "STOPPED")]
     assert positions == sorted(positions)
-    assert "grid grid-cols-1 lg:grid-cols-12" in html
-    assert html.count("lg:col-span-3") >= 2
-    assert "lg:col-span-6" in html
+    assert 'id="primary-problem-section"' in html
+    assert 'id="maintenance-section"' in html
+    assert 'id="dependency-summary"' in html
+    assert 'id="selected-reports"' in html
     assert 'id="task-card-template"' in html
     assert "progress" not in html.casefold()
     for region in ("logs-content", "role-table-body", "controls-content", "tab-grid", "history-list"):
@@ -442,3 +446,462 @@ def test_dashboard_shutdown_handles_keyboard_interrupt_cleanly(monkeypatch, tmp_
     )
 
     assert events == ["thread-start", "serve:0.25", "server-close", "thread-join:3"]
+
+
+
+def _mixed_timeline_task() -> dict[str, object]:
+    return {
+        "task_id": "task-timeline",
+        "team": "alpha",
+        "status": "BLOCKED",
+        "block_code": "route_validation_exhausted",
+        "block_reason": "Report file does not exist",
+        "active_role": "PLAN",
+        "active_hop_id": 4,
+        "created_at": "2026-07-23T01:00:00+00:00",
+        "updated_at": "2026-07-23T02:10:00+00:00",
+        "last_role_activity_at": "2026-07-23T02:08:00+00:00",
+        "errors": [
+            {"at": "2026-07-23T01:20:00+00:00", "error": "old transport error"},
+            {"at": "2026-07-23T02:09:04+00:00", "error": "Report file does not exist"},
+        ],
+        "hops": [
+            {
+                "hop_id": 4,
+                "target_role": "PLAN",
+                "state": "waiting",
+                "timestamps": {
+                    "created_at": "2026-07-23T02:00:00+00:00",
+                    "sent_at": "2026-07-23T02:04:00+00:00",
+                },
+                "errors": ["Report file does not exist"],
+            }
+        ],
+        "route_timeline": [
+            {
+                "hop_id": 3,
+                "at": "2026-07-23T01:50:00+00:00",
+                "source_role": "DEV",
+                "route": "PLAN",
+                "kind": "route",
+            }
+        ],
+        "controls": [
+            {
+                "control_id": "control-1",
+                "action": "resume",
+                "status": "applied",
+                "at": "2026-07-23T01:55:00+00:00",
+            }
+        ],
+        "maintenance": {
+            "active_incident_id": "maint-1",
+            "incidents": [
+                {
+                    "incident_id": "maint-1",
+                    "state": "RUNNING",
+                    "trigger_code": "route_validation_exhausted",
+                    "trigger_reason": "Report file does not exist",
+                    "source_role": "PLAN",
+                    "source_hop_id": 4,
+                    "created_at": "2026-07-23T02:09:10+00:00",
+                    "updated_at": "2026-07-23T02:09:30+00:00",
+                    "report_path": "/repo/.plan/maintainers/alpha_turn1_20260723T020920Z.md",
+                    "report_sha256": "a" * 64,
+                    "report_size": 120,
+                    "turn": 1,
+                }
+            ],
+        },
+        "dependency_events": [
+            {
+                "event_id": "dep-1",
+                "at": "2026-07-23T01:40:00+00:00",
+                "message": "Waiting for task-parent",
+            }
+        ],
+    }
+
+
+def test_timeline_orders_all_sources_by_real_timestamp_descending():
+    timeline = build_task_timeline(_mixed_timeline_task())
+    assert [item["at"] for item in timeline] == sorted(
+        [item["at"] for item in timeline], reverse=True
+    )
+    assert timeline[0]["level"] == "MAINTENANCE"
+    assert {item["level"] for item in timeline} >= {
+        "ERROR", "STATE", "ROUTE", "CONTROL", "MAINTENANCE", "DEPENDENCY"
+    }
+    assert all(set(item) == {"key", "at", "level", "source", "message"} for item in timeline)
+
+
+def test_primary_problem_prefers_active_block_over_old_errors():
+    problem = primary_task_problem(_mixed_timeline_task())
+    assert problem is not None
+    assert problem["code"] == "route_validation_exhausted"
+    assert problem["role"] == "PLAN"
+    assert problem["hop_id"] == 4
+    assert problem["message"] == "Report file does not exist"
+    assert problem["maintenance_incident_id"] == "maint-1"
+
+
+def test_effective_activity_uses_state_specific_real_evidence():
+    blocked = _mixed_timeline_task()
+    waiting = {
+        "status": "WAITING",
+        "updated_at": "2026-07-23T04:00:00+00:00",
+        "dependency_events": [
+            {"at": "2026-07-23T03:00:00+00:00", "message": "parent incomplete"}
+        ],
+    }
+    done = {"status": "DONE", "completed_at": "2026-07-23T05:00:00+00:00", "updated_at": "2026-07-23T06:00:00+00:00"}
+    stopped = {"status": "STOPPED", "stopped_at": "2026-07-23T07:00:00+00:00", "updated_at": "2026-07-23T08:00:00+00:00"}
+    running = {"status": "RUNNING", "last_role_activity_at": "2026-07-23T09:00:00+00:00", "updated_at": "2026-07-23T10:00:00+00:00"}
+
+    assert effective_activity_at(blocked) == "2026-07-23T02:09:30+00:00"
+    assert effective_activity_at(waiting) == "2026-07-23T03:00:00+00:00"
+    assert effective_activity_at(done) == done["completed_at"]
+    assert effective_activity_at(stopped) == stopped["stopped_at"]
+    assert effective_activity_at(running) == running["last_role_activity_at"]
+
+
+def test_task_payload_exposes_error_first_projections_and_maintenance_report():
+    raw = _mixed_timeline_task()
+    raw.update({
+        "task_text": "Timeline task",
+        "task_slug": "timeline-task",
+        "repository": "/repo",
+        "manifest_path": "/repo/.plan/alpha/task-timeline/timeline-task.json",
+        "team_suffix": 1,
+        "roles": {},
+        "reports": [],
+        "cleanup": {},
+        "options": {},
+    })
+    payload = build_task_payload(raw)
+
+    assert payload["timeline"] == build_task_timeline(raw)
+    assert payload["primary_problem"]["code"] == "route_validation_exhausted"
+    assert payload["effective_activity_at"] == "2026-07-23T02:09:30+00:00"
+    assert payload["latest_maintenance_report"] == {
+        "incident_id": "maint-1",
+        "state": "RUNNING",
+        "turn": 1,
+        "path": "/repo/.plan/maintainers/alpha_turn1_20260723T020920Z.md",
+        "url": "/api/maintenance-reports/task-timeline/maint-1",
+        "at": "2026-07-23T02:09:30+00:00",
+    }
+
+
+def test_malformed_maintenance_projection_surfaces_without_mutating_or_recursing():
+    raw = {
+        "task_id": "task-bad-maintenance",
+        "task_text": "Bad maintenance projection",
+        "task_slug": "bad-maintenance-projection",
+        "repository": "/repo",
+        "manifest_path": "/repo/.plan/alpha/task-bad-maintenance/task.json",
+        "team": "alpha",
+        "team_suffix": 1,
+        "status": "RUNNING",
+        "updated_at": "2026-07-23T10:00:00+00:00",
+        "roles": {},
+        "hops": [],
+        "reports": [],
+        "route_timeline": [],
+        "errors": [],
+        "controls": [],
+        "cleanup": {},
+        "options": {},
+        "maintenance": {"active_incident_id": "missing", "incidents": "broken"},
+    }
+    before = json.loads(json.dumps(raw))
+
+    payload = build_task_payload(raw)
+
+    assert payload["projection_errors"] == ["maintenance.incidents must be a list"]
+    assert payload["primary_problem"]["code"] == "dashboard_projection_error"
+    assert raw == before
+
+
+def test_terminal_task_never_promotes_historical_error_to_primary_problem():
+    raw = _mixed_timeline_task()
+    raw["status"] = "DONE"
+    raw["completed_at"] = "2026-07-23T03:00:00+00:00"
+    assert primary_task_problem(raw) is None
+
+
+def test_timeline_uses_requested_and_applied_control_timestamps():
+    raw = {
+        "created_at": "2026-07-23T01:00:00+00:00",
+        "controls": [
+            {
+                "control_id": "control-2",
+                "action": "resume",
+                "status": "applied",
+                "requested_at": "2026-07-23T01:01:00+00:00",
+                "applied_at": "2026-07-23T01:02:00+00:00",
+            }
+        ],
+    }
+    controls = [item for item in build_task_timeline(raw) if item["level"] == "CONTROL"]
+    assert [(item["key"], item["at"]) for item in controls] == [
+        ("control:control-2:applied", "2026-07-23T01:02:00+00:00"),
+        ("control:control-2:requested", "2026-07-23T01:01:00+00:00"),
+    ]
+
+
+def test_active_block_timestamp_outranks_newer_unrelated_historical_error():
+    raw = _mixed_timeline_task()
+    raw["errors"].append(
+        {"at": "2026-07-23T03:00:00+00:00", "error": "unrelated later history"}
+    )
+    problem = primary_task_problem(raw)
+    assert problem is not None
+    assert problem["at"] == "2026-07-23T02:09:30+00:00"
+
+
+def test_timeline_sorts_timezone_offsets_by_instant_not_text():
+    raw = {
+        "errors": [
+            {"at": "2026-07-23T02:00:00+09:00", "error": "earlier instant"},
+            {"at": "2026-07-23T00:30:00+00:00", "error": "later instant"},
+        ]
+    }
+    errors = [item for item in build_task_timeline(raw) if item["level"] == "ERROR"]
+    assert [item["message"] for item in errors] == ["later instant", "earlier instant"]
+
+
+def test_malformed_maintenance_report_evidence_is_explicit_projection_error():
+    raw = {
+        "status": "RUNNING",
+        "updated_at": "2026-07-23T04:00:00+00:00",
+        "maintenance": {
+            "active_incident_id": None,
+            "incidents": [
+                {
+                    "incident_id": "maint-bad-report",
+                    "state": "RESOLVED",
+                    "report_path": "/repo/.plan/maintainers/bad.md",
+                    "report_sha256": "short",
+                    "report_size": "invalid",
+                }
+            ],
+        },
+    }
+    payload = build_task_payload(raw)
+    assert payload["primary_problem"]["code"] == "dashboard_projection_error"
+    assert any("report_sha256" in item for item in payload["projection_errors"])
+    assert any("report_size" in item for item in payload["projection_errors"])
+
+
+def test_route_timeline_keys_are_unique_for_distinct_events_on_same_hop():
+    raw = {
+        "route_timeline": [
+            {
+                "hop_id": 7,
+                "at": "2026-07-23T01:00:00+00:00",
+                "source_role": "DEV",
+                "route": "DEV",
+                "kind": "route_repair",
+            },
+            {
+                "hop_id": 7,
+                "at": "2026-07-23T01:01:00+00:00",
+                "source_role": "DEV",
+                "route": "TEST",
+                "kind": "route",
+            },
+        ]
+    }
+
+    routes = [item for item in build_task_timeline(raw) if item["level"] == "ROUTE"]
+
+    assert len(routes) == 2
+    assert len({item["key"] for item in routes}) == 2
+    assert {item["message"] for item in routes} == {
+        "DEV → DEV · route_repair",
+        "DEV → TEST · route",
+    }
+
+
+def _active_report_provenance_task(status: str, *, active_has_report: bool) -> dict[str, object]:
+    raw = _mixed_timeline_task()
+    raw["status"] = status
+    raw["task_id"] = f"task-{status.lower()}-provenance"
+    raw["maintenance"] = {
+        "active_incident_id": "maint-new",
+        "incidents": [
+            {
+                "incident_id": "maint-old",
+                "state": "RESOLVED",
+                "turn": 1,
+                "created_at": "2026-07-23T00:00:00+00:00",
+                "updated_at": "2026-07-23T00:05:00+00:00",
+                "resolved_at": "2026-07-23T00:05:00+00:00",
+                "report_path": "/repo/.plan/maintainers/old.md",
+                "report_sha256": "a" * 64,
+                "report_size": 10,
+            },
+            {
+                "incident_id": "maint-new",
+                "state": "OPEN",
+                "turn": 2,
+                "trigger_code": "dependency_wait" if status == "WAITING" else "role_offline",
+                "trigger_reason": "Waiting for parent" if status == "WAITING" else "Exact role is offline",
+                "created_at": "2026-07-23T01:00:00+00:00",
+                "updated_at": "2026-07-23T01:01:00+00:00",
+                **(
+                    {
+                        "report_path": "/repo/.plan/maintainers/new.md",
+                        "report_sha256": "b" * 64,
+                        "report_size": 20,
+                    }
+                    if active_has_report
+                    else {}
+                ),
+            },
+        ],
+    }
+    if status == "WAITING":
+        raw["waiting_reason"] = "Waiting for parent"
+        raw["dependency_events"] = [
+            {"at": "2026-07-23T01:02:00+00:00", "message": "Waiting for parent"}
+        ]
+    return raw
+
+
+@pytest.mark.parametrize("status", ["BLOCKED", "WAITING"])
+def test_active_problem_never_links_historical_report_from_another_incident(status: str):
+    raw = _active_report_provenance_task(status, active_has_report=False)
+
+    problem = primary_task_problem(raw)
+    payload = build_task_payload(raw)
+
+    assert problem is not None
+    assert problem["maintenance_incident_id"] == "maint-new"
+    assert problem["maintenance_report"] is None
+    assert payload["active_maintenance_report"] is None
+    assert payload["latest_maintenance_report"]["incident_id"] == "maint-old"
+
+
+@pytest.mark.parametrize("status", ["BLOCKED", "WAITING"])
+def test_active_problem_links_only_its_own_report(status: str):
+    raw = _active_report_provenance_task(status, active_has_report=True)
+
+    problem = primary_task_problem(raw)
+    payload = build_task_payload(raw)
+
+    assert problem is not None
+    assert problem["maintenance_incident_id"] == "maint-new"
+    assert problem["maintenance_report"]["incident_id"] == "maint-new"
+    assert problem["maintenance_report"]["url"].endswith("/maint-new")
+    assert payload["active_maintenance_report"] == problem["maintenance_report"]
+
+
+def test_equal_timestamp_errors_and_dependency_events_keep_unique_timeline_keys():
+    at = "2026-07-23T01:00:00+00:00"
+    raw = {
+        "errors": [
+            {"at": at, "error": "first error"},
+            {"at": at, "error": "second error"},
+        ],
+        "dependency_events": [
+            {"at": at, "message": "first dependency"},
+            {"at": at, "message": "second dependency"},
+        ],
+    }
+
+    timeline = build_task_timeline(raw)
+
+    assert len(timeline) == 4
+    assert len({item["key"] for item in timeline}) == 4
+    assert {item["message"] for item in timeline} == {
+        "first error",
+        "second error",
+        "first dependency",
+        "second dependency",
+    }
+
+
+def test_action_event_identity_is_persisted_and_legacy_tail_ids_stay_stable(tmp_path: Path):
+    path = tmp_path / "actions.jsonl"
+    configure_action_event_log(path)
+
+    first = append_action_event("send", "complete", detail="first")
+    second = append_action_event("send", "complete", detail="second")
+
+    assert first["event_id"]
+    assert second["event_id"]
+    assert first["event_id"] != second["event_id"]
+    persisted = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [item["event_id"] for item in persisted] == [first["event_id"], second["event_id"]]
+
+    legacy = [
+        {
+            "at": "2026-07-23T01:00:00+00:00",
+            "task_id": "task-rolling",
+            "action": "send",
+            "phase": "complete",
+            "detail": f"legacy-{index:03d}",
+        }
+        for index in range(161)
+    ]
+    path.write_text(
+        "".join(json.dumps(item, sort_keys=True) + "\n" for item in legacy[:160]),
+        encoding="utf-8",
+    )
+    before = read_recent_action_events(path, limit=160)
+    before_ids = {item["detail"]: item["event_id"] for item in before}
+
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(legacy[160], sort_keys=True) + "\n")
+    after = read_recent_action_events(path, limit=160)
+    after_ids = {item["detail"]: item["event_id"] for item in after}
+
+    assert before_ids["legacy-150"] == after_ids["legacy-150"]
+    assert len({item["event_id"] for item in before}) == 160
+    assert len({item["event_id"] for item in after}) == 160
+
+
+def test_maintenance_creation_row_never_back_projects_final_state():
+    raw = {
+        "maintenance": {
+            "active_incident_id": None,
+            "incidents": [
+                {
+                    "incident_id": "maint-history",
+                    "state": "RESOLVED",
+                    "trigger_code": "role_offline",
+                    "trigger_reason": "offline",
+                    "created_at": "2026-07-23T01:00:00+00:00",
+                    "updated_at": "2026-07-23T01:10:00+00:00",
+                    "resolved_at": "2026-07-23T01:10:00+00:00",
+                    "decision": {"action": "OPEN_ROLE_TAB"},
+                }
+            ],
+        }
+    }
+
+    maintenance = [
+        item for item in build_task_timeline(raw) if item["level"] == "MAINTENANCE"
+    ]
+
+    assert [(item["key"], item["at"], item["message"]) for item in maintenance] == [
+        (
+            "maintenance:maint-history:updated",
+            "2026-07-23T01:10:00+00:00",
+            "OPEN_ROLE_TAB · role_offline · offline",
+        ),
+        (
+            "maintenance:maint-history:resolved",
+            "2026-07-23T01:10:00+00:00",
+            "Resolved · role_offline",
+        ),
+        (
+            "maintenance:maint-history:created",
+            "2026-07-23T01:00:00+00:00",
+            "Opened · role_offline · offline",
+        ),
+    ]
+    assert len({item["key"] for item in maintenance}) == 3
+    assert "RESOLVED" not in maintenance[-1]["message"]
