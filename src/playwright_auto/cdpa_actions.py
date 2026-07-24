@@ -19,7 +19,14 @@ _CHATGPT_HOSTS = frozenset({"chatgpt.com", "www.chatgpt.com"})
 
 
 class RoleOwnershipError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "role_ownership_ambiguous",
+    ) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class TeamCloseError(RuntimeError):
@@ -192,7 +199,8 @@ class CDPATabActions:
         created = not matches
         if created and role_record.get("page_id"):
             raise RoleOwnershipError(
-                f"recorded {physical!r} tab is offline; use Open tab for controlled recovery"
+                f"recorded {physical!r} tab is offline; use Open tab for controlled recovery",
+                code="role_offline",
             )
         if created:
             await random_delay(action_delay_multiplier("open_tab"))
@@ -297,16 +305,18 @@ class CDPATabActions:
                     f"conversation reopen redirected away from the recorded URL: {page.url!r}"
                 )
             client = ChatGPTPage(page, timeout_ms=timeout)
-            assigned = await client.set_role(physical, force_new_page_id=True)
-            await client.wait_until_clean_ready(timeout_ms=timeout)
-            await client.bind_task_identity(
-                str(manifest["task_id"]), str(manifest["team"])
+            await client.restore_identity(
+                page_id=page_id,
+                role=physical,
+                task_id=str(manifest["task_id"]),
+                team=str(manifest["team"]),
             )
+            await client.wait_until_clean_ready(timeout_ms=timeout)
             snapshot = await client.assert_ownership()
             await page.bring_to_front()
             return AcquiredRole(
                 client=client,
-                page_id=str(assigned["page_id"]),
+                page_id=page_id,
                 url=str(snapshot.url),
                 created=True,
                 new_chat=False,

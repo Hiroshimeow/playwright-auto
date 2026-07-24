@@ -2530,6 +2530,89 @@ def test_waiting_missing_dependency_creates_one_maintenance_incident():
     assert len(state["maintenance"]["incidents"]) == 1
 
 
+def test_reconcile_replace_task_ignores_catalog_invalid_recorded_replacement(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import playwright_auto.cdpa_maintenance as maintenance_module
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_store import TaskStore, utc_now
+    from test_cdpa_core import poison_catalog_identity_entry, write_config
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task("Parent", requested_team="parent", task_id="task-parent")
+    parent = store.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "STOPPED",
+            "terminal_state": "STOPPED",
+            "active_role": None,
+            "active_hop_id": None,
+            "stopped_at": utc_now(),
+            "stop_reason": "unsafe to continue",
+        },
+    )
+    incident = ensure_maintenance_incident(parent)
+    assert incident is not None
+    incident.update({
+        "state": "RUNNING",
+        "turn": 1,
+        "request_id": "maint-filtered-replace-turn1",
+        "report_path": str(tmp_path / ".plan" / "maintainers" / "report.md"),
+        "report_sha256": "a" * 64,
+        "report_size": 10,
+        "decision": {
+            "action": "REPLACE_TASK",
+            "reason": "stopped parent cannot continue",
+            "role": None,
+            "lesson": None,
+            "replacement": {
+                "target_task_id": "task-parent",
+                "task": "Continue parent safely",
+                "reuse_team": True,
+                "rewire_children": True,
+            },
+        },
+    })
+    parent = store.save_maintenance(parent["manifest_path"], parent)
+    invalid_replacement = store.create_task(
+        "Invalid recorded replacement",
+        requested_team="invalid-replacement",
+        task_id="task-invalid-replacement",
+        replaces_task_id=parent["task_id"],
+        replacement_incident_id=incident["incident_id"],
+    )
+    poison_catalog_identity_entry(store, invalid_replacement)
+    tasks, _errors = store.discover_with_errors()
+    assert invalid_replacement["task_id"] not in {
+        task["task_id"] for task in tasks
+    }
+    coordinator = maintenance_module.MaintainerCoordinator(config, store=store)
+    global_state = coordinator.state_store.load()
+    global_state["history"] = [{
+        "incident_id": incident["incident_id"],
+        "request_id": incident["request_id"],
+        "application_state": "RESOLVED",
+        "replacement_task_id": invalid_replacement["task_id"],
+    }]
+    coordinator.state_store.save(global_state)
+    calls: list[str] = []
+
+    def replace_task_and_rewire(*_args, **_kwargs):
+        calls.append("replace")
+        return {
+            "replacement": {"task_id": "task-valid-replacement"},
+            "rewired_children": [],
+        }
+
+    monkeypatch.setattr(store, "replace_task_and_rewire", replace_task_and_rewire)
+
+    assert coordinator._reconcile_active(Path(parent["manifest_path"]), parent) is True
+    assert calls == ["replace"]
+
+
 def test_reconcile_replace_task_applies_atomic_rewire_once(tmp_path: Path):
     import playwright_auto.cdpa_maintenance as maintenance_module
     from playwright_auto.cdpa_config import load_cdpa_config

@@ -38,6 +38,7 @@ from playwright_auto.durable import RequestLedger, RequestStatus
 from test_cdpa_core import (
     install_cycle_isolation_graph,
     install_duplicate_task_graph,
+    poison_catalog_identity_entry,
     write_config,
 )
 
@@ -200,6 +201,98 @@ class RecordingCDPASendActions:
             created=False,
             new_chat=False,
         )
+
+
+def test_pause_requested_during_role_acquisition_survives_and_applies_before_send(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_task(
+        "owner",
+        requested_team="alpha",
+        task_id="task-presend-control-race",
+    )
+    path = Path(state["manifest_path"])
+    worker = CDPAWorker(config, store=store)
+
+    class ConcurrentAcquireActions(FakeActions):
+        async def acquire(self, current, role):
+            store.request_control(
+                path,
+                "pause",
+                reason="pause requested during role acquisition",
+            )
+            return await super().acquire(current, role)
+
+    actions = ConcurrentAcquireActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    first = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    assert first == store.load(path)
+    assert _active_hop(first)["state"] == "sending"
+    assert len(first["controls"]) == 1
+    assert first["controls"][0]["action"] == "pause"
+    assert first["controls"][0]["role"] is None
+    assert first["controls"][0]["reason"] == "pause requested during role acquisition"
+    assert first["controls"][0]["status"] == "requested"
+
+    second = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    assert second == store.load(path)
+    assert second["status"] == "PAUSED"
+    assert second["controls"][0]["status"] == "applied"
+    assert _active_hop(second)["state"] == "sending"
+
+
+def test_pause_requested_after_accepted_send_survives_without_duplicate_send(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_task(
+        "owner",
+        requested_team="alpha",
+        task_id="task-send-control-race",
+    )
+    path = Path(state["manifest_path"])
+    worker = CDPAWorker(config, store=store)
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: FakeActions())
+    prepared = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+    assert _active_hop(prepared)["state"] == "sending"
+
+    class ConcurrentSendClient(RecordingCDPASendClient):
+        async def send(self, text, **kwargs):
+            receipt = await super().send(text, **kwargs)
+            store.request_control(
+                path,
+                "pause",
+                reason="pause requested after accepted send",
+            )
+            return receipt
+
+    client = ConcurrentSendClient()
+    actions = RecordingCDPASendActions(client)
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    sent = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    assert sent == store.load(path)
+    assert _active_hop(sent)["state"] == "sent"
+    assert len(client.send_calls) == 1
+    assert sent["controls"][0]["action"] == "pause"
+    assert sent["controls"][0]["status"] == "requested"
+
+    paused = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    assert paused == store.load(path)
+    assert paused["status"] == "PAUSED"
+    assert paused["controls"][0]["status"] == "applied"
+    assert _active_hop(paused)["state"] == "sent"
+    assert len(client.send_calls) == 1
 
 
 def test_pre_send_lazily_acquires_only_plan_and_persists_constructor(tmp_path: Path):
@@ -523,7 +616,7 @@ def test_resume_recheck_ownership_failure_reblocks_once(
     assert control["status"] == "reblocked"
     assert control["applied_at"] is not None
     assert control["result"] == {
-        "block_code": "role_ownership_ambiguous",
+        "block_code": "role_offline",
         "block_retryable": False,
         "block_reason": (
             "RoleOwnershipError: recorded 'alpha-plan' tab is offline; "
@@ -575,6 +668,61 @@ def test_terminal_idle_cleanup_preflight_failure_preserves_terminal_result(
     assert result["block_code"] is None
 
 
+def test_automatic_cleanup_preflight_failure_preserves_concurrent_control_atomically(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _, store, state, worker = setup_task(
+        tmp_path,
+        task_id="task-auto-cleanup-preflight-race",
+    )
+    path = Path(state["manifest_path"])
+    state["status"] = "DONE"
+    state["terminal_state"] = "DONE"
+    state["kanban_column"] = "DONE_STOPPED"
+    state["completed_at"] = "2026-07-20T00:00:00+00:00"
+    state["last_role_activity_at"] = "2026-07-20T00:00:00+00:00"
+    state["active_role"] = None
+    state["active_hop_id"] = None
+    state = store.save(path, state)
+    reports_before = list(state["reports"])
+
+    class DuplicateActions(FakeActions):
+        async def preflight_team(self, current):
+            self.preflight_calls += 1
+            store.request_control(
+                current["manifest_path"],
+                "clear_team",
+                confirmed=True,
+                reason="concurrent dashboard clear",
+            )
+            raise RuntimeError("duplicate exact role tabs")
+
+    actions = DuplicateActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    result = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    persisted = store.load(path)
+    assert result == persisted
+    assert persisted["status"] == "DONE"
+    assert persisted["terminal_state"] == "DONE"
+    assert persisted["completed_at"] == "2026-07-20T00:00:00+00:00"
+    assert persisted["reports"] == reports_before
+    assert persisted["cleanup"]["state"] == "ACTIVE"
+    assert persisted["cleanup"]["retry_count"] == 1
+    assert "duplicate exact role tabs" in persisted["cleanup"]["last_error"]
+    assert [
+        (item["control_id"], item["action"], item["status"], item.get("reason"))
+        for item in persisted["controls"]
+    ] == [
+        (1, "clear_team", "requested", "concurrent dashboard clear"),
+    ]
+    assert actions.preflight_calls == 1
+    assert actions.stop_calls == 0
+    assert actions.closed_teams == 0
+
+
 def test_clear_team_preserves_done_terminal_state(tmp_path: Path):
     _, store, state, worker = setup_task(tmp_path, task_id="task-clear-done")
     path = Path(state["manifest_path"])
@@ -605,7 +753,7 @@ def test_clear_team_preserves_done_terminal_state(tmp_path: Path):
 
 
 def test_clear_team_preflight_failure_happens_before_stop_or_close(tmp_path: Path):
-    _, _, state, worker = setup_task(tmp_path, task_id="task-clear-preflight")
+    _, store, state, worker = setup_task(tmp_path, task_id="task-clear-preflight")
     path = Path(state["manifest_path"])
     state["controls"] = [{
         "control_id": 1,
@@ -614,6 +762,7 @@ def test_clear_team_preflight_failure_happens_before_stop_or_close(tmp_path: Pat
         "confirmed": True,
         "status": "requested",
     }]
+    state = store.save(path, state)
 
     class DuplicateActions(FakeActions):
         async def preflight_team(self, _state):
@@ -628,6 +777,51 @@ def test_clear_team_preflight_failure_happens_before_stop_or_close(tmp_path: Pat
     assert state["cleanup"]["state"] == "ACTIVE"
     assert state["status"] == "INBOX"
     assert state["active_hop_id"] == 1
+
+
+def test_clear_team_preflight_failure_preserves_concurrent_control_atomically(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    store.request_control(owner["manifest_path"], "clear_team", confirmed=True)
+    worker = CDPAWorker(config, store=store)
+
+    class DuplicateActions(FakeActions):
+        async def preflight_team(self, state):
+            self.preflight_calls += 1
+            store.request_control(
+                state["manifest_path"],
+                "pause",
+                reason="concurrent dashboard pause",
+            )
+            raise RuntimeError("duplicate exact role tabs")
+
+    actions = DuplicateActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    result = asyncio.run(
+        worker.advance(owner["manifest_path"], SimpleNamespace(pages=[]))
+    )
+
+    persisted = store.load(owner["manifest_path"])
+    assert result == persisted
+    assert persisted["status"] == "INBOX"
+    assert persisted["active_hop_id"] == 1
+    assert persisted["cleanup"]["state"] == "ACTIVE"
+    assert [
+        (item["control_id"], item["action"], item["status"], item.get("reason"))
+        for item in persisted["controls"]
+    ] == [
+        (1, "clear_team", "rejected", None),
+        (2, "pause", "requested", "concurrent dashboard pause"),
+    ]
+    assert "duplicate exact role tabs" in persisted["controls"][0]["result"]
+    assert actions.preflight_calls == 1
+    assert actions.stop_calls == 0
+    assert actions.closed_teams == 0
 
 
 def test_clear_team_stop_failure_persists_stopped_recoverable_state_and_resumes(
@@ -671,6 +865,130 @@ def test_clear_team_stop_failure_persists_stopped_recoverable_state_and_resumes(
     assert resumed.stop_calls == 1
     assert resumed.closed_teams == 1
     assert result["block_code"] is None
+
+
+def test_cleanup_stop_failure_preserves_concurrent_control_atomically(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-stop-race")
+    store.request_control(owner["manifest_path"], "clear_team", confirmed=True)
+    worker = CDPAWorker(config, store=store)
+
+    class StopFailureActions(FakeActions):
+        async def stop_if_active(self, _acquired):
+            self.stop_calls += 1
+            store.request_control(
+                owner["manifest_path"],
+                "pause",
+                reason="concurrent dashboard pause",
+            )
+            raise RuntimeError("stop inspection failed")
+
+    actions = StopFailureActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    result = asyncio.run(worker.advance(owner["manifest_path"], SimpleNamespace(pages=[])))
+
+    persisted = store.load(owner["manifest_path"])
+    assert result == persisted
+    assert persisted["status"] == "STOPPED"
+    assert persisted["active_hop_id"] is None
+    assert persisted["cleanup"]["state"] == "CLEARING"
+    assert persisted["cleanup"]["phase"] == "stop_pending"
+    assert persisted["cleanup"]["retry_count"] == 1
+    assert "stop inspection failed" in persisted["cleanup"]["last_error"]
+    assert [
+        (item["control_id"], item["action"], item["status"], item.get("reason"))
+        for item in persisted["controls"]
+    ] == [
+        (1, "clear_team", "cleanup_pending", None),
+        (2, "pause", "requested", "concurrent dashboard pause"),
+    ]
+    assert actions.stop_calls == 1
+    assert actions.closed_teams == 0
+
+
+def test_cleanup_close_success_preserves_concurrent_control_atomically(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-close-race")
+    store.request_control(owner["manifest_path"], "clear_team", confirmed=True)
+    worker = CDPAWorker(config, store=store)
+
+    class ConcurrentCloseActions(FakeActions):
+        async def close_team(self, state, *, preflighted_pages=None):
+            store.request_control(
+                state["manifest_path"],
+                "pause",
+                reason="concurrent dashboard pause",
+            )
+            return await super().close_team(state, preflighted_pages=preflighted_pages)
+
+    actions = ConcurrentCloseActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    result = asyncio.run(worker.advance(owner["manifest_path"], SimpleNamespace(pages=[])))
+
+    persisted = store.load(owner["manifest_path"])
+    assert result == persisted
+    assert persisted["cleanup"]["state"] == "CLEARED"
+    assert persisted["cleanup"]["closed_tabs"] == 1
+    assert [
+        (item["control_id"], item["action"], item["status"], item.get("reason"))
+        for item in persisted["controls"]
+    ] == [
+        (1, "clear_team", "applied", None),
+        (2, "pause", "requested", "concurrent dashboard pause"),
+    ]
+    assert actions.closed_teams == 1
+    assert actions.pages == []
+
+
+def test_cleanup_verification_preserves_concurrent_control_atomically(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-verify-race")
+    store.request_control(owner["manifest_path"], "clear_team", confirmed=True)
+    worker = CDPAWorker(config, store=store)
+
+    class ConcurrentVerifyActions(FakeActions):
+        async def preflight_team(self, state):
+            self.preflight_calls += 1
+            if self.closed_teams:
+                store.request_control(
+                    state["manifest_path"],
+                    "pause",
+                    reason="concurrent dashboard pause",
+                )
+            return list(self.pages)
+
+    actions = ConcurrentVerifyActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    result = asyncio.run(worker.advance(owner["manifest_path"], SimpleNamespace(pages=[])))
+
+    persisted = store.load(owner["manifest_path"])
+    assert result == persisted
+    assert persisted["cleanup"]["state"] == "CLEARED"
+    assert persisted["cleanup"]["closed_tabs"] == 1
+    assert [
+        (item["control_id"], item["action"], item["status"], item.get("reason"))
+        for item in persisted["controls"]
+    ] == [
+        (1, "clear_team", "applied", None),
+        (2, "pause", "requested", "concurrent dashboard pause"),
+    ]
+    assert actions.preflight_calls == 2
+    assert actions.closed_teams == 1
 
 
 def test_clear_team_partial_close_failure_resumes_remaining_tabs(
@@ -1186,6 +1504,90 @@ def test_open_tab_recovers_presend_role_offline_and_sends_original_once(
     assert len(sent_prompts) == 1
 
 
+def test_open_tab_recovers_waiting_accepted_send_on_exact_conversation_without_resend(
+    tmp_path: Path,
+):
+    _, _, state, worker = setup_task(
+        tmp_path, task_id="task-open-tab-waiting-accepted"
+    )
+    hop = _active_hop(state)
+    conversation_url = "https://chatgpt.com/c/owned-plan"
+    original_request_id = hop["request_id"]
+    receipt = {
+        "prompt": "accepted prompt",
+        "prompt_sha256": "digest",
+        "binding": {"page_id": "closed-page", "role": "alpha-plan"},
+        "accepted_via": "user_message_identity",
+        "user_message_id": "accepted-user-message",
+        "user_turn_id": "accepted-user-turn",
+    }
+    hop.update(
+        state="waiting",
+        conversation_url=conversation_url,
+        receipt=receipt,
+    )
+    state.update(
+        status="BLOCKED",
+        kanban_column="BLOCKED",
+        block_code="role_offline",
+        block_retryable=False,
+        block_reason="owned alpha-plan tab is offline",
+    )
+    state["roles"]["PLAN"].update(
+        page_id="closed-page",
+        page_url=conversation_url,
+        online=False,
+    )
+    state["controls"] = [
+        {
+            "control_id": 1,
+            "action": "open_tab",
+            "role": "PLAN",
+            "reason": "recover exact accepted waiting conversation",
+            "status": "requested",
+        }
+    ]
+
+    acquired = AcquiredRole(
+        client=SimpleNamespace(),
+        page_id="closed-page",
+        url=conversation_url,
+        created=True,
+        new_chat=False,
+    )
+
+    class ExactWaitingRecovery:
+        def __init__(self):
+            self.reopen_calls = 0
+
+        async def locate_owned(self, *_args, **_kwargs):
+            return None
+
+        async def reopen(self, *_args, **_kwargs):
+            self.reopen_calls += 1
+            return acquired
+
+    actions = ExactWaitingRecovery()
+
+    assert asyncio.run(worker._apply_control(state, actions)) is True
+    assert actions.reopen_calls == 1
+    assert state["status"] == "RUNNING"
+    assert state["block_code"] is None
+    assert state["roles"]["PLAN"]["page_id"] == "closed-page"
+    assert state["roles"]["PLAN"]["page_url"] == conversation_url
+    assert hop["state"] == "waiting"
+    assert hop["request_id"] == original_request_id
+    assert hop["receipt"] == receipt
+    assert state["controls"][0]["status"] == "applied"
+    assert state["controls"][0]["result"] == {
+        "page_id": "closed-page",
+        "recovered": True,
+        "resumed": True,
+        "hop_id": hop["hop_id"],
+        "request_id": original_request_id,
+    }
+
+
 @pytest.mark.parametrize("hop_state", ["sending", "sent", "waiting"])
 def test_open_tab_rejects_inflight_role_offline_without_browser_mutation(
     tmp_path: Path,
@@ -1362,6 +1764,97 @@ def test_stop_targets_active_role_even_if_control_selects_another_role(tmp_path:
     assert state["controls"][0]["status"] == "applied"
 
 
+def test_stop_control_preserves_later_clear_team_atomically(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-stop-control-race")
+    store.request_control(
+        owner["manifest_path"],
+        "stop",
+        reason="manual stop",
+    )
+    worker = CDPAWorker(config, store=store)
+
+    class ConcurrentStopActions(FakeActions):
+        async def stop_if_active(self, acquired):
+            self.stop_calls += 1
+            store.request_control(
+                owner["manifest_path"],
+                "clear_team",
+                confirmed=True,
+                reason="concurrent dashboard clear after stop",
+            )
+            return True
+
+    actions = ConcurrentStopActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    result = asyncio.run(worker.advance(owner["manifest_path"], SimpleNamespace(pages=[])))
+
+    persisted = store.load(owner["manifest_path"])
+    assert result == persisted
+    assert persisted["status"] == "STOPPED"
+    assert persisted["stop_reason"] == "manual stop"
+    assert [
+        (item["control_id"], item["action"], item["status"], item.get("reason"))
+        for item in persisted["controls"]
+    ] == [
+        (1, "stop", "applied", "manual stop"),
+        (2, "clear_team", "requested", "concurrent dashboard clear after stop"),
+    ]
+    assert persisted["controls"][0]["result"] == {"stopped_response": True}
+    assert actions.stop_calls == 1
+    assert actions.closed_teams == 0
+
+    cleared = asyncio.run(
+        worker.advance(owner["manifest_path"], SimpleNamespace(pages=[]))
+    )
+    assert cleared == store.load(owner["manifest_path"])
+    assert cleared["cleanup"]["state"] == "CLEARED"
+    assert cleared["controls"][1]["status"] == "applied"
+    assert actions.closed_teams == 1
+
+
+def test_new_chat_control_preserves_later_pause_atomically(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-new-chat-control-race")
+    store.request_control(owner["manifest_path"], "new_chat", role="PLAN")
+    worker = CDPAWorker(config, store=store)
+
+    class ConcurrentNewChatActions(FakeActions):
+        async def new_chat(self, state, role):
+            store.request_control(
+                owner["manifest_path"],
+                "pause",
+                reason="concurrent dashboard pause",
+            )
+            return await super().new_chat(state, role)
+
+    actions = ConcurrentNewChatActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    result = asyncio.run(worker.advance(owner["manifest_path"], SimpleNamespace(pages=[])))
+
+    persisted = store.load(owner["manifest_path"])
+    assert result == persisted
+    assert persisted["roles"]["PLAN"]["page_id"] == "new-chat-alpha-plan"
+    assert persisted["roles"]["PLAN"]["conversation_generation"] == 1
+    assert [
+        (item["control_id"], item["action"], item["status"], item.get("reason"))
+        for item in persisted["controls"]
+    ] == [
+        (1, "new_chat", "applied", None),
+        (2, "pause", "requested", "concurrent dashboard pause"),
+    ]
+
+
 def test_route_plan_abandons_superseded_unsent_hop(tmp_path: Path):
     _, _, state, worker = setup_task(tmp_path, task_id="task-route-plan")
     plan_hop = _active_hop(state)
@@ -1394,6 +1887,50 @@ def test_route_plan_abandons_superseded_unsent_hop(tmp_path: Path):
     assert new_hop["parent_hop_id"] == dev_hop["hop_id"]
     assert state["route_timeline"][-1]["kind"] == "control"
     assert state["route_timeline"][-1]["new_hop_id"] == new_hop["hop_id"]
+
+
+def test_maintainers_route_plan_delivers_repair_brief_to_team(tmp_path: Path):
+    _, _, state, worker = setup_task(tmp_path, task_id="task-maintainer-repair-plan")
+    plan_hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, plan_hop, FakeActions()))
+    report = (
+        tmp_path
+        / ".plan"
+        / "alpha"
+        / "alpha-plan_turn1_task-maintainer-repair-plan.md"
+    )
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("plan evidence", encoding="utf-8")
+    plan_hop["response"] = (
+        '{"route":"DEV","handoff":'
+        '".plan/alpha/alpha-plan_turn1_task-maintainer-repair-plan.md"}'
+    )
+    plan_hop["state"] = "responded"
+    worker._responded(state, plan_hop)
+    dev_hop = _active_hop(state)
+    state["controls"] = [
+        {
+            "control_id": 1,
+            "action": "route_plan",
+            "role": "DEV",
+            "reason": "Repeated role-offline classification requires a durable repair.",
+            "status": "requested",
+            "maintenance_incident_id": "maint-role-offline-pattern",
+            "maintenance_request_id": "maint-role-offline-pattern-turn1",
+        }
+    ]
+
+    assert asyncio.run(worker._apply_control(state, FakeActions())) is True
+
+    repair_hop = _active_hop(state)
+    assert dev_hop["state"] == "abandoned"
+    assert repair_hop["target_role"] == "PLAN"
+    assert repair_hop["kind"] == "maintenance_repair"
+    assert "CDPA_MAINTENANCE_REPAIR_REQUEST" in repair_hop["handoff"]
+    assert "maint-role-offline-pattern" in repair_hop["handoff"]
+    assert "Repeated role-offline classification" in repair_hop["handoff"]
+    assert str(report) in repair_hop["handoff"]
+    assert "PLAN must inspect the evidence" in repair_hop["handoff"]
 
 
 def test_new_chat_remains_rejected_at_inflight_boundary(tmp_path: Path):
@@ -1903,6 +2440,103 @@ def test_timeout_banner_without_stop_refreshes_after_no_progress_and_accepts_reh
     assert hop["response"] == final.text
     assert hop["request_id"] == "task-timeout-f5-hop1"
     assert hop["turn"] == 1
+
+
+def test_pause_requested_during_refresh_survives_refresh_checkpoints(
+    tmp_path: Path,
+    monkeypatch,
+):
+    store, state, worker, path, hop, receipt, sent_at = _prepare_sent_waiting_task(
+        tmp_path,
+        task_id="task-refresh-control-race",
+    )
+    old = sent_at - timedelta(minutes=21)
+    progress = MessageSnapshot(
+        "assistant",
+        "a-progress",
+        "ta-progress",
+        "still working",
+        (),
+    )
+    snapshot = SimpleNamespace(
+        state=ChatGPTState.ERROR,
+        stop_visible=False,
+        composer_empty=True,
+        manual_input_pending=False,
+        error_texts=("Message delivery timed out. Please try again.",),
+        blocking_dialogs=(),
+        messages=(
+            MessageSnapshot("user", "u1", "t1", receipt.prompt, ()),
+            progress,
+        ),
+    )
+    signature, length = response_activity_signature(snapshot, receipt.baseline)
+    hop["timestamps"]["sent_at"] = old.isoformat()
+    hop["wait"].update(
+        {
+            "started_at": old.isoformat(),
+            "deadline_at": (old + timedelta(hours=2)).isoformat(),
+            "activity_signature": signature,
+            "activity_length": length,
+            "activity_changed_at": old.isoformat(),
+            "activity_observed_at": old.isoformat(),
+        }
+    )
+    store.save(path, state)
+
+    class Client:
+        def __init__(self):
+            self.wait_calls = 0
+
+        async def assert_ownership(self):
+            return snapshot
+
+        async def wait_for_response(self, _receipt, **_kwargs):
+            self.wait_calls += 1
+            raise TimeoutError("continue polling")
+
+    client = Client()
+    acquired = AcquiredRole(
+        client=client,
+        page_id="page-alpha-plan",
+        url="https://chatgpt.com/c/exact",
+        created=False,
+        new_chat=False,
+    )
+
+    class ConcurrentRefreshActions:
+        def __init__(self):
+            self.refresh_calls = 0
+
+        async def locate_owned(self, _state, _role):
+            return acquired
+
+        async def refresh(self, _acquired):
+            self.refresh_calls += 1
+            store.request_control(
+                path,
+                "pause",
+                reason="pause requested during refresh",
+            )
+
+    actions = ConcurrentRefreshActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    refreshed = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    assert refreshed == store.load(path)
+    assert _active_hop(refreshed)["state"] == "waiting"
+    assert _active_hop(refreshed)["wait"]["refresh_count"] == 1
+    assert refreshed["controls"][0]["action"] == "pause"
+    assert refreshed["controls"][0]["status"] == "requested"
+    assert actions.refresh_calls == 1
+
+    paused = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    assert paused == store.load(path)
+    assert paused["status"] == "PAUSED"
+    assert paused["controls"][0]["status"] == "applied"
+    assert actions.refresh_calls == 1
 
 
 def test_waiting_persists_pre_refresh_provenance_before_f5(tmp_path: Path):
@@ -2772,6 +3406,69 @@ def test_clear_team_reverifies_and_closes_tab_after_false_cleared_state(tmp_path
     assert result["controls"][-1]["result"]["reverified"] is True
 
 
+def test_clear_team_failed_reverify_clears_old_verification_evidence(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _, store, state, worker = setup_task(tmp_path, task_id="task-cleared-tab-recheck-failure")
+    path = Path(state["manifest_path"])
+    old_verified = datetime.now(timezone.utc).isoformat()
+    state.update(
+        {
+            "status": "STOPPED",
+            "terminal_state": "STOPPED",
+            "active_role": None,
+            "active_hop_id": None,
+        }
+    )
+    state["cleanup"].update(
+        {
+            "state": "CLEARED",
+            "phase": "cleared",
+            "cleared_at": old_verified,
+            "verified_empty_at": old_verified,
+            "closed_tabs": 0,
+        }
+    )
+    state["controls"].append(
+        {
+            "control_id": 1,
+            "action": "clear_team",
+            "role": "PLAN",
+            "reason": None,
+            "confirmed": True,
+            "status": "requested",
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "applied_at": None,
+            "result": None,
+        }
+    )
+    store.save(path, state)
+
+    class ReverifyFailureActions(FakeActions):
+        async def close_team(self, _state, *, preflighted_pages=None):
+            self.closed_teams += 1
+            raise TeamCloseError("synthetic reverify close failure", closed_tabs=0)
+
+    actions = ReverifyFailureActions()
+    actions.pages = ["surviving-tab"]
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    result = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+    persisted = store.load(path)
+
+    assert result == persisted
+    assert persisted["cleanup"]["state"] == "CLEARING"
+    assert persisted["cleanup"]["phase"] == "close_pending"
+    assert persisted["cleanup"]["cleared_at"] is None
+    assert persisted["cleanup"]["verified_empty_at"] is None
+    assert persisted["cleanup"]["retry_count"] == 1
+    assert "synthetic reverify close failure" in persisted["cleanup"]["last_error"]
+    assert persisted["controls"][0]["status"] == "cleanup_pending"
+    assert persisted["controls"][0]["result"].get("reverified") is None
+    assert actions.pages == ["surviving-tab"]
+
+
 def test_run_once_passes_locked_task_path_to_global_maintainers(
     tmp_path: Path, monkeypatch
 ):
@@ -2781,7 +3478,9 @@ def test_run_once_passes_locked_task_path_to_global_maintainers(
     path = Path(state["manifest_path"])
     calls = []
 
-    async def locked_advance(_manifest_path, _browser_context):
+    async def locked_advance(
+        _manifest_path, _browser_context, *, scheduling_tasks=None
+    ):
         return None
 
     class FakeCoordinator:
@@ -2981,7 +3680,9 @@ def test_run_once_advances_global_maintainers_after_task_iteration(
     path = Path(state["manifest_path"])
     calls = []
 
-    async def fake_advance(manifest_path, _browser_context):
+    async def fake_advance(
+        manifest_path, _browser_context, *, scheduling_tasks=None
+    ):
         current = store.load(manifest_path)
         current["status"] = "BLOCKED"
         current["kanban_column"] = "BLOCKED"
@@ -3494,6 +4195,1232 @@ def test_stopped_and_missing_dependencies_remain_waiting_across_restart(tmp_path
     assert store.load(path)["waiting"]["missing"] == ["task-parent"]
 
 
+def test_same_team_queue_releases_oldest_ready_task_before_browser_access(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    queued_b = store.create_task("queued b", reuse_team="alpha", task_id="task-b")
+    queued_a = store.create_task("queued a", reuse_team="alpha", task_id="task-a")
+    same_time = "2026-07-23T00:00:00+00:00"
+    for queued in (queued_a, queued_b):
+        store.update(
+            queued["manifest_path"],
+            lambda state: {
+                **state,
+                "created_at": same_time,
+                "queue": {**state["queue"], "enqueued_at": same_time},
+            },
+        )
+    store.update(
+        owner["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+    worker = CDPAWorker(config, store=store)
+
+    later = asyncio.run(worker.advance(queued_b["manifest_path"], ExplodingBrowserContext()))
+    first = asyncio.run(worker.advance(queued_a["manifest_path"], ExplodingBrowserContext()))
+
+    assert later["status"] == "WAITING"
+    assert later["waiting"]["blocked_by_task_id"] == "task-a"
+    assert first["status"] == "INBOX"
+    assert first["queue"]["released_at"]
+    assert first["reusable_teams"] == ["alpha"]
+
+    still_waiting = asyncio.run(
+        worker.advance(queued_b["manifest_path"], ExplodingBrowserContext())
+    )
+    assert still_waiting["status"] == "WAITING"
+    assert still_waiting["waiting"]["blocked_by_task_id"] == "task-a"
+
+    store.update(
+        queued_a["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+    released = asyncio.run(
+        worker.advance(queued_b["manifest_path"], ExplodingBrowserContext())
+    )
+    assert released["status"] == "INBOX"
+    assert released["queue_events"][-1]["status"] == "RELEASED"
+
+
+def test_run_once_cannot_create_two_mixed_same_team_owners(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task("parent", requested_team="parent", task_id="task-parent")
+    first = store.create_task(
+        "first",
+        requested_team="alpha",
+        task_id="task-first",
+        depends_on_task_ids=(parent["task_id"],),
+    )
+    second = store.create_task(
+        "second",
+        reuse_team="alpha",
+        task_id="task-second",
+        depends_on_task_ids=(parent["task_id"],),
+    )
+    store.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+    worker = CDPAWorker(config, store=store)
+
+    class FakeCoordinator:
+        async def advance(self, tasks, _browser_context):
+            assert len(tasks) == 3
+            return False
+
+    worker.maintainers = FakeCoordinator()
+    asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
+
+    first_state = store.load(first["manifest_path"])
+    second_state = store.load(second["manifest_path"])
+    states = [first_state, second_state]
+    assert sum(state["status"] == "INBOX" for state in states) == 1
+    assert sum(state["status"] == "WAITING" for state in states) == 1
+    owner = next(state for state in states if state["status"] == "INBOX")
+    waiting = next(state for state in states if state["status"] == "WAITING")
+    assert owner["task_id"] == first["task_id"]
+    assert waiting["waiting"]["blocked_by_task_id"] == owner["task_id"]
+    assert waiting["hops"][0]["state"] == "pre_send"
+
+
+def test_run_once_atomically_releases_only_one_same_team_queue_owner(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    queued_a = store.create_task("queued a", reuse_team="alpha", task_id="task-a")
+    queued_b = store.create_task("queued b", reuse_team="alpha", task_id="task-b")
+    store.update(
+        owner["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+    worker = CDPAWorker(config, store=store)
+
+    class FakeCoordinator:
+        async def advance(self, tasks, _browser_context):
+            assert len(tasks) == 3
+            return False
+
+    worker.maintainers = FakeCoordinator()
+    asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
+
+    states = [store.load(queued_a["manifest_path"]), store.load(queued_b["manifest_path"])]
+    assert sum(state["status"] == "INBOX" for state in states) == 1
+    assert sum(state["status"] == "WAITING" for state in states) == 1
+    owner_ids = [state["task_id"] for state in states if state["status"] == "INBOX"]
+    waiting = next(state for state in states if state["status"] == "WAITING")
+    assert waiting["waiting"]["blocked_by_task_id"] == owner_ids[0]
+
+
+@pytest.mark.parametrize("owner_failure", ["missing", "invalid_json"])
+def test_queue_owner_loss_stays_waiting_before_browser_and_opens_one_incident(
+    tmp_path: Path,
+    owner_failure: str,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    queued = store.create_task("queued", reuse_team="alpha", task_id="task-queued")
+    before = store.load(queued["manifest_path"])
+    owner_path = Path(owner["manifest_path"])
+    if owner_failure == "missing":
+        owner_path.unlink()
+    else:
+        owner_path.write_text("{", encoding="utf-8")
+
+    result = asyncio.run(
+        CDPAWorker(config, store=store).advance(
+            queued["manifest_path"], ExplodingBrowserContext()
+        )
+    )
+
+    assert result["status"] == "WAITING"
+    assert result["waiting_code"] == "queue_release_failed"
+    assert result["queue"] == before["queue"]
+    assert result["queue"]["released_at"] is None
+    assert result["active_hop_id"] == before["active_hop_id"]
+    assert result["hops"] == before["hops"]
+    first = ensure_maintenance_incident(result)
+    second = ensure_maintenance_incident(result)
+    assert first is second
+    assert first["trigger_code"] == "queue_release_failed"
+    assert len(result["maintenance"]["incidents"]) == 1
+
+
+def test_queue_catalog_mismatch_persists_across_two_worker_polls_without_reconciliation(
+    tmp_path: Path,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    queued = store.create_task("queued", reuse_team="alpha", task_id="task-queued")
+    before = store.load(queued["manifest_path"])
+    owner_key = store._catalog_key(owner["manifest_path"])
+    catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    catalog["entries"][owner_key]["status"] = "DONE"
+    poisoned_owner_entry = json.loads(json.dumps(catalog["entries"][owner_key]))
+    store.catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    worker = CDPAWorker(config, store=store)
+
+    first = asyncio.run(
+        worker.advance(queued["manifest_path"], ExplodingBrowserContext())
+    )
+    first_incident = ensure_maintenance_incident(first)
+    assert first_incident is not None
+    first_incident_id = first_incident["incident_id"]
+    store.save_maintenance(queued["manifest_path"], first)
+
+    after_first = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    assert after_first["entries"][owner_key] == poisoned_owner_entry
+    assert first["status"] == "WAITING"
+    assert first["waiting_code"] == "queue_release_failed"
+    assert first["queue"]["released_at"] is None
+    assert first["hops"] == before["hops"]
+
+    second = asyncio.run(
+        worker.advance(queued["manifest_path"], ExplodingBrowserContext())
+    )
+    second_incident = ensure_maintenance_incident(second)
+
+    after_second = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    assert after_second["entries"][owner_key] == poisoned_owner_entry
+    assert second["status"] == "WAITING"
+    assert second["waiting_code"] == "queue_release_failed"
+    assert second["queue"]["released_at"] is None
+    assert second["hops"] == before["hops"]
+    assert second_incident is not None
+    assert second_incident["incident_id"] == first_incident_id
+    assert len(second["maintenance"]["incidents"]) == 1
+
+
+@pytest.mark.parametrize(
+    "catalog_corruption",
+    [
+        "status_mismatch",
+        "non_mapping",
+        "missing_manifest_path",
+        "wrong_three_part_key",
+        "backslash_key",
+        "identity_missing_path",
+        "identity_outside_path",
+    ],
+)
+def test_run_once_preserves_catalog_mismatch_and_queue_incident_across_polls(
+    tmp_path: Path,
+    monkeypatch,
+    catalog_corruption: str,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    queued = store.create_task("queued", reuse_team="alpha", task_id="task-queued")
+    unrelated = store.create_task(
+        "unrelated", requested_team="beta", task_id="task-unrelated"
+    )
+    queued_before = store.load(queued["manifest_path"])
+    unrelated_before = store.load(unrelated["manifest_path"])
+    owner_key = store._catalog_key(owner["manifest_path"])
+    catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    poisoned_key = owner_key
+    if catalog_corruption == "status_mismatch":
+        catalog["entries"][owner_key]["status"] = "DONE"
+    elif catalog_corruption == "non_mapping":
+        catalog["entries"][owner_key] = "corrupt"
+    elif catalog_corruption == "missing_manifest_path":
+        del catalog["entries"][owner_key]["manifest_path"]
+    else:
+        entry = catalog["entries"].pop(owner_key)
+        if catalog_corruption == "wrong_three_part_key":
+            poisoned_key = "wrong/task-owner/owner.json"
+        elif catalog_corruption == "backslash_key":
+            poisoned_key = "alpha\\bad/task-owner/owner.json"
+        else:
+            poisoned_key = "bad"
+            if catalog_corruption == "identity_missing_path":
+                del entry["manifest_path"]
+            else:
+                entry["manifest_path"] = str((tmp_path / "outside-owner.json").resolve())
+        catalog["entries"][poisoned_key] = entry
+    poisoned = json.loads(json.dumps(catalog["entries"][poisoned_key]))
+    store.catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    worker = CDPAWorker(config, store=store)
+    real_advance = worker.advance
+    advanced: list[str] = []
+    incident_ids: list[str] = []
+
+    async def selective_advance(path, browser_context, *, scheduling_tasks=None):
+        state = store.load(path)
+        advanced.append(state["task_id"])
+        if state["task_id"] == queued["task_id"]:
+            return await real_advance(
+                path,
+                browser_context,
+                scheduling_tasks=scheduling_tasks,
+            )
+        return state
+
+    class RecordingCoordinator:
+        async def advance(self, tasks, _browser_context):
+            for path, state in tasks:
+                if state.get("waiting_code") != "queue_release_failed":
+                    continue
+                incident = ensure_maintenance_incident(state)
+                assert incident is not None
+                incident_ids.append(incident["incident_id"])
+                store.save_maintenance(path, state)
+            return False
+
+    monkeypatch.setattr(worker, "advance", selective_advance)
+    worker.maintainers = RecordingCoordinator()
+
+    first = asyncio.run(worker.run_once(ExplodingBrowserContext()))
+    second = asyncio.run(worker.run_once(ExplodingBrowserContext()))
+
+    after = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    queued_after = store.load(queued["manifest_path"])
+    unrelated_after = store.load(unrelated["manifest_path"])
+    assert after["entries"][poisoned_key] == poisoned
+    if poisoned_key != owner_key:
+        assert owner_key not in after["entries"]
+    assert incident_ids[0] == incident_ids[1]
+    assert len(queued_after["maintenance"]["incidents"]) == 1
+    assert queued_after["status"] == "WAITING"
+    assert queued_after["waiting_code"] == "queue_release_failed"
+    assert queued_after["queue"]["released_at"] is None
+    assert queued_after["hops"] == queued_before["hops"]
+    assert unrelated_after == unrelated_before
+    assert owner["task_id"] not in advanced
+    assert advanced.count(unrelated["task_id"]) == 2
+    assert all(
+        result is None or result.get("task_id") != queued["task_id"]
+        or result.get("waiting_code") == "queue_release_failed"
+        for result in (*first, *second)
+    )
+
+
+@pytest.mark.parametrize("parent_status", ["DONE", "STOPPED"])
+def test_run_once_keeps_catalog_invalid_dependency_parent_fail_closed_across_polls(
+    tmp_path: Path,
+    monkeypatch,
+    parent_status: str,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task(
+        "Parent", requested_team="alpha", task_id="task-parent"
+    )
+    child = store.create_task(
+        "Child",
+        requested_team="beta",
+        task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+    unrelated = store.create_task(
+        "Unrelated", requested_team="gamma", task_id="task-unrelated"
+    )
+    parent = store.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "status": parent_status,
+            "terminal_state": parent_status,
+            "active_role": None,
+            "active_hop_id": None,
+            **(
+                {"completed_at": utc_now()}
+                if parent_status == "DONE"
+                else {"stopped_at": utc_now(), "stop_reason": "failed parent"}
+            ),
+        },
+    )
+    parent_path = Path(parent["manifest_path"])
+    child_path = Path(child["manifest_path"])
+    parent_before = parent_path.read_bytes()
+    child_before = store.load(child_path)
+    poisoned = poison_catalog_identity_entry(store, parent)
+    worker = CDPAWorker(config, store=store)
+    real_advance = worker.advance
+    advanced: list[str] = []
+    incident_ids: list[str] = []
+
+    class CountingBrowserContext:
+        def __init__(self):
+            self.page_reads = 0
+
+        @property
+        def pages(self):
+            self.page_reads += 1
+            raise AssertionError("catalog-invalid dependency must not inspect browser pages")
+
+    async def selective_advance(path, browser_context, *, scheduling_tasks=None):
+        state = store.load(path)
+        advanced.append(state["task_id"])
+        if state["task_id"] == child["task_id"]:
+            return await real_advance(
+                path,
+                browser_context,
+                scheduling_tasks=scheduling_tasks,
+            )
+        return state
+
+    class RecordingCoordinator:
+        async def advance(self, tasks, _browser_context):
+            for path, state in tasks:
+                incident = ensure_maintenance_incident(state)
+                if incident is None:
+                    continue
+                incident_ids.append(incident["incident_id"])
+                store.save_maintenance(path, state)
+            return False
+
+    monkeypatch.setattr(worker, "advance", selective_advance)
+    worker.maintainers = RecordingCoordinator()
+    browser_context = CountingBrowserContext()
+
+    asyncio.run(worker.run_once(browser_context))
+    asyncio.run(worker.run_once(browser_context))
+
+    current = store.load(child_path)
+    catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    assert parent["task_id"] not in advanced
+    assert advanced.count(child["task_id"]) == 2
+    assert advanced.count(unrelated["task_id"]) == 2
+    assert current["status"] == "WAITING"
+    assert current["waiting_code"] == "dependency_missing"
+    assert current["waiting"]["missing"] == [parent["task_id"]]
+    assert current["hops"] == child_before["hops"]
+    assert not any(
+        item["status"] == "RELEASED" for item in current["dependency_events"]
+    )
+    assert browser_context.page_reads == 0
+    assert len(incident_ids) == 2
+    assert incident_ids[0] == incident_ids[1]
+    assert len(current["maintenance"]["incidents"]) == 1
+    assert parent_path.read_bytes() == parent_before
+    assert catalog["entries"]["bad"] == poisoned
+
+
+def test_unrelated_create_keeps_catalog_invalid_owner_out_of_worker_loop(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    owner_key = store._catalog_key(owner["manifest_path"])
+    poisoned = poison_catalog_identity_entry(store, owner)
+    unrelated = store.create_task(
+        "Unrelated", requested_team="beta", task_id="task-unrelated"
+    )
+    worker = CDPAWorker(config, store=store)
+    real_advance = worker.advance
+    advanced: list[str] = []
+
+    class CountingBrowserContext:
+        def __init__(self):
+            self.page_reads = 0
+
+        @property
+        def pages(self):
+            self.page_reads += 1
+            raise AssertionError("catalog-invalid owner must not inspect browser pages")
+
+    async def selective_advance(path, browser_context, *, scheduling_tasks=None):
+        state = store.load(path)
+        advanced.append(state["task_id"])
+        if state["task_id"] == owner["task_id"]:
+            return await real_advance(
+                path,
+                browser_context,
+                scheduling_tasks=scheduling_tasks,
+            )
+        return state
+
+    class FakeCoordinator:
+        async def advance(self, _tasks, _browser_context):
+            return False
+
+    monkeypatch.setattr(worker, "advance", selective_advance)
+    worker.maintainers = FakeCoordinator()
+    browser_context = CountingBrowserContext()
+
+    results = asyncio.run(worker.run_once(browser_context))
+
+    assert advanced == [unrelated["task_id"]]
+    assert [state["task_id"] for state in results if state] == [unrelated["task_id"]]
+    assert browser_context.page_reads == 0
+    catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    assert owner_key not in catalog["entries"]
+    assert catalog["entries"]["bad"] == poisoned
+
+
+def test_queue_release_is_restart_idempotent_and_preserves_unsent_plan_identity(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    queued = store.create_task("queued", reuse_team="alpha", task_id="task-queued")
+    original = store.load(queued["manifest_path"])
+    original_hop = json.loads(json.dumps(original["hops"][0]))
+    store.update(
+        owner["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+
+    released = asyncio.run(
+        CDPAWorker(config, store=store).advance(
+            queued["manifest_path"], ExplodingBrowserContext()
+        )
+    )
+    restarted_store = TaskStore(config)
+    reloaded, changed = restarted_store.refresh_scheduling(queued["manifest_path"])
+
+    assert changed is False
+    assert reloaded["queue"]["released_at"] == released["queue"]["released_at"]
+    assert sum(item["status"] == "RELEASED" for item in reloaded["queue_events"]) == 1
+    assert reloaded["active_hop_id"] == original["active_hop_id"] == 1
+    for field in ("hop_id", "turn", "request_id", "state", "handoff", "ledger_path"):
+        assert reloaded["hops"][0][field] == original_hop[field]
+    assert reloaded["hops"][0]["state"] == "pre_send"
+
+
+def test_queue_owner_conflict_remains_waiting_and_opens_one_incident(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    first = store.create_task("first", reuse_team="alpha", task_id="task-first")
+    second = store.create_task("second", reuse_team="alpha", task_id="task-second")
+    store.update(
+        first["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "INBOX",
+            "kanban_column": "INBOX",
+            "active_action": "queued",
+            "queue": {**state["queue"], "released_at": utc_now()},
+            "waiting": {
+                "reason": None,
+                "waiting_on": [],
+                "stopped": [],
+                "missing": [],
+                "blocked_by_task_id": None,
+                "since": None,
+            },
+        },
+    )
+
+    result = asyncio.run(
+        CDPAWorker(config, store=store).advance(
+            second["manifest_path"], ExplodingBrowserContext()
+        )
+    )
+
+    assert result["status"] == "WAITING"
+    assert result["waiting_code"] == "team_owner_conflict"
+    assert result["queue"]["released_at"] is None
+    first_incident = ensure_maintenance_incident(result)
+    second_incident = ensure_maintenance_incident(result)
+    assert first_incident is second_incident
+    assert first_incident["trigger_code"] == "team_owner_conflict"
+    assert len(result["maintenance"]["incidents"]) == 1
+
+
+def test_queue_release_failure_remains_waiting_and_opens_one_incident(
+    tmp_path: Path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    queued = store.create_task("queued", reuse_team="alpha", task_id="task-queued")
+    worker = CDPAWorker(config, store=store)
+
+    def fail_refresh(_path):
+        raise RuntimeError("injected queue release failure")
+
+    monkeypatch.setattr(store, "refresh_scheduling", fail_refresh)
+    result = asyncio.run(
+        worker.advance(queued["manifest_path"], ExplodingBrowserContext())
+    )
+
+    assert result["status"] == "WAITING"
+    assert result["waiting_code"] == "queue_release_failed"
+    first = ensure_maintenance_incident(result)
+    second = ensure_maintenance_incident(result)
+    assert first is second
+    assert first["trigger_code"] == "queue_release_failed"
+    assert len(result["maintenance"]["incidents"]) == 1
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ["stop_pending", "close_pending", "closing", "verify_pending"],
+)
+def test_queue_waits_for_clearing_owner_until_verified_empty(tmp_path: Path, phase: str):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    queued = store.create_task("queued", reuse_team="alpha", task_id="task-queued")
+    owner = store.update(
+        owner["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "STOPPED",
+            "terminal_state": "STOPPED",
+            "active_role": None,
+            "active_hop_id": None,
+            "stopped_at": utc_now(),
+            "stop_reason": "team cleared",
+            "cleanup": {
+                **state["cleanup"],
+                "state": "CLEARING",
+                "phase": phase,
+                "verified_empty_at": None,
+            },
+        },
+    )
+    before = store.load(queued["manifest_path"])
+
+    first, changed = store.refresh_scheduling(queued["manifest_path"])
+    second, changed_again = TaskStore(config).refresh_scheduling(queued["manifest_path"])
+
+    assert changed is False or first["status"] == "WAITING"
+    assert first["status"] == "WAITING"
+    assert first["waiting_code"] == "team_busy"
+    assert first["waiting"]["blocked_by_task_id"] == owner["task_id"]
+    assert second["status"] == "WAITING"
+    assert second["queue"]["released_at"] is None
+    assert second["hops"] == before["hops"]
+    assert changed_again is False
+    assert len(second["queue_events"]) == len(first["queue_events"])
+
+    store.update(
+        owner["manifest_path"],
+        lambda state: {
+            **state,
+            "cleanup": {
+                **state["cleanup"],
+                "state": "CLEARED",
+                "phase": "cleared",
+                "cleared_at": utc_now(),
+                "verified_empty_at": None,
+            },
+        },
+    )
+    unverified, changed = TaskStore(config).refresh_scheduling(
+        queued["manifest_path"]
+    )
+    assert changed is False
+    assert unverified["status"] == "WAITING"
+    assert unverified["waiting"]["blocked_by_task_id"] == owner["task_id"]
+
+    store.update(
+        owner["manifest_path"],
+        lambda state: {
+            **state,
+            "cleanup": {
+                **state["cleanup"],
+                "verified_empty_at": utc_now(),
+            },
+        },
+    )
+    released, changed = TaskStore(config).refresh_scheduling(queued["manifest_path"])
+    assert changed is True
+    assert released["status"] == "INBOX"
+    assert released["queue"]["released_at"]
+
+
+def test_terminal_cleanup_is_suppressed_while_same_team_queue_exists(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    queued = store.create_task("queued", reuse_team="alpha", task_id="task-queued")
+    old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    owner = store.update(
+        owner["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": old,
+            "last_role_activity_at": old,
+        },
+    )
+
+    released, changed = store.refresh_scheduling(queued["manifest_path"])
+    assert changed is True
+    assert released["status"] == "INBOX"
+
+    result = asyncio.run(
+        CDPAWorker(config, store=store).advance(
+            owner["manifest_path"], ExplodingBrowserContext()
+        )
+    )
+
+    assert result["status"] == "DONE"
+    assert result["cleanup"]["state"] == "ACTIVE"
+
+
+def test_terminal_cleanup_ignores_catalog_invalid_same_team_queue(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    queued = store.create_task("queued", reuse_team="alpha", task_id="task-queued")
+    old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    owner = store.update(
+        owner["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": old,
+            "last_role_activity_at": old,
+        },
+    )
+    poison_catalog_identity_entry(store, queued)
+    tasks, _errors = store.discover_with_errors()
+    assert [task["task_id"] for task in tasks] == [owner["task_id"]]
+    actions = FakeActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    result = asyncio.run(
+        CDPAWorker(config, store=store).advance(
+            owner["manifest_path"],
+            SimpleNamespace(pages=[]),
+            scheduling_tasks=tasks,
+        )
+    )
+
+    assert result["status"] == "DONE"
+    assert result["cleanup"]["state"] == "CLEARED"
+    assert actions.closed_teams == 1
+
+
+def test_queue_rebind_failure_blocks_for_maintainers(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    queued = store.create_task("queued", reuse_team="alpha", task_id="task-queued")
+    store.update(
+        owner["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+    worker = CDPAWorker(config, store=store)
+    released = asyncio.run(
+        worker.advance(queued["manifest_path"], ExplodingBrowserContext())
+    )
+    assert released["status"] == "INBOX"
+
+    blocked = asyncio.run(
+        worker.advance(queued["manifest_path"], ExplodingBrowserContext())
+    )
+
+    assert blocked["status"] == "BLOCKED"
+    assert blocked["block_code"] == "queue_rebind_failed"
+    first = ensure_maintenance_incident(blocked)
+    second = ensure_maintenance_incident(blocked)
+    assert first is second
+    assert first["trigger_code"] == "queue_rebind_failed"
+    assert len(blocked["maintenance"]["incidents"]) == 1
+
+
+def test_clear_team_rejects_terminal_cleanup_when_queue_exists(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    queued = store.create_task("queued", reuse_team="alpha", task_id="task-queued")
+    owner = store.update(
+        owner["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+    released, changed = store.refresh_scheduling(queued["manifest_path"])
+    assert changed is True
+    assert released["status"] == "INBOX"
+    store.request_control(owner["manifest_path"], "clear_team", confirmed=True)
+    actions = FakeActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    result = asyncio.run(
+        CDPAWorker(config, store=store).advance(
+            owner["manifest_path"], SimpleNamespace(pages=[])
+        )
+    )
+
+    assert result["cleanup"]["state"] == "ACTIVE"
+    assert result["controls"][-1]["status"] == "rejected"
+    assert "queued exact-team work" in result["controls"][-1]["result"]
+    assert actions.preflight_calls == 1
+    assert actions.closed_teams == 0
+
+
+def test_clear_team_released_queue_is_blocked_by_ordinary_same_team_waiter(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task("parent", requested_team="parent", task_id="task-parent")
+    waiter = store.create_task(
+        "waiter",
+        requested_team="alpha",
+        task_id="task-waiter",
+        depends_on_task_ids=(parent["task_id"],),
+    )
+    owner = store.create_task("owner", reuse_team="alpha", task_id="task-owner")
+    owner, changed = store.refresh_scheduling(owner["manifest_path"])
+    assert changed is True
+    assert owner["status"] == "INBOX"
+    store.request_control(owner["manifest_path"], "clear_team", confirmed=True)
+    actions = FakeActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    result = asyncio.run(
+        CDPAWorker(config, store=store).advance(
+            owner["manifest_path"],
+            SimpleNamespace(pages=[]),
+        )
+    )
+
+    assert store.load(waiter["manifest_path"])["status"] == "WAITING"
+    assert result["status"] == "INBOX"
+    assert result["cleanup"]["state"] == "ACTIVE"
+    assert result["controls"][-1]["status"] == "rejected"
+    assert "other nonterminal exact-team work" in result["controls"][-1]["result"]
+    assert actions.closed_teams == 0
+
+
+def test_clear_team_succeeds_for_active_released_queue_without_successor(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    queued = store.create_task("queued", reuse_team="alpha", task_id="task-queued")
+    store.update(
+        owner["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+    released, changed = store.refresh_scheduling(queued["manifest_path"])
+    assert changed is True
+    assert released["status"] == "INBOX"
+    store.request_control(queued["manifest_path"], "clear_team", confirmed=True)
+    actions = FakeActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    result = asyncio.run(
+        CDPAWorker(config, store=store).advance(
+            queued["manifest_path"],
+            SimpleNamespace(pages=[]),
+        )
+    )
+
+    assert result["status"] == "STOPPED"
+    assert result["cleanup"]["state"] == "CLEARED"
+    assert result["controls"][-1]["status"] == "applied"
+    assert actions.closed_teams == 1
+
+
+def test_clear_team_ignores_catalog_invalid_same_team_queue(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    queued = store.create_task("queued", reuse_team="alpha", task_id="task-queued")
+    owner = store.update(
+        owner["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+    poison_catalog_identity_entry(store, queued)
+    tasks, _errors = store.discover_with_errors()
+    assert [task["task_id"] for task in tasks] == [owner["task_id"]]
+    store.request_control(owner["manifest_path"], "clear_team", confirmed=True)
+    actions = FakeActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    result = asyncio.run(
+        CDPAWorker(config, store=store).advance(
+            owner["manifest_path"],
+            SimpleNamespace(pages=[]),
+            scheduling_tasks=tasks,
+        )
+    )
+
+    assert result["cleanup"]["state"] == "CLEARED"
+    assert result["controls"][-1]["status"] == "applied"
+    assert actions.closed_teams == 1
+
+
+def test_run_once_refreshes_clear_team_sibling_guard_after_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    store.request_control(owner["manifest_path"], "clear_team", confirmed=True)
+    worker = CDPAWorker(config, store=store)
+    actions = FakeActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+    original_advance = worker.advance
+    queued = None
+
+    async def create_after_snapshot(path, browser_context, *, scheduling_tasks=None):
+        nonlocal queued
+        if queued is None:
+            queued = store.create_task(
+                "queued",
+                reuse_team="alpha",
+                task_id="task-queued",
+            )
+        return await original_advance(
+            path,
+            browser_context,
+            scheduling_tasks=scheduling_tasks,
+        )
+
+    class FakeCoordinator:
+        async def advance(self, _tasks, _browser_context):
+            return False
+
+    monkeypatch.setattr(worker, "advance", create_after_snapshot)
+    worker.maintainers = FakeCoordinator()
+
+    results = asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
+
+    assert queued is not None
+    assert store.load(queued["manifest_path"])["status"] == "WAITING"
+    assert results[0]["status"] == "INBOX"
+    assert results[0]["cleanup"]["state"] == "ACTIVE"
+    assert results[0]["controls"][-1]["status"] == "rejected"
+    assert "other nonterminal exact-team work" in results[0]["controls"][-1]["result"]
+    assert actions.closed_teams == 0
+
+
+def test_clear_team_preserves_concurrent_target_control_during_preflight(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    store.request_control(owner["manifest_path"], "clear_team", confirmed=True)
+    worker = CDPAWorker(config, store=store)
+
+    class ConcurrentControlActions(FakeActions):
+        async def preflight_team(self, state):
+            self.preflight_calls += 1
+            if self.preflight_calls == 1:
+                store.request_control(
+                    state["manifest_path"],
+                    "pause",
+                    reason="concurrent dashboard pause",
+                )
+            return list(self.pages)
+
+    actions = ConcurrentControlActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    result = asyncio.run(
+        worker.advance(owner["manifest_path"], SimpleNamespace(pages=[]))
+    )
+
+    persisted = store.load(owner["manifest_path"])
+    assert result == persisted
+    assert persisted["status"] == "INBOX"
+    assert persisted["cleanup"]["state"] == "ACTIVE"
+    assert [
+        (item["control_id"], item["action"], item["status"], item.get("reason"))
+        for item in persisted["controls"]
+    ] == [
+        (1, "clear_team", "rejected", None),
+        (2, "pause", "requested", "concurrent dashboard pause"),
+    ]
+    assert "task changed while cleanup was being prepared" in persisted["controls"][0]["result"]
+    assert actions.closed_teams == 0
+
+
+def test_clear_team_preserves_sibling_guard_control_through_atomic_transaction(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    sibling = store.create_task("sibling", reuse_team="alpha", task_id="task-sibling")
+    store.request_control(owner["manifest_path"], "clear_team", confirmed=True)
+    worker = CDPAWorker(config, store=store)
+    actions = FakeActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+    original_begin = store.begin_team_cleanup
+
+    def add_control_before_atomic_guard(*args, **kwargs):
+        store.request_control(
+            owner["manifest_path"],
+            "pause",
+            reason="concurrent dashboard pause",
+        )
+        return original_begin(*args, **kwargs)
+
+    monkeypatch.setattr(store, "begin_team_cleanup", add_control_before_atomic_guard)
+
+    result = asyncio.run(
+        worker.advance(owner["manifest_path"], SimpleNamespace(pages=[]))
+    )
+
+    persisted = store.load(owner["manifest_path"])
+    assert result == persisted
+    assert store.load(sibling["manifest_path"])["status"] == "WAITING"
+    assert persisted["cleanup"]["state"] == "ACTIVE"
+    assert [
+        (item["control_id"], item["action"], item["status"], item.get("reason"))
+        for item in persisted["controls"]
+    ] == [
+        (1, "clear_team", "rejected", None),
+        (2, "pause", "requested", "concurrent dashboard pause"),
+    ]
+    assert "other nonterminal exact-team work" in persisted["controls"][0]["result"]
+    assert actions.preflight_calls == 1
+    assert actions.closed_teams == 0
+
+
+def test_clear_team_preserves_post_transaction_control_without_redundant_save(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    store.request_control(owner["manifest_path"], "clear_team", confirmed=True)
+    worker = CDPAWorker(config, store=store)
+
+    class ConcurrentControlActions(FakeActions):
+        async def preflight_team(self, state):
+            self.preflight_calls += 1
+            if self.preflight_calls == 1:
+                store.request_control(
+                    state["manifest_path"],
+                    "resume",
+                    reason="preflight conflict trigger",
+                )
+            return list(self.pages)
+
+    actions = ConcurrentControlActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+    original_begin = store.begin_team_cleanup
+
+    def add_control_after_transaction(*args, **kwargs):
+        saved, started = original_begin(*args, **kwargs)
+        assert started is False
+        store.request_control(
+            owner["manifest_path"],
+            "pause",
+            reason="post-transaction dashboard pause",
+        )
+        return saved, started
+
+    monkeypatch.setattr(store, "begin_team_cleanup", add_control_after_transaction)
+
+    result = asyncio.run(
+        worker.advance(owner["manifest_path"], SimpleNamespace(pages=[]))
+    )
+
+    persisted = store.load(owner["manifest_path"])
+    assert result == persisted
+    assert persisted["cleanup"]["state"] == "ACTIVE"
+    assert [
+        (item["control_id"], item["action"], item["status"], item.get("reason"))
+        for item in persisted["controls"]
+    ] == [
+        (1, "clear_team", "rejected", None),
+        (2, "resume", "requested", "preflight conflict trigger"),
+        (3, "pause", "requested", "post-transaction dashboard pause"),
+    ]
+    assert actions.closed_teams == 0
+
+
+def test_automatic_cleanup_preserves_concurrent_target_control_during_preflight(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    owner = store.update(
+        owner["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": (
+                datetime.now(timezone.utc) - timedelta(hours=2)
+            ).isoformat(),
+        },
+    )
+    worker = CDPAWorker(config, store=store)
+
+    class ConcurrentControlActions(FakeActions):
+        async def preflight_team(self, state):
+            self.preflight_calls += 1
+            if self.preflight_calls == 1:
+                store.request_control(
+                    state["manifest_path"],
+                    "pause",
+                    reason="concurrent dashboard pause",
+                )
+            return list(self.pages)
+
+    actions = ConcurrentControlActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    result = asyncio.run(
+        worker.advance(owner["manifest_path"], SimpleNamespace(pages=[]))
+    )
+
+    persisted = store.load(owner["manifest_path"])
+    assert result == persisted
+    assert persisted["status"] == "DONE"
+    assert persisted["terminal_state"] == "DONE"
+    assert persisted["cleanup"]["state"] == "ACTIVE"
+    assert persisted["controls"][-1]["action"] == "pause"
+    assert persisted["controls"][-1]["status"] == "requested"
+    assert persisted["controls"][-1]["reason"] == "concurrent dashboard pause"
+    assert actions.closed_teams == 0
+
+
+def test_run_once_refreshes_automatic_cleanup_sibling_guard_after_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    owner = store.update(
+        owner["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": (
+                datetime.now(timezone.utc) - timedelta(hours=2)
+            ).isoformat(),
+        },
+    )
+    worker = CDPAWorker(config, store=store)
+    actions = FakeActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+    original_advance = worker.advance
+    queued = None
+
+    async def create_after_snapshot(path, browser_context, *, scheduling_tasks=None):
+        nonlocal queued
+        if queued is None:
+            queued = store.create_task(
+                "queued",
+                reuse_team="alpha",
+                task_id="task-queued",
+            )
+        return await original_advance(
+            path,
+            browser_context,
+            scheduling_tasks=scheduling_tasks,
+        )
+
+    class FakeCoordinator:
+        async def advance(self, _tasks, _browser_context):
+            return False
+
+    monkeypatch.setattr(worker, "advance", create_after_snapshot)
+    worker.maintainers = FakeCoordinator()
+
+    results = asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
+
+    assert queued is not None
+    assert store.load(queued["manifest_path"])["status"] == "WAITING"
+    assert results[0]["status"] == "DONE"
+    assert results[0]["cleanup"]["state"] == "ACTIVE"
+    assert results[0]["cleanup"]["cleared_at"] is None
+    assert actions.closed_teams == 0
+
+
 def test_run_once_never_reclassifies_missing_edge_cycle_as_dependency_missing(
     tmp_path: Path, monkeypatch
 ):
@@ -3547,7 +5474,7 @@ def test_run_once_isolates_diagnostic_cycle_from_unrelated_tasks(
     worker = CDPAWorker(config, store=store)
     advanced: list[str] = []
 
-    async def no_browser_advance(path, _browser_context):
+    async def no_browser_advance(path, _browser_context, *, scheduling_tasks=None):
         state = store.load(path)
         advanced.append(state["task_id"])
         return state
@@ -3669,7 +5596,7 @@ def test_run_once_recovers_phase4_journal_with_unrelated_missing_dependency(
     worker = CDPAWorker(config, store=restarted_store)
     advanced: list[str] = []
 
-    async def no_browser_advance(path, _browser_context):
+    async def no_browser_advance(path, _browser_context, *, scheduling_tasks=None):
         state = restarted_store.load(path)
         advanced.append(state["task_id"])
         return state

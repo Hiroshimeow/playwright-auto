@@ -15,7 +15,12 @@ from urllib.parse import unquote, urlparse
 
 from .cdpa_config import CDPAConfigError, load_cdpa_config
 from .cdpa_store import TaskStore
-from .cdpa_team import normalize_team_base
+from .cdpa_team import (
+    exact_team_ready_waiters,
+    is_team_availability_barrier,
+    normalize_team_base,
+    queued_team_tasks,
+)
 from .chatgpt import ChatGPTPage
 from .connection import connect, validate_cdp_url
 from .observability import read_recent_action_events
@@ -717,6 +722,52 @@ def build_task_payload(
         if isinstance(item, Mapping)
         and task_id in _string_list(item.get("depends_on_task_ids"))
     ]
+    exact_team = str(raw.get("team") or "")
+    team_tasks = [
+        item
+        for item in tasks
+        if isinstance(item, Mapping)
+        and str(item.get("team") or "") == exact_team
+    ]
+    active_team_owners = [
+        item for item in team_tasks if is_team_availability_barrier(item)
+    ]
+    active_team_owner_task_id = (
+        str(active_team_owners[0].get("task_id") or "")
+        if len(active_team_owners) == 1
+        else None
+    )
+    pending_queue = queued_team_tasks(team_tasks, exact_team) if exact_team else []
+    queue_task_ids = [str(item.get("task_id") or "") for item in pending_queue]
+    queue_position = (
+        queue_task_ids.index(task_id) + 1 if task_id in queue_task_ids else None
+    )
+    queue_length = len(pending_queue) if queue_position is not None else None
+    ready_waiters = (
+        exact_team_ready_waiters(
+            team_tasks,
+            exact_team,
+            dependency_tasks=tasks,
+        )
+        if exact_team
+        else []
+    )
+    dependency_ready_task_ids = [
+        str(item.get("task_id") or "") for item in ready_waiters
+    ]
+    dependency_ready_queue_task_ids = [
+        str(item.get("task_id") or "")
+        for item in ready_waiters
+        if isinstance(item.get("queue"), Mapping)
+        and item["queue"].get("reuse_team") is True
+        and item["queue"].get("released_at") is None
+    ]
+    selected_ready_task_id = (
+        dependency_ready_task_ids[0] if dependency_ready_task_ids else None
+    )
+    queue_blocked_by_task_id = active_team_owner_task_id or (
+        selected_ready_task_id if selected_ready_task_id != task_id else None
+    )
     replacement_task = next(
         (
             item
@@ -794,8 +845,13 @@ def build_task_payload(
             if isinstance(raw.get("waiting"), Mapping)
             else ()
         ),
-        "queue_position": raw.get("queue_position"),
-        "queue_length": raw.get("queue_length"),
+        "queue": dict(raw.get("queue") or {}),
+        "queue_position": queue_position,
+        "queue_length": queue_length,
+        "queue_blocked_by_task_id": queue_blocked_by_task_id,
+        "active_team_owner_task_id": active_team_owner_task_id,
+        "dependency_ready_task_ids": dependency_ready_task_ids,
+        "dependency_ready_queue_task_ids": dependency_ready_queue_task_ids,
         "waiting_reason": raw.get("waiting_reason"),
         "pause_reason": raw.get("pause_reason"),
         "block_code": raw.get("block_code"),
@@ -1226,9 +1282,10 @@ def _handler(
                             or body.get("new_all")
                             or "report_mode" in body
                             or body.get("depends_on_task_ids")
+                            or body.get("reuse_team")
                         ):
                             raise ValueError(
-                                "new_roles, new_all, report_mode, and depends_on_task_ids are invalid when resuming"
+                                "new_roles, new_all, report_mode, depends_on_task_ids, and reuse_team are invalid when resuming"
                             )
                         team = body.get("team")
                         if not isinstance(team, str) or not team:
@@ -1236,7 +1293,10 @@ def _handler(
                         task = task_store.resume_team(team, reason="resume requested")
                         self._json(
                             202,
-                            build_task_payload(task, tasks=task_store.discover()),
+                            build_task_payload(
+                                task,
+                                tasks=task_store.discover_with_errors()[0],
+                            ),
                         )
                         return
                     live_snapshot = store.snapshot()
@@ -1244,6 +1304,7 @@ def _handler(
                     task = task_store.create_task(
                         str(body.get("task") or ""),
                         requested_team=str(body.get("team") or "").strip() or None,
+                        reuse_team=str(body.get("reuse_team") or "").strip() or None,
                         new_roles=tuple(body.get("new_roles") or ()),
                         new_all=bool(body.get("new_all")),
                         report_mode=(
@@ -1256,13 +1317,20 @@ def _handler(
                         reserved_team_suffixes=_busy_role_suffixes(
                             task_store,
                             [page for page in live_pages if isinstance(page, Mapping)],
-                            team_base=str(body.get("team") or "").strip() or None,
+                            team_base=(
+                                str(body.get("team") or "").strip() or None
+                                if not body.get("reuse_team")
+                                else None
+                            ),
                             connected=bool(live_snapshot.get("connected")),
                         ),
                     )
                     self._json(
                         201,
-                        build_task_payload(task, tasks=task_store.discover()),
+                        build_task_payload(
+                            task,
+                            tasks=task_store.discover_with_errors()[0],
+                        ),
                     )
                     return
                 if path.startswith("/api/tasks/") and path.endswith("/controls"):

@@ -3,15 +3,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import json
 import sys
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from .cdpa_actions import AcquiredRole, CDPATabActions, RoleOwnershipError, TeamCloseError
 from .cdpa_config import CDPAConfig, load_cdpa_config
-from .cdpa_dependencies import dependency_readiness
 from .cdpa_maintenance import MaintainerCoordinator
 from .cdpa_prompts import PromptBuilder
 from .cdpa_response import (
@@ -33,8 +33,12 @@ from .cdpa_routes import (
     parse_role_response,
     validate_report,
 )
-from .cdpa_store import TaskStore, normalize_dependency_ids, report_mode_from_options, utc_now
-from .cdpa_team import cleanup_eligible
+from .cdpa_store import (
+    TaskStore,
+    report_mode_from_options,
+    utc_now,
+)
+from .cdpa_team import cleanup_eligible, has_other_nonterminal_team_work
 from .chatgpt import (
     ChoicePromptBlockedError,
     capture_response_recovery_baseline,
@@ -64,6 +68,60 @@ def _active_hop(state: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(hop, dict) and hop.get("hop_id") == active:
             return hop
     raise RuntimeError(f"active hop {active!r} does not exist")
+
+
+_ROLE_OFFLINE_TRUE_LIST_CODES = frozenset(
+    {"role_offline", "unexpected_error", "role_ownership_ambiguous"}
+)
+_ROLE_OFFLINE_SUFFIX = " tab is offline; use Open tab for controlled recovery"
+
+
+def _looks_like_recorded_role_offline_error(message: object) -> bool:
+    value = str(message or "").strip()
+    if value.startswith("RoleOwnershipError: "):
+        value = value.removeprefix("RoleOwnershipError: ")
+    return value.startswith("recorded '") and value.endswith(
+        "'" + _ROLE_OFFLINE_SUFFIX
+    )
+
+
+def _role_ownership_block_code(error: BaseException) -> str | None:
+    if not isinstance(error, RoleOwnershipError):
+        return None
+    code = str(getattr(error, "code", "") or "")
+    if code == "role_offline" or _looks_like_recorded_role_offline_error(error):
+        return "role_offline"
+    return "role_ownership_ambiguous"
+
+
+def _is_verified_role_offline_block(
+    state: Mapping[str, Any],
+    role: str,
+) -> bool:
+    logical_role = str(role or "").upper()
+    block_code = str(state.get("block_code") or "")
+    if (
+        str(state.get("status") or "").upper() != "BLOCKED"
+        or block_code not in _ROLE_OFFLINE_TRUE_LIST_CODES
+        or str(state.get("active_role") or "").upper() != logical_role
+    ):
+        return False
+    role_record = (state.get("roles") or {}).get(logical_role)
+    if not isinstance(role_record, Mapping):
+        return False
+    if block_code != "role_offline":
+        physical_role = str(role_record.get("physical_role") or "")
+        expected = f"recorded {physical_role!r}{_ROLE_OFFLINE_SUFFIX}"
+        reason = str(state.get("block_reason") or "").strip()
+        if reason.startswith("RoleOwnershipError: "):
+            reason = reason.removeprefix("RoleOwnershipError: ")
+        if reason != expected:
+            return False
+    try:
+        hop = _active_hop(state)
+    except RuntimeError:
+        return False
+    return str(hop.get("target_role") or "").upper() == logical_role
 
 
 def _column_for(role: str) -> str:
@@ -141,6 +199,12 @@ class CDPAWorker:
         state["block_retryable"] = bool(retryable)
         state["block_reason"] = message
         state["active_action"] = "blocked"
+        if str(code) == "role_offline":
+            role = str(state.get("active_role") or "").upper()
+            record = state.get("roles", {}).get(role)
+            if isinstance(record, dict):
+                record["online"] = False
+                record["last_error"] = message
         if not unchanged_active_block:
             state.setdefault("errors", []).append(
                 {"at": utc_now(), "error": message}
@@ -152,92 +216,32 @@ class CDPAWorker:
                 pass
         return state
 
-    def _apply_dependency_readiness(
+    def _wait_queue_error(
         self,
         state: dict[str, Any],
-        tasks: list[Mapping[str, Any]],
+        error: BaseException | str,
+        *,
+        code: str,
     ) -> bool:
-        dependencies = normalize_dependency_ids(state.get("depends_on_task_ids"))
-        if not dependencies or str(state.get("status") or "").upper() in TERMINAL:
-            return False
-        readiness = dependency_readiness(state, tasks)
-        waiting = state.get("waiting") if isinstance(state.get("waiting"), Mapping) else {}
-        desired = {
-            "reason": None if readiness.ready else "dependency",
-            "waiting_on": list(readiness.waiting_on),
-            "stopped": list(readiness.stopped),
-            "missing": list(readiness.missing),
-            "since": (
-                None
-                if readiness.ready
-                else waiting.get("since") or utc_now()
-            ),
-        }
-        status = str(state.get("status") or "").upper()
-        if readiness.ready:
-            if status != "WAITING" or waiting.get("reason") != "dependency":
-                return False
-            now = utc_now()
-            state.update(
-                status="INBOX",
-                kanban_column="INBOX",
-                active_action="queued",
-                waiting_reason=None,
-                waiting_code=None,
-                waiting=desired,
-            )
-            state.setdefault("dependency_events", []).append(
-                {
-                    "at": now,
-                    "status": "RELEASED",
-                    "message": "All dependencies are DONE; task released to PLAN",
-                    "waiting_on": [],
-                    "stopped": [],
-                    "missing": [],
-                }
-            )
-            return True
-
-        code = (
-            "dependency_missing"
-            if readiness.missing
-            else "dependency_stopped"
-            if readiness.stopped
-            else "dependency"
-        )
-        blocked_ids = [*readiness.waiting_on, *readiness.missing]
-        reason = "Waiting for dependencies: " + ", ".join(blocked_ids)
+        message = str(error)
         unchanged = (
-            status == "WAITING"
-            and waiting.get("reason") == "dependency"
-            and list(waiting.get("waiting_on") or []) == desired["waiting_on"]
-            and list(waiting.get("stopped") or []) == desired["stopped"]
-            and list(waiting.get("missing") or []) == desired["missing"]
+            state.get("status") == "WAITING"
             and state.get("waiting_code") == code
-            and state.get("waiting_reason") == reason
+            and state.get("waiting_reason") == message
         )
-        if unchanged:
-            return False
-        now = utc_now()
-        state.update(
-            status="WAITING",
-            kanban_column="WAITING",
-            active_action="waiting_dependency",
-            waiting_reason=reason,
-            waiting_code=code,
-            waiting=desired,
-        )
-        state.setdefault("dependency_events", []).append(
-            {
-                "at": now,
-                "status": "WAITING",
-                "message": reason,
-                "waiting_on": list(readiness.waiting_on),
-                "stopped": list(readiness.stopped),
-                "missing": list(readiness.missing),
-            }
-        )
-        return True
+        state["status"] = "WAITING"
+        state["kanban_column"] = "WAITING"
+        state["waiting_code"] = code
+        state["waiting_reason"] = message
+        state["active_action"] = "waiting_team_recovery"
+        waiting = state.setdefault("waiting", {})
+        waiting["reason"] = "team_busy"
+        waiting["since"] = waiting.get("since") or utc_now()
+        if not unchanged:
+            state.setdefault("errors", []).append(
+                {"at": utc_now(), "error": message}
+            )
+        return not unchanged
 
     def _start_wait_budget_from_sent(self, hop: dict[str, Any]) -> None:
         sent_at = parse_time((hop.get("timestamps") or {}).get("sent_at"))
@@ -346,25 +350,38 @@ class CDPAWorker:
         control: dict[str, Any] | None,
         target_tabs: int,
         manifest_path: Path,
-    ) -> None:
-        cleanup = state.setdefault("cleanup", {})
+    ) -> bool:
+        candidate = json.loads(json.dumps(state, ensure_ascii=False, default=str))
+        cleanup = candidate.setdefault("cleanup", {})
         if cleanup.get("state") == "CLEARING":
-            return
-        status_before = str(state.get("status") or "").upper()
+            return True
+        status_before = str(candidate.get("status") or "").upper()
         now = utc_now()
-        active_role = str(state.get("active_role") or "").upper() or None
-        active_hop_id = state.get("active_hop_id")
+        active_role = str(candidate.get("active_role") or "").upper() or None
+        active_hop_id = candidate.get("active_hop_id")
+        control_id = control.get("control_id") if control is not None else None
+        working_control = next(
+            (
+                item
+                for item in candidate.get("controls") or []
+                if isinstance(item, dict) and item.get("control_id") == control_id
+            ),
+            None,
+        )
+        if control_id is not None and working_control is None:
+            raise RuntimeError("Clear Team control is no longer present")
         cleanup.update(
             {
                 "state": "CLEARING",
                 "phase": "stop_pending",
                 "clear_requested_at": cleanup.get("clear_requested_at") or now,
                 "cleared_at": None,
+                "verified_empty_at": None,
                 "status_before": status_before,
-                "terminal_state_before": state.get("terminal_state"),
+                "terminal_state_before": candidate.get("terminal_state"),
                 "active_role": active_role,
                 "active_hop_id": active_hop_id,
-                "control_id": control.get("control_id") if control is not None else None,
+                "control_id": control_id,
                 "target_tabs": max(0, int(target_tabs)),
                 "closed_tabs": int(cleanup.get("closed_tabs") or 0),
                 "retry_count": 0,
@@ -372,34 +389,48 @@ class CDPAWorker:
                 "last_error_at": None,
             }
         )
-        if control is not None:
-            control["status"] = "cleanup_pending"
-            control["result"] = {"phase": "stop_pending", "status_before": status_before}
-            control["applied_at"] = now
+        if working_control is not None:
+            working_control["status"] = "cleanup_pending"
+            working_control["result"] = {
+                "phase": "stop_pending",
+                "status_before": status_before,
+            }
+            working_control["applied_at"] = now
         if status_before not in TERMINAL:
             if active_hop_id is not None:
                 try:
-                    hop = _active_hop(state)
+                    hop = _active_hop(candidate)
                 except RuntimeError:
                     hop = None
-                if hop is not None and str(hop.get("state") or "") not in {"routed", "abandoned"}:
+                if hop is not None and str(hop.get("state") or "") not in {
+                    "routed",
+                    "abandoned",
+                }:
                     hop["state"] = "abandoned"
                     hop["abandon_reason"] = "team cleanup started"
                     hop.setdefault("timestamps", {})["abandoned_at"] = now
-            state["status"] = "STOPPED"
-            state["terminal_state"] = "STOPPED"
-            state["kanban_column"] = "DONE_STOPPED"
-            state["stopped_at"] = state.get("stopped_at") or now
-            state["stop_reason"] = "team cleared"
-            state["last_role_activity_at"] = now
-            state["active_role"] = None
-            state["active_hop_id"] = None
-        state["active_action"] = "cleanup_stop_pending"
-        state["pause_reason"] = None
-        state["block_code"] = None
-        state["block_retryable"] = False
-        state["block_reason"] = None
-        self.store.save(manifest_path, state)
+            candidate["status"] = "STOPPED"
+            candidate["terminal_state"] = "STOPPED"
+            candidate["kanban_column"] = "DONE_STOPPED"
+            candidate["stopped_at"] = candidate.get("stopped_at") or now
+            candidate["stop_reason"] = "team cleared"
+            candidate["last_role_activity_at"] = now
+            candidate["active_role"] = None
+            candidate["active_hop_id"] = None
+        candidate["active_action"] = "cleanup_stop_pending"
+        candidate["pause_reason"] = None
+        candidate["block_code"] = None
+        candidate["block_retryable"] = False
+        candidate["block_reason"] = None
+        saved, started = self.store.begin_team_cleanup(
+            manifest_path,
+            candidate,
+            expected_state=state,
+            control_id=control_id,
+        )
+        state.clear()
+        state.update(saved)
+        return started
 
     def _record_cleanup_failure(
         self,
@@ -467,52 +498,82 @@ class CDPAWorker:
         *,
         preflighted_pages: list[Any] | None = None,
     ) -> bool:
+        def persist(
+            mutator: Callable[[dict[str, Any]], Mapping[str, Any] | None],
+        ) -> dict[str, Any]:
+            saved = self.store.update(manifest_path, mutator)
+            state.clear()
+            state.update(saved)
+            return state
+
         cleanup = state.setdefault("cleanup", {})
         if cleanup.get("state") == "CLEARED":
             return True
         if cleanup.get("state") != "CLEARING":
             raise RuntimeError("cleanup continuation requires CLEARING state")
-        status = str(state.get("status") or "").upper()
-        if status not in TERMINAL:
-            now = utc_now()
-            active_role = str(state.get("active_role") or "").upper() or None
-            active_hop_id = state.get("active_hop_id")
-            cleanup["status_before"] = cleanup.get("status_before") or status
-            cleanup["active_role"] = cleanup.get("active_role") or active_role
-            cleanup["active_hop_id"] = cleanup.get("active_hop_id") or active_hop_id
-            if active_hop_id is not None:
-                try:
-                    hop = _active_hop(state)
-                except RuntimeError:
-                    hop = None
-                if hop is not None and str(hop.get("state") or "") not in {"routed", "abandoned"}:
-                    hop["state"] = "abandoned"
-                    hop["abandon_reason"] = "team cleanup resumed"
-                    hop.setdefault("timestamps", {})["abandoned_at"] = now
-            state["status"] = "STOPPED"
-            state["terminal_state"] = "STOPPED"
-            state["kanban_column"] = "DONE_STOPPED"
-            state["stopped_at"] = state.get("stopped_at") or now
-            state["stop_reason"] = state.get("stop_reason") or "team cleared"
-            state["last_role_activity_at"] = now
-            state["active_role"] = None
-            state["active_hop_id"] = None
-            self.store.save(manifest_path, state)
+        if str(state.get("status") or "").upper() not in TERMINAL:
+            def normalize_stopped(current: dict[str, Any]) -> dict[str, Any]:
+                current_cleanup = current.setdefault("cleanup", {})
+                status = str(current.get("status") or "").upper()
+                if status in TERMINAL:
+                    return current
+                now = utc_now()
+                active_role = str(current.get("active_role") or "").upper() or None
+                active_hop_id = current.get("active_hop_id")
+                current_cleanup["status_before"] = (
+                    current_cleanup.get("status_before") or status
+                )
+                current_cleanup["active_role"] = (
+                    current_cleanup.get("active_role") or active_role
+                )
+                current_cleanup["active_hop_id"] = (
+                    current_cleanup.get("active_hop_id") or active_hop_id
+                )
+                if active_hop_id is not None:
+                    try:
+                        hop = _active_hop(current)
+                    except RuntimeError:
+                        hop = None
+                    if hop is not None and str(hop.get("state") or "") not in {
+                        "routed",
+                        "abandoned",
+                    }:
+                        hop["state"] = "abandoned"
+                        hop["abandon_reason"] = "team cleanup resumed"
+                        hop.setdefault("timestamps", {})["abandoned_at"] = now
+                current["status"] = "STOPPED"
+                current["terminal_state"] = "STOPPED"
+                current["kanban_column"] = "DONE_STOPPED"
+                current["stopped_at"] = current.get("stopped_at") or now
+                current["stop_reason"] = current.get("stop_reason") or "team cleared"
+                current["last_role_activity_at"] = now
+                current["active_role"] = None
+                current["active_hop_id"] = None
+                return current
+
+            persist(normalize_stopped)
         try:
-            phase = str(cleanup.get("phase") or "stop_pending")
+            phase = str(state.get("cleanup", {}).get("phase") or "stop_pending")
             if phase == "stop_pending":
-                active_role = str(cleanup.get("active_role") or "").upper()
+                active_role = str(
+                    state.get("cleanup", {}).get("active_role") or ""
+                ).upper()
                 stopped = False
                 if active_role and active_role in state.get("roles", {}):
                     acquired = await actions.locate_owned(state, active_role)
                     if acquired is not None:
                         stopped = await actions.stop_if_active(acquired)
-                cleanup["stopped_response"] = bool(stopped)
-                cleanup["phase"] = "close_pending"
-                cleanup["last_error"] = None
-                cleanup["last_error_at"] = None
-                state["active_action"] = "cleanup_close_pending"
-                self.store.save(manifest_path, state)
+
+                def persist_stop(current: dict[str, Any]) -> dict[str, Any]:
+                    current_cleanup = current.setdefault("cleanup", {})
+                    current_cleanup["stopped_response"] = bool(stopped)
+                    current_cleanup["phase"] = "close_pending"
+                    current_cleanup["last_error"] = None
+                    current_cleanup["last_error_at"] = None
+                    current["active_action"] = "cleanup_close_pending"
+                    return current
+
+                persist(persist_stop)
                 phase = "close_pending"
             if phase in {"close_pending", "closing"}:
                 selected = (
@@ -520,48 +581,272 @@ class CDPAWorker:
                     if preflighted_pages is not None
                     else await actions.preflight_team(state)
                 )
-                cleanup["target_tabs"] = max(
-                    int(cleanup.get("target_tabs") or 0),
-                    int(cleanup.get("closed_tabs") or 0) + len(selected),
-                )
-                cleanup["phase"] = "closing"
-                state["active_action"] = "cleanup_closing"
-                self.store.save(manifest_path, state)
+
+                def persist_closing(current: dict[str, Any]) -> dict[str, Any]:
+                    current_cleanup = current.setdefault("cleanup", {})
+                    current_cleanup["target_tabs"] = max(
+                        int(current_cleanup.get("target_tabs") or 0),
+                        int(current_cleanup.get("closed_tabs") or 0) + len(selected),
+                    )
+                    current_cleanup["phase"] = "closing"
+                    current["active_action"] = "cleanup_closing"
+                    return current
+
+                persist(persist_closing)
                 try:
-                    closed = await actions.close_team(state, preflighted_pages=selected)
+                    closed = await actions.close_team(
+                        state,
+                        preflighted_pages=selected,
+                    )
                 except TeamCloseError as exc:
-                    cleanup["closed_tabs"] = int(cleanup.get("closed_tabs") or 0) + exc.closed_tabs
-                    raise
-                cleanup["closed_tabs"] = int(cleanup.get("closed_tabs") or 0) + int(closed)
-                cleanup["phase"] = "verify_pending"
-                state["active_action"] = "cleanup_verify_pending"
-                self.store.save(manifest_path, state)
+                    def persist_partial_failure(
+                        current: dict[str, Any],
+                    ) -> dict[str, Any]:
+                        current_cleanup = current.setdefault("cleanup", {})
+                        current_cleanup["closed_tabs"] = int(
+                            current_cleanup.get("closed_tabs") or 0
+                        ) + int(exc.closed_tabs)
+                        self._record_cleanup_failure(current, exc)
+                        return current
+
+                    persist(persist_partial_failure)
+                    return False
+
+                def persist_closed(current: dict[str, Any]) -> dict[str, Any]:
+                    current_cleanup = current.setdefault("cleanup", {})
+                    current_cleanup["closed_tabs"] = int(
+                        current_cleanup.get("closed_tabs") or 0
+                    ) + int(closed)
+                    current_cleanup["phase"] = "verify_pending"
+                    current["active_action"] = "cleanup_verify_pending"
+                    return current
+
+                persist(persist_closed)
                 phase = "verify_pending"
             if phase == "verify_pending":
                 remaining = await actions.preflight_team(state)
                 if remaining:
-                    cleanup["phase"] = "close_pending"
-                    raise RoleOwnershipError(
+                    error = RoleOwnershipError(
                         f"post-close verification found {len(remaining)} assigned team tab(s) still open"
                     )
-                self._finish_cleanup(state)
-                self.store.save(manifest_path, state)
+
+                    def persist_verification_failure(
+                        current: dict[str, Any],
+                    ) -> dict[str, Any]:
+                        current.setdefault("cleanup", {})["phase"] = "close_pending"
+                        self._record_cleanup_failure(current, error)
+                        return current
+
+                    persist(persist_verification_failure)
+                    return False
+
+                def persist_finished(current: dict[str, Any]) -> dict[str, Any]:
+                    self._finish_cleanup(current)
+                    return current
+
+                persist(persist_finished)
                 return True
             if phase == "cleared":
-                self._finish_cleanup(state)
-                self.store.save(manifest_path, state)
+                def persist_finished(current: dict[str, Any]) -> dict[str, Any]:
+                    self._finish_cleanup(current)
+                    return current
+
+                persist(persist_finished)
                 return True
             raise RuntimeError(f"unknown cleanup phase {phase!r}")
         except Exception as exc:
-            self._record_cleanup_failure(state, exc)
-            self.store.save(manifest_path, state)
+            def persist_failure(current: dict[str, Any]) -> dict[str, Any]:
+                self._record_cleanup_failure(current, exc)
+                return current
+
+            persist(persist_failure)
             return False
+
+    @staticmethod
+    def _merge_control_delta(
+        current: Any,
+        before: Any,
+        after: Any,
+        *,
+        path: str,
+    ) -> Any:
+        if before == after:
+            return current
+        if isinstance(before, Mapping) and isinstance(after, Mapping):
+            if not isinstance(current, dict):
+                raise ValueError(f"task changed at {path}; reload before applying control")
+            for key in before.keys() | after.keys():
+                child_path = f"{path}.{key}" if path else str(key)
+                if key not in before:
+                    if key not in current:
+                        current[key] = json.loads(
+                            json.dumps(after[key], ensure_ascii=False, default=str)
+                        )
+                    elif current[key] != after[key]:
+                        raise ValueError(
+                            f"task changed at {child_path}; reload before applying control"
+                        )
+                elif key not in after:
+                    if key not in current:
+                        continue
+                    if current[key] != before[key]:
+                        raise ValueError(
+                            f"task changed at {child_path}; reload before applying control"
+                        )
+                    current.pop(key)
+                else:
+                    current[key] = CDPAWorker._merge_control_delta(
+                        current.get(key),
+                        before[key],
+                        after[key],
+                        path=child_path,
+                    )
+            return current
+        if isinstance(before, list) and isinstance(after, list):
+            if not isinstance(current, list):
+                raise ValueError(f"task changed at {path}; reload before applying control")
+            if len(before) == len(after) == len(current):
+                for index, (before_item, after_item) in enumerate(zip(before, after)):
+                    current[index] = CDPAWorker._merge_control_delta(
+                        current[index],
+                        before_item,
+                        after_item,
+                        path=f"{path}[{index}]",
+                    )
+                return current
+            if current != before:
+                raise ValueError(f"task changed at {path}; reload before applying control")
+            return json.loads(json.dumps(after, ensure_ascii=False, default=str))
+        if current == after:
+            return current
+        if current != before:
+            raise ValueError(f"task changed at {path}; reload before applying control")
+        return json.loads(json.dumps(after, ensure_ascii=False, default=str))
+
+    def _persist_control_result(
+        self,
+        manifest_path: Path,
+        before: Mapping[str, Any],
+        after: Mapping[str, Any],
+        *,
+        control_id: int,
+        action: str,
+    ) -> dict[str, Any]:
+        before_control = next(
+            (
+                item
+                for item in before.get("controls") or []
+                if isinstance(item, Mapping) and item.get("control_id") == control_id
+            ),
+            None,
+        )
+        after_control = next(
+            (
+                item
+                for item in after.get("controls") or []
+                if isinstance(item, Mapping) and item.get("control_id") == control_id
+            ),
+            None,
+        )
+        if before_control is None or after_control is None:
+            raise ValueError(f"control {control_id} changed while it was being applied")
+        if before_control.get("action") != action or after_control.get("action") != action:
+            raise ValueError(f"control {control_id} action changed while it was being applied")
+
+        def merge(current: dict[str, Any]) -> dict[str, Any]:
+            current_control = next(
+                (
+                    item
+                    for item in current.get("controls") or []
+                    if isinstance(item, dict) and item.get("control_id") == control_id
+                ),
+                None,
+            )
+            if current_control is None or current_control.get("action") != action:
+                raise ValueError(f"control {control_id} changed while it was being applied")
+            for key in before.keys() | after.keys():
+                if key in {"controls", "updated_at"}:
+                    continue
+                if key not in before:
+                    if key not in current:
+                        current[key] = json.loads(
+                            json.dumps(after[key], ensure_ascii=False, default=str)
+                        )
+                    elif current[key] != after[key]:
+                        raise ValueError(
+                            f"task changed at {key}; reload before applying control"
+                        )
+                elif key not in after:
+                    if key not in current:
+                        continue
+                    if current[key] != before[key]:
+                        raise ValueError(
+                            f"task changed at {key}; reload before applying control"
+                        )
+                    current.pop(key)
+                else:
+                    current[key] = self._merge_control_delta(
+                        current.get(key),
+                        before[key],
+                        after[key],
+                        path=key,
+                    )
+            self._merge_control_delta(
+                current_control,
+                before_control,
+                after_control,
+                path=f"controls[{control_id}]",
+            )
+            return current
+
+        return self.store.update(manifest_path, merge)
+
+    def _persist_transport_result(
+        self,
+        manifest_path: Path,
+        before: Mapping[str, Any],
+        after: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        def merge(current: dict[str, Any]) -> dict[str, Any]:
+            for key in before.keys() | after.keys():
+                if key in {"controls", "updated_at"}:
+                    continue
+                if key not in before:
+                    if key not in current:
+                        current[key] = json.loads(
+                            json.dumps(after[key], ensure_ascii=False, default=str)
+                        )
+                    elif current[key] != after[key]:
+                        raise ValueError(
+                            f"task changed at {key}; reload before applying transport state"
+                        )
+                elif key not in after:
+                    if key not in current:
+                        continue
+                    if current[key] != before[key]:
+                        raise ValueError(
+                            f"task changed at {key}; reload before applying transport state"
+                        )
+                    current.pop(key)
+                else:
+                    current[key] = self._merge_control_delta(
+                        current.get(key),
+                        before[key],
+                        after[key],
+                        path=key,
+                    )
+            return current
+
+        return self.store.update(manifest_path, merge)
 
     async def _apply_control(
         self,
         state: dict[str, Any],
         actions: CDPATabActions,
         manifest_path: Path | None = None,
+        *,
+        scheduling_tasks: Sequence[Mapping[str, Any]] | None = None,
+        persisted_result: list[bool] | None = None,
     ) -> bool:
         control = next(
             (
@@ -574,6 +859,8 @@ class CDPAWorker:
         if control is None:
             return False
         action = str(control.get("action") or "")
+        control_id = control.get("control_id")
+        baseline = json.loads(json.dumps(state, ensure_ascii=False, default=str))
         role = str(control.get("role") or state.get("active_role") or "PLAN").upper()
         result: Any = None
         try:
@@ -725,18 +1012,39 @@ class CDPAWorker:
                 state["roles"][role]["constructor_sent_generation"] = None
                 result = {"page_id": acquired.page_id, "new_chat": True}
             elif action == "open_tab":
-                blocked_role_recovery = (
-                    state.get("status") == "BLOCKED"
-                    and state.get("block_code") == "role_offline"
-                )
+                blocked_role_recovery = _is_verified_role_offline_block(state, role)
                 if blocked_role_recovery:
                     if hop is None or str(hop.get("target_role") or "") != role:
                         raise RuntimeError(
                             "blocked role reopen requires the active hop to belong to the selected role"
                         )
-                    if hop_state != "pre_send":
+                    receipt = (
+                        hop.get("receipt")
+                        if isinstance(hop.get("receipt"), Mapping)
+                        else {}
+                    )
+                    binding = (
+                        receipt.get("binding")
+                        if isinstance(receipt.get("binding"), Mapping)
+                        else {}
+                    )
+                    role_record = state["roles"][role]
+                    conversation_url = str(hop.get("conversation_url") or "").strip()
+                    accepted_waiting_reopen = (
+                        hop_state == "waiting"
+                        and bool(
+                            str(receipt.get("user_message_id") or "").strip()
+                            or str(receipt.get("user_turn_id") or "").strip()
+                        )
+                        and conversation_url
+                        == str(role_record.get("page_url") or "").strip()
+                        and str(binding.get("page_id") or "").strip()
+                        == str(role_record.get("page_id") or "").strip()
+                    )
+                    if hop_state != "pre_send" and not accepted_waiting_reopen:
                         raise RuntimeError(
-                            "blocked role reopen may resume only an unsent pre_send hop"
+                            "blocked role reopen requires pre_send or an accepted waiting hop "
+                            "on the exact recorded conversation"
                         )
                 acquired = await actions.locate_owned(state, role)
                 recovered = acquired is None
@@ -770,6 +1078,31 @@ class CDPAWorker:
                 source_role = str(state.get("active_role") or role)
                 old_hop_id = int(hop["hop_id"])
                 reason = str(control.get("reason") or "").strip() or "manual route to PLAN"
+                latest_handoff = (
+                    (state.get("reports") or [{}])[-1].get("path")
+                    if state.get("reports")
+                    else str(state["task_text"])
+                )
+                maintenance_incident_id = str(
+                    control.get("maintenance_incident_id") or ""
+                ).strip()
+                if maintenance_incident_id:
+                    next_handoff = "\n".join(
+                        (
+                            "CDPA_MAINTENANCE_REPAIR_REQUEST",
+                            f"incident-id: {maintenance_incident_id}",
+                            f"reason: {reason}",
+                            f"latest-evidence: {latest_handoff}",
+                            "PLAN must inspect the evidence, preserve completed work, "
+                            "and route the smallest DEV, TEST, REVIEW, or AUDIT repair loop needed.",
+                            "After the repair is independently verified, continue the original task; "
+                            "do not mark DONE solely because this maintenance request was handled.",
+                        )
+                    )
+                    hop_kind = "maintenance_repair"
+                else:
+                    next_handoff = latest_handoff
+                    hop_kind = "control"
                 hop["state"] = "abandoned"
                 hop["abandon_reason"] = reason
                 hop["timestamps"]["abandoned_at"] = utc_now()
@@ -777,10 +1110,8 @@ class CDPAWorker:
                     state,
                     source_role=source_role,
                     target_role="PLAN",
-                    handoff=(state.get("reports") or [{}])[-1].get("path")
-                    if state.get("reports")
-                    else str(state["task_text"]),
-                    kind="control",
+                    handoff=next_handoff,
+                    kind=hop_kind,
                 )
                 state.setdefault("route_timeline", []).append(
                     {
@@ -788,7 +1119,7 @@ class CDPAWorker:
                         "hop_id": old_hop_id,
                         "source_role": source_role,
                         "route": "PLAN",
-                        "kind": "control",
+                        "kind": hop_kind,
                         "new_hop_id": new_hop["hop_id"],
                         "reason": reason,
                     }
@@ -801,26 +1132,48 @@ class CDPAWorker:
                         raise RuntimeError("Clear Team requires a manifest path")
                     selected_pages = await actions.preflight_team(state)
                     if selected_pages:
-                        self._start_cleanup(
+                        if not self._start_cleanup(
                             state,
                             control=control,
                             target_tabs=len(selected_pages),
                             manifest_path=manifest_path,
-                        )
+                        ):
+                            if persisted_result is not None:
+                                persisted_result.append(True)
+                            return True
+                        cleanup = state["cleanup"]
+                        control = self._cleanup_control(state, cleanup) or control
                         completed = await self._continue_cleanup(
                             state,
                             actions,
                             manifest_path,
                             preflighted_pages=selected_pages,
                         )
-                        if not completed:
-                            return True
-                        result = {
-                            "closed_tabs": int(cleanup.get("closed_tabs") or 0),
-                            "status_before": cleanup.get("status_before"),
-                            "retry_count": int(cleanup.get("retry_count") or 0),
-                            "reverified": True,
-                        }
+                        if completed:
+                            def mark_reverified(current: dict[str, Any]) -> dict[str, Any]:
+                                current_cleanup = current.setdefault("cleanup", {})
+                                if (
+                                    current_cleanup.get("state") != "CLEARED"
+                                    or not current_cleanup.get("verified_empty_at")
+                                ):
+                                    raise ValueError(
+                                        "cleanup re-verification did not reach a verified CLEARED state"
+                                    )
+                                current_control = self._cleanup_control(current, current_cleanup)
+                                if current_control is not None:
+                                    current_result = current_control.get("result")
+                                    if not isinstance(current_result, dict):
+                                        current_result = {}
+                                        current_control["result"] = current_result
+                                    current_result["reverified"] = True
+                                return current
+
+                            saved = self.store.update(manifest_path, mark_reverified)
+                            state.clear()
+                            state.update(saved)
+                        if persisted_result is not None:
+                            persisted_result.append(True)
+                        return True
                     else:
                         result = {
                             "closed_tabs": int(cleanup.get("closed_tabs") or 0),
@@ -829,14 +1182,10 @@ class CDPAWorker:
                 elif cleanup.get("state") == "CLEARING":
                     if manifest_path is None:
                         raise RuntimeError("cleanup continuation requires a manifest path")
-                    completed = await self._continue_cleanup(state, actions, manifest_path)
-                    if not completed:
-                        return True
-                    result = {
-                        "closed_tabs": int(cleanup.get("closed_tabs") or 0),
-                        "status_before": cleanup.get("status_before"),
-                        "retry_count": int(cleanup.get("retry_count") or 0),
-                    }
+                    await self._continue_cleanup(state, actions, manifest_path)
+                    if persisted_result is not None:
+                        persisted_result.append(True)
+                    return True
                 else:
                     status_before = str(state.get("status") or "").upper()
                     if status_before not in TERMINAL and not bool(control.get("confirmed")):
@@ -844,35 +1193,78 @@ class CDPAWorker:
                     if manifest_path is None:
                         raise RuntimeError("Clear Team requires a manifest path")
                     selected_pages = await actions.preflight_team(state)
-                    self._start_cleanup(
+                    if not self._start_cleanup(
                         state,
                         control=control,
                         target_tabs=len(selected_pages),
                         manifest_path=manifest_path,
-                    )
-                    completed = await self._continue_cleanup(
+                    ):
+                        if persisted_result is not None:
+                            persisted_result.append(True)
+                        return True
+                    cleanup = state["cleanup"]
+                    control = self._cleanup_control(state, cleanup) or control
+                    await self._continue_cleanup(
                         state,
                         actions,
                         manifest_path,
                         preflighted_pages=selected_pages,
                     )
-                    if not completed:
-                        return True
-                    result = {
-                        "closed_tabs": int(cleanup.get("closed_tabs") or 0),
-                        "status_before": cleanup.get("status_before"),
-                        "retry_count": int(cleanup.get("retry_count") or 0),
-                    }
+                    if persisted_result is not None:
+                        persisted_result.append(True)
+                    return True
             else:
                 raise RuntimeError(f"unsupported control action {action!r}")
         except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}"
+            control_id = control.get("control_id")
+            if (
+                action == "clear_team"
+                and manifest_path is not None
+                and isinstance(control_id, int)
+            ):
+                saved = self.store.reject_control(
+                    manifest_path,
+                    control_id,
+                    detail,
+                    action="clear_team",
+                )
+                state.clear()
+                state.update(saved)
+                if persisted_result is not None:
+                    persisted_result.append(True)
+                return True
             control["status"] = "rejected"
-            control["result"] = f"{type(exc).__name__}: {exc}"
+            control["result"] = detail
             control["applied_at"] = utc_now()
+            if manifest_path is not None and isinstance(control_id, int):
+                saved = self._persist_control_result(
+                    manifest_path,
+                    baseline,
+                    state,
+                    control_id=control_id,
+                    action=action,
+                )
+                state.clear()
+                state.update(saved)
+                if persisted_result is not None:
+                    persisted_result.append(True)
             return True
         control["status"] = "applied"
         control["result"] = result
         control["applied_at"] = utc_now()
+        if manifest_path is not None and isinstance(control_id, int):
+            saved = self._persist_control_result(
+                manifest_path,
+                baseline,
+                state,
+                control_id=control_id,
+                action=action,
+            )
+            state.clear()
+            state.update(saved)
+            if persisted_result is not None:
+                persisted_result.append(True)
         return True
 
     def _append_hop(
@@ -1102,13 +1494,14 @@ class CDPAWorker:
         record = ledger.get(str(hop["request_id"]))
         if record is None:
             raise RuntimeError("durable request disappeared while upgrading receipt")
+        baseline = json.loads(json.dumps(state, ensure_ascii=False, default=str))
         ledger.update(
             record.request_id,
             receipt=upgraded.to_dict(),
             error=None,
         )
         hop["receipt"] = upgraded.to_dict()
-        self.store.save(manifest_path, state)
+        self._persist_transport_result(manifest_path, baseline, state)
         return upgraded
 
     def _validate_response_candidate(
@@ -1314,6 +1707,9 @@ class CDPAWorker:
                 )
                 return
         if should_refresh:
+            refresh_baseline = json.loads(
+                json.dumps(state, ensure_ascii=False, default=str)
+            )
             wait["recovery_baseline"] = merge_response_recovery_baselines(
                 wait.get("recovery_baseline"),
                 capture_response_recovery_baseline(
@@ -1322,15 +1718,18 @@ class CDPAWorker:
                 ),
             )
             begin_refresh(wait)
-            self.store.save(manifest_path, state)
+            self._persist_transport_result(manifest_path, refresh_baseline, state)
+            refresh_baseline = json.loads(
+                json.dumps(state, ensure_ascii=False, default=str)
+            )
             try:
                 await actions.refresh(acquired)
             except Exception as exc:
                 finish_refresh(wait, error=f"{type(exc).__name__}: {exc}")
-                self.store.save(manifest_path, state)
+                self._persist_transport_result(manifest_path, refresh_baseline, state)
                 raise
             finish_refresh(wait)
-            self.store.save(manifest_path, state)
+            self._persist_transport_result(manifest_path, refresh_baseline, state)
         remaining = remaining_timeout_ms(wait)
         if remaining <= 0:
             if await self._final_response_reconciliation(
@@ -1576,31 +1975,63 @@ class CDPAWorker:
         self,
         manifest_path: str | Path,
         browser_context: Any,
+        *,
+        scheduling_tasks: Sequence[Mapping[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         path = Path(manifest_path).resolve()
         try:
             with self.store.task_run_lock(path, blocking=False):
                 state = self.store.load(path)
                 try:
-                    dependency_changed = self._apply_dependency_readiness(
-                        state, self.store.discover_with_errors()[0]
+                    state, scheduling_changed = self.store.refresh_scheduling(
+                        path,
+                        tasks=scheduling_tasks,
                     )
                 except Exception as exc:
-                    self._block(
-                        state,
-                        f"{type(exc).__name__}: {exc}",
-                        code="dependency_invalid",
-                        retryable=False,
+                    failure_baseline = json.loads(
+                        json.dumps(state, ensure_ascii=False, default=str)
                     )
-                    return self.store.save(path, state)
-                if dependency_changed:
-                    return self.store.save(path, state)
+                    queue = state.get("queue")
+                    code = (
+                        "team_owner_conflict"
+                        if "multiple active owners" in str(exc)
+                        else "queue_release_failed"
+                        if isinstance(queue, Mapping)
+                        and queue.get("reuse_team") is True
+                        and queue.get("released_at") is None
+                        else "dependency_invalid"
+                    )
+                    if code in {"team_owner_conflict", "queue_release_failed"}:
+                        changed = self._wait_queue_error(
+                            state,
+                            f"{type(exc).__name__}: {exc}",
+                            code=code,
+                        )
+                        if not changed:
+                            return self.store.load(path)
+                    else:
+                        self._block(
+                            state,
+                            f"{type(exc).__name__}: {exc}",
+                            code=code,
+                            retryable=False,
+                        )
+                    saved = self._persist_transport_result(
+                        path,
+                        failure_baseline,
+                        state,
+                    )
+                    state.clear()
+                    state.update(saved)
+                    return saved
+                if scheduling_changed:
+                    return state
                 if state.get("status") == "WAITING":
                     return state
                 actions = CDPATabActions(browser_context, self.config)
                 if state.get("cleanup", {}).get("state") == "CLEARING":
                     await self._continue_cleanup(state, actions, path)
-                    return self.store.save(path, state)
+                    return self.store.load(path)
                 pending_control = next(
                     (
                         item for item in state.get("controls") or []
@@ -1608,46 +2039,90 @@ class CDPAWorker:
                     ),
                     None,
                 )
+                pending_control_id = (
+                    pending_control.get("control_id") if pending_control is not None else None
+                )
+                pending_action = (
+                    str(pending_control.get("action") or "")
+                    if pending_control is not None
+                    else ""
+                )
                 resumed_control = None
-                if await self._apply_control(state, actions, path):
+                resume_baseline: dict[str, Any] | None = None
+                persisted_control: list[bool] = []
+                if await self._apply_control(
+                    state,
+                    actions,
+                    path,
+                    scheduling_tasks=scheduling_tasks,
+                    persisted_result=persisted_control,
+                ):
+                    applied_control = next(
+                        (
+                            item
+                            for item in state.get("controls") or []
+                            if isinstance(item, dict)
+                            and item.get("control_id") == pending_control_id
+                        ),
+                        None,
+                    )
                     if (
-                        pending_control is not None
-                        and pending_control.get("action") == "resume"
-                        and pending_control.get("status") == "applied"
+                        pending_action == "resume"
+                        and applied_control is not None
+                        and applied_control.get("status") == "applied"
                         and state.get("status") not in TERMINAL
                     ):
-                        resumed_control = pending_control
+                        resumed_control = applied_control
+                        resume_baseline = json.loads(
+                            json.dumps(state, ensure_ascii=False, default=str)
+                        )
+                    elif persisted_control:
+                        return self.store.load(path)
                     else:
-                        return self.store.save(path, state)
+                        raise RuntimeError("control result was not persisted atomically")
                 if state.get("status") in TERMINAL:
+                    operational_tasks = self.store.discover_with_errors()[0]
+                    queued_team_work = has_other_nonterminal_team_work(
+                        operational_tasks,
+                        str(state.get("team") or ""),
+                        exclude_task_id=str(state.get("task_id") or ""),
+                    )
                     if (
                         not state.get("cleanup", {}).get("cleared_at")
                         and cleanup_eligible(
                             state,
                             idle_seconds=self.config.cleanup_terminal_idle_seconds,
+                            queued_team_work=queued_team_work,
                         )
                     ):
                         try:
                             selected_pages = await actions.preflight_team(state)
                         except Exception as exc:
-                            self._record_cleanup_failure(state, exc)
-                            return self.store.save(path, state)
-                        self._start_cleanup(
+                            def record_failure(current: dict[str, Any]) -> dict[str, Any]:
+                                self._record_cleanup_failure(current, exc)
+                                return current
+
+                            return self.store.update(path, record_failure)
+                        if not self._start_cleanup(
                             state,
                             control=None,
                             target_tabs=len(selected_pages),
                             manifest_path=path,
-                        )
+                        ):
+                            return state
                         await self._continue_cleanup(
                             state,
                             actions,
                             path,
                             preflighted_pages=selected_pages,
                         )
-                        return self.store.save(path, state)
+                        return self.store.load(path)
                     return state
                 if state.get("status") in {"PAUSED", "BLOCKED"}:
                     return state
+                transport_baseline = json.loads(
+                    json.dumps(state, ensure_ascii=False, default=str)
+                )
                 try:
                     hop = _active_hop(state)
                     if hop["state"] == "pre_send":
@@ -1683,11 +2158,7 @@ class CDPAWorker:
                 except Exception as exc:
                     if resumed_control is None or _is_cdp_disconnect(exc):
                         raise
-                    code = (
-                        "role_ownership_ambiguous"
-                        if isinstance(exc, RoleOwnershipError)
-                        else "unexpected_error"
-                    )
+                    code = _role_ownership_block_code(exc) or "unexpected_error"
                     self._block(
                         state,
                         f"{type(exc).__name__}: {exc}",
@@ -1695,10 +2166,34 @@ class CDPAWorker:
                         retryable=False,
                     )
                     self._finalize_resume_recheck(state, resumed_control)
-                    return self.store.save(path, state)
+                    assert resume_baseline is not None
+                    saved = self._persist_control_result(
+                        path,
+                        resume_baseline,
+                        state,
+                        control_id=int(resumed_control["control_id"]),
+                        action="resume",
+                    )
+                    state.clear()
+                    state.update(saved)
+                    return saved
                 if resumed_control is not None:
                     self._finalize_resume_recheck(state, resumed_control)
-                return self.store.save(path, state)
+                    assert resume_baseline is not None
+                    saved = self._persist_control_result(
+                        path,
+                        resume_baseline,
+                        state,
+                        control_id=int(resumed_control["control_id"]),
+                        action="resume",
+                    )
+                    state.clear()
+                    state.update(saved)
+                    return saved
+                saved = self._persist_transport_result(path, transport_baseline, state)
+                state.clear()
+                state.update(saved)
+                return saved
         except BlockingIOError:
             return None
         except Exception as exc:
@@ -1706,13 +2201,33 @@ class CDPAWorker:
                 raise
             try:
                 state = self.store.load(path)
+                failure_baseline = json.loads(
+                    json.dumps(state, ensure_ascii=False, default=str)
+                )
+                queue = state.get("queue")
+                queue_rebind = (
+                    isinstance(queue, Mapping)
+                    and queue.get("reuse_team") is True
+                    and queue.get("released_at") is not None
+                    and str((_active_hop(state)).get("state") or "") == "pre_send"
+                )
                 self._block(
                     state,
                     f"{type(exc).__name__}: {exc}",
-                    code="unexpected_error",
+                    code=(
+                        _role_ownership_block_code(exc)
+                        or ("queue_rebind_failed" if queue_rebind else "unexpected_error")
+                    ),
                     retryable=False,
                 )
-                return self.store.save(path, state)
+                saved = self._persist_transport_result(
+                    path,
+                    failure_baseline,
+                    state,
+                )
+                state.clear()
+                state.update(saved)
+                return saved
             except Exception:
                 raise
 
@@ -1721,7 +2236,14 @@ class CDPAWorker:
         tasks, _errors = self.store.discover_with_errors()
         paths = [Path(task["manifest_path"]) for task in tasks]
         raw_results = await asyncio.gather(
-            *(self.advance(path, browser_context) for path in paths),
+            *(
+                self.advance(
+                    path,
+                    browser_context,
+                    scheduling_tasks=tasks,
+                )
+                for path in paths
+            ),
             return_exceptions=True,
         )
         results: list[dict[str, Any] | None] = []

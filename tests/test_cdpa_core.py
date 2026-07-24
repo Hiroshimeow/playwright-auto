@@ -12,7 +12,12 @@ from playwright_auto.cdpa_config import CDPAConfigError, load_cdpa_config
 from playwright_auto.cdpa_prompts import PromptBuilder
 from playwright_auto.cdpa_routes import RouteContractError, parse_route_response, validate_report
 from playwright_auto.cdpa_store import TaskStore, utc_now
-from playwright_auto.cdpa_team import cleanup_eligible, physical_role
+from playwright_auto.cdpa_team import (
+    cleanup_eligible,
+    is_active_team_owner,
+    physical_role,
+    queued_team_tasks,
+)
 
 
 def write_config(root: Path) -> Path:
@@ -88,6 +93,25 @@ def install_cycle_isolation_graph(store: TaskStore) -> dict[str, dict[str, objec
         "b": b,
         "unrelated": unrelated,
     }
+
+
+def poison_catalog_identity_entry(
+    store: TaskStore,
+    state: dict[str, object],
+    *,
+    mapping_path: str | Path | None = None,
+    key: str = "bad",
+) -> dict[str, object]:
+    catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    canonical_key = store._catalog_key(str(state["manifest_path"]))
+    entry = catalog["entries"].pop(canonical_key)
+    if mapping_path is None:
+        entry.pop("manifest_path", None)
+    else:
+        entry["manifest_path"] = str(Path(mapping_path).expanduser().resolve())
+    catalog["entries"][key] = entry
+    store.catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    return json.loads(json.dumps(entry))
 
 
 def install_duplicate_task_graph(store: TaskStore) -> dict[str, dict[str, object]]:
@@ -484,6 +508,29 @@ def test_corrupt_manifest_reserves_only_its_team_and_task_identity(tmp_path: Pat
         }
     ]
     assert errors[0]["error"].startswith("InvalidManifestError:")
+
+
+def test_create_rejects_valid_filesystem_task_id_when_catalog_is_missing(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    existing = store.create_task(
+        "Existing", requested_team="alpha", task_id="task-existing"
+    )
+    existing_path = Path(existing["manifest_path"])
+    existing_before = existing_path.read_bytes()
+    store.catalog_path.unlink()
+
+    with pytest.raises(ValueError, match="task_id is already"):
+        store.create_task(
+            "Duplicate",
+            requested_team="beta",
+            task_id=existing["task_id"],
+        )
+
+    assert existing_path.read_bytes() == existing_before
+    assert [path for path in store.root.glob("*/*/*.json") if path.name != "requests.json"] == [
+        existing_path
+    ]
 
 
 def test_malformed_primary_without_catalog_remains_diagnostic_and_reserves_suffix(tmp_path: Path):
@@ -1047,6 +1094,794 @@ def test_cleanup_only_terminal_and_idle():
     assert not cleanup_eligible({"status": "BLOCKED", "last_role_activity_at": old}, now=now, idle_seconds=3600)
     assert not cleanup_eligible({"status": "DONE", "active_role": "PLAN", "last_role_activity_at": old}, now=now, idle_seconds=3600)
     assert not cleanup_eligible({"status": "DONE", "last_role_activity_at": now.isoformat()}, now=now, idle_seconds=3600)
+    assert not cleanup_eligible(
+        {"status": "DONE", "last_role_activity_at": old},
+        now=now,
+        idle_seconds=3600,
+        queued_team_work=True,
+    )
+
+
+def test_team_owner_and_queue_order_are_shared_pure_predicates():
+    tasks = [
+        {"task_id": "owner", "team": "alpha", "status": "RUNNING"},
+        {
+            "task_id": "task-z",
+            "team": "alpha",
+            "status": "WAITING",
+            "created_at": "2026-07-23T00:00:00+00:00",
+            "queue": {"reuse_team": True, "released_at": None},
+        },
+        {
+            "task_id": "task-a",
+            "team": "alpha",
+            "status": "WAITING",
+            "created_at": "2026-07-23T00:00:00+00:00",
+            "queue": {"reuse_team": True, "released_at": None},
+        },
+    ]
+    assert is_active_team_owner(tasks[0]) is True
+    assert is_active_team_owner(tasks[1]) is False
+    assert [item["task_id"] for item in queued_team_tasks(tasks, "alpha")] == [
+        "task-a",
+        "task-z",
+    ]
+
+
+def test_reuse_team_creates_waiting_task_without_allocating_suffix(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    first = store.create_task("one", requested_team="alpha", task_id="task-one")
+
+    second = store.create_task("two", reuse_team="alpha", task_id="task-two")
+
+    assert second["team"] == "alpha"
+    assert second["team_suffix"] == first["team_suffix"]
+    assert second["roles"]["PLAN"]["physical_role"] == first["roles"]["PLAN"]["physical_role"]
+    assert second["status"] == "WAITING"
+    assert second["waiting"]["reason"] == "team_busy"
+    assert second["waiting"]["blocked_by_task_id"] == "task-one"
+    assert second["queue"] == {
+        "reuse_team": True,
+        "blocked_by_task_id": "task-one",
+        "enqueued_at": second["created_at"],
+        "released_at": None,
+    }
+    assert second["queue_events"][0]["status"] == "WAITING"
+
+
+def test_reuse_team_requires_exact_existing_team_and_preserves_terminal_slot(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    first = store.create_task("one", requested_team="alpha", task_id="task-one")
+    store.update(
+        first["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+
+    queued = store.create_task("two", reuse_team="alpha", task_id="task-two")
+
+    assert queued["team"] == "alpha"
+    assert queued["team_suffix"] == 1
+    assert queued["reusable_teams"] == ["alpha"]
+    assert queued["status"] == "WAITING"
+    assert queued["waiting"]["blocked_by_task_id"] is None
+    with pytest.raises(ValueError, match="exact team"):
+        store.create_task("missing", reuse_team="missing", task_id="task-missing")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        store.create_task(
+            "invalid",
+            requested_team="alpha",
+            reuse_team="alpha",
+            task_id="task-invalid",
+        )
+
+
+def test_reuse_team_validates_exact_raw_catalog_before_any_write(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    key = store._catalog_key(owner["manifest_path"])
+    catalog["entries"][key]["status"] = "DONE"
+    store.catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    before_catalog = store.catalog_path.read_bytes()
+    before_paths = store.discover_paths()
+
+    with pytest.raises(ValueError, match="catalog field 'status' does not match"):
+        store.create_task("queued", reuse_team="alpha", task_id="task-queued")
+
+    assert store.catalog_path.read_bytes() == before_catalog
+    assert store.discover_paths() == before_paths
+
+
+def test_reuse_team_and_resume_treat_clearing_owner_as_availability_barrier(
+    tmp_path: Path,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    owner = store.update(
+        owner["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "STOPPED",
+            "terminal_state": "STOPPED",
+            "active_role": None,
+            "active_hop_id": None,
+            "stopped_at": utc_now(),
+            "stop_reason": "team cleared",
+            "cleanup": {
+                **state["cleanup"],
+                "state": "CLEARING",
+                "phase": "close_pending",
+                "verified_empty_at": None,
+            },
+        },
+    )
+
+    queued = store.create_task("queued", reuse_team="alpha", task_id="task-queued")
+
+    assert queued["status"] == "WAITING"
+    assert queued["waiting_code"] == "team_busy"
+    assert queued["waiting"]["blocked_by_task_id"] == owner["task_id"]
+    before = Path(queued["manifest_path"]).read_bytes()
+    with pytest.raises(ValueError, match="cleanup is still clearing"):
+        store.resume_team("alpha")
+    assert Path(queued["manifest_path"]).read_bytes() == before
+
+    store.update(
+        owner["manifest_path"],
+        lambda state: {
+            **state,
+            "cleanup": {
+                **state["cleanup"],
+                "state": "CLEARED",
+                "phase": "cleared",
+                "cleared_at": utc_now(),
+                "verified_empty_at": utc_now(),
+            },
+        },
+    )
+    resumed = store.resume_team("alpha")
+    assert resumed["task_id"] == queued["task_id"]
+    assert resumed["status"] == "INBOX"
+    assert resumed["queue"]["released_at"]
+
+
+def test_reuse_team_combines_dependency_and_team_waiting_evidence(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    parent = store.create_task("parent", requested_team="parent", task_id="task-parent")
+
+    queued = store.create_task(
+        "queued",
+        reuse_team="alpha",
+        task_id="task-queued",
+        depends_on_task_ids=("task-parent",),
+    )
+
+    assert queued["status"] == "WAITING"
+    assert queued["waiting"]["reason"] == "dependency_team_busy"
+    assert queued["waiting"]["waiting_on"] == ["task-parent"]
+    assert queued["waiting"]["blocked_by_task_id"] == owner["task_id"]
+    assert queued["waiting_code"] == "dependency_team_busy"
+    assert parent["task_id"] in queued["waiting_reason"]
+
+
+def test_queue_manifest_validation_rejects_persisted_derived_or_malformed_fields(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    queued = store.create_task("queued", reuse_team="alpha", task_id="task-queued")
+    path = Path(queued["manifest_path"])
+    base = json.loads(path.read_text(encoding="utf-8"))
+
+    for field, value in (
+        ("queue", []),
+        ("queue", {"reuse_team": "yes", "blocked_by_task_id": None, "enqueued_at": queued["created_at"], "released_at": None}),
+        ("queue_position", 1),
+        ("queue_length", 2),
+        ("owner_task_ids", ["task-owner"]),
+    ):
+        raw = json.loads(json.dumps(base))
+        raw[field] = value
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        with pytest.raises(ValueError):
+            store.load(path)
+    path.write_text(json.dumps(base), encoding="utf-8")
+
+
+@pytest.mark.parametrize("owner_failure", ["missing", "invalid_json"])
+def test_queue_scheduling_fails_closed_when_exact_team_owner_is_unreadable(
+    tmp_path: Path,
+    owner_failure: str,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    queued = store.create_task("queued", reuse_team="alpha", task_id="task-queued")
+    queued_path = Path(queued["manifest_path"])
+    before = queued_path.read_bytes()
+    owner_path = Path(owner["manifest_path"])
+    if owner_failure == "missing":
+        owner_path.unlink()
+    else:
+        owner_path.write_text("{", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exact team 'alpha'"):
+        store.refresh_scheduling(queued_path)
+
+    assert queued_path.read_bytes() == before
+    unchanged = json.loads(before)
+    assert unchanged["status"] == "WAITING"
+    assert unchanged["queue"]["released_at"] is None
+    assert unchanged["hops"][0]["state"] == "pre_send"
+
+
+@pytest.mark.parametrize(
+    "catalog_corruption",
+    [
+        "status_mismatch",
+        "non_mapping",
+        "missing_manifest_path",
+        "wrong_three_part_key",
+        "backslash_key",
+        "identity_missing_path",
+        "identity_outside_path",
+        "identity_ghost_path",
+        "identity_other_manifest_path",
+    ],
+)
+def test_discovery_reports_catalog_mismatch_without_reconciling_it(
+    tmp_path: Path,
+    catalog_corruption: str,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    queued = store.create_task("queued", reuse_team="alpha", task_id="task-queued")
+    unrelated = store.create_task(
+        "unrelated", requested_team="beta", task_id="task-unrelated"
+    )
+    owner_key = store._catalog_key(owner["manifest_path"])
+    catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    poisoned_key = owner_key
+    if catalog_corruption == "status_mismatch":
+        catalog["entries"][owner_key]["status"] = "DONE"
+    elif catalog_corruption == "non_mapping":
+        catalog["entries"][owner_key] = "corrupt"
+    elif catalog_corruption == "missing_manifest_path":
+        del catalog["entries"][owner_key]["manifest_path"]
+    else:
+        entry = catalog["entries"].pop(owner_key)
+        if catalog_corruption == "wrong_three_part_key":
+            poisoned_key = "wrong/task-owner/owner.json"
+        elif catalog_corruption == "backslash_key":
+            poisoned_key = "alpha\\bad/task-owner/owner.json"
+        else:
+            poisoned_key = "bad"
+            if catalog_corruption == "identity_missing_path":
+                del entry["manifest_path"]
+            elif catalog_corruption == "identity_outside_path":
+                entry["manifest_path"] = str((tmp_path / "outside-owner.json").resolve())
+            elif catalog_corruption == "identity_ghost_path":
+                entry["manifest_path"] = str(
+                    (store.root / "ghost" / "task-owner" / "owner.json").resolve()
+                )
+            else:
+                entry["manifest_path"] = unrelated["manifest_path"]
+        catalog["entries"][poisoned_key] = entry
+    poisoned = json.loads(json.dumps(catalog["entries"][poisoned_key]))
+    store.catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+
+    tasks, errors = store.discover_with_errors()
+
+    assert {task["task_id"] for task in tasks} == {
+        queued["task_id"],
+        unrelated["task_id"],
+    }
+    assert any(
+        item["manifest_path"] == owner["manifest_path"]
+        and "catalog" in item["error"].lower()
+        for item in errors
+    )
+    after = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    assert after["entries"][poisoned_key] == poisoned
+    if poisoned_key != owner_key:
+        assert owner_key not in after["entries"]
+
+
+def test_valid_catalog_entry_wins_over_malformed_declared_identity_duplicate(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    owner_key = store._catalog_key(owner["manifest_path"])
+    duplicate = json.loads(json.dumps(catalog["entries"][owner_key]))
+    del duplicate["manifest_path"]
+    catalog["entries"]["bad"] = duplicate
+    poisoned = json.loads(json.dumps(catalog["entries"]["bad"]))
+    store.catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+
+    tasks, errors = store.discover_with_errors()
+
+    assert [task["task_id"] for task in tasks] == [owner["task_id"]]
+    assert any(
+        item["manifest_path"] == owner["manifest_path"]
+        and "raw catalog entry 'bad'" in item["error"]
+        for item in errors
+    )
+    after = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    assert after["entries"][owner_key] == catalog["entries"][owner_key]
+    assert after["entries"]["bad"] == poisoned
+
+
+def test_unrelated_create_does_not_reconcile_catalog_invalid_owner(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    owner_key = store._catalog_key(owner["manifest_path"])
+    owner_before = Path(owner["manifest_path"]).read_bytes()
+    poisoned = poison_catalog_identity_entry(store, owner)
+
+    before, _errors = store.discover_with_errors()
+    created = store.create_task(
+        "Unrelated", requested_team="beta", task_id="task-unrelated"
+    )
+    after, _errors = store.discover_with_errors()
+
+    assert before == []
+    assert [task["task_id"] for task in after] == [created["task_id"]]
+    catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    assert owner_key not in catalog["entries"]
+    assert catalog["entries"]["bad"] == poisoned
+    assert Path(owner["manifest_path"]).read_bytes() == owner_before
+
+
+def test_dependency_create_rejects_catalog_invalid_parent_without_writes(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task(
+        "Parent", requested_team="alpha", task_id="task-parent"
+    )
+    parent = store.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+    poison_catalog_identity_entry(store, parent)
+    before_catalog = store.catalog_path.read_bytes()
+    before_files = sorted(store.root.glob("*/*/*.json"))
+
+    with pytest.raises(ValueError, match="missing dependency"):
+        store.create_task(
+            "Child",
+            requested_team="beta",
+            task_id="task-child",
+            depends_on_task_ids=(parent["task_id"],),
+        )
+
+    assert store.catalog_path.read_bytes() == before_catalog
+    assert sorted(store.root.glob("*/*/*.json")) == before_files
+    tasks, _errors = store.discover_with_errors()
+    assert tasks == []
+
+
+@pytest.mark.parametrize("parent_status", ["DONE", "STOPPED"])
+def test_refresh_scheduling_excludes_catalog_invalid_dependency_parent(
+    tmp_path: Path,
+    parent_status: str,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task(
+        "Parent", requested_team="alpha", task_id="task-parent"
+    )
+    child = store.create_task(
+        "Child",
+        requested_team="beta",
+        task_id="task-child",
+        depends_on_task_ids=("task-parent",),
+    )
+    unrelated = store.create_task(
+        "Unrelated", requested_team="gamma", task_id="task-unrelated"
+    )
+    parent_path = Path(parent["manifest_path"])
+    child_path = Path(child["manifest_path"])
+    parent = store.update(
+        parent_path,
+        lambda state: {
+            **state,
+            "status": parent_status,
+            "terminal_state": parent_status,
+            "active_role": None,
+            "active_hop_id": None,
+            **(
+                {"completed_at": utc_now()}
+                if parent_status == "DONE"
+                else {"stopped_at": utc_now(), "stop_reason": "failed parent"}
+            ),
+        },
+    )
+    parent_before = parent_path.read_bytes()
+    poisoned = poison_catalog_identity_entry(store, parent)
+
+    tasks, errors = store.discover_with_errors()
+    refreshed, changed = store.refresh_scheduling(child_path)
+
+    assert {task["task_id"] for task in tasks} == {
+        child["task_id"],
+        unrelated["task_id"],
+    }
+    assert any(
+        item["manifest_path"] == parent["manifest_path"]
+        and "raw catalog entry 'bad'" in item["error"]
+        for item in errors
+    )
+    assert changed is True
+    assert refreshed["status"] == "WAITING"
+    assert refreshed["waiting_code"] == "dependency_missing"
+    assert refreshed["waiting"]["missing"] == ["task-parent"]
+    assert refreshed["hops"][0]["state"] == "pre_send"
+    assert not any(
+        item["status"] == "RELEASED" for item in refreshed["dependency_events"]
+    )
+    assert parent_path.read_bytes() == parent_before
+    catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    assert catalog["entries"]["bad"] == poisoned
+
+
+@pytest.mark.parametrize("parent_status", ["DONE", "STOPPED"])
+def test_exact_team_resume_does_not_release_queue_through_catalog_invalid_parent(
+    tmp_path: Path,
+    parent_status: str,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task(
+        "parent", requested_team="alpha", task_id="task-parent"
+    )
+    owner = store.create_task(
+        "owner", requested_team="beta", task_id="task-owner"
+    )
+    queued = store.create_task(
+        "queued",
+        reuse_team="beta",
+        task_id="task-queued",
+        depends_on_task_ids=(parent["task_id"],),
+    )
+    parent = store.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "status": parent_status,
+            "terminal_state": parent_status,
+            "active_role": None,
+            "active_hop_id": None,
+            **(
+                {"completed_at": utc_now()}
+                if parent_status == "DONE"
+                else {"stopped_at": utc_now(), "stop_reason": "failed parent"}
+            ),
+        },
+    )
+    store.update(
+        owner["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+    queued_path = Path(queued["manifest_path"])
+    poisoned = poison_catalog_identity_entry(store, parent)
+    queued_before = queued_path.read_bytes()
+    catalog_before = store.catalog_path.read_bytes()
+
+    tasks, errors = store.discover_with_errors()
+    assert parent["task_id"] not in {task["task_id"] for task in tasks}
+    assert any(
+        item["manifest_path"] == parent["manifest_path"]
+        and "raw catalog entry 'bad'" in item["error"]
+        for item in errors
+    )
+
+    with pytest.raises(ValueError, match="queued tasks are not dependency-ready"):
+        store.resume_team("beta", reason="test resume")
+
+    assert queued_path.read_bytes() == queued_before
+    assert store.catalog_path.read_bytes() == catalog_before
+    current = store.load(queued_path)
+    assert current["status"] == "WAITING"
+    assert current["queue"]["released_at"] is None
+    assert not any(
+        event.get("status") == "RELEASED" for event in current["queue_events"]
+    )
+    catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    assert catalog["entries"]["bad"] == poisoned
+
+
+def test_exact_team_resume_accepts_active_owner_with_queued_tasks_and_releases_oldest_ready(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    queued_b = store.create_task("queued b", reuse_team="alpha", task_id="task-b")
+    queued_a = store.create_task("queued a", reuse_team="alpha", task_id="task-a")
+    same_time = "2026-07-23T00:00:00+00:00"
+    for queued in (queued_a, queued_b):
+        store.update(
+            queued["manifest_path"],
+            lambda state, same_time=same_time: {
+                **state,
+                "created_at": same_time,
+                "queue": {**state["queue"], "enqueued_at": same_time},
+            },
+        )
+
+    resumed_owner = store.resume_team("alpha", reason="owner resume")
+    assert resumed_owner["task_id"] == owner["task_id"]
+
+    store.update(
+        owner["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+    resumed_queue = store.resume_team("alpha", reason="queue resume")
+    assert resumed_queue["task_id"] == "task-a"
+    assert resumed_queue["status"] == "INBOX"
+    assert resumed_queue["queue"]["released_at"]
+    assert resumed_queue["queue_events"][-1]["status"] == "RELEASED"
+    assert resumed_queue["controls"][-1]["action"] == "resume"
+
+
+def test_taskless_resume_releases_dependency_ready_ordinary_waiter(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task("parent", requested_team="parent", task_id="task-parent")
+    waiter = store.create_task(
+        "waiter",
+        requested_team="alpha",
+        task_id="task-waiter",
+        depends_on_task_ids=(parent["task_id"],),
+    )
+    original_hop = json.loads(json.dumps(waiter["hops"][0]))
+    store.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+
+    resumed = store.resume_team("alpha", reason="dependency-ready resume")
+
+    assert resumed["task_id"] == waiter["task_id"]
+    assert resumed["status"] == "INBOX"
+    assert resumed["waiting_code"] is None
+    assert resumed["controls"][-1]["action"] == "resume"
+    assert resumed["controls"][-1]["reason"] == "dependency-ready resume"
+    for field in ("hop_id", "turn", "request_id", "state", "handoff", "ledger_path"):
+        assert resumed["hops"][0][field] == original_hop[field]
+
+
+def test_taskless_resume_mixed_waiters_selects_worker_winner(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task("parent", requested_team="parent", task_id="task-parent")
+    first = store.create_task(
+        "first",
+        requested_team="alpha",
+        task_id="task-first",
+        depends_on_task_ids=(parent["task_id"],),
+    )
+    second = store.create_task(
+        "second",
+        reuse_team="alpha",
+        task_id="task-second",
+        depends_on_task_ids=(parent["task_id"],),
+    )
+    store.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+    losing_path = Path(second["manifest_path"])
+    losing_before = losing_path.read_bytes()
+
+    resumed = store.resume_team("alpha")
+
+    assert resumed["task_id"] == first["task_id"]
+    assert resumed["status"] == "INBOX"
+    assert resumed["queue"] is None
+    assert losing_path.read_bytes() == losing_before
+    losing, changed = store.refresh_scheduling(second["manifest_path"])
+    assert changed is True
+    assert losing["status"] == "WAITING"
+    assert losing["waiting"]["blocked_by_task_id"] == first["task_id"]
+
+
+def test_dependency_waiter_does_not_release_beside_active_reuse_team_task(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task("parent", requested_team="parent", task_id="task-parent")
+    first = store.create_task(
+        "first",
+        requested_team="alpha",
+        task_id="task-first",
+        depends_on_task_ids=(parent["task_id"],),
+    )
+    second = store.create_task("second", reuse_team="alpha", task_id="task-second")
+
+    released, changed = store.refresh_scheduling(second["manifest_path"])
+    assert changed is True
+    assert released["status"] == "INBOX"
+
+    store.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+    waiting, changed = store.refresh_scheduling(first["manifest_path"])
+
+    assert changed is True
+    assert waiting["status"] == "WAITING"
+    assert waiting["waiting_code"] == "team_busy"
+    assert waiting["waiting"]["reason"] == "team_busy"
+    assert waiting["waiting"]["blocked_by_task_id"] == second["task_id"]
+    owners = [
+        task["task_id"]
+        for task in store.discover_with_errors()[0]
+        if task["team"] == "alpha" and is_active_team_owner(task)
+    ]
+    assert owners == [second["task_id"]]
+
+
+def test_mixed_dependency_and_queue_waiters_release_one_deterministic_owner(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task("parent", requested_team="parent", task_id="task-parent")
+    first = store.create_task(
+        "first",
+        requested_team="alpha",
+        task_id="task-first",
+        depends_on_task_ids=(parent["task_id"],),
+    )
+    second = store.create_task(
+        "second",
+        reuse_team="alpha",
+        task_id="task-second",
+        depends_on_task_ids=(parent["task_id"],),
+    )
+    original_second_hop = json.loads(json.dumps(second["hops"][0]))
+    store.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+
+    later, changed = store.refresh_scheduling(second["manifest_path"])
+    assert changed is True
+    assert later["status"] == "WAITING"
+    assert later["waiting"]["blocked_by_task_id"] == first["task_id"]
+
+    winner, changed = store.refresh_scheduling(first["manifest_path"])
+    assert changed is True
+    assert winner["status"] == "INBOX"
+
+    restarted = TaskStore(config)
+    losing = restarted.load(second["manifest_path"])
+    assert losing["status"] == "WAITING"
+    assert losing["active_hop_id"] == 1
+    for field in ("hop_id", "turn", "request_id", "state", "handoff", "ledger_path"):
+        assert losing["hops"][0][field] == original_second_hop[field]
+    assert losing["hops"][0]["state"] == "pre_send"
+    owners = [
+        task["task_id"]
+        for task in restarted.discover_with_errors()[0]
+        if task["team"] == "alpha" and is_active_team_owner(task)
+    ]
+    assert owners == [first["task_id"]]
+
+
+def test_exact_team_resume_fails_closed_for_multiple_owners_or_dependency_blocked_queue(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    queued = store.create_task("queued", reuse_team="alpha", task_id="task-queued")
+    store.update(
+        queued["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "INBOX",
+            "kanban_column": "INBOX",
+            "active_action": "queued",
+            "queue": {**state["queue"], "released_at": utc_now()},
+            "waiting": {
+                "reason": None,
+                "waiting_on": [],
+                "stopped": [],
+                "missing": [],
+                "blocked_by_task_id": None,
+                "since": None,
+            },
+        },
+    )
+    with pytest.raises(ValueError, match="multiple active owners"):
+        store.resume_team("alpha")
+
+    blocked_root = tmp_path / "blocked"
+    blocked_root.mkdir()
+    isolated = TaskStore(
+        load_cdpa_config(write_config(blocked_root), repository_root=blocked_root)
+    )
+    first = isolated.create_task("owner", requested_team="alpha", task_id="task-owner")
+    parent = isolated.create_task("parent", requested_team="parent", task_id="task-parent")
+    blocked = isolated.create_task(
+        "blocked",
+        reuse_team="alpha",
+        task_id="task-blocked",
+        depends_on_task_ids=(parent["task_id"],),
+    )
+    isolated.update(
+        first["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+    with pytest.raises(ValueError, match="not dependency-ready"):
+        isolated.resume_team("alpha")
+    assert isolated.load(blocked["manifest_path"])["status"] == "WAITING"
 
 
 def test_catalog_detects_external_manifest_loss_and_reserves_slot(tmp_path: Path):
@@ -1838,6 +2673,69 @@ def test_existing_missing_dependency_does_not_poison_unrelated_replacement(tmp_p
     assert catalog_after["entries"][missing_child_key] == missing_child_catalog_before
 
 
+def test_replacement_does_not_reconcile_unrelated_catalog_invalid_owner(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
+    target = store.create_task(
+        "Target", requested_team="beta", task_id="task-target"
+    )
+    target = _stop_task(store, target)
+    owner_key = store._catalog_key(owner["manifest_path"])
+    target_before = Path(target["manifest_path"]).read_bytes()
+    poisoned = poison_catalog_identity_entry(store, owner)
+    before_catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+
+    result = store.replace_task_and_rewire(
+        target["task_id"],
+        "Continue target safely",
+        reuse_team=True,
+        rewire_children=True,
+        incident_id="maint-unrelated-catalog-invalid",
+    )
+
+    replacement = result["replacement"]
+    tasks, _errors = store.discover_with_errors()
+    assert {task["task_id"] for task in tasks} == {
+        target["task_id"],
+        replacement["task_id"],
+    }
+    catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+    assert owner_key not in catalog["entries"]
+    assert catalog["entries"]["bad"] == poisoned
+    assert set(catalog["entries"]) == {
+        *before_catalog["entries"],
+        store._catalog_key(replacement["manifest_path"]),
+    }
+    assert Path(target["manifest_path"]).read_bytes() == target_before
+
+
+def test_replacement_rejects_catalog_invalid_target_without_writes(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    target = store.create_task(
+        "Target", requested_team="alpha", task_id="task-target"
+    )
+    target = _stop_task(store, target)
+    target_before = Path(target["manifest_path"]).read_bytes()
+    poison_catalog_identity_entry(store, target)
+    catalog_before = store.catalog_path.read_bytes()
+
+    with pytest.raises(ValueError, match="replacement target does not exist"):
+        store.replace_task_and_rewire(
+            target["task_id"],
+            "Continue target safely",
+            reuse_team=True,
+            rewire_children=True,
+            incident_id="maint-invalid-target",
+        )
+
+    assert Path(target["manifest_path"]).read_bytes() == target_before
+    assert store.catalog_path.read_bytes() == catalog_before
+    assert not store.phase4_journal_path.exists()
+    assert list(store.root.rglob("*.phase4.tmp")) == []
+
+
 def _stop_task(store: TaskStore, state: dict, reason="stopped parent") -> dict:
     return store.update(
         state["manifest_path"],
@@ -2291,6 +3189,67 @@ def test_replace_task_recovers_after_process_interruption_between_manifest_insta
     assert list(restarted.root.rglob("*.phase4.tmp")) == []
     assert list(restarted.root.rglob("*.phase4.rollback.tmp")) == []
     assert install_targets[0] != install_targets[1]
+
+
+def test_phase4_recovery_does_not_reconcile_unrelated_catalog_invalid_owner(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    owner = store.create_task("Owner", requested_team="alpha", task_id="task-owner")
+    target = store.create_task(
+        "Recovery target", requested_team="beta", task_id="task-target"
+    )
+    child = store.create_task(
+        "Recovery child",
+        requested_team="gamma",
+        task_id="task-child",
+        depends_on_task_ids=(target["task_id"],),
+    )
+    target = _stop_task(store, target)
+    owner_key = store._catalog_key(owner["manifest_path"])
+    owner_before = Path(owner["manifest_path"]).read_bytes()
+    poisoned = poison_catalog_identity_entry(store, owner)
+    original_replace = store_module.os.replace
+    interrupted = False
+
+    def interrupt_first_manifest(source, destination):
+        nonlocal interrupted
+        if Path(source).name.endswith(".json.phase4.tmp") and not interrupted:
+            interrupted = True
+            raise SystemExit("simulated filtered recovery interruption")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(store_module.os, "replace", interrupt_first_manifest)
+    with pytest.raises(SystemExit, match="filtered recovery interruption"):
+        store.replace_task_and_rewire(
+            target["task_id"],
+            "Continue target safely",
+            reuse_team=True,
+            rewire_children=True,
+            incident_id="maint-filtered-recovery",
+        )
+    assert store.phase4_journal_path.exists()
+
+    monkeypatch.setattr(store_module.os, "replace", original_replace)
+    restarted = TaskStore(config)
+    recovered = restarted.recover_phase4_replacement()
+
+    assert recovered is not None
+    replacement = recovered["replacement"]
+    assert restarted.load(child["manifest_path"])["depends_on_task_ids"] == [
+        replacement["task_id"]
+    ]
+    catalog = json.loads(restarted.catalog_path.read_text(encoding="utf-8"))
+    assert owner_key not in catalog["entries"]
+    assert catalog["entries"]["bad"] == poisoned
+    assert Path(owner["manifest_path"]).read_bytes() == owner_before
+    tasks, _errors = restarted.discover_with_errors()
+    assert owner["task_id"] not in {task["task_id"] for task in tasks}
+    assert not restarted.phase4_journal_path.exists()
+    assert list(restarted.root.rglob("*.phase4.tmp")) == []
+    assert list(restarted.root.rglob("*.phase4.rollback.tmp")) == []
 
 
 def test_phase4_recovery_ignores_unrelated_duplicate_diagnostics(

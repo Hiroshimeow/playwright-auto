@@ -31,7 +31,11 @@ from playwright_auto.dashboard import (
     build_task_timeline,
 )
 
-from test_cdpa_core import install_duplicate_task_graph, write_config
+from test_cdpa_core import (
+    install_duplicate_task_graph,
+    poison_catalog_identity_entry,
+    write_config,
+)
 
 
 class FakeWorkerActions:
@@ -451,6 +455,23 @@ def test_v3_create_resume_modal_posts_real_modes_and_preserves_drafts_during_pol
             page.wait_for_timeout(100)
             assert captured[-1] == ("create", {"task": "Create via V3", "repository": "/repo", "team": "new-team", "new_roles": ["PLAN"], "new_all": True})
             assert "Created created" in page.locator("#dialog-result").text_content()
+            page.locator("#create-task-input").fill("Queue via V3")
+            page.locator("#create-team-input").fill("exact-team")
+            page.locator('input[name="new_role"][value="PLAN"]').uncheck()
+            page.locator("#new-all-input").uncheck()
+            page.locator("#create-reuse-team-input").check()
+            page.locator("#create-submit").click()
+            page.wait_for_timeout(100)
+            assert captured[-1] == (
+                "create",
+                {
+                    "task": "Queue via V3",
+                    "repository": "/repo",
+                    "reuse_team": "exact-team",
+                    "new_roles": [],
+                    "new_all": False,
+                },
+            )
             page.locator("#dialog-close").click()
             assert not dialog.get_attribute("open")
             assert page.evaluate("document.activeElement.id") == "open-create"
@@ -825,6 +846,42 @@ def test_dashboard_task_api_uses_shared_store_and_persists_controls(tmp_path: Pa
         invalid_response = connection.getresponse()
         assert invalid_response.status == 400
         assert "must match" in json.loads(invalid_response.read())["error"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_dashboard_resume_payload_excludes_catalog_invalid_derived_child(tmp_path: Path):
+    config_path = write_config(tmp_path)
+    server, thread, tasks = start_dashboard_server(config_path, tmp_path)
+    target = tasks.create_task(
+        "Target", requested_team="alpha", task_id="task-target"
+    )
+    child = tasks.create_task(
+        "Child",
+        requested_team="beta",
+        task_id="task-child",
+        depends_on_task_ids=(target["task_id"],),
+    )
+    poison_catalog_identity_entry(tasks, child)
+    filtered, _errors = tasks.discover_with_errors()
+    assert child["task_id"] not in {task["task_id"] for task in filtered}
+
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        connection.request(
+            "POST",
+            "/api/tasks/resume",
+            body=json.dumps({"repository": str(tmp_path), "team": "alpha"}),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+
+        assert response.status == 202
+        assert payload["task_id"] == target["task_id"]
+        assert payload["child_task_ids"] == []
     finally:
         server.shutdown()
         server.server_close()
@@ -1818,6 +1875,48 @@ def test_cli_depends_on_flattens_commas_and_preserves_first_seen(monkeypatch, tm
     assert captured["depends_on_task_ids"] == ("task-a", "task-b", "task-c")
 
 
+def test_cli_reuse_team_sends_exact_creation_mode(monkeypatch, tmp_path: Path):
+    config_path = write_config(tmp_path)
+    captured = {}
+
+    def fake_submit(config, **kwargs):
+        captured.update(kwargs)
+        return {
+            "task_id": "task-queued",
+            "team": "alpha",
+            "manifest_path": str(tmp_path / ".plan" / "alpha.json"),
+        }
+
+    monkeypatch.setattr(cdpa_cli_module, "submit_task", fake_submit)
+    assert cdpa_cli_module.main([
+        "Queued",
+        "--reuse-team", "alpha",
+        "--repository", str(tmp_path),
+        "--config", str(config_path),
+    ]) == 0
+    assert captured["team"] is None
+    assert captured["reuse_team"] == "alpha"
+
+
+def test_cli_rejects_reuse_team_with_team_or_taskless(tmp_path: Path, capsys):
+    config_path = write_config(tmp_path)
+    assert cdpa_cli_module.main([
+        "Invalid",
+        "--team", "alpha",
+        "--reuse-team", "alpha",
+        "--repository", str(tmp_path),
+        "--config", str(config_path),
+    ]) == 2
+    assert "mutually exclusive" in capsys.readouterr().err
+
+    assert cdpa_cli_module.main([
+        "--reuse-team", "alpha",
+        "--repository", str(tmp_path),
+        "--config", str(config_path),
+    ]) == 2
+    assert "taskless resume" in capsys.readouterr().err
+
+
 def test_cli_rejects_depends_on_in_taskless_resume(monkeypatch, tmp_path: Path, capsys):
     config_path = write_config(tmp_path)
     assert cdpa_cli_module.main([
@@ -1827,6 +1926,167 @@ def test_cli_rejects_depends_on_in_taskless_resume(monkeypatch, tmp_path: Path, 
         "--depends-on", "task-a",
     ]) == 2
     assert "--depends-on" in capsys.readouterr().err
+
+
+def test_dashboard_creates_same_team_queue_and_rejects_mixed_team_modes(tmp_path: Path):
+    config_path = write_config(tmp_path)
+    server, thread, tasks = start_dashboard_server(config_path, tmp_path)
+    try:
+        tasks.create_task("Owner", requested_team="alpha", task_id="task-owner")
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        connection.request(
+            "POST",
+            "/api/tasks",
+            body=json.dumps({
+                "task": "Queued",
+                "repository": str(tmp_path),
+                "reuse_team": "alpha",
+            }),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+        assert response.status == 201
+        assert payload["team"] == "alpha"
+        assert payload["status"] == "WAITING"
+        assert payload["queue_position"] == 1
+        assert payload["queue_length"] == 1
+        assert payload["active_team_owner_task_id"] == "task-owner"
+        assert payload["queue_blocked_by_task_id"] == "task-owner"
+
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        connection.request(
+            "POST",
+            "/api/tasks",
+            body=json.dumps({
+                "task": "Invalid",
+                "repository": str(tmp_path),
+                "team": "alpha",
+                "reuse_team": "alpha",
+            }),
+            headers={"Content-Type": "application/json"},
+        )
+        invalid_response = connection.getresponse()
+        invalid_payload = json.loads(invalid_response.read())
+        assert invalid_response.status == 400
+        assert "mutually exclusive" in invalid_payload["error"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_dashboard_derives_queue_order_and_owner_without_persisting_projection(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    tasks = TaskStore(config)
+    owner = tasks.create_task("Owner", requested_team="alpha", task_id="task-owner")
+    queued_b = tasks.create_task("Queued B", reuse_team="alpha", task_id="task-b")
+    queued_a = tasks.create_task("Queued A", reuse_team="alpha", task_id="task-a")
+    same_time = "2026-07-23T00:00:00+00:00"
+    for queued in (queued_a, queued_b):
+        tasks.update(
+            queued["manifest_path"],
+            lambda state: {
+                **state,
+                "created_at": same_time,
+                "queue": {**state["queue"], "enqueued_at": same_time},
+            },
+        )
+    all_tasks = tasks.discover()
+
+    payload_a = build_task_payload(tasks.load(queued_a["manifest_path"]), tasks=all_tasks)
+    payload_b = build_task_payload(tasks.load(queued_b["manifest_path"]), tasks=all_tasks)
+
+    assert payload_a["queue_position"] == 1
+    assert payload_b["queue_position"] == 2
+    assert payload_a["queue_length"] == payload_b["queue_length"] == 2
+    assert payload_a["active_team_owner_task_id"] == owner["task_id"]
+    assert payload_b["queue_blocked_by_task_id"] == owner["task_id"]
+    for queued in (queued_a, queued_b):
+        raw = json.loads(Path(queued["manifest_path"]).read_text(encoding="utf-8"))
+        assert "queue_position" not in raw
+        assert "queue_length" not in raw
+        assert "owner_task_ids" not in raw
+
+
+def test_dashboard_mixed_waiters_match_worker_deterministic_blocker(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    tasks = TaskStore(config)
+    parent = tasks.create_task("Parent", requested_team="parent", task_id="task-parent")
+    first = tasks.create_task(
+        "First",
+        requested_team="alpha",
+        task_id="task-first",
+        depends_on_task_ids=(parent["task_id"],),
+    )
+    second = tasks.create_task(
+        "Second",
+        reuse_team="alpha",
+        task_id="task-second",
+        depends_on_task_ids=(parent["task_id"],),
+    )
+    tasks.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": "2026-07-23T00:00:00+00:00",
+        },
+    )
+    all_tasks = tasks.discover_with_errors()[0]
+
+    payload = build_task_payload(
+        tasks.load(second["manifest_path"]),
+        tasks=all_tasks,
+    )
+    scheduled, changed = tasks.refresh_scheduling(
+        second["manifest_path"],
+        tasks=all_tasks,
+    )
+
+    assert payload["dependency_ready_task_ids"] == [
+        first["task_id"],
+        second["task_id"],
+    ]
+    assert payload["queue_blocked_by_task_id"] == first["task_id"]
+    assert changed is True
+    assert scheduled["waiting"]["blocked_by_task_id"] == first["task_id"]
+
+
+def test_dashboard_projects_clearing_owner_as_queue_availability_barrier(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    tasks = TaskStore(config)
+    owner = tasks.create_task("Owner", requested_team="alpha", task_id="task-owner")
+    queued = tasks.create_task("Queued", reuse_team="alpha", task_id="task-queued")
+    owner = tasks.update(
+        owner["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "STOPPED",
+            "terminal_state": "STOPPED",
+            "active_role": None,
+            "active_hop_id": None,
+            "stopped_at": "2026-07-23T00:00:00+00:00",
+            "stop_reason": "team cleared",
+            "cleanup": {
+                **state["cleanup"],
+                "state": "CLEARING",
+                "phase": "verify_pending",
+                "verified_empty_at": None,
+            },
+        },
+    )
+
+    payload = build_task_payload(
+        tasks.load(queued["manifest_path"]),
+        tasks=tasks.discover_with_errors()[0],
+    )
+
+    assert payload["active_team_owner_task_id"] == owner["task_id"]
+    assert payload["queue_blocked_by_task_id"] == owner["task_id"]
 
 
 def test_dashboard_create_dependencies_wait_and_reject_missing(tmp_path: Path):
@@ -1873,7 +2133,7 @@ def test_dashboard_html_exposes_dependency_creation_and_status_projection():
     assert "depends_on_task_ids" in html
     assert "Stopped dependencies" in html
     assert "Missing dependencies" in html
-    assert "queue_position" in html  # existing placeholder remains only; Phase 5 is not implemented.
+    assert "queue_position" in html  # Phase 5 renders the derived queue projection.
 
 
 def test_dashboard_control_recovers_phase4_before_task_lookup(tmp_path: Path, monkeypatch):

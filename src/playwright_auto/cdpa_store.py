@@ -15,8 +15,13 @@ from .cdpa_config import CDPAConfig
 from .cdpa_dependencies import dependency_readiness, validate_new_dependencies
 from .cdpa_team import (
     allocate_team,
+    exact_team_ready_waiters,
+    has_other_nonterminal_team_work,
+    is_active_team_owner,
+    is_team_availability_barrier,
     normalize_team_base,
     physical_role,
+    queued_team_tasks,
     validate_exact_team,
 )
 from .file_lock import exclusive_file_lock, fsync_parent_directory
@@ -31,6 +36,10 @@ _HOP_STATES = frozenset({"pre_send", "sending", "sent", "waiting", "responded", 
 _CLEANUP_STATES = frozenset({"ACTIVE", "CLEARING", "CLEARED"})
 _MAINTENANCE_STATES = frozenset({"OPEN", "RUNNING", "RESOLVED", "ESCALATED"})
 _REPORT_MODES = frozenset({"file", "inline"})
+
+
+class TeamWorkExistsError(RuntimeError):
+    pass
 
 
 def normalize_report_mode(value: Any) -> str:
@@ -370,6 +379,65 @@ class TaskStore:
             if items[0][2]
         }
 
+    def _load_exact_team_states_unlocked(
+        self,
+        team: str,
+        catalog: Mapping[str, Any],
+    ) -> list[tuple[Path, dict[str, Any], tuple[str, Mapping[str, Any]] | None]]:
+        catalog_records = self._catalog_records_for_exact_team(catalog, team)
+        candidate_paths: set[Path] = set(catalog_records)
+        for path in self._filesystem_manifest_like_paths():
+            relative = path.relative_to(self.root.resolve())
+            if relative.parts and relative.parts[0] == team:
+                candidate_paths.add(path)
+        if not candidate_paths:
+            raise ValueError(f"no CDPA task exists for exact team {team!r}")
+
+        loaded = []
+        for target in sorted(candidate_paths):
+            if not target.is_relative_to(self.root.resolve()):
+                raise ValueError(
+                    f"exact team {team!r} has corrupt catalog metadata outside "
+                    f"the plans root: {target}"
+                )
+            if not target.exists():
+                raise ValueError(
+                    f"exact team {team!r} has a cataloged manifest that is missing: "
+                    f"{target}"
+                )
+            try:
+                with exclusive_file_lock(self._lock_path(target)):
+                    state = json.loads(target.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"exact team {team!r} has a corrupt unreadable manifest {target}: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            if not isinstance(state, Mapping):
+                raise ValueError(
+                    f"exact team {team!r} has a corrupt manifest {target}: "
+                    "root must be an object"
+                )
+            record = catalog_records.get(target)
+            if record is not None:
+                key, entry = record
+                error = self._manifest_value_error(
+                    target,
+                    state,
+                    catalog_key=key,
+                    catalog_entry=entry,
+                )
+                prefix = "corrupt cataloged manifest"
+            else:
+                error = self._manifest_value_error(target, state)
+                prefix = "corrupt manifest"
+            if error is not None:
+                raise ValueError(
+                    f"exact team {team!r} has a {prefix} {target}: {error}"
+                )
+            loaded.append((target, dict(state), record))
+        return loaded
+
     def _manifest_value_error(
         self,
         path: str | Path,
@@ -479,18 +547,61 @@ class TaskStore:
         if waiting is not None:
             if not isinstance(waiting, Mapping):
                 return "waiting must be an object"
-            if waiting.get("reason") not in {None, "dependency"}:
+            if waiting.get("reason") not in {
+                None,
+                "dependency",
+                "team_busy",
+                "dependency_team_busy",
+            }:
                 return "waiting reason is invalid"
             for field in ("waiting_on", "stopped", "missing"):
                 try:
                     normalize_dependency_ids(waiting.get(field, []))
                 except ValueError as exc:
                     return f"waiting.{field} {exc}"
+            blocked_by = waiting.get("blocked_by_task_id")
+            if blocked_by is not None and (
+                not isinstance(blocked_by, str) or not blocked_by.strip()
+            ):
+                return "waiting.blocked_by_task_id must be null or a non-empty string"
             since = waiting.get("since")
             if since is not None and (not isinstance(since, str) or not since.strip()):
                 return "waiting.since must be null or a non-empty string"
         elif status == "WAITING":
             return "WAITING task must contain waiting state"
+
+        for derived_field in (
+            "queue_position",
+            "queue_length",
+            "owner_task_ids",
+        ):
+            if derived_field in state:
+                return f"derived field {derived_field!r} must not be persisted"
+        queue = state.get("queue")
+        if queue is not None:
+            if not isinstance(queue, Mapping):
+                return "queue must be an object"
+            if not isinstance(queue.get("reuse_team"), bool):
+                return "queue.reuse_team must be a boolean"
+            blocked_by = queue.get("blocked_by_task_id")
+            if blocked_by is not None and (
+                not isinstance(blocked_by, str) or not blocked_by.strip()
+            ):
+                return "queue.blocked_by_task_id must be null or a non-empty string"
+            enqueued_at = queue.get("enqueued_at")
+            if not isinstance(enqueued_at, str) or not enqueued_at.strip():
+                return "queue.enqueued_at must be a non-empty string"
+            released_at = queue.get("released_at")
+            if released_at is not None and (
+                not isinstance(released_at, str) or not released_at.strip()
+            ):
+                return "queue.released_at must be null or a non-empty string"
+        queue_events = state.get("queue_events")
+        if queue_events is not None:
+            if not isinstance(queue_events, list):
+                return "queue_events must be a list"
+            if any(not isinstance(item, Mapping) for item in queue_events):
+                return "queue event must be an object"
 
         maintenance = state.get("maintenance")
         if maintenance is not None:
@@ -760,14 +871,11 @@ class TaskStore:
         ]
         return sorted(set(primary))
 
-    def _catalog_existing_paths(self) -> list[Path]:
-        if not self.catalog_path.exists():
-            return []
-        try:
-            catalog = json.loads(self.catalog_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            return []
-        entries = catalog.get("entries") if isinstance(catalog, Mapping) else None
+    def _catalog_existing_paths_from(
+        self,
+        catalog: Mapping[str, Any],
+    ) -> list[Path]:
+        entries = catalog.get("entries")
         if not isinstance(entries, Mapping):
             return []
         paths: list[Path] = []
@@ -786,6 +894,17 @@ class TaskStore:
                 paths.append(candidate)
         return sorted(set(paths))
 
+    def _catalog_existing_paths(self) -> list[Path]:
+        if not self.catalog_path.exists():
+            return []
+        try:
+            catalog = json.loads(self.catalog_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return []
+        if not isinstance(catalog, Mapping):
+            return []
+        return self._catalog_existing_paths_from(catalog)
+
     def discover_paths(self) -> list[Path]:
         return sorted(set(self._filesystem_primary_paths()) | set(self._catalog_existing_paths()))
 
@@ -798,12 +917,20 @@ class TaskStore:
                 continue
         return tasks
 
-    def discover_with_errors(
+    def _discover_candidates(
         self,
+        catalog: Mapping[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
         tasks: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
-        paths = self.discover_paths()
+        paths = (
+            sorted(
+                set(self._filesystem_primary_paths())
+                | set(self._catalog_existing_paths_from(catalog))
+            )
+            if catalog is not None
+            else self.discover_paths()
+        )
         for path in paths:
             try:
                 tasks.append(self.load(path))
@@ -831,26 +958,108 @@ class TaskStore:
                     "error": f"InvalidManifestError: {detail}",
                 }
             )
-            diagnosed.add(str(candidate))
+        return tasks, errors
 
-        try:
-            self.root.mkdir(parents=True, exist_ok=True)
-            with exclusive_file_lock(self.allocation_lock):
-                catalog = self._load_catalog_unlocked(reconcile=True)
-        except Exception as exc:
-            errors.append(
-                {
-                    "manifest_path": str(self.catalog_path),
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
+    def _filter_catalog_tasks(
+        self,
+        tasks: list[dict[str, Any]],
+        errors: list[dict[str, str]],
+        catalog: Mapping[str, Any],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+        diagnosed = {item["manifest_path"] for item in errors}
+        identity_paths: dict[tuple[str, str], list[Path]] = {}
+        for task in tasks:
+            identity = (str(task["team"]), str(task["task_id"]))
+            identity_paths.setdefault(identity, []).append(
+                Path(str(task["manifest_path"])).expanduser().resolve()
             )
-            return tasks, errors
+        canonical_paths = {
+            path for matched_paths in identity_paths.values() for path in matched_paths
+        }
 
+        valid_catalog_paths: set[Path] = set()
+        invalid_catalog_paths: set[Path] = set()
         for key, entry in catalog["entries"].items():
-            if not isinstance(entry, Mapping):
+            associated_paths: set[Path] = set()
+            key_candidate: Path | None = None
+            mapping_candidate: Path | None = None
+            identity_candidate: Path | None = None
+            key_path = PurePosixPath(key)
+            if (
+                chr(92) not in key
+                and not key_path.is_absolute()
+                and len(key_path.parts) == 3
+                and all(part not in {"", ".", ".."} for part in key_path.parts)
+            ):
+                try:
+                    key_candidate = (self.root / Path(*key_path.parts)).resolve()
+                    key_candidate.relative_to(self.root.resolve())
+                except (OSError, RuntimeError, ValueError):
+                    key_candidate = None
+                else:
+                    associated_paths.add(key_candidate)
+            if isinstance(entry, Mapping):
+                raw_path = entry.get("manifest_path")
+                if isinstance(raw_path, str) and raw_path.strip():
+                    try:
+                        mapping_candidate = Path(raw_path).expanduser().resolve()
+                        mapping_candidate.relative_to(self.root.resolve())
+                    except (OSError, RuntimeError, ValueError):
+                        mapping_candidate = None
+                    else:
+                        associated_paths.add(mapping_candidate)
+                declared_team = entry.get("team")
+                declared_task_id = entry.get("task_id")
+                if isinstance(declared_team, str) and isinstance(declared_task_id, str):
+                    matches = identity_paths.get((declared_team, declared_task_id), [])
+                    if len(matches) == 1:
+                        identity_candidate = matches[0]
+                        associated_paths.add(identity_candidate)
+
+            record_error = self._catalog_record_error(key, entry)
+            if record_error is not None:
+                invalid_catalog_paths.update(associated_paths)
+                mapping_misidentifies = (
+                    identity_candidate is not None
+                    and mapping_candidate is not None
+                    and (
+                        not mapping_candidate.exists()
+                        or (
+                            mapping_candidate in canonical_paths
+                            and mapping_candidate != identity_candidate
+                        )
+                    )
+                )
+                diagnostic_path = (
+                    identity_candidate
+                    if mapping_misidentifies
+                    else mapping_candidate
+                    or identity_candidate
+                    or key_candidate
+                    or self.catalog_path
+                )
+                manifest_path = str(diagnostic_path)
+                catalog_error = (
+                    f"InvalidManifestError: raw catalog entry {key!r}: "
+                    f"catalog metadata {record_error}"
+                )
+                if manifest_path in diagnosed:
+                    existing = next(
+                        item for item in errors if item["manifest_path"] == manifest_path
+                    )
+                    existing["error"] = f'{existing["error"]}; {catalog_error}'
+                else:
+                    errors.append(
+                        {
+                            "manifest_path": manifest_path,
+                            "error": catalog_error,
+                        }
+                    )
                 continue
-            manifest_path = str(entry.get("manifest_path") or "")
-            if not manifest_path or manifest_path in diagnosed:
+
+            assert isinstance(entry, Mapping)
+            manifest_path = str(entry["manifest_path"])
+            if manifest_path in diagnosed:
                 continue
             candidate = Path(manifest_path).expanduser().resolve()
             if self._primary_manifest_state(
@@ -858,12 +1067,22 @@ class TaskStore:
                 catalog_key=str(key),
                 catalog_entry=entry,
             ) is not None:
+                valid_catalog_paths.add(candidate)
                 continue
             if candidate.exists():
-                error = (
-                    "InvalidManifestError: cataloged path is not a canonical primary "
-                    "CDPA manifest; it is reserved for diagnostics only"
-                )
+                invalid_catalog_paths.add(candidate)
+                try:
+                    value = json.loads(candidate.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    detail = f"{type(exc).__name__}: {exc}"
+                else:
+                    detail = self._manifest_value_error(
+                        candidate,
+                        value,
+                        catalog_key=str(key),
+                        catalog_entry=entry,
+                    ) or "cataloged path is not a canonical primary CDPA manifest"
+                error = f"InvalidManifestError: {detail}"
             else:
                 error = (
                     "MissingManifestError: cataloged CDPA manifest is missing; "
@@ -875,7 +1094,40 @@ class TaskStore:
                     "error": error,
                 }
             )
+        rejected_paths = invalid_catalog_paths - valid_catalog_paths
+        if rejected_paths:
+            tasks = [
+                task
+                for task in tasks
+                if Path(str(task["manifest_path"])).expanduser().resolve()
+                not in rejected_paths
+            ]
         return tasks, errors
+
+    def _discover_with_catalog_unlocked(
+        self,
+        catalog: Mapping[str, Any],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+        tasks, errors = self._discover_candidates(catalog)
+        return self._filter_catalog_tasks(tasks, errors, catalog)
+
+    def discover_with_errors(
+        self,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+        tasks, errors = self._discover_candidates()
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            with exclusive_file_lock(self.allocation_lock):
+                catalog = self._load_catalog_unlocked(reconcile=False)
+        except Exception as exc:
+            errors.append(
+                {
+                    "manifest_path": str(self.catalog_path),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            return tasks, errors
+        return self._filter_catalog_tasks(tasks, errors, catalog)
 
     def _dependency_states(
         self,
@@ -1017,7 +1269,7 @@ class TaskStore:
 
     def _catalog_saved_manifest_unlocked(self, saved: Mapping[str, Any]) -> None:
         target = Path(str(saved["manifest_path"])).expanduser().resolve()
-        catalog = self._load_catalog_unlocked(reconcile=True)
+        catalog = self._load_catalog_unlocked(reconcile=False)
         key = self._catalog_key(target)
         entry = self._catalog_entry(saved)
         if catalog["entries"].get(key) != entry:
@@ -1106,6 +1358,94 @@ class TaskStore:
         target = Path(path).expanduser().resolve()
         return self._mutate_manifest(target, mutator)
 
+    def begin_team_cleanup(
+        self,
+        path: str | Path,
+        state: Mapping[str, Any],
+        *,
+        expected_state: Mapping[str, Any],
+        control_id: int | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        target = Path(path).expanduser().resolve()
+        replacement = json.loads(json.dumps(dict(state), ensure_ascii=False, default=str))
+        expected = json.loads(
+            json.dumps(dict(expected_state), ensure_ascii=False, default=str)
+        )
+        self.root.mkdir(parents=True, exist_ok=True)
+        with exclusive_file_lock(self.allocation_lock):
+            self._recover_phase4_replacement_unlocked()
+            catalog = self._load_catalog_unlocked(reconcile=False)
+            tasks, _errors = self._discover_with_catalog_unlocked(catalog)
+            canonical = next(
+                (
+                    item
+                    for item in tasks
+                    if Path(str(item.get("manifest_path") or "")).expanduser().resolve()
+                    == target
+                ),
+                None,
+            )
+            if canonical is None:
+                raise ValueError("cleanup target is not a canonical CDPA task")
+            team = str(canonical.get("team") or "")
+            task_id = str(canonical.get("task_id") or "")
+            sibling_conflict = has_other_nonterminal_team_work(
+                tasks,
+                team,
+                exclude_task_id=task_id,
+            )
+            with exclusive_file_lock(self._lock_path(target)):
+                current = self._load_current_manifest_unlocked(target)
+                self._assert_manifest_mutable_unlocked(target, current)
+                current_content = {
+                    key: value for key, value in current.items() if key != "updated_at"
+                }
+                expected_content = {
+                    key: value for key, value in expected.items() if key != "updated_at"
+                }
+                changed = (
+                    str(current.get("updated_at") or "")
+                    != str(expected.get("updated_at") or "")
+                    and current_content != expected_content
+                )
+                if sibling_conflict or changed:
+                    if control_id is None:
+                        return current, False
+                    control = next(
+                        (
+                            item
+                            for item in current.get("controls") or []
+                            if isinstance(item, dict)
+                            and item.get("control_id") == control_id
+                            and item.get("action") == "clear_team"
+                        ),
+                        None,
+                    )
+                    if control is None:
+                        raise ValueError("Clear Team control changed while cleanup was being prepared")
+                    reason = (
+                        "TeamWorkExistsError: Clear Team is blocked while other "
+                        "nonterminal exact-team work exists, including queued exact-team work"
+                        if sibling_conflict
+                        else "ValueError: task changed while cleanup was being prepared"
+                    )
+                    control["status"] = "rejected"
+                    control["result"] = reason
+                    control["applied_at"] = utc_now()
+                    saved = self._save_unlocked(target, current)
+                    catalog["entries"][self._catalog_key(target)] = self._catalog_entry(saved)
+                    self._write_catalog_unlocked(catalog)
+                    return saved, False
+                replacement["updated_at"] = current.get("updated_at")
+                if normalize_dependency_ids(current.get("depends_on_task_ids")) != normalize_dependency_ids(
+                    replacement.get("depends_on_task_ids")
+                ):
+                    raise ValueError("task dependencies changed; reload before cleanup")
+                saved = self._save_unlocked(target, replacement)
+            catalog["entries"][self._catalog_key(target)] = self._catalog_entry(saved)
+            self._write_catalog_unlocked(catalog)
+            return saved, True
+
     def update_maintenance(
         self,
         path: str | Path,
@@ -1118,6 +1458,288 @@ class TaskStore:
             mutator,
             maintenance_write=True,
         )
+
+    def refresh_scheduling(
+        self,
+        path: str | Path,
+        *,
+        tasks: Sequence[Mapping[str, Any]] | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        target = Path(path).expanduser().resolve()
+        if tasks is None:
+            self.recover_phase4_replacement()
+            scheduling_tasks, _errors = self.discover_with_errors()
+        else:
+            scheduling_tasks = list(tasks)
+        self.root.mkdir(parents=True, exist_ok=True)
+        with exclusive_file_lock(self.allocation_lock):
+            self._recover_phase4_replacement_unlocked()
+            state = self.load(target)
+            if str(state.get("status") or "").upper() in TERMINAL:
+                return state, False
+            dependencies = normalize_dependency_ids(state.get("depends_on_task_ids"))
+            readiness = dependency_readiness(state, scheduling_tasks)
+            queue = state.get("queue")
+            queue_pending = (
+                isinstance(queue, Mapping)
+                and queue.get("reuse_team") is True
+                and queue.get("released_at") is None
+            )
+            next_state = json.loads(json.dumps(state, ensure_ascii=False))
+            changed = False
+            status = str(state.get("status") or "").upper()
+            team = str(state.get("team") or "")
+            current_id = str(state.get("task_id") or "")
+            blocked_by: str | None = None
+            selected_id: str | None = None
+
+            if status == "WAITING" and (queue_pending or dependencies):
+                catalog = self._load_catalog_unlocked(reconcile=False)
+                exact_tasks = [
+                    item
+                    for _path, item, _record in self._load_exact_team_states_unlocked(
+                        team,
+                        catalog,
+                    )
+                ]
+                exact_task_ids = {
+                    str(item.get("task_id") or "") for item in exact_tasks
+                }
+                recorded_blocker = (
+                    str(queue.get("blocked_by_task_id") or "")
+                    if isinstance(queue, Mapping)
+                    else ""
+                )
+                if queue_pending and recorded_blocker and recorded_blocker not in exact_task_ids:
+                    raise ValueError(
+                        f"exact team {team!r} queue blocker is missing: "
+                        f"{recorded_blocker}"
+                    )
+                barriers = [
+                    item for item in exact_tasks if is_team_availability_barrier(item)
+                ]
+                if len(barriers) > 1:
+                    raise ValueError(f"exact team {team!r} has multiple active owners")
+                barrier_id = (
+                    str(barriers[0].get("task_id") or "") if barriers else None
+                )
+                ready_waiters = exact_team_ready_waiters(
+                    exact_tasks,
+                    team,
+                    dependency_tasks=scheduling_tasks,
+                )
+                selected_id = (
+                    str(ready_waiters[0].get("task_id") or "")
+                    if ready_waiters
+                    else None
+                )
+                blocked_by = barrier_id or (
+                    selected_id if selected_id != current_id else None
+                )
+
+            if queue_pending:
+                if readiness.ready and blocked_by is None and selected_id == current_id:
+                    if dependencies and (
+                        state.get("waiting") or {}
+                    ).get("waiting_on"):
+                        next_state.setdefault("dependency_events", []).append(
+                            {
+                                "at": utc_now(),
+                                "status": "RELEASED",
+                                "message": "All dependencies are DONE",
+                                "waiting_on": [],
+                                "stopped": [],
+                                "missing": [],
+                            }
+                        )
+                    self._release_queued_state(
+                        next_state,
+                        reason="Exact-team queue released",
+                    )
+                    changed = True
+                else:
+                    dependency_waiting = not readiness.ready
+                    team_waiting = blocked_by is not None
+                    waiting_kind = (
+                        "dependency_team_busy"
+                        if dependency_waiting and team_waiting
+                        else "dependency"
+                        if dependency_waiting
+                        else "team_busy"
+                    )
+                    blocked_ids = [*readiness.waiting_on, *readiness.missing]
+                    reason = (
+                        "Waiting for dependencies and exact-team ownership"
+                        if dependency_waiting and team_waiting
+                        else "Waiting for dependencies"
+                        if dependency_waiting
+                        else "Waiting for exact-team ownership"
+                    )
+                    details = [*blocked_ids, *([blocked_by] if blocked_by else [])]
+                    if details:
+                        reason += ": " + ", ".join(details)
+                    code = (
+                        "dependency_team_busy"
+                        if dependency_waiting and team_waiting
+                        else "dependency_missing"
+                        if readiness.missing
+                        else "dependency_stopped"
+                        if readiness.stopped
+                        else "dependency"
+                        if dependency_waiting
+                        else "team_busy"
+                    )
+                    waiting = (
+                        state.get("waiting")
+                        if isinstance(state.get("waiting"), Mapping)
+                        else {}
+                    )
+                    desired = {
+                        "reason": waiting_kind,
+                        "waiting_on": list(readiness.waiting_on),
+                        "stopped": list(readiness.stopped),
+                        "missing": list(readiness.missing),
+                        "blocked_by_task_id": blocked_by,
+                        "since": waiting.get("since") or utc_now(),
+                    }
+                    unchanged = (
+                        status == "WAITING"
+                        and state.get("waiting_code") == code
+                        and state.get("waiting_reason") == reason
+                        and dict(waiting) == desired
+                        and isinstance(queue, Mapping)
+                        and queue.get("blocked_by_task_id") == blocked_by
+                    )
+                    if not unchanged:
+                        next_state.update(
+                            status="WAITING",
+                            kanban_column="WAITING",
+                            active_action=(
+                                "waiting_dependency_team"
+                                if dependency_waiting and team_waiting
+                                else "waiting_dependency"
+                                if dependency_waiting
+                                else "waiting_team"
+                            ),
+                            waiting_reason=reason,
+                            waiting_code=code,
+                            waiting=desired,
+                        )
+                        next_state["queue"]["blocked_by_task_id"] = blocked_by
+                        next_state.setdefault("queue_events", []).append(
+                            {
+                                "at": utc_now(),
+                                "status": "WAITING",
+                                "message": reason,
+                                "blocked_by_task_id": blocked_by,
+                            }
+                        )
+                        changed = True
+            elif dependencies:
+                waiting = (
+                    state.get("waiting")
+                    if isinstance(state.get("waiting"), Mapping)
+                    else {}
+                )
+                dependency_waiting = not readiness.ready
+                team_waiting = blocked_by is not None
+                waiting_kind = (
+                    "dependency_team_busy"
+                    if dependency_waiting and team_waiting
+                    else "dependency"
+                    if dependency_waiting
+                    else "team_busy"
+                    if team_waiting
+                    else None
+                )
+                desired = {
+                    "reason": waiting_kind,
+                    "waiting_on": list(readiness.waiting_on),
+                    "stopped": list(readiness.stopped),
+                    "missing": list(readiness.missing),
+                    "since": (
+                        None
+                        if readiness.ready and not team_waiting
+                        else waiting.get("since") or utc_now()
+                    ),
+                }
+                if team_waiting:
+                    desired["blocked_by_task_id"] = blocked_by
+                if (
+                    readiness.ready
+                    and not team_waiting
+                    and selected_id == current_id
+                    and status == "WAITING"
+                ):
+                    self._release_dependency_state(
+                        next_state,
+                        reason="All dependencies are DONE; task released to PLAN",
+                    )
+                    changed = True
+                elif status == "WAITING":
+                    code = (
+                        "dependency_team_busy"
+                        if dependency_waiting and team_waiting
+                        else "dependency_missing"
+                        if readiness.missing
+                        else "dependency_stopped"
+                        if readiness.stopped
+                        else "dependency"
+                        if dependency_waiting
+                        else "team_busy"
+                    )
+                    blocked_ids = [*readiness.waiting_on, *readiness.missing]
+                    reason = (
+                        "Waiting for dependencies and exact-team ownership"
+                        if dependency_waiting and team_waiting
+                        else "Waiting for dependencies"
+                        if dependency_waiting
+                        else "Waiting for exact-team ownership"
+                    )
+                    details = [*blocked_ids, *([blocked_by] if blocked_by else [])]
+                    if details:
+                        reason += ": " + ", ".join(details)
+                    unchanged = (
+                        state.get("waiting_code") == code
+                        and state.get("waiting_reason") == reason
+                        and dict(waiting) == desired
+                    )
+                    if not unchanged:
+                        next_state.update(
+                            status="WAITING",
+                            kanban_column="WAITING",
+                            active_action=(
+                                "waiting_dependency_team"
+                                if dependency_waiting and team_waiting
+                                else "waiting_dependency"
+                                if dependency_waiting
+                                else "waiting_team"
+                            ),
+                            waiting_reason=reason,
+                            waiting_code=code,
+                            waiting=desired,
+                        )
+                        next_state.setdefault("dependency_events", []).append(
+                            {
+                                "at": utc_now(),
+                                "status": "WAITING",
+                                "message": reason,
+                                "waiting_on": list(readiness.waiting_on),
+                                "stopped": list(readiness.stopped),
+                                "missing": list(readiness.missing),
+                            }
+                        )
+                        changed = True
+
+            if not changed:
+                return state, False
+            with exclusive_file_lock(self._lock_path(target)):
+                current = self._load_current_manifest_unlocked(target)
+                if current.get("updated_at") != state.get("updated_at"):
+                    raise ValueError("task changed while refreshing scheduling state")
+                saved = self._save_unlocked(target, next_state)
+            self._catalog_saved_manifest_unlocked(saved)
+            return saved, True
 
     @contextmanager
     def task_run_lock(self, path: str | Path, *, blocking: bool = False) -> Iterator[None]:
@@ -1145,6 +1767,8 @@ class TaskStore:
         normalized_replaces: str | None,
         normalized_incident: str | None,
         readiness: Any,
+        queue_reuse: bool,
+        queue_blocked_by: str | None,
         now: str,
     ) -> dict[str, Any]:
         roles = {}
@@ -1207,12 +1831,26 @@ class TaskStore:
             "timestamps": {"created_at": now},
             "errors": [],
         }
+        dependency_waiting = not readiness.ready
+        queue_waiting = bool(queue_reuse)
         waiting_ids = [*readiness.waiting_on, *readiness.missing]
-        waiting_reason = (
-            None
-            if readiness.ready
-            else "Waiting for dependencies: " + ", ".join(waiting_ids)
-        )
+        if dependency_waiting and queue_waiting:
+            waiting_kind = "dependency_team_busy"
+            waiting_reason = "Waiting for dependencies and exact-team ownership"
+            if waiting_ids:
+                waiting_reason += ": " + ", ".join(waiting_ids)
+        elif dependency_waiting:
+            waiting_kind = "dependency"
+            waiting_reason = "Waiting for dependencies: " + ", ".join(waiting_ids)
+        elif queue_waiting:
+            waiting_kind = "team_busy"
+            waiting_reason = "Waiting for exact-team ownership"
+            if queue_blocked_by:
+                waiting_reason += f": {queue_blocked_by}"
+        else:
+            waiting_kind = None
+            waiting_reason = None
+        waiting_status = dependency_waiting or queue_waiting
         return {
             "schema_version": SCHEMA_VERSION,
             "manifest_path": str(target),
@@ -1226,17 +1864,30 @@ class TaskStore:
             "team": team,
             "team_suffix": suffix,
             "reusable_teams": reusable_teams,
-            "status": "INBOX" if readiness.ready else "WAITING",
-            "kanban_column": "INBOX" if readiness.ready else "WAITING",
+            "status": "WAITING" if waiting_status else "INBOX",
+            "kanban_column": "WAITING" if waiting_status else "INBOX",
             "terminal_state": None,
             "active_role": "PLAN",
             "active_hop_id": 1,
-            "active_action": "queued" if readiness.ready else "waiting_dependency",
+            "active_action": (
+                "waiting_dependency_team"
+                if waiting_kind == "dependency_team_busy"
+                else "waiting_dependency"
+                if waiting_kind == "dependency"
+                else "waiting_team"
+                if waiting_kind == "team_busy"
+                else "queued"
+            ),
             "pause_reason": None,
             "waiting_reason": waiting_reason,
-            "waiting_code": None if readiness.ready else (
-                "dependency_missing" if readiness.missing else
-                "dependency_stopped" if readiness.stopped else "dependency"
+            "waiting_code": (
+                "dependency_team_busy"
+                if waiting_kind == "dependency_team_busy"
+                else "dependency_missing"
+                if readiness.missing
+                else "dependency_stopped"
+                if readiness.stopped
+                else waiting_kind
             ),
             "block_code": None,
             "block_retryable": False,
@@ -1262,18 +1913,43 @@ class TaskStore:
                 else [{
                     "at": now,
                     "status": "WAITING",
-                    "message": waiting_reason,
+                    "message": "Waiting for dependencies: " + ", ".join(waiting_ids),
                     "waiting_on": list(readiness.waiting_on),
                     "stopped": list(readiness.stopped),
                     "missing": list(readiness.missing),
                 }]
             ),
+            "queue": (
+                {
+                    "reuse_team": True,
+                    "blocked_by_task_id": queue_blocked_by,
+                    "enqueued_at": now,
+                    "released_at": None,
+                }
+                if queue_reuse
+                else None
+            ),
+            "queue_events": (
+                [{
+                    "at": now,
+                    "status": "WAITING",
+                    "message": waiting_reason,
+                    "blocked_by_task_id": queue_blocked_by,
+                }]
+                if queue_reuse
+                else []
+            ),
             "waiting": {
-                "reason": None if readiness.ready else "dependency",
+                "reason": waiting_kind,
                 "waiting_on": list(readiness.waiting_on),
                 "stopped": list(readiness.stopped),
                 "missing": list(readiness.missing),
-                "since": None if readiness.ready else now,
+                **(
+                    {"blocked_by_task_id": queue_blocked_by}
+                    if queue_reuse
+                    else {}
+                ),
+                "since": now if waiting_status else None,
             },
             "roles": roles,
             "hops": [hop],
@@ -1306,6 +1982,7 @@ class TaskStore:
         task: str,
         *,
         requested_team: str | None = None,
+        reuse_team: str | None = None,
         new_roles: Sequence[str] = (),
         new_all: bool = False,
         repository: str | Path | None = None,
@@ -1329,12 +2006,15 @@ class TaskStore:
         normalized_incident = _optional_nonempty_string(
             replacement_incident_id, "replacement_incident_id"
         )
-        base = normalize_team_base(requested_team or task_id)
+        if requested_team is not None and reuse_team is not None:
+            raise ValueError("requested_team and reuse_team are mutually exclusive")
+        exact_reuse_team = validate_exact_team(reuse_team) if reuse_team is not None else None
+        base = normalize_team_base(requested_team or task_id) if exact_reuse_team is None else ""
         repository_path = Path(repository or self.config.repository_root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         with exclusive_file_lock(self.allocation_lock):
             self._recover_phase4_replacement_unlocked()
-            catalog = self._load_catalog_unlocked(reconcile=True)
+            catalog = self._load_catalog_unlocked(reconcile=False)
             catalog_entries = [
                 entry
                 for entry in catalog["entries"].values()
@@ -1356,7 +2036,16 @@ class TaskStore:
             if task_id in filesystem_task_ids:
                 raise ValueError(f"task_id is already reserved by corrupt filesystem state: {task_id}")
 
-            manifests = self.discover()
+            exact_loaded = (
+                self._load_exact_team_states_unlocked(exact_reuse_team, catalog)
+                if exact_reuse_team is not None
+                else []
+            )
+            manifests, _discovery_errors = self._discover_with_catalog_unlocked(catalog)
+            if task_id in {
+                str(item.get("task_id") or "") for item in manifests
+            }:
+                raise ValueError(f"task_id is already used by a valid manifest: {task_id}")
             requested_dependencies = normalize_dependency_ids(depends_on_task_ids)
             duplicate_task_ids = self.duplicate_task_ids()
             ambiguous_dependencies = [
@@ -1375,55 +2064,113 @@ class TaskStore:
                 {"task_id": task_id, "depends_on_task_ids": normalized_dependencies},
                 manifests,
             )
-            actual_paths = {
-                str(Path(item["manifest_path"]).expanduser().resolve())
-                for item in manifests
-            }
-            catalog_reservations = [
-                {
-                    "manifest_path": str(entry.get("manifest_path") or ""),
-                    "task_id": str(entry.get("task_id") or ""),
-                    "team": str(entry.get("team") or ""),
-                    "team_suffix": int(entry.get("team_suffix") or 1),
-                    "status": "MISSING_OR_INVALID",
+            queue_blocked_by: str | None = None
+            if exact_reuse_team is not None:
+                exact_states = [state for _path, state, _record in exact_loaded]
+                identities = {
+                    (
+                        str(item.get("team_base") or ""),
+                        int(item.get("team_suffix") or 1),
+                    )
+                    for item in exact_states
                 }
-                for entry in catalog_entries
-                if str(entry.get("manifest_path") or "") not in actual_paths
-            ]
-            inferred_suffixes = {
-                suffix
-                for item in filesystem_reservations
-                if (suffix := self._team_suffix_reservation(base, str(item.get("team") or "")))
-                is not None
-            }
-            team, suffix = allocate_team(
-                base,
-                [*manifests, *catalog_reservations, *filesystem_reservations],
-                reserved_suffixes=(*reserved_team_suffixes, *sorted(inferred_suffixes)),
-            )
-            terminal_candidates = sorted(
-                (
-                    item
-                    for item in manifests
-                    if str(item.get("status") or "").upper() in TERMINAL
-                    and int(item.get("team_suffix") or 1) == suffix
-                ),
-                key=lambda item: str(
-                    item.get("completed_at")
-                    or item.get("stopped_at")
-                    or item.get("updated_at")
-                    or item.get("created_at")
-                    or ""
-                ),
-                reverse=True,
-            )
-            reusable_teams = list(
-                dict.fromkeys(
-                    str(item.get("team"))
-                    for item in terminal_candidates
-                    if item.get("team")
+                if len(identities) != 1:
+                    raise ValueError(
+                        f"exact team {exact_reuse_team!r} has inconsistent identity"
+                    )
+                base, suffix = identities.pop()
+                team = exact_reuse_team
+                availability_barriers = [
+                    item for item in exact_states if is_team_availability_barrier(item)
+                ]
+                if len(availability_barriers) > 1:
+                    raise ValueError(
+                        f"exact team {team!r} has multiple active owners"
+                    )
+                queue_blocked_by = (
+                    str(availability_barriers[0].get("task_id") or "") or None
+                    if availability_barriers
+                    else None
                 )
-            )
+                if queue_blocked_by is None:
+                    pending_queue = queued_team_tasks(exact_states, team)
+                    if pending_queue:
+                        queue_blocked_by = (
+                            str(pending_queue[0].get("task_id") or "") or None
+                        )
+                terminal_candidates = sorted(
+                    (
+                        item
+                        for item in exact_states
+                        if str(item.get("status") or "").upper() in TERMINAL
+                    ),
+                    key=lambda item: str(
+                        item.get("completed_at")
+                        or item.get("stopped_at")
+                        or item.get("updated_at")
+                        or item.get("created_at")
+                        or ""
+                    ),
+                    reverse=True,
+                )
+                reusable_teams = [team] if terminal_candidates else []
+            else:
+                actual_paths = {
+                    str(Path(item["manifest_path"]).expanduser().resolve())
+                    for item in manifests
+                }
+                catalog_reservations = [
+                    {
+                        "manifest_path": str(entry.get("manifest_path") or ""),
+                        "task_id": str(entry.get("task_id") or ""),
+                        "team": str(entry.get("team") or ""),
+                        "team_suffix": int(entry.get("team_suffix") or 1),
+                        "status": "MISSING_OR_INVALID",
+                    }
+                    for entry in catalog_entries
+                    if str(entry.get("manifest_path") or "") not in actual_paths
+                ]
+                inferred_suffixes = {
+                    suffix
+                    for item in filesystem_reservations
+                    if (
+                        suffix := self._team_suffix_reservation(
+                            base, str(item.get("team") or "")
+                        )
+                    )
+                    is not None
+                }
+                team, suffix = allocate_team(
+                    base,
+                    [*manifests, *catalog_reservations, *filesystem_reservations],
+                    reserved_suffixes=(
+                        *reserved_team_suffixes,
+                        *sorted(inferred_suffixes),
+                    ),
+                )
+                terminal_candidates = sorted(
+                    (
+                        item
+                        for item in manifests
+                        if str(item.get("status") or "").upper() in TERMINAL
+                        and int(item.get("team_suffix") or 1) == suffix
+                    ),
+                    key=lambda item: str(
+                        item.get("completed_at")
+                        or item.get("stopped_at")
+                        or item.get("updated_at")
+                        or item.get("created_at")
+                        or ""
+                    ),
+                    reverse=True,
+                )
+                reusable_teams = list(
+                    dict.fromkeys(
+                        str(item.get("team"))
+                        for item in terminal_candidates
+                        if item.get("team")
+                    )
+                )
             title_slug = slugify(text)
             target = (self.root / team / task_id / f"{title_slug}.json").resolve()
             if target.exists():
@@ -1446,6 +2193,8 @@ class TaskStore:
                 normalized_replaces=normalized_replaces,
                 normalized_incident=normalized_incident,
                 readiness=readiness,
+                queue_reuse=exact_reuse_team is not None,
+                queue_blocked_by=queue_blocked_by,
                 now=now,
             )
             saved = self._save_unlocked(target, state)
@@ -1625,6 +2374,7 @@ class TaskStore:
         self,
         states: Sequence[Mapping[str, Any]],
         fallback_bytes: bytes,
+        write_paths: set[Path],
     ) -> dict[str, Any]:
         try:
             current = json.loads(self.catalog_path.read_text(encoding="utf-8"))
@@ -1635,7 +2385,9 @@ class TaskStore:
         if not isinstance(current.get("entries"), dict):
             raise ValueError("Phase-4 recovery catalog entries are invalid")
         for state in states:
-            current["entries"][self._catalog_key(state["manifest_path"])] = self._catalog_entry(state)
+            manifest_path = Path(str(state["manifest_path"])).expanduser().resolve()
+            if manifest_path in write_paths:
+                current["entries"][self._catalog_key(manifest_path)] = self._catalog_entry(state)
         return current
 
     def _verify_phase4_replacement_unlocked(
@@ -1683,8 +2435,15 @@ class TaskStore:
         catalog = json.loads(self.catalog_path.read_text(encoding="utf-8"))
         if not isinstance(catalog, Mapping) or not isinstance(catalog.get("entries"), Mapping):
             raise RuntimeError("Phase-4 recovery catalog is invalid")
+        write_paths = {
+            self._phase4_absolute_path(item["path"], "write.path")
+            for item in journal["writes"]
+        }
         for state in states:
-            key = self._catalog_key(state["manifest_path"])
+            manifest_path = Path(str(state["manifest_path"])).expanduser().resolve()
+            if manifest_path not in write_paths:
+                continue
+            key = self._catalog_key(manifest_path)
             if catalog["entries"].get(key) != self._catalog_entry(state):
                 raise RuntimeError(f"Phase-4 recovery catalog mismatch for {state['task_id']}")
         return {"replacement": dict(replacement), "rewired_children": rewired}
@@ -1701,10 +2460,27 @@ class TaskStore:
             self._phase4_absolute_path(item["path"], "write.path")
             for item in write_entries
         }
+        catalog_after = self._phase4_decode_bytes(
+            journal["catalog"]["after"], "catalog.after"
+        )
+        assert catalog_after is not None
+        try:
+            catalog_snapshot = json.loads(catalog_after.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Phase-4 recovery catalog after bytes are invalid") from exc
+        if (
+            not isinstance(catalog_snapshot, Mapping)
+            or catalog_snapshot.get("version") != CATALOG_VERSION
+            or not isinstance(catalog_snapshot.get("entries"), Mapping)
+        ):
+            raise ValueError("Phase-4 recovery catalog after snapshot is invalid")
+        planning, _discovery_errors = self._discover_with_catalog_unlocked(
+            catalog_snapshot
+        )
         canonical_paths = sorted(
             {
                 Path(item["manifest_path"]).expanduser().resolve()
-                for item in self.discover()
+                for item in planning
             }
             | journal_paths,
             key=str,
@@ -1811,11 +2587,11 @@ class TaskStore:
                     [other for other in states if other is not state],
                     allow_missing=True,
                 )
-            catalog_after = self._phase4_decode_bytes(
-                journal["catalog"]["after"], "catalog.after"
+            catalog = self._phase4_catalog_for_states(
+                states,
+                catalog_after,
+                journal_paths,
             )
-            assert catalog_after is not None
-            catalog = self._phase4_catalog_for_states(states, catalog_after)
             self._write_catalog_unlocked(catalog)
             result = self._verify_phase4_replacement_unlocked(journal, states)
             self._clear_phase4_journal_unlocked()
@@ -1852,11 +2628,11 @@ class TaskStore:
                 and recovered["replacement"].get("replacement_incident_id") == incident
             ):
                 return recovered
-            catalog = self._load_catalog_unlocked(reconcile=True)
+            catalog = self._load_catalog_unlocked(reconcile=False)
             catalog_before = (
                 self.catalog_path.read_bytes() if self.catalog_path.exists() else None
             )
-            planning = self.discover()
+            planning, _discovery_errors = self._discover_with_catalog_unlocked(catalog)
             canonical_paths = sorted(
                 {
                     Path(item["manifest_path"]).expanduser().resolve()
@@ -2027,6 +2803,8 @@ class TaskStore:
                     normalized_replaces=target_id,
                     normalized_incident=incident,
                     readiness=readiness,
+                    queue_reuse=False,
+                    queue_blocked_by=None,
                     now=now,
                 )
                 replacement_state["dependency_events"].append(
@@ -2116,11 +2894,6 @@ class TaskStore:
                 )
                 next_catalog["version"] = CATALOG_VERSION
                 next_catalog.setdefault("entries", {})
-                for item in manifests:
-                    manifest_path = Path(item["manifest_path"])
-                    next_catalog["entries"][
-                        self._catalog_key(manifest_path)
-                    ] = self._catalog_entry(item)
                 for manifest_path, value in writes.items():
                     next_catalog["entries"][
                         self._catalog_key(manifest_path)
@@ -2286,6 +3059,78 @@ class TaskStore:
         )
         return state
 
+    @staticmethod
+    def _release_dependency_state(
+        state: dict[str, Any],
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        if not normalize_dependency_ids(state.get("depends_on_task_ids")):
+            raise ValueError("task is not dependency-waiting")
+        state["status"] = "INBOX"
+        state["kanban_column"] = "INBOX"
+        state["active_action"] = "queued"
+        state["waiting_reason"] = None
+        state["waiting_code"] = None
+        state["waiting"] = {
+            "reason": None,
+            "waiting_on": [],
+            "stopped": [],
+            "missing": [],
+            "since": None,
+        }
+        state.setdefault("dependency_events", []).append(
+            {
+                "at": utc_now(),
+                "status": "RELEASED",
+                "message": reason,
+                "waiting_on": [],
+                "stopped": [],
+                "missing": [],
+            }
+        )
+        return state
+
+    @staticmethod
+    def _release_queued_state(
+        state: dict[str, Any],
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        queue = state.get("queue")
+        if not isinstance(queue, dict) or queue.get("reuse_team") is not True:
+            raise ValueError("task is not a same-team queue entry")
+        if queue.get("released_at"):
+            return state
+        now = utc_now()
+        queue["released_at"] = now
+        queue["blocked_by_task_id"] = None
+        state["status"] = "INBOX"
+        state["kanban_column"] = "INBOX"
+        state["active_action"] = "queued"
+        state["waiting_reason"] = None
+        state["waiting_code"] = None
+        state["waiting"] = {
+            "reason": None,
+            "waiting_on": [],
+            "stopped": [],
+            "missing": [],
+            "blocked_by_task_id": None,
+            "since": None,
+        }
+        state["reusable_teams"] = list(
+            dict.fromkeys([*state.get("reusable_teams", []), str(state["team"])])
+        )
+        state.setdefault("queue_events", []).append(
+            {
+                "at": now,
+                "status": "RELEASED",
+                "message": reason,
+                "blocked_by_task_id": None,
+            }
+        )
+        return state
+
     def request_resume(
         self,
         path: str | Path,
@@ -2368,28 +3213,87 @@ class TaskStore:
                         )
                 loaded.append((target, dict(state), record))
 
-            resumable = [
-                item
-                for item in loaded
-                if str(item[1].get("status") or "").upper() not in TERMINAL
+            all_tasks, _discovery_errors = self._discover_with_catalog_unlocked(catalog)
+            barriers = [
+                item for item in loaded if is_team_availability_barrier(item[1])
             ]
-            if len(resumable) > 1:
-                paths = ", ".join(str(path) for path, _state, _records in resumable)
+            if len(barriers) > 1:
+                paths = ", ".join(str(path) for path, _state, _record in barriers)
                 raise ValueError(
-                    f"duplicate nonterminal manifests for exact team {team!r}: {paths}"
+                    "duplicate nonterminal manifests; "
+                    f"exact team {team!r} has multiple active owners: {paths}"
                 )
-            if not resumable:
-                statuses = sorted(
-                    {
-                        str(state.get("status") or "unknown").upper()
-                        for _path, state, _records in loaded
-                    }
+            releasing_queue = False
+            releasing_dependency = False
+            if barriers:
+                target, snapshot, record = barriers[0]
+                if not is_active_team_owner(snapshot):
+                    raise ValueError(
+                        f"exact team {team!r} cleanup is still clearing"
+                    )
+            else:
+                exact_states = [state for _path, state, _record in loaded]
+                ready_waiters = exact_team_ready_waiters(
+                    exact_states,
+                    team,
+                    dependency_tasks=all_tasks,
                 )
-                raise ValueError(
-                    f"exact team {team!r} has no resumable nonterminal task; statuses={statuses}"
+                selected_id = (
+                    str(ready_waiters[0].get("task_id") or "")
+                    if ready_waiters
+                    else None
                 )
-
-            target, _snapshot, record = resumable[0]
+                selected = next(
+                    (
+                        item
+                        for item in loaded
+                        if str(item[1].get("task_id") or "") == selected_id
+                    ),
+                    None,
+                )
+                if selected is None:
+                    waiting_candidates = [
+                        state
+                        for state in exact_states
+                        if str(state.get("status") or "").upper() == "WAITING"
+                        and (
+                            bool(normalize_dependency_ids(state.get("depends_on_task_ids")))
+                            or (
+                                isinstance(state.get("queue"), Mapping)
+                                and state["queue"].get("reuse_team") is True
+                                and state["queue"].get("released_at") is None
+                            )
+                        )
+                    ]
+                    if waiting_candidates:
+                        queue_only = all(
+                            isinstance(state.get("queue"), Mapping)
+                            and state["queue"].get("reuse_team") is True
+                            and state["queue"].get("released_at") is None
+                            for state in waiting_candidates
+                        )
+                        kind = "queued" if queue_only else "waiting"
+                        raise ValueError(
+                            f"exact team {team!r} {kind} tasks are not dependency-ready"
+                        )
+                    statuses = sorted(
+                        {
+                            str(state.get("status") or "unknown").upper()
+                            for state in exact_states
+                        }
+                    )
+                    raise ValueError(
+                        f"exact team {team!r} has no resumable nonterminal task; "
+                        f"statuses={statuses}"
+                    )
+                target, selected_snapshot, record = selected
+                selected_queue = selected_snapshot.get("queue")
+                releasing_queue = (
+                    isinstance(selected_queue, Mapping)
+                    and selected_queue.get("reuse_team") is True
+                    and selected_queue.get("released_at") is None
+                )
+                releasing_dependency = not releasing_queue
             with exclusive_file_lock(self._lock_path(target)):
                 try:
                     current = json.loads(target.read_text(encoding="utf-8"))
@@ -2423,7 +3327,27 @@ class TaskStore:
                 self._assert_manifest_mutable_unlocked(target, current)
                 if str(current.get("status") or "").upper() in TERMINAL:
                     raise ValueError(f"exact team {team!r} became terminal while resuming")
-                queued = self._queue_resume(dict(current), reason=reason or "exact-team resume")
+                queued = dict(current)
+                if releasing_queue or releasing_dependency:
+                    if str(queued.get("status") or "").upper() != "WAITING":
+                        raise ValueError(
+                            f"exact team {team!r} selected task is no longer waiting"
+                        )
+                    if not dependency_readiness(queued, all_tasks).ready:
+                        raise ValueError(
+                            f"exact team {team!r} selected task is no longer dependency-ready"
+                        )
+                    if releasing_queue:
+                        self._release_queued_state(
+                            queued,
+                            reason="Exact-team queue released by resume",
+                        )
+                    else:
+                        self._release_dependency_state(
+                            queued,
+                            reason="All dependencies are DONE; task released by resume",
+                        )
+                self._queue_resume(queued, reason=reason or "exact-team resume")
                 saved = self._save_unlocked(target, queued)
             catalog["entries"][self._catalog_key(target)] = self._catalog_entry(saved)
             self._write_catalog_unlocked(catalog)
@@ -2527,6 +3451,46 @@ class TaskStore:
                 maintenance_incident_id=incident_id,
                 maintenance_request_id=request_id,
             )
+            return state
+
+        return self.update(path, mutate)
+
+    def reject_control(
+        self,
+        path: str | Path,
+        control_id: int,
+        reason: str,
+        *,
+        action: str | None = None,
+    ) -> dict[str, Any]:
+        control_id = int(control_id)
+        reason = str(reason).strip()
+        expected_action = str(action or "").strip().lower() or None
+        if control_id < 1:
+            raise ValueError("control_id must be positive")
+        if not reason:
+            raise ValueError("control rejection reason must not be empty")
+
+        def mutate(state: dict[str, Any]) -> dict[str, Any]:
+            control = next(
+                (
+                    item
+                    for item in state.get("controls") or []
+                    if isinstance(item, dict)
+                    and item.get("control_id") == control_id
+                ),
+                None,
+            )
+            if control is None:
+                raise ValueError(f"control {control_id} no longer exists")
+            if expected_action is not None and control.get("action") != expected_action:
+                raise ValueError(
+                    f"control {control_id} is not action {expected_action!r}"
+                )
+            if control.get("status") == "requested":
+                control["status"] = "rejected"
+                control["result"] = reason
+                control["applied_at"] = utc_now()
             return state
 
         return self.update(path, mutate)

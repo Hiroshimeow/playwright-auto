@@ -93,6 +93,9 @@ class FakeClient:
 
     async def task_preflight(self, task_id):
         self.preflight_calls.append(task_id)
+        error = getattr(self.page, "preflight_error", None)
+        if error is not None:
+            raise error
         return {
             "task_id": task_id,
             "previous_task_id": self.page.snapshot_value.page_task_id,
@@ -262,6 +265,36 @@ def test_terminal_team_reuse_rebinds_without_new_chat(tmp_path, monkeypatch):
     assert page.snapshot_value.page_team == "new-team"
 
 
+@pytest.mark.parametrize(
+    "message",
+    (
+        "accepted in-flight receipt cannot be transferred",
+        "manual draft or attachment blocks task rebind",
+    ),
+)
+def test_terminal_team_reuse_fails_before_identity_mutation_on_preflight(
+    tmp_path, monkeypatch, message
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    page = FakePage(
+        page_id="terminal-page",
+        role="PLAN",
+        team="old-newest",
+        task_id="task-old",
+    )
+    page.preflight_error = RuntimeError(message)
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    actions = CDPATabActions(SimpleNamespace(pages=[page]), config)
+
+    with pytest.raises(RuntimeError, match=message):
+        asyncio.run(actions.acquire(manifest(), "PLAN"))
+
+    client = asyncio.run(actions._matching_clients(manifest(), "PLAN"))[0][0]
+    assert client.bind_calls == []
+    assert page.snapshot_value.page_task_id == "task-old"
+    assert page.snapshot_value.page_team == "old-newest"
+
+
 def test_terminal_team_reuse_with_fresh_flag_opens_new_chat(tmp_path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     page = FakePage(
@@ -368,9 +401,9 @@ def test_recorded_offline_role_requires_controlled_reopen(tmp_path, monkeypatch)
 
     reopened = asyncio.run(actions.reopen(state, "PLAN"))
 
-    assert reopened.page_id == "reopened-page"
+    assert reopened.page_id == "closed-page"
     assert reopened.created is True
-    assert reopened.client.binding.page_id == "reopened-page"
+    assert reopened.client.binding.page_id == "closed-page"
     assert reopened.url == "https://chatgpt.com/c/exact-conversation"
     assert reopened.client.clean_ready_calls == [
         round(config.workspace_timeout_seconds * 1000)

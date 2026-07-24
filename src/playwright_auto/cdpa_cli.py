@@ -93,6 +93,7 @@ def submit_task(
     team: str | None,
     new_roles: Sequence[str],
     new_all: bool,
+    reuse_team: str | None = None,
     report_mode: str = "file",
     depends_on_task_ids: Sequence[str] = (),
 ) -> Mapping[str, Any]:
@@ -103,6 +104,7 @@ def submit_task(
             "task": task,
             "repository": str(repository),
             "team": team,
+            "reuse_team": reuse_team,
             "new_roles": list(new_roles),
             "new_all": bool(new_all),
             "report_mode": str(report_mode),
@@ -284,6 +286,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--new-all", action="store_true", help="reset every selected role lazily once")
     parser.add_argument("--team", default=None, help="new-task team base or exact team to resume")
     parser.add_argument(
+        "--reuse-team",
+        default=None,
+        help="queue new work for one exact existing team without allocating a suffix",
+    )
+    parser.add_argument(
         "--inline-report",
         action="store_true",
         help="write role reports from response Markdown instead of agent-created files",
@@ -340,11 +347,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         new_roles = parse_new_roles(args.new_roles)
         dependencies = parse_dependency_ids(args.depends_on)
         if task:
+            if args.team and args.reuse_team:
+                raise ValueError("--team and --reuse-team are mutually exclusive")
             state = submit_task(
                 config,
                 task=task,
                 repository=repository,
                 team=args.team,
+                reuse_team=args.reuse_team,
                 new_roles=new_roles,
                 new_all=bool(args.new_all),
                 report_mode="inline" if args.inline_report else "file",
@@ -352,6 +362,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             mode = "created"
         else:
+            if args.reuse_team:
+                raise ValueError("--reuse-team is invalid in taskless resume mode")
             if not args.team:
                 raise ValueError("taskless resume requires --team <exact-existing-team>")
             if new_roles or args.new_all or args.inline_report or dependencies:

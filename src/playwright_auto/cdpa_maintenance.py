@@ -93,9 +93,13 @@ def _maintenance_operational_key(state: Mapping[str, Any]) -> str | None:
         if code.lower().startswith("maintainer_"):
             return None
         reason = str(state.get("block_reason") or "")
-    elif status == "WAITING" and state.get("waiting_code") == "dependency_missing":
-        code = "dependency_missing"
-        reason = str(state.get("waiting_reason") or "Missing dependency")
+    elif status == "WAITING" and state.get("waiting_code") in {
+        "dependency_missing",
+        "team_owner_conflict",
+        "queue_release_failed",
+    }:
+        code = str(state.get("waiting_code") or "waiting")
+        reason = str(state.get("waiting_reason") or "Operational wait")
     elif status == "STOPPED" and terminal != "DONE":
         code = code or "task_stopped"
         reason = str(state.get("stop_reason") or "")
@@ -810,7 +814,13 @@ class MaintainerCoordinator:
             None,
         )
 
-    def _reconcile_active(self, path: Path, state: dict[str, Any]) -> bool:
+    def _reconcile_active(
+        self,
+        path: Path,
+        state: dict[str, Any],
+        *,
+        tasks: Sequence[Mapping[str, Any]] | None = None,
+    ) -> bool:
         maintenance = state.get("maintenance")
         if not isinstance(maintenance, Mapping):
             return False
@@ -856,10 +866,15 @@ class MaintainerCoordinator:
             )
             if applied is not None:
                 replacement_id = str(applied.get("replacement_task_id") or "")
+                operational_tasks = (
+                    list(tasks)
+                    if tasks is not None
+                    else self.store.discover_with_errors()[0]
+                )
                 if any(
                     task.get("task_id") == replacement_id
                     and task.get("replacement_incident_id") == incident.get("incident_id")
-                    for task in self.store.discover()
+                    for task in operational_tasks
                 ):
                     active = global_state.get("active_incident")
                     if (
@@ -1335,8 +1350,9 @@ class MaintainerCoordinator:
             for raw_path, _snapshot in tasks
         ]
         global_changed = self._reconcile_global_state(loaded)
+        operational_tasks = [state for _path, state in loaded]
         for path, state in loaded:
-            if self._reconcile_active(path, state):
+            if self._reconcile_active(path, state, tasks=operational_tasks):
                 return True
             active_id = (
                 state.get("maintenance", {}).get("active_incident_id")
