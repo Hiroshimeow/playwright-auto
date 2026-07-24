@@ -3979,3 +3979,43 @@ def test_queued_task_retains_attachment_identity_when_released(tmp_path: Path):
     assert released["status"] == "INBOX"
     assert released["attachments"] == expected
     assert released["roles"]["PLAN"]["attachments_uploaded_generation"] is None
+
+
+def test_phase7_documentation_contract_is_complete():
+    repository = Path(__file__).resolve().parents[1]
+    readme = (repository / "README.md").read_text(encoding="utf-8")
+    agents = (repository / "AGENTS.md").read_text(encoding="utf-8")
+    learning = (repository / "LEARNING.md").read_text(encoding="utf-8")
+
+    for example in (
+        'cdpa "Build parent" --team alpha',
+        'cdpa "Build child" --team beta --depends-on <parent-task-id>',
+        'cdpa "Continue with same context" --reuse-team alpha --depends-on <other-task-id>',
+        'cdpa "Analyze uploaded sources" --team analysis --inline-report --upload design.md',
+        'cdpa --team <exact-existing-team>',
+    ):
+        assert example in readme
+
+    for invariant in (
+        "one global `MAINTAINERS` role for CDP 9222",
+        "never a normal route",
+        "Only PLAN may mark the task DONE",
+        "persist only `depends_on_task_ids`",
+        "A STOPPED parent keeps its child WAITING",
+        "`--reuse-team` queues work for that exact team",
+        "the worker materializes",
+        "once per role conversation generation",
+        "recover from the exact durable request ledger",
+        "raw attachment paths or contents",
+    ):
+        assert invariant in agents
+
+    assert (
+        "Before an irreversible upload/send boundary, validate and use the same immutable byte snapshot. "
+        "After the exact request crosses that boundary, recover from persisted durable evidence rather "
+        "than rereading mutable source inputs."
+    ) in learning
+
+    combined = readme + agents
+    assert "--report-back" not in combined
+    assert "--report-to" not in combined

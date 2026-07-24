@@ -289,8 +289,8 @@ def test_upload_uses_supplied_snapshot_bytes_after_source_path_changes(
         captured_payloads.extend(item.data for item in snapshots)
         return True
 
-    async def ownership_token(_page, *, expected_names):
-        assert tuple(expected_names) == ("context.txt",)
+    async def ownership_token(_page, *, expected_files, **_kwargs):
+        assert tuple(item.name for item in expected_files) == ("context.txt",)
         return "ownership-token"
 
     monkeypatch.setattr(upload, "_upload_via_input", capture_input)

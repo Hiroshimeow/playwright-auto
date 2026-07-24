@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -30,7 +32,14 @@ from playwright_auto.chatgpt import (
 )
 from playwright_auto.durable import RequestLedger, RequestStatus
 from playwright_auto.durable_blocks import DurableSendBlock
-from playwright_auto.upload import UploadReceipt, collect_file_identities, wait_upload_ready
+from playwright_auto.upload import (
+    FileIdentity,
+    UploadReadinessError,
+    UploadReceipt,
+    collect_file_identities,
+    collect_file_snapshots,
+    wait_upload_ready,
+)
 from playwright_auto.workflow import WorkflowContext
 
 
@@ -1049,6 +1058,21 @@ def _attachment_html(name: str) -> str:
     """
 
 
+def _test_file_identity(
+    data: bytes,
+    *,
+    name: str = "context.txt",
+    mime_type: str = "text/plain",
+) -> FileIdentity:
+    return FileIdentity(
+        path=f"/tmp/{name}",
+        name=name,
+        size=len(data),
+        sha256=hashlib.sha256(data).hexdigest(),
+        mime_type=mime_type,
+    )
+
+
 async def _bind_real_task_identity(
     page,
     client: ChatGPTPage,
@@ -1065,7 +1089,11 @@ async def _bind_real_task_identity(
     )
 
 
-async def _with_real_attachment_page(callback, *, url: str | None = None):
+async def _with_real_attachment_page(
+    callback,
+    *,
+    url: str | None = "https://chatgpt.com/c/attachment-test",
+):
     async with async_playwright() as playwright:
         bundled = Path(playwright.chromium.executable_path)
         executable = bundled if bundled.is_file() else Path(shutil.which("chromium") or "")
@@ -1094,6 +1122,21 @@ async def _with_real_attachment_page(callback, *, url: str | None = None):
 
 
 async def _prepare_real_owned_attachment(page, file_value) -> str:
+    if isinstance(file_value, dict):
+        data = bytes(file_value["buffer"])
+        identity = _test_file_identity(
+            data,
+            name=str(file_value.get("name") or "context.txt"),
+            mime_type=str(file_value.get("mimeType") or "application/octet-stream"),
+        )
+    else:
+        path = Path(file_value)
+        identity = collect_file_identities([path])[0]
+        file_value = {
+            "name": identity.name,
+            "mimeType": identity.mime_type,
+            "buffer": path.read_bytes(),
+        }
     await page.locator("#composer-form").evaluate(
         """form => {
           const existing = document.querySelector('#owned-file-input');
@@ -1114,7 +1157,7 @@ async def _prepare_real_owned_attachment(page, file_value) -> str:
     )
     return await upload_module.establish_attachment_ownership(
         page,
-        expected_names=("context.txt",),
+        expected_files=(identity,),
     )
 
 
@@ -1190,6 +1233,259 @@ async def _install_trusted_send_handler(
             "replaceAttachmentWithoutAcceptance": replace_attachment_without_acceptance,
         },
     )
+
+
+def test_real_browser_indexed_remove_file_label_uses_exact_filename(tmp_path):
+    attachment = tmp_path / "context.txt"
+    attachment.write_bytes(b"owned-bytes")
+    expected = collect_file_identities([attachment])
+
+    async def probe(page):
+        await page.locator("#composer-form").evaluate(
+            """form => {
+              const input = document.createElement('input');
+              input.id = 'upload-files';
+              input.type = 'file';
+              form.appendChild(input);
+            }"""
+        )
+        await page.locator("#upload-files").set_input_files(
+            {
+                "name": expected[0].name,
+                "mimeType": expected[0].mime_type,
+                "buffer": attachment.read_bytes(),
+            }
+        )
+        await page.locator("#attachments").evaluate(
+            "(root) => { root.innerHTML = '<div data-testid=\"file-attachment\" style=\"display:block;width:300px;height:40px\"><button type=\"button\" aria-label=\"Remove file 1: context.txt\">Remove</button></div>'; }"
+        )
+        inspected = await chatgpt.inspect_chatgpt_page(page)
+
+        class InspectClient:
+            async def assert_ownership(self):
+                return await chatgpt.inspect_chatgpt_page(page)
+
+        ready = await wait_upload_ready(
+            InspectClient(),
+            request_marker="exact prompt",
+            expected_names=("context.txt",),
+            timeout_ms=100,
+            poll_ms=10,
+        )
+        token = await upload_module.establish_attachment_ownership(
+            page,
+            expected_files=expected,
+        )
+        persisted = await upload_module.current_attachment_ownership_token(
+            page,
+            expected_files=expected,
+        )
+        return inspected.attachment_markers, ready.attachment_markers, token, persisted
+
+    inspected, ready, token, persisted = asyncio.run(_with_real_attachment_page(probe))
+    assert inspected == ("context.txt",)
+    assert ready == ("context.txt",)
+    assert token
+    assert persisted == token
+
+
+def test_real_browser_platform_duplicate_suffix_maps_to_expected_attachment_identity(
+    tmp_path,
+    monkeypatch,
+):
+    async def no_delay(*_args, **_kwargs):
+        return 0.0
+
+    async def no_record(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(chatgpt, "action_delay", no_delay)
+    monkeypatch.setattr(chatgpt, "record_page_action", no_record)
+    attachment = tmp_path / "context.md"
+    attachment.write_bytes(b"owned-bytes")
+    expected = collect_file_identities([attachment])
+
+    async def probe(page):
+        await page.locator("#composer-form").evaluate(
+            """form => {
+              const input = document.createElement('input');
+              input.id = 'upload-files';
+              input.type = 'file';
+              form.appendChild(input);
+            }"""
+        )
+        await page.locator("#upload-files").set_input_files(
+            {
+                "name": expected[0].name,
+                "mimeType": expected[0].mime_type,
+                "buffer": attachment.read_bytes(),
+            }
+        )
+        await page.locator("#attachments").evaluate(
+            "(root) => { root.innerHTML = '<div data-testid=\"file-attachment\" style=\"display:block;width:300px;height:40px\"><button type=\"button\" aria-label=\"Remove file 1: context(1).md\">Remove</button></div>'; }"
+        )
+
+        class InspectClient:
+            async def assert_ownership(self):
+                return await chatgpt.inspect_chatgpt_page(page)
+
+        ready = await wait_upload_ready(
+            InspectClient(),
+            request_marker="exact prompt",
+            expected_names=("context.md",),
+            timeout_ms=100,
+            poll_ms=10,
+        )
+        token = await upload_module.establish_attachment_ownership(
+            page,
+            expected_files=expected,
+        )
+        persisted = await upload_module.current_attachment_ownership_token(
+            page,
+            expected_files=expected,
+        )
+        method = await chatgpt.click_send_button(
+            page,
+            expected_attachment_ownership_token=token,
+            expected_attachment_count=1,
+            expected_attachment_names=("context.md",),
+        )
+        clicks = await page.evaluate("window.sendClicks")
+        return ready.attachment_markers, token, persisted, method, clicks
+
+    markers, token, persisted, method, clicks = asyncio.run(
+        _with_real_attachment_page(probe)
+    )
+    assert markers == ("context(1).md",)
+    assert token
+    assert persisted == token
+    assert method == "dom_click"
+    assert clicks == 1
+
+
+def test_real_browser_current_ownership_token_rejects_silent_same_name_replacement(
+    tmp_path,
+):
+    attachment = tmp_path / "context.txt"
+    attachment.write_bytes(b"owned-aaaa")
+    expected = collect_file_identities([attachment])
+
+    async def probe(page):
+        await page.locator("#composer-form").evaluate(
+            """form => {
+              const input = document.createElement('input');
+              input.id = 'upload-files';
+              input.type = 'file';
+              form.appendChild(input);
+            }"""
+        )
+        await page.locator("#upload-files").set_input_files(
+            {
+                "name": expected[0].name,
+                "mimeType": expected[0].mime_type,
+                "buffer": attachment.read_bytes(),
+            }
+        )
+        await page.locator("#attachments").evaluate(
+            "(root, html) => { root.innerHTML = html; }",
+            _attachment_html("context.txt"),
+        )
+        token = await upload_module.establish_attachment_ownership(
+            page,
+            expected_files=expected,
+        )
+        await page.locator("#upload-files").evaluate(
+            """input => {
+              const transfer = new DataTransfer();
+              transfer.items.add(new File(['manual-bbb'], 'context.txt', {type: 'text/plain'}));
+              input.files = transfer.files;
+            }"""
+        )
+        persisted = await upload_module.current_attachment_ownership_token(
+            page,
+            expected_files=expected,
+        )
+        return token, persisted
+
+    token, persisted = asyncio.run(_with_real_attachment_page(probe))
+
+    assert token
+    assert persisted is None
+
+
+def test_real_browser_attachment_ownership_requires_secure_hashing_context(tmp_path):
+    attachment = tmp_path / "context.txt"
+    attachment.write_bytes(b"owned-aaaa")
+    expected = collect_file_identities([attachment])
+
+    async def probe(page):
+        await page.locator("#composer-form").evaluate(
+            """form => {
+              const input = document.createElement('input');
+              input.id = 'upload-files';
+              input.type = 'file';
+              form.appendChild(input);
+            }"""
+        )
+        await page.locator("#upload-files").set_input_files(
+            {
+                "name": expected[0].name,
+                "mimeType": expected[0].mime_type,
+                "buffer": attachment.read_bytes(),
+            }
+        )
+        await page.locator("#attachments").evaluate(
+            "(root, html) => { root.innerHTML = html; }",
+            _attachment_html("context.txt"),
+        )
+        with pytest.raises(UploadReadinessError, match="secure browser SHA-256"):
+            await upload_module.establish_attachment_ownership(
+                page,
+                expected_files=expected,
+            )
+
+    asyncio.run(_with_real_attachment_page(probe, url=None))
+
+
+def test_real_browser_upload_chooses_general_composer_input_before_camera(
+    tmp_path,
+):
+    attachment = tmp_path / "context.txt"
+    attachment.write_bytes(b"authoritative-bytes")
+    snapshots = collect_file_snapshots([attachment])
+
+    async def probe(page):
+        await page.locator("#composer-form").evaluate(
+            """form => {
+              for (const [id, accept] of [
+                ['upload-files', ''],
+                ['upload-photos', 'image/*'],
+                ['upload-camera', 'image/*'],
+              ]) {
+                const input = document.createElement('input');
+                input.type = 'file';
+                input.id = id;
+                input.accept = accept;
+                input.multiple = true;
+                form.appendChild(input);
+              }
+            }"""
+        )
+        assert await upload_module._upload_via_input(page, snapshots) is True
+        return await page.evaluate(
+            """() => Object.fromEntries(
+              ['upload-files', 'upload-photos', 'upload-camera'].map(id => [
+                id,
+                [...document.getElementById(id).files].map(file => file.name),
+              ])
+            )"""
+        )
+
+    assert asyncio.run(_with_real_attachment_page(probe)) == {
+        "upload-files": ["context.txt"],
+        "upload-photos": [],
+        "upload-camera": [],
+    }
 
 
 def test_real_browser_attachment_filename_contract(monkeypatch):
@@ -1797,9 +2093,13 @@ def test_real_browser_send_returns_no_receipt_when_composer_changes_during_delay
         )
         client = ChatGPTPage(page, timeout_ms=500)
         await client.set_role("DEV")
-        ownership_token = await upload_module.establish_attachment_ownership(
+        ownership_token = await _prepare_real_owned_attachment(
             page,
-            expected_names=("context.txt",),
+            {
+                "name": "context.txt",
+                "mimeType": "text/plain",
+                "buffer": b"owned-aaaa",
+            },
         )
         error = None
         receipt = None
@@ -2235,9 +2535,13 @@ def test_real_browser_send_returns_no_receipt_when_task_team_changes_during_dela
               };
             }"""
         )
-        ownership_token = await upload_module.establish_attachment_ownership(
+        ownership_token = await _prepare_real_owned_attachment(
             page,
-            expected_names=("context.txt",),
+            {
+                "name": "context.txt",
+                "mimeType": "text/plain",
+                "buffer": b"owned-aaaa",
+            },
         )
         error = None
         receipt = None
@@ -2348,7 +2652,7 @@ def test_real_browser_atomic_send_rejects_same_name_attachment_instance_replacem
         )
         ownership_token = await upload_module.establish_attachment_ownership(
             page,
-            expected_names=("context.txt",),
+            expected_files=(_test_file_identity(b"owned-aaaa"),),
         )
         error = None
         try:
@@ -2406,14 +2710,20 @@ def test_real_browser_durable_send_rejects_same_name_attachment_replacement(
               form.appendChild(input);
             }"""
         )
-        await page.locator("#owned-file-input").set_input_files(str(attachment))
+        await page.locator("#owned-file-input").set_input_files(
+            {
+                "name": identities[0].name,
+                "mimeType": identities[0].mime_type,
+                "buffer": attachment.read_bytes(),
+            }
+        )
         await page.locator("#attachments").evaluate(
             "(root, html) => { root.innerHTML = html; }",
             _attachment_html("context.txt"),
         )
         ownership_token = await upload_module.establish_attachment_ownership(
             page,
-            expected_names=("context.txt",),
+            expected_files=identities,
         )
         ledger = RequestLedger(ledger_path)
         record = ledger.begin(
@@ -2535,7 +2845,7 @@ def test_real_browser_controlled_upload_establishes_send_ownership(
             "token": receipt.ownership_token,
             "persisted_token": (
                 await client.current_attachment_ownership_token(
-                    expected_names=("context.txt",)
+                    expected_files=receipt.files
                 )
             ),
             "method": method,
@@ -2949,7 +3259,7 @@ def test_real_browser_atomic_send_does_not_dispatch_focus_before_attachment_clic
         )
         ownership_token = await upload_module.establish_attachment_ownership(
             page,
-            expected_names=("context.txt",),
+            expected_files=(_test_file_identity(b"owned-aaaa"),),
         )
         method = await chatgpt.click_send_button(
             page,
@@ -3038,7 +3348,7 @@ def test_real_browser_send_does_not_dispatch_focus_before_attachment_click(
         )
         ownership_token = await upload_module.establish_attachment_ownership(
             page,
-            expected_names=("context.txt",),
+            expected_files=(_test_file_identity(b"owned-aaaa"),),
         )
         receipt = await client.send(
             "exact prompt",
@@ -3125,7 +3435,7 @@ def test_real_browser_external_focus_attachment_mutation_is_rejected_before_clic
         )
         ownership_token = await upload_module.establish_attachment_ownership(
             page,
-            expected_names=("context.txt",),
+            expected_files=(_test_file_identity(b"owned-aaaa"),),
         )
         await page.locator("[data-testid='send-button']").focus()
         error = None
@@ -3203,7 +3513,13 @@ def test_real_browser_durable_send_does_not_focus_before_owned_attachment_click(
               form.appendChild(input);
             }"""
         )
-        await page.locator("#owned-file-input").set_input_files(str(attachment))
+        await page.locator("#owned-file-input").set_input_files(
+            {
+                "name": identities[0].name,
+                "mimeType": identities[0].mime_type,
+                "buffer": attachment.read_bytes(),
+            }
+        )
         await page.locator("#attachments").evaluate(
             "(root, html) => { root.innerHTML = html; }",
             _attachment_html("context.txt"),
@@ -3237,7 +3553,7 @@ def test_real_browser_durable_send_does_not_focus_before_owned_attachment_click(
         )
         ownership_token = await upload_module.establish_attachment_ownership(
             page,
-            expected_names=("context.txt",),
+            expected_files=identities,
         )
         ledger = RequestLedger(ledger_path)
         record = ledger.begin(
@@ -3418,7 +3734,7 @@ def test_real_browser_atomic_send_accepts_unchanged_attachment_ownership(monkeyp
         )
         ownership_token = await upload_module.establish_attachment_ownership(
             page,
-            expected_names=("context.txt",),
+            expected_files=(_test_file_identity(b"owned-aaaa"),),
         )
         method = await chatgpt.click_send_button(
             page,
@@ -3567,9 +3883,13 @@ def test_real_browser_send_returns_no_receipt_when_conversation_changes_during_d
         )
         client = ChatGPTPage(page, timeout_ms=500)
         await client.set_role("DEV")
-        ownership_token = await upload_module.establish_attachment_ownership(
+        ownership_token = await _prepare_real_owned_attachment(
             page,
-            expected_names=("context.txt",),
+            {
+                "name": "context.txt",
+                "mimeType": "text/plain",
+                "buffer": b"owned-aaaa",
+            },
         )
         error = None
         receipt = None
@@ -3729,6 +4049,221 @@ def test_real_browser_input_upload_uses_same_byte_snapshot(
         "disk_text": "changed-after-snapshot",
         "token": True,
     }
+
+
+def test_real_browser_upload_rejects_same_name_same_size_replacement_before_ownership(
+    tmp_path,
+    monkeypatch,
+):
+    attachment = tmp_path / "context.txt"
+    attachment.write_bytes(b"owned-aaaa")
+    expected = collect_file_identities([attachment])
+    original_wait = upload_module.wait_upload_ready
+
+    async def replace_after_ready(client, **kwargs):
+        ready = await original_wait(client, **kwargs)
+        await client.page.locator("#snapshot-file-input").set_input_files(
+            {
+                "name": "context.txt",
+                "mimeType": "text/plain",
+                "buffer": b"manual-bbb",
+            }
+        )
+        return ready
+
+    monkeypatch.setattr(upload_module, "wait_upload_ready", replace_after_ready)
+
+    async def probe(page):
+        client = ChatGPTPage(page, timeout_ms=500)
+        await client.set_role("alpha-plan")
+        await _bind_real_task_identity(page, client)
+        await _install_snapshot_upload_input(page)
+        with pytest.raises(UploadReadinessError, match="browser file identity"):
+            await client.upload_files(
+                [str(attachment)],
+                request_marker="exact prompt",
+                timeout_ms=500,
+                expected_files=expected,
+            )
+        ownership = await page.evaluate(
+            "key => window[key] || null",
+            chatgpt.ATTACHMENT_OWNERSHIP_WINDOW_KEY,
+        )
+        return ownership and ownership.get("phase")
+
+    phase = asyncio.run(
+        _with_real_attachment_page(
+            probe,
+            url="https://chatgpt.com/c/original",
+        )
+    )
+
+    assert phase != "owned"
+
+
+def test_real_browser_durable_send_rejects_preownership_same_name_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    attachment = tmp_path / "context.txt"
+    attachment.write_bytes(b"owned-aaaa")
+    expected = collect_file_identities([attachment])
+    ledger_path = tmp_path / "ledger.json"
+    original_wait = upload_module.wait_upload_ready
+
+    async def replace_after_ready(client, **kwargs):
+        ready = await original_wait(client, **kwargs)
+        await client.page.locator("#snapshot-file-input").set_input_files(
+            {
+                "name": "context.txt",
+                "mimeType": "text/plain",
+                "buffer": b"manual-bbb",
+            }
+        )
+        return ready
+
+    async def no_delay(*_args, **_kwargs):
+        return 0.0
+
+    async def no_record(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(upload_module, "wait_upload_ready", replace_after_ready)
+    monkeypatch.setattr(chatgpt, "action_delay", no_delay)
+    monkeypatch.setattr(chatgpt, "record_page_action", no_record)
+
+    async def probe(page):
+        client = ChatGPTPage(page, timeout_ms=500)
+        await client.set_role("alpha-plan")
+        await _bind_real_task_identity(page, client)
+        await _install_snapshot_upload_input(page)
+        await page.locator("[data-testid='send-button']").evaluate(
+            """button => {
+              button.onclick = null;
+              button.addEventListener('click', () => {
+                window.sendClicks += 1;
+                const turn = document.createElement('div');
+                turn.setAttribute('data-turn-id', 't1');
+                const message = document.createElement('div');
+                message.setAttribute('data-message-author-role', 'user');
+                message.setAttribute('data-message-id', 'u1');
+                message.innerText = document.querySelector('#prompt-textarea').innerText;
+                turn.appendChild(message);
+                document.body.appendChild(turn);
+              }, {once: true});
+            }"""
+        )
+        error = None
+        try:
+            await DurableSendBlock(
+                "exact prompt",
+                ledger_path=ledger_path,
+                files=[str(attachment)],
+                source_context={"task_id": "task-a", "team": "alpha"},
+                render_request_marker=False,
+                wait_for_response=False,
+                wait_for_stop=False,
+                max_attempts=1,
+                recovery_reload=False,
+                stable_ms=0,
+            ).run(WorkflowContext(client))
+        except Exception as exc:
+            error = type(exc).__name__
+        record = next(iter(json.loads(ledger_path.read_text())["records"].values()))
+        return {
+            "error": error,
+            "status": record["status"],
+            "attempts": record["attempts"],
+            "receipt": record["receipt"],
+            "upload_receipt": record["upload_receipt"],
+            "ledger_sha": record["files"][0]["sha256"],
+            "clicks": await page.evaluate("window.sendClicks"),
+        }
+
+    result = asyncio.run(
+        _with_real_attachment_page(
+            probe,
+            url="https://chatgpt.com/c/original",
+        )
+    )
+
+    assert result == {
+        "error": "UploadReadinessError",
+        "status": "uploading",
+        "attempts": 0,
+        "receipt": None,
+        "upload_receipt": None,
+        "ledger_sha": expected[0].sha256,
+        "clicks": 0,
+    }
+
+
+def test_real_browser_drop_upload_rejects_later_unowned_same_name_drop(
+    tmp_path,
+    monkeypatch,
+):
+    attachment = tmp_path / "context.txt"
+    attachment.write_bytes(b"owned-aaaa")
+    expected = collect_file_identities([attachment])
+    original_wait = upload_module.wait_upload_ready
+
+    async def force_drop(_page, _snapshots):
+        return False
+
+    async def replace_after_ready(client, **kwargs):
+        ready = await original_wait(client, **kwargs)
+        await client.page.locator("#composer-form").evaluate(
+            """form => {
+              const transfer = new DataTransfer();
+              transfer.items.add(new File(['manual-bbb'], 'context.txt', {type: 'text/plain'}));
+              form.dispatchEvent(new DragEvent('drop', {
+                bubbles: true,
+                cancelable: true,
+                dataTransfer: transfer,
+              }));
+            }"""
+        )
+        return ready
+
+    monkeypatch.setattr(upload_module, "_upload_via_input", force_drop)
+    monkeypatch.setattr(upload_module, "wait_upload_ready", replace_after_ready)
+
+    async def probe(page):
+        client = ChatGPTPage(page, timeout_ms=500)
+        await client.set_role("alpha-plan")
+        await _bind_real_task_identity(page, client)
+        await page.locator("#composer-form").evaluate(
+            """form => {
+              form.addEventListener('dragover', event => event.preventDefault());
+              form.addEventListener('drop', event => {
+                event.preventDefault();
+                const file = event.dataTransfer.files[0];
+                window.droppedTextPromise = file.text();
+                document.querySelector('#attachments').innerHTML = `
+                  <div data-testid="file-attachment" style="display:block;width:300px;height:40px">
+                    <span>${file.name}</span>
+                    <button type="button" aria-label="Remove file ${file.name}">Remove</button>
+                  </div>`;
+              });
+            }"""
+        )
+        with pytest.raises(UploadReadinessError, match="drop provenance"):
+            await client.upload_files(
+                [str(attachment)],
+                request_marker="exact prompt",
+                timeout_ms=500,
+                expected_files=expected,
+            )
+        return await page.evaluate("window.droppedTextPromise")
+
+    dropped_text = asyncio.run(
+        _with_real_attachment_page(
+            probe,
+            url="https://chatgpt.com/c/original",
+        )
+    )
+
+    assert dropped_text == "manual-bbb"
 
 
 def test_real_browser_drop_upload_uses_same_byte_snapshot(

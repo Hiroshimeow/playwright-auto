@@ -104,8 +104,10 @@ class FakeDurableClient:
             ownership_token=self.attachment_ownership_token,
         )
 
-    async def current_attachment_ownership_token(self, *, expected_names):
-        if tuple(expected_names) != tuple(self.current.attachment_markers):
+    async def current_attachment_ownership_token(self, *, expected_files):
+        if tuple(item.name for item in expected_files) != tuple(
+            self.current.attachment_markers
+        ):
             return None
         return self.attachment_ownership_token
 
@@ -380,6 +382,28 @@ def test_persisted_receipt_recovers_without_transcript_rendering(tmp_path):
     )
 
     assert classify_recovery_state(record, snapshot()) is DurableRecoveryState.SENT_WAITING_RESPONSE
+
+
+def test_upload_recovery_accepts_platform_duplicate_filename_suffix(tmp_path):
+    attachment = tmp_path / "context.md"
+    attachment.write_bytes(b"durable bytes")
+    files = collect_file_identities([attachment])
+    ledger = RequestLedger(tmp_path / "ledger.json")
+    record = ledger.begin(role="DEV", prompt="task", files=files)
+    record = ledger.update(record.request_id, status=RequestStatus.PROMPT_SET)
+    record = ledger.update(record.request_id, status=RequestStatus.UPLOADING)
+
+    assert (
+        classify_recovery_state(
+            record,
+            snapshot(
+                text=record.rendered_prompt,
+                attachments=("context(1).md",),
+                state=ChatGPTState.DRAFT,
+            ),
+        )
+        is DurableRecoveryState.UPLOAD_READY_NOT_SENT
+    )
 
 
 def test_recovery_classifier_never_resends_after_send_boundary(tmp_path):
@@ -1538,6 +1562,42 @@ def test_durable_cdpa_source_context_requires_exact_browser_task_team(tmp_path):
     persisted = next(iter(records.values()))
     assert persisted["status"] == RequestStatus.PROMPT_SET.value
     assert persisted["receipt"] is None
+
+
+def test_global_maintainers_source_context_is_incident_provenance_not_page_ownership(
+    tmp_path,
+):
+    ledger_path = tmp_path / "ledger.json"
+    client = FakeDurableClient(snapshot())
+    client.binding = PageBinding("page-1", "MAINTAINERS")
+
+    run_block(
+        DurableSendBlock(
+            "maintenance incident prompt",
+            ledger_path=ledger_path,
+            source_context={
+                "task_id": "task-a",
+                "team": "alpha",
+                "incident_id": "maint-a",
+            },
+            render_request_marker=False,
+            wait_for_response=False,
+            stable_ms=0,
+        ),
+        client,
+    )
+
+    assert len(client.send_calls) == 1
+    record = next(
+        iter(json.loads(ledger_path.read_text(encoding="utf-8"))["records"].values())
+    )
+    assert record["status"] == RequestStatus.SENT.value
+    assert record["attempts"] == 1
+    assert record["source_context"] == {
+        "incident_id": "maint-a",
+        "task_id": "task-a",
+        "team": "alpha",
+    }
 
 
 @pytest.mark.parametrize(

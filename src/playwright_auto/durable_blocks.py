@@ -8,6 +8,7 @@ from typing import Any
 from .chatgpt import (
     ChatGPTPage,
     MessageSnapshot,
+    attachment_names_match,
     capture_message_baseline,
     unique_new_user_message,
     visible_text_matches,
@@ -408,7 +409,7 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
                 )
             if record.status is RequestStatus.UPLOADING:
                 ownership_token = await context.client.current_attachment_ownership_token(
-                    expected_names=tuple(item.name for item in identities)
+                    expected_files=identities
                 )
                 if not ownership_token:
                     raise DurableRequestError(
@@ -476,25 +477,28 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
             raw_task_id = record.source_context.get("task_id")
             raw_team = record.source_context.get("team")
             if raw_task_id is not None or raw_team is not None:
-                source_task_id = str(raw_task_id or "").strip() or None
-                source_team = str(raw_team or "").strip() or None
-                if source_task_id is None or source_team is None:
+                provenance_task_id = str(raw_task_id or "").strip() or None
+                provenance_team = str(raw_team or "").strip() or None
+                if provenance_task_id is None or provenance_team is None:
                     raise DurableRequestError(
                         "durable source context has incomplete task/team ownership"
                     )
-                if (
-                    before_send.page_task_id != source_task_id
-                    or before_send.page_team != source_team
-                ):
-                    raise DurableRequestError(
-                        "durable task/team ownership does not match before send"
-                    )
+                if context.client.binding.role != "MAINTAINERS":
+                    source_task_id = provenance_task_id
+                    source_team = provenance_team
+                    if (
+                        before_send.page_task_id != source_task_id
+                        or before_send.page_team != source_team
+                    ):
+                        raise DurableRequestError(
+                            "durable task/team ownership does not match before send"
+                        )
         if not visible_text_matches(before_send.composer_text, record.rendered_prompt):
             raise DurableRequestError(
                 "exact durable prompt ownership was lost before send"
             )
         expected_markers = tuple(item.name for item in identities)
-        if tuple(before_send.attachment_markers) != expected_markers:
+        if not attachment_names_match(before_send.attachment_markers, expected_markers):
             raise DurableRequestError(
                 "durable attachment identity changed before send"
             )

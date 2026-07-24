@@ -2470,6 +2470,112 @@ def test_timeout_banner_without_stop_refreshes_after_no_progress_and_accepts_reh
     assert hop["turn"] == 1
 
 
+def test_advance_accepts_response_after_refresh_without_remerging_old_baseline(
+    tmp_path: Path,
+    monkeypatch,
+):
+    store, state, worker, path, hop, receipt, sent_at = _prepare_sent_waiting_task(
+        tmp_path,
+        task_id="task-refresh-response-merge",
+    )
+    old = sent_at - timedelta(minutes=21)
+    report = (
+        tmp_path
+        / ".plan"
+        / "alpha"
+        / "alpha-plan_turn1_task-refresh-response-merge.md"
+    )
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("response after refresh", encoding="utf-8")
+    progress = MessageSnapshot(
+        "assistant",
+        "a-progress",
+        "ta-progress",
+        "still working before refresh",
+        (),
+    )
+    final = MessageSnapshot(
+        "assistant",
+        "a-final",
+        "ta-final",
+        '{"route":"TEST","handoff":".plan/alpha/alpha-plan_turn1_task-refresh-response-merge.md"}',
+        (),
+    )
+    snapshot = SimpleNamespace(
+        state=ChatGPTState.ERROR,
+        stop_visible=False,
+        composer_empty=True,
+        manual_input_pending=False,
+        error_texts=("Message delivery timed out. Please try again.",),
+        blocking_dialogs=(),
+        messages=(
+            MessageSnapshot("user", "u1", "t1", receipt.prompt, ()),
+            progress,
+        ),
+    )
+    signature, length = response_activity_signature(snapshot, receipt.baseline)
+    hop["timestamps"]["sent_at"] = old.isoformat()
+    hop["wait"].update(
+        {
+            "started_at": old.isoformat(),
+            "deadline_at": (old + timedelta(hours=2)).isoformat(),
+            "activity_signature": signature,
+            "activity_length": length,
+            "activity_changed_at": old.isoformat(),
+            "activity_observed_at": old.isoformat(),
+            "recovery_baseline": {
+                "assistant_message_ids": ["a-prior-refresh"],
+                "assistant_turn_ids": ["ta-prior-refresh"],
+                "assistant_fingerprints": ["f" * 64],
+            },
+        }
+    )
+    store.save(path, state)
+
+    class Client:
+        def __init__(self):
+            self.wait_calls = 0
+
+        async def assert_ownership(self):
+            return snapshot
+
+        async def wait_for_response(self, _receipt, **kwargs):
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                raise TimeoutError("no final response before refresh")
+            kwargs["candidate_validator"](final)
+            return final
+
+    client = Client()
+    acquired = AcquiredRole(
+        client=client,
+        page_id="page-alpha-plan",
+        url="https://chatgpt.com/c/exact",
+        created=False,
+        new_chat=False,
+    )
+
+    class Actions:
+        async def locate_owned(self, _state, _role):
+            return acquired
+
+        async def refresh(self, _acquired):
+            return None
+
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
+
+    result = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    assert result == store.load(path)
+    assert result["status"] == "RUNNING"
+    assert result["block_code"] is None
+    active = _active_hop(result)
+    assert active["state"] == "responded"
+    assert active["response"] == final.text
+    assert active["wait"]["recovery_baseline"] is None
+    assert client.wait_calls == 2
+
+
 def test_pause_requested_during_refresh_survives_refresh_checkpoints(
     tmp_path: Path,
     monkeypatch,

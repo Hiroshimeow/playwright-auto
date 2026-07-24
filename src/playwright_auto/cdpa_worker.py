@@ -1762,6 +1762,7 @@ class CDPAWorker:
         hop: dict[str, Any],
         actions: CDPATabActions,
         manifest_path: Path,
+        transport_baseline: dict[str, Any] | None = None,
     ) -> None:
         role = str(hop["target_role"])
         acquired = await self._owned_or_block(state, role, actions)
@@ -1852,7 +1853,16 @@ class CDPAWorker:
                 self._persist_transport_result(manifest_path, refresh_baseline, state)
                 raise
             finish_refresh(wait)
-            self._persist_transport_result(manifest_path, refresh_baseline, state)
+            saved = self._persist_transport_result(manifest_path, refresh_baseline, state)
+            if transport_baseline is not None:
+                state.clear()
+                state.update(saved)
+                hop = _active_hop(state)
+                wait = hop["wait"]
+                transport_baseline.clear()
+                transport_baseline.update(
+                    json.loads(json.dumps(saved, ensure_ascii=False, default=str))
+                )
         remaining = remaining_timeout_ms(wait)
         if remaining <= 0:
             if await self._final_response_reconciliation(
@@ -2258,7 +2268,13 @@ class CDPAWorker:
                         hop["timestamps"]["waiting_at"] = utc_now()
                         state["active_action"] = "wait_response"
                     elif hop["state"] == "waiting":
-                        await self._waiting(state, hop, actions, path)
+                        await self._waiting(
+                            state,
+                            hop,
+                            actions,
+                            path,
+                            transport_baseline,
+                        )
                     elif hop["state"] == "responded":
                         self._responded(state, hop)
                     elif hop["state"] == "routed":

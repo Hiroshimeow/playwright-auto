@@ -5,6 +5,7 @@ Reusable lessons for CDPA teams. Read before starting a task. Add only evidence-
 ## Durable transport
 
 - Persist state before and after every send boundary. On restart or CDP reconnect, distinguish `pre_send`, `sending`, `sent`, `responded`, and `routed`; never infer that an ambiguous send is safe to repeat. Browser/transport disconnect exceptions must escape per-task blocking logic so the reconnect supervisor can attach again without changing hop, request, report, or control identity.
+- Before an irreversible upload/send boundary, validate and use the same immutable byte snapshot. After the exact request crosses that boundary, recover from persisted durable evidence rather than rereading mutable source inputs.
 - Once send acceptance is persisted, consume only an assistant message newer than the pre-send baseline. Persist the accepted user message/turn identity and match either non-empty identity after restart or F5 because DOM message IDs may change while turn IDs survive. When durable identity exists, never fall back to rendered text; long prompts may be collapsed behind `Show more`.
 - Structurally incomplete output with exact provenance is resumable waiting, not proof of failure. Unproven or stale output remains blocked.
 - Rendered ChatGPT DOM may expose route JSON without Markdown fences. Parse the terminal JSON object, validate duplicate keys and all fields, and fail closed.

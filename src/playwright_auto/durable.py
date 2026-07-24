@@ -16,6 +16,7 @@ from .chatgpt import (
     MessageBaseline,
     PageBinding,
     SendReceipt,
+    attachment_names_match,
     exact_prompt_seen,
     unique_new_user_message,
     validate_page_role,
@@ -483,7 +484,7 @@ def classify_recovery_state(
         if attachment_markers:
             if (
                 record.status in {RequestStatus.UPLOADING, RequestStatus.UPLOAD_READY}
-                and attachment_markers == expected_markers
+                and attachment_names_match(attachment_markers, expected_markers)
             ):
                 return DurableRecoveryState.UPLOAD_READY_NOT_SENT
             return DurableRecoveryState.COMPOSER_PROMPT_AND_ATTACHMENTS_PENDING

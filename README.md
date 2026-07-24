@@ -217,10 +217,28 @@ browser work. PLAN is created first, while DEV/TEST/REVIEW/AUDIT tabs are create
 a validated route first needs them.
 
 ```bash
-uv run cdpa "Implement and verify the requested behavior"
-uv run cdpa "Implement and verify the requested behavior" --team release --new plan,dev
-uv run cdpa "Implement and verify the requested behavior" --new-all
+cdpa "Build parent" --team alpha
+cdpa "Build child" --team beta --depends-on <parent-task-id>
+cdpa "Continue with same context" --reuse-team alpha --depends-on <other-task-id>
+cdpa "Analyze uploaded sources" --team analysis --inline-report --upload design.md
+cdpa --team <exact-existing-team>
 ```
+
+`--team` allocates a readable team base and adds a suffix only when needed. `--reuse-team`
+creates queued work for one exact existing team without suffix allocation; only one task owns
+that team's role tabs at a time, and queued work reuses conversations through the guarded
+rebind path. Dependencies are a durable DAG: each child stores only `depends_on_task_ids`,
+parents/children are derived for display, and a STOPPED parent leaves its child WAITING until
+Maintainers repairs or replaces it.
+
+PLAN remains the only task role allowed to finish with DONE. One global `MAINTAINERS` role
+serves CDP 9222 outside all task teams and normal routes. It returns one inline report plus one
+allowlisted operational decision; the worker validates and applies that decision. Inline task
+reports are also materialized by the worker without weakening route or provenance checks.
+`--upload` captures file identity at task creation, uploads the same bytes once per role
+conversation generation, blocks pre-send source drift, and recovers crossed durable requests
+without duplicate upload or Send. Dashboard attachment data contains only sanitized filename,
+size, MIME type, and hash prefix—not raw paths or contents.
 
 Port `9224` is the compact Kanban creation/control surface. It exposes durable Pause,
 Resume, safe Retry, Stop, Restart role, Open tab, New Chat, Route PLAN, and Clear Team

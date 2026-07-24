@@ -149,6 +149,28 @@ def visible_text_matches(actual: Any, expected: Any) -> bool:
     return normalize_visible_text(actual) == normalize_visible_text(expected)
 
 
+def attachment_name_matches(actual: str, expected: str) -> bool:
+    if actual == expected:
+        return True
+    dot = expected.rfind(".")
+    split = dot if dot > 0 else len(expected)
+    stem, suffix = expected[:split], expected[split:]
+    return re.fullmatch(
+        rf"{re.escape(stem)}\([1-9]\d*\){re.escape(suffix)}",
+        actual,
+    ) is not None
+
+
+def attachment_names_match(
+    actual: Sequence[str],
+    expected: Sequence[str],
+) -> bool:
+    return len(actual) == len(expected) and all(
+        attachment_name_matches(str(name), str(expected[index]))
+        for index, name in enumerate(actual)
+    )
+
+
 def _expected_attachment_contract(
     expected_names: Sequence[str] | None,
     expected_count: int,
@@ -174,7 +196,7 @@ def _assert_expected_attachment_markers(
 ) -> None:
     actual = tuple(str(marker) for marker in markers)
     matches = (
-        actual == expected_names
+        attachment_names_match(actual, expected_names)
         if expected_names is not None
         else len(actual) == expected_count
     )
@@ -1195,6 +1217,8 @@ async def click_send_button(
               if (index < 0) continue;
               const candidate = label.slice(index + prefix.length)
                 .replace(/^[\s:–—-]+/, '').trim();
+              const indexed = candidate.match(/^\d+\s*:\s*(.+)$/);
+              if (indexed) return indexed[1].trim();
               if (candidate) return candidate;
             }
             return '';
@@ -1266,19 +1290,35 @@ async def click_send_button(
             });
             return records;
           };
+          const platformNameMatches = (actual, expected) => {
+            if (actual === expected) return true;
+            const dot = expected.lastIndexOf('.');
+            const split = dot > 0 ? dot : expected.length;
+            const stem = expected.slice(0, split);
+            const suffix = expected.slice(split);
+            if (!actual.startsWith(stem) || !actual.endsWith(suffix)) return false;
+            const middle = actual.slice(stem.length, actual.length - suffix.length);
+            return /^\([1-9]\d*\)$/.test(middle);
+          };
           const attachmentMarkersMatch = (markers) => expectedNames === null
             ? markers.length === expectedCount
             : markers.length === expectedNames.length &&
-              markers.every((marker, index) => marker === expectedNames[index]);
+              markers.every((marker, index) => platformNameMatches(marker, expectedNames[index]));
           const attachmentOwnershipMatches = (records, markers) => {
             if (expectedAttachmentToken === null) return true;
             const ownership = window[attachmentOwnershipKey];
             const tokenMatches = Boolean(
-              ownership && ownership.valid === true &&
+              ownership && ownership.phase === 'owned' && ownership.valid === true &&
               ownership.token === expectedAttachmentToken &&
-              Array.isArray(ownership.names) &&
-              ownership.names.length === markers.length &&
-              ownership.names.every((name, index) => name === markers[index])
+              expectedNames !== null && Array.isArray(ownership.names) &&
+              ownership.names.length === expectedNames.length &&
+              ownership.names.every((name, index) => name === expectedNames[index]) &&
+              Array.isArray(ownership.identities) &&
+              ownership.identities.length === expectedNames.length &&
+              ownership.identities.every((item, index) => item.name === expectedNames[index]) &&
+              Array.isArray(ownership.fileRecords) &&
+              ownership.fileRecords.length === expectedNames.length &&
+              ownership.fileRecords.every((file) => file instanceof File)
             );
             const attachmentElementsMatch = Boolean(
               tokenMatches && Array.isArray(ownership.attachmentElements) &&
@@ -1287,19 +1327,28 @@ async def click_send_button(
                 element === records[index].element && element?.isConnected
               )
             );
+            if (!attachmentElementsMatch) return false;
             const liveInputs = [...document.querySelectorAll('input[type="file"]')]
               .filter((input) => input.files && input.files.length > 0);
-            return Boolean(
-              attachmentElementsMatch && Array.isArray(ownership.inputRecords) &&
-              ownership.inputRecords.length === liveInputs.length &&
-              ownership.inputRecords.every((record, index) => {
-                const input = liveInputs[index];
-                const files = [...(input.files || [])];
-                return record.input === input && input.isConnected &&
-                  Array.isArray(record.files) && record.files.length === files.length &&
-                  record.files.every((file, fileIndex) => file === files[fileIndex]);
-              })
-            );
+            if (ownership.method === 'drop') {
+              return liveInputs.length === 0 && Array.isArray(ownership.inputRecords) &&
+                ownership.inputRecords.length === 0;
+            }
+            if (ownership.method !== 'input' || !Array.isArray(ownership.inputRecords) ||
+                ownership.inputRecords.length !== liveInputs.length) {
+              return false;
+            }
+            const liveFiles = [];
+            const inputsMatch = ownership.inputRecords.every((record, index) => {
+              const input = liveInputs[index];
+              const files = [...(input.files || [])];
+              liveFiles.push(...files);
+              return record.input === input && input.isConnected &&
+                Array.isArray(record.files) && record.files.length === files.length &&
+                record.files.every((file, fileIndex) => file === files[fileIndex]);
+            });
+            return inputsMatch && liveFiles.length === ownership.fileRecords.length &&
+              ownership.fileRecords.every((file, index) => file === liveFiles[index]);
           };
           const attachmentRecords = collectAttachmentRecords(composerHost);
           const attachmentMarkers = attachmentRecords.map((item) => item.filename);
@@ -1756,6 +1805,8 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
               if (index < 0) continue;
               const candidate = label.slice(index + prefix.length)
                 .replace(/^[\s:–—-]+/, '').trim();
+              const indexed = candidate.match(/^\d+\s*:\s*(.+)$/);
+              if (indexed) return indexed[1].trim();
               if (candidate) return candidate;
             }
             return '';
@@ -3414,13 +3465,13 @@ class ChatGPTPage:
     async def current_attachment_ownership_token(
         self,
         *,
-        expected_names: Sequence[str],
+        expected_files: Sequence[Any],
     ) -> str | None:
         from .upload import current_attachment_ownership_token
 
         return await current_attachment_ownership_token(
             self.page,
-            expected_names=expected_names,
+            expected_files=expected_files,
         )
 
     async def wait_upload_ready(

@@ -19,6 +19,7 @@ from .chatgpt import (
     PageOwnershipError,
     SELECTORS,
     UnsafePageStateError,
+    attachment_names_match,
     visible_text_matches,
 )
 
@@ -45,14 +46,28 @@ class UploadReadinessError(UploadError):
 async def establish_attachment_ownership(
     page: Any,
     *,
-    expected_names: Sequence[str],
+    expected_files: Sequence["FileIdentity"],
+    drop_provenance_token: str | None = None,
 ) -> str:
-    names = tuple(str(item).strip() for item in expected_names)
-    if not names or any(not item for item in names):
-        raise ValueError("expected attachment names must be non-empty")
+    files = tuple(expected_files)
+    if not files:
+        raise ValueError("expected files must be non-empty")
+    names = tuple(item.name for item in files)
+    expected = [
+        {
+            "name": item.name,
+            "size": item.size,
+            "sha256": item.sha256,
+            "mime_type": item.mime_type,
+        }
+        for item in files
+    ]
     token = secrets.token_urlsafe(24)
     result = await page.evaluate(
-        r"""([ownershipKey, token, expectedNames, composerSelector]) => {
+        r"""async ([ownershipKey, token, dropToken, expectedNames, expectedFiles, composerSelector]) => {
+          if (!globalThis.crypto?.subtle) {
+            return {ok: false, reason: 'secure_hashing_unavailable'};
+          }
           const visible = (element) => {
             const style = element ? window.getComputedStyle(element) : null;
             return Boolean(
@@ -67,6 +82,80 @@ async def establish_attachment_ownership(
           if (!composer || !composerHost) {
             return {ok: false, reason: 'composer_missing'};
           }
+
+          const previous = window[ownershipKey];
+          const liveInputRecords = () => [...document.querySelectorAll('input[type="file"]')]
+            .filter((input) => input.files && input.files.length > 0)
+            .map((input) => ({input, files: [...input.files]}));
+          let method;
+          let inputRecords;
+          let fileRecords;
+          if (dropToken) {
+            if (liveInputRecords().length || previous?.phase !== 'pending_drop' ||
+                previous.token !== dropToken || previous.valid !== true ||
+                !Array.isArray(previous.fileRecords)) {
+              return {ok: false, reason: 'drop_provenance_changed'};
+            }
+            method = 'drop';
+            inputRecords = [];
+            fileRecords = [...previous.fileRecords];
+          } else {
+            method = 'input';
+            inputRecords = liveInputRecords();
+            fileRecords = inputRecords.flatMap((item) => item.files);
+          }
+          if (fileRecords.length !== expectedFiles.length) {
+            return {ok: false, reason: 'browser_file_count_changed'};
+          }
+          for (let index = 0; index < fileRecords.length; index += 1) {
+            const file = fileRecords[index];
+            const expected = expectedFiles[index];
+            if (!(file instanceof File) || file.name !== expected.name ||
+                file.size !== expected.size || file.type !== expected.mime_type) {
+              return {ok: false, reason: 'browser_file_identity_changed'};
+            }
+          }
+          const referencesMatch = () => {
+            if (method === 'drop') {
+              const current = window[ownershipKey];
+              return Boolean(
+                current === previous && current?.phase === 'pending_drop' &&
+                current.token === dropToken && current.valid === true &&
+                Array.isArray(current.fileRecords) &&
+                current.fileRecords.length === fileRecords.length &&
+                current.fileRecords.every((file, index) => file === fileRecords[index]) &&
+                liveInputRecords().length === 0
+              );
+            }
+            const live = liveInputRecords();
+            return live.length === inputRecords.length &&
+              inputRecords.every((record, index) => {
+                const current = live[index];
+                return record.input === current.input && current.input.isConnected &&
+                  record.files.length === current.files.length &&
+                  record.files.every((file, fileIndex) => file === current.files[fileIndex]);
+              });
+          };
+          if (!referencesMatch()) {
+            return {ok: false, reason: 'browser_file_identity_changed'};
+          }
+          for (let index = 0; index < fileRecords.length; index += 1) {
+            const file = fileRecords[index];
+            const buffer = await file.arrayBuffer();
+            if (!referencesMatch()) {
+              return {ok: false, reason: 'browser_file_identity_changed'};
+            }
+            const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', buffer));
+            if (!referencesMatch()) {
+              return {ok: false, reason: 'browser_file_identity_changed'};
+            }
+            const sha256 = [...digest]
+              .map((byte) => byte.toString(16).padStart(2, '0')).join('');
+            if (sha256 !== expectedFiles[index].sha256) {
+              return {ok: false, reason: 'browser_file_sha256_changed'};
+            }
+          }
+
           const filenameFromLabel = (value) => {
             const label = String(value || '').replace(/\s+/g, ' ').trim();
             const lower = label.toLowerCase();
@@ -78,6 +167,8 @@ async def establish_attachment_ownership(
               if (index < 0) continue;
               const candidate = label.slice(index + prefix.length)
                 .replace(/^[\s:–—-]+/, '').trim();
+              const indexed = candidate.match(/^\d+\s*:\s*(.+)$/);
+              if (indexed) return indexed[1].trim();
               if (candidate) return candidate;
             }
             return '';
@@ -91,9 +182,7 @@ async def establish_attachment_ownership(
           };
           const hasAttachmentToken = (element) => {
             const tokens = (element.getAttribute?.('data-testid') || '')
-              .toLowerCase()
-              .split(/[^a-z0-9]+/)
-              .filter(Boolean);
+              .toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
             return tokens.includes('attachment') || tokens.includes('file');
           };
           const leafFilename = (root) => {
@@ -115,7 +204,9 @@ async def establish_attachment_ownership(
           )) {
             if (!visible(candidate)) continue;
             const explicitItem = candidate.closest('[data-filename], [data-file-name]');
-            const item = explicitItem && explicitItem !== composerHost && composerHost.contains(explicitItem) && visible(explicitItem) ? explicitItem : candidate;
+            const item = explicitItem && explicitItem !== composerHost &&
+              composerHost.contains(explicitItem) && visible(explicitItem)
+              ? explicitItem : candidate;
             const filename = directFilename(item);
             if (!filename || seenAttachmentItems.has(item)) continue;
             seenAttachmentItems.add(item);
@@ -142,34 +233,45 @@ async def establish_attachment_ownership(
             if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
             return 0;
           });
+          const platformNameMatches = (actual, expected) => {
+            if (actual === expected) return true;
+            const dot = expected.lastIndexOf('.');
+            const split = dot > 0 ? dot : expected.length;
+            const stem = expected.slice(0, split);
+            const suffix = expected.slice(split);
+            if (!actual.startsWith(stem) || !actual.endsWith(suffix)) return false;
+            const middle = actual.slice(stem.length, actual.length - suffix.length);
+            return /^\([1-9]\d*\)$/.test(middle);
+          };
           const actualNames = attachmentRecords.map((item) => item.filename);
-          if (
-            actualNames.length !== expectedNames.length ||
-            !actualNames.every((name, index) => name === expectedNames[index])
-          ) {
+          if (actualNames.length !== expectedNames.length ||
+              !actualNames.every((name, index) => platformNameMatches(name, expectedNames[index]))) {
             return {ok: false, reason: 'attachment_names_changed', actualNames};
           }
+          if (!referencesMatch()) {
+            return {ok: false, reason: 'browser_file_identity_changed'};
+          }
 
-          const previous = window[ownershipKey];
           try { previous?.observer?.disconnect?.(); } catch (_) {}
           try { previous?.abortController?.abort?.(); } catch (_) {}
-
-          const inputRecords = [...document.querySelectorAll('input[type="file"]')]
-            .filter((input) => input.files && input.files.length > 0)
-            .map((input) => ({input, files: [...input.files]}));
           const abortController = new AbortController();
           const ownership = {
+            phase: 'owned',
             token,
             valid: true,
-            names: [...actualNames],
+            method,
+            identities: expectedFiles.map((item) => ({...item})),
+            names: [...expectedNames],
+            actualNames: [...actualNames],
             attachmentElements: attachmentRecords.map((item) => item.element),
             inputRecords,
+            fileRecords,
             abortController,
             observer: null,
           };
           const invalidate = () => {
             const current = window[ownershipKey];
-            if (current && current.token === token) current.valid = false;
+            if (current?.token === token) current.valid = false;
           };
           document.addEventListener('change', (event) => {
             if (event.target?.matches?.('input[type="file"]')) invalidate();
@@ -182,10 +284,8 @@ async def establish_attachment_ownership(
           const observer = new MutationObserver((mutations) => {
             for (const mutation of mutations) {
               if (mutation.type === 'attributes') {
-                if (
-                  mutation.target?.matches?.('input[type="file"]') ||
-                  ownedElements.has(mutation.target)
-                ) {
+                if (mutation.target?.matches?.('input[type="file"]') ||
+                    ownedElements.has(mutation.target)) {
                   invalidate();
                   return;
                 }
@@ -219,13 +319,24 @@ async def establish_attachment_ownership(
         [
             ATTACHMENT_OWNERSHIP_WINDOW_KEY,
             token,
+            drop_provenance_token,
             list(names),
+            expected,
             SELECTORS["composer"],
         ],
     )
     if not result.get("ok"):
+        reason = str(result.get("reason") or "unknown")
+        if reason == "secure_hashing_unavailable":
+            raise UploadReadinessError(
+                "attachment ownership requires secure browser SHA-256 support"
+            )
+        if reason.startswith("drop_provenance"):
+            raise UploadReadinessError(
+                f"drop provenance changed before ownership: {reason}"
+            )
         raise UploadReadinessError(
-            f"attachment ownership could not be established: {result.get('reason') or 'unknown'}"
+            f"browser file identity changed before attachment ownership: {reason}"
         )
     return token
 
@@ -233,24 +344,62 @@ async def establish_attachment_ownership(
 async def current_attachment_ownership_token(
     page: Any,
     *,
-    expected_names: Sequence[str],
+    expected_files: Sequence["FileIdentity"],
 ) -> str | None:
-    names = tuple(str(item).strip() for item in expected_names)
+    files = tuple(expected_files)
+    expected = [
+        {
+            "name": item.name,
+            "size": item.size,
+            "sha256": item.sha256,
+            "mime_type": item.mime_type,
+        }
+        for item in files
+    ]
     return await page.evaluate(
-        r"""([ownershipKey, expectedNames]) => {
+        r"""([ownershipKey, expectedFiles]) => {
           const ownership = window[ownershipKey];
-          if (!ownership || ownership.valid !== true || typeof ownership.token !== 'string') {
+          if (!ownership || ownership.phase !== 'owned' || ownership.valid !== true ||
+              typeof ownership.token !== 'string') {
             return null;
           }
-          if (!Array.isArray(ownership.names) || ownership.names.length !== expectedNames.length) {
+          if (!Array.isArray(ownership.identities) ||
+              ownership.identities.length !== expectedFiles.length ||
+              !ownership.identities.every((item, index) => {
+                const expected = expectedFiles[index];
+                return item.name === expected.name && item.size === expected.size &&
+                  item.mime_type === expected.mime_type && item.sha256 === expected.sha256;
+              }) || !Array.isArray(ownership.fileRecords) ||
+              ownership.fileRecords.length !== expectedFiles.length ||
+              !ownership.fileRecords.every((file) => file instanceof File) ||
+              !Array.isArray(ownership.attachmentElements) ||
+              !ownership.attachmentElements.every((element) => element?.isConnected)) {
             return null;
           }
-          if (!ownership.names.every((name, index) => name === expectedNames[index])) {
+          const liveInputs = [...document.querySelectorAll('input[type="file"]')]
+            .filter((input) => input.files && input.files.length > 0);
+          if (ownership.method === 'drop') {
+            return liveInputs.length === 0 && Array.isArray(ownership.inputRecords) &&
+              ownership.inputRecords.length === 0 ? ownership.token : null;
+          }
+          if (ownership.method !== 'input' || !Array.isArray(ownership.inputRecords) ||
+              ownership.inputRecords.length !== liveInputs.length) {
             return null;
           }
-          return ownership.token;
+          const liveFiles = [];
+          const inputsMatch = ownership.inputRecords.every((record, index) => {
+            const input = liveInputs[index];
+            const files = [...(input.files || [])];
+            liveFiles.push(...files);
+            return record.input === input && input.isConnected &&
+              Array.isArray(record.files) && record.files.length === files.length &&
+              record.files.every((file, fileIndex) => file === files[fileIndex]);
+          });
+          return inputsMatch && liveFiles.length === ownership.fileRecords.length &&
+            ownership.fileRecords.every((file, index) => file === liveFiles[index])
+            ? ownership.token : null;
         }""",
-        [ATTACHMENT_OWNERSHIP_WINDOW_KEY, list(names)],
+        [ATTACHMENT_OWNERSHIP_WINDOW_KEY, expected],
     )
 
 
@@ -438,8 +587,11 @@ async def dismiss_stale_upload_overlay(page: Any) -> tuple[str, ...]:
 
 
 async def _upload_via_input(page: Any, files: Sequence[FileSnapshot]) -> bool:
-    inputs = page.locator('input[type="file"]')
+    inputs = page.locator('input#upload-files[type="file"]')
     count = await inputs.count()
+    if count < 1:
+        inputs = page.locator('input[type="file"]:not([accept*="image"])')
+        count = await inputs.count()
     if count < 1:
         await page.evaluate(
             r"""() => {
@@ -465,11 +617,14 @@ async def _upload_via_input(page: Any, files: Sequence[FileSnapshot]) -> bool:
             await page.wait_for_selector('input[type="file"]', state="attached", timeout=1_500)
         except Exception:
             return False
-        inputs = page.locator('input[type="file"]')
+        inputs = page.locator('input#upload-files[type="file"]')
         count = await inputs.count()
+        if count < 1:
+            inputs = page.locator('input[type="file"]:not([accept*="image"])')
+            count = await inputs.count()
     if count < 1:
         return False
-    await inputs.nth(count - 1).set_input_files(
+    await inputs.first.set_input_files(
         [snapshot.input_payload() for snapshot in files]
     )
     return True
@@ -478,7 +633,7 @@ async def _upload_via_input(page: Any, files: Sequence[FileSnapshot]) -> bool:
 async def _upload_via_drop(
     page: Any,
     files: Sequence[FileSnapshot],
-) -> bool:
+) -> str | None:
     payload = [
         {
             "name": snapshot.identity.name,
@@ -487,32 +642,64 @@ async def _upload_via_drop(
         }
         for snapshot in files
     ]
-    return bool(
-        await page.evaluate(
-            r"""([selector, payload]) => {
-              const composer = document.querySelector(selector);
-              const target = composer?.closest('form') || composer;
-              if (!target) return false;
-              const transfer = new DataTransfer();
-              for (const item of payload) {
-                const binary = atob(item.base64);
-                const bytes = new Uint8Array(binary.length);
-                for (let index = 0; index < binary.length; index += 1) {
-                  bytes[index] = binary.charCodeAt(index);
-                }
-                transfer.items.add(new File([bytes], item.name, {type: item.type}));
-              }
-              for (const type of ['dragenter', 'dragover', 'drop']) {
-                target.dispatchEvent(new DragEvent(type, {
-                  bubbles: true,
-                  cancelable: true,
-                  dataTransfer: transfer,
-                }));
-              }
-              return true;
-            }""",
-            [SELECTORS["composer"], payload],
-        )
+    token = secrets.token_urlsafe(24)
+    return await page.evaluate(
+        r"""([selector, payload, ownershipKey, token]) => {
+          const composer = document.querySelector(selector);
+          const target = composer?.closest('form') || composer;
+          if (!target) return null;
+          const transfer = new DataTransfer();
+          for (const item of payload) {
+            const binary = atob(item.base64);
+            const bytes = new Uint8Array(binary.length);
+            for (let index = 0; index < binary.length; index += 1) {
+              bytes[index] = binary.charCodeAt(index);
+            }
+            transfer.items.add(new File([bytes], item.name, {type: item.type}));
+          }
+          const fileRecords = [...transfer.files];
+          for (const type of ['dragenter', 'dragover', 'drop']) {
+            target.dispatchEvent(new DragEvent(type, {
+              bubbles: true,
+              cancelable: true,
+              dataTransfer: transfer,
+            }));
+          }
+          const previous = window[ownershipKey];
+          try { previous?.observer?.disconnect?.(); } catch (_) {}
+          try { previous?.abortController?.abort?.(); } catch (_) {}
+          const abortController = new AbortController();
+          const pending = {
+            phase: 'pending_drop',
+            token,
+            valid: true,
+            method: 'drop',
+            names: fileRecords.map((file) => file.name),
+            fileRecords,
+            inputRecords: [],
+            abortController,
+            observer: null,
+          };
+          const invalidate = () => {
+            const current = window[ownershipKey];
+            if (current?.token === token) current.valid = false;
+          };
+          document.addEventListener('change', (event) => {
+            if (event.target?.matches?.('input[type="file"]')) invalidate();
+          }, {capture: true, signal: abortController.signal});
+          document.addEventListener('drop', invalidate, {
+            capture: true,
+            signal: abortController.signal,
+          });
+          window[ownershipKey] = pending;
+          return token;
+        }""",
+        [
+            SELECTORS["composer"],
+            payload,
+            ATTACHMENT_OWNERSHIP_WINDOW_KEY,
+            token,
+        ],
     )
 
 
@@ -568,7 +755,7 @@ async def wait_upload_ready(
                 exact_prompt=exact_prompt,
             )
             and (
-                tuple(snapshot.attachment_markers) == names
+                attachment_names_match(snapshot.attachment_markers, names)
                 if names
                 else len(snapshot.attachment_markers) == expected
             )
@@ -590,7 +777,10 @@ async def wait_upload_ready(
             reason = "upload_text_missing"
         elif not last_snapshot.attachment_markers:
             reason = "upload_attachments_missing"
-        elif names and tuple(last_snapshot.attachment_markers) != names:
+        elif names and not attachment_names_match(
+            last_snapshot.attachment_markers,
+            names,
+        ):
             reason = "upload_attachment_identity_mismatch"
         elif len(last_snapshot.attachment_markers) != expected:
             reason = "upload_attachment_identity_mismatch"
@@ -658,9 +848,11 @@ async def upload_files(
             )
 
         method = "input"
+        drop_provenance_token: str | None = None
         if not await _upload_via_input(client.page, snapshots):
             method = "drop"
-            if not await _upload_via_drop(client.page, snapshots):
+            drop_provenance_token = await _upload_via_drop(client.page, snapshots)
+            if not drop_provenance_token:
                 raise UploadTransportError("no usable file input or drop target")
         expected_names = tuple(item.name for item in files)
         ready = await wait_upload_ready(
@@ -672,7 +864,8 @@ async def upload_files(
         )
         ownership_token = await establish_attachment_ownership(
             client.page,
-            expected_names=expected_names,
+            expected_files=files,
+            drop_provenance_token=drop_provenance_token,
         )
         return UploadReceipt(
             request_marker=request_marker,
