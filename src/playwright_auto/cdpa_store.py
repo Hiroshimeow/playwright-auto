@@ -153,6 +153,30 @@ def replacement_continuation_text(
     )
 
 
+def replacement_task_for(
+    state: Mapping[str, Any],
+    tasks: Sequence[Mapping[str, Any]],
+) -> Mapping[str, Any] | None:
+    task_id = str(state.get("task_id") or "")
+    if not task_id:
+        return None
+    return next(
+        (
+            item
+            for item in tasks
+            if str(item.get("replaces_task_id") or "") == task_id
+        ),
+        None,
+    )
+
+
+def is_replaced_immutable_history(
+    state: Mapping[str, Any],
+    tasks: Sequence[Mapping[str, Any]],
+) -> bool:
+    return replacement_task_for(state, tasks) is not None
+
+
 def slugify(value: str, *, maximum: int = 72) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", str(value).strip().lower()).strip("-")
     return (slug or "task")[:maximum].rstrip("-")
@@ -1313,14 +1337,17 @@ class TaskStore:
         current: Mapping[str, Any],
     ) -> None:
         task_id = str(current.get("task_id") or "")
-        for candidate in self._filesystem_primary_paths():
-            if candidate == target:
-                continue
-            replacement = self._primary_manifest_state(candidate)
-            if replacement is not None and replacement.get("replaces_task_id") == task_id:
-                raise ValueError(
-                    f"task {task_id!r} is immutable history after replacement"
-                )
+        other_tasks = [
+            state
+            for candidate in self._filesystem_primary_paths()
+            if candidate != target
+            for state in [self._primary_manifest_state(candidate)]
+            if state is not None
+        ]
+        if is_replaced_immutable_history(current, other_tasks):
+            raise ValueError(
+                f"task {task_id!r} is immutable history after replacement"
+            )
 
     def _catalog_saved_manifest_unlocked(self, saved: Mapping[str, Any]) -> None:
         target = Path(str(saved["manifest_path"])).expanduser().resolve()

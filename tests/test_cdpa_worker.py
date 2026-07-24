@@ -5792,6 +5792,95 @@ def test_run_once_recovers_phase4_journal_before_task_discovery(tmp_path: Path, 
     assert calls == ["recover", "discover", "maintainers"]
 
 
+def test_run_once_skips_replaced_immutable_history_without_log_noise(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+):
+    from playwright_auto.dashboard import build_task_payload
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task(
+        "Parent", requested_team="parent", task_id="task-parent-history"
+    )
+    child = store.create_task(
+        "Child",
+        requested_team="child",
+        task_id="task-child-history",
+        depends_on_task_ids=("task-parent-history",),
+    )
+    parent = store.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "STOPPED",
+            "terminal_state": "STOPPED",
+            "kanban_column": "DONE_STOPPED",
+            "active_role": None,
+            "active_hop_id": None,
+            "active_action": "stopped",
+            "stopped_at": utc_now(),
+            "stop_reason": "replacement probe",
+        },
+    )
+    result = store.replace_task_and_rewire(
+        "task-parent-history",
+        "Continue the parent safely",
+        reuse_team=True,
+        rewire_children=True,
+        incident_id="maint-worker-immutable-history",
+    )
+    replacement = result["replacement"]
+    parent_path = Path(parent["manifest_path"])
+    before_bytes = parent_path.read_bytes()
+    before_mtime = parent_path.stat().st_mtime_ns
+    worker = CDPAWorker(config, store=store)
+    advanced: list[str] = []
+    maintenance_batches: list[list[str]] = []
+
+    async def no_browser_advance(path, _browser_context, *, scheduling_tasks=None):
+        state = store.load(path)
+        advanced.append(state["task_id"])
+        assert scheduling_tasks is not None
+        assert {item["task_id"] for item in scheduling_tasks} == {
+            "task-parent-history",
+            "task-child-history",
+            replacement["task_id"],
+        }
+        return state
+
+    class FakeCoordinator:
+        async def advance(self, tasks, _browser_context):
+            maintenance_batches.append([state["task_id"] for _path, state in tasks])
+            return False
+
+    monkeypatch.setattr(worker, "advance", no_browser_advance)
+    worker.maintainers = FakeCoordinator()
+
+    first = asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
+    second = asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
+
+    expected_operational = {"task-child-history", replacement["task_id"]}
+    assert {item["task_id"] for item in first if item} == expected_operational
+    assert {item["task_id"] for item in second if item} == expected_operational
+    assert advanced.count("task-parent-history") == 0
+    assert all("task-parent-history" not in batch for batch in maintenance_batches)
+    assert parent_path.read_bytes() == before_bytes
+    assert parent_path.stat().st_mtime_ns == before_mtime
+    assert capsys.readouterr().err == ""
+    assert store.load(child["manifest_path"])["depends_on_task_ids"] == [
+        replacement["task_id"]
+    ]
+
+    tasks = store.discover()
+    payload = build_task_payload(store.load(parent_path), tasks=tasks)
+    assert payload["status"] == "STOPPED"
+    assert payload["immutable_history"] is True
+    assert payload["controls"] == []
+    assert payload["maintenance_replacement_task_id"] == replacement["task_id"]
+
+
 def test_replacement_plan_first_prompt_contains_immutable_parent_context(tmp_path: Path):
     import hashlib
 

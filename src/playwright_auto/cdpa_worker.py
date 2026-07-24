@@ -35,6 +35,7 @@ from .cdpa_routes import (
 )
 from .cdpa_store import (
     TaskStore,
+    is_replaced_immutable_history,
     report_mode_from_options,
     utc_now,
 )
@@ -53,7 +54,7 @@ from .chatgpt import (
     StableMalformedResponseError,
     unique_new_user_message,
 )
-from .connection import connected_browser
+from .connection import connected_browser, is_cdp_disconnect
 from .durable import RequestLedger, RequestStatus
 from .durable_blocks import DurableSendBlock
 from .upload import UploadIdentityChangedError, collect_file_identities
@@ -142,29 +143,6 @@ def _report_mode(state: Mapping[str, Any]) -> str:
     if not isinstance(options, Mapping):
         raise ValueError("task options must be a mapping")
     return report_mode_from_options(options)
-
-
-def _is_cdp_disconnect(error: BaseException) -> bool:
-    current: BaseException | None = error
-    seen: set[int] = set()
-    needles = (
-        "browser has been closed",
-        "browser closed",
-        "connection closed",
-        "connection is closed",
-        "target page, context or browser has been closed",
-        "browser context has been closed",
-        "websocket is not open",
-    )
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if type(current).__name__ in {"TargetClosedError", "BrowserDisconnectedError"}:
-            return True
-        message = str(current).lower()
-        if any(needle in message for needle in needles):
-            return True
-        current = current.__cause__ or current.__context__
-    return False
 
 
 class CDPAWorker:
@@ -1541,7 +1519,7 @@ class CDPAWorker:
             )
             return
         except Exception as exc:
-            if not files or _is_cdp_disconnect(exc):
+            if not files or is_cdp_disconnect(exc):
                 raise
             names = ", ".join(
                 str(item.get("name") or "attachment")
@@ -2295,7 +2273,7 @@ class CDPAWorker:
                             retryable=False,
                         )
                 except Exception as exc:
-                    if resumed_control is None or _is_cdp_disconnect(exc):
+                    if resumed_control is None or is_cdp_disconnect(exc):
                         raise
                     code = _role_ownership_block_code(exc) or "unexpected_error"
                     self._block(
@@ -2336,7 +2314,7 @@ class CDPAWorker:
         except BlockingIOError:
             return None
         except Exception as exc:
-            if _is_cdp_disconnect(exc):
+            if is_cdp_disconnect(exc):
                 raise
             try:
                 state = self.store.load(path)
@@ -2373,7 +2351,10 @@ class CDPAWorker:
     async def run_once(self, browser_context: Any) -> list[dict[str, Any] | None]:
         self.store.recover_phase4_replacement()
         tasks, _errors = self.store.discover_with_errors()
-        paths = [Path(task["manifest_path"]) for task in tasks]
+        operational_tasks = [
+            task for task in tasks if not is_replaced_immutable_history(task, tasks)
+        ]
+        paths = [Path(task["manifest_path"]) for task in operational_tasks]
         raw_results = await asyncio.gather(
             *(
                 self.advance(
@@ -2389,7 +2370,7 @@ class CDPAWorker:
         disconnect: BaseException | None = None
         for path, result in zip(paths, raw_results, strict=True):
             if isinstance(result, BaseException):
-                if _is_cdp_disconnect(result):
+                if is_cdp_disconnect(result):
                     disconnect = disconnect or result
                 else:
                     print(

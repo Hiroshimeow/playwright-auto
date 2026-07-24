@@ -15,6 +15,7 @@ from .cdpa_config import CDPAConfig
 from .cdpa_routes import ReportEvidence
 from .cdpa_store import TaskStore, retained_report_references, utc_now
 from .cdpa_team import validate_exact_team
+from .connection import is_cdp_disconnect
 from .durable import RequestLedger, RequestStatus
 from .durable_blocks import DurableSendBlock
 from .file_lock import exclusive_file_lock, fsync_parent_directory
@@ -47,27 +48,6 @@ _DECISION_KEYS = frozenset({"action", "reason", "role", "lesson", "replacement"}
 _REPLACEMENT_KEYS = frozenset({"target_task_id", "task", "reuse_team", "rewire_children"})
 _JSON_FENCE = re.compile(r"```json\s*(\{.*\})\s*```\s*$", re.DOTALL | re.IGNORECASE)
 _JSON_LABEL = re.compile(r"(?:^|\s)json\s*$", re.IGNORECASE)
-
-
-def _is_cdp_disconnect(error: BaseException) -> bool:
-    current: BaseException | None = error
-    seen: set[int] = set()
-    needles = (
-        "browser has been closed",
-        "connection closed",
-        "connection is closed",
-        "target page, context or browser has been closed",
-        "browser context has been closed",
-        "websocket is not open",
-    )
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if type(current).__name__ in {"TargetClosedError", "BrowserDisconnectedError"}:
-            return True
-        if any(needle in str(current).lower() for needle in needles):
-            return True
-        current = current.__cause__ or current.__context__
-    return False
 
 
 @dataclass(frozen=True)
@@ -1608,7 +1588,7 @@ class MaintainerCoordinator:
             self.state_store.save(global_state)
             return True
         except Exception as exc:
-            if _is_cdp_disconnect(exc):
+            if is_cdp_disconnect(exc):
                 raise
             detail = f"{type(exc).__name__}: {exc}"
             state = self.store.load(path)

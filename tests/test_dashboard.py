@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import socket
+import struct
 import sys
 import threading
 from http.client import HTTPConnection
@@ -296,6 +298,17 @@ def test_cleared_task_without_assigned_tab_is_history_only():
     assert payload["surface_warning"] is None
 
 
+def test_ordinary_terminal_task_remains_recoverable_when_cdp_is_disconnected():
+    payload = build_task_payload(
+        _surface_task(cleanup_state="ACTIVE"),
+        pages=[],
+        connected=False,
+    )
+    assert payload["surface"] == "offline_recoverable"
+    assert payload["availability"] == "unknown"
+    assert payload["surface_warning"] is None
+
+
 @pytest.mark.parametrize("disconnect_error", [BrokenPipeError, ConnectionResetError])
 def test_dashboard_response_write_ignores_client_disconnect(disconnect_error):
     handler_type = dashboard_module._handler(
@@ -313,6 +326,52 @@ def test_dashboard_response_write_ignores_client_disconnect(disconnect_error):
 
     handler.wfile = DisconnectedWriter()
     handler._send(200, "text/plain", b"ok")
+
+
+@pytest.mark.parametrize("disconnect_error", [BrokenPipeError, ConnectionResetError])
+def test_dashboard_request_processing_ignores_client_disconnect(disconnect_error, capsys):
+    server = dashboard_module.DashboardHTTPServer.__new__(
+        dashboard_module.DashboardHTTPServer
+    )
+    try:
+        raise disconnect_error("client disconnected while reading headers")
+    except disconnect_error:
+        server.handle_error(None, ("127.0.0.1", 1))
+    assert capsys.readouterr().err == ""
+
+
+def test_dashboard_read_side_reset_does_not_log_traceback(capsys):
+    handler = dashboard_module._handler(
+        dashboard_module.DashboardStore("http://127.0.0.1:9222"),
+        b"dashboard",
+    )
+    server = dashboard_module.DashboardHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.handle_request, daemon=True)
+    thread.start()
+    client = socket.create_connection(("127.0.0.1", server.server_port), timeout=3)
+    client.setsockopt(
+        socket.SOL_SOCKET,
+        socket.SO_LINGER,
+        struct.pack("ii", 1, 0),
+    )
+    client.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+    client.close()
+    thread.join(timeout=3)
+    server.server_close()
+
+    assert not thread.is_alive()
+    assert capsys.readouterr().err == ""
+
+
+def test_dashboard_request_processing_reports_unexpected_errors(capsys):
+    server = dashboard_module.DashboardHTTPServer.__new__(
+        dashboard_module.DashboardHTTPServer
+    )
+    try:
+        raise RuntimeError("unexpected request failure")
+    except RuntimeError:
+        server.handle_error(None, ("127.0.0.1", 1))
+    assert "RuntimeError: unexpected request failure" in capsys.readouterr().err
 
 
 def test_dashboard_main_uses_config_runtime_defaults_and_explicit_overrides(
@@ -434,7 +493,7 @@ def test_dashboard_shutdown_handles_keyboard_interrupt_cleanly(monkeypatch, tmp_
             events.append("server-close")
 
     monkeypatch.setattr(dashboard_module.threading, "Thread", FakeThread)
-    monkeypatch.setattr(dashboard_module, "ThreadingHTTPServer", FakeServer)
+    monkeypatch.setattr(dashboard_module, "DashboardHTTPServer", FakeServer)
 
     dashboard_module.serve_dashboard(
         host="127.0.0.1",
@@ -1014,7 +1073,14 @@ def test_replacement_provenance_suppresses_frozen_parent_active_maintenance_proj
         "status": "STOPPED",
         "created_at": "2026-07-23T01:00:00+00:00",
         "updated_at": "2026-07-23T01:01:00+00:00",
-        "roles": {},
+        "roles": {
+            "AUDIT": {
+                "physical_role": "parent-audit",
+                "status": "offline",
+                "turn": 1,
+                "online": False,
+            }
+        },
         "hops": [],
         "reports": [],
         "controls": [],
@@ -1038,12 +1104,34 @@ def test_replacement_provenance_suppresses_frozen_parent_active_maintenance_proj
         "maintenance": None,
     }
 
-    payload = build_task_payload(parent, tasks=[parent, replacement])
+    observed_old_page = {
+        "role": "parent-audit",
+        "team": "parent",
+        "task_id": "task-parent",
+    }
+    connected_payload = build_task_payload(
+        parent,
+        tasks=[parent, replacement],
+        pages=[observed_old_page],
+        connected=True,
+    )
+    disconnected_payload = build_task_payload(
+        parent,
+        tasks=[parent, replacement],
+        pages=[],
+        connected=False,
+    )
 
-    assert payload["active_maintenance_incident"] is None
-    assert payload["active_maintenance_report"] is None
-    assert payload["latest_maintenance_report"]["incident_id"] == "maint-1"
-    assert payload["maintenance_replacement_task_id"] == "task-replacement"
+    for payload in (connected_payload, disconnected_payload):
+        assert payload["active_maintenance_incident"] is None
+        assert payload["active_maintenance_report"] is None
+        assert payload["latest_maintenance_report"]["incident_id"] == "maint-1"
+        assert payload["maintenance_replacement_task_id"] == "task-replacement"
+        assert payload["surface"] == "history"
+        assert payload["availability"] == "terminal"
+        assert payload["surface_warning"] is None
+        assert payload["immutable_history"] is True
+        assert payload["controls"] == []
 
 
 def test_task_payload_sanitizes_attachments_and_exposes_role_generation():

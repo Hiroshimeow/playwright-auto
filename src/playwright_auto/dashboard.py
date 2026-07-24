@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import unquote, urlparse
 
 from .cdpa_config import CDPAConfigError, load_cdpa_config
-from .cdpa_store import TaskStore
+from .cdpa_store import TaskStore, replacement_task_for
 from .cdpa_team import (
     exact_team_ready_waiters,
     is_team_availability_barrier,
@@ -688,7 +688,13 @@ def build_task_payload(
             "report_id": str(report.get("report_id") or index),
             "url": f"/api/reports/{raw.get('task_id')}/{report.get('report_id') or index}",
         })
-    surface, availability = _task_surface(raw, pages, connected=connected)
+    replacement_task = replacement_task_for(raw, tasks)
+    immutable_history = replacement_task is not None
+    surface, availability = (
+        ("history", "terminal")
+        if immutable_history
+        else _task_surface(raw, pages, connected=connected)
+    )
     title_lines = str(
         raw.get("task_text") or raw.get("task_title") or ""
     ).splitlines()
@@ -769,18 +775,6 @@ def build_task_payload(
     queue_blocked_by_task_id = active_team_owner_task_id or (
         selected_ready_task_id if selected_ready_task_id != task_id else None
     )
-    replacement_task = next(
-        (
-            item
-            for item in tasks
-            if isinstance(item, Mapping)
-            and item.get("replaces_task_id") == task_id
-            and active_maintenance is not None
-            and item.get("replacement_incident_id")
-            == active_maintenance.get("incident_id")
-        ),
-        None,
-    )
     if replacement_task is not None:
         active_maintenance = None
         active_maintenance_report = None
@@ -827,6 +821,7 @@ def build_task_payload(
             if replacement_task is not None
             else None
         ),
+        "immutable_history": immutable_history,
         "attachments": [
             {
                 "name": str(item.get("name") or ""),
@@ -875,7 +870,7 @@ def build_task_payload(
         "route_timeline": [dict(item) for item in raw.get("route_timeline") or [] if isinstance(item, Mapping)],
         "errors": [dict(item) if isinstance(item, Mapping) else str(item) for item in raw.get("errors") or []],
         "control_results": [dict(item) for item in raw.get("controls") or [] if isinstance(item, Mapping)],
-        "controls": list(TASK_CONTROLS),
+        "controls": [] if immutable_history else list(TASK_CONTROLS),
         "options": dict(raw.get("options") or {}),
     }
 
@@ -1106,6 +1101,14 @@ def _find_task(task_store: TaskStore, task_id: str) -> dict[str, Any]:
     if not matches:
         raise KeyError(task_id)
     return matches[0]
+
+
+class DashboardHTTPServer(ThreadingHTTPServer):
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        error = sys.exc_info()[1]
+        if isinstance(error, (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
 
 
 def _handler(
@@ -1424,7 +1427,7 @@ def serve_dashboard(
         daemon=True,
     )
     monitor_thread.start()
-    server = ThreadingHTTPServer((host, port), _handler(store, html, task_store=task_store))
+    server = DashboardHTTPServer((host, port), _handler(store, html, task_store=task_store))
     server.daemon_threads = True
     try:
         server.serve_forever(poll_interval=0.25)

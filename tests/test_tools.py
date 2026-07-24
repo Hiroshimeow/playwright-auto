@@ -1,5 +1,5 @@
 import pytest
-from playwright_auto.connection import validate_cdp_url
+from playwright_auto.connection import is_cdp_disconnect, validate_cdp_url
 from playwright_auto.inspect import locator_candidates
 from playwright_auto.screenshot import screenshot_options
 
@@ -19,6 +19,35 @@ def test_locator_priority():
 def test_screenshot_options():
     assert screenshot_options(True,None)=={"full_page":True}
     assert screenshot_options(False,"#main")=={"selector":"#main","full_page":False}
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "browser has been closed",
+        "browser closed",
+        "connection closed",
+        "connection is closed",
+        "target page, context or browser has been closed",
+        "browser context has been closed",
+        "websocket is not open",
+    ],
+)
+def test_cdp_disconnect_message_variants_are_shared(message):
+    inner = RuntimeError(message)
+    outer = RuntimeError("wrapper")
+    outer.__cause__ = inner
+    assert is_cdp_disconnect(outer) is True
+
+
+def test_cdp_disconnect_recognizes_nested_playwright_exception_names():
+    target_closed = type("TargetClosedError", (RuntimeError,), {})("opaque")
+    disconnected = type("BrowserDisconnectedError", (RuntimeError,), {})("opaque")
+    outer = RuntimeError("wrapper")
+    outer.__context__ = target_closed
+    assert is_cdp_disconnect(outer) is True
+    assert is_cdp_disconnect(disconnected) is True
+    assert is_cdp_disconnect(RuntimeError("ordinary failure")) is False
 
 
 def test_connected_browser_disconnects_without_closing_remote(monkeypatch):
