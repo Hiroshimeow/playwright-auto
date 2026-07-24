@@ -668,6 +668,7 @@ def build_task_payload(
             "online": bool(value.get("online")),
             "conversation_generation": int(value.get("conversation_generation") or 0),
             "constructor_sent_generation": value.get("constructor_sent_generation"),
+            "attachments_uploaded_generation": value.get("attachments_uploaded_generation"),
             "reset_requested": bool(value.get("reset_requested")),
             "last_error": value.get("last_error"),
             "last_activity_at": value.get("last_activity_at"),
@@ -826,6 +827,16 @@ def build_task_payload(
             if replacement_task is not None
             else None
         ),
+        "attachments": [
+            {
+                "name": str(item.get("name") or ""),
+                "size": int(item.get("size") or 0),
+                "mime_type": str(item.get("mime_type") or "application/octet-stream"),
+                "sha256_prefix": str(item.get("sha256") or "")[:12],
+            }
+            for item in raw.get("attachments") or []
+            if isinstance(item, Mapping)
+        ],
         "depends_on_task_ids": _string_list(raw.get("depends_on_task_ids")),
         "parents": parents,
         "child_task_ids": [item["task_id"] for item in children],
@@ -1283,9 +1294,10 @@ def _handler(
                             or "report_mode" in body
                             or body.get("depends_on_task_ids")
                             or body.get("reuse_team")
+                            or body.get("upload_paths")
                         ):
                             raise ValueError(
-                                "new_roles, new_all, report_mode, depends_on_task_ids, and reuse_team are invalid when resuming"
+                                "new_roles, new_all, report_mode, depends_on_task_ids, reuse_team, and upload_paths are invalid when resuming"
                             )
                         team = body.get("team")
                         if not isinstance(team, str) or not team:
@@ -1299,6 +1311,12 @@ def _handler(
                             ),
                         )
                         return
+                    raw_upload_paths = body.get("upload_paths") or []
+                    if not isinstance(raw_upload_paths, list) or any(
+                        not isinstance(item, str) or not item.strip()
+                        for item in raw_upload_paths
+                    ):
+                        raise ValueError("upload_paths must be a list of non-empty strings")
                     live_snapshot = store.snapshot()
                     live_pages = live_snapshot.get("pages") or []
                     task = task_store.create_task(
@@ -1314,6 +1332,7 @@ def _handler(
                         ),
                         repository=requested_repository,
                         depends_on_task_ids=tuple(body.get("depends_on_task_ids") or ()),
+                        upload_paths=tuple(raw_upload_paths),
                         reserved_team_suffixes=_busy_role_suffixes(
                             task_store,
                             [page for page in live_pages if isinstance(page, Mapping)],
@@ -1344,7 +1363,13 @@ def _handler(
                         reason=str(body.get("reason") or "").strip() or None,
                         confirmed=bool(body.get("confirmed")),
                     )
-                    self._json(202, updated)
+                    projected = build_task_payload(
+                        updated,
+                        tasks=task_store.discover_with_errors()[0],
+                    )
+                    public_updated = dict(updated)
+                    public_updated["attachments"] = projected["attachments"]
+                    self._json(202, public_updated)
                     return
                 self._json(404, {"error": "not found"})
             except KeyError:

@@ -23,11 +23,14 @@ from playwright_auto.cdpa_worker import CDPAWorker, _active_hop, _report_mode
 from playwright_auto.chatgpt import (
     ChatGPTSnapshot,
     ChatGPTState,
+    ComposerConflictError,
     MessageBaseline,
     MessageSnapshot,
     PageBinding,
+    PageOwnershipError,
     SendReceipt,
     StableMalformedResponseError,
+    UnsafePageStateError,
     capture_message_baseline,
     capture_response_recovery_baseline,
     response_activity_signature,
@@ -123,14 +126,21 @@ def setup_task(tmp_path: Path, *, task_id="task-a", report_mode="file"):
     return config, store, state, CDPAWorker(config, store=store)
 
 
-def send_snapshot(*, text="", messages=(), state=ChatGPTState.NEW_CHAT):
+def send_snapshot(
+    *,
+    text="",
+    messages=(),
+    state=ChatGPTState.NEW_CHAT,
+    task_id="task-a",
+    team="alpha",
+):
     return ChatGPTSnapshot(
         url="https://chatgpt.com/c/cdpa-send",
         session_id="cdpa-send",
         page_id="page-PLAN",
         page_role="PLAN",
-        page_task_id="task-a",
-        page_team="alpha",
+        page_task_id=task_id,
+        page_team=team,
         state=state,
         requires_login=False,
         composer_present=True,
@@ -147,9 +157,9 @@ def send_snapshot(*, text="", messages=(), state=ChatGPTState.NEW_CHAT):
 
 
 class RecordingCDPASendClient:
-    def __init__(self):
+    def __init__(self, *, task_id="task-a", team="alpha"):
         self.binding = PageBinding("page-PLAN", "PLAN")
-        self.current = send_snapshot()
+        self.current = send_snapshot(task_id=task_id, team=team)
         self.set_calls = []
         self.send_calls = []
 
@@ -158,7 +168,13 @@ class RecordingCDPASendClient:
 
     async def set_text(self, text):
         self.set_calls.append(text)
-        self.current = send_snapshot(text=text, messages=self.current.messages, state=ChatGPTState.DRAFT)
+        self.current = send_snapshot(
+            text=text,
+            messages=self.current.messages,
+            state=ChatGPTState.DRAFT,
+            task_id=self.current.page_task_id,
+            team=self.current.page_team,
+        )
 
     async def send(
         self,
@@ -167,7 +183,11 @@ class RecordingCDPASendClient:
         wait_for_stop=True,
         max_attempts=2,
         recovery_reload=True,
+        expected_task_id=None,
+        expected_team=None,
+        expected_attachment_ownership_token=None,
         expected_attachment_count=0,
+        expected_attachment_names=None,
     ):
         self.send_calls.append(text)
         baseline = capture_message_baseline(self.current.messages)
@@ -175,6 +195,8 @@ class RecordingCDPASendClient:
         self.current = send_snapshot(
             messages=(*self.current.messages, user),
             state=ChatGPTState.SUBMITTING,
+            task_id=self.current.page_task_id,
+            team=self.current.page_team,
         )
         return SendReceipt(
             prompt=text,
@@ -274,7 +296,10 @@ def test_pause_requested_after_accepted_send_survives_without_duplicate_send(
             )
             return receipt
 
-    client = ConcurrentSendClient()
+    client = ConcurrentSendClient(
+        task_id=prepared["task_id"],
+        team=prepared["team"],
+    )
     actions = RecordingCDPASendActions(client)
     monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
 
@@ -365,7 +390,10 @@ def test_route_repair_send_keeps_transport_identity_out_of_actual_payload(tmp_pa
     worker._responded(state, original)
     repair = _active_hop(state)
     asyncio.run(worker._pre_send(state, repair, FakeActions()))
-    client = RecordingCDPASendClient()
+    client = RecordingCDPASendClient(
+        task_id=state["task_id"],
+        team=state["team"],
+    )
 
     asyncio.run(worker._sending(state, repair, RecordingCDPASendActions(client)))
 
@@ -5721,3 +5749,922 @@ def test_replacement_plan_first_prompt_contains_immutable_parent_context(tmp_pat
     assert str(report_path) in prompt
     assert "Continue the original requested outcome safely" in prompt
     assert hop["handoff"] == replacement["task_text"]
+
+
+def test_worker_restores_sent_upload_after_source_changes_before_manifest_persist(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from playwright_auto.upload import UploadReceipt, collect_file_identities
+    from test_durable import FakeDurableClient, snapshot as durable_snapshot
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    attachment = tmp_path / "context.txt"
+    attachment.write_text("original", encoding="utf-8")
+    state = store.create_task(
+        "Recover accepted upload",
+        requested_team="alpha",
+        task_id="task-upload-sent-restart",
+        upload_paths=[attachment],
+    )
+    path = Path(state["manifest_path"])
+    worker = CDPAWorker(config, store=store)
+    monkeypatch.setattr(
+        worker_module,
+        "CDPATabActions",
+        lambda *_args, **_kwargs: FakeActions(),
+    )
+    prepared = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+    hop = _active_hop(prepared)
+    role = prepared["roles"]["PLAN"]["physical_role"]
+    binding = PageBinding("page-alpha-plan", role)
+    identities = collect_file_identities([attachment])
+    constructor = config.constructor_paths["PLAN"].read_text(encoding="utf-8")
+    ledger = RequestLedger(hop["ledger_path"])
+    record = ledger.begin(
+        role=role,
+        prompt=hop["prompt"],
+        source_context={
+            "task_id": prepared["task_id"],
+            "team": prepared["team"],
+            "hop_id": hop["hop_id"],
+            "manifest": prepared["manifest_path"],
+        },
+        role_prompt_hash=worker_module._sha(constructor),
+        files=identities,
+        request_id=hop["request_id"],
+        render_request_marker=False,
+    )
+    record = ledger.update(record.request_id, status=RequestStatus.PROMPT_SET)
+    record = ledger.update(record.request_id, status=RequestStatus.UPLOADING)
+    upload_receipt = UploadReceipt(
+        request_marker=record.rendered_prompt,
+        method="input",
+        files=identities,
+        attachment_count=1,
+        ownership_token="fake-upload-token",
+    )
+    record = ledger.update(
+        record.request_id,
+        status=RequestStatus.UPLOAD_READY,
+        upload_receipt=upload_receipt.to_dict(),
+    )
+    baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
+    record = ledger.update(
+        record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=binding,
+        baseline=baseline,
+        session_id_before="session-1",
+    )
+    send_receipt = SendReceipt(
+        prompt=record.rendered_prompt,
+        prompt_sha256=prompt_digest(record.rendered_prompt),
+        binding=binding,
+        baseline=baseline,
+        attempts=1,
+        accepted_via="user_message_identity",
+        session_id_before="session-1",
+        user_message_id="accepted-user",
+        user_turn_id="accepted-turn",
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENT,
+        accepted_at=datetime.now(timezone.utc).timestamp(),
+        receipt=send_receipt.to_dict(),
+        binding=binding,
+        baseline=baseline,
+        session_id_before="session-1",
+    )
+    attachment.write_text("changed after accepted send", encoding="utf-8")
+    client = FakeDurableClient(
+        durable_snapshot(
+            state=ChatGPTState.SUBMITTING,
+            task_id=prepared["task_id"],
+            team=prepared["team"],
+        )
+    )
+    client.binding = binding
+
+    class Actions(FakeActions):
+        async def locate_owned(self, _state, _role):
+            return AcquiredRole(
+                client=client,
+                page_id=binding.page_id,
+                url="https://chatgpt.com/c/upload-sent-restart",
+                created=False,
+                new_chat=False,
+            )
+
+    monkeypatch.setattr(
+        worker_module,
+        "CDPATabActions",
+        lambda *_args, **_kwargs: Actions(),
+    )
+
+    result = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    restored = _active_hop(result)
+    assert result["status"] == "RUNNING"
+    assert result["block_code"] is None
+    assert restored["state"] == "sent"
+    assert restored["receipt"]["user_message_id"] == "accepted-user"
+    assert result["roles"]["PLAN"]["attachments_uploaded_generation"] == 0
+    assert client.upload_calls == []
+    assert client.send_calls == []
+    assert ledger.get(record.request_id).status is RequestStatus.SENT
+
+
+def test_upload_mutated_after_worker_preflight_blocks_before_ledger_or_browser_mutation(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    attachment = tmp_path / "context.txt"
+    attachment.write_text("original", encoding="utf-8")
+    state = store.create_task(
+        "Analyze context",
+        requested_team="alpha",
+        task_id="task-upload-toctou",
+        upload_paths=[attachment],
+    )
+    path = Path(state["manifest_path"])
+    worker = CDPAWorker(config, store=store)
+    monkeypatch.setattr(
+        worker_module,
+        "CDPATabActions",
+        lambda *_args, **_kwargs: FakeActions(),
+    )
+    prepared = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+    prepared_hop = _active_hop(prepared)
+    original_request_id = prepared_hop["request_id"]
+    assert prepared_hop["state"] == "sending"
+
+    original_preflight = worker._attachment_files_for_generation
+    mutated = False
+
+    def mutate_after_preflight(current, role):
+        nonlocal mutated
+        files = original_preflight(current, role)
+        if files and not mutated:
+            attachment.write_text("changed after worker preflight", encoding="utf-8")
+            mutated = True
+        return files
+
+    monkeypatch.setattr(worker, "_attachment_files_for_generation", mutate_after_preflight)
+    client = SimpleNamespace(
+        binding=PageBinding("page-alpha-plan", "alpha-plan")
+    )
+
+    class Actions(FakeActions):
+        async def locate_owned(self, _state, _role):
+            return AcquiredRole(
+                client=client,
+                page_id="page-alpha-plan",
+                url="https://chatgpt.com/c/upload-toctou",
+                created=False,
+                new_chat=False,
+            )
+
+    monkeypatch.setattr(
+        worker_module,
+        "CDPATabActions",
+        lambda *_args, **_kwargs: Actions(),
+    )
+
+    result = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    hop = _active_hop(result)
+    assert mutated is True
+    assert result["status"] == "BLOCKED"
+    assert result["block_code"] == "attachment_identity_changed"
+    assert "context.txt" in result["block_reason"]
+    assert str(attachment.resolve()) not in result["block_reason"]
+    assert hop["state"] == "sending"
+    assert hop["request_id"] == original_request_id
+    assert not Path(hop["ledger_path"]).exists()
+    first = ensure_maintenance_incident(result)
+    second = ensure_maintenance_incident(result)
+    assert first is second
+    assert first["trigger_code"] == "attachment_identity_changed"
+
+
+def test_changed_upload_file_blocks_before_browser_acquisition_and_opens_one_incident(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    attachment = tmp_path / "context.txt"
+    attachment.write_text("original", encoding="utf-8")
+    state = store.create_task(
+        "Analyze context",
+        requested_team="alpha",
+        task_id="task-upload-changed",
+        upload_paths=[attachment],
+    )
+    attachment.write_text("changed", encoding="utf-8")
+    worker = CDPAWorker(config, store=store)
+
+    class NoAcquire(FakeActions):
+        def __init__(self):
+            super().__init__()
+            self.acquire_calls = 0
+
+        async def acquire(self, state, role):
+            self.acquire_calls += 1
+            return await super().acquire(state, role)
+
+    actions = NoAcquire()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    result = asyncio.run(worker.advance(state["manifest_path"], SimpleNamespace(pages=[])))
+
+    assert result == store.load(state["manifest_path"])
+    assert result["status"] == "BLOCKED"
+    assert result["block_code"] == "attachment_identity_changed"
+    assert "context.txt" in result["block_reason"]
+    assert str(attachment.resolve()) not in result["block_reason"]
+    assert actions.acquire_calls == 0
+    first = ensure_maintenance_incident(result)
+    second = ensure_maintenance_incident(result)
+    assert first is second
+    assert first["trigger_code"] == "attachment_identity_changed"
+    maintenance_prompt = worker.maintainers._prompt(
+        result,
+        first,
+        include_constructor=False,
+        tasks=[result],
+    )
+    assert str(attachment.resolve()) not in maintenance_prompt
+    assert "attachment_identity_changed" in maintenance_prompt
+
+
+def test_cdpa_uploads_once_per_role_conversation_generation(tmp_path: Path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    attachment = tmp_path / "context.md"
+    attachment.write_text("stable context", encoding="utf-8")
+    state = store.create_task(
+        "Analyze context",
+        requested_team="alpha",
+        task_id="task-upload-generation",
+        upload_paths=[attachment],
+    )
+    worker = CDPAWorker(config, store=store)
+    captured_files: list[tuple[str, ...]] = []
+
+    class Client:
+        binding = PageBinding("page-alpha-plan", "alpha-plan")
+
+        async def assert_ownership(self):
+            return SimpleNamespace(
+                conversation_url="https://chatgpt.com/c/upload",
+                url="https://chatgpt.com/c/upload",
+            )
+
+    client = Client()
+
+    class Actions(FakeActions):
+        async def locate_owned(self, _state, _role):
+            return AcquiredRole(
+                client=client,
+                page_id="page-alpha-plan",
+                url="https://chatgpt.com/c/upload",
+                created=False,
+                new_chat=False,
+            )
+
+    class FakeDurableSendBlock:
+        def __init__(self, _prompt, *, files=(), **_kwargs):
+            captured_files.append(tuple(str(path) for path in files))
+
+        async def run(self, _context):
+            return {
+                "receipt": {"prompt_sha256": "a" * 64},
+                "record": {"accepted_at": datetime.now(timezone.utc).timestamp()},
+            }
+
+    monkeypatch.setattr(worker_module, "DurableSendBlock", FakeDurableSendBlock)
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    assert str(attachment.resolve()) not in str(hop["prompt"])
+    assert "stable context" not in str(hop["prompt"])
+    asyncio.run(worker._sending(state, hop, Actions()))
+
+    assert captured_files == [(str(attachment.resolve()),)]
+    assert state["roles"]["PLAN"]["attachments_uploaded_generation"] == 0
+
+    next_hop = worker._append_hop(
+        state,
+        source_role="PLAN",
+        target_role="PLAN",
+        handoff="next turn",
+    )
+    asyncio.run(worker._pre_send(state, next_hop, FakeActions()))
+    asyncio.run(worker._sending(state, next_hop, Actions()))
+
+    assert captured_files[-1] == ()
+    assert state["roles"]["PLAN"]["attachments_uploaded_generation"] == 0
+
+    state["roles"]["PLAN"]["conversation_generation"] = 1
+    fresh_hop = worker._append_hop(
+        state,
+        source_role="PLAN",
+        target_role="PLAN",
+        handoff="fresh generation",
+    )
+    asyncio.run(worker._pre_send(state, fresh_hop, FakeActions()))
+    asyncio.run(worker._sending(state, fresh_hop, Actions()))
+
+    assert captured_files[-1] == (str(attachment.resolve()),)
+    assert state["roles"]["PLAN"]["attachments_uploaded_generation"] == 1
+
+    dev_hop = worker._append_hop(
+        state,
+        source_role="PLAN",
+        target_role="DEV",
+        handoff="independent DEV context",
+    )
+    asyncio.run(worker._pre_send(state, dev_hop, FakeActions()))
+    asyncio.run(worker._sending(state, dev_hop, Actions()))
+
+    assert captured_files[-1] == (str(attachment.resolve()),)
+    assert state["roles"]["DEV"]["attachments_uploaded_generation"] == 0
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_code"),
+    [
+        ("missing", "attachment_missing"),
+        ("directory", "attachment_validation_failed"),
+    ],
+)
+def test_attachment_preflight_rejects_missing_or_non_file_without_browser_mutation(
+    tmp_path: Path,
+    monkeypatch,
+    mutation: str,
+    expected_code: str,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    attachment = tmp_path / "evidence.txt"
+    attachment.write_text("stable", encoding="utf-8")
+    state = store.create_task(
+        "Use evidence",
+        requested_team="alpha",
+        task_id=f"task-upload-{mutation}",
+        upload_paths=[attachment],
+    )
+    attachment.unlink()
+    if mutation == "directory":
+        attachment.mkdir()
+    worker = CDPAWorker(config, store=store)
+
+    class NoAcquire(FakeActions):
+        def __init__(self):
+            super().__init__()
+            self.acquire_calls = 0
+
+        async def acquire(self, state, role):
+            self.acquire_calls += 1
+            return await super().acquire(state, role)
+
+    actions = NoAcquire()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    result = asyncio.run(worker.advance(state["manifest_path"], SimpleNamespace(pages=[])))
+
+    assert result["status"] == "BLOCKED"
+    assert result["block_code"] == expected_code
+    assert "evidence.txt" in result["block_reason"]
+    assert str(tmp_path) not in result["block_reason"]
+    assert actions.acquire_calls == 0
+    assert _active_hop(result)["state"] == "pre_send"
+
+
+def test_attachment_upload_failure_is_sanitized_and_creates_one_maintainers_incident(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    attachment = tmp_path / "private-context.txt"
+    attachment.write_text("stable", encoding="utf-8")
+    state = store.create_task(
+        "Upload evidence",
+        requested_team="alpha",
+        task_id="task-upload-failure",
+        upload_paths=[attachment],
+    )
+    worker = CDPAWorker(config, store=store)
+    path = Path(state["manifest_path"])
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: FakeActions())
+    prepared = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+    assert _active_hop(prepared)["state"] == "sending"
+
+    class Client:
+        async def assert_ownership(self):
+            return SimpleNamespace(
+                conversation_url="https://chatgpt.com/c/upload-failure",
+                url="https://chatgpt.com/c/upload-failure",
+            )
+
+    class Actions(FakeActions):
+        async def locate_owned(self, _state, _role):
+            return AcquiredRole(
+                client=Client(),
+                page_id="page-alpha-plan",
+                url="https://chatgpt.com/c/upload-failure",
+                created=False,
+                new_chat=False,
+            )
+
+    class FailingBlock:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def run(self, _context):
+            raise RuntimeError(f"unsafe raw path {attachment.resolve()}")
+
+    monkeypatch.setattr(worker_module, "DurableSendBlock", FailingBlock)
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
+
+    result = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    assert result == store.load(path)
+    assert result["status"] == "BLOCKED"
+    assert result["block_code"] == "attachment_upload_failed"
+    assert "private-context.txt" in result["block_reason"]
+    assert str(attachment.resolve()) not in result["block_reason"]
+    assert _active_hop(result)["state"] == "sending"
+    first = ensure_maintenance_incident(result)
+    second = ensure_maintenance_incident(result)
+    assert first is second
+    assert first["trigger_code"] == "attachment_upload_failed"
+
+
+def test_attachment_generation_marker_persists_after_normal_advance_and_restart(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    attachment = tmp_path / "context.txt"
+    attachment.write_text("stable", encoding="utf-8")
+    state = store.create_task(
+        "Upload once",
+        requested_team="alpha",
+        task_id="task-upload-persisted-marker",
+        upload_paths=[attachment],
+    )
+    path = Path(state["manifest_path"])
+    worker = CDPAWorker(config, store=store)
+    send_calls = 0
+    captured_files = []
+
+    class Client:
+        async def assert_ownership(self):
+            return SimpleNamespace(
+                conversation_url="https://chatgpt.com/c/upload-marker",
+                url="https://chatgpt.com/c/upload-marker",
+            )
+
+    client = Client()
+
+    class Actions(FakeActions):
+        async def locate_owned(self, _state, _role):
+            return AcquiredRole(
+                client=client,
+                page_id="page-alpha-plan",
+                url="https://chatgpt.com/c/upload-marker",
+                created=False,
+                new_chat=False,
+            )
+
+    class AcceptedBlock:
+        def __init__(self, _prompt, *, files=(), **_kwargs):
+            captured_files.append(tuple(str(item) for item in files))
+
+        async def run(self, _context):
+            nonlocal send_calls
+            send_calls += 1
+            return {
+                "receipt": {"prompt_sha256": "a" * 64},
+                "record": {"accepted_at": datetime.now(timezone.utc).timestamp()},
+            }
+
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: FakeActions())
+    first = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+    assert _active_hop(first)["state"] == "sending"
+
+    monkeypatch.setattr(worker_module, "DurableSendBlock", AcceptedBlock)
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
+    sent = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    assert sent == store.load(path)
+    assert _active_hop(sent)["state"] == "sent"
+    assert sent["roles"]["PLAN"]["attachments_uploaded_generation"] == 0
+    assert captured_files == [(str(attachment.resolve()),)]
+    assert send_calls == 1
+
+    restarted = CDPAWorker(config, store=TaskStore(config))
+    waiting = asyncio.run(restarted.advance(path, SimpleNamespace(pages=[])))
+    assert _active_hop(waiting)["state"] == "waiting"
+    assert waiting["roles"]["PLAN"]["attachments_uploaded_generation"] == 0
+    assert send_calls == 1
+
+
+@pytest.mark.parametrize("visible_name", ["manual-unowned.txt", "expected-context.txt"])
+def test_normal_worker_rejects_prompt_set_unowned_attachment_before_send(
+    tmp_path: Path,
+    monkeypatch,
+    visible_name: str,
+):
+    import hashlib
+
+    from playwright_auto.upload import collect_file_identities
+    from test_durable import FakeDurableClient, snapshot as durable_snapshot
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    attachment = tmp_path / "expected-context.txt"
+    attachment.write_text("expected context", encoding="utf-8")
+    state = store.create_task(
+        "Use expected context",
+        requested_team="alpha",
+        task_id=f"task-upload-manual-{visible_name.replace('.', '-')}",
+        upload_paths=[attachment],
+    )
+    path = Path(state["manifest_path"])
+    worker = CDPAWorker(config, store=store)
+
+    monkeypatch.setattr(
+        worker_module,
+        "CDPATabActions",
+        lambda *_args, **_kwargs: FakeActions(),
+    )
+    prepared = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+    hop = _active_hop(prepared)
+    assert hop["state"] == "sending"
+
+    identities = collect_file_identities([attachment])
+    constructor = config.constructor_paths["PLAN"].read_text(encoding="utf-8")
+    ledger = RequestLedger(hop["ledger_path"])
+    record = ledger.begin(
+        role=prepared["roles"]["PLAN"]["physical_role"],
+        prompt=hop["prompt"],
+        source_context={
+            "task_id": prepared["task_id"],
+            "team": prepared["team"],
+            "hop_id": hop["hop_id"],
+            "manifest": prepared["manifest_path"],
+        },
+        role_prompt_hash=hashlib.sha256(constructor.encode("utf-8")).hexdigest(),
+        files=identities,
+        request_id=hop["request_id"],
+        render_request_marker=False,
+    )
+    ledger.update(record.request_id, status=RequestStatus.PROMPT_SET)
+
+    client = FakeDurableClient(
+        durable_snapshot(
+            text=record.rendered_prompt,
+            attachments=(visible_name,),
+            state=ChatGPTState.DRAFT,
+        )
+    )
+    client.binding = PageBinding(
+        "page-alpha-plan",
+        prepared["roles"]["PLAN"]["physical_role"],
+    )
+
+    class Actions(FakeActions):
+        async def locate_owned(self, _state, _role):
+            return AcquiredRole(
+                client=client,
+                page_id="page-alpha-plan",
+                url="https://chatgpt.com/c/upload-manual",
+                created=False,
+                new_chat=False,
+            )
+
+    monkeypatch.setattr(
+        worker_module,
+        "CDPATabActions",
+        lambda *_args, **_kwargs: Actions(),
+    )
+
+    result = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    assert result == store.load(path)
+    assert result["status"] == "BLOCKED"
+    assert result["block_code"] == "attachment_upload_failed"
+    assert str(attachment.resolve()) not in result["block_reason"]
+    assert client.upload_calls == []
+    assert client.send_calls == []
+    assert result["roles"]["PLAN"]["attachments_uploaded_generation"] is None
+    persisted = ledger.get(record.request_id)
+    assert persisted is not None
+    assert persisted.status is RequestStatus.PROMPT_SET
+    assert persisted.upload_receipt is None
+    first = ensure_maintenance_incident(result)
+    second = ensure_maintenance_incident(result)
+    assert first is second
+    assert first["trigger_code"] == "attachment_upload_failed"
+
+
+@pytest.mark.parametrize(
+    "race_kind",
+    [
+        "attachment",
+        "attachment_instance",
+        "attachment_dispatch",
+        "prompt",
+        "ownership",
+        "page_state",
+    ],
+)
+def test_normal_worker_blocks_locked_send_boundary_conflict(
+    tmp_path: Path,
+    monkeypatch,
+    race_kind: str,
+):
+    import hashlib
+
+    from playwright_auto.upload import UploadReceipt, collect_file_identities
+    from test_durable import FakeDurableClient, snapshot as durable_snapshot
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    attachment = tmp_path / "context.txt"
+    attachment.write_text("context", encoding="utf-8")
+    state = store.create_task(
+        "Use durable context",
+        requested_team="alpha",
+        task_id="task-upload-locked-race",
+        upload_paths=[attachment],
+    )
+    path = Path(state["manifest_path"])
+    worker = CDPAWorker(config, store=store)
+
+    monkeypatch.setattr(
+        worker_module,
+        "CDPATabActions",
+        lambda *_args, **_kwargs: FakeActions(),
+    )
+    prepared = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+    hop = _active_hop(prepared)
+    assert hop["state"] == "sending"
+
+    identities = collect_file_identities([attachment])
+    constructor = config.constructor_paths["PLAN"].read_text(encoding="utf-8")
+    ledger = RequestLedger(hop["ledger_path"])
+    record = ledger.begin(
+        role=prepared["roles"]["PLAN"]["physical_role"],
+        prompt=hop["prompt"],
+        source_context={
+            "task_id": prepared["task_id"],
+            "team": prepared["team"],
+            "hop_id": hop["hop_id"],
+            "manifest": prepared["manifest_path"],
+        },
+        role_prompt_hash=hashlib.sha256(constructor.encode("utf-8")).hexdigest(),
+        files=identities,
+        request_id=hop["request_id"],
+        render_request_marker=False,
+    )
+    record = ledger.update(record.request_id, status=RequestStatus.PROMPT_SET)
+    record = ledger.update(record.request_id, status=RequestStatus.UPLOADING)
+    upload_receipt = UploadReceipt(
+        request_marker=record.rendered_prompt,
+        method="input",
+        files=identities,
+        attachment_count=1,
+        ownership_token="fake-upload-token",
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.UPLOAD_READY,
+        upload_receipt=upload_receipt.to_dict(),
+    )
+
+    class BoundaryRaceClient(FakeDurableClient):
+        async def send(
+            self,
+            text,
+            *,
+            wait_for_stop=True,
+            max_attempts=2,
+            recovery_reload=True,
+            expected_task_id=None,
+            expected_team=None,
+            expected_attachment_ownership_token=None,
+            expected_attachment_count=0,
+            expected_attachment_names=None,
+        ):
+            if race_kind in {
+                "attachment_instance",
+                "attachment_dispatch",
+            }:
+                assert expected_attachment_ownership_token == "fake-upload-token"
+                raise ComposerConflictError(
+                    "attachment ownership changed in locked send"
+                )
+            if race_kind == "prompt":
+                self.current = durable_snapshot(
+                    text="manual changed prompt",
+                    attachments=self.current.attachment_markers,
+                    messages=self.current.messages,
+                    state=ChatGPTState.DRAFT,
+                )
+                raise ComposerConflictError("composer text changed in locked send")
+            if race_kind == "ownership":
+                raise PageOwnershipError("conversation changed in locked send")
+            if race_kind == "page_state":
+                raise UnsafePageStateError("blocking dialog appeared in locked send")
+            self.current = durable_snapshot(
+                text=self.current.composer_text,
+                attachments=("manual-unowned.txt",),
+                messages=self.current.messages,
+                state=ChatGPTState.DRAFT,
+            )
+            if expected_attachment_names is not None and tuple(
+                self.current.attachment_markers
+            ) != tuple(expected_attachment_names):
+                raise ComposerConflictError("attachment identity changed in locked send")
+            return await super().send(
+                text,
+                wait_for_stop=wait_for_stop,
+                max_attempts=max_attempts,
+                recovery_reload=recovery_reload,
+                expected_task_id=expected_task_id,
+                expected_team=expected_team,
+                expected_attachment_ownership_token=expected_attachment_ownership_token,
+                expected_attachment_count=expected_attachment_count,
+                expected_attachment_names=expected_attachment_names,
+            )
+
+    client = BoundaryRaceClient(
+        durable_snapshot(
+            text=record.rendered_prompt,
+            attachments=("context.txt",),
+            state=ChatGPTState.DRAFT,
+            task_id=prepared["task_id"],
+            team=prepared["team"],
+        )
+    )
+    client.binding = PageBinding(
+        "page-alpha-plan",
+        prepared["roles"]["PLAN"]["physical_role"],
+    )
+
+    class Actions(FakeActions):
+        async def locate_owned(self, _state, _role):
+            return AcquiredRole(
+                client=client,
+                page_id="page-alpha-plan",
+                url="https://chatgpt.com/c/upload-race",
+                created=False,
+                new_chat=False,
+            )
+
+    monkeypatch.setattr(
+        worker_module,
+        "CDPATabActions",
+        lambda *_args, **_kwargs: Actions(),
+    )
+
+    result = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    assert result == store.load(path)
+    assert result["status"] == "BLOCKED"
+    assert result["block_code"] == "attachment_upload_failed"
+    assert client.send_calls == []
+    assert result["roles"]["PLAN"]["attachments_uploaded_generation"] is None
+    persisted = ledger.get(record.request_id)
+    assert persisted is not None
+    assert persisted.status is RequestStatus.SENDING
+    assert persisted.receipt is None
+    first = ensure_maintenance_incident(result)
+    second = ensure_maintenance_incident(result)
+    assert first is second
+    assert first["trigger_code"] == "attachment_upload_failed"
+
+
+def test_normal_worker_valid_multi_attachment_sends_once_and_persists_generation(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from playwright_auto.upload import UploadReceipt
+    from test_durable import FakeDurableClient, snapshot as durable_snapshot
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    context_file = tmp_path / "context.txt"
+    logs_file = tmp_path / "logs.txt"
+    context_file.write_text("context", encoding="utf-8")
+    logs_file.write_text("logs", encoding="utf-8")
+    state = store.create_task(
+        "Use canonical context and logs",
+        requested_team="alpha",
+        task_id="task-upload-canonical-multi",
+        upload_paths=[context_file, logs_file],
+    )
+    path = Path(state["manifest_path"])
+    worker = CDPAWorker(config, store=store)
+
+    monkeypatch.setattr(
+        worker_module,
+        "CDPATabActions",
+        lambda *_args, **_kwargs: FakeActions(),
+    )
+    prepared = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+    hop = _active_hop(prepared)
+    assert hop["state"] == "sending"
+
+    class CanonicalClient(FakeDurableClient):
+        def __init__(self):
+            super().__init__(
+                durable_snapshot(
+                    task_id=prepared["task_id"],
+                    team=prepared["team"],
+                )
+            )
+            self.exact_name_contracts = []
+
+        async def send(
+            self,
+            text,
+            *,
+            wait_for_stop=True,
+            max_attempts=2,
+            recovery_reload=True,
+            expected_task_id=None,
+            expected_team=None,
+            expected_attachment_ownership_token=None,
+            expected_attachment_count=0,
+            expected_attachment_names=None,
+        ):
+            expected_names = tuple(expected_attachment_names or ())
+            self.exact_name_contracts.append(expected_names)
+            assert tuple(self.current.attachment_markers) == expected_names
+            return await super().send(
+                text,
+                wait_for_stop=wait_for_stop,
+                max_attempts=max_attempts,
+                recovery_reload=recovery_reload,
+                expected_task_id=expected_task_id,
+                expected_team=expected_team,
+                expected_attachment_ownership_token=expected_attachment_ownership_token,
+                expected_attachment_count=expected_attachment_count,
+                expected_attachment_names=expected_attachment_names,
+            )
+
+    client = CanonicalClient()
+    client.binding = PageBinding(
+        "page-alpha-plan",
+        prepared["roles"]["PLAN"]["physical_role"],
+    )
+
+    class Actions(FakeActions):
+        async def locate_owned(self, _state, _role):
+            return AcquiredRole(
+                client=client,
+                page_id="page-alpha-plan",
+                url="https://chatgpt.com/c/upload-valid",
+                created=False,
+                new_chat=False,
+            )
+
+    monkeypatch.setattr(
+        worker_module,
+        "CDPATabActions",
+        lambda *_args, **_kwargs: Actions(),
+    )
+
+    sent = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    assert sent == store.load(path)
+    assert sent["status"] == "RUNNING"
+    assert _active_hop(sent)["state"] == "sent"
+    assert len(client.upload_calls) == 1
+    assert client.upload_calls[0][0] == (
+        str(context_file.resolve()),
+        str(logs_file.resolve()),
+    )
+    assert len(client.send_calls) == 1
+    assert client.exact_name_contracts == [("context.txt", "logs.txt")]
+    assert sent["roles"]["PLAN"]["attachments_uploaded_generation"] == 0
+    ledger = RequestLedger(hop["ledger_path"])
+    record = ledger.get(str(hop["request_id"]))
+    assert record is not None
+    assert record.status is RequestStatus.SENT
+    assert record.receipt is not None
+    assert record.upload_receipt is not None
+    receipt = UploadReceipt.from_dict(record.upload_receipt)
+    assert tuple(item.name for item in receipt.files) == ("context.txt", "logs.txt")

@@ -1044,3 +1044,57 @@ def test_replacement_provenance_suppresses_frozen_parent_active_maintenance_proj
     assert payload["active_maintenance_report"] is None
     assert payload["latest_maintenance_report"]["incident_id"] == "maint-1"
     assert payload["maintenance_replacement_task_id"] == "task-replacement"
+
+
+def test_task_payload_sanitizes_attachments_and_exposes_role_generation():
+    from playwright_auto.dashboard import build_task_payload
+
+    raw = {
+        "task_id": "task-attachment-payload",
+        "task_title": "Attachment payload",
+        "task_text": "Attachment payload",
+        "task_slug": "attachment-payload",
+        "repository": "/repo",
+        "manifest_path": "/repo/.plan/alpha/task/attachment-payload.json",
+        "team": "alpha",
+        "team_suffix": 1,
+        "status": "INBOX",
+        "created_at": "2026-07-24T00:00:00+00:00",
+        "updated_at": "2026-07-24T00:00:00+00:00",
+        "active_role": "PLAN",
+        "active_hop_id": 1,
+        "roles": {
+            "PLAN": {
+                "physical_role": "alpha-plan",
+                "status": "pending",
+                "turn": 0,
+                "online": False,
+                "conversation_generation": 2,
+                "attachments_uploaded_generation": 1,
+            }
+        },
+        "hops": [{"hop_id": 1}],
+        "reports": [],
+        "controls": [],
+        "route_timeline": [],
+        "errors": [],
+        "depends_on_task_ids": [],
+        "attachments": [{
+            "path": "/private/context.txt",
+            "name": "context.txt",
+            "size": 7,
+            "sha256": "a" * 64,
+            "mime_type": "text/plain",
+        }],
+    }
+
+    payload = build_task_payload(raw, tasks=[raw])
+
+    assert payload["attachments"] == [{
+        "name": "context.txt",
+        "size": 7,
+        "sha256_prefix": "a" * 12,
+        "mime_type": "text/plain",
+    }]
+    assert payload["roles"][0]["attachments_uploaded_generation"] == 1
+    assert "/private/context.txt" not in json.dumps(payload)

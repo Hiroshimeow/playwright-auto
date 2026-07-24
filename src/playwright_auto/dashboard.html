@@ -131,6 +131,12 @@
             <div id="dependency-content" class="grid grid-cols-1 md:grid-cols-2 gap-2 mt-2 text-xs text-textDim"></div>
           </section>
 
+          <section id="attachments-summary" class="border-t border-borderDark pt-3 mb-3" aria-labelledby="attachments-title">
+            <p class="text-[10px] uppercase tracking-wider text-textDim">Durable context</p>
+            <h3 id="attachments-title" class="text-white font-medium">Attachments</h3>
+            <div id="attachment-content" class="grid grid-cols-1 md:grid-cols-2 gap-2 mt-2 text-xs text-textDim"></div>
+          </section>
+
           <section class="border-t border-borderDark pt-3 mb-3" aria-labelledby="roles-title">
             <p class="text-[10px] uppercase tracking-wider text-textDim">Exact ownership</p>
             <h3 id="roles-title" class="text-white font-medium mb-2">Roles</h3>
@@ -191,6 +197,7 @@
         <div class="grid grid-cols-1 md:grid-cols-2 gap-3"><label class="text-xs text-white">Team base or exact team<input id="create-team-input" class="mt-1 min-h-10 w-full rounded-lg border border-borderDark bg-dark px-3 text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" required autocomplete="off"></label><label class="text-xs text-white">Repository / workspace<input id="create-repository-input" class="mt-1 min-h-10 w-full rounded-lg border border-borderDark bg-dark px-3 text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" required autocomplete="off"></label></div>
         <label class="min-h-10 inline-flex items-center gap-2 text-xs text-white"><input id="create-reuse-team-input" type="checkbox" class="accent-accent">Queue this task on the exact existing team instead of allocating a suffix</label>
         <label class="text-xs text-white">Dependency task IDs<input id="create-dependencies-input" class="mt-1 min-h-10 w-full rounded-lg border border-borderDark bg-dark px-3 text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" autocomplete="off" placeholder="task-a, task-b"><span class="mt-1 block text-[10px] text-textDim">Optional comma-separated durable task IDs. All must exist and form a DAG.</span></label>
+        <label class="text-xs text-white">Upload paths<textarea id="create-uploads-input" class="mt-1 min-h-20 w-full rounded-lg border border-borderDark bg-dark px-3 py-2 text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" autocomplete="off" placeholder="/absolute/path/context.md&#10;/absolute/path/logs.txt"></textarea><span class="mt-1 block text-[10px] text-textDim">Optional absolute file paths, one per line. Public task payloads omit raw paths.</span></label>
         <fieldset class="rounded-lg border border-borderDark bg-dark p-3"><legend class="px-1 text-xs text-white">Fresh conversation on first use</legend><p class="text-xs text-textDim mb-2">Select logical roles that should lazily start in a fresh conversation.</p><div class="flex flex-wrap gap-2"><label class="min-h-10 inline-flex items-center gap-2 rounded-lg border border-borderDark px-3 text-xs"><input type="checkbox" name="new_role" value="PLAN" class="accent-accent">PLAN</label><label class="min-h-10 inline-flex items-center gap-2 rounded-lg border border-borderDark px-3 text-xs"><input type="checkbox" name="new_role" value="DEV" class="accent-accent">DEV</label><label class="min-h-10 inline-flex items-center gap-2 rounded-lg border border-borderDark px-3 text-xs"><input type="checkbox" name="new_role" value="TEST" class="accent-accent">TEST</label><label class="min-h-10 inline-flex items-center gap-2 rounded-lg border border-borderDark px-3 text-xs"><input type="checkbox" name="new_role" value="REVIEW" class="accent-accent">REVIEW</label><label class="min-h-10 inline-flex items-center gap-2 rounded-lg border border-borderDark px-3 text-xs"><input type="checkbox" name="new_role" value="AUDIT" class="accent-accent">AUDIT</label></div><label class="min-h-10 mt-2 inline-flex items-center gap-2 text-xs text-white"><input id="new-all-input" type="checkbox" class="accent-accent">Fresh conversation for every role on first use</label></fieldset>
         <button type="submit" id="create-submit" class="min-h-10 rounded-lg border border-accent bg-accent text-white font-semibold px-4 disabled:border-borderDark disabled:bg-borderDark disabled:text-textDim">Create task</button>
       </form>
@@ -444,6 +451,32 @@
         });
         removeStale(host, '[data-key]', keys);
       }
+      function formatBytes(value) {
+        const size = Number(value || 0);
+        if (size < 1024) return `${size} B`;
+        if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KiB`;
+        return `${(size / (1024 * 1024)).toFixed(1)} MiB`;
+      }
+      function renderAttachments(task) {
+        const host = byId('attachment-content');
+        const rows = task.attachments || [];
+        const keys = new Set();
+        rows.forEach((item, index) => {
+          const key = `${item.name || 'attachment'}:${item.sha256_prefix || index}`;
+          keys.add(key);
+          const row = keyed(host, '[data-key]', key, createSummaryItem);
+          setText(field(row, 'label'), item.name || 'Attachment');
+          setText(field(row, 'value'), `${formatBytes(item.size)} · ${item.mime_type || 'application/octet-stream'} · sha256 ${item.sha256_prefix || 'unknown'}…`);
+          placeInOrder(host, row, index);
+        });
+        if (!rows.length) {
+          keys.add('empty');
+          const empty = keyed(host, '[data-key]', 'empty', createSummaryItem);
+          setText(field(empty, 'label'), 'Task context');
+          setText(field(empty, 'value'), 'No attachments.');
+        }
+        removeStale(host, '[data-key]', keys);
+      }
       function createReportLink() {
         const link = make('a', 'min-h-10 inline-flex items-center rounded-lg border border-borderDark px-3 text-xs text-textDim hover:text-white hover:bg-borderDark');
         link.target = '_blank'; link.rel = 'noopener';
@@ -518,7 +551,11 @@
           setClass(field(row, 'url'), 'py-2 pr-2 text-textDim max-w-[190px] break-all');
           setText(field(row, 'availability'), availability);
           setClass(field(row, 'availability'), availability === 'online' ? 'py-2 pr-2 text-accent' : availability === 'offline' ? 'py-2 pr-2 text-warning' : 'py-2 pr-2 text-textDim');
-          setText(field(row, 'status'), `${role.status || 'unknown'} · turn ${role.turn || 0} · gen ${role.conversation_generation || 0}`);
+          const uploadedGeneration = role.attachments_uploaded_generation;
+          const uploadState = (task.attachments || []).length
+            ? ` · attachments ${uploadedGeneration === null || uploadedGeneration === undefined ? 'pending' : `gen ${uploadedGeneration}`}`
+            : '';
+          setText(field(row, 'status'), `${role.status || 'unknown'} · turn ${role.turn || 0} · gen ${role.conversation_generation || 0}${uploadState}`);
           setClass(field(row, 'status'), 'py-2 pr-2 text-textDim');
           const actions = field(row, 'actions');
           clearNode(actions);
@@ -606,7 +643,7 @@
         if (!task) {
           setText(byId('team-title'), 'No task available.');
           setText(byId('team-meta'), '');
-          clearNode(byId('logs-content')); clearNode(byId('role-table-body')); clearNode(byId('dependency-content')); clearNode(byId('selected-reports'));
+          clearNode(byId('logs-content')); clearNode(byId('role-table-body')); clearNode(byId('dependency-content')); clearNode(byId('attachment-content')); clearNode(byId('selected-reports'));
           setClass(byId('primary-problem-section'), 'hidden rounded-lg border border-danger bg-danger/10 p-3 mb-3');
           setClass(byId('maintenance-section'), 'hidden rounded-lg border border-borderDark bg-dark p-3 mb-3');
           setText(byId('task-control-target'), 'Target: no selected task');
@@ -620,6 +657,7 @@
         renderMaintenance(task);
         renderControls(task);
         renderDependencySummary(task);
+        renderAttachments(task);
         renderRoles(task);
         renderLogs(task);
         renderSelectedReports(task);
@@ -765,11 +803,13 @@
         const submit = byId(create ? 'create-submit' : 'resume-submit');
         const newRoles = [...document.querySelectorAll('input[name="new_role"]:checked')].map(node => node.value);
         const dependencies = [...new Set(byId('create-dependencies-input').value.split(',').map(value => value.trim()).filter(Boolean))];
+        const uploadPaths = byId('create-uploads-input').value.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
         const teamValue = byId('create-team-input').value.trim();
         const reuseTeam = create && byId('create-reuse-team-input').checked;
         const body = create ? {task: byId('create-task-input').value.trim(), repository: byId('create-repository-input').value, new_roles: newRoles, new_all: byId('new-all-input').checked} : {repository: state.repository, team: byId('resume-team-input').value};
         if (create) body[reuseTeam ? 'reuse_team' : 'team'] = teamValue;
         if (create && dependencies.length) body.depends_on_task_ids = dependencies;
+        if (create && uploadPaths.length) body.upload_paths = uploadPaths;
         if (create && (!body.task || !body.repository || !teamValue)) { setText(byId('dialog-result'), 'Task text, repository, and team are required.'); return; }
         if (!create && !body.team) { setText(byId('dialog-result'), 'Exact allocated team is required.'); return; }
         submit.disabled = true;

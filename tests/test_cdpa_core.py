@@ -3863,3 +3863,119 @@ def test_replacement_context_bounds_retained_report_references():
     assert "report-5.md" in context
     assert "report-24.md" in context
     assert "secret report body" not in context
+
+
+def test_upload_paths_are_hashed_when_task_is_created(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    context = tmp_path / "context.md"
+    context.write_text("evidence", encoding="utf-8")
+
+    state = store.create_task(
+        "Analyze uploaded context",
+        requested_team="alpha",
+        task_id="task-upload-create",
+        upload_paths=[context],
+    )
+
+    assert state["attachments"] == [
+        {
+            "path": str(context.resolve()),
+            "name": "context.md",
+            "size": len("evidence"),
+            "sha256": __import__("hashlib").sha256(b"evidence").hexdigest(),
+            "mime_type": "text/markdown",
+        }
+    ]
+    assert all(
+        role["attachments_uploaded_generation"] is None
+        for role in state["roles"].values()
+    )
+    manifest_text = Path(state["manifest_path"]).read_text(encoding="utf-8")
+    assert "evidence" not in manifest_text
+
+
+def test_upload_creation_failure_writes_no_manifest_or_catalog_entry(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+
+    with pytest.raises(ValueError, match="missing.txt"):
+        store.create_task(
+            "Missing upload",
+            requested_team="alpha",
+            task_id="task-upload-missing",
+            upload_paths=[tmp_path / "missing.txt"],
+        )
+
+    assert store.discover() == []
+    assert not store.catalog_path.exists()
+
+
+def test_attachment_manifest_validation_is_strict_but_backward_compatible(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    context = tmp_path / "context.txt"
+    context.write_text("stable", encoding="utf-8")
+    state = store.create_task(
+        "Attachment validation",
+        requested_team="alpha",
+        task_id="task-upload-validation",
+        upload_paths=[context],
+    )
+    path = Path(state["manifest_path"])
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["attachments"][0]["sha256"] = "NOT-A-DIGEST"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ValueError, match="attachment"):
+        store.load(path)
+
+    raw = state
+    raw.pop("attachments")
+    for role in raw["roles"].values():
+        role.pop("attachments_uploaded_generation")
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    loaded = store.load(path)
+    assert "attachments" not in loaded
+    assert all(
+        "attachments_uploaded_generation" not in role
+        for role in loaded["roles"].values()
+    )
+
+
+def test_queued_task_retains_attachment_identity_when_released(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    attachment = tmp_path / "queued-context.txt"
+    attachment.write_text("queued", encoding="utf-8")
+    owner = store.create_task(
+        "Owner",
+        requested_team="alpha",
+        task_id="task-upload-owner",
+    )
+    queued = store.create_task(
+        "Queued with context",
+        reuse_team="alpha",
+        task_id="task-upload-queued",
+        upload_paths=[attachment],
+    )
+    expected = queued["attachments"]
+
+    owner = store.update(
+        owner["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+    released, changed = store.refresh_scheduling(queued["manifest_path"])
+
+    assert owner["status"] == "DONE"
+    assert changed is True
+    assert released["status"] == "INBOX"
+    assert released["attachments"] == expected
+    assert released["roles"]["PLAN"]["attachments_uploaded_generation"] is None

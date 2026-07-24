@@ -56,6 +56,7 @@ from .chatgpt import (
 from .connection import connected_browser
 from .durable import RequestLedger, RequestStatus
 from .durable_blocks import DurableSendBlock
+from .upload import UploadIdentityChangedError, collect_file_identities
 from .workflow import WorkflowContext
 
 TERMINAL = frozenset({"DONE", "STOPPED"})
@@ -252,6 +253,71 @@ class CDPAWorker:
             timeout_seconds=self.config.response_timeout_seconds,
             now=sent_at,
         )
+
+    def _attachment_files_for_generation(
+        self,
+        state: dict[str, Any],
+        logical_role: str,
+    ) -> tuple[str, ...] | None:
+        attachments = state.get("attachments")
+        if not isinstance(attachments, list) or not attachments:
+            return ()
+        role_record = state["roles"][logical_role]
+        generation = int(role_record.get("conversation_generation") or 0)
+        if role_record.get("attachments_uploaded_generation") == generation:
+            return ()
+
+        paths = tuple(str(item["path"]) for item in attachments)
+        for item in attachments:
+            path = Path(str(item["path"]))
+            name = str(item.get("name") or path.name or "attachment")
+            digest_prefix = str(item.get("sha256") or "")[:12]
+            if not path.exists():
+                self._block(
+                    state,
+                    f"Attachment {name} is missing (expected {digest_prefix})",
+                    code="attachment_missing",
+                    retryable=False,
+                )
+                return None
+            if not path.is_file():
+                self._block(
+                    state,
+                    f"Attachment {name} is not a regular file (expected {digest_prefix})",
+                    code="attachment_validation_failed",
+                    retryable=False,
+                )
+                return None
+        try:
+            current = tuple(
+                identity.to_dict() for identity in collect_file_identities(paths)
+            )
+        except Exception as exc:
+            self._block(
+                state,
+                f"Attachment validation failed for {', '.join(str(item.get('name') or 'attachment') for item in attachments)} ({type(exc).__name__})",
+                code="attachment_validation_failed",
+                retryable=False,
+            )
+            return None
+        expected = tuple(dict(item) for item in attachments)
+        if current != expected:
+            changed = next(
+                (
+                    item
+                    for item, actual in zip(attachments, current)
+                    if dict(item) != actual
+                ),
+                attachments[0],
+            )
+            self._block(
+                state,
+                f"Attachment identity changed for {changed.get('name') or 'attachment'} (expected {str(changed.get('sha256') or '')[:12]})",
+                code="attachment_identity_changed",
+                retryable=False,
+            )
+            return None
+        return paths
 
     def _record_acquired(
         self,
@@ -1348,6 +1414,8 @@ class CDPAWorker:
         actions: CDPATabActions,
     ) -> None:
         role = str(hop["target_role"])
+        if self._attachment_files_for_generation(state, role) is None:
+            return
         acquired = await actions.acquire(state, role)
         self._record_acquired(state, role, acquired)
         role_record = state["roles"][role]
@@ -1417,6 +1485,22 @@ class CDPAWorker:
         actions: CDPATabActions,
     ) -> None:
         role = str(hop["target_role"])
+        ledger = RequestLedger(str(hop["ledger_path"]))
+        record = (
+            ledger.get(str(hop["request_id"]))
+            if ledger.path.exists()
+            else None
+        )
+        if record is not None and record.status in {
+            RequestStatus.SENDING,
+            RequestStatus.SENT,
+            RequestStatus.COMPLETED,
+        }:
+            files = tuple(item.path for item in record.files)
+        else:
+            files = self._attachment_files_for_generation(state, role)
+            if files is None:
+                return
         acquired = await self._owned_or_block(state, role, actions)
         if acquired is None:
             return
@@ -1424,6 +1508,8 @@ class CDPAWorker:
         block = DurableSendBlock(
             str(hop["prompt"]),
             ledger_path=hop["ledger_path"],
+            files=files,
+            expected_file_identities=state.get("attachments") if files else None,
             source_context={
                 "task_id": state["task_id"],
                 "team": state["team"],
@@ -1436,7 +1522,39 @@ class CDPAWorker:
             wait_for_response=False,
             response_timeout_ms=None,
         )
-        output = await block.run(WorkflowContext(acquired.client))
+        try:
+            output = await block.run(WorkflowContext(acquired.client))
+        except UploadIdentityChangedError:
+            attachment = next(
+                (
+                    item
+                    for item in state.get("attachments") or []
+                    if isinstance(item, Mapping)
+                ),
+                {},
+            )
+            self._block(
+                state,
+                f"Attachment identity changed for {attachment.get('name') or 'attachment'} (expected {str(attachment.get('sha256') or '')[:12]})",
+                code="attachment_identity_changed",
+                retryable=False,
+            )
+            return
+        except Exception as exc:
+            if not files or _is_cdp_disconnect(exc):
+                raise
+            names = ", ".join(
+                str(item.get("name") or "attachment")
+                for item in state.get("attachments") or []
+                if isinstance(item, Mapping)
+            )
+            self._block(
+                state,
+                f"Attachment upload failed for {names or 'task context'}; durable request preserved ({type(exc).__name__})",
+                code="attachment_upload_failed",
+                retryable=False,
+            )
+            return
         post_send = await acquired.client.assert_ownership()
         self._record_acquired(
             state,
@@ -1453,6 +1571,11 @@ class CDPAWorker:
         hop["receipt"] = output["receipt"]
         hop["rendered_prompt_sha256"] = output["receipt"]["prompt_sha256"]
         hop["state"] = "sent"
+        if files:
+            role_record = state["roles"][role]
+            role_record["attachments_uploaded_generation"] = int(
+                role_record.get("conversation_generation") or 0
+            )
         record = output.get("record") if isinstance(output, Mapping) else None
         accepted_epoch = record.get("accepted_at") if isinstance(record, Mapping) else None
         if accepted_epoch is not None:

@@ -19,6 +19,7 @@ ROLE_STORAGE_KEY = "playwright-auto:role"
 PAGE_ID_STORAGE_KEY = "playwright-auto:page-id"
 TASK_ID_STORAGE_KEY = "playwright-auto:task-id"
 TEAM_STORAGE_KEY = "playwright-auto:team"
+ATTACHMENT_OWNERSHIP_WINDOW_KEY = "__playwrightAutoAttachmentOwnershipV1"
 
 SELECTORS = {
     "composer": '[contenteditable="true"][role="textbox"]',
@@ -146,6 +147,42 @@ def normalize_visible_text(value: Any) -> str:
 
 def visible_text_matches(actual: Any, expected: Any) -> bool:
     return normalize_visible_text(actual) == normalize_visible_text(expected)
+
+
+def _expected_attachment_contract(
+    expected_names: Sequence[str] | None,
+    expected_count: int,
+) -> tuple[tuple[str, ...] | None, int]:
+    if expected_count < 0:
+        raise ValueError("expected_attachment_count must not be negative")
+    if expected_names is None:
+        return None, expected_count
+    names = tuple(str(name).strip() for name in expected_names)
+    if any(not name for name in names):
+        raise ValueError("expected attachment names must be non-empty")
+    if expected_count not in {0, len(names)}:
+        raise ValueError("expected attachment count does not match expected names")
+    return names, len(names)
+
+
+def _assert_expected_attachment_markers(
+    markers: Sequence[str],
+    *,
+    expected_names: tuple[str, ...] | None,
+    expected_count: int,
+    message: str,
+) -> None:
+    actual = tuple(str(marker) for marker in markers)
+    matches = (
+        actual == expected_names
+        if expected_names is not None
+        else len(actual) == expected_count
+    )
+    if not matches:
+        expected = list(expected_names) if expected_names is not None else expected_count
+        raise ComposerConflictError(
+            f"{message}: expected {expected!r}, found {list(actual)!r}"
+        )
 
 
 def rate_limit_dialogs(snapshot: "ChatGPTSnapshot") -> tuple[str, ...]:
@@ -971,23 +1008,318 @@ async def refresh_page(page: Any, timeout_ms: int = 15_000) -> None:
     await page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
 
 
-async def click_send_button(page: Any, timeout_ms: int = 8_000) -> str:
+async def click_send_button(
+    page: Any,
+    timeout_ms: int = 8_000,
+    *,
+    expected_url: str | None = None,
+    expected_page_id: str | None = None,
+    expected_role: str | None = None,
+    expected_task_id: str | None = None,
+    expected_team: str | None = None,
+    expected_prompt: str | None = None,
+    expected_attachment_ownership_token: str | None = None,
+    expected_attachment_count: int = 0,
+    expected_attachment_names: Sequence[str] | None = None,
+) -> str:
+    expected_names, expected_count = _expected_attachment_contract(
+        expected_attachment_names, expected_attachment_count
+    )
+    if (expected_page_id is None) != (expected_role is None):
+        raise ValueError("expected page ID and role must be provided together")
+    if (expected_task_id is None) != (expected_team is None):
+        raise ValueError("expected task ID and team must be provided together")
+    normalized_page_id = str(expected_page_id or "").strip() or None
+    normalized_role = validate_page_role(expected_role) if expected_role is not None else None
+    normalized_task_id = str(expected_task_id or "").strip() or None
+    normalized_team = str(expected_team or "").strip() or None
+    normalized_attachment_token = (
+        str(expected_attachment_ownership_token or "").strip() or None
+    )
+    if expected_page_id is not None and normalized_page_id is None:
+        raise ValueError("expected page ID must be non-empty")
+    if expected_task_id is not None and (
+        normalized_task_id is None or len(normalized_task_id) > 256
+    ):
+        raise ValueError("expected task ID must contain 1-256 characters")
+    if expected_team is not None and (
+        normalized_team is None or not _TEAM_PATTERN.fullmatch(normalized_team)
+    ):
+        raise ValueError("expected team must match [A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+    expected_hostname: str | None = None
+    expected_path: str | None = None
+    if expected_url is not None:
+        parsed = urlparse(str(expected_url))
+        expected_hostname = str(parsed.hostname or "").lower()
+        expected_path = parsed.path or "/"
     await action_delay(page, "send", SEND_DELAY_MULTIPLIER)
     await record_page_action(page, "send", "click")
+    normalized_prompt = (
+        normalize_visible_text(expected_prompt) if expected_prompt is not None else None
+    )
     result = await page.evaluate(
-        r"""() => {
-          const visible = (element) => Boolean(
-            element && (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
-          );
+        r"""([expectedPrompt, expectedNames, expectedCount,
+               expectedHostname, expectedPath, expectedPageId, expectedRole,
+               expectedTaskId, expectedTeam, expectedAttachmentToken,
+               roleKey, pageIdKey, taskIdKey, teamKey, windowNamePrefix,
+               attachmentOwnershipKey]) => {
+          const visible = (element) => {
+            const style = element ? window.getComputedStyle(element) : null;
+            return Boolean(
+              element && style && style.visibility !== 'hidden' && style.visibility !== 'collapse' &&
+              (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
+            );
+          };
+          const firstVisible = (selector) =>
+            [...document.querySelectorAll(selector)].find(visible) || null;
           const enabled = (element) => Boolean(
             element && !element.disabled && element.getAttribute('aria-disabled') !== 'true'
           );
-          const composer = [...document.querySelectorAll(
-            'div#prompt-textarea, [data-testid="composer"] [contenteditable="true"], form [contenteditable="true"], [contenteditable="true"][role="textbox"]'
-          )].find((element) => visible(element) && enabled(element)) || null;
+          const editable = (element) => Boolean(element && element.isContentEditable);
+          const text = (element) => (element?.innerText || '').replace(/\s+/g, ' ').trim();
+
+          const validateOwnership = () => {
+            if (expectedHostname !== null && (
+                location.hostname.toLowerCase() !== expectedHostname ||
+                location.pathname !== expectedPath
+            )) {
+              return {ok: false, method: 'ownership_conflict', reason: 'conversation_changed'};
+            }
+            if (expectedPageId === null && expectedTaskId === null) return null;
+            let pageRole = null;
+            let pageId = null;
+            let pageTaskId = null;
+            let pageTeam = null;
+            try {
+              pageRole = sessionStorage.getItem(roleKey);
+              pageId = sessionStorage.getItem(pageIdKey);
+              pageTaskId = sessionStorage.getItem(taskIdKey);
+              pageTeam = sessionStorage.getItem(teamKey);
+            } catch (_) {
+              // Missing primary evidence may use the existing exact window.name mirror.
+            }
+            const needsMirror = Boolean(
+              (expectedPageId !== null && (!pageRole || !pageId)) ||
+              (expectedTaskId !== null && (!pageTaskId || !pageTeam))
+            );
+            if (needsMirror) {
+              if (!window.name?.startsWith(windowNamePrefix)) {
+                return {ok: false, method: 'ownership_conflict', reason: 'binding_evidence_missing'};
+              }
+              let binding = null;
+              try {
+                binding = JSON.parse(window.name.slice(windowNamePrefix.length));
+              } catch (_) {
+                return {ok: false, method: 'ownership_conflict', reason: 'binding_evidence_invalid'};
+              }
+              if (!binding || typeof binding !== 'object') {
+                return {ok: false, method: 'ownership_conflict', reason: 'binding_evidence_invalid'};
+              }
+              const mirrorRole = binding.role || null;
+              const mirrorPageId = binding.pageId || null;
+              const mirrorTaskId = binding.taskId || null;
+              const mirrorTeam = binding.team || null;
+              if (
+                (pageRole && mirrorRole && pageRole !== mirrorRole) ||
+                (pageId && mirrorPageId && pageId !== mirrorPageId) ||
+                (pageTaskId && mirrorTaskId && pageTaskId !== mirrorTaskId) ||
+                (pageTeam && mirrorTeam && pageTeam !== mirrorTeam)
+              ) {
+                return {ok: false, method: 'ownership_conflict', reason: 'binding_mirror_conflict'};
+              }
+              pageRole = pageRole || mirrorRole;
+              pageId = pageId || mirrorPageId;
+              pageTaskId = pageTaskId || mirrorTaskId;
+              pageTeam = pageTeam || mirrorTeam;
+            }
+            if (expectedPageId !== null && (
+                pageId !== expectedPageId || pageRole !== expectedRole
+            )) {
+              return {ok: false, method: 'ownership_conflict', reason: 'binding_changed'};
+            }
+            if (expectedTaskId !== null && (
+                pageTaskId !== expectedTaskId || pageTeam !== expectedTeam
+            )) {
+              return {ok: false, method: 'ownership_conflict', reason: 'task_binding_changed'};
+            }
+            return null;
+          };
+          const validatePageState = () => {
+            const retry = firstVisible('[data-testid="regenerate-thread-error-button"]');
+            const errorAlert = [...document.querySelectorAll('[role="alert"]')]
+              .filter(visible)
+              .find((element) => /error|failed|issue|try again/i.test(text(element))) || null;
+            if (retry || errorAlert) {
+              return {ok: false, method: 'page_state_conflict', reason: 'error_state'};
+            }
+            if (firstVisible('[role="dialog"], [data-testid^="modal-"]')) {
+              return {ok: false, method: 'page_state_conflict', reason: 'blocking_dialog'};
+            }
+            if (firstVisible('button[data-testid="stop-button"], button[aria-label*="Stop"]')) {
+              return {ok: false, method: 'page_state_conflict', reason: 'active_response'};
+            }
+            return null;
+          };
+          const initialOwnershipConflict = validateOwnership();
+          if (initialOwnershipConflict) return initialOwnershipConflict;
+          const initialPageStateConflict = validatePageState();
+          if (initialPageStateConflict) return initialPageStateConflict;
+
+          const composerSelector = 'div#prompt-textarea, [data-testid="composer"] [contenteditable="true"], form [contenteditable="true"], [contenteditable="true"][role="textbox"]';
+          const findComposer = () => [...document.querySelectorAll(composerSelector)]
+            .find((element) => visible(element) && enabled(element) && editable(element)) || null;
+          const composer = findComposer();
+          if (!composer || (expectedPrompt !== null && text(composer) !== expectedPrompt)) {
+            return {
+              ok: false,
+              method: 'composer_conflict',
+              actual_prompt: composer ? text(composer) : null,
+            };
+          }
           const root = composer?.closest('form') || composer?.closest('[data-testid="composer"]') || document;
-          const candidates = [...new Set([
-            ...root.querySelectorAll('button,[role="button"]'),
+          const composerHost = composer?.closest('form') || composer?.parentElement || null;
+          const elementLabel = (element) => [
+            text(element),
+            element?.getAttribute?.('aria-label') || '',
+            element?.getAttribute?.('data-testid') || '',
+          ].join(' ').replace(/\s+/g, ' ').trim();
+          const attachmentLabel = elementLabel;
+          const filenameFromLabel = (value) => {
+            const label = String(value || '').replace(/\s+/g, ' ').trim();
+            const lower = label.toLowerCase();
+            for (const prefix of [
+              'remove file', 'remove attachment', 'open image',
+              'attached file', 'file uploaded', 'uploading'
+            ]) {
+              const index = lower.indexOf(prefix);
+              if (index < 0) continue;
+              const candidate = label.slice(index + prefix.length)
+                .replace(/^[\s:–—-]+/, '').trim();
+              if (candidate) return candidate;
+            }
+            return '';
+          };
+          const directFilename = (element) => {
+            for (const attribute of ['data-filename', 'data-file-name']) {
+              const candidate = (element.getAttribute?.(attribute) || '').trim();
+              if (candidate) return candidate;
+            }
+            return filenameFromLabel(element.getAttribute?.('aria-label'));
+          };
+          const hasAttachmentToken = (element) => {
+            const tokens = (element.getAttribute?.('data-testid') || '')
+              .toLowerCase()
+              .split(/[^a-z0-9]+/)
+              .filter(Boolean);
+            return tokens.includes('attachment') || tokens.includes('file');
+          };
+          const leafFilename = (root) => {
+            const candidates = [];
+            for (const element of [root, ...root.querySelectorAll('*')]) {
+              if (!visible(element) || element.matches('button,[role="button"],svg,path')) continue;
+              if ([...element.children].some(visible)) continue;
+              const candidate = text(element);
+              if (candidate && !['remove', 'open', 'attached', 'uploading'].includes(candidate.toLowerCase())) {
+                candidates.push(candidate);
+              }
+            }
+            return candidates.length === 1 ? candidates[0] : '';
+          };
+          const collectAttachmentRecords = (host) => {
+            const records = [];
+            const seenAttachmentItems = new Set();
+            if (host) {
+              for (const candidate of host.querySelectorAll(
+                '[data-filename], [data-file-name], [aria-label]'
+              )) {
+                if (!visible(candidate)) continue;
+                const explicitItem = candidate.closest('[data-filename], [data-file-name]');
+                const item = explicitItem && explicitItem !== host && host.contains(explicitItem) && visible(explicitItem) ? explicitItem : candidate;
+                const filename = directFilename(item);
+                if (!filename || seenAttachmentItems.has(item)) continue;
+                seenAttachmentItems.add(item);
+                records.push({element: item, filename});
+              }
+              for (const attachmentRoot of host.querySelectorAll('[data-testid]')) {
+                if (!visible(attachmentRoot) || !hasAttachmentToken(attachmentRoot)) continue;
+                const hasFilenameEvidence = [attachmentRoot, ...attachmentRoot.querySelectorAll(
+                  '[data-filename], [data-file-name], [aria-label]'
+                )].some((element) => visible(element) && Boolean(directFilename(element)));
+                const hasNestedAttachmentRoot = [...attachmentRoot.querySelectorAll('[data-testid]')]
+                  .some((element) =>
+                    element !== attachmentRoot && visible(element) && hasAttachmentToken(element)
+                  );
+                if (hasFilenameEvidence || hasNestedAttachmentRoot || seenAttachmentItems.has(attachmentRoot)) continue;
+                seenAttachmentItems.add(attachmentRoot);
+                records.push({
+                  element: attachmentRoot,
+                  filename: leafFilename(attachmentRoot) || '\u0000unidentified attachment',
+                });
+              }
+            }
+            records.sort((left, right) => {
+              if (left.element === right.element) return 0;
+              const position = left.element.compareDocumentPosition(right.element);
+              if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+              if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+              return 0;
+            });
+            return records;
+          };
+          const attachmentMarkersMatch = (markers) => expectedNames === null
+            ? markers.length === expectedCount
+            : markers.length === expectedNames.length &&
+              markers.every((marker, index) => marker === expectedNames[index]);
+          const attachmentOwnershipMatches = (records, markers) => {
+            if (expectedAttachmentToken === null) return true;
+            const ownership = window[attachmentOwnershipKey];
+            const tokenMatches = Boolean(
+              ownership && ownership.valid === true &&
+              ownership.token === expectedAttachmentToken &&
+              Array.isArray(ownership.names) &&
+              ownership.names.length === markers.length &&
+              ownership.names.every((name, index) => name === markers[index])
+            );
+            const attachmentElementsMatch = Boolean(
+              tokenMatches && Array.isArray(ownership.attachmentElements) &&
+              ownership.attachmentElements.length === records.length &&
+              ownership.attachmentElements.every((element, index) =>
+                element === records[index].element && element?.isConnected
+              )
+            );
+            const liveInputs = [...document.querySelectorAll('input[type="file"]')]
+              .filter((input) => input.files && input.files.length > 0);
+            return Boolean(
+              attachmentElementsMatch && Array.isArray(ownership.inputRecords) &&
+              ownership.inputRecords.length === liveInputs.length &&
+              ownership.inputRecords.every((record, index) => {
+                const input = liveInputs[index];
+                const files = [...(input.files || [])];
+                return record.input === input && input.isConnected &&
+                  Array.isArray(record.files) && record.files.length === files.length &&
+                  record.files.every((file, fileIndex) => file === files[fileIndex]);
+              })
+            );
+          };
+          const attachmentRecords = collectAttachmentRecords(composerHost);
+          const attachmentMarkers = attachmentRecords.map((item) => item.filename);
+          if (!attachmentMarkersMatch(attachmentMarkers)) {
+            return {
+              ok: false,
+              method: 'attachment_conflict',
+              actual: attachmentMarkers,
+            };
+          }
+          if (!attachmentOwnershipMatches(attachmentRecords, attachmentMarkers)) {
+            return {
+              ok: false,
+              method: 'attachment_conflict',
+              reason: 'attachment_ownership_changed',
+              actual: attachmentMarkers,
+            };
+          }
+          const findSendTarget = (scopeRoot) => [...new Set([
+            ...scopeRoot.querySelectorAll('button,[role="button"]'),
             ...document.querySelectorAll('button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"]')
           ])].map((button) => {
             const label = [
@@ -1002,31 +1334,126 @@ async def click_send_button(page: Any, timeout_ms: int = 8_000) -> str:
               (button.type === 'submit' ? 3 : 0);
             return {button, score};
           }).filter((item) => visible(item.button) && enabled(item.button) && item.score >= 4)
-            .sort((a, b) => b.score - a.score);
-          const target = candidates[0]?.button || null;
+            .sort((a, b) => b.score - a.score)[0]?.button || null;
+          const target = findSendTarget(root);
           if (!target) return {ok: false, method: 'not_found'};
-          try {
-            target.focus();
-            target.click();
-            return {ok: true, method: 'dom_click'};
-          } catch (error) {
-            const form = composer?.closest('form') || null;
-            if (form && typeof form.requestSubmit === 'function') {
-              form.requestSubmit(target);
-              return {ok: true, method: 'form_request_submit'};
+
+          const validateDispatchBoundary = () => {
+            const ownershipConflict = validateOwnership();
+            if (ownershipConflict) return ownershipConflict;
+            const pageStateConflict = validatePageState();
+            if (pageStateConflict) return pageStateConflict;
+            const currentComposer = findComposer();
+            if (!currentComposer || (
+                expectedPrompt !== null && text(currentComposer) !== expectedPrompt
+            )) {
+              return {
+                ok: false,
+                method: 'composer_conflict',
+                reason: 'composer_changed_during_click_dispatch',
+                actual_prompt: currentComposer ? text(currentComposer) : null,
+              };
             }
+            const currentRoot = currentComposer.closest('form') ||
+              currentComposer.closest('[data-testid="composer"]') || document;
+            const currentHost = currentComposer.closest('form') ||
+              currentComposer.parentElement || null;
+            const currentRecords = collectAttachmentRecords(currentHost);
+            const currentMarkers = currentRecords.map((item) => item.filename);
+            if (!attachmentMarkersMatch(currentMarkers)) {
+              return {
+                ok: false,
+                method: 'attachment_conflict',
+                reason: 'attachment_names_changed_during_click_dispatch',
+                actual: currentMarkers,
+              };
+            }
+            if (!attachmentOwnershipMatches(currentRecords, currentMarkers)) {
+              return {
+                ok: false,
+                method: 'attachment_conflict',
+                reason: 'attachment_ownership_changed_during_click_dispatch',
+                actual: currentMarkers,
+              };
+            }
+            if (findSendTarget(currentRoot) !== target || !target.isConnected) {
+              return {
+                ok: false,
+                method: 'page_state_conflict',
+                reason: 'send_target_changed_during_click_dispatch',
+              };
+            }
+            return null;
+          };
+
+          // The page application is trusted. These checks fail closed on observable
+          // ownership drift; they are not a hostile-main-world attestation boundary.
+          let dispatchGuardRan = false;
+          let dispatchConflict = null;
+          const dispatchGuard = (event) => {
+            dispatchGuardRan = true;
+            dispatchConflict = validateDispatchBoundary();
+            if (!dispatchConflict) return;
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          };
+          target.addEventListener('click', dispatchGuard, {capture: true, once: true});
+          try {
+            target.click();
+          } catch (error) {
+            target.removeEventListener('click', dispatchGuard, {capture: true});
             return {ok: false, method: 'click_failed', error: String(error)};
           }
-        }"""
+          target.removeEventListener('click', dispatchGuard, {capture: true});
+          if (!dispatchGuardRan) {
+            return {ok: false, method: 'click_failed', reason: 'dispatch_guard_not_reached'};
+          }
+          if (dispatchConflict) return dispatchConflict;
+          return {ok: true, method: 'dom_click'};
+        }""",
+        [
+            normalized_prompt,
+            list(expected_names) if expected_names is not None else None,
+            expected_count,
+            expected_hostname,
+            expected_path,
+            normalized_page_id,
+            normalized_role,
+            normalized_task_id,
+            normalized_team,
+            normalized_attachment_token,
+            ROLE_STORAGE_KEY,
+            PAGE_ID_STORAGE_KEY,
+            TASK_ID_STORAGE_KEY,
+            TEAM_STORAGE_KEY,
+            WINDOW_NAME_PREFIX,
+            ATTACHMENT_OWNERSHIP_WINDOW_KEY,
+        ],
     )
     if not result.get("ok"):
         method = str(result.get("method") or "unknown")
         await record_page_action(page, "send", "error", detail=method)
+        reason = str(result.get("reason") or method)
+        if method == "ownership_conflict":
+            raise PageOwnershipError(
+                f"page ownership changed inside the atomic send boundary: {reason}"
+            )
+        if method == "page_state_conflict":
+            raise UnsafePageStateError(
+                f"page state changed inside the atomic send boundary: {reason}"
+            )
+        if method == "composer_conflict":
+            raise ComposerConflictError(
+                "composer changed or became unavailable inside the atomic send boundary"
+            )
+        if method == "attachment_conflict":
+            raise ComposerConflictError(
+                "attachment identity changed inside the atomic send boundary"
+            )
         raise UnsafePageStateError(f"Send button could not be clicked: {method}")
     method = str(result.get("method") or "dom_click")
     await record_page_action(page, "send", "complete", detail=method)
     return method
-
 
 async def click_safe_choice_prompt(page: Any) -> str:
     result = await page.evaluate(
@@ -1075,8 +1502,14 @@ async def send_prompt(
 ) -> None:
     if not text.strip():
         raise ValueError("prompt must not be empty")
+    expected_url = str(getattr(page, "url", "") or "") or None
     await set_composer_text(page, text, timeout_ms=timeout_ms)
-    await click_send_button(page, timeout_ms=timeout_ms)
+    await click_send_button(
+        page,
+        timeout_ms=timeout_ms,
+        expected_url=expected_url,
+        expected_prompt=text.strip(),
+    )
     if wait_for_stop:
         await page.locator(SELECTORS["stop"]).wait_for(
             state="visible", timeout=timeout_ms
@@ -1264,9 +1697,13 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
     raw = await page.evaluate(
         r"""
         ([roleKey, pageIdKey, taskIdKey, teamKey, windowNamePrefix]) => {
-          const visible = (element) => Boolean(
-            element && (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
-          );
+          const visible = (element) => {
+            const style = element ? window.getComputedStyle(element) : null;
+            return Boolean(
+              element && style && style.visibility !== 'hidden' && style.visibility !== 'collapse' &&
+              (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
+            );
+          };
           const text = (element) => (element?.innerText || "").replace(/\s+/g, " ").trim();
           const firstVisible = (selector) => [...document.querySelectorAll(selector)].find(visible) || null;
 
@@ -1302,29 +1739,92 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             .map((element) => text(element) || element.getAttribute('data-testid') || 'dialog')
             .filter(Boolean);
           const composerHost = composer?.closest('form') || composer?.parentElement || null;
-          const attachmentLabel = (element) => [
+          const elementLabel = (element) => [
             text(element),
             element?.getAttribute?.('aria-label') || '',
             element?.getAttribute?.('data-testid') || '',
-          ].join(' ').replace(/\\s+/g, ' ').trim();
-          const isRealAttachment = (element) => {
-            const label = attachmentLabel(element).toLowerCase();
-            if (!label || label.includes('composer-plus-btn') || label.includes('add files and more')) {
-              return false;
+          ].join(' ').replace(/\s+/g, ' ').trim();
+          const attachmentLabel = elementLabel;
+          const filenameFromLabel = (value) => {
+            const label = String(value || '').replace(/\s+/g, ' ').trim();
+            const lower = label.toLowerCase();
+            for (const prefix of [
+              'remove file', 'remove attachment', 'open image',
+              'attached file', 'file uploaded', 'uploading'
+            ]) {
+              const index = lower.indexOf(prefix);
+              if (index < 0) continue;
+              const candidate = label.slice(index + prefix.length)
+                .replace(/^[\s:–—-]+/, '').trim();
+              if (candidate) return candidate;
             }
-            return [
-              'remove file', 'open image', 'attached', 'file uploaded',
-              'uploading', 'remove attachment'
-            ].some((marker) => label.includes(marker));
+            return '';
           };
-          const attachmentMarkers = composerHost
-            ? [...composerHost.querySelectorAll(
-                '[data-testid*="attachment"], [data-testid*="file"], button[aria-label], [role="button"][aria-label]'
-              )]
-                .filter((element) => visible(element) && isRealAttachment(element))
-                .map(attachmentLabel)
-                .filter(Boolean)
-            : [];
+          const directFilename = (element) => {
+            for (const attribute of ['data-filename', 'data-file-name']) {
+              const candidate = (element.getAttribute?.(attribute) || '').trim();
+              if (candidate) return candidate;
+            }
+            return filenameFromLabel(element.getAttribute?.('aria-label'));
+          };
+          const hasAttachmentToken = (element) => {
+            const tokens = (element.getAttribute?.('data-testid') || '')
+              .toLowerCase()
+              .split(/[^a-z0-9]+/)
+              .filter(Boolean);
+            return tokens.includes('attachment') || tokens.includes('file');
+          };
+          const leafFilename = (root) => {
+            const candidates = [];
+            for (const element of [root, ...root.querySelectorAll('*')]) {
+              if (!visible(element) || element.matches('button,[role="button"],svg,path')) continue;
+              if ([...element.children].some(visible)) continue;
+              const candidate = text(element);
+              if (candidate && !['remove', 'open', 'attached', 'uploading'].includes(candidate.toLowerCase())) {
+                candidates.push(candidate);
+              }
+            }
+            return candidates.length === 1 ? candidates[0] : '';
+          };
+          const attachmentRecords = [];
+          const seenAttachmentItems = new Set();
+          if (composerHost) {
+            for (const candidate of composerHost.querySelectorAll(
+              '[data-filename], [data-file-name], [aria-label]'
+            )) {
+              if (!visible(candidate)) continue;
+              const explicitItem = candidate.closest('[data-filename], [data-file-name]');
+              const item = explicitItem && explicitItem !== composerHost && composerHost.contains(explicitItem) && visible(explicitItem) ? explicitItem : candidate;
+              const filename = directFilename(item);
+              if (!filename || seenAttachmentItems.has(item)) continue;
+              seenAttachmentItems.add(item);
+              attachmentRecords.push({element: item, filename});
+            }
+            for (const root of composerHost.querySelectorAll('[data-testid]')) {
+              if (!visible(root) || !hasAttachmentToken(root)) continue;
+              const hasFilenameEvidence = [root, ...root.querySelectorAll(
+                '[data-filename], [data-file-name], [aria-label]'
+              )].some((element) => visible(element) && Boolean(directFilename(element)));
+              const hasNestedAttachmentRoot = [...root.querySelectorAll('[data-testid]')]
+                .some((element) =>
+                  element !== root && visible(element) && hasAttachmentToken(element)
+                );
+              if (hasFilenameEvidence || hasNestedAttachmentRoot || seenAttachmentItems.has(root)) continue;
+              seenAttachmentItems.add(root);
+              attachmentRecords.push({
+                element: root,
+                filename: leafFilename(root) || '\u0000unidentified attachment',
+              });
+            }
+          }
+          attachmentRecords.sort((left, right) => {
+            if (left.element === right.element) return 0;
+            const position = left.element.compareDocumentPosition(right.element);
+            if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+            if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+            return 0;
+          });
+          const attachmentMarkers = attachmentRecords.map((item) => item.filename);
 
           const positiveChoiceMarkers = [
             'continue', 'proceed', 'start', 'yes', 'ok', 'okay', 'accept',
@@ -1427,7 +1927,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             ),
             stop_visible: Boolean(stop),
             blocking_dialogs: [...new Set(blockingDialogs)],
-            attachment_markers: [...new Set(attachmentMarkers)],
+            attachment_markers: attachmentMarkers,
             choice_prompt_labels: [...new Set(choicePromptLabels)],
             error_present: Boolean(retry || authCallbackError || alertError),
             error_texts: errorTexts,
@@ -2380,16 +2880,21 @@ class ChatGPTPage:
         timeout_ms: int,
         *,
         expected_attachment_count: int = 0,
+        expected_attachment_names: Sequence[str] | None = None,
     ) -> None:
+        expected_names, expected_count = _expected_attachment_contract(
+            expected_attachment_names, expected_attachment_count
+        )
         snapshot = await self._interaction_snapshot(
             timeout_ms=timeout_ms,
-            allow_attachments=expected_attachment_count > 0,
+            allow_attachments=expected_count > 0,
         )
-        if len(snapshot.attachment_markers) != expected_attachment_count:
-            raise ComposerConflictError(
-                f"expected {expected_attachment_count} attachment(s), "
-                f"found {len(snapshot.attachment_markers)}"
-            )
+        _assert_expected_attachment_markers(
+            snapshot.attachment_markers,
+            expected_names=expected_names,
+            expected_count=expected_count,
+            message="attachment set does not match before send",
+        )
         existing = snapshot.composer_text.strip()
         if existing and not visible_text_matches(existing, prompt):
             raise ComposerConflictError(
@@ -2399,13 +2904,14 @@ class ChatGPTPage:
             await set_composer_text(self.page, prompt, timeout_ms=timeout_ms)
         fresh = await self._interaction_snapshot(
             timeout_ms=timeout_ms,
-            allow_attachments=expected_attachment_count > 0,
+            allow_attachments=expected_count > 0,
         )
-        if len(fresh.attachment_markers) != expected_attachment_count:
-            raise ComposerConflictError(
-                f"attachment count changed before send: expected "
-                f"{expected_attachment_count}, found {len(fresh.attachment_markers)}"
-            )
+        _assert_expected_attachment_markers(
+            fresh.attachment_markers,
+            expected_names=expected_names,
+            expected_count=expected_count,
+            message="attachment set changed before send",
+        )
         if not visible_text_matches(fresh.composer_text, prompt):
             raise ComposerConflictError("exact prompt ownership was lost before send")
         if not fresh.send_visible or not fresh.send_enabled:
@@ -2420,20 +2926,63 @@ class ChatGPTPage:
         timeout_ms: int | None = None,
         max_attempts: int = 2,
         recovery_reload: bool = True,
+        expected_task_id: str | None = None,
+        expected_team: str | None = None,
+        expected_attachment_ownership_token: str | None = None,
         expected_attachment_count: int = 0,
+        expected_attachment_names: Sequence[str] | None = None,
     ) -> SendReceipt:
         prompt = text.strip()
         if not prompt:
             raise ValueError("prompt must not be empty")
         if max_attempts not in {1, 2}:
             raise ValueError("max_attempts must be 1 or 2")
-        if expected_attachment_count < 0:
-            raise ValueError("expected_attachment_count must not be negative")
+        if (expected_task_id is None) != (expected_team is None):
+            raise ValueError("expected task ID and team must be provided together")
+        explicit_task_id = str(expected_task_id or "").strip() or None
+        explicit_team = str(expected_team or "").strip() or None
+        explicit_attachment_token = (
+            str(expected_attachment_ownership_token or "").strip() or None
+        )
+        if expected_task_id is not None and (
+            explicit_task_id is None or len(explicit_task_id) > 256
+        ):
+            raise ValueError("expected task ID must contain 1-256 characters")
+        if expected_team is not None and (
+            explicit_team is None or not _TEAM_PATTERN.fullmatch(explicit_team)
+        ):
+            raise ValueError("expected team must match [A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+        expected_names, expected_count = _expected_attachment_contract(
+            expected_attachment_names, expected_attachment_count
+        )
+        if expected_count > 0 and explicit_attachment_token is None:
+            raise ComposerConflictError(
+                "attachment send requires an exact live ownership token"
+            )
+        if expected_count == 0 and explicit_attachment_token is not None:
+            raise ValueError(
+                "attachment ownership token requires expected attachments"
+            )
         timeout = timeout_ms or self.timeout_ms
 
         async with self.mutation_guard():
             before = await self.assert_ownership()
-            self._assert_interaction_safe(before)
+            self._assert_interaction_safe(
+                before, allow_attachments=expected_count > 0
+            )
+            if (before.page_task_id is None) != (before.page_team is None):
+                raise TaskBindingError(
+                    "task/team ownership evidence is incomplete before send"
+                )
+            owned_task_id = before.page_task_id
+            owned_team = before.page_team
+            if explicit_task_id is not None:
+                if owned_task_id != explicit_task_id or owned_team != explicit_team:
+                    raise TaskBindingError(
+                        "exact task/team ownership does not match before send"
+                    )
+                owned_task_id = explicit_task_id
+                owned_team = explicit_team
             assert self.binding is not None
             baseline = capture_message_baseline(before.messages)
             last_error: BaseException | None = None
@@ -2443,10 +2992,23 @@ class ChatGPTPage:
                     await self._prepare_prompt_locked(
                         prompt,
                         timeout,
-                        expected_attachment_count=expected_attachment_count,
+                        expected_attachment_count=expected_count,
+                        expected_attachment_names=expected_names,
                     )
-                    # Fresh exact checks above intentionally precede the real click.
-                    await click_send_button(self.page, timeout_ms=timeout)
+                    # Ownership, safe page state, prompt, attachments, and click share one callback.
+                    await click_send_button(
+                        self.page,
+                        timeout_ms=timeout,
+                        expected_url=before.url,
+                        expected_page_id=self.binding.page_id,
+                        expected_role=self.binding.role,
+                        expected_task_id=owned_task_id,
+                        expected_team=owned_team,
+                        expected_prompt=prompt,
+                        expected_attachment_ownership_token=explicit_attachment_token,
+                        expected_attachment_count=expected_count,
+                        expected_attachment_names=expected_names,
+                    )
                     self._owned_composer_text = None
                     acceptance = await self._wait_send_acceptance(
                         baseline,
@@ -2476,7 +3038,7 @@ class ChatGPTPage:
                         user_message_id=(accepted_user.message_id if accepted_user else None),
                         user_turn_id=(accepted_user.turn_id if accepted_user else None),
                     )
-                except (ComposerConflictError, PageOwnershipError):
+                except (ComposerConflictError, PageOwnershipError, UnsafePageStateError):
                     raise
                 except Exception as exc:
                     last_error = exc
@@ -2507,10 +3069,15 @@ class ChatGPTPage:
                         raise ComposerConflictError(
                             "manual/unowned composer input appeared during send recovery"
                         ) from exc
-                    if len(recovered.attachment_markers) != expected_attachment_count:
-                        raise ComposerConflictError(
-                            "attachment set changed during send recovery"
-                        ) from exc
+                    try:
+                        _assert_expected_attachment_markers(
+                            recovered.attachment_markers,
+                            expected_names=expected_names,
+                            expected_count=expected_count,
+                            message="attachment set changed during send recovery",
+                        )
+                    except ComposerConflictError as conflict:
+                        raise conflict from exc
 
             raise SendRecoveryError(
                 f"send failed after {max_attempts} exact attempt(s): "
@@ -2827,6 +3394,9 @@ class ChatGPTPage:
         request_marker: str,
         timeout_ms: int | None = None,
         max_total_bytes: int = 20 * 1024 * 1024,
+        expected_files: Sequence[Any] | None = None,
+        file_snapshots: Sequence[Any] | None = None,
+        exact_prompt: bool = False,
     ) -> Any:
         from .upload import upload_files
 
@@ -2836,13 +3406,30 @@ class ChatGPTPage:
             request_marker=request_marker,
             timeout_ms=timeout_ms or self.timeout_ms,
             max_total_bytes=max_total_bytes,
+            expected_files=expected_files,
+            file_snapshots=file_snapshots,
+            exact_prompt=exact_prompt,
+        )
+
+    async def current_attachment_ownership_token(
+        self,
+        *,
+        expected_names: Sequence[str],
+    ) -> str | None:
+        from .upload import current_attachment_ownership_token
+
+        return await current_attachment_ownership_token(
+            self.page,
+            expected_names=expected_names,
         )
 
     async def wait_upload_ready(
         self,
         *,
         request_marker: str,
-        expected_count: int,
+        exact_prompt: bool = False,
+        expected_names: Sequence[str] | None = None,
+        expected_count: int | None = None,
         timeout_ms: int | None = None,
         poll_ms: int = 100,
     ) -> ChatGPTSnapshot:
@@ -2851,6 +3438,8 @@ class ChatGPTPage:
         return await wait_upload_ready(
             self,
             request_marker=request_marker,
+            exact_prompt=exact_prompt,
+            expected_names=expected_names,
             expected_count=expected_count,
             timeout_ms=timeout_ms or self.timeout_ms,
             poll_ms=poll_ms,

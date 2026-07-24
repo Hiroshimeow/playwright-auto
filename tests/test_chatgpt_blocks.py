@@ -96,6 +96,7 @@ class FakeChatGPTPage:
         max_attempts=2,
         recovery_reload=True,
         expected_attachment_count=0,
+        expected_attachment_names=None,
     ):
         self.calls.append(
             (

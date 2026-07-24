@@ -471,17 +471,24 @@ def classify_recovery_state(
         if marker_is_rendered
         else visible_text_matches(composer_text, record.rendered_prompt)
     )
-    attachment_count = len(snapshot.attachment_markers)
-    expected_files = len(record.files)
+    attachment_markers = tuple(snapshot.attachment_markers)
+    expected_markers = tuple(item.name for item in record.files)
     if prompt_in_composer:
-        if expected_files == 0:
-            return DurableRecoveryState.COMPOSER_PROMPT_ONLY_PENDING
-        if attachment_count >= expected_files:
-            return DurableRecoveryState.UPLOAD_READY_NOT_SENT
-        if attachment_count > 0:
+        if not expected_markers:
+            return (
+                DurableRecoveryState.COMPOSER_PROMPT_AND_ATTACHMENTS_PENDING
+                if attachment_markers
+                else DurableRecoveryState.COMPOSER_PROMPT_ONLY_PENDING
+            )
+        if attachment_markers:
+            if (
+                record.status in {RequestStatus.UPLOADING, RequestStatus.UPLOAD_READY}
+                and attachment_markers == expected_markers
+            ):
+                return DurableRecoveryState.UPLOAD_READY_NOT_SENT
             return DurableRecoveryState.COMPOSER_PROMPT_AND_ATTACHMENTS_PENDING
         return DurableRecoveryState.COMPOSER_PROMPT_MISSING_ATTACHMENTS
-    if attachment_count:
+    if attachment_markers:
         return DurableRecoveryState.COMPOSER_ATTACHMENTS_WITHOUT_MARKER
     if composer_text:
         return DurableRecoveryState.MANUAL_COMPOSER_DIRTY

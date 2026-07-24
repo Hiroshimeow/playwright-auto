@@ -2321,3 +2321,133 @@ def test_duplicate_task_get_returns_409_without_selecting_one_manifest(tmp_path:
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+
+
+def test_cli_upload_preserves_order_and_rejects_taskless_resume(monkeypatch, tmp_path: Path, capsys):
+    config_path = write_config(tmp_path)
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.md"
+    first.write_text("one", encoding="utf-8")
+    second.write_text("two", encoding="utf-8")
+    captured = {}
+
+    def fake_submit(config, **kwargs):
+        captured.update(kwargs)
+        return {
+            "task_id": "task-upload-cli",
+            "team": "alpha",
+            "manifest_path": str(tmp_path / ".plan" / "alpha.json"),
+        }
+
+    monkeypatch.setattr(cdpa_cli_module, "submit_task", fake_submit)
+    assert cdpa_cli_module.main([
+        "Upload context",
+        "--team", "alpha",
+        "--repository", str(tmp_path),
+        "--config", str(config_path),
+        "--upload", str(first),
+        "--upload", str(second),
+    ]) == 0
+    assert captured["upload_paths"] == (str(first.resolve()), str(second.resolve()))
+
+    assert cdpa_cli_module.main([
+        "--team", "alpha",
+        "--repository", str(tmp_path),
+        "--config", str(config_path),
+        "--upload", str(first),
+    ]) == 2
+    assert "--upload" in capsys.readouterr().err
+
+
+def test_dashboard_upload_creation_and_payload_are_path_free(tmp_path: Path):
+    config_path = write_config(tmp_path)
+    attachment = tmp_path / "dashboard-context.txt"
+    attachment.write_text("dashboard secret content", encoding="utf-8")
+    server, thread, tasks = start_dashboard_server(config_path, tmp_path)
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        connection.request(
+            "POST",
+            "/api/tasks",
+            body=json.dumps({
+                "task": "Dashboard upload",
+                "repository": str(tmp_path),
+                "team": "upload-ui",
+                "upload_paths": [str(attachment)],
+            }),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+
+        assert response.status == 201, payload
+        assert payload["attachments"] == [
+            {
+                "name": "dashboard-context.txt",
+                "size": len("dashboard secret content"),
+                "mime_type": "text/plain",
+                "sha256_prefix": __import__("hashlib").sha256(
+                    b"dashboard secret content"
+                ).hexdigest()[:12],
+            }
+        ]
+        serialized = json.dumps(payload)
+        assert str(attachment.resolve()) not in serialized
+        assert "dashboard secret content" not in serialized
+        assert all("attachments_uploaded_generation" in role for role in payload["roles"])
+        persisted = tasks.load(payload["manifest_path"])
+        assert persisted["attachments"][0]["path"] == str(attachment.resolve())
+
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        connection.request(
+            "POST",
+            f"/api/tasks/{payload['task_id']}/controls",
+            body=json.dumps({"action": "pause", "reason": "privacy check"}),
+            headers={"Content-Type": "application/json"},
+        )
+        control_response = connection.getresponse()
+        control_payload = json.loads(control_response.read())
+        assert control_response.status == 202
+        assert str(attachment.resolve()) not in json.dumps(control_payload)
+        assert control_payload["attachments"] == payload["attachments"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_dashboard_resume_rejects_upload_paths(tmp_path: Path):
+    config_path = write_config(tmp_path)
+    server, thread, tasks = start_dashboard_server(config_path, tmp_path)
+    tasks.create_task("Owner", requested_team="alpha", task_id="task-owner-upload-resume")
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        connection.request(
+            "POST",
+            "/api/tasks/resume",
+            body=json.dumps({
+                "repository": str(tmp_path),
+                "team": "alpha",
+                "upload_paths": [str(tmp_path / "context.txt")],
+            }),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+        assert response.status == 400
+        assert "upload" in payload["error"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_dashboard_html_renders_sanitized_attachment_metadata_only():
+    html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+
+    assert 'id="attachments-summary"' in html
+    assert 'id="attachment-content"' in html
+    assert 'id="create-uploads-input"' in html
+    assert "sha256_prefix" in html
+    assert "renderAttachments(task)" in html
+    assert "item.path" not in html

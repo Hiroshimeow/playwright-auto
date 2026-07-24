@@ -7,10 +7,13 @@ import pytest
 from playwright_auto.chatgpt import (
     ChatGPTSnapshot,
     ChatGPTState,
+    ComposerConflictError,
     MessageBaseline,
+    PageOwnershipError,
     MessageSnapshot,
     PageBinding,
     SendReceipt,
+    UnsafePageStateError,
     capture_message_baseline,
     prompt_digest,
 )
@@ -23,7 +26,7 @@ from playwright_auto.durable import (
     classify_recovery_state,
 )
 from playwright_auto.durable_blocks import DurableSendBlock
-from playwright_auto.upload import UploadReceipt, collect_file_identities
+from playwright_auto.upload import UploadError, UploadReceipt, collect_file_identities
 from playwright_auto.workflow import Workflow, WorkflowContext
 
 
@@ -33,12 +36,16 @@ def snapshot(
     attachments=(),
     messages=(),
     state=ChatGPTState.NEW_CHAT,
+    task_id=None,
+    team=None,
 ):
     return ChatGPTSnapshot(
         url="https://chatgpt.com/c/session-1",
         session_id="session-1",
         page_id="page-1",
         page_role="DEV",
+        page_task_id=task_id,
+        page_team=team,
         state=state,
         requires_login=False,
         composer_present=True,
@@ -62,6 +69,7 @@ class FakeDurableClient:
         self.upload_calls = []
         self.send_calls = []
         self.wait_calls = []
+        self.attachment_ownership_token = "fake-upload-token"
 
     async def assert_ownership(self):
         return self.current
@@ -73,6 +81,8 @@ class FakeDurableClient:
             attachments=self.current.attachment_markers,
             messages=self.current.messages,
             state=ChatGPTState.DRAFT,
+            task_id=self.current.page_task_id,
+            team=self.current.page_team,
         )
 
     async def upload_files(self, paths, *, request_marker, **_options):
@@ -83,13 +93,21 @@ class FakeDurableClient:
             attachments=tuple(item.name for item in identities),
             messages=self.current.messages,
             state=ChatGPTState.DRAFT,
+            task_id=self.current.page_task_id,
+            team=self.current.page_team,
         )
         return UploadReceipt(
             request_marker=request_marker,
             method="input",
             files=identities,
             attachment_count=len(identities),
+            ownership_token=self.attachment_ownership_token,
         )
+
+    async def current_attachment_ownership_token(self, *, expected_names):
+        if tuple(expected_names) != tuple(self.current.attachment_markers):
+            return None
+        return self.attachment_ownership_token
 
     async def send(
         self,
@@ -98,7 +116,11 @@ class FakeDurableClient:
         wait_for_stop=True,
         max_attempts=2,
         recovery_reload=True,
+        expected_task_id=None,
+        expected_team=None,
+        expected_attachment_ownership_token=None,
         expected_attachment_count=0,
+        expected_attachment_names=None,
     ):
         self.send_calls.append(
             (
@@ -106,6 +128,7 @@ class FakeDurableClient:
                 wait_for_stop,
                 max_attempts,
                 recovery_reload,
+                expected_attachment_ownership_token,
                 expected_attachment_count,
             )
         )
@@ -115,6 +138,8 @@ class FakeDurableClient:
             text="",
             messages=(*self.current.messages, user),
             state=ChatGPTState.SUBMITTING,
+            task_id=self.current.page_task_id,
+            team=self.current.page_team,
         )
         return SendReceipt(
             prompt=text,
@@ -136,6 +161,8 @@ class FakeDurableClient:
         self.current = snapshot(
             messages=(*self.current.messages, response),
             state=ChatGPTState.WAITING_PROMPT,
+            task_id=self.current.page_task_id,
+            team=self.current.page_team,
         )
         return response
 
@@ -996,3 +1023,636 @@ def test_durable_composer_whitespace_collapse_keeps_exact_semantic_prompt(tmp_pa
         collapsed.replace("body", "changed"),
         record.rendered_prompt,
     ) is False
+
+
+def test_markerless_durable_upload_uses_exact_prompt_as_composer_anchor(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    attachment = tmp_path / "context.txt"
+    attachment.write_text("context", encoding="utf-8")
+    client = FakeDurableClient()
+
+    result = run_block(
+        DurableSendBlock(
+            "markerless task with context",
+            ledger_path=ledger_path,
+            files=[str(attachment)],
+            render_request_marker=False,
+            stable_ms=0,
+        ),
+        client,
+    )
+
+    assert result.context.variables["durable_request"].status is RequestStatus.COMPLETED
+    assert client.upload_calls == [
+        ((str(attachment.resolve()),), "markerless task with context")
+    ]
+    assert "ROLE_REQUEST_ID" not in client.send_calls[0][0]
+
+
+def test_authoritative_upload_identity_mismatch_fails_before_ledger_or_browser(
+    tmp_path,
+):
+    ledger_path = tmp_path / "ledger.json"
+    attachment = tmp_path / "context.txt"
+    attachment.write_text("original", encoding="utf-8")
+    expected = collect_file_identities([attachment])
+    attachment.write_text("changed after worker preflight", encoding="utf-8")
+    client = FakeDurableClient()
+
+    with pytest.raises(Exception) as captured:
+        run_block(
+            DurableSendBlock(
+                "markerless task with authoritative context",
+                ledger_path=ledger_path,
+                files=[str(attachment)],
+                expected_file_identities=expected,
+                render_request_marker=False,
+                stable_ms=0,
+            ),
+            client,
+        )
+
+    assert isinstance(captured.value.cause, UploadError)
+    assert "source identity changed" in str(captured.value.cause)
+    assert not ledger_path.exists()
+    assert client.set_calls == []
+    assert client.upload_calls == []
+    assert client.send_calls == []
+
+
+@pytest.mark.parametrize("visible_name", ["manual-unowned.txt", "context.txt"])
+def test_prompt_set_request_rejects_unowned_attachment_even_with_expected_count(
+    tmp_path,
+    visible_name,
+):
+    ledger_path = tmp_path / "ledger.json"
+    attachment = tmp_path / "context.txt"
+    attachment.write_text("context", encoding="utf-8")
+    identities = collect_file_identities([attachment])
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(
+        role="DEV",
+        prompt="exact automated prompt",
+        files=identities,
+        render_request_marker=False,
+    )
+    ledger.update(record.request_id, status=RequestStatus.PROMPT_SET)
+    client = FakeDurableClient(
+        snapshot(
+            text=record.rendered_prompt,
+            attachments=(visible_name,),
+            state=ChatGPTState.DRAFT,
+        )
+    )
+
+    with pytest.raises(Exception) as captured:
+        run_block(
+            DurableSendBlock(
+                "exact automated prompt",
+                ledger_path=ledger_path,
+                files=[str(attachment)],
+                render_request_marker=False,
+                stable_ms=0,
+            ),
+            client,
+        )
+
+    assert isinstance(captured.value.cause, DurableRequestError)
+    assert client.upload_calls == []
+    assert client.send_calls == []
+    persisted = ledger.get(record.request_id)
+    assert persisted is not None
+    assert persisted.status is RequestStatus.PROMPT_SET
+    assert persisted.upload_receipt is None
+
+
+def test_uploading_recovery_persists_recovered_upload_receipt(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    attachment = tmp_path / "context.txt"
+    attachment.write_text("context", encoding="utf-8")
+    identities = collect_file_identities([attachment])
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(role="DEV", prompt="upload resume proof", files=identities)
+    record = ledger.update(record.request_id, status=RequestStatus.PROMPT_SET)
+    ledger.update(record.request_id, status=RequestStatus.UPLOADING)
+    client = FakeDurableClient(
+        snapshot(
+            text=record.rendered_prompt,
+            attachments=("context.txt",),
+            state=ChatGPTState.DRAFT,
+        )
+    )
+
+    run_block(
+        DurableSendBlock(
+            "upload resume proof",
+            ledger_path=ledger_path,
+            files=[str(attachment)],
+            stable_ms=0,
+        ),
+        client,
+    )
+
+    persisted = ledger.get(record.request_id)
+    assert persisted is not None
+    assert persisted.upload_receipt is not None
+    assert persisted.upload_receipt["method"] == "recovered"
+    assert persisted.upload_receipt["files"] == [item.to_dict() for item in identities]
+    assert persisted.upload_receipt["attachment_count"] == 1
+    assert client.upload_calls == []
+    assert len(client.send_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "markers",
+    [
+        ("wrong.txt",),
+        (),
+        ("context.txt", "extra.txt"),
+    ],
+)
+def test_uploading_recovery_rejects_wrong_partial_or_extra_markers(tmp_path, markers):
+    ledger_path = tmp_path / "ledger.json"
+    attachment = tmp_path / "context.txt"
+    attachment.write_text("context", encoding="utf-8")
+    identities = collect_file_identities([attachment])
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(role="DEV", prompt="upload recovery mismatch", files=identities)
+    record = ledger.update(record.request_id, status=RequestStatus.PROMPT_SET)
+    ledger.update(record.request_id, status=RequestStatus.UPLOADING)
+    client = FakeDurableClient(
+        snapshot(
+            text=record.rendered_prompt,
+            attachments=markers,
+            state=ChatGPTState.DRAFT,
+        )
+    )
+
+    with pytest.raises(Exception) as captured:
+        run_block(
+            DurableSendBlock(
+                "upload recovery mismatch",
+                ledger_path=ledger_path,
+                files=[str(attachment)],
+                stable_ms=0,
+            ),
+            client,
+        )
+
+    assert isinstance(captured.value.cause, DurableRequestError)
+    assert client.upload_calls == []
+    assert client.send_calls == []
+    persisted = ledger.get(record.request_id)
+    assert persisted is not None
+    assert persisted.status is RequestStatus.UPLOADING
+    assert persisted.upload_receipt is None
+
+
+def test_upload_ready_requires_valid_persisted_receipt(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    attachment = tmp_path / "context.txt"
+    attachment.write_text("context", encoding="utf-8")
+    identities = collect_file_identities([attachment])
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(role="DEV", prompt="upload ready receipt", files=identities)
+    record = ledger.update(record.request_id, status=RequestStatus.PROMPT_SET)
+    record = ledger.update(record.request_id, status=RequestStatus.UPLOADING)
+    ledger.update(record.request_id, status=RequestStatus.UPLOAD_READY)
+    client = FakeDurableClient(
+        snapshot(
+            text=record.rendered_prompt,
+            attachments=("context.txt",),
+            state=ChatGPTState.DRAFT,
+        )
+    )
+
+    with pytest.raises(Exception) as captured:
+        run_block(
+            DurableSendBlock(
+                "upload ready receipt",
+                ledger_path=ledger_path,
+                files=[str(attachment)],
+                stable_ms=0,
+            ),
+            client,
+        )
+
+    assert isinstance(captured.value.cause, DurableRequestError)
+    assert "upload receipt" in str(captured.value.cause)
+    assert client.upload_calls == []
+    assert client.send_calls == []
+
+
+def test_upload_ready_with_valid_receipt_resumes_without_reupload(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    attachment = tmp_path / "context.txt"
+    attachment.write_text("context", encoding="utf-8")
+    identities = collect_file_identities([attachment])
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(role="DEV", prompt="upload ready valid", files=identities)
+    record = ledger.update(record.request_id, status=RequestStatus.PROMPT_SET)
+    record = ledger.update(record.request_id, status=RequestStatus.UPLOADING)
+    upload_receipt = UploadReceipt(
+        request_marker=record.marker,
+        method="input",
+        files=identities,
+        attachment_count=1,
+        ownership_token="fake-upload-token",
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.UPLOAD_READY,
+        upload_receipt=upload_receipt.to_dict(),
+    )
+    client = FakeDurableClient(
+        snapshot(
+            text=record.rendered_prompt,
+            attachments=("context.txt",),
+            state=ChatGPTState.DRAFT,
+        )
+    )
+
+    run_block(
+        DurableSendBlock(
+            "upload ready valid",
+            ledger_path=ledger_path,
+            files=[str(attachment)],
+            stable_ms=0,
+        ),
+        client,
+    )
+
+    assert client.upload_calls == []
+    assert len(client.send_calls) == 1
+
+
+def test_upload_ready_rejects_receipt_for_different_files(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    attachment = tmp_path / "context.txt"
+    other = tmp_path / "other.txt"
+    attachment.write_text("context", encoding="utf-8")
+    other.write_text("other", encoding="utf-8")
+    identities = collect_file_identities([attachment])
+    wrong_identities = collect_file_identities([other])
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(role="DEV", prompt="upload ready forged", files=identities)
+    record = ledger.update(record.request_id, status=RequestStatus.PROMPT_SET)
+    record = ledger.update(record.request_id, status=RequestStatus.UPLOADING)
+    wrong_receipt = UploadReceipt(
+        request_marker=record.marker,
+        method="input",
+        files=wrong_identities,
+        attachment_count=1,
+        ownership_token="fake-upload-token",
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.UPLOAD_READY,
+        upload_receipt=wrong_receipt.to_dict(),
+    )
+    client = FakeDurableClient(
+        snapshot(
+            text=record.rendered_prompt,
+            attachments=("context.txt",),
+            state=ChatGPTState.DRAFT,
+        )
+    )
+
+    with pytest.raises(Exception) as captured:
+        run_block(
+            DurableSendBlock(
+                "upload ready forged",
+                ledger_path=ledger_path,
+                files=[str(attachment)],
+                stable_ms=0,
+            ),
+            client,
+        )
+
+    assert isinstance(captured.value.cause, DurableRequestError)
+    assert "upload receipt" in str(captured.value.cause)
+    assert client.upload_calls == []
+    assert client.send_calls == []
+
+
+def test_sending_upload_recovers_accepted_transcript_without_resend(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    attachment = tmp_path / "context.txt"
+    attachment.write_text("context", encoding="utf-8")
+    identities = collect_file_identities([attachment])
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(
+        role="DEV",
+        prompt="accepted upload crash",
+        files=identities,
+        render_request_marker=False,
+    )
+    baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
+    upload_receipt = UploadReceipt(
+        request_marker=record.rendered_prompt,
+        method="input",
+        files=identities,
+        attachment_count=1,
+        ownership_token="fake-upload-token",
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=PageBinding("page-1", "DEV"),
+        baseline=baseline,
+        session_id_before="session-1",
+        upload_receipt=upload_receipt.to_dict(),
+    )
+    client = FakeDurableClient(
+        snapshot(
+            messages=(
+                MessageSnapshot(
+                    "user", "accepted-user", "accepted-turn", record.rendered_prompt, ()
+                ),
+            ),
+            state=ChatGPTState.SUBMITTING,
+        )
+    )
+
+    result = run_block(
+        DurableSendBlock(
+            "accepted upload crash",
+            ledger_path=ledger_path,
+            files=[str(attachment)],
+            render_request_marker=False,
+            stable_ms=0,
+        ),
+        client,
+    )
+
+    assert client.upload_calls == []
+    assert client.send_calls == []
+    assert len(client.wait_calls) == 1
+    persisted = ledger.get(record.request_id)
+    assert persisted is not None
+    assert persisted.status is RequestStatus.COMPLETED
+    assert persisted.upload_receipt == upload_receipt.to_dict()
+    assert result.context.results["durable_send"]["response"]["text"] == "durable answer"
+
+
+def test_sending_upload_recovery_ignores_source_change_after_acceptance(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    attachment = tmp_path / "context.txt"
+    attachment.write_text("original", encoding="utf-8")
+    identities = collect_file_identities([attachment])
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(
+        role="DEV",
+        prompt="accepted upload source drift",
+        files=identities,
+        request_id="accepted-upload-source-drift",
+        render_request_marker=False,
+    )
+    baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
+    upload_receipt = UploadReceipt(
+        request_marker=record.rendered_prompt,
+        method="input",
+        files=identities,
+        attachment_count=1,
+        ownership_token="fake-upload-token",
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=PageBinding("page-1", "DEV"),
+        baseline=baseline,
+        session_id_before="session-1",
+        upload_receipt=upload_receipt.to_dict(),
+    )
+    attachment.write_text("changed after accepted send", encoding="utf-8")
+    client = FakeDurableClient(
+        snapshot(
+            messages=(
+                MessageSnapshot(
+                    "user", "accepted-user", "accepted-turn", record.rendered_prompt, ()
+                ),
+            ),
+            state=ChatGPTState.SUBMITTING,
+        )
+    )
+
+    result = run_block(
+        DurableSendBlock(
+            "accepted upload source drift",
+            ledger_path=ledger_path,
+            files=[str(attachment)],
+            expected_file_identities=identities,
+            request_id=record.request_id,
+            render_request_marker=False,
+            wait_for_response=False,
+            stable_ms=0,
+        ),
+        client,
+    )
+
+    output = result.context.results["durable_send"]
+    assert output["receipt"]["user_message_id"] == "accepted-user"
+    assert ledger.get(record.request_id).status is RequestStatus.SENT
+    assert client.upload_calls == []
+    assert client.send_calls == []
+
+
+def test_sending_upload_source_change_stays_ambiguous_without_acceptance(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    attachment = tmp_path / "context.txt"
+    attachment.write_text("original", encoding="utf-8")
+    identities = collect_file_identities([attachment])
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(
+        role="DEV",
+        prompt="ambiguous upload source drift",
+        files=identities,
+        request_id="ambiguous-upload-source-drift",
+        render_request_marker=False,
+    )
+    baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
+    upload_receipt = UploadReceipt(
+        request_marker=record.rendered_prompt,
+        method="input",
+        files=identities,
+        attachment_count=1,
+        ownership_token="fake-upload-token",
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=PageBinding("page-1", "DEV"),
+        baseline=baseline,
+        session_id_before="session-1",
+        upload_receipt=upload_receipt.to_dict(),
+    )
+    attachment.write_text("changed after ambiguous send", encoding="utf-8")
+    client = FakeDurableClient(snapshot(state=ChatGPTState.SUBMITTING))
+
+    with pytest.raises(Exception) as captured:
+        run_block(
+            DurableSendBlock(
+                "ambiguous upload source drift",
+                ledger_path=ledger_path,
+                files=[str(attachment)],
+                expected_file_identities=identities,
+                request_id=record.request_id,
+                render_request_marker=False,
+                wait_for_response=False,
+                stable_ms=0,
+            ),
+            client,
+        )
+
+    assert isinstance(captured.value.cause, DurableRequestError)
+    assert "ambiguous state" in str(captured.value.cause)
+    assert ledger.get(record.request_id).status is RequestStatus.SENDING
+    assert client.upload_calls == []
+    assert client.send_calls == []
+
+
+def test_durable_cdpa_source_context_requires_exact_browser_task_team(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    client = FakeDurableClient(snapshot())
+
+    with pytest.raises(Exception) as captured:
+        run_block(
+            DurableSendBlock(
+                "task-owned prompt",
+                ledger_path=ledger_path,
+                source_context={"task_id": "task-a", "team": "alpha"},
+                render_request_marker=False,
+                wait_for_response=False,
+                stable_ms=0,
+            ),
+            client,
+        )
+
+    assert isinstance(captured.value.cause, DurableRequestError)
+    assert "task/team ownership" in str(captured.value.cause)
+    assert client.send_calls == []
+    records = json.loads(ledger_path.read_text(encoding="utf-8"))["records"]
+    persisted = next(iter(records.values()))
+    assert persisted["status"] == RequestStatus.PROMPT_SET.value
+    assert persisted["receipt"] is None
+
+
+@pytest.mark.parametrize(
+    ("race_kind", "expected_error_type"),
+    [
+        ("attachment", ComposerConflictError),
+        ("prompt", ComposerConflictError),
+        ("ownership", PageOwnershipError),
+        ("page_state", UnsafePageStateError),
+    ],
+)
+def test_durable_send_rejects_locked_send_boundary_conflict(
+    tmp_path,
+    race_kind,
+    expected_error_type,
+):
+    ledger_path = tmp_path / "ledger.json"
+    attachment = tmp_path / "context.txt"
+    attachment.write_text("context", encoding="utf-8")
+    identities = collect_file_identities([attachment])
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(
+        role="DEV",
+        prompt="locked boundary race",
+        files=identities,
+        render_request_marker=False,
+    )
+    record = ledger.update(record.request_id, status=RequestStatus.PROMPT_SET)
+    record = ledger.update(record.request_id, status=RequestStatus.UPLOADING)
+    upload_receipt = UploadReceipt(
+        request_marker=record.rendered_prompt,
+        method="input",
+        files=identities,
+        attachment_count=1,
+        ownership_token="fake-upload-token",
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.UPLOAD_READY,
+        upload_receipt=upload_receipt.to_dict(),
+    )
+
+    class BoundaryRaceClient(FakeDurableClient):
+        async def send(
+            self,
+            text,
+            *,
+            wait_for_stop=True,
+            max_attempts=2,
+            recovery_reload=True,
+            expected_task_id=None,
+            expected_team=None,
+            expected_attachment_ownership_token=None,
+            expected_attachment_count=0,
+            expected_attachment_names=None,
+        ):
+            if race_kind == "prompt":
+                self.current = snapshot(
+                    text="manual changed prompt",
+                    attachments=self.current.attachment_markers,
+                    messages=self.current.messages,
+                    state=ChatGPTState.DRAFT,
+                )
+                raise ComposerConflictError("composer text changed in locked send")
+            if race_kind == "ownership":
+                raise PageOwnershipError("conversation changed in locked send")
+            if race_kind == "page_state":
+                raise UnsafePageStateError("blocking dialog appeared in locked send")
+            self.current = snapshot(
+                text=self.current.composer_text,
+                attachments=("manual-unowned.txt",),
+                messages=self.current.messages,
+                state=ChatGPTState.DRAFT,
+            )
+            if expected_attachment_names is not None and tuple(
+                self.current.attachment_markers
+            ) != tuple(expected_attachment_names):
+                raise ComposerConflictError("attachment identity changed in locked send")
+            return await super().send(
+                text,
+                wait_for_stop=wait_for_stop,
+                max_attempts=max_attempts,
+                recovery_reload=recovery_reload,
+                expected_task_id=expected_task_id,
+                expected_team=expected_team,
+                expected_attachment_ownership_token=expected_attachment_ownership_token,
+                expected_attachment_count=expected_attachment_count,
+                expected_attachment_names=expected_attachment_names,
+            )
+
+    client = BoundaryRaceClient(
+        snapshot(
+            text=record.rendered_prompt,
+            attachments=("context.txt",),
+            state=ChatGPTState.DRAFT,
+        )
+    )
+
+    with pytest.raises(Exception) as captured:
+        run_block(
+            DurableSendBlock(
+                "locked boundary race",
+                ledger_path=ledger_path,
+                files=[str(attachment)],
+                render_request_marker=False,
+                wait_for_response=False,
+                stable_ms=0,
+            ),
+            client,
+        )
+
+    assert isinstance(captured.value.cause, expected_error_type)
+    assert client.send_calls == []
+    persisted = ledger.get(record.request_id)
+    assert persisted is not None
+    assert persisted.status is RequestStatus.SENDING
+    assert persisted.receipt is None
+    assert persisted.upload_receipt == upload_receipt.to_dict()

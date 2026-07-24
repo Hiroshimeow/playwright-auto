@@ -25,6 +25,7 @@ from .cdpa_team import (
     validate_exact_team,
 )
 from .file_lock import exclusive_file_lock, fsync_parent_directory
+from .upload import collect_file_identities
 
 SCHEMA_VERSION = 1
 CATALOG_VERSION = 1
@@ -603,6 +604,49 @@ class TaskStore:
             if any(not isinstance(item, Mapping) for item in queue_events):
                 return "queue event must be an object"
 
+        attachments = state.get("attachments")
+        if attachments is not None:
+            if not isinstance(attachments, list):
+                return "attachments must be a list"
+            seen_attachment_paths: set[str] = set()
+            seen_attachment_identities: set[tuple[str, str, int, str, str]] = set()
+            required_attachment_keys = {"path", "name", "size", "sha256", "mime_type"}
+            for attachment in attachments:
+                if not isinstance(attachment, Mapping):
+                    return "attachment must be an object"
+                if set(attachment) != required_attachment_keys:
+                    return "attachment keys are invalid"
+                raw_path = attachment.get("path")
+                if not isinstance(raw_path, str) or not raw_path.strip():
+                    return "attachment path must be a non-empty string"
+                attachment_path = Path(raw_path).expanduser()
+                if not attachment_path.is_absolute():
+                    return "attachment path must be absolute"
+                canonical_path = str(attachment_path.resolve())
+                if canonical_path != raw_path:
+                    return "attachment path must be canonical"
+                name = attachment.get("name")
+                if (
+                    not isinstance(name, str)
+                    or not name.strip()
+                    or Path(name).name != name
+                ):
+                    return "attachment name must be a filename"
+                size = attachment.get("size")
+                if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+                    return "attachment size must be a non-negative integer"
+                digest = attachment.get("sha256")
+                if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                    return "attachment sha256 must be a lowercase 64-character digest"
+                mime_type = attachment.get("mime_type")
+                if not isinstance(mime_type, str) or not mime_type.strip():
+                    return "attachment mime_type must be a non-empty string"
+                identity = (canonical_path, name, size, digest, mime_type)
+                if canonical_path in seen_attachment_paths or identity in seen_attachment_identities:
+                    return "attachment identities must be unique"
+                seen_attachment_paths.add(canonical_path)
+                seen_attachment_identities.add(identity)
+
         maintenance = state.get("maintenance")
         if maintenance is not None:
             if not isinstance(maintenance, Mapping):
@@ -658,6 +702,17 @@ class TaskStore:
                 return f"role record {logical!r} has invalid status"
             if not isinstance(record.get("online"), bool):
                 return f"role record {logical!r} has invalid online flag"
+            uploaded_generation = record.get("attachments_uploaded_generation")
+            conversation_generation = record.get("conversation_generation")
+            if uploaded_generation is not None and (
+                isinstance(uploaded_generation, bool)
+                or not isinstance(uploaded_generation, int)
+                or uploaded_generation < 0
+                or not isinstance(conversation_generation, int)
+                or isinstance(conversation_generation, bool)
+                or uploaded_generation > conversation_generation
+            ):
+                return f"role record {logical!r} has invalid attachments_uploaded_generation"
 
         hops = state["hops"]
         if not hops:
@@ -1766,6 +1821,7 @@ class TaskStore:
         normalized_dependencies: tuple[str, ...],
         normalized_replaces: str | None,
         normalized_incident: str | None,
+        normalized_attachments: tuple[dict[str, Any], ...],
         readiness: Any,
         queue_reuse: bool,
         queue_blocked_by: str | None,
@@ -1783,6 +1839,7 @@ class TaskStore:
                 "online": False,
                 "conversation_generation": 0,
                 "constructor_sent_generation": None,
+                "attachments_uploaded_generation": None,
                 "reset_requested": bool(new_all or logical in normalized_new),
                 "reset_applied_generation": None,
                 "last_activity_at": None,
@@ -1907,6 +1964,7 @@ class TaskStore:
             "depends_on_task_ids": list(normalized_dependencies),
             "replaces_task_id": normalized_replaces,
             "replacement_incident_id": normalized_incident,
+            "attachments": [dict(item) for item in normalized_attachments],
             "dependency_events": (
                 []
                 if readiness.ready
@@ -1992,6 +2050,7 @@ class TaskStore:
         depends_on_task_ids: Sequence[str] = (),
         replaces_task_id: str | None = None,
         replacement_incident_id: str | None = None,
+        upload_paths: Sequence[str | Path] = (),
     ) -> dict[str, Any]:
         text = str(task).strip()
         if not text:
@@ -2011,6 +2070,18 @@ class TaskStore:
         exact_reuse_team = validate_exact_team(reuse_team) if reuse_team is not None else None
         base = normalize_team_base(requested_team or task_id) if exact_reuse_team is None else ""
         repository_path = Path(repository or self.config.repository_root).expanduser().resolve()
+        if isinstance(upload_paths, (str, bytes)):
+            raise ValueError("upload_paths must be a sequence of file paths")
+        try:
+            normalized_attachments = tuple(
+                identity.to_dict() for identity in collect_file_identities(upload_paths)
+            ) if upload_paths else ()
+        except FileNotFoundError as exc:
+            failed = Path(str(exc.filename or (exc.args[0] if exc.args else "attachment"))).name
+            raise ValueError(f"upload file is missing or not regular: {failed}") from exc
+        except OSError as exc:
+            failed = Path(str(exc.filename or (exc.args[0] if exc.args else "attachment"))).name
+            raise ValueError(f"upload file cannot be read: {failed}") from exc
         self.root.mkdir(parents=True, exist_ok=True)
         with exclusive_file_lock(self.allocation_lock):
             self._recover_phase4_replacement_unlocked()
@@ -2192,6 +2263,7 @@ class TaskStore:
                 normalized_dependencies=normalized_dependencies,
                 normalized_replaces=normalized_replaces,
                 normalized_incident=normalized_incident,
+                normalized_attachments=normalized_attachments,
                 readiness=readiness,
                 queue_reuse=exact_reuse_team is not None,
                 queue_blocked_by=queue_blocked_by,
@@ -2802,6 +2874,7 @@ class TaskStore:
                     normalized_dependencies=dependencies,
                     normalized_replaces=target_id,
                     normalized_incident=incident,
+                    normalized_attachments=(),
                     readiness=readiness,
                     queue_reuse=False,
                     queue_blocked_by=None,
