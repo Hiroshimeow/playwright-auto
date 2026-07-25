@@ -11,8 +11,10 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
+from .cdpa_commands import RepairRequest, WorkerCommand
 from .cdpa_config import CDPAConfig
 from .cdpa_dependencies import dependency_readiness, validate_new_dependencies
+from .cdpa_safety import sanitize_text, sanitize_value
 from .cdpa_team import (
     allocate_team,
     exact_team_ready_waiters,
@@ -35,7 +37,7 @@ _TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _TASK_STATUSES = frozenset({"INBOX", "WAITING", "RUNNING", "PAUSED", "BLOCKED", "DONE", "STOPPED"})
 _HOP_STATES = frozenset({"pre_send", "sending", "sent", "waiting", "responded", "routed", "abandoned"})
 _CLEANUP_STATES = frozenset({"ACTIVE", "CLEARING", "CLEARED"})
-_MAINTENANCE_STATES = frozenset({"OPEN", "RUNNING", "RESOLVED", "ESCALATED"})
+_MAINTENANCE_STATES = frozenset({"OPEN", "RUNNING", "SUSPENDED", "RESOLVED", "ESCALATED"})
 _REPORT_MODES = frozenset({"file", "inline"})
 
 
@@ -202,6 +204,7 @@ class TaskStore:
         self.allocation_lock = self.root / ".cdpa-allocation.lock"
         self.catalog_path = self.root / ".cdpa-catalog.json"
         self.phase4_journal_path = self.root / ".cdpa-phase4-replacement.journal"
+        self.repair_journal_path = self.root / ".cdpa-repair-transaction.journal"
 
     def _lock_path(self, manifest_path: Path) -> Path:
         return manifest_path.with_suffix(manifest_path.suffix + ".lock")
@@ -1418,8 +1421,8 @@ class TaskStore:
         maintenance = state.get("maintenance")
         if not isinstance(maintenance, Mapping):
             raise ValueError("maintenance must be an object")
-        maintenance_value = json.loads(
-            json.dumps(dict(maintenance), ensure_ascii=False, default=str)
+        maintenance_value = sanitize_value(
+            json.loads(json.dumps(dict(maintenance), ensure_ascii=False, default=str))
         )
 
         def merge(current: dict[str, Any]) -> dict[str, Any]:
@@ -1535,9 +1538,18 @@ class TaskStore:
     ) -> dict[str, Any]:
         """Atomically mutate maintenance-owned task state under the manifest lock."""
         target = Path(path).expanduser().resolve()
+
+        def sanitize_mutation(current: dict[str, Any]) -> Mapping[str, Any] | None:
+            result = mutator(current)
+            value = result if result is not None else current
+            maintenance = value.get("maintenance")
+            if isinstance(maintenance, Mapping):
+                value["maintenance"] = sanitize_value(maintenance)
+            return value
+
         return self._mutate_manifest(
             target,
-            mutator,
+            sanitize_mutation,
             maintenance_write=True,
         )
 
@@ -2548,6 +2560,7 @@ class TaskStore:
         return {"replacement": dict(replacement), "rewired_children": rewired}
 
     def _recover_phase4_replacement_unlocked(self) -> dict[str, Any] | None:
+        self._recover_repair_transaction_unlocked()
         journal = self._load_phase4_journal_unlocked()
         if journal is None:
             return None
@@ -2700,6 +2713,836 @@ class TaskStore:
         self.root.mkdir(parents=True, exist_ok=True)
         with exclusive_file_lock(self.allocation_lock):
             return self._recover_phase4_replacement_unlocked()
+
+    def _write_repair_journal_unlocked(self, value: Mapping[str, Any]) -> None:
+        body = json.loads(json.dumps(dict(value), ensure_ascii=False, default=str))
+        body["version"] = 1
+        body["operation"] = "create_or_gate_repair"
+        temporary = self.repair_journal_path.with_suffix(".journal.tmp")
+        self.root.mkdir(parents=True, exist_ok=True)
+        try:
+            with temporary.open("w", encoding="utf-8") as handle:
+                json.dump(body, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.repair_journal_path)
+            fsync_parent_directory(self.repair_journal_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _load_repair_journal_unlocked(self) -> dict[str, Any] | None:
+        if not self.repair_journal_path.exists():
+            return None
+        value = json.loads(self.repair_journal_path.read_text(encoding="utf-8"))
+        if not isinstance(value, Mapping):
+            raise ValueError("repair transaction journal root must be an object")
+        if value.get("version") != 1 or value.get("operation") != "create_or_gate_repair":
+            raise ValueError("unsupported repair transaction journal")
+        for field in (
+            "root_cause_key",
+            "repair_task_id",
+            "affected_task_id",
+            "incident_id",
+            "operation_key",
+            "disposition",
+            "repair_manifest_path",
+            "affected_manifest_path",
+            "created_at",
+        ):
+            if not isinstance(value.get(field), str) or not str(value.get(field)).strip():
+                raise ValueError(f"repair transaction journal {field} must be non-empty")
+        if value.get("disposition") not in {"CONTINUE_IN_PARALLEL", "HOLD_FOR_REPAIR"}:
+            raise ValueError("repair transaction journal disposition is invalid")
+        writes = value.get("writes")
+        if not isinstance(writes, list) or not writes:
+            raise ValueError("repair transaction journal writes must be non-empty")
+        seen: set[Path] = set()
+        for index, item in enumerate(writes):
+            if not isinstance(item, Mapping) or item.get("kind") not in {"repair", "affected"}:
+                raise ValueError("repair transaction journal write is invalid")
+            path = self._phase4_absolute_path(item.get("path"), f"writes[{index}].path")
+            if path in seen:
+                raise ValueError("repair transaction journal has duplicate paths")
+            seen.add(path)
+            self._phase4_decode_bytes(item.get("before"), f"writes[{index}].before")
+            after = self._phase4_decode_bytes(item.get("after"), f"writes[{index}].after")
+            if after is None or hashlib.sha256(after).hexdigest() != item.get("after_sha256"):
+                raise ValueError("repair transaction journal write hash is invalid")
+        catalog = value.get("catalog")
+        if not isinstance(catalog, Mapping):
+            raise ValueError("repair transaction journal catalog is invalid")
+        self._phase4_decode_bytes(catalog.get("before"), "catalog.before")
+        after_catalog = self._phase4_decode_bytes(catalog.get("after"), "catalog.after")
+        if after_catalog is None or hashlib.sha256(after_catalog).hexdigest() != catalog.get(
+            "after_sha256"
+        ):
+            raise ValueError("repair transaction journal catalog hash is invalid")
+        return dict(value)
+
+    def _clear_repair_journal_unlocked(self) -> None:
+        self.repair_journal_path.unlink(missing_ok=True)
+        fsync_parent_directory(self.repair_journal_path)
+
+    def _recover_repair_transaction_unlocked(self) -> dict[str, Any] | None:
+        journal = self._load_repair_journal_unlocked()
+        if journal is None:
+            return None
+        write_entries = [dict(item) for item in journal["writes"]]
+        write_paths = [
+            self._phase4_absolute_path(item["path"], "write.path")
+            for item in write_entries
+        ]
+        with ExitStack() as stack:
+            for path in sorted(set(write_paths), key=str):
+                stack.enter_context(exclusive_file_lock(self._lock_path(path)))
+            for item, path in zip(write_entries, write_paths, strict=True):
+                before = self._phase4_decode_bytes(item.get("before"), "write.before")
+                after = self._phase4_decode_bytes(item.get("after"), "write.after")
+                assert after is not None
+                current = path.read_bytes() if path.exists() else None
+                if current == after:
+                    continue
+                if current != before:
+                    raise RuntimeError(
+                        f"repair transaction found conflicting manifest state: {path}"
+                    )
+                self._phase4_write_bytes_unlocked(path, after)
+            catalog_before = self._phase4_decode_bytes(
+                journal["catalog"].get("before"), "catalog.before"
+            )
+            catalog_after = self._phase4_decode_bytes(
+                journal["catalog"].get("after"), "catalog.after"
+            )
+            assert catalog_after is not None
+            current_catalog = self.catalog_path.read_bytes() if self.catalog_path.exists() else None
+            if current_catalog != catalog_after:
+                if current_catalog != catalog_before:
+                    raise RuntimeError("repair transaction found conflicting task catalog")
+                self._phase4_write_bytes_unlocked(self.catalog_path, catalog_after)
+
+            repair_path = self._phase4_absolute_path(
+                journal["repair_manifest_path"], "repair_manifest_path"
+            )
+            affected_path = self._phase4_absolute_path(
+                journal["affected_manifest_path"], "affected_manifest_path"
+            )
+            repair = json.loads(repair_path.read_text(encoding="utf-8"))
+            affected = json.loads(affected_path.read_text(encoding="utf-8"))
+            if not isinstance(repair, Mapping) or not isinstance(affected, Mapping):
+                raise RuntimeError("repair transaction installed invalid manifest roots")
+            metadata = repair.get("repair")
+            if (
+                not isinstance(metadata, Mapping)
+                or metadata.get("root_cause_key") != journal["root_cause_key"]
+                or repair.get("task_id") != journal["repair_task_id"]
+            ):
+                raise RuntimeError("repair transaction installed invalid repair provenance")
+            operations = metadata.get("affected_operations") or []
+            if not any(
+                isinstance(item, Mapping)
+                and (
+                    item.get("operation_key") == journal["operation_key"]
+                    or (
+                        item.get("affected_task_id") == journal["affected_task_id"]
+                        and item.get("incident_id") == journal["incident_id"]
+                        and item.get("disposition") == journal["disposition"]
+                    )
+                )
+                for item in operations
+            ):
+                raise RuntimeError("repair transaction lost repair-side affected operation")
+            links = affected.get("repair_links") or []
+            if not any(
+                isinstance(item, Mapping)
+                and item.get("repair_task_id") == journal["repair_task_id"]
+                and item.get("root_cause_key") == journal["root_cause_key"]
+                and item.get("incident_id") == journal["incident_id"]
+                and item.get("disposition") == journal["disposition"]
+                and (
+                    item.get("operation_key") == journal["operation_key"]
+                    or item.get("operation_key") is None
+                )
+                for item in links
+            ):
+                raise RuntimeError("repair transaction lost affected-task relationship")
+            dependencies = normalize_dependency_ids(
+                affected.get("depends_on_task_ids")
+            )
+            wait = affected.get("repair_wait")
+            if journal["disposition"] == "HOLD_FOR_REPAIR":
+                if (
+                    not isinstance(wait, Mapping)
+                    or wait.get("repair_task_id") != journal["repair_task_id"]
+                    or wait.get("incident_id") != journal["incident_id"]
+                    or wait.get("disposition") != "HOLD_FOR_REPAIR"
+                    or wait.get("state") != "WAITING"
+                    or journal["repair_task_id"] not in dependencies
+                ):
+                    raise RuntimeError("repair transaction lost HOLD_FOR_REPAIR gate")
+            elif journal["repair_task_id"] in dependencies or (
+                isinstance(wait, Mapping)
+                and wait.get("repair_task_id") == journal["repair_task_id"]
+                and wait.get("state") == "WAITING"
+            ):
+                raise RuntimeError(
+                    "repair transaction lost CONTINUE_IN_PARALLEL postcondition"
+                )
+            self._clear_repair_journal_unlocked()
+            return {"repair": dict(repair), "affected": dict(affected)}
+
+    def recover_repair_transaction(self) -> dict[str, Any] | None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        with exclusive_file_lock(self.allocation_lock):
+            return self._recover_repair_transaction_unlocked()
+
+    @staticmethod
+    def _operator_originated_terminal_or_pause(state: Mapping[str, Any]) -> bool:
+        status = str(state.get("status") or "").upper()
+        if status == "PAUSED":
+            return True
+        if status != "STOPPED":
+            return False
+        return any(
+            isinstance(item, Mapping)
+            and item.get("origin") == "operator"
+            and item.get("action") == "stop"
+            and item.get("status") in {"applied", "requested"}
+            for item in reversed(state.get("controls") or [])
+        )
+
+    def create_or_gate_repair(
+        self,
+        request: RepairRequest | Mapping[str, Any],
+    ) -> dict[str, Any]:
+        repair_request = (
+            request
+            if isinstance(request, RepairRequest)
+            else RepairRequest.from_dict(request)
+        )
+        repository = Path(repair_request.repository).expanduser().resolve()
+        if repository != self.config.repository_root:
+            raise ValueError("repair task repository must match the CDPA repository")
+        self.root.mkdir(parents=True, exist_ok=True)
+        with exclusive_file_lock(self.allocation_lock):
+            self._recover_repair_transaction_unlocked()
+            self._recover_phase4_replacement_unlocked()
+            catalog = self._load_catalog_unlocked(reconcile=False)
+            catalog_before = self.catalog_path.read_bytes() if self.catalog_path.exists() else None
+            manifests, _errors = self._discover_with_catalog_unlocked(catalog)
+            affected = next(
+                (
+                    item
+                    for item in manifests
+                    if item.get("task_id") == repair_request.affected_task_id
+                    and item.get("team") == repair_request.affected_team
+                ),
+                None,
+            )
+            if affected is None:
+                raise ValueError("affected repair task does not exist")
+            if Path(str(affected.get("repository") or "")).expanduser().resolve() != repository:
+                raise ValueError("affected task repository does not match repair request")
+            if str(affected.get("status") or "").upper() == "DONE":
+                raise ValueError("cannot repair a DONE task")
+            if self._operator_originated_terminal_or_pause(affected):
+                raise ValueError("operator-originated Pause/Stop is authoritative")
+            if affected.get("active_hop_id") != repair_request.affected_hop_id:
+                raise ValueError("affected active hop changed before repair creation")
+            active_hop = next(
+                (
+                    item
+                    for item in affected.get("hops") or []
+                    if isinstance(item, Mapping)
+                    and item.get("hop_id") == affected.get("active_hop_id")
+                ),
+                None,
+            )
+            active_request_id = (
+                str(active_hop.get("request_id") or "") or None
+                if isinstance(active_hop, Mapping)
+                else None
+            )
+            if active_request_id != repair_request.affected_request_id:
+                raise ValueError("affected active request changed before repair creation")
+
+            existing = next(
+                (
+                    item
+                    for item in manifests
+                    if isinstance(item.get("repair"), Mapping)
+                    and item["repair"].get("root_cause_key")
+                    == repair_request.root_cause_key
+                    and Path(str(item.get("repository") or "")).expanduser().resolve()
+                    == repository
+                ),
+                None,
+            )
+            now = utc_now()
+            operation_identity = "|".join(
+                (
+                    repair_request.root_cause_key,
+                    repair_request.affected_task_id,
+                    repair_request.incident_id,
+                    repair_request.disposition,
+                    str(repair_request.affected_hop_id),
+                    str(repair_request.affected_request_id),
+                )
+            )
+            operation_key = "repair-op-" + hashlib.sha256(
+                operation_identity.encode("utf-8")
+            ).hexdigest()[:24]
+            operation = {
+                "operation_key": operation_key,
+                "at": now,
+                "affected_task_id": repair_request.affected_task_id,
+                "affected_team": repair_request.affected_team,
+                "affected_hop_id": repair_request.affected_hop_id,
+                "affected_request_id": repair_request.affected_request_id,
+                "affected_role": repair_request.affected_role,
+                "affected_conversation_id": repair_request.affected_conversation_id,
+                "incident_id": repair_request.incident_id,
+                "disposition": repair_request.disposition,
+                "reason": repair_request.reason,
+                "reproduction": repair_request.reproduction,
+                "source_areas": list(repair_request.source_areas),
+                "required_tests": list(repair_request.required_tests),
+                "lesson": repair_request.lesson,
+            }
+
+            if existing is None:
+                repair_id = (
+                    f"cdpa-repair-{repair_request.root_cause_key.removeprefix('root-')}"
+                )
+                known_ids = {str(item.get("task_id") or "") for item in manifests}
+                if repair_id in known_ids:
+                    raise ValueError("repair task ID conflicts with unrelated work")
+                base = f"cdpa-repair-{repair_request.root_cause_key[-12:]}"
+                team, suffix = allocate_team(base, manifests)
+                task_text = repair_request.task_text()
+                repair_path = (
+                    self.root / team / repair_id / f"{slugify(task_text)}.json"
+                ).resolve()
+                repair_state = self._initial_task_state(
+                    text=task_text,
+                    requested_team=base,
+                    task_id=repair_id,
+                    repository_path=repository,
+                    base=base,
+                    team=team,
+                    suffix=suffix,
+                    reusable_teams=[],
+                    target=repair_path,
+                    normalized_new=(),
+                    new_all=False,
+                    normalized_report_mode="file",
+                    normalized_dependencies=(),
+                    normalized_replaces=None,
+                    normalized_incident=None,
+                    normalized_attachments=(),
+                    readiness=dependency_readiness(
+                        {"task_id": repair_id, "depends_on_task_ids": []}, manifests
+                    ),
+                    queue_reuse=False,
+                    queue_blocked_by=None,
+                    now=now,
+                )
+                repair_state["priority"] = "urgent_repair"
+                repair_state["repair"] = {
+                    **repair_request.to_dict(),
+                    "kind": "cdpa_repair",
+                    "priority": "urgent",
+                    "state": "ACTIVE",
+                    "created_at": now,
+                    "updated_at": now,
+                    "affected_task_ids": [repair_request.affected_task_id],
+                    "affected_operations": [operation],
+                }
+                repair_state.setdefault("dependency_events", []).append(
+                    {
+                        "at": now,
+                        "status": "REPAIR_CREATED",
+                        "message": (
+                            f"Urgent repair created for {repair_request.affected_task_id}"
+                        ),
+                        "affected_task_id": repair_request.affected_task_id,
+                        "affected_team": repair_request.affected_team,
+                        "incident_id": repair_request.incident_id,
+                        "operation_key": operation_key,
+                        "root_cause_key": repair_request.root_cause_key,
+                        "disposition": repair_request.disposition,
+                    }
+                )
+            else:
+                repair_state = json.loads(json.dumps(existing, ensure_ascii=False))
+                repair_id = str(repair_state.get("task_id") or "")
+                team = str(repair_state.get("team") or "")
+                repair_path = Path(str(repair_state["manifest_path"])).expanduser().resolve()
+                if repair_id == repair_request.affected_task_id:
+                    raise ValueError("a repair task cannot recursively repair itself")
+                metadata = repair_state.get("repair")
+                if not isinstance(metadata, dict):
+                    raise ValueError("existing repair task metadata is invalid")
+                operations = [
+                    dict(item)
+                    for item in metadata.get("affected_operations") or []
+                    if isinstance(item, Mapping)
+                ]
+                synthesized_legacy_operation = False
+                if not operations and metadata.get("affected_task_id"):
+                    synthesized_legacy_operation = True
+                    operations.append(
+                        {
+                            "operation_key": metadata.get("operation_key"),
+                            "at": metadata.get("created_at"),
+                            "affected_task_id": metadata.get("affected_task_id"),
+                            "affected_team": metadata.get("affected_team"),
+                            "affected_hop_id": metadata.get("affected_hop_id"),
+                            "affected_request_id": metadata.get("affected_request_id"),
+                            "affected_role": metadata.get("affected_role"),
+                            "affected_conversation_id": metadata.get(
+                                "affected_conversation_id"
+                            ),
+                            "incident_id": metadata.get("incident_id"),
+                            "disposition": metadata.get("disposition"),
+                            "reason": metadata.get("reason"),
+                            "reproduction": metadata.get("reproduction"),
+                            "source_areas": list(metadata.get("source_areas") or []),
+                            "required_tests": list(
+                                metadata.get("required_tests") or []
+                            ),
+                            "lesson": metadata.get("lesson"),
+                        }
+                    )
+                exact_operation = next(
+                    (
+                        item
+                        for item in operations
+                        if item.get("operation_key") == operation_key
+                        or (
+                            item.get("affected_task_id")
+                            == repair_request.affected_task_id
+                            and item.get("incident_id") == repair_request.incident_id
+                            and item.get("disposition")
+                            == repair_request.disposition
+                            and item.get("affected_hop_id")
+                            == repair_request.affected_hop_id
+                            and (str(item.get("affected_request_id") or "") or None)
+                            == repair_request.affected_request_id
+                        )
+                    ),
+                    None,
+                )
+                affected_links = [
+                    item
+                    for item in affected.get("repair_links") or []
+                    if isinstance(item, Mapping)
+                ]
+                exact_link = next(
+                    (
+                        item
+                        for item in affected_links
+                        if item.get("repair_task_id") == repair_id
+                        and item.get("root_cause_key")
+                        == repair_request.root_cause_key
+                        and item.get("incident_id") == repair_request.incident_id
+                        and item.get("disposition") == repair_request.disposition
+                    ),
+                    None,
+                )
+                dependencies = normalize_dependency_ids(
+                    affected.get("depends_on_task_ids")
+                )
+                wait = affected.get("repair_wait")
+                if repair_request.disposition == "HOLD_FOR_REPAIR":
+                    relationship_complete = (
+                        exact_link is not None
+                        and str(affected.get("status") or "").upper() == "WAITING"
+                        and repair_id in dependencies
+                        and isinstance(wait, Mapping)
+                        and wait.get("repair_task_id") == repair_id
+                        and wait.get("root_cause_key")
+                        == repair_request.root_cause_key
+                        and wait.get("incident_id") == repair_request.incident_id
+                        and wait.get("disposition") == "HOLD_FOR_REPAIR"
+                        and wait.get("state") == "WAITING"
+                        and wait.get("preserved_hop_id")
+                        == repair_request.affected_hop_id
+                        and (str(wait.get("preserved_request_id") or "") or None)
+                        == repair_request.affected_request_id
+                    )
+                else:
+                    relationship_complete = (
+                        exact_link is not None
+                        and repair_id not in dependencies
+                        and not (
+                            isinstance(wait, Mapping)
+                            and wait.get("repair_task_id") == repair_id
+                            and wait.get("state") == "WAITING"
+                        )
+                    )
+                if exact_operation is not None and relationship_complete:
+                    return {"repair": dict(repair_state), "affected": dict(affected)}
+                if synthesized_legacy_operation:
+                    metadata["affected_operations"] = operations
+                    metadata["affected_task_ids"] = list(
+                        dict.fromkeys(
+                            str(item.get("affected_task_id") or "")
+                            for item in operations
+                            if str(item.get("affected_task_id") or "")
+                        )
+                    )
+                    metadata["updated_at"] = now
+                repair_status = str(repair_state.get("status") or "").upper()
+                if repair_status == "DONE":
+                    raise ValueError(
+                        "repair root cause is already resolved; recurring evidence "
+                        "requires a new root-cause identity"
+                    )
+                if repair_status == "STOPPED":
+                    raise ValueError("existing repair task is STOPPED and cannot be reused")
+                if exact_operation is None:
+                    previous = next(
+                        (
+                            item
+                            for item in reversed(operations)
+                            if item.get("affected_task_id")
+                            == repair_request.affected_task_id
+                        ),
+                        None,
+                    )
+                    if previous is not None:
+                        operation["previous_disposition"] = previous.get("disposition")
+                        operation["supersedes_operation_key"] = previous.get(
+                            "operation_key"
+                        )
+                    operations.append(operation)
+                    metadata["affected_operations"] = operations
+                    metadata["affected_task_ids"] = list(
+                        dict.fromkeys(
+                            str(item.get("affected_task_id") or "")
+                            for item in operations
+                            if str(item.get("affected_task_id") or "")
+                        )
+                    )
+                    metadata["updated_at"] = now
+                    event_status = (
+                        "REPAIR_DISPOSITION_CHANGED"
+                        if previous is not None
+                        and previous.get("disposition")
+                        != repair_request.disposition
+                        else "REPAIR_AFFECTED_ATTACHED"
+                    )
+                    repair_state.setdefault("dependency_events", []).append(
+                        {
+                            "at": now,
+                            "status": event_status,
+                            "message": (
+                                f"Repair linked to {repair_request.affected_task_id} "
+                                f"with {repair_request.disposition}"
+                            ),
+                            "affected_task_id": repair_request.affected_task_id,
+                            "affected_team": repair_request.affected_team,
+                            "incident_id": repair_request.incident_id,
+                            "operation_key": operation_key,
+                            "root_cause_key": repair_request.root_cause_key,
+                            "disposition": repair_request.disposition,
+                            "previous_disposition": (
+                                previous.get("disposition")
+                                if previous is not None
+                                else None
+                            ),
+                        }
+                    )
+
+            affected_path = Path(str(affected["manifest_path"])).expanduser().resolve()
+            affected_after = json.loads(json.dumps(affected, ensure_ascii=False))
+            prior_links = [
+                item
+                for item in affected_after.get("repair_links") or []
+                if isinstance(item, Mapping)
+            ]
+            exact_link = next(
+                (
+                    item
+                    for item in prior_links
+                    if item.get("repair_task_id") == repair_id
+                    and item.get("root_cause_key") == repair_request.root_cause_key
+                    and item.get("incident_id") == repair_request.incident_id
+                    and item.get("disposition") == repair_request.disposition
+                ),
+                None,
+            )
+            previous_link = next(
+                (
+                    item
+                    for item in reversed(prior_links)
+                    if item.get("repair_task_id") == repair_id
+                    and item.get("root_cause_key") == repair_request.root_cause_key
+                ),
+                None,
+            )
+            link = {
+                "operation_key": operation_key,
+                "at": now,
+                "repair_task_id": repair_id,
+                "repair_team": team,
+                "root_cause_key": repair_request.root_cause_key,
+                "affected_hop_id": repair_request.affected_hop_id,
+                "affected_request_id": repair_request.affected_request_id,
+                "incident_id": repair_request.incident_id,
+                "disposition": repair_request.disposition,
+                "blocker": repair_request.reason,
+            }
+            if previous_link is not None and previous_link.get("disposition") != (
+                repair_request.disposition
+            ):
+                link["previous_disposition"] = previous_link.get("disposition")
+                link["supersedes_operation_key"] = previous_link.get("operation_key")
+            if exact_link is None:
+                affected_after.setdefault("repair_links", []).append(link)
+                affected_after.setdefault("route_timeline", []).append(
+                    {"at": now, "kind": "repair_link", **link}
+                )
+
+            current_status = str(affected.get("status") or "").upper()
+            current_wait = affected.get("repair_wait")
+            if repair_request.disposition == "HOLD_FOR_REPAIR":
+                already_held = (
+                    current_status == "WAITING"
+                    and isinstance(current_wait, Mapping)
+                    and current_wait.get("repair_task_id") == repair_id
+                    and current_wait.get("root_cause_key")
+                    == repair_request.root_cause_key
+                    and current_wait.get("state") == "WAITING"
+                )
+                if current_status != "BLOCKED" and not already_held:
+                    raise ValueError(
+                        "HOLD_FOR_REPAIR requires a non-operator BLOCKED affected task"
+                    )
+                if not isinstance(active_hop, Mapping):
+                    raise ValueError(
+                        "HOLD_FOR_REPAIR requires a preserved active hop on the affected task"
+                    )
+                dependencies = list(
+                    normalize_dependency_ids(affected.get("depends_on_task_ids"))
+                )
+                if repair_id not in dependencies:
+                    dependencies.append(repair_id)
+                affected_after["depends_on_task_ids"] = dependencies
+                if already_held:
+                    wait_value = dict(current_wait)
+                    wait_value.update(link)
+                    wait_value["decision_changed_at"] = now
+                    affected_after["repair_wait"] = wait_value
+                else:
+                    affected_after["repair_wait"] = {
+                        **link,
+                        "state": "WAITING",
+                        "original_status": affected.get("status"),
+                        "original_block_code": affected.get("block_code"),
+                        "original_block_reason": affected.get("block_reason"),
+                        "original_stop_reason": affected.get("stop_reason"),
+                        "preserved_hop_id": affected.get("active_hop_id"),
+                        "preserved_request_id": active_request_id,
+                        "waiting_since": now,
+                        "released_at": None,
+                    }
+                affected_after.update(
+                    status="WAITING",
+                    kanban_column="WAITING",
+                    active_action="waiting_repair",
+                    waiting_code="repair_dependency",
+                    waiting_reason=f"Waiting for urgent repair {repair_id}",
+                    waiting={
+                        "reason": "dependency",
+                        "waiting_on": [repair_id],
+                        "stopped": [],
+                        "missing": [],
+                        "since": (
+                            current_wait.get("waiting_since")
+                            if already_held and isinstance(current_wait, Mapping)
+                            else now
+                        ),
+                    },
+                    block_code=None,
+                    block_retryable=False,
+                    block_reason=None,
+                    stop_reason=None,
+                )
+                if exact_link is None or not already_held:
+                    affected_after.setdefault("dependency_events", []).append(
+                        {
+                            "at": now,
+                            "status": "REPAIR_WAIT",
+                            "message": f"Held on urgent repair {repair_id}",
+                            "repair_task_id": repair_id,
+                            "waiting_on": [repair_id],
+                            "stopped": [],
+                            "missing": [],
+                            "incident_id": repair_request.incident_id,
+                            "operation_key": operation_key,
+                            "root_cause_key": repair_request.root_cause_key,
+                            "disposition": repair_request.disposition,
+                        }
+                    )
+            elif (
+                current_status == "WAITING"
+                and isinstance(current_wait, Mapping)
+                and current_wait.get("repair_task_id") == repair_id
+                and current_wait.get("root_cause_key")
+                == repair_request.root_cause_key
+                and current_wait.get("state") == "WAITING"
+            ):
+                if current_wait.get("preserved_hop_id") != affected.get(
+                    "active_hop_id"
+                ) or (str(current_wait.get("preserved_request_id") or "") or None) != (
+                    active_request_id
+                ):
+                    raise ValueError(
+                        "repair disposition change found changed preserved hop/request"
+                    )
+                dependencies = [
+                    item
+                    for item in normalize_dependency_ids(
+                        affected.get("depends_on_task_ids")
+                    )
+                    if item != repair_id
+                ]
+                affected_after["depends_on_task_ids"] = dependencies
+                role = str(affected.get("active_role") or "PLAN").upper()
+                affected_after.update(
+                    status="RUNNING",
+                    kanban_column=(
+                        "PLANNING"
+                        if role == "PLAN"
+                        else "WORKING"
+                        if role == "DEV"
+                        else "VERIFYING"
+                    ),
+                    active_action=(
+                        "observe_response"
+                        if str(active_hop.get("state") or "") == "waiting"
+                        else "resume_preserved_hop"
+                    ),
+                    waiting_code=None,
+                    waiting_reason=None,
+                    waiting={
+                        "reason": None,
+                        "waiting_on": [],
+                        "stopped": [],
+                        "missing": [],
+                        "since": None,
+                    },
+                )
+                released_wait = dict(current_wait)
+                released_wait.update(link)
+                released_wait["state"] = "DISPOSITION_CHANGED"
+                released_wait["released_at"] = now
+                released_wait["release_event"] = (
+                    "Maintainers changed repair disposition to CONTINUE_IN_PARALLEL"
+                )
+                affected_after["repair_wait"] = released_wait
+                affected_after.setdefault("dependency_events", []).append(
+                    {
+                        "at": now,
+                        "status": "REPAIR_DISPOSITION_CHANGED",
+                        "message": released_wait["release_event"],
+                        "repair_task_id": repair_id,
+                        "waiting_on": [],
+                        "stopped": [],
+                        "missing": [],
+                        "incident_id": repair_request.incident_id,
+                        "operation_key": operation_key,
+                        "root_cause_key": repair_request.root_cause_key,
+                        "disposition": repair_request.disposition,
+                    }
+                )
+                affected_after.setdefault("route_timeline", []).append(
+                    {
+                        "at": now,
+                        "kind": "repair_disposition_change",
+                        "repair_task_id": repair_id,
+                        "incident_id": repair_request.incident_id,
+                        "operation_key": operation_key,
+                        "disposition": repair_request.disposition,
+                        "hop_id": affected.get("active_hop_id"),
+                        "request_id": active_request_id,
+                    }
+                )
+
+            writes = {repair_path: repair_state, affected_path: affected_after}
+            for path, value in writes.items():
+                value["schema_version"] = SCHEMA_VERSION
+                value["updated_at"] = now
+                error = self._manifest_value_error(
+                    path, value, require_file=path.exists()
+                )
+                if error is not None:
+                    raise ValueError(f"invalid repair transaction manifest {path}: {error}")
+            proposed = []
+            for item in manifests:
+                if item.get("task_id") == affected_after.get("task_id"):
+                    proposed.append(affected_after)
+                elif item.get("task_id") == repair_state.get("task_id"):
+                    proposed.append(repair_state)
+                else:
+                    proposed.append(item)
+            if existing is None:
+                proposed.append(repair_state)
+            for item in proposed:
+                validate_new_dependencies(
+                    str(item["task_id"]),
+                    normalize_dependency_ids(item.get("depends_on_task_ids")),
+                    [other for other in proposed if other is not item],
+                    allow_missing=True,
+                )
+
+            next_catalog = json.loads(json.dumps(catalog, ensure_ascii=False, default=str))
+            next_catalog.setdefault("entries", {})
+            for path, value in writes.items():
+                next_catalog["entries"][self._catalog_key(path)] = self._catalog_entry(value)
+            next_catalog["version"] = CATALOG_VERSION
+            next_catalog["updated_at"] = now
+            catalog_after = json.dumps(
+                next_catalog, ensure_ascii=False, indent=2, sort_keys=True
+            ).encode("utf-8")
+            journal_writes = []
+            for path in sorted(writes, key=str):
+                before = path.read_bytes() if path.exists() else None
+                after = self._phase4_bytes(writes[path])
+                journal_writes.append(
+                    {
+                        "kind": "repair" if path == repair_path else "affected",
+                        "task_id": str(writes[path]["task_id"]),
+                        "path": self._phase4_relative_path(path),
+                        "before": self._phase4_encode_bytes(before),
+                        "after": self._phase4_encode_bytes(after),
+                        "after_sha256": hashlib.sha256(after).hexdigest(),
+                    }
+                )
+            self._write_repair_journal_unlocked(
+                {
+                    "root_cause_key": repair_request.root_cause_key,
+                    "repair_task_id": repair_id,
+                    "affected_task_id": repair_request.affected_task_id,
+                    "incident_id": repair_request.incident_id,
+                    "operation_key": operation_key,
+                    "disposition": repair_request.disposition,
+                    "repair_manifest_path": self._phase4_relative_path(repair_path),
+                    "affected_manifest_path": self._phase4_relative_path(affected_path),
+                    "created_at": now,
+                    "writes": journal_writes,
+                    "catalog": {
+                        "before": self._phase4_encode_bytes(catalog_before),
+                        "after": self._phase4_encode_bytes(catalog_after),
+                        "after_sha256": hashlib.sha256(catalog_after).hexdigest(),
+                    },
+                }
+            )
+            result = self._recover_repair_transaction_unlocked()
+            if result is None:
+                raise RuntimeError("repair transaction disappeared before verification")
+            return result
 
     def replace_task_and_rewire(
         self,
@@ -3165,8 +4008,82 @@ class TaskStore:
         *,
         reason: str,
     ) -> dict[str, Any]:
-        if not normalize_dependency_ids(state.get("depends_on_task_ids")):
+        dependencies = list(normalize_dependency_ids(state.get("depends_on_task_ids")))
+        if not dependencies:
             raise ValueError("task is not dependency-waiting")
+        repair_wait = state.get("repair_wait")
+        if (
+            isinstance(repair_wait, dict)
+            and repair_wait.get("state") == "WAITING"
+            and str(repair_wait.get("repair_task_id") or "") in dependencies
+        ):
+            repair_task_id = str(repair_wait["repair_task_id"])
+            preserved_hop_id = repair_wait.get("preserved_hop_id")
+            preserved_request_id = str(repair_wait.get("preserved_request_id") or "") or None
+            if state.get("active_hop_id") != preserved_hop_id:
+                raise ValueError("repair-held task active hop changed before release")
+            active_hop = next(
+                (
+                    item
+                    for item in state.get("hops") or []
+                    if isinstance(item, Mapping)
+                    and item.get("hop_id") == preserved_hop_id
+                ),
+                None,
+            )
+            if not isinstance(active_hop, Mapping) or (
+                str(active_hop.get("request_id") or "") or None
+            ) != preserved_request_id:
+                raise ValueError("repair-held task active request changed before release")
+            state["depends_on_task_ids"] = [
+                item for item in dependencies if item != repair_task_id
+            ]
+            role = str(state.get("active_role") or "PLAN").upper()
+            state["status"] = "RUNNING"
+            state["kanban_column"] = (
+                "PLANNING" if role == "PLAN" else "WORKING" if role == "DEV" else "VERIFYING"
+            )
+            state["active_action"] = (
+                "observe_response"
+                if str(active_hop.get("state") or "") == "waiting"
+                else "resume_preserved_hop"
+            )
+            state["waiting_reason"] = None
+            state["waiting_code"] = None
+            state["waiting"] = {
+                "reason": None,
+                "waiting_on": [],
+                "stopped": [],
+                "missing": [],
+                "since": None,
+            }
+            repair_wait["state"] = "RELEASED"
+            repair_wait["released_at"] = utc_now()
+            repair_wait["release_event"] = reason
+            state.setdefault("dependency_events", []).append(
+                {
+                    "at": repair_wait["released_at"],
+                    "status": "REPAIR_RELEASED",
+                    "message": reason,
+                    "repair_task_id": repair_task_id,
+                    "waiting_on": [],
+                    "stopped": [],
+                    "missing": [],
+                    "preserved_hop_id": preserved_hop_id,
+                    "preserved_request_id": preserved_request_id,
+                }
+            )
+            state.setdefault("route_timeline", []).append(
+                {
+                    "at": repair_wait["released_at"],
+                    "kind": "repair_release",
+                    "repair_task_id": repair_task_id,
+                    "hop_id": preserved_hop_id,
+                    "request_id": preserved_request_id,
+                    "hop_state": active_hop.get("state"),
+                }
+            )
+            return state
         state["status"] = "INBOX"
         state["kanban_column"] = "INBOX"
         state["active_action"] = "queued"
@@ -3461,9 +4378,12 @@ class TaskStore:
         role: str | None = None,
         reason: str | None = None,
         confirmed: bool = False,
+        origin: str | None = None,
         maintenance_incident_id: str | None = None,
         maintenance_request_id: str | None = None,
+        repair: RepairRequest | None = None,
     ) -> Mapping[str, Any]:
+        action = str(action).strip().lower()
         control_role = role
         if action == "resume" and control_role is None:
             control_role = str(state.get("active_role") or "PLAN").upper()
@@ -3473,7 +4393,21 @@ class TaskStore:
             raise ValueError(
                 "maintenance control provenance requires both incident and request IDs"
             )
+        normalized_origin = str(
+            origin or ("maintainers" if incident_id is not None else "operator")
+        ).strip().lower()
         normalized_reason = str(reason or "").strip() or None
+        command_reason = normalized_reason or f"{action} requested"
+        command = WorkerCommand.create(
+            origin=normalized_origin,
+            action=action,
+            reason=command_reason,
+            state=state,
+            role=control_role,
+            incident_id=incident_id,
+            request_id=request_id,
+            repair=repair,
+        )
         if incident_id is not None:
             existing = next(
                 (
@@ -3490,10 +4424,15 @@ class TaskStore:
                     existing.get("action") != action
                     or existing.get("role") != control_role
                     or existing.get("reason") != normalized_reason
+                    or existing.get("origin") not in {None, normalized_origin}
                 ):
                     raise ValueError(
                         "maintenance control provenance already belongs to another payload"
                     )
+                if existing.get("command") is None:
+                    existing["origin"] = normalized_origin
+                    existing["command"] = command.to_dict()
+                    existing["command_state"] = "PENDING"
                 return existing
         sequence = len(state.get("controls") or []) + 1
         control = {
@@ -3502,6 +4441,9 @@ class TaskStore:
             "role": control_role,
             "reason": normalized_reason,
             "confirmed": bool(confirmed),
+            "origin": normalized_origin,
+            "command": command.to_dict(),
+            "command_state": "PENDING",
             "status": "requested",
             "requested_at": utc_now(),
             "applied_at": None,
@@ -3548,6 +4490,7 @@ class TaskStore:
                 role=role,
                 reason=reason,
                 confirmed=confirmed,
+                origin=("maintainers" if incident_id is not None else "operator"),
                 maintenance_incident_id=incident_id,
                 maintenance_request_id=request_id,
             )
@@ -3564,7 +4507,7 @@ class TaskStore:
         action: str | None = None,
     ) -> dict[str, Any]:
         control_id = int(control_id)
-        reason = str(reason).strip()
+        reason = sanitize_text(reason, max_chars=2000).strip()
         expected_action = str(action or "").strip().lower() or None
         if control_id < 1:
             raise ValueError("control_id must be positive")

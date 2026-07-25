@@ -4019,3 +4019,57 @@ def test_phase7_documentation_contract_is_complete():
     combined = readme + agents
     assert "--report-back" not in combined
     assert "--report-to" not in combined
+
+
+def test_config_loads_tooling_probe_profile_without_secret(tmp_path: Path):
+    config_path = write_config(tmp_path)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["maintenance"]["tooling_probe"] = {
+        "dependency": "mcp-g8",
+        "endpoint": "http://127.0.0.1:8101/mcp",
+        "auth_profile": "local_mcp_static_bearer",
+        "required_tools": ["shell_execute"],
+    }
+    config_path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+
+    config = load_cdpa_config(config_path, repository_root=tmp_path)
+
+    assert config.maintenance_tooling_probe is not None
+    assert config.maintenance_tooling_probe.dependency == "mcp-g8"
+    assert config.maintenance_tooling_probe.endpoint == "http://127.0.0.1:8101/mcp"
+    assert config.maintenance_tooling_probe.auth_profile == "local_mcp_static_bearer"
+    assert config.maintenance_tooling_probe.required_tools == ("shell_execute",)
+    assert "secret" not in repr(config.maintenance_tooling_probe).casefold()
+    assert "token" not in repr(config.maintenance_tooling_probe).casefold()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("endpoint", "http://example.com:8101/mcp", "loopback HTTP"),
+        ("endpoint", "http://127.0.0.1/mcp", "loopback HTTP"),
+        ("auth_profile", "persisted_token", "auth_profile is unsupported"),
+        ("required_tools", ["shell_execute", "shell_execute"], "must be unique"),
+        ("required_tools", ["bad tool"], "invalid name"),
+    ],
+)
+def test_config_rejects_unsafe_tooling_probe_shapes(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    message: str,
+):
+    config_path = write_config(tmp_path)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    probe = {
+        "dependency": "mcp-g8",
+        "endpoint": "http://127.0.0.1:8101/mcp",
+        "auth_profile": "local_mcp_static_bearer",
+        "required_tools": ["shell_execute"],
+    }
+    probe[field] = value
+    raw["maintenance"]["tooling_probe"] = probe
+    config_path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+
+    with pytest.raises(CDPAConfigError, match=message):
+        load_cdpa_config(config_path, repository_root=tmp_path)

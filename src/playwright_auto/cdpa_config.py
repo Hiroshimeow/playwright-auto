@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -29,6 +30,18 @@ class CDPAConfigError(ValueError):
     pass
 
 
+CDPA_TOOLING_AUTH_PROFILES = frozenset({"none", "local_mcp_static_bearer"})
+_TOOLING_PROBE_KEYS = frozenset({"dependency", "endpoint", "auth_profile", "required_tools"})
+
+
+@dataclass(frozen=True)
+class CDPAToolingProbeConfig:
+    dependency: str
+    endpoint: str
+    auth_profile: str
+    required_tools: tuple[str, ...]
+
+
 def _mapping(value: Any, name: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise CDPAConfigError(f"{name} must be an object")
@@ -51,6 +64,78 @@ def _resolve(root: Path, value: Any, name: str) -> Path:
         raise CDPAConfigError(f"{name} must not be empty")
     path = Path(text).expanduser()
     return (path if path.is_absolute() else root / path).resolve()
+
+
+def _tooling_probe_config(value: Any) -> CDPAToolingProbeConfig | None:
+    if value is None:
+        return None
+    raw = _mapping(value, "maintenance.tooling_probe")
+    if set(raw) != _TOOLING_PROBE_KEYS:
+        raise CDPAConfigError(
+            "maintenance.tooling_probe must contain exactly "
+            f"{sorted(_TOOLING_PROBE_KEYS)!r}"
+        )
+    dependency = str(raw.get("dependency") or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", dependency) is None:
+        raise CDPAConfigError(
+            "maintenance.tooling_probe.dependency must be a bounded identifier"
+        )
+    endpoint = str(raw.get("endpoint") or "").strip()
+    try:
+        parsed = urlparse(endpoint)
+        port = parsed.port
+    except ValueError as exc:
+        raise CDPAConfigError("maintenance.tooling_probe.endpoint is invalid") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or port is None
+        or not (1 <= port <= 65535)
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise CDPAConfigError(
+            "maintenance.tooling_probe.endpoint must be exact loopback HTTP with an explicit port"
+        )
+    endpoint_path = parsed.path or "/"
+    host = f"[{parsed.hostname}]" if parsed.hostname == "::1" else parsed.hostname
+    canonical_endpoint = f"http://{host}:{port}{endpoint_path}"
+    if endpoint != canonical_endpoint:
+        raise CDPAConfigError("maintenance.tooling_probe.endpoint must be canonical")
+    auth_profile = str(raw.get("auth_profile") or "").strip()
+    if auth_profile not in CDPA_TOOLING_AUTH_PROFILES:
+        raise CDPAConfigError(
+            "maintenance.tooling_probe.auth_profile is unsupported"
+        )
+    required_raw = raw.get("required_tools")
+    if (
+        not isinstance(required_raw, list)
+        or not required_raw
+        or len(required_raw) > 16
+    ):
+        raise CDPAConfigError(
+            "maintenance.tooling_probe.required_tools must contain 1 to 16 names"
+        )
+    required_tools = tuple(str(item).strip() for item in required_raw)
+    if any(
+        re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", item) is None
+        for item in required_tools
+    ):
+        raise CDPAConfigError(
+            "maintenance.tooling_probe.required_tools contains an invalid name"
+        )
+    if len(set(required_tools)) != len(required_tools):
+        raise CDPAConfigError(
+            "maintenance.tooling_probe.required_tools must be unique"
+        )
+    return CDPAToolingProbeConfig(
+        dependency=dependency,
+        endpoint=endpoint,
+        auth_profile=auth_profile,
+        required_tools=required_tools,
+    )
 
 
 @dataclass(frozen=True)
@@ -76,6 +161,7 @@ class CDPAConfig:
     maintenance_refresh_after_seconds: float
     maintenance_stable_ms: int
     maintenance_poll_ms: int
+    maintenance_tooling_probe: CDPAToolingProbeConfig | None
     cleanup_terminal_idle_seconds: float
     worker_poll_seconds: float
     delay_minimum_seconds: float
@@ -159,6 +245,9 @@ def load_cdpa_config(
         str(name): float(_positive(value, f"delays.multipliers.{name}"))
         for name, value in multipliers.items()
     }
+    maintenance_tooling_probe = _tooling_probe_config(
+        maintenance.get("tooling_probe")
+    )
     dashboard_port = int(
         _positive(dashboard.get("port", 9224), "dashboard.port", integer=True)
     )
@@ -215,6 +304,7 @@ def load_cdpa_config(
         maintenance_poll_ms=int(
             _positive(maintenance.get("poll_ms", 100), "maintenance.poll_ms", integer=True)
         ),
+        maintenance_tooling_probe=maintenance_tooling_probe,
         cleanup_terminal_idle_seconds=float(_positive(cleanup.get("terminal_idle_seconds", 3600), "cleanup.terminal_idle_seconds")),
         worker_poll_seconds=float(_positive(worker.get("poll_seconds", 1), "worker.poll_seconds")),
         delay_minimum_seconds=minimum,

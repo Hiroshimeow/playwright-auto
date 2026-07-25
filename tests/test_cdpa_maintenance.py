@@ -2932,3 +2932,2997 @@ def test_stopped_maintainers_prompt_includes_original_outcome_repository_and_rep
             "path": str(report_path),
         }
     ]
+
+
+def test_parse_v2_maintenance_response_accepts_bounded_recovery_and_repair():
+    response = """# Recovery report
+
+OPEN_ROLE_TAB may restore the active request; the permanent repair prevents recurrence.
+
+```json
+{"version":2,"recovery":[{"action":"OPEN_ROLE_TAB","reason":"Restore exact DEV conversation.","role":"DEV"},{"action":"RESUME_TASK","reason":"Continue the preserved hop.","role":null}],"repair":{"root_cause":"OPEN_ROLE_TAB could report success while role_offline remained","reason":"Make recovery postconditions authoritative.","disposition":"CONTINUE_IN_PARALLEL","reproduction":"Reopen a mismatched conversation during a role_offline block.","source_areas":["cdpa_worker","cdpa_store","tests","prompts"],"required_tests":["focused role-offline regression","controlled live recovery"]},"lesson":"Recovery is applied only after its operational postcondition passes."}
+```
+"""
+
+    report, decision = parse_maintenance_response(
+        response,
+        configured_roles=("PLAN", "DEV", "REVIEW", "TEST", "AUDIT"),
+    )
+
+    assert report.startswith("# Recovery report")
+    assert decision.version == 2
+    assert [step.action for step in decision.recovery] == ["OPEN_ROLE_TAB", "RESUME_TASK"]
+    assert decision.recovery[0].role == "DEV"
+    assert decision.repair["disposition"] == "CONTINUE_IN_PARALLEL"
+
+
+def test_parse_v2_rejects_more_than_three_recovery_steps():
+    steps = ",".join(
+        '{"action":"RESUME_TASK","reason":"step","role":null}' for _ in range(4)
+    )
+    response = (
+        "# Report\n\n"
+        f'{{"version":2,"recovery":[{steps}],"repair":null,"lesson":null}}'
+    )
+    with pytest.raises(ValueError, match="at most three"):
+        parse_maintenance_response(response)
+
+
+def test_resolved_lesson_deduplicates_normalized_markdown_text(tmp_path: Path):
+    learning = tmp_path / "LEARNING.md"
+    learning.write_text(
+        "# LEARNING.md\n\n- Recovery is applied only after its operational postcondition passes!\n",
+        encoding="utf-8",
+    )
+    incident = {"state": "RESOLVED"}
+    decision = MaintenanceDecision(
+        action="WAIT",
+        reason="resolved",
+        lesson="  recovery   is applied only after its operational postcondition passes. ",
+    )
+
+    assert append_resolved_lesson(learning, incident, decision) is False
+    assert learning.read_text(encoding="utf-8").count("Recovery is applied") == 1
+
+
+def test_repair_lesson_finalizes_only_after_done_and_preserved_task_release(tmp_path: Path):
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_maintenance import MaintainerCoordinator
+    from playwright_auto.cdpa_store import TaskStore
+
+    from test_cdpa_core import write_config
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    learning = tmp_path / "LEARNING.md"
+    learning.write_text("# LEARNING.md\n", encoding="utf-8")
+    store = TaskStore(config)
+    affected = store.create_task(
+        "affected",
+        requested_team="alpha",
+        task_id="task-affected-lesson",
+    )
+    repair = store.create_task(
+        "repair",
+        requested_team="repair-alpha",
+        task_id="task-repair-lesson",
+    )
+    affected_path = Path(affected["manifest_path"])
+    repair_path = Path(repair["manifest_path"])
+    lesson = "Only finalize a repair lesson after repair DONE and preserved-task release."
+
+    def hold(current):
+        current.update(
+            status="BLOCKED",
+            kanban_column="BLOCKED",
+            block_code="role_offline",
+            block_reason="fixture",
+        )
+        incident = ensure_maintenance_incident(current)
+        assert incident is not None
+        incident.update(
+            state="RESOLVED",
+            pending_lesson=lesson,
+            repair_task_id=repair["task_id"],
+            repair_disposition="HOLD_FOR_REPAIR",
+            decision={
+                "action": "CREATE_REPAIR_TASK",
+                "reason": "repair",
+                "role": None,
+                "lesson": lesson,
+                "replacement": None,
+                "version": 2,
+                "recovery": [],
+                "repair": {
+                    "root_cause": "repair lesson gate",
+                    "reason": "repair",
+                    "disposition": "HOLD_FOR_REPAIR",
+                    "reproduction": "fixture",
+                    "source_areas": ["tests"],
+                    "required_tests": ["fixture"],
+                },
+            },
+        )
+        current["maintenance"]["active_incident_id"] = None
+        current["maintenance"]["last_resolved_at"] = current["updated_at"]
+        current.update(
+            status="WAITING",
+            kanban_column="WAITING",
+            depends_on_task_ids=[repair["task_id"]],
+            repair_wait={
+                "repair_task_id": repair["task_id"],
+                "state": "WAITING",
+                "disposition": "HOLD_FOR_REPAIR",
+            },
+            block_code=None,
+            block_reason=None,
+        )
+        return current
+
+    affected = store.update(affected_path, hold)
+    coordinator = MaintainerCoordinator(config, store=store)
+    assert coordinator._finalize_repair_lessons(
+        [(affected_path, affected), (repair_path, repair)]
+    ) is False
+    assert "Only finalize" not in learning.read_text(encoding="utf-8")
+
+    def finish(current):
+        current.update(
+            status="DONE",
+            terminal_state="DONE",
+            kanban_column="DONE_STOPPED",
+            active_action="done",
+            active_role=None,
+            active_hop_id=None,
+        )
+        return current
+
+    repair = store.update(repair_path, finish)
+    affected = store.load(affected_path)
+    assert coordinator._finalize_repair_lessons(
+        [(affected_path, affected), (repair_path, repair)]
+    ) is False
+
+    def release(current):
+        current["repair_wait"]["state"] = "RELEASED"
+        return current
+
+    affected = store.update(affected_path, release)
+    assert coordinator._finalize_repair_lessons(
+        [(affected_path, affected), (repair_path, repair)]
+    ) is True
+    assert learning.read_text(encoding="utf-8").count("Only finalize") == 1
+    saved = store.load(affected_path)
+    saved_incident = saved["maintenance"]["incidents"][0]
+    assert saved_incident["pending_lesson"] is None
+    assert saved_incident["lesson_append_state"] == "appended"
+
+    assert coordinator._finalize_repair_lessons(
+        [(affected_path, saved), (repair_path, repair)]
+    ) is False
+    assert learning.read_text(encoding="utf-8").count("Only finalize") == 1
+
+
+
+def test_environment_failure_suspends_after_three_attempts_and_resumes_same_incident(
+    tmp_path: Path,
+):
+    import asyncio
+    from types import SimpleNamespace
+
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_maintenance import MaintainerCoordinator
+    from playwright_auto.cdpa_store import TaskStore
+
+    from test_cdpa_core import write_config
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    (tmp_path / "LEARNING.md").write_text("# LEARNING.md\n", encoding="utf-8")
+    store = TaskStore(config)
+    task = store.create_task("blocked", requested_team="alpha", task_id="task-env")
+    path = Path(task["manifest_path"])
+
+    def block(current):
+        current.update(
+            status="BLOCKED",
+            kanban_column="BLOCKED",
+            block_code="role_offline",
+            block_reason="CDP unavailable",
+        )
+        incident = ensure_maintenance_incident(current)
+        assert incident is not None
+        incident["request_id"] = f"{incident['incident_id']}-turn1"
+        incident["prompt"] = "durable prompt"
+        return current
+
+    task = store.update(path, block)
+    incident = task["maintenance"]["incidents"][0]
+    coordinator = MaintainerCoordinator(config, store=store)
+
+    class OfflineContext:
+        @property
+        def pages(self):
+            raise ConnectionError("CDP offline")
+
+    global_state = coordinator.state_store.load()
+    for expected in (1, 2, 3):
+        assert coordinator._record_environment_failure(
+            path,
+            incident_id=incident["incident_id"],
+            error=ConnectionError("CDP unavailable"),
+            browser_context=OfflineContext(),
+            global_state=global_state,
+        ) is True
+        current = store.load(path)
+        incident = current["maintenance"]["incidents"][0]
+        assert incident["environment_attempts"] == expected
+
+    suspended = store.load(path)
+    suspended_incident = suspended["maintenance"]["incidents"][0]
+    assert suspended_incident["state"] == "SUSPENDED"
+    assert suspended["maintenance"]["active_incident_id"] is None
+    assert suspended_incident["request_id"].endswith("-turn1")
+    assert suspended_incident["prompt"] == "durable prompt"
+    active_hop_id = suspended["active_hop_id"]
+
+    class OnlineBrowser:
+        def is_connected(self):
+            return True
+
+    class OnlineContext:
+        browser = OnlineBrowser()
+        pages = [SimpleNamespace(page_id="maint-page", url="https://chatgpt.com/c/maint")]
+
+        async def cookies(self):
+            return []
+
+    assert asyncio.run(
+        coordinator._resume_suspended_environments([(path, suspended)], OnlineContext())
+    ) is True
+    resumed = store.load(path)
+    resumed_incident = resumed["maintenance"]["incidents"][0]
+    assert resumed_incident["state"] == "OPEN"
+    assert resumed["maintenance"]["active_incident_id"] == resumed_incident["incident_id"]
+    assert resumed["active_hop_id"] == active_hop_id
+    assert resumed_incident["request_id"].endswith("-turn1")
+    assert resumed_incident["prompt"] == "durable prompt"
+
+
+def test_maintainers_prompt_contains_complete_operational_snapshot(tmp_path: Path):
+    import json
+
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_maintenance import MaintainerCoordinator
+    from playwright_auto.cdpa_store import TaskStore
+
+    from test_cdpa_core import write_config
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    task = store.create_task("Recover exact send", requested_team="alpha", task_id="task-snapshot")
+    path = Path(task["manifest_path"])
+
+    def block(current):
+        hop = next(item for item in current["hops"] if item["hop_id"] == current["active_hop_id"])
+        hop.update(
+            state="waiting",
+            request_id="task-snapshot-hop1",
+            conversation_url="https://chatgpt.com/c/exact",
+            conversation_generation=3,
+            receipt={"user_turn_id": "turn-1", "binding": {"page_id": "page-1"}},
+        )
+        current["roles"]["PLAN"].update(
+            online=False,
+            page_id="page-1",
+            page_url="https://chatgpt.com/c/exact",
+            conversation_generation=3,
+        )
+        current.update(
+            status="BLOCKED",
+            kanban_column="BLOCKED",
+            block_code="role_offline",
+            block_reason="exact role tab offline",
+            repair_links=[{"repair_task_id": "repair-1", "disposition": "CONTINUE_IN_PARALLEL"}],
+        )
+        store._queue_control(
+            current,
+            "open_tab",
+            role="PLAN",
+            reason="operator requested exact reopen",
+            origin="operator",
+        )
+        return current
+
+    task = store.update(path, block)
+    incident = ensure_maintenance_incident(task)
+    assert incident is not None
+    prompt = MaintainerCoordinator(config, store=store)._prompt(
+        task,
+        incident,
+        include_constructor=False,
+        tasks=[task],
+    )
+    snapshot = json.loads(prompt.split("\n\n", 1)[0].split("\n", 1)[1])
+
+    assert snapshot["durable_send_boundary"]["request_id"] == "task-snapshot-hop1"
+    assert snapshot["durable_send_boundary"]["receipt"]["user_turn_id"] == "turn-1"
+    assert snapshot["roles"]["PLAN"]["page_id"] == "page-1"
+    assert snapshot["controls"][-1]["origin"] == "operator"
+    assert snapshot["repair_links"][0]["repair_task_id"] == "repair-1"
+    assert snapshot["runtime_availability"]["roles_online"]["PLAN"] is False
+    assert "version, recovery, repair, lesson" in prompt
+
+
+def test_v2_ineffective_primitive_queues_next_bounded_recovery_step(tmp_path: Path):
+    from datetime import datetime, timezone
+
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_maintenance import (
+        MaintainerCoordinator,
+        MaintenanceDecision,
+        MaintenanceStep,
+    )
+    from playwright_auto.cdpa_store import TaskStore
+
+    from test_cdpa_core import write_config
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_task("recover", requested_team="alpha", task_id="task-steps")
+    path = Path(state["manifest_path"])
+
+    def block(current):
+        current.update(
+            status="BLOCKED",
+            kanban_column="BLOCKED",
+            block_code="role_offline",
+            block_reason="exact role unavailable",
+        )
+        return current
+
+    state = store.update(path, block)
+    incident = ensure_maintenance_incident(state)
+    assert incident is not None
+    incident["turn"] = 1
+    incident["request_id"] = f"{incident['incident_id']}-turn1"
+    state = store.save_maintenance(path, state)
+    coordinator = MaintainerCoordinator(config, store=store)
+    decision = MaintenanceDecision(
+        action="OPEN_ROLE_TAB",
+        reason="reopen",
+        recovery=(
+            MaintenanceStep("OPEN_ROLE_TAB", "reopen exact tab", "PLAN"),
+            MaintenanceStep("RESTART_ROLE", "restart role after ineffective reopen", "PLAN"),
+        ),
+        version=2,
+    )
+    committed, active, _evidence, first, stale = coordinator._commit_response(
+        path,
+        incident_id=incident["incident_id"],
+        expected_incident_key=incident["key"],
+        request_id=incident["request_id"],
+        turn=1,
+        report="# Recovery\n\nTry exact reopen, then bounded restart.\n",
+        report_at=datetime.now(timezone.utc),
+        decision=decision,
+    )
+    assert stale is False
+    assert first["action"] == "open_tab"
+
+    def ineffective(current):
+        control = next(item for item in current["controls"] if item["control_id"] == first["control_id"])
+        control.update(
+            status="ineffective",
+            command_state="INEFFECTIVE",
+            result="exact conversation unavailable",
+        )
+        return current
+
+    committed = store.update(path, ineffective)
+    assert coordinator._reconcile_active(path, committed) is True
+    queued = store.load(path)
+    assert [item["action"] for item in queued["controls"]] == ["open_tab", "restart_role"]
+    assert queued["controls"][-1]["origin"] == "maintainers"
+    assert queued["controls"][-1]["maintenance_request_id"].endswith("-step2")
+
+
+def test_parse_v2_rejects_repair_creation_inside_recovery_list():
+    response = """# Invalid recovery
+
+Repair creation belongs in the dedicated repair object.
+
+```json
+{"version":2,"recovery":[{"action":"CREATE_REPAIR_TASK","reason":"Create repair.","role":null}],"repair":null,"lesson":null}
+```
+"""
+
+    with pytest.raises(ValueError, match="unsupported recovery action"):
+        parse_maintenance_response(response)
+
+
+def test_network_tooling_suspension_resumes_with_same_browser_after_exact_probe_recovers(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import asyncio
+    import urllib.error
+
+    import playwright_auto.cdpa_maintenance as maintenance_module
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_maintenance import MaintainerCoordinator
+    from playwright_auto.cdpa_store import TaskStore
+
+    from test_cdpa_core import write_config
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    (tmp_path / "LEARNING.md").write_text("# LEARNING.md\n", encoding="utf-8")
+    store = TaskStore(config)
+    task = store.create_task(
+        "network recovery",
+        requested_team="alpha",
+        task_id="task-network-recovery",
+    )
+    path = Path(task["manifest_path"])
+
+    def block(current):
+        current.update(
+            status="BLOCKED",
+            kanban_column="BLOCKED",
+            block_code="unexpected_error",
+            block_reason="network timeout",
+        )
+        incident = ensure_maintenance_incident(current)
+        assert incident is not None
+        incident["request_id"] = f"{incident['incident_id']}-turn1"
+        incident["prompt"] = "same durable prompt"
+        return current
+
+    task = store.update(path, block)
+    incident = task["maintenance"]["incidents"][0]
+    coordinator = MaintainerCoordinator(config, store=store)
+
+    class StablePage:
+        page_id = "maint-page"
+        url = "https://chatgpt.com/c/maint"
+        healthy = False
+
+    page = StablePage()
+    network_calls: list[tuple[str, str, float]] = []
+
+    class HealthyResponse:
+        status = 204
+
+        def getcode(self):
+            return self.status
+
+        def close(self):
+            return None
+
+    def fake_urlopen(request, timeout):
+        network_calls.append((request.full_url, request.get_method(), timeout))
+        if not page.healthy:
+            raise urllib.error.URLError("network unavailable")
+        return HealthyResponse()
+
+    monkeypatch.setattr(maintenance_module, "_open_no_redirect", fake_urlopen)
+
+    class StableContext:
+        pages = [page]
+
+    global_state = coordinator.state_store.load()
+    for _ in range(3):
+        assert coordinator._record_environment_failure(
+            path,
+            incident_id=incident["incident_id"],
+            error=TimeoutError("network timed out"),
+            browser_context=StableContext(),
+            global_state=global_state,
+        ) is True
+
+    suspended = store.load(path)
+    suspended_incident = suspended["maintenance"]["incidents"][0]
+    assert suspended_incident["state"] == "SUSPENDED"
+    assert suspended_incident["environment_signature"]["available"] is False
+    before_pages = suspended_incident["environment_signature"]["browser_pages"]
+
+    page.healthy = True
+    assert asyncio.run(
+        coordinator._resume_suspended_environments(
+            [(path, suspended)], StableContext()
+        )
+    ) is True
+    resumed = store.load(path)
+    resumed_incident = resumed["maintenance"]["incidents"][0]
+    assert resumed_incident["state"] == "OPEN"
+    assert resumed_incident["environment_resume_signature"]["available"] is True
+    assert resumed_incident["environment_resume_signature"]["browser_pages"] == before_pages
+    assert resumed_incident["environment_resume_signature"]["health_probe"] == (
+        "network_exact_endpoint_head"
+    )
+    assert network_calls
+    assert all(method == "HEAD" and timeout == 2.5 for _url, method, timeout in network_calls)
+
+
+def test_filesystem_environment_probe_requires_real_write_fsync_and_delete(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import errno
+    import os
+
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_maintenance import MaintainerCoordinator
+    from test_cdpa_core import write_config
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    coordinator = MaintainerCoordinator(config)
+    context = type("Context", (), {"pages": []})()
+    original_open = os.open
+
+    def no_space(path, flags, mode=0o777, *, dir_fd=None):
+        if str(path).endswith(".cdpa-maintainers-filesystem-probe"):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        if dir_fd is None:
+            return original_open(path, flags, mode)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, "open", no_space)
+        failed = coordinator._environment_signature(context, "filesystem")
+
+    recovered = coordinator._environment_signature(context, "filesystem")
+
+    assert failed["available"] is False
+    assert failed["health_probe"] == "filesystem_write_fsync_delete"
+    assert "No space left" in str(failed["filesystem_error"])
+    assert recovered["available"] is True
+    assert recovered["filesystem_write_fsync_delete"] is True
+    assert not (config.plans_root / ".cdpa-maintainers-filesystem-probe").exists()
+
+
+def test_environment_prerequisite_distinguishes_network_connection_from_cdp():
+    from playwright_auto.cdpa_maintenance import MaintainerCoordinator
+
+    assert MaintainerCoordinator._environment_prerequisite(
+        ConnectionError("network unavailable")
+    ) == "network"
+    assert MaintainerCoordinator._environment_prerequisite(
+        ConnectionError("CDP unavailable")
+    ) == "browser_cdp"
+
+
+def test_filesystem_suspension_resumes_after_real_probe_write_recovers(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import asyncio
+    import errno
+    import os
+
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_maintenance import MaintainerCoordinator
+    from playwright_auto.cdpa_store import TaskStore
+    from test_cdpa_core import write_config
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    (tmp_path / "LEARNING.md").write_text("# LEARNING.md\n", encoding="utf-8")
+    store = TaskStore(config)
+    task = store.create_task(
+        "filesystem recovery",
+        requested_team="alpha",
+        task_id="task-filesystem-recovery",
+    )
+    path = Path(task["manifest_path"])
+
+    def block(current):
+        current.update(
+            status="BLOCKED",
+            kanban_column="BLOCKED",
+            block_code="unexpected_error",
+            block_reason="No space left on device",
+        )
+        incident = ensure_maintenance_incident(current)
+        assert incident is not None
+        return current
+
+    task = store.update(path, block)
+    incident = task["maintenance"]["incidents"][0]
+    coordinator = MaintainerCoordinator(config, store=store)
+    context = type("Context", (), {"pages": []})()
+    original_open = os.open
+
+    def no_space(probe_path, flags, mode=0o777, *, dir_fd=None):
+        if str(probe_path).endswith(".cdpa-maintainers-filesystem-probe"):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        if dir_fd is None:
+            return original_open(probe_path, flags, mode)
+        return original_open(probe_path, flags, mode, dir_fd=dir_fd)
+
+    global_state = coordinator.state_store.load()
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, "open", no_space)
+        for _ in range(3):
+            coordinator._record_environment_failure(
+                path,
+                incident_id=incident["incident_id"],
+                error=OSError(errno.ENOSPC, "No space left on device"),
+                browser_context=context,
+                global_state=global_state,
+            )
+
+    suspended = store.load(path)
+    assert suspended["maintenance"]["incidents"][0]["state"] == "SUSPENDED"
+    assert asyncio.run(
+        coordinator._resume_suspended_environments([(path, suspended)], context)
+    ) is True
+    resumed = store.load(path)
+    resumed_incident = resumed["maintenance"]["incidents"][0]
+    assert resumed_incident["state"] == "OPEN"
+    assert resumed_incident["environment_resume_signature"][
+        "filesystem_write_fsync_delete"
+    ] is True
+
+
+def test_cached_pages_do_not_resume_disconnected_cdp_incident(tmp_path: Path):
+    import asyncio
+    from types import SimpleNamespace
+
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_maintenance import MaintainerCoordinator, ensure_maintenance_incident
+    from playwright_auto.cdpa_store import TaskStore
+    from test_cdpa_core import write_config
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    (tmp_path / "LEARNING.md").write_text("# LEARNING.md\n", encoding="utf-8")
+    store = TaskStore(config)
+    task = store.create_task("cached CDP", requested_team="alpha", task_id="task-cached-cdp")
+    path = Path(task["manifest_path"])
+
+    def block(current):
+        current.update(
+            status="BLOCKED",
+            kanban_column="BLOCKED",
+            block_code="unexpected_error",
+            block_reason="CDP unavailable",
+        )
+        incident = ensure_maintenance_incident(current)
+        assert incident is not None
+        incident.update(
+            state="SUSPENDED",
+            environment_attempts=3,
+            environment_prerequisite="browser_cdp",
+            environment_last_error="ConnectionError: CDP unavailable",
+            environment_signature={"available": False, "prerequisite": "browser_cdp"},
+        )
+        current["maintenance"]["active_incident_id"] = None
+        return current
+
+    suspended = store.update(path, block)
+    coordinator = MaintainerCoordinator(config, store=store)
+
+    class Browser:
+        def is_connected(self):
+            return False
+
+    class CachedContext:
+        browser = Browser()
+        pages = [SimpleNamespace(page_id="cached", url="https://chatgpt.com/c/cached")]
+
+        async def cookies(self):
+            raise AssertionError("live probe must not run after disconnected state")
+
+    assert asyncio.run(
+        coordinator._resume_suspended_environments([(path, suspended)], CachedContext())
+    ) is False
+    current = store.load(path)
+    incident = current["maintenance"]["incidents"][0]
+    assert incident["state"] == "SUSPENDED"
+    assert current["maintenance"]["active_incident_id"] is None
+
+
+def test_live_cdp_probe_resumes_same_suspended_incident(tmp_path: Path):
+    import asyncio
+    from types import SimpleNamespace
+
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_maintenance import MaintainerCoordinator, ensure_maintenance_incident
+    from playwright_auto.cdpa_store import TaskStore
+    from test_cdpa_core import write_config
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    (tmp_path / "LEARNING.md").write_text("# LEARNING.md\n", encoding="utf-8")
+    store = TaskStore(config)
+    task = store.create_task("live CDP", requested_team="alpha", task_id="task-live-cdp")
+    path = Path(task["manifest_path"])
+
+    def block(current):
+        current.update(
+            status="BLOCKED",
+            kanban_column="BLOCKED",
+            block_code="unexpected_error",
+            block_reason="CDP unavailable",
+        )
+        incident = ensure_maintenance_incident(current)
+        assert incident is not None
+        incident.update(
+            state="SUSPENDED",
+            environment_attempts=3,
+            environment_prerequisite="browser_cdp",
+            environment_last_error="ConnectionError: CDP unavailable",
+            environment_signature={"available": False, "prerequisite": "browser_cdp"},
+        )
+        current["maintenance"]["active_incident_id"] = None
+        return current
+
+    suspended = store.update(path, block)
+    coordinator = MaintainerCoordinator(config, store=store)
+    calls = []
+
+    class Browser:
+        def is_connected(self):
+            return True
+
+    class LiveContext:
+        browser = Browser()
+        pages = [SimpleNamespace(page_id="live", url="https://chatgpt.com/c/live")]
+
+        async def cookies(self):
+            calls.append("cookies")
+            return []
+
+    assert asyncio.run(
+        coordinator._resume_suspended_environments([(path, suspended)], LiveContext())
+    ) is True
+    current = store.load(path)
+    incident = current["maintenance"]["incidents"][0]
+    assert calls == ["cookies"]
+    assert incident["state"] == "OPEN"
+    assert incident["environment_resume_signature"]["available"] is True
+    assert incident["environment_resume_signature"]["browser_live_operation"] == "context.cookies"
+
+
+def test_chatgpt_head_does_not_resume_tooling_incident(tmp_path: Path, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    import playwright_auto.cdpa_maintenance as maintenance_module
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_maintenance import MaintainerCoordinator, ensure_maintenance_incident
+    from playwright_auto.cdpa_store import TaskStore
+    from test_cdpa_core import write_config
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    (tmp_path / "LEARNING.md").write_text("# LEARNING.md\n", encoding="utf-8")
+    store = TaskStore(config)
+    task = store.create_task("tooling", requested_team="alpha", task_id="task-tooling")
+    path = Path(task["manifest_path"])
+
+    def block(current):
+        current.update(
+            status="BLOCKED",
+            kanban_column="BLOCKED",
+            block_code="unexpected_error",
+            block_reason="MCP tooling unavailable",
+        )
+        incident = ensure_maintenance_incident(current)
+        assert incident is not None
+        incident.update(
+            state="SUSPENDED",
+            environment_attempts=3,
+            environment_prerequisite="tooling",
+            environment_last_error="RuntimeError: MCP tooling unavailable",
+            environment_signature={"available": False, "prerequisite": "tooling"},
+        )
+        current["maintenance"]["active_incident_id"] = None
+        return current
+
+    suspended = store.update(path, block)
+    coordinator = MaintainerCoordinator(config, store=store)
+
+    class Response:
+        status = 200
+        def getcode(self): return 200
+        def close(self): return None
+
+    monkeypatch.setattr(maintenance_module.urllib.request, "urlopen", lambda *_a, **_k: Response())
+    context = SimpleNamespace(
+        pages=[SimpleNamespace(page_id="page", url="https://chatgpt.com/c/tooling")]
+    )
+
+    assert asyncio.run(
+        coordinator._resume_suspended_environments([(path, suspended)], context)
+    ) is False
+    current = store.load(path)
+    incident = current["maintenance"]["incidents"][0]
+    assert incident["state"] == "SUSPENDED"
+    assert current["maintenance"]["active_incident_id"] is None
+
+
+def test_non_cdp_connection_refused_is_not_classified_as_browser_cdp():
+    from playwright_auto.cdpa_maintenance import MaintainerCoordinator
+
+    assert MaintainerCoordinator._environment_prerequisite(
+        ConnectionRefusedError("connection refused to MCP endpoint 127.0.0.1:8101")
+    ) == "tooling"
+    assert MaintainerCoordinator._environment_prerequisite(
+        ConnectionRefusedError("connection refused to https://example.invalid/api")
+    ) == "network"
+    assert MaintainerCoordinator._environment_prerequisite(
+        RuntimeError("tooling timeout while listing capabilities")
+    ) == "tooling"
+
+
+def test_tooling_failure_records_exact_dependency_and_never_uses_http_as_recovery(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import asyncio
+    from types import SimpleNamespace
+
+    import playwright_auto.cdpa_maintenance as maintenance_module
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_maintenance import MaintainerCoordinator, ensure_maintenance_incident
+    from playwright_auto.cdpa_store import TaskStore
+    from test_cdpa_core import write_config
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    (tmp_path / "LEARNING.md").write_text("# LEARNING.md\n", encoding="utf-8")
+    store = TaskStore(config)
+    task = store.create_task("tooling evidence", requested_team="alpha", task_id="task-tooling-evidence")
+    path = Path(task["manifest_path"])
+
+    def block(current):
+        current.update(
+            status="BLOCKED",
+            kanban_column="BLOCKED",
+            block_code="unexpected_error",
+            block_reason="MCP endpoint unavailable",
+        )
+        incident = ensure_maintenance_incident(current)
+        assert incident is not None
+        return current
+
+    task = store.update(path, block)
+    incident = task["maintenance"]["incidents"][0]
+    coordinator = MaintainerCoordinator(config, store=store)
+    context = SimpleNamespace(
+        pages=[SimpleNamespace(page_id="page", url="https://chatgpt.com/c/tooling")]
+    )
+
+    class Response:
+        status = 200
+        def getcode(self): return 200
+        def close(self): return None
+
+    http_calls = []
+    monkeypatch.setattr(
+        maintenance_module.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: http_calls.append((args, kwargs)) or Response(),
+    )
+
+    error = ConnectionRefusedError(
+        "connection refused to MCP endpoint 127.0.0.1:8101"
+    )
+    global_state = coordinator.state_store.load()
+    for _ in range(3):
+        assert coordinator._record_environment_failure(
+            path,
+            incident_id=incident["incident_id"],
+            error=error,
+            browser_context=context,
+            global_state=global_state,
+        ) is True
+
+    suspended = store.load(path)
+    suspended_incident = suspended["maintenance"]["incidents"][0]
+    signature = suspended_incident["environment_signature"]
+    assert suspended_incident["state"] == "SUSPENDED"
+    assert suspended_incident["environment_prerequisite"] == "tooling"
+    assert signature["tooling_probe_supported"] is False
+    assert signature["tooling_dependency_identity"].casefold() == "mcp"
+    assert signature["tooling_endpoint"] == "127.0.0.1:8101"
+    assert signature["available"] is False
+    assert http_calls == []
+
+    assert asyncio.run(
+        coordinator._resume_suspended_environments([(path, suspended)], context)
+    ) is False
+    assert http_calls == []
+    assert store.load(path)["maintenance"]["incidents"][0]["state"] == "SUSPENDED"
+
+
+def test_network_probe_prefers_exact_failure_endpoint(tmp_path: Path, monkeypatch):
+    from types import SimpleNamespace
+
+    import playwright_auto.cdpa_maintenance as maintenance_module
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_maintenance import MaintainerCoordinator
+    from test_cdpa_core import write_config
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    coordinator = MaintainerCoordinator(config)
+    requested = []
+
+    class Response:
+        status = 204
+        def getcode(self): return 204
+        def close(self): return None
+
+    def fake_urlopen(request, timeout):
+        requested.append((request.full_url, request.get_method(), timeout))
+        return Response()
+
+    monkeypatch.setattr(maintenance_module, "_open_no_redirect", fake_urlopen)
+    context = SimpleNamespace(
+        pages=[SimpleNamespace(page_id="chatgpt", url="https://chatgpt.com/c/example")]
+    )
+    signature = coordinator._environment_signature(
+        context,
+        "network",
+        failure_detail="ConnectionRefusedError: https://example.invalid/api refused",
+    )
+
+    assert signature["available"] is True
+    assert signature["network_evidence"]["endpoint"] == "https://example.invalid/api"
+    assert requested == [("https://example.invalid/api", "HEAD", 2.5)]
+
+
+def test_exact_mcp_tools_list_probe_resumes_same_suspended_incident(
+    tmp_path: Path,
+):
+    import asyncio
+    import json
+    import socket
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from types import SimpleNamespace
+
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_maintenance import (
+        MaintainerCoordinator,
+        ToolingProbeDescriptor,
+        ToolingUnavailableError,
+        ensure_maintenance_incident,
+    )
+    from playwright_auto.cdpa_store import TaskStore
+    from test_cdpa_core import write_config
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    (tmp_path / "LEARNING.md").write_text("# LEARNING.md\n", encoding="utf-8")
+    store = TaskStore(config)
+    task = store.create_task(
+        "exact MCP recovery",
+        requested_team="alpha",
+        task_id="task-exact-mcp-recovery",
+    )
+    path = Path(task["manifest_path"])
+
+    def block(current):
+        hop = next(
+            item
+            for item in current["hops"]
+            if item["hop_id"] == current["active_hop_id"]
+        )
+        hop.update(
+            state="waiting",
+            request_id="task-exact-mcp-recovery-hop1",
+            conversation_url="https://chatgpt.com/c/exact-mcp",
+            conversation_generation=2,
+            receipt={
+                "user_turn_id": "tooling-turn-1",
+                "binding": {"page_id": "tooling-page-1"},
+            },
+        )
+        current["roles"]["PLAN"].update(
+            online=False,
+            page_id="tooling-page-1",
+            page_url="https://chatgpt.com/c/exact-mcp",
+            conversation_generation=2,
+        )
+        current.update(
+            status="BLOCKED",
+            kanban_column="BLOCKED",
+            block_code="unexpected_error",
+            block_reason="mcp-g8 tools/list unavailable",
+        )
+        incident = ensure_maintenance_incident(current)
+        assert incident is not None
+        incident["request_id"] = f"{incident['incident_id']}-turn1"
+        incident["prompt"] = "same tooling request"
+        return current
+
+    task = store.update(path, block)
+    incident = task["maintenance"]["incidents"][0]
+    coordinator = MaintainerCoordinator(config, store=store)
+    context = SimpleNamespace(pages=[])
+
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    endpoint = f"http://127.0.0.1:{port}/mcp"
+    descriptor = ToolingProbeDescriptor.mcp_tools_list(
+        dependency="mcp-g8",
+        endpoint=endpoint,
+    )
+    error = ToolingUnavailableError(
+        "mcp-g8 tools/list unavailable",
+        probe=descriptor,
+    )
+    global_state = coordinator.state_store.load()
+    for _ in range(3):
+        assert coordinator._record_environment_failure(
+            path,
+            incident_id=incident["incident_id"],
+            error=error,
+            browser_context=context,
+            global_state=global_state,
+        ) is True
+
+    suspended = store.load(path)
+    suspended_incident = suspended["maintenance"]["incidents"][0]
+    before = {
+        "task_id": suspended["task_id"],
+        "team": suspended["team"],
+        "active_hop_id": suspended["active_hop_id"],
+        "active_role": suspended["active_role"],
+        "hop": next(
+            item
+            for item in suspended["hops"]
+            if item["hop_id"] == suspended["active_hop_id"]
+        ),
+        "request_id": suspended_incident["request_id"],
+        "prompt": suspended_incident["prompt"],
+    }
+    assert suspended_incident["state"] == "SUSPENDED"
+    assert suspended_incident["environment_probe_descriptor"] == descriptor.to_dict()
+    assert asyncio.run(
+        coordinator._resume_suspended_environments([(path, suspended)], context)
+    ) is False
+    failed_probe_state = store.load(path)
+    failed_probe_incident = failed_probe_state["maintenance"]["incidents"][0]
+    failed_signature = failed_probe_incident["environment_last_probe_signature"]
+    assert failed_signature["available"] is False
+    assert failed_signature["tooling_probe_supported"] is True
+    assert failed_signature["tooling_capability_succeeded"] is False
+    assert failed_signature["tooling_evidence"]["executed"] is True
+    assert failed_signature["tooling_evidence"]["error"]
+
+    calls: list[dict[str, object]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            calls.append(payload)
+            if payload.get("method") == "initialize":
+                result = {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "stateless-fixture", "version": "1"},
+                }
+            elif payload.get("method") == "tools/list":
+                result = {"tools": [{"name": "shell_execute"}]}
+            else:
+                self.send_response(400)
+                self.end_headers()
+                return
+            body = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": result,
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        assert asyncio.run(
+            coordinator._resume_suspended_environments([(path, suspended)], context)
+        ) is True
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    resumed = store.load(path)
+    resumed_incident = resumed["maintenance"]["incidents"][0]
+    after = {
+        "task_id": resumed["task_id"],
+        "team": resumed["team"],
+        "active_hop_id": resumed["active_hop_id"],
+        "active_role": resumed["active_role"],
+        "hop": next(
+            item
+            for item in resumed["hops"]
+            if item["hop_id"] == resumed["active_hop_id"]
+        ),
+        "request_id": resumed_incident["request_id"],
+        "prompt": resumed_incident["prompt"],
+    }
+    assert after == before
+    assert resumed_incident["state"] == "OPEN"
+    assert resumed_incident["environment_resume_signature"]["available"] is True
+    assert resumed_incident["environment_resume_signature"]["tooling_probe_supported"] is True
+    assert resumed_incident["environment_resume_signature"]["tooling_capability_succeeded"] is True
+    assert resumed_incident["environment_resume_signature"]["tooling_tool_count"] == 1
+    assert [item["method"] for item in calls] == ["initialize", "tools/list"]
+    assert calls[0]["params"]["protocolVersion"] == "2025-03-26"
+    assert calls[1]["params"] == {}
+
+
+def test_mcp_endpoint_without_tools_list_capability_remains_suspended(tmp_path: Path):
+    import asyncio
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from types import SimpleNamespace
+
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_maintenance import (
+        MaintainerCoordinator,
+        ToolingProbeDescriptor,
+        ensure_maintenance_incident,
+    )
+    from playwright_auto.cdpa_store import TaskStore
+    from test_cdpa_core import write_config
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            body = json.dumps(
+                {"jsonrpc": "2.0", "id": payload["id"], "result": {"healthy": True}}
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        endpoint = f"http://127.0.0.1:{server.server_port}/mcp"
+        config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+        (tmp_path / "LEARNING.md").write_text("# LEARNING.md\n", encoding="utf-8")
+        store = TaskStore(config)
+        task = store.create_task("bad MCP capability", requested_team="alpha", task_id="task-bad-mcp")
+        path = Path(task["manifest_path"])
+
+        def block(current):
+            current.update(
+                status="BLOCKED",
+                kanban_column="BLOCKED",
+                block_code="unexpected_error",
+                block_reason="MCP capability unavailable",
+            )
+            incident = ensure_maintenance_incident(current)
+            assert incident is not None
+            incident.update(
+                state="SUSPENDED",
+                environment_attempts=3,
+                environment_prerequisite="tooling",
+                environment_last_error="ToolingUnavailableError: MCP capability unavailable",
+                environment_probe_descriptor=ToolingProbeDescriptor.mcp_tools_list(
+                    dependency="mcp-g8",
+                    endpoint=endpoint,
+                ).to_dict(),
+                environment_signature={"available": False, "prerequisite": "tooling"},
+            )
+            current["maintenance"]["active_incident_id"] = None
+            return current
+
+        suspended = store.update(path, block)
+        coordinator = MaintainerCoordinator(config, store=store)
+        context = SimpleNamespace(pages=[])
+        assert asyncio.run(
+            coordinator._resume_suspended_environments([(path, suspended)], context)
+        ) is False
+        current = store.load(path)
+        assert current["maintenance"]["incidents"][0]["state"] == "SUSPENDED"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_unallowlisted_tooling_probe_descriptor_fails_closed(tmp_path: Path):
+    import asyncio
+    from types import SimpleNamespace
+
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_maintenance import MaintainerCoordinator, ensure_maintenance_incident
+    from playwright_auto.cdpa_store import TaskStore
+    from test_cdpa_core import write_config
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    (tmp_path / "LEARNING.md").write_text("# LEARNING.md\n", encoding="utf-8")
+    store = TaskStore(config)
+    task = store.create_task("invalid tooling probe", requested_team="alpha", task_id="task-invalid-tooling")
+    path = Path(task["manifest_path"])
+
+    def block(current):
+        current.update(
+            status="BLOCKED",
+            kanban_column="BLOCKED",
+            block_code="unexpected_error",
+            block_reason="tooling unavailable",
+        )
+        incident = ensure_maintenance_incident(current)
+        assert incident is not None
+        incident.update(
+            state="SUSPENDED",
+            environment_attempts=3,
+            environment_prerequisite="tooling",
+            environment_last_error="RuntimeError: tooling unavailable",
+            environment_probe_descriptor={
+                "version": 1,
+                "kind": "shell_command",
+                "dependency": "mcp-g8",
+                "endpoint": "http://127.0.0.1:8101/mcp",
+                "method": "rm -rf /",
+            },
+            environment_signature={"available": False, "prerequisite": "tooling"},
+        )
+        current["maintenance"]["active_incident_id"] = None
+        return current
+
+    suspended = store.update(path, block)
+    coordinator = MaintainerCoordinator(config, store=store)
+    context = SimpleNamespace(pages=[])
+    assert asyncio.run(
+        coordinator._resume_suspended_environments([(path, suspended)], context)
+    ) is False
+    current = store.load(path)
+    incident = current["maintenance"]["incidents"][0]
+    assert incident["state"] == "SUSPENDED"
+    assert current["maintenance"]["active_incident_id"] is None
+
+
+
+def test_tooling_probe_descriptor_rejects_non_loopback_and_redirectable_shapes():
+    import pytest
+
+    from playwright_auto.cdpa_maintenance import ToolingProbeDescriptor
+
+    invalid_endpoints = (
+        "https://127.0.0.1:8101/mcp",
+        "http://example.com:8101/mcp",
+        "http://127.0.0.1/mcp",
+        "http://user@127.0.0.1:8101/mcp",
+        "http://127.0.0.1:8101/mcp?redirect=https://example.com",
+    )
+    for endpoint in invalid_endpoints:
+        with pytest.raises(ValueError):
+            ToolingProbeDescriptor.mcp_tools_list(
+                dependency="mcp-g8",
+                endpoint=endpoint,
+            )
+
+
+def test_mcp_tools_list_probe_does_not_follow_redirects(tmp_path: Path):
+    import asyncio
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from types import SimpleNamespace
+
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_maintenance import (
+        MaintainerCoordinator,
+        ToolingProbeDescriptor,
+        ensure_maintenance_incident,
+    )
+    from playwright_auto.cdpa_store import TaskStore
+    from test_cdpa_core import write_config
+
+    calls = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            calls.append(self.path)
+            self.send_response(302)
+            self.send_header("Location", "http://example.com:80/tools")
+            self.end_headers()
+
+        def log_message(self, *_args):
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        endpoint = f"http://127.0.0.1:{server.server_port}/mcp"
+        config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+        (tmp_path / "LEARNING.md").write_text("# LEARNING.md\n", encoding="utf-8")
+        store = TaskStore(config)
+        task = store.create_task("redirect tooling", requested_team="alpha", task_id="task-tooling-redirect")
+        path = Path(task["manifest_path"])
+
+        def block(current):
+            current.update(
+                status="BLOCKED",
+                kanban_column="BLOCKED",
+                block_code="unexpected_error",
+                block_reason="MCP tools/list unavailable",
+            )
+            incident = ensure_maintenance_incident(current)
+            assert incident is not None
+            incident.update(
+                state="SUSPENDED",
+                environment_attempts=3,
+                environment_prerequisite="tooling",
+                environment_last_error="ToolingUnavailableError: MCP tools/list unavailable",
+                environment_probe_descriptor=ToolingProbeDescriptor.mcp_tools_list(
+                    dependency="mcp-g8",
+                    endpoint=endpoint,
+                ).to_dict(),
+                environment_signature={"available": False, "prerequisite": "tooling"},
+            )
+            current["maintenance"]["active_incident_id"] = None
+            return current
+
+        suspended = store.update(path, block)
+        coordinator = MaintainerCoordinator(config, store=store)
+        assert asyncio.run(
+            coordinator._resume_suspended_environments(
+                [(path, suspended)],
+                SimpleNamespace(pages=[]),
+            )
+        ) is False
+        current = store.load(path)
+        incident = current["maintenance"]["incidents"][0]
+        signature = incident["environment_last_probe_signature"]
+        assert incident["state"] == "SUSPENDED"
+        assert signature["tooling_capability_succeeded"] is False
+        assert "MCP initialize HTTP 302" in signature["tooling_error"]
+        assert calls == ["/mcp"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_production_maintenance_preflight_suspends_and_resumes_via_authenticated_stateful_mcp(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import asyncio
+    import json
+    import socket
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from types import SimpleNamespace
+
+    import playwright_auto.cdpa_maintenance as maintenance_module
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_maintenance import ensure_maintenance_incident
+    from playwright_auto.cdpa_store import TaskStore
+    from test_cdpa_core import write_config
+
+    token = "test-only-static-bearer-never-persist"
+    monkeypatch.setenv("MCP_BEARER_TOKEN", token)
+    monkeypatch.delenv("MCP_AUTH_PASSWORD", raising=False)
+
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    endpoint = f"http://127.0.0.1:{port}/mcp"
+
+    config_path = write_config(tmp_path)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["maintenance"]["tooling_probe"] = {
+        "dependency": "mcp-g8",
+        "endpoint": endpoint,
+        "auth_profile": "local_mcp_static_bearer",
+        "required_tools": ["shell_execute"],
+    }
+    config_path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+    config = load_cdpa_config(config_path, repository_root=tmp_path)
+    store = TaskStore(config)
+    task = store.create_task(
+        "production tooling preflight",
+        requested_team="alpha",
+        task_id="task-production-tooling-preflight",
+    )
+    path = Path(task["manifest_path"])
+
+    def block(current):
+        hop = next(
+            item
+            for item in current["hops"]
+            if item["hop_id"] == current["active_hop_id"]
+        )
+        hop.update(
+            state="waiting",
+            request_id="task-production-tooling-preflight-hop1",
+            receipt={
+                "user_turn_id": "accepted-turn-1",
+                "binding": {"page_id": "accepted-page-1"},
+            },
+        )
+        current.update(
+            status="BLOCKED",
+            kanban_column="BLOCKED",
+            block_code="role_offline",
+            block_reason="exact role tab offline",
+        )
+        incident = ensure_maintenance_incident(current)
+        assert incident is not None
+        incident["request_id"] = "maint-production-tooling-turn1"
+        incident["prompt"] = "same durable maintenance prompt"
+        return current
+
+    task = store.update(path, block)
+    incident = task["maintenance"]["incidents"][0]
+    original = {
+        "task_id": task["task_id"],
+        "team": task["team"],
+        "active_hop_id": task["active_hop_id"],
+        "active_role": task["active_role"],
+        "hop": next(
+            item
+            for item in task["hops"]
+            if item["hop_id"] == task["active_hop_id"]
+        ),
+        "maintenance_request_id": incident["request_id"],
+        "prompt": incident["prompt"],
+    }
+
+    browser_calls = []
+
+    class NoBrowserWork:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def acquire_global_role(self, *_args, **_kwargs):
+            browser_calls.append("acquire")
+            raise AssertionError("tooling preflight must run before browser work")
+
+    monkeypatch.setattr(maintenance_module, "CDPATabActions", NoBrowserWork)
+    coordinator = maintenance_module.MaintainerCoordinator(config, store=store)
+    context = SimpleNamespace(pages=[])
+
+    for _ in range(3):
+        assert asyncio.run(coordinator.advance([(path, store.load(path))], context)) is True
+
+    suspended = store.load(path)
+    suspended_incident = suspended["maintenance"]["incidents"][0]
+    assert suspended_incident["state"] == "SUSPENDED"
+    assert suspended_incident["environment_prerequisite"] == "tooling"
+    descriptor = suspended_incident["environment_probe_descriptor"]
+    assert descriptor["dependency"] == "mcp-g8"
+    assert descriptor["endpoint"] == endpoint
+    assert descriptor["auth_profile"] == "local_mcp_static_bearer"
+    assert descriptor["required_tools"] == ["shell_execute"]
+    assert token not in path.read_text(encoding="utf-8")
+    assert all(
+        token not in candidate.read_text(encoding="utf-8")
+        for candidate in config.plans_root.rglob("*.json")
+    )
+    assert browser_calls == []
+
+    session_id = "stateful-test-session"
+    calls = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def _authorized(self):
+            return self.headers.get("Authorization") == f"Bearer {token}"
+
+        def _json(self, status, payload, *, session=None):
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            if session:
+                self.send_header("MCP-Session-Id", session)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            calls.append(
+                {
+                    "http_method": "POST",
+                    "rpc_method": payload.get("method"),
+                    "session": self.headers.get("MCP-Session-Id"),
+                    "accept": self.headers.get("Accept"),
+                    "protocol": self.headers.get("MCP-Protocol-Version"),
+                    "authorized": self._authorized(),
+                }
+            )
+            if not self._authorized():
+                self._json(401, {"error": "unauthorized"})
+                return
+            method = payload.get("method")
+            if method == "initialize":
+                self._json(
+                    200,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": payload["id"],
+                        "result": {
+                            "protocolVersion": "2025-03-26",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "stateful-fixture", "version": "1"},
+                        },
+                    },
+                    session=session_id,
+                )
+                return
+            if self.headers.get("MCP-Session-Id") != session_id:
+                self._json(400, {"error": "missing session"})
+                return
+            if method == "notifications/initialized":
+                self.send_response(202)
+                self.end_headers()
+                return
+            if method == "tools/list":
+                self._json(
+                    200,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": payload["id"],
+                        "result": {"tools": [{"name": "shell_execute"}]},
+                    },
+                )
+                return
+            self._json(400, {"error": "unsupported"})
+
+        def do_DELETE(self):
+            calls.append(
+                {
+                    "http_method": "DELETE",
+                    "rpc_method": None,
+                    "session": self.headers.get("MCP-Session-Id"),
+                    "accept": self.headers.get("Accept"),
+                    "protocol": self.headers.get("MCP-Protocol-Version"),
+                    "authorized": self._authorized(),
+                }
+            )
+            if not self._authorized() or self.headers.get("MCP-Session-Id") != session_id:
+                self._json(400, {"error": "bad delete"})
+                return
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        assert asyncio.run(
+            coordinator.advance([(path, suspended)], context)
+        ) is True
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    resumed = store.load(path)
+    resumed_incident = resumed["maintenance"]["incidents"][0]
+    current = {
+        "task_id": resumed["task_id"],
+        "team": resumed["team"],
+        "active_hop_id": resumed["active_hop_id"],
+        "active_role": resumed["active_role"],
+        "hop": next(
+            item
+            for item in resumed["hops"]
+            if item["hop_id"] == resumed["active_hop_id"]
+        ),
+        "maintenance_request_id": resumed_incident["request_id"],
+        "prompt": resumed_incident["prompt"],
+    }
+    assert current == original
+    assert resumed_incident["state"] == "OPEN"
+    signature = resumed_incident["environment_resume_signature"]
+    assert signature["available"] is True
+    assert signature["tooling_capability_succeeded"] is True
+    assert signature["tooling_required_tools"] == ["shell_execute"]
+    assert signature["tooling_matched_tools"] == ["shell_execute"]
+    assert signature["tooling_missing_tools"] == []
+    assert signature["tooling_session_mode"] == "stateful"
+    assert signature["tooling_session_id_sha256"]
+    assert signature["tooling_cleanup_attempted"] is True
+    assert signature["tooling_cleanup_succeeded"] is True
+    assert browser_calls == []
+    assert [item["rpc_method"] for item in calls if item["http_method"] == "POST"] == [
+        "initialize",
+        "notifications/initialized",
+        "tools/list",
+    ]
+    assert calls[-1]["http_method"] == "DELETE"
+    assert all(item["authorized"] is True for item in calls)
+    assert all(item["accept"] == "application/json, text/event-stream" for item in calls)
+    assert all(item["protocol"] == "2025-03-26" for item in calls)
+    assert token not in json.dumps(signature)
+    assert all(
+        token not in candidate.read_text(encoding="utf-8")
+        for candidate in config.plans_root.rglob("*.json")
+    )
+
+
+def test_mcp_sse_parser_selects_matching_event_without_combining_messages():
+    from playwright_auto.cdpa_maintenance import MaintainerCoordinator
+
+    raw = (
+        b"event: message\n"
+        b'data: {"jsonrpc":"2.0","id":"other","result":{"tools":[]}}\n\n'
+        b": keepalive\n\n"
+        b"event: message\r\n"
+        b'data: {"jsonrpc":"2.0","id":"wanted",\r\n'
+        b'data: "result":{"tools":[{"name":"shell_execute"}]}}\r\n\r\n'
+    )
+
+    result = MaintainerCoordinator._decode_mcp_response(raw, expected_id="wanted")
+
+    assert result["id"] == "wanted"
+    assert result["result"]["tools"] == [{"name": "shell_execute"}]
+
+
+def test_stateful_mcp_probe_requires_successful_session_cleanup(tmp_path: Path):
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from playwright_auto.cdpa_maintenance import (
+        MaintainerCoordinator,
+        ToolingProbeDescriptor,
+    )
+
+    session_id = "cleanup-failure-session"
+
+    class Handler(BaseHTTPRequestHandler):
+        def _json(self, status, payload, *, session=None):
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            if session:
+                self.send_header("MCP-Session-Id", session)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            if payload.get("method") == "initialize":
+                self._json(
+                    200,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": payload["id"],
+                        "result": {
+                            "protocolVersion": "2025-03-26",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "cleanup-fixture", "version": "1"},
+                        },
+                    },
+                    session=session_id,
+                )
+            elif payload.get("method") == "notifications/initialized":
+                self.send_response(202)
+                self.end_headers()
+            elif payload.get("method") == "tools/list":
+                self._json(
+                    200,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": payload["id"],
+                        "result": {"tools": [{"name": "shell_execute"}]},
+                    },
+                )
+            else:
+                self._json(400, {"error": "unsupported"})
+
+        def do_DELETE(self):
+            self._json(500, {"error": "cleanup failed"})
+
+        def log_message(self, *_args):
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        descriptor = ToolingProbeDescriptor.mcp_tools_list(
+            dependency="mcp-g8",
+            endpoint=f"http://127.0.0.1:{server.server_port}/mcp",
+        )
+        result = MaintainerCoordinator._tooling_environment_probe(
+            "stateful cleanup acceptance",
+            descriptor.to_dict(),
+            execute=True,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert result["available"] is False
+    assert result["capability_succeeded"] is False
+    assert result["cleanup_attempted"] is True
+    assert result["cleanup_succeeded"] is False
+    assert "session cleanup failed" in result["error"]
+
+
+@pytest.mark.parametrize(
+    ("initialized_content_type", "initialized_body", "expected_error"),
+    [
+        (
+            "application/json",
+            b'{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"initialized rejected"}}',
+            "JSON-RPC error",
+        ),
+        (
+            "application/json",
+            b"{malformed-json",
+            "JSONDecodeError",
+        ),
+        (
+            "application/json",
+            b'{"jsonrpc":"2.0","id":null,"result":{}}',
+            "unexpected non-empty response",
+        ),
+        (
+            "text/event-stream",
+            b'data: {"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"initialized rejected"}}\n\n',
+            "JSON-RPC error",
+        ),
+    ],
+)
+def test_stateful_mcp_probe_rejects_nonempty_initialized_protocol_body(
+    initialized_content_type: str,
+    initialized_body: bytes,
+    expected_error: str,
+):
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from playwright_auto.cdpa_maintenance import (
+        MaintainerCoordinator,
+        ToolingProbeDescriptor,
+    )
+
+    session_id = "initialized-rejection-session"
+    calls: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def _json(self, status, payload, *, session=None):
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            if session:
+                self.send_header("MCP-Session-Id", session)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            method = str(payload.get("method") or "")
+            calls.append(method)
+            if method == "initialize":
+                self._json(
+                    200,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": payload["id"],
+                        "result": {
+                            "protocolVersion": "2025-03-26",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "initialized-fixture", "version": "1"},
+                        },
+                    },
+                    session=session_id,
+                )
+                return
+            if method == "notifications/initialized":
+                self.send_response(200)
+                self.send_header("Content-Type", initialized_content_type)
+                self.send_header("Content-Length", str(len(initialized_body)))
+                self.end_headers()
+                self.wfile.write(initialized_body)
+                return
+            if method == "tools/list":
+                self._json(
+                    200,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": payload["id"],
+                        "result": {"tools": [{"name": "shell_execute"}]},
+                    },
+                )
+                return
+            self._json(400, {"error": "unsupported"})
+
+        def do_DELETE(self):
+            calls.append("DELETE")
+            assert self.headers.get("MCP-Session-Id") == session_id
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        descriptor = ToolingProbeDescriptor.mcp_tools_list(
+            dependency="mcp-g8",
+            endpoint=f"http://127.0.0.1:{server.server_port}/mcp",
+        )
+        result = MaintainerCoordinator._tooling_environment_probe(
+            "initialized protocol rejection",
+            descriptor.to_dict(),
+            execute=True,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert result["available"] is False
+    assert result["capability_succeeded"] is False
+    assert result["cleanup_attempted"] is True
+    assert result["cleanup_succeeded"] is True
+    assert expected_error in result["error"]
+    assert calls == ["initialize", "notifications/initialized", "DELETE"]
+    initialized_step = next(
+        item for item in result["evidence"]["steps"] if item["stage"] == "initialized"
+    )
+    assert initialized_step["status"] == 200
+    assert expected_error in initialized_step["error"]
+
+
+def test_network_probe_records_exact_redirect_without_following_target(tmp_path: Path):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from types import SimpleNamespace
+
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_maintenance import MaintainerCoordinator
+    from test_cdpa_core import write_config
+
+    target_hits: list[str] = []
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            target_hits.append(self.path)
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            return None
+
+    target = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+    target_thread = threading.Thread(target=target.serve_forever, daemon=True)
+    target_thread.start()
+
+    class RedirectHandler(BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(302)
+            self.send_header(
+                "Location",
+                f"http://127.0.0.1:{target.server_port}/redirect-target",
+            )
+            self.end_headers()
+
+        def log_message(self, *_args):
+            return None
+
+    redirect = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+    redirect_thread = threading.Thread(target=redirect.serve_forever, daemon=True)
+    redirect_thread.start()
+    try:
+        endpoint = f"http://127.0.0.1:{redirect.server_port}/exact-endpoint"
+        config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+        coordinator = MaintainerCoordinator(config)
+        signature = coordinator._environment_signature(
+            SimpleNamespace(pages=[]),
+            "network",
+            failure_detail=f"TimeoutError: {endpoint} timed out",
+        )
+    finally:
+        redirect.shutdown()
+        redirect.server_close()
+        redirect_thread.join(timeout=5)
+        target.shutdown()
+        target.server_close()
+        target_thread.join(timeout=5)
+
+    assert signature["available"] is True
+    assert signature["network_evidence"] == {
+        "endpoint": endpoint,
+        "method": "HEAD",
+        "timeout_seconds": 2.5,
+        "status": 302,
+        "error": None,
+    }
+    assert target_hits == []
+
+
+def test_legacy_repair_action_is_rejected_before_report_control_or_manifest_mutation(
+    tmp_path: Path,
+):
+    import json
+
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_store import TaskStore
+    from test_cdpa_core import write_config
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    task = store.create_task(
+        "legacy repair rejection",
+        requested_team="alpha",
+        task_id="task-legacy-repair-rejection",
+    )
+    path = Path(task["manifest_path"])
+    before = path.read_bytes()
+    reports_before = tuple(config.plans_root.rglob("*.md"))
+    response = """# Legacy repair
+
+This legacy form cannot carry the required repair contract.
+
+```json
+{"action":"CREATE_REPAIR_TASK","reason":"Create repair.","role":null,"lesson":null,"replacement":null}
+```
+"""
+
+    with pytest.raises(ValueError, match="unsupported maintenance action"):
+        parse_maintenance_response(response)
+
+    assert path.read_bytes() == before
+    assert json.loads(path.read_text(encoding="utf-8"))["controls"] == []
+    assert tuple(config.plans_root.rglob("*.md")) == reports_before
+
+
+def test_network_failure_credentials_are_redacted_before_manifest_global_prompt_and_report(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import json
+    from types import SimpleNamespace
+
+    import playwright_auto.cdpa_maintenance as maintenance_module
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_store import TaskStore
+    from test_cdpa_core import write_config
+
+    secret_query = "review-secret-token-should-not-persist"
+    secret_user = "review-basic-user"
+    secret_password = "review-basic-password"
+    secret_bearer = "review-bearer-secret"
+    sensitive_url = (
+        f"https://{secret_user}:{secret_password}@api.example.invalid/run"
+        f"?access_token={secret_query}&mode=check#review-fragment-secret"
+    )
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    (tmp_path / "LEARNING.md").write_text("# LEARNING.md\n", encoding="utf-8")
+    store = TaskStore(config)
+    state = store.create_task(
+        "credential sanitization",
+        requested_team="alpha",
+        task_id="task-credential-sanitization",
+    )
+    path = Path(state["manifest_path"])
+
+    def block(current):
+        current.update(
+            status="BLOCKED",
+            kanban_column="BLOCKED",
+            block_code="unexpected_error",
+            block_reason="network timeout",
+        )
+        incident = ensure_maintenance_incident(current)
+        assert incident is not None
+        return current
+
+    state = store.update(path, block)
+    incident = state["maintenance"]["incidents"][0]
+    coordinator = maintenance_module.MaintainerCoordinator(config, store=store)
+    network_calls: list[str] = []
+
+    def forbidden_probe(request, timeout):
+        network_calls.append(request.full_url)
+        raise AssertionError("credential-bearing endpoint must not be probed without auth profile")
+
+    monkeypatch.setattr(maintenance_module, "_open_no_redirect", forbidden_probe)
+    global_state = coordinator.state_store.load()
+    error = TimeoutError(
+        f"GET {sensitive_url} Authorization: Bearer {secret_bearer} timed out"
+    )
+
+    assert coordinator._record_environment_failure(
+        path,
+        incident_id=incident["incident_id"],
+        error=error,
+        browser_context=SimpleNamespace(pages=[]),
+        global_state=global_state,
+    ) is True
+
+    current = store.load(path)
+    current_incident = current["maintenance"]["incidents"][0]
+    prompt = coordinator._prompt(
+        current,
+        current_incident,
+        include_constructor=False,
+        tasks=[current],
+    )
+    store.update_maintenance(
+        path,
+        lambda value: (
+            value["maintenance"]["incidents"][0].update(prompt=prompt) or value
+        ),
+    )
+    evidence = write_maintenance_report(
+        tmp_path,
+        team="alpha",
+        turn=1,
+        report=(
+            "# Sanitized report\n\n"
+            f"Observed {sensitive_url} Authorization: Bearer {secret_bearer}.\n"
+        ),
+        at=datetime(2026, 7, 25, 5, 0, 0, tzinfo=timezone.utc),
+    )
+
+    durable_text = "\n".join(
+        candidate.read_text(encoding="utf-8", errors="replace")
+        for candidate in config.plans_root.rglob("*")
+        if candidate.is_file() and candidate.stat().st_size < 2_000_000
+    )
+    global_text = coordinator.state_store.path.read_text(encoding="utf-8")
+    report_text = Path(evidence.path).read_text(encoding="utf-8")
+    serialized_incident = json.dumps(store.load(path)["maintenance"], ensure_ascii=False)
+    for secret in (
+        secret_query,
+        secret_user,
+        secret_password,
+        secret_bearer,
+        "review-fragment-secret",
+    ):
+        assert secret not in durable_text
+        assert secret not in global_text
+        assert secret not in prompt
+        assert secret not in report_text
+        assert secret not in serialized_incident
+    assert network_calls == []
+    assert "[REDACTED]" in serialized_incident
+    assert "[REDACTED]" in report_text
+    assert current_incident["environment_signature"]["network_evidence"] is None
+    assert current_incident["environment_signature"]["network_available"] is False
+
+
+def test_prompt_projects_allowlisted_maintenance_summary_without_raw_prompt_or_evidence(
+    tmp_path: Path,
+):
+    import json
+
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_maintenance import MaintainerCoordinator
+    from test_cdpa_core import write_config
+
+    secret = "review-secret-prompt-token"
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    coordinator = MaintainerCoordinator(config)
+    incident = {
+        "incident_id": "maint-secret",
+        "state": "SUSPENDED",
+        "turn": 3,
+        "trigger_status": "BLOCKED",
+        "trigger_code": "unexpected_error",
+        "trigger_reason": f"failed token={secret}",
+        "source_hop_id": 7,
+        "source_role": "DEV",
+        "created_at": "2026-07-25T05:00:00+00:00",
+        "updated_at": "2026-07-25T05:01:00+00:00",
+        "environment_attempts": 3,
+        "environment_prerequisite": "network",
+        "environment_last_error": f"TimeoutError: access_token={secret}",
+        "environment_signature": {
+            "version": 3,
+            "prerequisite": "network",
+            "available": False,
+            "network_available": False,
+            "network_evidence": {
+                "endpoint": f"https://api.invalid/?access_token={secret}",
+                "method": "HEAD",
+                "status": None,
+                "error": f"token={secret}",
+            },
+        },
+        "environment_evidence": [{"raw": secret}],
+        "prompt": f"full maintainer prompt with {secret}",
+        "request_id": "maint-secret-turn3",
+        "last_error": f"Bearer {secret}",
+    }
+    task = {
+        "task_id": "task-secret",
+        "team": "alpha",
+        "task_text": "safe task",
+        "repository": str(tmp_path),
+        "status": "BLOCKED",
+        "block_code": "unexpected_error",
+        "block_reason": "safe block",
+        "active_hop_id": None,
+        "active_role": None,
+        "roles": {},
+        "hops": [],
+        "controls": [],
+        "errors": [],
+        "route_timeline": [],
+        "dependency_events": [],
+        "maintenance": {"active_incident_id": "maint-secret", "incidents": [incident]},
+    }
+
+    prompt = coordinator._prompt(task, incident, include_constructor=False, tasks=[task])
+    payload = json.loads(prompt.split("CDPA_MAINTENANCE_INCIDENT\n", 1)[1].split("\n\nReturn", 1)[0])
+
+    assert secret not in prompt
+    summary = payload["recent_maintenance_incidents"][0]
+    assert "prompt" not in summary
+    assert "environment_evidence" not in summary
+    assert "environment_probe_checks" not in summary
+    assert summary["environment_last_error"] == "TimeoutError: access_token=[REDACTED]"
+    assert summary["environment_signature"]["network_evidence"]["endpoint"].endswith(
+        "access_token=%5BREDACTED%5D"
+    )
+
+
+@pytest.mark.parametrize(
+    ("repair_override", "message"),
+    [
+        ({"root_cause": "r" * 1201}, "root cause"),
+        ({"reason": "q" * 1201}, "reason"),
+        ({"reproduction": "p" * 2401}, "reproduction"),
+        ({"required_tests": [f"test-{index}" for index in range(17)]}, "required tests"),
+        ({"required_tests": ["t" * 301]}, "required test"),
+        (
+            {
+                "source_areas": [
+                    "cdpa_worker",
+                    "cdpa_store",
+                    "cdpa_maintenance",
+                    "cdpa_actions",
+                    "dashboard",
+                    "dependencies",
+                    "queue",
+                    "transport",
+                    "tests",
+                ]
+            },
+            "source areas",
+        ),
+    ],
+)
+def test_parse_v2_repair_uses_canonical_worker_bounds(
+    repair_override: dict[str, object],
+    message: str,
+):
+    import json
+
+    repair = {
+        "root_cause": "bounded root cause",
+        "reason": "bounded reason",
+        "disposition": "HOLD_FOR_REPAIR",
+        "reproduction": "bounded reproduction",
+        "source_areas": ["cdpa_worker", "tests"],
+        "required_tests": ["focused regression"],
+    }
+    repair.update(repair_override)
+    response = (
+        "# Bounded repair\n\n"
+        "```json\n"
+        + json.dumps(
+            {
+                "version": 2,
+                "recovery": [],
+                "repair": repair,
+                "lesson": None,
+            }
+        )
+        + "\n```"
+    )
+
+    with pytest.raises(ValueError, match=message):
+        parse_maintenance_response(response)
+
+
+def _strict_v2_repair_response(repair_override: dict[str, object]) -> str:
+    import json
+
+    repair: dict[str, object] = {
+        "root_cause": "strict root cause",
+        "reason": "strict reason",
+        "disposition": "CONTINUE_IN_PARALLEL",
+        "reproduction": "strict reproduction",
+        "source_areas": ["tests"],
+        "required_tests": ["focused regression"],
+    }
+    repair.update(repair_override)
+    return (
+        "# Strict repair\n\n```json\n"
+        + json.dumps(
+            {
+                "version": 2,
+                "recovery": [],
+                "repair": repair,
+                "lesson": None,
+            }
+        )
+        + "\n```"
+    )
+
+
+@pytest.mark.parametrize(
+    ("repair_override", "message"),
+    [
+        ({"required_tests": ["same"] * 17}, "required tests may contain at most 16 raw entries"),
+        ({"source_areas": ["tests"] * 9}, "source areas may contain at most 8 raw entries"),
+        ({"required_tests": ["same", "same"]}, "required tests must not contain duplicates"),
+        ({"source_areas": ["tests", "tests"]}, "source areas must not contain duplicates"),
+        ({"required_tests": [" same ", "same"]}, "required tests must not normalize to duplicates"),
+        ({"source_areas": [" tests ", "tests"]}, "source areas must not normalize to duplicates"),
+    ],
+)
+def test_parse_v2_repair_rejects_raw_count_and_duplicate_bypass(
+    repair_override: dict[str, object],
+    message: str,
+):
+    with pytest.raises(ValueError, match=message):
+        parse_maintenance_response(_strict_v2_repair_response(repair_override))
+
+
+@pytest.mark.parametrize("field", ["root_cause", "reason", "disposition", "reproduction"])
+@pytest.mark.parametrize("value", [123, True, {"bad": "type"}, None])
+def test_parse_v2_repair_rejects_non_string_required_fields(field: str, value: object):
+    with pytest.raises(ValueError, match="string"):
+        parse_maintenance_response(_strict_v2_repair_response({field: value}))
+
+
+@pytest.mark.parametrize("field", ["source_areas", "required_tests"])
+@pytest.mark.parametrize("value", [123, True, {"bad": "type"}, None])
+def test_parse_v2_repair_rejects_non_list_collections(field: str, value: object):
+    with pytest.raises(ValueError, match="list"):
+        parse_maintenance_response(_strict_v2_repair_response({field: value}))
+
+
+@pytest.mark.parametrize("field", ["source_areas", "required_tests"])
+@pytest.mark.parametrize("value", [123, True, {"bad": "type"}, None])
+def test_parse_v2_repair_rejects_non_string_collection_items(field: str, value: object):
+    message = "source area item" if field == "source_areas" else "required test item"
+    with pytest.raises(ValueError, match=message):
+        parse_maintenance_response(_strict_v2_repair_response({field: [value]}))
+
+
+def test_path_embedded_credentials_are_redacted_and_never_probed_across_maintenance_surfaces(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import json
+    from types import SimpleNamespace
+
+    import playwright_auto.cdpa_maintenance as maintenance_module
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_safety import (
+        extract_probeable_url,
+        probeable_url,
+        sanitize_text,
+        sanitize_url,
+    )
+    from playwright_auto.cdpa_store import TaskStore
+    from playwright_auto.dashboard import build_task_payload
+    from test_cdpa_core import write_config
+
+    secret = "review-webhook-path-secret-token"
+    sensitive_url = f"https://api.example.invalid/webhooks/{secret}/status"
+    sanitized_url = sanitize_url(sensitive_url)
+
+    assert sanitized_url is not None
+    assert secret not in sanitized_url
+    assert "[REDACTED]" in sanitized_url
+    assert secret not in sanitize_text(f"GET {sensitive_url} failed")
+    assert probeable_url(sensitive_url) is None
+    assert extract_probeable_url(f"GET {sensitive_url} failed") is None
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    (tmp_path / "LEARNING.md").write_text("# LEARNING.md\n", encoding="utf-8")
+    store = TaskStore(config)
+    state = store.create_task(
+        "path credential sanitization",
+        requested_team="alpha",
+        task_id="task-path-credential-sanitization",
+    )
+    path = Path(state["manifest_path"])
+
+    def block(current):
+        current.update(
+            status="BLOCKED",
+            kanban_column="BLOCKED",
+            block_code="unexpected_error",
+            block_reason="network timeout",
+        )
+        incident = ensure_maintenance_incident(current)
+        assert incident is not None
+        return current
+
+    state = store.update(path, block)
+    incident = state["maintenance"]["incidents"][0]
+    coordinator = maintenance_module.MaintainerCoordinator(config, store=store)
+    probe_calls: list[str] = []
+
+    class FakeResponse:
+        status = 204
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def record_probe(request, timeout):
+        probe_calls.append(request.full_url)
+        return FakeResponse()
+
+    monkeypatch.setattr(maintenance_module, "_open_no_redirect", record_probe)
+    global_state = coordinator.state_store.load()
+    error = TimeoutError(f"GET {sensitive_url} timed out")
+
+    assert coordinator._record_environment_failure(
+        path,
+        incident_id=incident["incident_id"],
+        error=error,
+        browser_context=SimpleNamespace(pages=[]),
+        global_state=global_state,
+    ) is True
+
+    current = store.load(path)
+    current_incident = current["maintenance"]["incidents"][0]
+    prompt = coordinator._prompt(
+        current,
+        current_incident,
+        include_constructor=False,
+        tasks=[current],
+    )
+    store.update_maintenance(
+        path,
+        lambda value: (
+            value["maintenance"]["incidents"][0].update(prompt=prompt) or value
+        ),
+    )
+    evidence = write_maintenance_report(
+        tmp_path,
+        team="alpha",
+        turn=1,
+        report=f"# Path credential report\n\nObserved {sensitive_url}.\n",
+        at=datetime(2026, 7, 25, 6, 35, 0, tzinfo=timezone.utc),
+    )
+    dashboard = build_task_payload(store.load(path), tasks=[store.load(path)])
+
+    surfaces = {
+        "manifest": path.read_text(encoding="utf-8"),
+        "global": coordinator.state_store.path.read_text(encoding="utf-8"),
+        "prompt": prompt,
+        "report": Path(evidence.path).read_text(encoding="utf-8"),
+        "dashboard": json.dumps(dashboard, ensure_ascii=False),
+    }
+    assert probe_calls == []
+    assert current_incident["environment_signature"]["network_evidence"] is None
+    assert current_incident["environment_signature"]["network_available"] is False
+    for text in surfaces.values():
+        assert secret not in text
+        assert "[REDACTED]" in text
+
+
+@pytest.mark.parametrize(
+    "sensitive_url",
+    [
+        "https://api.example.invalid/webhooks/A9b8C7d6E5f4G3h2J1k0/status",
+        "https://api.example.invalid/reset/550e8400-e29b-41d4-a716-446655440000",
+        "https://api.example.invalid/capability/opaque-value-12345/run",
+        "https://api.example.invalid/signed/opaque-signature-value/result",
+        "https://api.example.invalid/run/secret-token-value/status",
+        "https://api.example.invalid/run/aaaaaaaa.bbbbbbbb.cccccccc/status",
+    ],
+)
+def test_high_risk_path_credentials_are_redacted_and_unprobeable(sensitive_url: str):
+    from playwright_auto.cdpa_safety import probeable_url, sanitize_url
+
+    sanitized = sanitize_url(sensitive_url)
+    assert sanitized is not None
+    assert sanitized != sensitive_url
+    assert "[REDACTED]" in sanitized
+    assert probeable_url(sensitive_url) is None
+
+
+def test_normal_resource_identifier_path_remains_probeable():
+    from playwright_auto.cdpa_safety import probeable_url, sanitize_url
+
+    url = "https://api.example.invalid/v1/resources/550e8400-e29b-41d4-a716-446655440000/status"
+    assert sanitize_url(url) == url
+    assert probeable_url(url) == url
+
+
+_MULTI_SEGMENT_HIGH_RISK_PATHS = (
+    "/webhooks/incoming/{secret}/status",
+    "/oauth/callback/{secret}/complete",
+    "/password-reset/confirm/{secret}",
+    "/capability/v1/{secret}/run",
+    "/magic-link/callback/{secret}",
+    "/password-reset-link/{secret}",
+    "/signed-url/{secret}/result",
+)
+
+
+@pytest.mark.parametrize("path_template", _MULTI_SEGMENT_HIGH_RISK_PATHS)
+def test_multi_segment_and_compound_high_risk_paths_are_fully_redacted_and_unprobeable(
+    path_template: str,
+):
+    from playwright_auto.cdpa_safety import (
+        extract_probeable_url,
+        probeable_url,
+        sanitize_text,
+        sanitize_url,
+    )
+
+    secret = "K7p4Q9Lm3Vx8"
+    url = "https://api.example.invalid" + path_template.format(secret=secret)
+    sanitized = sanitize_url(url)
+
+    assert sanitized is not None
+    assert secret not in sanitized
+    assert "[REDACTED]" in sanitized
+    assert secret not in sanitize_text(f"GET {url} failed")
+    assert probeable_url(url) is None
+    assert extract_probeable_url(f"GET {url} failed") is None
+
+
+@pytest.mark.parametrize("path_template", _MULTI_SEGMENT_HIGH_RISK_PATHS)
+def test_multi_segment_high_risk_paths_never_probe_or_persist_on_maintenance_surfaces(
+    tmp_path: Path,
+    monkeypatch,
+    path_template: str,
+):
+    import json
+    from types import SimpleNamespace
+
+    import playwright_auto.cdpa_maintenance as maintenance_module
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_store import TaskStore
+    from playwright_auto.dashboard import build_task_payload
+    from test_cdpa_core import write_config
+
+    secret = "K7p4Q9Lm3Vx8"
+    sensitive_url = "https://api.example.invalid" + path_template.format(secret=secret)
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    (tmp_path / "LEARNING.md").write_text("# LEARNING.md\n", encoding="utf-8")
+    store = TaskStore(config)
+    state = store.create_task(
+        "multi segment path credential sanitization",
+        requested_team="alpha",
+        task_id="task-multi-segment-path-credential",
+    )
+    manifest_path = Path(state["manifest_path"])
+
+    def block(current):
+        current.update(
+            status="BLOCKED",
+            kanban_column="BLOCKED",
+            block_code="unexpected_error",
+            block_reason="network timeout",
+        )
+        incident = ensure_maintenance_incident(current)
+        assert incident is not None
+        return current
+
+    state = store.update(manifest_path, block)
+    incident = state["maintenance"]["incidents"][0]
+    coordinator = maintenance_module.MaintainerCoordinator(config, store=store)
+    probe_calls: list[str] = []
+
+    class FakeResponse:
+        status = 204
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def record_probe(request, timeout):
+        probe_calls.append(request.full_url)
+        return FakeResponse()
+
+    monkeypatch.setattr(maintenance_module, "_open_no_redirect", record_probe)
+    global_state = coordinator.state_store.load()
+    error = TimeoutError(f"GET {sensitive_url} timed out")
+
+    assert coordinator._record_environment_failure(
+        manifest_path,
+        incident_id=incident["incident_id"],
+        error=error,
+        browser_context=SimpleNamespace(pages=[]),
+        global_state=global_state,
+    ) is True
+
+    current = store.load(manifest_path)
+    current_incident = current["maintenance"]["incidents"][0]
+    prompt = coordinator._prompt(
+        current,
+        current_incident,
+        include_constructor=False,
+        tasks=[current],
+    )
+    store.update_maintenance(
+        manifest_path,
+        lambda value: (
+            value["maintenance"]["incidents"][0].update(prompt=prompt) or value
+        ),
+    )
+    report = write_maintenance_report(
+        tmp_path,
+        team="alpha",
+        turn=1,
+        report=f"# Multi-segment path report\n\nObserved {sensitive_url}.\n",
+        at=datetime(2026, 7, 25, 7, 15, 0, tzinfo=timezone.utc),
+    )
+    current = store.load(manifest_path)
+    dashboard = build_task_payload(current, tasks=[current])
+    surfaces = {
+        "manifest": manifest_path.read_text(encoding="utf-8"),
+        "global": coordinator.state_store.path.read_text(encoding="utf-8"),
+        "prompt": prompt,
+        "report": Path(report.path).read_text(encoding="utf-8"),
+        "dashboard": json.dumps(dashboard, ensure_ascii=False),
+        "timeline": json.dumps(dashboard["timeline"], ensure_ascii=False),
+    }
+
+    assert probe_calls == []
+    assert current_incident["environment_signature"]["network_evidence"] is None
+    assert current_incident["environment_signature"]["network_available"] is False
+    for value in surfaces.values():
+        assert secret not in value
+        assert "[REDACTED]" in value
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "/magic-link-callback/K7p4Q9Lm3Vx8/complete",
+        "/webhook-incoming/K7p4Q9Lm3Vx8/status",
+        "/oauth-callback/K7p4Q9Lm3Vx8/complete",
+        "/capability-v1/K7p4Q9Lm3Vx8/run",
+        "/authorization-callback/K7p4Q9Lm3Vx8/complete",
+    ),
+)
+def test_tokenized_compound_high_risk_marker_starts_fail_closed_tail(path: str):
+    from playwright_auto.cdpa_safety import probeable_url, sanitize_url
+
+    url = "https://api.example.invalid" + path
+    sanitized = sanitize_url(url)
+    assert sanitized is not None
+    assert "K7p4Q9Lm3Vx8" not in sanitized
+    assert "[REDACTED]" in sanitized
+    assert probeable_url(url) is None
+
+
+def test_bare_high_risk_context_is_unprobeable_even_without_a_tail():
+    from playwright_auto.cdpa_safety import probeable_url, sanitize_url
+
+    url = "https://api.example.invalid/signed-url"
+    assert sanitize_url(url) == "https://api.example.invalid/[REDACTED]"
+    assert probeable_url(url) is None
+
+
+_DIRECT_MARKER_VALUE_PATHS = (
+    "/run/token-{secret}/status",
+    "/run/secret_{secret}/status",
+    "/run/CREDENTIAL-{secret}/status",
+    "/run/signature-{secret}/status",
+    "/run/session-{secret}/status",
+    "/run/jwt-{secret}/status",
+    "/run/api-key-{secret}/status",
+    "/run/auth-{secret}/status",
+    "/run/authorization-{secret}/status",
+    "/run/code-{secret}/status",
+    "/run/key-{secret}/status",
+    "/run/signed-{secret}/status",
+    "/run/token%2D{secret}/status",
+)
+
+
+@pytest.mark.parametrize("path_template", _DIRECT_MARKER_VALUE_PATHS)
+def test_direct_marker_value_segment_is_redacted_with_its_tail(path_template: str):
+    from playwright_auto.cdpa_safety import (
+        extract_probeable_url,
+        probeable_url,
+        sanitize_text,
+        sanitize_url,
+    )
+
+    secret = "K7p4Q9Lm3Vx8"
+    url = "https://api.example.invalid" + path_template.format(secret=secret)
+    sanitized = sanitize_url(url)
+
+    assert sanitized is not None
+    assert secret not in sanitized
+    assert "[REDACTED]" in sanitized
+    assert secret not in sanitize_text(f"GET {url} failed")
+    assert probeable_url(url) is None
+    assert extract_probeable_url(f"GET {url} failed") is None
+
+
+@pytest.mark.parametrize("path_template", _DIRECT_MARKER_VALUE_PATHS)
+def test_direct_marker_value_never_probes_or_persists_on_maintenance_surfaces(
+    tmp_path: Path,
+    monkeypatch,
+    path_template: str,
+):
+    import json
+    from types import SimpleNamespace
+
+    import playwright_auto.cdpa_maintenance as maintenance_module
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_store import TaskStore
+    from playwright_auto.dashboard import build_task_payload
+    from test_cdpa_core import write_config
+
+    secret = "K7p4Q9Lm3Vx8"
+    sensitive_url = "https://api.example.invalid" + path_template.format(secret=secret)
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    (tmp_path / "LEARNING.md").write_text("# LEARNING.md\n", encoding="utf-8")
+    store = TaskStore(config)
+    state = store.create_task(
+        "direct marker value credential sanitization",
+        requested_team="alpha",
+        task_id="task-direct-marker-value-credential",
+    )
+    manifest_path = Path(state["manifest_path"])
+
+    def block(current):
+        current.update(
+            status="BLOCKED",
+            kanban_column="BLOCKED",
+            block_code="unexpected_error",
+            block_reason="network timeout",
+        )
+        incident = ensure_maintenance_incident(current)
+        assert incident is not None
+        return current
+
+    state = store.update(manifest_path, block)
+    incident = state["maintenance"]["incidents"][0]
+    coordinator = maintenance_module.MaintainerCoordinator(config, store=store)
+    probe_calls: list[str] = []
+
+    class FakeResponse:
+        status = 204
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def record_probe(request, timeout):
+        probe_calls.append(request.full_url)
+        return FakeResponse()
+
+    monkeypatch.setattr(maintenance_module, "_open_no_redirect", record_probe)
+    global_state = coordinator.state_store.load()
+    error = TimeoutError(f"GET {sensitive_url} timed out")
+
+    assert coordinator._record_environment_failure(
+        manifest_path,
+        incident_id=incident["incident_id"],
+        error=error,
+        browser_context=SimpleNamespace(pages=[]),
+        global_state=global_state,
+    ) is True
+
+    current = store.load(manifest_path)
+    current_incident = current["maintenance"]["incidents"][0]
+    prompt = coordinator._prompt(
+        current,
+        current_incident,
+        include_constructor=False,
+        tasks=[current],
+    )
+    store.update_maintenance(
+        manifest_path,
+        lambda value: (
+            value["maintenance"]["incidents"][0].update(prompt=prompt) or value
+        ),
+    )
+    report = write_maintenance_report(
+        tmp_path,
+        team="alpha",
+        turn=1,
+        report=f"# Direct marker value report\n\nObserved {sensitive_url}.\n",
+        at=datetime(2026, 7, 25, 7, 40, 0, tzinfo=timezone.utc),
+    )
+    current = store.load(manifest_path)
+    dashboard = build_task_payload(current, tasks=[current])
+    surfaces = {
+        "manifest": manifest_path.read_text(encoding="utf-8"),
+        "global": coordinator.state_store.path.read_text(encoding="utf-8"),
+        "prompt": prompt,
+        "report": Path(report.path).read_text(encoding="utf-8"),
+        "dashboard": json.dumps(dashboard, ensure_ascii=False),
+        "timeline": json.dumps(dashboard["timeline"], ensure_ascii=False),
+    }
+
+    assert probe_calls == []
+    assert current_incident["environment_signature"]["network_evidence"] is None
+    assert current_incident["environment_signature"]["network_available"] is False
+    for value in surfaces.values():
+        assert secret not in value
+        assert "[REDACTED]" in value
+
+
+def test_direct_credential_segment_itself_is_removed_not_only_its_tail():
+    from playwright_auto.cdpa_safety import sanitize_url
+
+    url = "https://api.example.invalid/run/secret-token-value/status"
+    sanitized = sanitize_url(url)
+    assert sanitized is not None
+    assert "secret-token-value" not in sanitized
+    assert sanitized == (
+        "https://api.example.invalid/run/[REDACTED]/[REDACTED]"
+    )
+
+
+_CANONICALIZED_HIGH_RISK_ROUTE_PATHS = (
+    "/oauth2/callback/{secret}/complete",
+    "/oauthCallback/{secret}/complete",
+    "/oauthcallback/{secret}/complete",
+    "/oauth2Callback/{secret}/complete",
+    "/oauth2callback/{secret}/complete",
+    "/signedUrl/{secret}/result",
+    "/signedurl/{secret}/result",
+    "/magicLink/{secret}/complete",
+    "/magiclink/{secret}/complete",
+    "/webhookIncoming/{secret}/status",
+    "/webhookincoming/{secret}/status",
+    "/authorizationCallback/{secret}/complete",
+    "/authorizationcallback/{secret}/complete",
+    "/apiKey/{secret}/status",
+    "/apikey/{secret}/status",
+    "/accessToken/{secret}/status",
+    "/accesstoken/{secret}/status",
+    "/sessionId/{secret}/status",
+    "/sessionid/{secret}/status",
+    "/passwordResetLink/{secret}",
+    "/passwordresetlink/{secret}",
+    "/resetPassword/{secret}/complete",
+    "/resetpassword/{secret}/complete",
+    "/refreshtoken/{secret}/status",
+    "/idtoken/{secret}/status",
+    "/apitoken/{secret}/status",
+    "/clientsecret/{secret}/status",
+    "/clientcredential/{secret}/status",
+    "/bearertoken/{secret}/status",
+    "/authtoken/{secret}/status",
+    "/sessiontoken/{secret}/status",
+    "/csrftoken/{secret}/status",
+    "/verificationcode/{secret}/status",
+    "/activationcode/{secret}/status",
+    "/invitecode/{secret}/status",
+    "/resetcode/{secret}/status",
+    "/passwordreset/{secret}/complete",
+    "/magiclinkcallback/{secret}/complete",
+    "/signedurlcallback/{secret}/complete",
+    "/webhooksincoming/{secret}/status",
+    "/webhookcallback/{secret}/status",
+    "/oauthredirect/{secret}/complete",
+    "/oauth2redirect/{secret}/complete",
+    "/refreshToken/{secret}/status",
+    "/idToken/{secret}/status",
+    "/apiToken/{secret}/status",
+    "/clientSecret/{secret}/status",
+    "/clientCredential/{secret}/status",
+    "/bearerToken/{secret}/status",
+    "/authToken/{secret}/status",
+    "/sessionToken/{secret}/status",
+    "/csrfToken/{secret}/status",
+    "/verificationCode/{secret}/status",
+    "/activationCode/{secret}/status",
+    "/inviteCode/{secret}/status",
+    "/resetCode/{secret}/status",
+    "/passwordReset/{secret}/complete",
+    "/magicLinkCallback/{secret}/complete",
+    "/signedUrlCallback/{secret}/complete",
+    "/webhooksIncoming/{secret}/status",
+    "/webhookCallback/{secret}/status",
+    "/oauthRedirect/{secret}/complete",
+    "/oauth2Redirect/{secret}/complete",
+    "/RefreshToken/{secret}/status",
+    "/IDToken/{secret}/status",
+    "/APIToken/{secret}/status",
+    "/ClientSecret/{secret}/status",
+    "/CSRFToken/{secret}/status",
+    "/VerificationCode/{secret}/status",
+    "/MagicLinkCallback/{secret}/complete",
+    "/SignedURLCallback/{secret}/complete",
+    "/OAuth2Redirect/{secret}/complete",
+)
+
+
+@pytest.mark.parametrize("path_template", _CANONICALIZED_HIGH_RISK_ROUTE_PATHS)
+def test_camel_compact_and_numeric_high_risk_routes_are_fully_redacted(
+    path_template: str,
+):
+    from playwright_auto.cdpa_safety import (
+        extract_probeable_url,
+        probeable_url,
+        sanitize_text,
+        sanitize_url,
+    )
+
+    secret = "K7p4Q9Lm3Vx8"
+    url = "https://api.example.invalid" + path_template.format(secret=secret)
+    sanitized = sanitize_url(url)
+
+    assert sanitized is not None
+    assert secret not in sanitized
+    assert "[REDACTED]" in sanitized
+    assert secret not in sanitize_text(f"GET {url} failed")
+    assert probeable_url(url) is None
+    assert extract_probeable_url(f"GET {url} failed") is None
+
+
+@pytest.mark.parametrize("path_template", _CANONICALIZED_HIGH_RISK_ROUTE_PATHS)
+def test_canonicalized_high_risk_routes_never_probe_or_persist_on_maintenance_surfaces(
+    tmp_path: Path,
+    monkeypatch,
+    path_template: str,
+):
+    import json
+    from types import SimpleNamespace
+
+    import playwright_auto.cdpa_maintenance as maintenance_module
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_store import TaskStore
+    from playwright_auto.dashboard import build_task_payload
+    from test_cdpa_core import write_config
+
+    secret = "K7p4Q9Lm3Vx8"
+    sensitive_url = "https://api.example.invalid" + path_template.format(secret=secret)
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    (tmp_path / "LEARNING.md").write_text("# LEARNING.md\n", encoding="utf-8")
+    store = TaskStore(config)
+    state = store.create_task(
+        "canonicalized route credential sanitization",
+        requested_team="alpha",
+        task_id="task-canonicalized-route-credential",
+    )
+    manifest_path = Path(state["manifest_path"])
+
+    def block(current):
+        current.update(
+            status="BLOCKED",
+            kanban_column="BLOCKED",
+            block_code="unexpected_error",
+            block_reason="network timeout",
+        )
+        incident = ensure_maintenance_incident(current)
+        assert incident is not None
+        return current
+
+    state = store.update(manifest_path, block)
+    incident = state["maintenance"]["incidents"][0]
+    coordinator = maintenance_module.MaintainerCoordinator(config, store=store)
+    probe_calls: list[str] = []
+
+    class FakeResponse:
+        status = 204
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def record_probe(request, timeout):
+        probe_calls.append(request.full_url)
+        return FakeResponse()
+
+    monkeypatch.setattr(maintenance_module, "_open_no_redirect", record_probe)
+    global_state = coordinator.state_store.load()
+    error = TimeoutError(f"GET {sensitive_url} timed out")
+
+    assert coordinator._record_environment_failure(
+        manifest_path,
+        incident_id=incident["incident_id"],
+        error=error,
+        browser_context=SimpleNamespace(pages=[]),
+        global_state=global_state,
+    ) is True
+
+    current = store.load(manifest_path)
+    current_incident = current["maintenance"]["incidents"][0]
+    prompt = coordinator._prompt(
+        current,
+        current_incident,
+        include_constructor=False,
+        tasks=[current],
+    )
+    store.update_maintenance(
+        manifest_path,
+        lambda value: (
+            value["maintenance"]["incidents"][0].update(prompt=prompt) or value
+        ),
+    )
+    report = write_maintenance_report(
+        tmp_path,
+        team="alpha",
+        turn=1,
+        report=f"# Canonicalized route report\n\nObserved {sensitive_url}.\n",
+        at=datetime(2026, 7, 25, 8, 10, 0, tzinfo=timezone.utc),
+    )
+    current = store.load(manifest_path)
+    dashboard = build_task_payload(current, tasks=[current])
+    surfaces = {
+        "manifest": manifest_path.read_text(encoding="utf-8"),
+        "global": coordinator.state_store.path.read_text(encoding="utf-8"),
+        "prompt": prompt,
+        "report": Path(report.path).read_text(encoding="utf-8"),
+        "dashboard": json.dumps(dashboard, ensure_ascii=False),
+        "timeline": json.dumps(dashboard["timeline"], ensure_ascii=False),
+    }
+
+    assert probe_calls == []
+    assert current_incident["environment_signature"]["network_evidence"] is None
+    assert current_incident["environment_signature"]["network_available"] is False
+    for value in surfaces.values():
+        assert secret not in value
+        assert "[REDACTED]" in value
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "/v1/resources/K7p4Q9Lm3Vx8/status",
+        "/v1/oauth20/K7p4Q9Lm3Vx8/status",
+        "/v1/oauthcallbacker/K7p4Q9Lm3Vx8/status",
+        "/v1/authorizationcallbacker/K7p4Q9Lm3Vx8/status",
+        "/v1/magiclinker/K7p4Q9Lm3Vx8/status",
+        "/v1/signedness/K7p4Q9Lm3Vx8/status",
+        "/v1/webhookincomingarchive/K7p4Q9Lm3Vx8/status",
+        "/v1/monkey/K7p4Q9Lm3Vx8/status",
+        "/v1/verificationcoder/K7p4Q9Lm3Vx8/status",
+        "/v1/activationcoder/K7p4Q9Lm3Vx8/status",
+        "/v1/invitecoder/K7p4Q9Lm3Vx8/status",
+        "/v1/magiclinkcallbacker/K7p4Q9Lm3Vx8/status",
+        "/v1/signedurlcallbacker/K7p4Q9Lm3Vx8/status",
+        "/v1/oauth2redirector/K7p4Q9Lm3Vx8/status",
+        "/v1/authorizationredirector/K7p4Q9Lm3Vx8/status",
+    ),
+)
+def test_compact_alias_matching_does_not_use_generic_substrings(path: str):
+    from playwright_auto.cdpa_safety import probeable_url, sanitize_url
+
+    url = "https://api.example.invalid" + path
+    assert sanitize_url(url) == url
+    assert probeable_url(url) == url

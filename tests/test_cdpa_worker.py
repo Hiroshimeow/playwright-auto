@@ -6863,3 +6863,428 @@ def test_normal_worker_valid_multi_attachment_sends_once_and_persists_generation
     assert record.upload_receipt is not None
     receipt = UploadReceipt.from_dict(record.upload_receipt)
     assert tuple(item.name for item in receipt.files) == ("context.txt", "logs.txt")
+
+
+def test_worker_operational_failures_are_sanitized_before_manifest_and_dashboard(
+    tmp_path: Path,
+):
+    from playwright_auto.dashboard import build_task_payload
+
+    _config, store, state, worker = setup_task(
+        tmp_path,
+        task_id="task-worker-credential-boundary",
+    )
+    path = Path(state["manifest_path"])
+    secret_path = "worker-path-secret-token"
+    secret_query = "worker-query-secret"
+    secret_bearer = "worker-bearer-secret"
+    sensitive_url = (
+        f"https://api.example.invalid/webhooks/{secret_path}/status"
+        f"?access_token={secret_query}#worker-fragment-secret"
+    )
+    error = TimeoutError(
+        f"GET {sensitive_url} timed out; Authorization: Bearer {secret_bearer}"
+    )
+
+    requested = store.request_control(path, "pause", reason="credential boundary fixture")
+    control_id = requested["controls"][-1]["control_id"]
+
+    saved = store.update(
+        path,
+        lambda current: worker._block(
+            current,
+            error,
+            code="role_offline",
+            retryable=False,
+        ),
+    )
+    saved = store.reject_control(
+        path,
+        control_id,
+        f"{type(error).__name__}: {error}",
+        action="pause",
+    )
+    payload = build_task_payload(saved, tasks=[saved])
+    manifest_text = path.read_text(encoding="utf-8")
+    dashboard_text = json.dumps(payload, ensure_ascii=False)
+
+    for secret in (
+        secret_path,
+        secret_query,
+        secret_bearer,
+        "worker-fragment-secret",
+    ):
+        assert secret not in manifest_text
+        assert secret not in dashboard_text
+    assert "[REDACTED]" in manifest_text
+    assert "[REDACTED]" in dashboard_text
+    assert secret_path not in str(saved["block_reason"])
+    assert secret_path not in str(saved["roles"][saved["active_role"]]["last_error"])
+    assert all(secret_path not in str(item) for item in saved["errors"])
+    assert all(secret_path not in str(item) for item in _active_hop(saved)["errors"])
+    assert secret_path not in str(saved["controls"][-1]["result"])
+    assert all(secret_path not in item["message"] for item in payload["timeline"])
+
+
+def test_worker_shared_error_boundary_covers_wait_cleanup_and_route_fields(tmp_path: Path):
+    _config, _store, state, worker = setup_task(
+        tmp_path,
+        task_id="task-worker-error-surfaces",
+    )
+    secret = "shared-worker-secret-token"
+    error = RuntimeError(
+        f"POST https://api.example.invalid/webhooks/{secret}/status failed; token={secret}"
+    )
+
+    waiting_state = json.loads(json.dumps(state))
+    assert worker._wait_queue_error(
+        waiting_state,
+        error,
+        code="queue_release_failed",
+    ) is True
+    assert secret not in json.dumps(waiting_state, ensure_ascii=False)
+
+    cleanup_state = json.loads(json.dumps(state))
+    cleanup_state["cleanup"] = {
+        "state": "CLEARING",
+        "phase": "closing",
+        "control_id": None,
+    }
+    worker._record_cleanup_failure(cleanup_state, error)
+    assert secret not in json.dumps(cleanup_state["cleanup"], ensure_ascii=False)
+
+    route_state = json.loads(json.dumps(state))
+    hop = _active_hop(route_state)
+    worker._repair_route(route_state, hop, error)
+    assert secret not in json.dumps(
+        {
+            "validation_error": hop.get("validation_error"),
+            "route_timeline": route_state.get("route_timeline"),
+            "new_hop": _active_hop(route_state),
+        },
+        ensure_ascii=False,
+    )
+
+
+def test_refresh_failure_error_is_sanitized_before_transport_persistence(tmp_path: Path):
+    store, state, worker, path, hop, receipt, sent_at = _prepare_sent_waiting_task(
+        tmp_path,
+        task_id="task-refresh-credential-boundary",
+    )
+    old = sent_at - timedelta(minutes=30)
+    secret = "refresh-path-secret-token"
+    sensitive_url = f"https://api.example.invalid/webhooks/{secret}/status"
+    snapshot = SimpleNamespace(
+        state=ChatGPTState.ERROR,
+        stop_visible=False,
+        composer_empty=True,
+        manual_input_pending=False,
+        error_texts=("Message delivery timed out. Please try again.",),
+        blocking_dialogs=(),
+        messages=(MessageSnapshot("user", "u1", "t1", receipt.prompt, ()),),
+    )
+    signature, length = response_activity_signature(snapshot, receipt.baseline)
+    hop["timestamps"]["sent_at"] = old.isoformat()
+    hop["wait"].update(
+        {
+            "started_at": old.isoformat(),
+            "deadline_at": (old + timedelta(hours=2)).isoformat(),
+            "activity_signature": signature,
+            "activity_length": length,
+            "activity_changed_at": old.isoformat(),
+            "activity_observed_at": old.isoformat(),
+        }
+    )
+    store.save(path, state)
+
+    class Client:
+        async def assert_ownership(self):
+            return snapshot
+
+        async def wait_for_response(self, _receipt, **_kwargs):
+            raise TimeoutError("continue polling")
+
+    acquired = AcquiredRole(
+        client=Client(),
+        page_id="page-alpha-plan",
+        url="https://chatgpt.com/c/exact",
+        created=False,
+        new_chat=False,
+    )
+
+    class Actions:
+        async def locate_owned(self, _state, _role):
+            return acquired
+
+        async def refresh(self, _acquired):
+            raise RuntimeError(
+                f"refresh {sensitive_url} failed; Authorization: Bearer {secret}"
+            )
+
+    with pytest.raises(RuntimeError, match="refresh-path-secret-token"):
+        asyncio.run(worker._waiting(state, hop, Actions(), path))
+
+    persisted = store.load(path)
+    error = _active_hop(persisted)["wait"]["last_refresh_result"]["error"]
+    assert secret not in error
+    assert "[REDACTED]" in error
+    assert secret not in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "path_template",
+    (
+        "/webhooks/incoming/{secret}/status",
+        "/oauth/callback/{secret}/complete",
+        "/password-reset/confirm/{secret}",
+        "/capability/v1/{secret}/run",
+        "/magic-link/callback/{secret}",
+        "/password-reset-link/{secret}",
+        "/signed-url/{secret}/result",
+    ),
+)
+def test_worker_multi_segment_high_risk_paths_never_persist(
+    tmp_path: Path,
+    path_template: str,
+):
+    from playwright_auto.dashboard import build_task_payload
+
+    _config, store, state, worker = setup_task(
+        tmp_path,
+        task_id="task-worker-multi-segment-path",
+    )
+    manifest_path = Path(state["manifest_path"])
+    secret = "K7p4Q9Lm3Vx8"
+    sensitive_url = "https://api.example.invalid" + path_template.format(secret=secret)
+    error = RuntimeError(
+        f"GET {sensitive_url}?access_token=query-secret#fragment-secret failed; "
+        "Authorization: Bearer bearer-secret; password=password-secret"
+    )
+    requested = store.request_control(
+        manifest_path,
+        "pause",
+        reason="multi-segment credential fixture",
+    )
+    control_id = requested["controls"][-1]["control_id"]
+
+    saved = store.update(
+        manifest_path,
+        lambda current: worker._block(
+            current,
+            error,
+            code="role_offline",
+            retryable=False,
+        ),
+    )
+    saved = store.reject_control(
+        manifest_path,
+        control_id,
+        f"{type(error).__name__}: {error}",
+        action="pause",
+    )
+    payload = build_task_payload(saved, tasks=[saved])
+
+    assert secret not in manifest_path.read_text(encoding="utf-8")
+    assert secret not in json.dumps(payload, ensure_ascii=False)
+    assert secret not in str(saved["block_reason"])
+    assert all(secret not in str(item) for item in saved["errors"])
+    assert all(secret not in str(item) for item in _active_hop(saved)["errors"])
+    assert secret not in str(saved["controls"][-1]["result"])
+    assert all(secret not in item["message"] for item in payload["timeline"])
+
+
+@pytest.mark.parametrize(
+    "path_template",
+    (
+        "/run/token-{secret}/status",
+        "/run/secret_{secret}/status",
+        "/run/CREDENTIAL-{secret}/status",
+        "/run/signature-{secret}/status",
+        "/run/session-{secret}/status",
+        "/run/jwt-{secret}/status",
+        "/run/api-key-{secret}/status",
+        "/run/auth-{secret}/status",
+        "/run/authorization-{secret}/status",
+        "/run/code-{secret}/status",
+        "/run/key-{secret}/status",
+        "/run/signed-{secret}/status",
+        "/run/token%2D{secret}/status",
+    ),
+)
+def test_worker_direct_marker_value_segment_never_persists(
+    tmp_path: Path,
+    path_template: str,
+):
+    from playwright_auto.dashboard import build_task_payload
+
+    _config, store, state, worker = setup_task(
+        tmp_path,
+        task_id="task-worker-direct-marker-value",
+    )
+    manifest_path = Path(state["manifest_path"])
+    secret = "K7p4Q9Lm3Vx8"
+    sensitive_url = "https://api.example.invalid" + path_template.format(secret=secret)
+    error = RuntimeError(
+        f"GET {sensitive_url}?access_token=query-secret#fragment-secret failed; "
+        "Authorization: Bearer bearer-secret; password=password-secret"
+    )
+    requested = store.request_control(
+        manifest_path,
+        "pause",
+        reason="direct marker value fixture",
+    )
+    control_id = requested["controls"][-1]["control_id"]
+
+    saved = store.update(
+        manifest_path,
+        lambda current: worker._block(
+            current,
+            error,
+            code="role_offline",
+            retryable=False,
+        ),
+    )
+    saved = store.reject_control(
+        manifest_path,
+        control_id,
+        f"{type(error).__name__}: {error}",
+        action="pause",
+    )
+    payload = build_task_payload(saved, tasks=[saved])
+
+    assert secret not in manifest_path.read_text(encoding="utf-8")
+    assert secret not in json.dumps(payload, ensure_ascii=False)
+    assert secret not in str(saved["block_reason"])
+    assert secret not in str(saved["roles"][saved["active_role"]]["last_error"])
+    assert all(secret not in str(item) for item in saved["errors"])
+    assert all(secret not in str(item) for item in _active_hop(saved)["errors"])
+    assert secret not in str(saved["controls"][-1]["result"])
+    assert all(secret not in item["message"] for item in payload["timeline"])
+
+
+@pytest.mark.parametrize(
+    "path_template",
+    (
+        "/oauth2/callback/{secret}/complete",
+        "/oauthCallback/{secret}/complete",
+        "/oauthcallback/{secret}/complete",
+        "/oauth2Callback/{secret}/complete",
+        "/oauth2callback/{secret}/complete",
+        "/signedUrl/{secret}/result",
+        "/signedurl/{secret}/result",
+        "/magicLink/{secret}/complete",
+        "/magiclink/{secret}/complete",
+        "/webhookIncoming/{secret}/status",
+        "/webhookincoming/{secret}/status",
+        "/authorizationCallback/{secret}/complete",
+        "/authorizationcallback/{secret}/complete",
+        "/apiKey/{secret}/status",
+        "/apikey/{secret}/status",
+        "/accessToken/{secret}/status",
+        "/accesstoken/{secret}/status",
+        "/sessionId/{secret}/status",
+        "/sessionid/{secret}/status",
+        "/passwordResetLink/{secret}",
+        "/passwordresetlink/{secret}",
+        "/resetPassword/{secret}/complete",
+        "/resetpassword/{secret}/complete",
+        "/refreshtoken/{secret}/status",
+        "/idtoken/{secret}/status",
+        "/apitoken/{secret}/status",
+        "/clientsecret/{secret}/status",
+        "/clientcredential/{secret}/status",
+        "/bearertoken/{secret}/status",
+        "/authtoken/{secret}/status",
+        "/sessiontoken/{secret}/status",
+        "/csrftoken/{secret}/status",
+        "/verificationcode/{secret}/status",
+        "/activationcode/{secret}/status",
+        "/invitecode/{secret}/status",
+        "/resetcode/{secret}/status",
+        "/passwordreset/{secret}/complete",
+        "/magiclinkcallback/{secret}/complete",
+        "/signedurlcallback/{secret}/complete",
+        "/webhooksincoming/{secret}/status",
+        "/webhookcallback/{secret}/status",
+        "/oauthredirect/{secret}/complete",
+        "/oauth2redirect/{secret}/complete",
+        "/refreshToken/{secret}/status",
+        "/idToken/{secret}/status",
+        "/apiToken/{secret}/status",
+        "/clientSecret/{secret}/status",
+        "/clientCredential/{secret}/status",
+        "/bearerToken/{secret}/status",
+        "/authToken/{secret}/status",
+        "/sessionToken/{secret}/status",
+        "/csrfToken/{secret}/status",
+        "/verificationCode/{secret}/status",
+        "/activationCode/{secret}/status",
+        "/inviteCode/{secret}/status",
+        "/resetCode/{secret}/status",
+        "/passwordReset/{secret}/complete",
+        "/magicLinkCallback/{secret}/complete",
+        "/signedUrlCallback/{secret}/complete",
+        "/webhooksIncoming/{secret}/status",
+        "/webhookCallback/{secret}/status",
+        "/oauthRedirect/{secret}/complete",
+        "/oauth2Redirect/{secret}/complete",
+        "/RefreshToken/{secret}/status",
+        "/IDToken/{secret}/status",
+        "/APIToken/{secret}/status",
+        "/ClientSecret/{secret}/status",
+        "/CSRFToken/{secret}/status",
+        "/VerificationCode/{secret}/status",
+        "/MagicLinkCallback/{secret}/complete",
+        "/SignedURLCallback/{secret}/complete",
+        "/OAuth2Redirect/{secret}/complete",
+    ),
+)
+def test_worker_canonicalized_high_risk_route_never_persists(
+    tmp_path: Path,
+    path_template: str,
+):
+    from playwright_auto.dashboard import build_task_payload
+
+    _config, store, state, worker = setup_task(
+        tmp_path,
+        task_id="task-worker-canonicalized-route",
+    )
+    manifest_path = Path(state["manifest_path"])
+    secret = "K7p4Q9Lm3Vx8"
+    sensitive_url = "https://api.example.invalid" + path_template.format(secret=secret)
+    error = RuntimeError(
+        f"GET {sensitive_url}?access_token=query-secret#fragment-secret failed; "
+        "Authorization: Bearer bearer-secret; password=password-secret"
+    )
+    requested = store.request_control(
+        manifest_path,
+        "pause",
+        reason="canonicalized route fixture",
+    )
+    control_id = requested["controls"][-1]["control_id"]
+
+    saved = store.update(
+        manifest_path,
+        lambda current: worker._block(
+            current,
+            error,
+            code="role_offline",
+            retryable=False,
+        ),
+    )
+    saved = store.reject_control(
+        manifest_path,
+        control_id,
+        f"{type(error).__name__}: {error}",
+        action="pause",
+    )
+    payload = build_task_payload(saved, tasks=[saved])
+
+    assert secret not in manifest_path.read_text(encoding="utf-8")
+    assert secret not in json.dumps(payload, ensure_ascii=False)
+    assert secret not in str(saved["block_reason"])
+    assert secret not in str(saved["roles"][saved["active_role"]]["last_error"])
+    assert all(secret not in str(item) for item in saved["errors"])
+    assert all(secret not in str(item) for item in _active_hop(saved)["errors"])
+    assert secret not in str(saved["controls"][-1]["result"])
+    assert all(secret not in item["message"] for item in payload["timeline"])

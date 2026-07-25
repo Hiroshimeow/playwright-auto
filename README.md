@@ -232,9 +232,39 @@ parents/children are derived for display, and a STOPPED parent leaves its child 
 Maintainers repairs or replaces it.
 
 PLAN remains the only task role allowed to finish with DONE. One global `MAINTAINERS` role
-serves CDP 9222 outside all task teams and normal routes. It returns one inline report plus one
-allowlisted operational decision; the worker validates and applies that decision. Inline task
-reports are also materialized by the worker without weakening route or provenance checks.
+serves CDP 9222 outside all task teams and normal routes. It is the default recovery authority
+for non-operator BLOCKED/STOPPED incidents and receives the complete task/hop/send/ownership,
+control-origin, dependency/queue, report, error, repair, and runtime snapshot. It may choose up
+to three bounded recovery steps or propose one repository-bounded repair task; the worker
+validates immutable command snapshots and records a control as applied only after its recovery
+postcondition succeeds. Repair proposals use one canonical validator at model parsing, command creation, and durable reload: root cause/reason are limited to 1200 characters, reproduction to 2400, source areas to 1–8 allowlisted entries, required tests to 1–16 one-line entries of at most 300 characters, and lesson to one optional paragraph of at most 600 characters. Every declared textual repair field must already be a JSON/string value; optional identity and lesson fields are null or strings. Source areas and required tests must be concrete arrays at the model boundary and list/tuple collections in worker code. The worker checks raw entry count before trimming or other normalization, rejects non-string items, rejects exact duplicates, and rejects values that become duplicates after trimming; it never applies `str()` coercion or silent duplicate collapse. Explicit operator Pause/Stop/Restart/New Chat/Clear Team is never
+automatically reversed. Inline task reports are also materialized by the worker without
+weakening route or provenance checks.
+
+Repair proposals are root-cause deduplicated and urgent. One active repair may serve multiple
+affected tasks, but every affected task, incident, and disposition is attached as a separate
+idempotent operation; reusing the repair never skips the current task. A later durable decision
+may change that task's disposition. `CONTINUE_IN_PARALLEL` keeps the safe affected task progressing
+without an unnecessary dependency. `HOLD_FOR_REPAIR` atomically adds the repair task to the same
+affected task's existing `depends_on_task_ids`, moves it to WAITING, preserves the exact active
+hop/request/receipt/reports, and automatically resumes that same hop after repair DONE. Accepted
+waiting work resumes response observation without resend; pre-send work continues the same
+request. Repair relationships, disposition history, priority, dependency gate, and release event
+are projected by `/api/tasks`, the unified timeline, and the selected-task Repair Relationships
+panel. Environmental Maintainers failures suspend after three durable attempts. Browser/CDP
+recovery requires `browser.is_connected()` plus a bounded live `context.cookies()` command;
+network recovery uses a bounded no-redirect `HEAD` against the exact failed endpoint when available,
+otherwise the current ChatGPT origin for ChatGPT transport failures; filesystem recovery performs a real
+temporary write/fsync/delete under `.plan`. MCP/tooling is tracked separately. When `maintenance.tooling_probe` is configured, the production
+Maintainers path preflights that worker-owned dependency before browser acquisition or Send. The
+descriptor stores only dependency, canonical loopback endpoint, auth-profile reference, method, and
+required tools; the bearer is resolved from the worker environment and is never persisted or projected.
+Worker-owned sanitization strips URL userinfo/fragments and redacts sensitive query plus Authorization/credential values before manifest, global-state, prompt, dashboard, timeline, or report surfaces. URL path credentials are also secret material: JWT-like segments and directly credential-bearing segments are redacted, while exact or tokenized compound high-risk route markers such as webhooks, OAuth, reset, capability, signed-url, magic-link, or token start a fail-closed context. Before matching, percent-decoded camelCase/acronym boundaries are canonicalized. Separator-free labels are classified by a bounded exact credential-operation grammar: explicit qualifier+noun pairs cover access/refresh/id/api/bearer/auth/session/CSRF tokens, client secrets or credentials, API keys, session IDs, and verification/activation/invite/reset codes; explicit operation+suffix rules cover password-reset links and OAuth, authorization, magic-link, signed-URL, and webhook callback, redirect, or incoming routes. The grammar materializes exact compact identities only; generic prefix, suffix, and substring matching are forbidden. The marker segment itself and every remaining non-empty path segment are redacted, including bare markers and marker-plus-payload forms; static intermediary labels, version segments, callbacks, status names, and completion routes cannot end that context. Any URL containing the context is unprobeable unless the worker has an explicit secret-free descriptor/auth profile. Normal resource identifiers and near-match names outside exact high-risk contexts remain intact. The same worker-owned boundary applies before exception-derived operational text enters task/hop/role errors, block or waiting reasons, refresh state, cleanup state, route-repair evidence, or control results; dashboard task, hop, role, cleanup, route, error, and control projections sanitize those fields again as defense in depth. Maintainers and dashboard payloads receive only allowlisted incident summaries; stored full prompts and raw evidence arrays are excluded. A credential-bearing network URL without a secret-free endpoint and explicit auth profile remains suspended and is not probed.
+The bounded Streamable HTTP lifecycle disables redirects, authenticates, performs `initialize`, sends `notifications/initialized` only when the server returns a session ID,
+accepts only an empty successful notification response, verifies `tools/list` contains every required
+capability, and requires successful deletion of that temporary session. Stateless servers use
+`initialize` followed directly by `tools/list`. Missing credentials, malformed/non-loopback/
+unallowlisted descriptors, protocol errors, or missing tools remain suspended. Cached pages and unrelated HTTP success are not recovery evidence.
 `--upload` captures file identity at task creation, uploads the same bytes once per role
 conversation generation, blocks pre-send source drift, and recovers crossed durable requests
 without duplicate upload or Send. Dashboard attachment data contains only sanitized filename,
@@ -343,3 +373,6 @@ uv run playwright-auto stop
 ```
 
 GUI and headless must never run simultaneously with the same profile.
+
+
+Repair creation is accepted only through the version-2 top-level `repair` object; legacy `CREATE_REPAIR_TASK` actions and recovery-list repair actions are rejected before report/control/task mutation.

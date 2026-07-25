@@ -1186,3 +1186,629 @@ def test_task_payload_sanitizes_attachments_and_exposes_role_generation():
     }]
     assert payload["roles"][0]["attachments_uploaded_generation"] == 1
     assert "/private/context.txt" not in json.dumps(payload)
+
+
+def test_dashboard_projects_repair_relationship_gate_priority_and_release():
+    repair = _surface_task(cleanup_state="ACTIVE")
+    repair.update(
+        task_id="repair-1",
+        team="cdpa-repair",
+        status="RUNNING",
+        kanban_column="WORKING",
+        cleanup={"state": "ACTIVE"},
+    )
+    repair["priority"] = "urgent_repair"
+    repair["repair"] = {
+        "kind": "cdpa_repair",
+        "priority": "urgent",
+        "root_cause_key": "root-role-offline",
+        "affected_task_id": "task-affected",
+        "affected_team": "alpha",
+        "disposition": "HOLD_FOR_REPAIR",
+        "reason": "exact recovery postcondition failed",
+    }
+    affected = _surface_task(cleanup_state="ACTIVE")
+    affected.update(
+        task_id="task-affected",
+        team="alpha",
+        status="WAITING",
+        kanban_column="WAITING",
+        cleanup={"state": "ACTIVE"},
+    )
+    affected["depends_on_task_ids"] = ["repair-1"]
+    affected["repair_wait"] = {
+        "repair_task_id": "repair-1",
+        "repair_team": "cdpa-repair",
+        "root_cause_key": "root-role-offline",
+        "disposition": "HOLD_FOR_REPAIR",
+        "blocker": "exact recovery postcondition failed",
+        "state": "WAITING",
+        "release_event": None,
+    }
+
+    tasks = [affected, repair]
+    affected_payload = build_task_payload(affected, tasks=tasks)
+    repair_payload = build_task_payload(repair, tasks=tasks)
+
+    assert affected_payload["repair_relationship"] == {
+        "repair_task_id": "repair-1",
+        "repair_team": "cdpa-repair",
+        "repair_status": "RUNNING",
+        "repair_priority": "urgent",
+        "affected_task_id": "task-affected",
+        "affected_team": "alpha",
+        "affected_status": "WAITING",
+        "disposition": "HOLD_FOR_REPAIR",
+        "blocker": "exact recovery postcondition failed",
+        "dependency_gate": True,
+        "release_event": None,
+        "root_cause_key": "root-role-offline",
+    }
+    assert repair_payload["repair_relationship"]["affected_task_id"] == "task-affected"
+    assert repair_payload["repair_relationship"]["repair_priority"] == "urgent"
+
+    affected["depends_on_task_ids"] = []
+    affected["status"] = "RUNNING"
+    affected["repair_wait"].update(
+        state="RELEASED",
+        release_event="repair DONE released preserved waiting hop",
+    )
+    released = build_task_payload(affected, tasks=[affected, repair])
+    assert released["repair_relationship"]["dependency_gate"] is False
+    assert released["repair_relationship"]["release_event"] == (
+        "repair DONE released preserved waiting hop"
+    )
+
+
+def test_dashboard_projects_all_affected_operations_for_shared_repair():
+    repair = _surface_task(cleanup_state="ACTIVE")
+    repair.update(
+        task_id="repair-shared",
+        team="cdpa-repair",
+        status="RUNNING",
+        kanban_column="WORKING",
+        cleanup={"state": "ACTIVE"},
+        priority="urgent_repair",
+        repair={
+            "kind": "cdpa_repair",
+            "priority": "urgent",
+            "root_cause_key": "root-shared",
+            "affected_task_id": "task-a",
+            "affected_team": "alpha",
+            "disposition": "HOLD_FOR_REPAIR",
+            "reason": "shared defect",
+            "affected_operations": [
+                {
+                    "affected_task_id": "task-a",
+                    "affected_team": "alpha",
+                    "incident_id": "maint-a",
+                    "disposition": "HOLD_FOR_REPAIR",
+                    "reason": "shared defect",
+                },
+                {
+                    "affected_task_id": "task-b",
+                    "affected_team": "beta",
+                    "incident_id": "maint-b",
+                    "disposition": "CONTINUE_IN_PARALLEL",
+                    "reason": "shared defect",
+                },
+            ],
+        },
+    )
+    task_a = _surface_task(cleanup_state="ACTIVE")
+    task_a.update(task_id="task-a", team="alpha", status="WAITING")
+    task_b = _surface_task(cleanup_state="ACTIVE")
+    task_b.update(task_id="task-b", team="beta", status="RUNNING")
+
+    payload = build_task_payload(repair, tasks=[repair, task_a, task_b])
+
+    assert [
+        (item["affected_task_id"], item["affected_status"], item["disposition"])
+        for item in payload["repair_relationships"]
+    ] == [
+        ("task-a", "WAITING", "HOLD_FOR_REPAIR"),
+        ("task-b", "RUNNING", "CONTINUE_IN_PARALLEL"),
+    ]
+
+
+def test_dashboard_html_renders_complete_repair_relationships():
+    html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+
+    assert 'id="repair-summary"' in html
+    assert 'id="repair-content"' in html
+    assert "function renderRepairRelationships(task)" in html
+    assert "task.repair_relationships" in html
+    assert "renderRepairRelationships(task);" in html
+    for label in (
+        "Repair task",
+        "Affected task",
+        "Disposition",
+        "Blocker",
+        "Dependency gate",
+        "Release event",
+    ):
+        assert label in html
+
+
+def test_dashboard_projects_allowlisted_maintenance_summary_without_credentials_or_prompt():
+    secret = "review-secret-dashboard-token"
+    raw = {
+        "task_id": "task-dashboard-secret",
+        "task_text": "safe task",
+        "task_slug": "task-dashboard-secret",
+        "repository": "/repo",
+        "manifest_path": "/repo/.plan/alpha/task-dashboard-secret/task.json",
+        "team": "alpha",
+        "team_suffix": 1,
+        "status": "BLOCKED",
+        "block_code": "unexpected_error",
+        "block_reason": "safe block",
+        "updated_at": "2026-07-25T05:00:00+00:00",
+        "roles": {},
+        "hops": [],
+        "reports": [],
+        "route_timeline": [],
+        "errors": [],
+        "controls": [],
+        "cleanup": {},
+        "options": {},
+        "maintenance": {
+            "active_incident_id": "maint-secret",
+            "incidents": [
+                {
+                    "incident_id": "maint-secret",
+                    "state": "RUNNING",
+                    "turn": 1,
+                    "trigger_status": "BLOCKED",
+                    "trigger_code": "unexpected_error",
+                    "trigger_reason": f"token={secret}",
+                    "created_at": "2026-07-25T05:00:00+00:00",
+                    "updated_at": "2026-07-25T05:01:00+00:00",
+                    "prompt": f"full maintainer prompt with {secret}",
+                    "environment_last_error": f"access_token={secret}",
+                    "environment_evidence": [{"raw": secret}],
+                    "environment_signature": {
+                        "version": 3,
+                        "prerequisite": "network",
+                        "available": False,
+                        "network_available": False,
+                        "network_evidence": {
+                            "endpoint": f"https://api.invalid/run?access_token={secret}",
+                            "method": "HEAD",
+                            "status": None,
+                            "error": f"Bearer {secret}",
+                        },
+                    },
+                    "last_error": f"Bearer {secret}",
+                }
+            ],
+        },
+    }
+
+    payload = build_task_payload(raw)
+    serialized = json.dumps(payload, ensure_ascii=False)
+
+    assert secret not in serialized
+    incident = payload["active_maintenance_incident"]
+    assert incident is not None
+    assert "prompt" not in incident
+    assert "environment_evidence" not in incident
+    assert set(incident).issuperset(
+        {
+            "incident_id",
+            "state",
+            "turn",
+            "trigger_status",
+            "trigger_code",
+            "trigger_reason",
+            "environment_last_error",
+            "environment_signature",
+        }
+    )
+    assert all(secret not in item["message"] for item in payload["timeline"])
+
+
+def test_dashboard_defense_in_depth_sanitizes_all_operational_error_surfaces():
+    secret = "dashboard-operational-secret-token"
+    sensitive = (
+        f"RuntimeError: GET https://api.invalid/webhooks/{secret}/status failed; "
+        f"Authorization: Bearer {secret}; access_token={secret}"
+    )
+    raw = {
+        "task_id": "task-dashboard-operational-secret",
+        "task_text": "safe task text",
+        "task_slug": "task-dashboard-operational-secret",
+        "repository": "/repo",
+        "manifest_path": "/repo/.plan/alpha/task-dashboard-operational-secret/task.json",
+        "team": "alpha",
+        "team_suffix": 1,
+        "status": "BLOCKED",
+        "block_code": "unexpected_error",
+        "block_reason": sensitive,
+        "waiting_reason": sensitive,
+        "pause_reason": sensitive,
+        "stop_reason": sensitive,
+        "active_role": "DEV",
+        "active_hop_id": 1,
+        "active_action": "blocked",
+        "updated_at": "2026-07-25T06:35:00+00:00",
+        "roles": {
+            "DEV": {
+                "physical_role": "alpha-dev",
+                "status": "offline",
+                "turn": 1,
+                "page_url": f"https://chatgpt.com/webhooks/{secret}/status",
+                "last_error": sensitive,
+            }
+        },
+        "hops": [
+            {
+                "hop_id": 1,
+                "target_role": "DEV",
+                "timestamps": {"created_at": "2026-07-25T06:34:00+00:00"},
+                "errors": [sensitive],
+                "validation_error": sensitive,
+                "wait": {"refresh_error": sensitive},
+            }
+        ],
+        "reports": [],
+        "route_timeline": [
+            {
+                "at": "2026-07-25T06:34:30+00:00",
+                "source_role": "DEV",
+                "route": "DEV",
+                "kind": "route_repair",
+                "error": sensitive,
+            }
+        ],
+        "errors": [{"at": "2026-07-25T06:35:00+00:00", "error": sensitive}],
+        "controls": [
+            {
+                "control_id": 1,
+                "action": "resume",
+                "status": "rejected",
+                "requested_at": "2026-07-25T06:34:20+00:00",
+                "applied_at": "2026-07-25T06:34:40+00:00",
+                "result": {"error": sensitive},
+            }
+        ],
+        "cleanup": {"state": "CLEARING", "last_error": sensitive},
+        "options": {},
+    }
+
+    payload = build_task_payload(raw)
+    serialized = json.dumps(payload, ensure_ascii=False)
+
+    assert secret not in serialized
+    assert "[REDACTED]" in serialized
+    assert all(secret not in item["message"] for item in payload["timeline"])
+    assert secret not in payload["primary_problem"]["message"]
+
+
+@pytest.mark.parametrize(
+    "path_template",
+    (
+        "/webhooks/incoming/{secret}/status",
+        "/oauth/callback/{secret}/complete",
+        "/password-reset/confirm/{secret}",
+        "/capability/v1/{secret}/run",
+        "/magic-link/callback/{secret}",
+        "/password-reset-link/{secret}",
+        "/signed-url/{secret}/result",
+    ),
+)
+def test_dashboard_defense_in_depth_redacts_multi_segment_high_risk_paths(
+    path_template: str,
+):
+    secret = "K7p4Q9Lm3Vx8"
+    url = "https://api.invalid" + path_template.format(secret=secret)
+    sensitive = f"RuntimeError: GET {url} failed"
+    raw = {
+        "task_id": "task-dashboard-multi-segment-secret",
+        "task_text": "safe task text",
+        "task_slug": "task-dashboard-multi-segment-secret",
+        "repository": "/repo",
+        "manifest_path": "/repo/.plan/alpha/task-dashboard-multi-segment-secret/task.json",
+        "team": "alpha",
+        "team_suffix": 1,
+        "status": "BLOCKED",
+        "block_code": "unexpected_error",
+        "block_reason": sensitive,
+        "active_role": "DEV",
+        "active_hop_id": 1,
+        "active_action": "blocked",
+        "updated_at": "2026-07-25T07:15:00+00:00",
+        "roles": {
+            "DEV": {
+                "physical_role": "alpha-dev",
+                "status": "offline",
+                "turn": 1,
+                "page_url": url,
+                "last_error": sensitive,
+            }
+        },
+        "hops": [
+            {
+                "hop_id": 1,
+                "target_role": "DEV",
+                "timestamps": {"created_at": "2026-07-25T07:14:00+00:00"},
+                "errors": [sensitive],
+                "validation_error": sensitive,
+                "wait": {"last_refresh_result": {"error": sensitive}},
+            }
+        ],
+        "reports": [],
+        "route_timeline": [
+            {
+                "at": "2026-07-25T07:14:30+00:00",
+                "source_role": "DEV",
+                "route": "DEV",
+                "kind": "route_repair",
+                "error": sensitive,
+            }
+        ],
+        "errors": [{"at": "2026-07-25T07:15:00+00:00", "error": sensitive}],
+        "controls": [
+            {
+                "control_id": 1,
+                "action": "resume",
+                "status": "rejected",
+                "requested_at": "2026-07-25T07:14:20+00:00",
+                "applied_at": "2026-07-25T07:14:40+00:00",
+                "result": {"error": sensitive},
+            }
+        ],
+        "cleanup": {"state": "CLEARING", "last_error": sensitive},
+        "options": {},
+    }
+
+    payload = build_task_payload(raw)
+    serialized = json.dumps(payload, ensure_ascii=False)
+
+    assert secret not in serialized
+    assert "[REDACTED]" in serialized
+    assert all(secret not in item["message"] for item in payload["timeline"])
+    assert secret not in payload["primary_problem"]["message"]
+
+
+@pytest.mark.parametrize(
+    "path_template",
+    (
+        "/run/token-{secret}/status",
+        "/run/secret_{secret}/status",
+        "/run/CREDENTIAL-{secret}/status",
+        "/run/signature-{secret}/status",
+        "/run/session-{secret}/status",
+        "/run/jwt-{secret}/status",
+        "/run/api-key-{secret}/status",
+        "/run/auth-{secret}/status",
+        "/run/authorization-{secret}/status",
+        "/run/code-{secret}/status",
+        "/run/key-{secret}/status",
+        "/run/signed-{secret}/status",
+        "/run/token%2D{secret}/status",
+    ),
+)
+def test_dashboard_defense_in_depth_redacts_direct_marker_value_segment(
+    path_template: str,
+):
+    secret = "K7p4Q9Lm3Vx8"
+    url = "https://api.invalid" + path_template.format(secret=secret)
+    sensitive = f"RuntimeError: GET {url} failed"
+    raw = {
+        "task_id": "task-dashboard-direct-marker-value",
+        "task_text": "safe task text",
+        "task_slug": "task-dashboard-direct-marker-value",
+        "repository": "/repo",
+        "manifest_path": "/repo/.plan/alpha/task-dashboard-direct-marker-value/task.json",
+        "team": "alpha",
+        "team_suffix": 1,
+        "status": "BLOCKED",
+        "block_code": "unexpected_error",
+        "block_reason": sensitive,
+        "active_role": "DEV",
+        "active_hop_id": 1,
+        "active_action": "blocked",
+        "updated_at": "2026-07-25T07:40:00+00:00",
+        "roles": {
+            "DEV": {
+                "physical_role": "alpha-dev",
+                "status": "offline",
+                "turn": 1,
+                "page_url": url,
+                "last_error": sensitive,
+            }
+        },
+        "hops": [
+            {
+                "hop_id": 1,
+                "target_role": "DEV",
+                "timestamps": {"created_at": "2026-07-25T07:39:00+00:00"},
+                "errors": [sensitive],
+                "validation_error": sensitive,
+                "wait": {"last_refresh_result": {"error": sensitive}},
+            }
+        ],
+        "reports": [],
+        "route_timeline": [
+            {
+                "at": "2026-07-25T07:39:30+00:00",
+                "source_role": "DEV",
+                "route": "DEV",
+                "kind": "route_repair",
+                "error": sensitive,
+            }
+        ],
+        "errors": [{"at": "2026-07-25T07:40:00+00:00", "error": sensitive}],
+        "controls": [
+            {
+                "control_id": 1,
+                "action": "resume",
+                "status": "rejected",
+                "requested_at": "2026-07-25T07:39:20+00:00",
+                "applied_at": "2026-07-25T07:39:40+00:00",
+                "result": {"error": sensitive},
+            }
+        ],
+        "cleanup": {"state": "CLEARING", "last_error": sensitive},
+        "options": {},
+    }
+
+    payload = build_task_payload(raw)
+    serialized = json.dumps(payload, ensure_ascii=False)
+
+    assert secret not in serialized
+    assert "[REDACTED]" in serialized
+    assert all(secret not in item["message"] for item in payload["timeline"])
+    assert secret not in payload["primary_problem"]["message"]
+
+
+@pytest.mark.parametrize(
+    "path_template",
+    (
+        "/oauth2/callback/{secret}/complete",
+        "/oauthCallback/{secret}/complete",
+        "/oauthcallback/{secret}/complete",
+        "/oauth2Callback/{secret}/complete",
+        "/oauth2callback/{secret}/complete",
+        "/signedUrl/{secret}/result",
+        "/signedurl/{secret}/result",
+        "/magicLink/{secret}/complete",
+        "/magiclink/{secret}/complete",
+        "/webhookIncoming/{secret}/status",
+        "/webhookincoming/{secret}/status",
+        "/authorizationCallback/{secret}/complete",
+        "/authorizationcallback/{secret}/complete",
+        "/apiKey/{secret}/status",
+        "/apikey/{secret}/status",
+        "/accessToken/{secret}/status",
+        "/accesstoken/{secret}/status",
+        "/sessionId/{secret}/status",
+        "/sessionid/{secret}/status",
+        "/passwordResetLink/{secret}",
+        "/passwordresetlink/{secret}",
+        "/resetPassword/{secret}/complete",
+        "/resetpassword/{secret}/complete",
+        "/refreshtoken/{secret}/status",
+        "/idtoken/{secret}/status",
+        "/apitoken/{secret}/status",
+        "/clientsecret/{secret}/status",
+        "/clientcredential/{secret}/status",
+        "/bearertoken/{secret}/status",
+        "/authtoken/{secret}/status",
+        "/sessiontoken/{secret}/status",
+        "/csrftoken/{secret}/status",
+        "/verificationcode/{secret}/status",
+        "/activationcode/{secret}/status",
+        "/invitecode/{secret}/status",
+        "/resetcode/{secret}/status",
+        "/passwordreset/{secret}/complete",
+        "/magiclinkcallback/{secret}/complete",
+        "/signedurlcallback/{secret}/complete",
+        "/webhooksincoming/{secret}/status",
+        "/webhookcallback/{secret}/status",
+        "/oauthredirect/{secret}/complete",
+        "/oauth2redirect/{secret}/complete",
+        "/refreshToken/{secret}/status",
+        "/idToken/{secret}/status",
+        "/apiToken/{secret}/status",
+        "/clientSecret/{secret}/status",
+        "/clientCredential/{secret}/status",
+        "/bearerToken/{secret}/status",
+        "/authToken/{secret}/status",
+        "/sessionToken/{secret}/status",
+        "/csrfToken/{secret}/status",
+        "/verificationCode/{secret}/status",
+        "/activationCode/{secret}/status",
+        "/inviteCode/{secret}/status",
+        "/resetCode/{secret}/status",
+        "/passwordReset/{secret}/complete",
+        "/magicLinkCallback/{secret}/complete",
+        "/signedUrlCallback/{secret}/complete",
+        "/webhooksIncoming/{secret}/status",
+        "/webhookCallback/{secret}/status",
+        "/oauthRedirect/{secret}/complete",
+        "/oauth2Redirect/{secret}/complete",
+        "/RefreshToken/{secret}/status",
+        "/IDToken/{secret}/status",
+        "/APIToken/{secret}/status",
+        "/ClientSecret/{secret}/status",
+        "/CSRFToken/{secret}/status",
+        "/VerificationCode/{secret}/status",
+        "/MagicLinkCallback/{secret}/complete",
+        "/SignedURLCallback/{secret}/complete",
+        "/OAuth2Redirect/{secret}/complete",
+    ),
+)
+def test_dashboard_redacts_canonicalized_high_risk_route_from_legacy_state(
+    path_template: str,
+):
+    secret = "K7p4Q9Lm3Vx8"
+    url = "https://api.invalid" + path_template.format(secret=secret)
+    sensitive = f"RuntimeError: GET {url} failed"
+    raw = {
+        "task_id": "task-dashboard-canonicalized-route",
+        "task_text": "safe task text",
+        "task_slug": "task-dashboard-canonicalized-route",
+        "repository": "/repo",
+        "manifest_path": "/repo/.plan/alpha/task-dashboard-canonicalized-route/task.json",
+        "team": "alpha",
+        "team_suffix": 1,
+        "status": "BLOCKED",
+        "block_code": "unexpected_error",
+        "block_reason": sensitive,
+        "active_role": "DEV",
+        "active_hop_id": 1,
+        "active_action": "blocked",
+        "updated_at": "2026-07-25T08:10:00+00:00",
+        "roles": {
+            "DEV": {
+                "physical_role": "alpha-dev",
+                "status": "offline",
+                "turn": 1,
+                "page_url": url,
+                "last_error": sensitive,
+            }
+        },
+        "hops": [
+            {
+                "hop_id": 1,
+                "target_role": "DEV",
+                "timestamps": {"created_at": "2026-07-25T08:09:00+00:00"},
+                "errors": [sensitive],
+                "validation_error": sensitive,
+                "wait": {"last_refresh_result": {"error": sensitive}},
+            }
+        ],
+        "reports": [],
+        "route_timeline": [
+            {
+                "at": "2026-07-25T08:09:30+00:00",
+                "source_role": "DEV",
+                "route": "DEV",
+                "kind": "route_repair",
+                "error": sensitive,
+            }
+        ],
+        "errors": [{"at": "2026-07-25T08:10:00+00:00", "error": sensitive}],
+        "controls": [
+            {
+                "control_id": 1,
+                "action": "resume",
+                "status": "rejected",
+                "requested_at": "2026-07-25T08:09:20+00:00",
+                "applied_at": "2026-07-25T08:09:40+00:00",
+                "result": {"error": sensitive},
+            }
+        ],
+        "cleanup": {"state": "CLEARING", "last_error": sensitive},
+        "options": {},
+    }
+
+    payload = build_task_payload(raw)
+    serialized = json.dumps(payload, ensure_ascii=False)
+
+    assert secret not in serialized
+    assert "[REDACTED]" in serialized
+    assert all(secret not in item["message"] for item in payload["timeline"])
+    assert secret not in payload["primary_problem"]["message"]

@@ -14,6 +14,12 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import unquote, urlparse
 
 from .cdpa_config import CDPAConfigError, load_cdpa_config
+from .cdpa_safety import (
+    project_maintenance_incident,
+    sanitize_text,
+    sanitize_url,
+    sanitize_value,
+)
 from .cdpa_store import TaskStore, replacement_task_for
 from .cdpa_team import (
     exact_team_ready_waiters,
@@ -307,7 +313,7 @@ def build_task_timeline(raw: Mapping[str, Any]) -> list[dict[str, Any]]:
 
     def add(key: str, at: Any, level: str, source: Any, message: Any) -> None:
         timestamp = _timestamp(at)
-        text = str(message or "").strip()
+        text = sanitize_text(message, max_chars=2000).strip()
         if timestamp is None or not text:
             return
         items.append(
@@ -436,11 +442,12 @@ def build_task_timeline(raw: Mapping[str, Any]) -> list[dict[str, Any]]:
             f"{action} · {status}{f' · {result}' if result else ''}",
         )
 
-    for index, incident in enumerate(_maintenance_incidents(raw)):
+    for index, raw_incident in enumerate(_maintenance_incidents(raw)):
+        incident = project_maintenance_incident(raw_incident) or {}
         incident_id = str(incident.get("incident_id") or index)
         state = str(incident.get("state") or "unknown")
         code = str(incident.get("trigger_code") or "incident")
-        reason = str(incident.get("trigger_reason") or "").strip()
+        reason = sanitize_text(incident.get("trigger_reason"), max_chars=2000).strip()
         add(
             f"maintenance:{incident_id}:created",
             incident.get("created_at"),
@@ -470,7 +477,7 @@ def build_task_timeline(raw: Mapping[str, Any]) -> list[dict[str, Any]]:
             incident.get("updated_at"),
             "ERROR",
             "maintainers",
-            incident.get("last_error"),
+            sanitize_text(incident.get("last_error"), max_chars=2000),
         )
 
     for field, source in (("dependency_events", "dependency"), ("queue_events", "queue")):
@@ -499,7 +506,9 @@ def primary_task_problem(raw: Mapping[str, Any]) -> dict[str, Any] | None:
     active_incident = _active_maintenance_incident(raw)
     active_report = _maintenance_report(raw, active_incident)
     if status == "BLOCKED":
-        block_message = str(raw.get("block_reason") or "Task is blocked")
+        block_message = sanitize_text(
+            raw.get("block_reason") or "Task is blocked", max_chars=2000
+        )
         candidates = [
             item["at"]
             for item in build_task_timeline(raw)
@@ -550,11 +559,12 @@ def primary_task_problem(raw: Mapping[str, Any]) -> dict[str, Any] | None:
                 or raw.get("active_action")
                 or "waiting"
             ),
-            "message": str(
+            "message": sanitize_text(
                 raw.get("waiting_reason")
                 or waiting.get("reason")
                 or (newest or {}).get("message")
-                or "Task is waiting"
+                or "Task is waiting",
+                max_chars=2000,
             ),
             "role": raw.get("active_role"),
             "hop_id": raw.get("active_hop_id"),
@@ -664,13 +674,19 @@ def build_task_payload(
             "status": str(value.get("status") or "unknown"),
             "turn": int(value.get("turn") or 0),
             "page_id": value.get("page_id"),
-            "page_url": value.get("page_url"),
+            "page_url": (
+                sanitize_url(str(value.get("page_url") or ""))
+                if value.get("page_url")
+                else None
+            ),
             "online": bool(value.get("online")),
             "conversation_generation": int(value.get("conversation_generation") or 0),
             "constructor_sent_generation": value.get("constructor_sent_generation"),
             "attachments_uploaded_generation": value.get("attachments_uploaded_generation"),
             "reset_requested": bool(value.get("reset_requested")),
-            "last_error": value.get("last_error"),
+            "last_error": (
+                sanitize_text(value.get("last_error"), max_chars=2000) or None
+            ),
             "last_activity_at": value.get("last_activity_at"),
         }
         for role, value in roles_raw.items()
@@ -678,7 +694,15 @@ def build_task_payload(
     ]
     hops_raw = raw.get("hops") if isinstance(raw.get("hops"), list) else []
     active_hop_id = raw.get("active_hop_id")
-    active_hop = next((dict(hop) for hop in hops_raw if isinstance(hop, Mapping) and hop.get("hop_id") == active_hop_id), None)
+    active_hop_raw = next(
+        (
+            dict(hop)
+            for hop in hops_raw
+            if isinstance(hop, Mapping) and hop.get("hop_id") == active_hop_id
+        ),
+        None,
+    )
+    active_hop = sanitize_value(active_hop_raw) if active_hop_raw is not None else None
     reports = []
     for index, report in enumerate(raw.get("reports") or [], start=1):
         if not isinstance(report, Mapping):
@@ -704,6 +728,7 @@ def build_task_payload(
     primary_problem = primary_task_problem(raw)
     latest_maintenance_report = _latest_maintenance_report(raw)
     active_maintenance = _active_maintenance_incident(raw)
+    active_maintenance_summary = project_maintenance_incident(active_maintenance)
     active_maintenance_report = _maintenance_report(raw, active_maintenance)
     task_id = str(raw.get("task_id") or "")
     task_index = {
@@ -775,8 +800,177 @@ def build_task_payload(
     queue_blocked_by_task_id = active_team_owner_task_id or (
         selected_ready_task_id if selected_ready_task_id != task_id else None
     )
+    repair_metadata = (
+        sanitize_value(dict(raw.get("repair")))
+        if isinstance(raw.get("repair"), Mapping)
+        else None
+    )
+    repair_wait = (
+        sanitize_value(dict(raw.get("repair_wait")))
+        if isinstance(raw.get("repair_wait"), Mapping)
+        else None
+    )
+    repair_links = [
+        sanitize_value(dict(item))
+        for item in raw.get("repair_links") or []
+        if isinstance(item, Mapping)
+    ]
+    repair_relationships: list[dict[str, Any]] = []
+    if repair_metadata is not None:
+        operations = [
+            dict(item)
+            for item in repair_metadata.get("affected_operations") or []
+            if isinstance(item, Mapping)
+        ]
+        if not operations and repair_metadata.get("affected_task_id"):
+            operations = [dict(repair_metadata)]
+        for operation in operations:
+            affected_id = str(operation.get("affected_task_id") or "") or None
+            affected = task_index.get(affected_id or "")
+            affected_wait = (
+                affected.get("repair_wait")
+                if affected and isinstance(affected.get("repair_wait"), Mapping)
+                else None
+            )
+            dependency_gate = bool(
+                affected
+                and task_id in _string_list(affected.get("depends_on_task_ids"))
+                and isinstance(affected_wait, Mapping)
+                and affected_wait.get("repair_task_id") == task_id
+                and affected_wait.get("state") == "WAITING"
+                and (
+                    operation.get("operation_key") is None
+                    or affected_wait.get("operation_key")
+                    == operation.get("operation_key")
+                    or affected_wait.get("incident_id")
+                    == operation.get("incident_id")
+                )
+            )
+            release_event = (
+                affected_wait.get("release_event")
+                if isinstance(affected_wait, Mapping)
+                and affected_wait.get("repair_task_id") == task_id
+                and (
+                    operation.get("operation_key") is None
+                    or affected_wait.get("operation_key")
+                    == operation.get("operation_key")
+                    or affected_wait.get("incident_id")
+                    == operation.get("incident_id")
+                )
+                else None
+            )
+            repair_relationships.append(
+                {
+                    "repair_task_id": task_id,
+                    "repair_team": str(raw.get("team") or "") or None,
+                    "repair_status": str(raw.get("status") or "UNKNOWN"),
+                    "repair_priority": repair_metadata.get("priority")
+                    or raw.get("priority"),
+                    "affected_task_id": affected_id,
+                    "affected_team": (
+                        str(affected.get("team") or "") or None
+                        if affected
+                        else operation.get("affected_team")
+                    ),
+                    "affected_status": (
+                        str(affected.get("status") or "UNKNOWN")
+                        if affected
+                        else "UNKNOWN"
+                    ),
+                    "incident_id": operation.get("incident_id"),
+                    "operation_key": operation.get("operation_key"),
+                    "disposition": operation.get("disposition"),
+                    "previous_disposition": operation.get("previous_disposition"),
+                    "blocker": operation.get("reason"),
+                    "dependency_gate": dependency_gate,
+                    "release_event": release_event,
+                    "root_cause_key": repair_metadata.get("root_cause_key"),
+                }
+            )
+    elif repair_wait is not None or repair_links:
+        relationship_sources = list(repair_links)
+        if repair_wait is not None and not any(
+            item.get("repair_task_id") == repair_wait.get("repair_task_id")
+            and item.get("incident_id") == repair_wait.get("incident_id")
+            and item.get("disposition") == repair_wait.get("disposition")
+            for item in relationship_sources
+        ):
+            relationship_sources.append(repair_wait)
+        for link in relationship_sources:
+            repair_id = str(link.get("repair_task_id") or "") or None
+            repair_task = task_index.get(repair_id or "")
+            repair_task_metadata = (
+                repair_task.get("repair")
+                if repair_task and isinstance(repair_task.get("repair"), Mapping)
+                else {}
+            )
+            repair_relationships.append(
+                {
+                    "repair_task_id": repair_id,
+                    "repair_team": (
+                        str(repair_task.get("team") or "") or None
+                        if repair_task
+                        else link.get("repair_team")
+                    ),
+                    "repair_status": (
+                        str(repair_task.get("status") or "UNKNOWN")
+                        if repair_task
+                        else "UNKNOWN"
+                    ),
+                    "repair_priority": (
+                        repair_task_metadata.get("priority")
+                        or repair_task.get("priority")
+                        if repair_task
+                        else None
+                    ),
+                    "affected_task_id": task_id,
+                    "affected_team": str(raw.get("team") or "") or None,
+                    "affected_status": str(raw.get("status") or "UNKNOWN"),
+                    "incident_id": link.get("incident_id"),
+                    "operation_key": link.get("operation_key"),
+                    "disposition": link.get("disposition"),
+                    "previous_disposition": link.get("previous_disposition"),
+                    "blocker": link.get("blocker")
+                    or link.get("original_block_reason"),
+                    "dependency_gate": bool(
+                        repair_id
+                        and repair_id
+                        in _string_list(raw.get("depends_on_task_ids"))
+                        and repair_wait is not None
+                        and repair_wait.get("repair_task_id") == repair_id
+                        and repair_wait.get("state") == "WAITING"
+                        and (
+                            link.get("operation_key") is None
+                            or repair_wait.get("operation_key")
+                            == link.get("operation_key")
+                            or repair_wait.get("incident_id")
+                            == link.get("incident_id")
+                        )
+                    ),
+                    "release_event": (
+                        repair_wait.get("release_event")
+                        if repair_wait is not None
+                        and repair_wait.get("repair_task_id") == repair_id
+                        and (
+                            link.get("operation_key") is None
+                            or repair_wait.get("operation_key")
+                            == link.get("operation_key")
+                            or repair_wait.get("incident_id")
+                            == link.get("incident_id")
+                        )
+                        else None
+                    ),
+                    "root_cause_key": link.get("root_cause_key"),
+                }
+            )
+    for relationship in repair_relationships:
+        for optional_key in ("incident_id", "operation_key", "previous_disposition"):
+            if relationship.get(optional_key) is None:
+                relationship.pop(optional_key, None)
+    repair_relationship = repair_relationships[-1] if repair_relationships else None
     if replacement_task is not None:
         active_maintenance = None
+        active_maintenance_summary = None
         active_maintenance_report = None
     return {
         "task_id": task_id,
@@ -813,7 +1007,7 @@ def build_task_payload(
         "timeline": timeline,
         "primary_problem": primary_problem,
         "projection_errors": projection_errors,
-        "active_maintenance_incident": dict(active_maintenance) if active_maintenance is not None else None,
+        "active_maintenance_incident": active_maintenance_summary,
         "active_maintenance_report": active_maintenance_report,
         "latest_maintenance_report": latest_maintenance_report,
         "maintenance_replacement_task_id": (
@@ -852,24 +1046,38 @@ def build_task_payload(
             else ()
         ),
         "queue": dict(raw.get("queue") or {}),
+        "priority": raw.get("priority"),
+        "repair": repair_metadata,
+        "repair_wait": repair_wait,
+        "repair_links": repair_links,
+        "repair_relationship": repair_relationship,
+        "repair_relationships": repair_relationships,
         "queue_position": queue_position,
         "queue_length": queue_length,
         "queue_blocked_by_task_id": queue_blocked_by_task_id,
         "active_team_owner_task_id": active_team_owner_task_id,
         "dependency_ready_task_ids": dependency_ready_task_ids,
         "dependency_ready_queue_task_ids": dependency_ready_queue_task_ids,
-        "waiting_reason": raw.get("waiting_reason"),
-        "pause_reason": raw.get("pause_reason"),
+        "waiting_reason": sanitize_text(raw.get("waiting_reason"), max_chars=2000) or None,
+        "pause_reason": sanitize_text(raw.get("pause_reason"), max_chars=2000) or None,
         "block_code": raw.get("block_code"),
         "block_retryable": bool(raw.get("block_retryable")),
-        "block_reason": raw.get("block_reason"),
-        "stop_reason": raw.get("stop_reason"),
-        "cleanup": dict(raw.get("cleanup") or {}),
+        "block_reason": sanitize_text(raw.get("block_reason"), max_chars=2000) or None,
+        "stop_reason": sanitize_text(raw.get("stop_reason"), max_chars=2000) or None,
+        "cleanup": sanitize_value(dict(raw.get("cleanup") or {})),
         "roles": roles,
         "reports": reports,
-        "route_timeline": [dict(item) for item in raw.get("route_timeline") or [] if isinstance(item, Mapping)],
-        "errors": [dict(item) if isinstance(item, Mapping) else str(item) for item in raw.get("errors") or []],
-        "control_results": [dict(item) for item in raw.get("controls") or [] if isinstance(item, Mapping)],
+        "route_timeline": [
+            sanitize_value(dict(item))
+            for item in raw.get("route_timeline") or []
+            if isinstance(item, Mapping)
+        ],
+        "errors": [sanitize_value(item) for item in raw.get("errors") or []],
+        "control_results": [
+            sanitize_value(dict(item))
+            for item in raw.get("controls") or []
+            if isinstance(item, Mapping)
+        ],
         "controls": [] if immutable_history else list(TASK_CONTROLS),
         "options": dict(raw.get("options") or {}),
     }

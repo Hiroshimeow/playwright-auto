@@ -58,6 +58,14 @@
     "timeout_seconds": 300,
     "refresh_after_seconds": 120,
     "stable_ms": 1000,
-    "poll_ms": 100
+    "poll_ms": 100,
+    "tooling_probe": {
+      "dependency": "mcp-g8",
+      "endpoint": "http://127.0.0.1:8101/mcp",
+      "auth_profile": "local_mcp_static_bearer",
+      "required_tools": [
+        "shell_execute"
+      ]
+    }
   }
 }

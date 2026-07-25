@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from .cdpa_actions import AcquiredRole, CDPATabActions, RoleOwnershipError, TeamCloseError
+from .cdpa_commands import (
+    WorkerCommand,
+    conversation_identity,
+    validate_worker_command,
+)
 from .cdpa_config import CDPAConfig, load_cdpa_config
 from .cdpa_maintenance import MaintainerCoordinator
 from .cdpa_prompts import PromptBuilder
@@ -25,6 +30,7 @@ from .cdpa_response import (
     remaining_timeout_ms,
     start_wait_budget,
 )
+from .cdpa_safety import sanitize_exception, sanitize_text
 from .cdpa_routes import (
     InlineReportMaterializationError,
     RouteContractError,
@@ -62,6 +68,10 @@ from .workflow import WorkflowContext
 
 TERMINAL = frozenset({"DONE", "STOPPED"})
 IN_FLIGHT = frozenset({"sending", "sent", "waiting"})
+
+
+class IneffectiveControlError(RuntimeError):
+    """The primitive ran, but its required operational postcondition did not hold."""
 
 
 def _active_hop(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -165,7 +175,7 @@ class CDPAWorker:
         code: str = "unexpected_error",
         retryable: bool = False,
     ) -> dict[str, Any]:
-        message = str(error)
+        message = sanitize_text(error, max_chars=2000)
         unchanged_active_block = (
             state.get("status") == "BLOCKED"
             and state.get("block_code") == str(code)
@@ -202,7 +212,7 @@ class CDPAWorker:
         *,
         code: str,
     ) -> bool:
-        message = str(error)
+        message = sanitize_text(error, max_chars=2000)
         unchanged = (
             state.get("status") == "WAITING"
             and state.get("waiting_code") == code
@@ -485,7 +495,7 @@ class CDPAWorker:
         if cleanup.get("phase") == "closing":
             cleanup["phase"] = "close_pending"
         now = utc_now()
-        detail = f"{type(error).__name__}: {error}"
+        detail = sanitize_exception(error)
         cleanup["last_error"] = detail
         cleanup["last_error_at"] = now
         cleanup["retry_count"] = int(cleanup.get("retry_count") or 0) + 1
@@ -714,7 +724,7 @@ class CDPAWorker:
         *,
         path: str,
     ) -> Any:
-        if before == after:
+        if before == after or current == after:
             return current
         if isinstance(before, Mapping) and isinstance(after, Mapping):
             if not isinstance(current, dict):
@@ -905,9 +915,18 @@ class CDPAWorker:
         action = str(control.get("action") or "")
         control_id = control.get("control_id")
         baseline = json.loads(json.dumps(state, ensure_ascii=False, default=str))
+        baseline_control_id = control.get("control_id")
         role = str(control.get("role") or state.get("active_role") or "PLAN").upper()
         result: Any = None
+        command: WorkerCommand | None = None
         try:
+            command_value = control.get("command")
+            if isinstance(command_value, Mapping):
+                command = WorkerCommand.from_dict(command_value)
+                validate_worker_command(command, state)
+                if command.action != action or command.role != control.get("role"):
+                    raise ValueError("worker command payload does not match queued control")
+                control["command_state"] = "RUNNING"
             hop = _active_hop(state) if state.get("active_hop_id") is not None else None
             hop_state = str(hop.get("state") or "") if hop else ""
             if action == "pause":
@@ -1090,13 +1109,51 @@ class CDPAWorker:
                             "blocked role reopen requires pre_send or an accepted waiting hop "
                             "on the exact recorded conversation"
                         )
+                expected_conversation = (
+                    command.snapshot.get("conversation_id")
+                    if command is not None
+                    else conversation_identity(
+                        (hop.get("conversation_url") if hop is not None else None)
+                        or state["roles"][role].get("page_url")
+                    )
+                )
+                expected_binding_page_id = None
+                if blocked_role_recovery and hop is not None and hop_state == "waiting":
+                    receipt = hop.get("receipt") if isinstance(hop.get("receipt"), Mapping) else {}
+                    binding = receipt.get("binding") if isinstance(receipt.get("binding"), Mapping) else {}
+                    expected_binding_page_id = str(binding.get("page_id") or "").strip() or None
                 acquired = await actions.locate_owned(state, role)
                 recovered = acquired is None
                 if acquired is None:
                     acquired = await actions.reopen(state, role)
                 else:
                     await actions.open_tab(acquired)
+                acquired_conversation = conversation_identity(acquired.url)
+                if expected_conversation and acquired_conversation != expected_conversation:
+                    raise IneffectiveControlError(
+                        "OPEN_ROLE_TAB reopened a different conversation; operational block remains"
+                    )
+                if (
+                    expected_binding_page_id is not None
+                    and str(acquired.page_id) != expected_binding_page_id
+                ):
+                    raise IneffectiveControlError(
+                        "OPEN_ROLE_TAB did not restore the accepted-send page binding"
+                    )
                 self._record_acquired(state, role, acquired)
+                role_after = state["roles"][role]
+                if (
+                    not bool(role_after.get("online"))
+                    or str(role_after.get("page_id") or "") != str(acquired.page_id)
+                    or (
+                        expected_conversation
+                        and conversation_identity(role_after.get("page_url"))
+                        != expected_conversation
+                    )
+                ):
+                    raise IneffectiveControlError(
+                        "OPEN_ROLE_TAB did not establish the required role ownership postcondition"
+                    )
                 result = {"page_id": acquired.page_id, "recovered": recovered}
                 if blocked_role_recovery:
                     state["status"] = "RUNNING"
@@ -1169,6 +1226,89 @@ class CDPAWorker:
                     }
                 )
                 result = {"old_hop_id": old_hop_id, "new_hop_id": new_hop["hop_id"]}
+            elif action == "create_repair_task":
+                if command is None or command.repair is None:
+                    raise RuntimeError("create_repair_task requires a validated repair command")
+                disposition = command.repair.disposition
+                current_status = str(state.get("status") or "").upper()
+                current_repair_wait = state.get("repair_wait")
+                matching_repair_gate = (
+                    current_status == "WAITING"
+                    and isinstance(current_repair_wait, Mapping)
+                    and current_repair_wait.get("root_cause_key")
+                    == command.repair.root_cause_key
+                    and current_repair_wait.get("state") == "WAITING"
+                    and current_repair_wait.get("preserved_hop_id")
+                    == command.repair.affected_hop_id
+                    and (
+                        str(current_repair_wait.get("preserved_request_id") or "")
+                        or None
+                    )
+                    == command.repair.affected_request_id
+                )
+                if (
+                    disposition == "CONTINUE_IN_PARALLEL"
+                    and current_status != "RUNNING"
+                    and not matching_repair_gate
+                ):
+                    raise IneffectiveControlError(
+                        "CONTINUE_IN_PARALLEL requires RUNNING work or the exact "
+                        "preserved repair gate being disposition-changed"
+                    )
+                if (
+                    disposition == "HOLD_FOR_REPAIR"
+                    and current_status != "BLOCKED"
+                    and not matching_repair_gate
+                ):
+                    raise IneffectiveControlError(
+                        "HOLD_FOR_REPAIR requires a non-operator BLOCKED task or "
+                        "an idempotent replay of the exact preserved repair gate"
+                    )
+                bundle = self.store.create_or_gate_repair(command.repair)
+                affected = bundle["affected"]
+                repair_task = bundle["repair"]
+                repair_task_id = str(repair_task.get("task_id") or "")
+                if disposition == "HOLD_FOR_REPAIR":
+                    repair_wait = affected.get("repair_wait")
+                    if (
+                        str(affected.get("status") or "").upper() != "WAITING"
+                        or repair_task_id
+                        not in (affected.get("depends_on_task_ids") or [])
+                        or not isinstance(repair_wait, Mapping)
+                        or repair_wait.get("repair_task_id") != repair_task_id
+                        or repair_wait.get("state") != "WAITING"
+                    ):
+                        raise IneffectiveControlError(
+                            "repair task exists but HOLD_FOR_REPAIR postcondition was not achieved"
+                        )
+                elif (
+                    str(affected.get("status") or "").upper() != "RUNNING"
+                    or repair_task_id in (affected.get("depends_on_task_ids") or [])
+                ):
+                    raise IneffectiveControlError(
+                        "repair task exists but CONTINUE_IN_PARALLEL postcondition was not achieved"
+                    )
+                state.clear()
+                state.update(affected)
+                control = next(
+                    (
+                        item
+                        for item in state.get("controls") or []
+                        if isinstance(item, dict)
+                        and item.get("control_id") == baseline_control_id
+                    ),
+                    None,
+                )
+                if control is None:
+                    raise RuntimeError("repair transaction lost its worker control")
+                result = {
+                    "repair_task_id": repair_task["task_id"],
+                    "repair_team": repair_task["team"],
+                    "repair_status": repair_task["status"],
+                    "priority": (repair_task.get("repair") or {}).get("priority"),
+                    "disposition": command.repair.disposition,
+                    "gated": command.repair.disposition == "HOLD_FOR_REPAIR",
+                }
             elif action == "clear_team":
                 cleanup = state.setdefault("cleanup", {})
                 if cleanup.get("state") == "CLEARED":
@@ -1259,9 +1399,42 @@ class CDPAWorker:
                     return True
             else:
                 raise RuntimeError(f"unsupported control action {action!r}")
-        except Exception as exc:
-            detail = f"{type(exc).__name__}: {exc}"
+        except IneffectiveControlError as exc:
+            detail = sanitize_exception(exc)
             control_id = control.get("control_id")
+            state.clear()
+            state.update(baseline)
+            current_control = next(
+                (
+                    item
+                    for item in state.get("controls") or []
+                    if isinstance(item, dict) and item.get("control_id") == control_id
+                ),
+                None,
+            )
+            if current_control is None:
+                raise RuntimeError("ineffective control disappeared during rollback")
+            current_control["status"] = "ineffective"
+            current_control["command_state"] = "INEFFECTIVE"
+            current_control["result"] = detail
+            current_control["applied_at"] = utc_now()
+            if manifest_path is not None and isinstance(control_id, int):
+                saved = self._persist_control_result(
+                    manifest_path,
+                    baseline,
+                    state,
+                    control_id=control_id,
+                    action=action,
+                )
+                state.clear()
+                state.update(saved)
+                if persisted_result is not None:
+                    persisted_result.append(True)
+            return True
+        except Exception as exc:
+            detail = sanitize_exception(exc)
+            control_id = control.get("control_id")
+            control["command_state"] = "REJECTED"
             if (
                 action == "clear_team"
                 and manifest_path is not None
@@ -1295,6 +1468,7 @@ class CDPAWorker:
                     persisted_result.append(True)
             return True
         control["status"] = "applied"
+        control["command_state"] = "APPLIED"
         control["result"] = result
         control["applied_at"] = utc_now()
         if manifest_path is not None and isinstance(control_id, int):
@@ -1353,7 +1527,11 @@ class CDPAWorker:
             "report_size": None,
             "route": None,
             "repair_attempt": int(repair_attempt),
-            "validation_error": validation_error,
+            "validation_error": (
+                sanitize_text(validation_error, max_chars=2000)
+                if validation_error is not None
+                else None
+            ),
             "wait": {
                 "started_at": None,
                 "deadline_at": None,
@@ -1643,7 +1821,9 @@ class CDPAWorker:
             "message_id": response.message_id,
             "turn_id": response.turn_id,
         }
-        hop["validation_error"] = validation_error
+        hop["validation_error"] = (
+            sanitize_text(validation_error, max_chars=2000) if validation_error is not None else None
+        )
         hop["state"] = "responded"
         hop.setdefault("timestamps", {})["responded_at"] = utc_now()
         state["active_action"] = "validate_route"
@@ -1720,7 +1900,7 @@ class CDPAWorker:
         except ManualInputPendingError as exc:
             state["status"] = "PAUSED"
             state["kanban_column"] = "PAUSED"
-            state["pause_reason"] = str(exc)
+            state["pause_reason"] = sanitize_text(exc, max_chars=2000)
             return True
         except ChoicePromptBlockedError as exc:
             self._block(
@@ -1827,7 +2007,7 @@ class CDPAWorker:
             try:
                 await actions.refresh(acquired)
             except Exception as exc:
-                finish_refresh(wait, error=f"{type(exc).__name__}: {exc}")
+                finish_refresh(wait, error=sanitize_exception(exc))
                 self._persist_transport_result(manifest_path, refresh_baseline, state)
                 raise
             finish_refresh(wait)
@@ -1900,7 +2080,7 @@ class CDPAWorker:
         except ManualInputPendingError as exc:
             state["status"] = "PAUSED"
             state["kanban_column"] = "PAUSED"
-            state["pause_reason"] = str(exc)
+            state["pause_reason"] = sanitize_text(exc, max_chars=2000)
             return
         except ChoicePromptBlockedError as exc:
             self._block(
@@ -1921,7 +2101,7 @@ class CDPAWorker:
     ) -> None:
         self._complete_request_response(hop)
         attempt = int(hop.get("repair_attempt") or 0) + 1
-        hop["validation_error"] = str(error)
+        hop["validation_error"] = sanitize_text(error, max_chars=2000)
         if attempt > self.config.route_repair_attempts:
             self._block(
                 state,
@@ -1941,7 +2121,7 @@ class CDPAWorker:
                 "source_role": role,
                 "route": role,
                 "kind": "route_repair",
-                "error": str(error),
+                "error": sanitize_text(error, max_chars=2000),
             }
         )
         self._append_hop(
@@ -1952,7 +2132,7 @@ class CDPAWorker:
             kind="route_repair",
             turn=int(hop["turn"]),
             repair_attempt=attempt,
-            validation_error=str(error),
+            validation_error=sanitize_text(error, max_chars=2000),
         )
 
     def _responded(self, state: dict[str, Any], hop: dict[str, Any]) -> None:

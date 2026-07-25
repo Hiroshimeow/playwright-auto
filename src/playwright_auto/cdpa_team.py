@@ -121,6 +121,7 @@ def exact_team_ready_waiters(
             and dependency_readiness(manifest, graph_tasks).ready
         ),
         key=lambda item: (
+            0 if item.get("priority") == "urgent_repair" else 1,
             str(item.get("created_at") or ""),
             str(item.get("task_id") or ""),
         ),

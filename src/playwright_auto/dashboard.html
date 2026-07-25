@@ -131,6 +131,12 @@
             <div id="dependency-content" class="grid grid-cols-1 md:grid-cols-2 gap-2 mt-2 text-xs text-textDim"></div>
           </section>
 
+          <section id="repair-summary" class="hidden border-t border-borderDark pt-3 mb-3" aria-labelledby="repair-title">
+            <p class="text-[10px] uppercase tracking-wider text-textDim">Operational repair</p>
+            <h3 id="repair-title" class="text-white font-medium">Repair Relationships</h3>
+            <div id="repair-content" class="grid grid-cols-1 gap-2 mt-2 text-xs text-textDim"></div>
+          </section>
+
           <section id="attachments-summary" class="border-t border-borderDark pt-3 mb-3" aria-labelledby="attachments-title">
             <p class="text-[10px] uppercase tracking-wider text-textDim">Durable context</p>
             <h3 id="attachments-title" class="text-white font-medium">Attachments</h3>
@@ -451,6 +457,77 @@
         });
         removeStale(host, '[data-key]', keys);
       }
+      function createRepairRelationshipItem() {
+        const card = make('article', 'rounded-lg border border-borderDark bg-dark p-3');
+        const grid = make('div', 'grid grid-cols-1 md:grid-cols-2 gap-2', card);
+        for (const name of ['repair-task', 'affected-task', 'disposition', 'blocker', 'dependency-gate', 'release-event']) {
+          const item = createSummaryItem();
+          item.dataset.field = name;
+          grid.appendChild(item);
+        }
+        return card;
+      }
+      function setRepairSummaryField(card, name, label, value) {
+        const item = field(card, name);
+        setText(field(item, 'label'), label);
+        setText(field(item, 'value'), value);
+      }
+      function renderRepairRelationships(task) {
+        const section = byId('repair-summary');
+        const host = byId('repair-content');
+        const relationships = (task.repair_relationships || []).length
+          ? task.repair_relationships
+          : task.repair_relationship
+            ? [task.repair_relationship]
+            : [];
+        setClass(section, relationships.length ? 'block border-t border-borderDark pt-3 mb-3' : 'hidden border-t border-borderDark pt-3 mb-3');
+        const keys = new Set();
+        relationships.forEach((relationship, index) => {
+          const key = relationship.operation_key || [
+            relationship.repair_task_id || 'repair',
+            relationship.affected_task_id || 'affected',
+            relationship.incident_id || 'incident',
+            relationship.disposition || 'disposition',
+            index,
+          ].join(':');
+          keys.add(key);
+          const card = keyed(host, 'article[data-key]', key, createRepairRelationshipItem);
+          const priority = relationship.repair_priority || 'ordinary';
+          setRepairSummaryField(
+            card,
+            'repair-task',
+            'Repair task',
+            `${relationship.repair_task_id || 'unknown'} · ${relationship.repair_team || 'unknown team'} · ${relationship.repair_status || 'UNKNOWN'} · priority ${priority}`,
+          );
+          setRepairSummaryField(
+            card,
+            'affected-task',
+            'Affected task',
+            `${relationship.affected_task_id || 'unknown'} · ${relationship.affected_team || 'unknown team'} · ${relationship.affected_status || 'UNKNOWN'}`,
+          );
+          setRepairSummaryField(
+            card,
+            'disposition',
+            'Disposition',
+            `${relationship.disposition || 'unknown'}${relationship.previous_disposition ? ` · previously ${relationship.previous_disposition}` : ''}`,
+          );
+          setRepairSummaryField(card, 'blocker', 'Blocker', relationship.blocker || 'None recorded');
+          setRepairSummaryField(
+            card,
+            'dependency-gate',
+            'Dependency gate',
+            relationship.dependency_gate ? 'Active · affected task waits on repair' : 'Not active',
+          );
+          setRepairSummaryField(
+            card,
+            'release-event',
+            'Release event',
+            relationship.release_event || 'Pending repair completion or not required',
+          );
+          placeInOrder(host, card, index);
+        });
+        removeStale(host, 'article[data-key]', keys);
+      }
       function formatBytes(value) {
         const size = Number(value || 0);
         if (size < 1024) return `${size} B`;
@@ -643,7 +720,8 @@
         if (!task) {
           setText(byId('team-title'), 'No task available.');
           setText(byId('team-meta'), '');
-          clearNode(byId('logs-content')); clearNode(byId('role-table-body')); clearNode(byId('dependency-content')); clearNode(byId('attachment-content')); clearNode(byId('selected-reports'));
+          clearNode(byId('logs-content')); clearNode(byId('role-table-body')); clearNode(byId('dependency-content')); clearNode(byId('repair-content')); clearNode(byId('attachment-content')); clearNode(byId('selected-reports'));
+          setClass(byId('repair-summary'), 'hidden border-t border-borderDark pt-3 mb-3');
           setClass(byId('primary-problem-section'), 'hidden rounded-lg border border-danger bg-danger/10 p-3 mb-3');
           setClass(byId('maintenance-section'), 'hidden rounded-lg border border-borderDark bg-dark p-3 mb-3');
           setText(byId('task-control-target'), 'Target: no selected task');
@@ -657,6 +735,7 @@
         renderMaintenance(task);
         renderControls(task);
         renderDependencySummary(task);
+        renderRepairRelationships(task);
         renderAttachments(task);
         renderRoles(task);
         renderLogs(task);
