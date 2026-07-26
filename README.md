@@ -1,6 +1,6 @@
 # playwright-auto
 
-Persistent Chromium automation through local CDP, with a low-latency interactive Selkies/WebRTC view.
+Persistent Chromium automation through local CDP, with a multi-client interactive noVNC view.
 
 ## Endpoints
 
@@ -17,44 +17,45 @@ CDP clients must disconnect with `playwright.stop()` or `connected_browser(...)`
 
 - Linux with Bash and Python 3.11 or newer.
 - `uv`, Node.js, and PM2.
-- Xvfb and a Chromium-family browser.
+- Xvfb, `x11vnc`, nginx, `curl`, `tar`, and a Chromium-family browser.
 - Tailscale for private remote viewer access.
-- Selkies GStreamer unpacked under `~/.local/opt/selkies-gstreamer`, or set `SELKIES_ROOT`.
+- noVNC 1.7.0 and websockify 0.13.0 are installed under `.runtime/`.
 
 Runtime executables are discovered automatically. On nonstandard installations, set:
 
 ```bash
 export CHROMIUM_BIN=/path/to/chromium-or-chrome
 export XVFB_BIN=/path/to/Xvfb
-export SELKIES_ROOT=/path/to/selkies-gstreamer
-# Only needed when Selkies has a nonstandard Python package layout:
-export SELKIES_PYTHON_PACKAGE=/path/to/site-packages/selkies_gstreamer
+export X11VNC_BIN=/path/to/x11vnc
+export NOVNC_ROOT=/path/to/noVNC
+export WEBSOCKIFY_BIN=/path/to/websockify
 ```
 
 ## Start
 
 ```bash
 uv sync
+./scripts/install-novnc.sh
 pm2 start ecosystem.config.cjs
 pm2 save
 ```
 
 ```bash
-pm2 status playwright-display playwright-selkies playwright-browser playwright-role-ui
+pm2 status playwright-display playwright-vnc playwright-novnc playwright-browser playwright-role-ui
 curl http://127.0.0.1:9222/json/version
 curl -I http://127.0.0.1:9223/
 uv run python scripts/smoke.py
 ```
 
-Stop or restart with `pm2 stop|restart playwright-browser playwright-selkies playwright-display playwright-role-ui`.
+Stop or restart with `pm2 stop|restart playwright-browser playwright-novnc playwright-vnc playwright-display playwright-role-ui`.
 
-Selkies v1.6.2 is unpacked user-locally at `~/.local/opt/selkies-gstreamer`. The viewer has no application password and must stay inside the private Tailscale network. Do not expose port 9223 through Funnel or a public tunnel.
+The viewer uses noVNC 1.7.0 with websockify 0.13.0. x11vnc listens only on loopback port 5901 and accepts shared clients; web access is exposed on port 9223. The viewer has no application password and must stay inside the private Tailscale network. Do not expose port 9223 through Funnel or a public tunnel.
 
-The virtual display is a separate PM2 service, so restarting Selkies does not restart Chrome or affect its profile.
+The display, VNC backend, web viewer, and Chromium are separate PM2 services. Restarting the viewer does not restart Chrome or affect its profile.
 
 ### Windows with an existing CDP browser
 
-The PM2/Xvfb/Selkies stack above is Linux-only. On Windows, point the tools at a Chrome
+The PM2/Xvfb/noVNC stack above is Linux-only. On Windows, point the tools at a Chrome
 instance already running with loopback CDP on port 9222:
 
 ```powershell
@@ -202,13 +203,16 @@ provide a stable identity for an explicit resume or audit trail.
 Port 9223 uses this path:
 
 ```text
-Xvfb :100 → Selkies GStreamer/WebRTC → x264 H.264 → browser viewer
+Xvfb :100 → x11vnc 127.0.0.1:5901 → websockify 127.0.0.1:9226
+          → nginx/noVNC 0.0.0.0:9223 → browser viewers
 ```
 
-It is not VNC/noVNC. The private Tailscale profile is video-only, uses UDP ICE only
-for loopback/Tailscale/LAN addresses, and keeps port 9223 fixed. Current settings are
-1280×720, 15 FPS, and 1.2 Mbps. The Selkies web and Python runtime patches are
-generated under `.runtime/`; the installed Selkies package is not modified.
+x11vnc uses shared mode, so multiple desktop and mobile viewers can connect to the
+same Chromium display simultaneously. noVNC scales the 1400×936 remote framebuffer
+inside each client's viewport instead of letting clients fight over the X display size.
+Legacy Selkies paths under `/webrtc/` return HTTP 410 and are never proxied into VNC.
+The VNC protocol port is loopback-only; only the private Tailscale viewer port 9223 is
+reachable remotely.
 
 ## ChatGPT workflows
 
@@ -249,7 +253,7 @@ See `docs/chatgpt-workflows.md`, `docs/tampermonkey-edge-cases.md`, and
 Stop both PM2 apps before reusing the profile headlessly:
 
 ```bash
-pm2 stop playwright-browser playwright-selkies playwright-display
+pm2 stop playwright-browser playwright-novnc playwright-vnc playwright-display
 uv run playwright-auto start --headless
 uv run playwright-auto status
 uv run playwright-auto stop
