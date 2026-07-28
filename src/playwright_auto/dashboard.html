@@ -119,6 +119,24 @@
     </form>
   </dialog>
 
+  <dialog id="agent-command-dialog" class="create-dialog">
+    <form id="agent-command-form" method="dialog" class="create-form">
+      <header class="secondary-header">
+        <div>
+          <p class="eyebrow">Independent agent</p>
+          <h2>Command</h2>
+        </div>
+        <button type="button" class="button icon-button" data-close-agent-command aria-label="Close agent command">Close</button>
+      </header>
+      <input type="hidden" name="task_id">
+      <label>One-off instruction<textarea name="instruction" rows="5" maxlength="4000" required></textarea></label>
+      <footer class="dialog-actions">
+        <button type="button" class="button" data-close-agent-command>Cancel</button>
+        <button type="submit" class="button primary">Run command</button>
+      </footer>
+    </form>
+  </dialog>
+
   <dialog id="agent-settings-dialog" class="create-dialog">
     <form id="agent-settings-form" method="dialog" class="create-form">
       <header class="secondary-header">
@@ -130,18 +148,19 @@
       </header>
       <input type="hidden" name="task_id">
       <label class="check-row"><input type="checkbox" name="enabled"> Enabled</label>
-      <label>Replace system prompt (optional)<textarea name="system_prompt" rows="6"></textarea></label>
+      <label>System prompt<textarea name="system_prompt" rows="8" required></textarea></label>
       <fieldset class="action-fieldset">
         <legend>Triggers</legend>
-        <label class="check-row"><input type="checkbox" name="recovery"> Exclusive recovery</label>
-        <label class="check-row"><input type="checkbox" name="task_done"> Task DONE</label>
-        <label class="check-row"><input type="checkbox" name="check_all"> CHECK_ALL</label>
-        <label>Interval minutes<input type="number" name="interval_minutes" min="20" step="1"></label>
-        <label>Selected exact teams<input name="teams" placeholder="team-a, team-b" autocomplete="off"></label>
-        <label>Selected states<input name="states" placeholder="RUNNING, WAITING, BLOCKED" autocomplete="off"></label>
-        <label>Completed roles<input name="role_completed" placeholder="PLAN, DEV, TEST" autocomplete="off"></label>
+        <div class="form-grid agent-trigger-grid">
+          <label class="check-row"><input type="checkbox" name="recovery"> Exclusive recovery</label>
+          <label class="check-row"><input type="checkbox" name="task_done"> Task DONE</label>
+          <label class="check-row"><input type="checkbox" name="check_all"> CHECK_ALL</label>
+          <label>Interval minutes<input type="number" name="interval_minutes" min="20" step="1"></label>
+          <label>Exact teams<input name="teams" placeholder="team-a, team-b" autocomplete="off"></label>
+          <label>Selected states<input name="states" placeholder="RUNNING, WAITING, BLOCKED" autocomplete="off"></label>
+          <label>Completed roles<input name="role_completed" placeholder="PLAN, DEV, TEST" autocomplete="off"></label>
+        </div>
       </fieldset>
-      <label class="check-row"><input type="checkbox" name="new_chat_next_job"> New Chat on next job</label>
       <footer class="dialog-actions">
         <button type="button" class="button" data-close-agent-settings>Cancel</button>
         <button type="submit" class="button primary">Save settings</button>

@@ -29,6 +29,8 @@ const roots = {
   requestedTeam: document.querySelector('#create-form input[name="requested_team"]'),
   agentDialog: document.querySelector("#agent-dialog"),
   agentForm: document.querySelector("#agent-form"),
+  agentCommandDialog: document.querySelector("#agent-command-dialog"),
+  agentCommandForm: document.querySelector("#agent-command-form"),
   agentSettingsDialog: document.querySelector("#agent-settings-dialog"),
   agentSettingsForm: document.querySelector("#agent-settings-form"),
   toast: document.querySelector("#toast"),
@@ -144,13 +146,22 @@ async function loadAgentReports(detail) {
 }
 
 
+function openAgentCommand(detail) {
+  if (!detail || detail.task_mode !== "independent") return;
+  const form = roots.agentCommandForm;
+  form.elements.task_id.value = detail.task_id;
+  form.elements.instruction.value = "";
+  roots.agentCommandDialog.showModal();
+  form.elements.instruction.focus();
+}
+
 function openAgentSettings(detail) {
   if (!detail || detail.task_mode !== "independent") return;
   const form = roots.agentSettingsForm;
   const settings = detail.agent?.trigger_settings || {};
   form.elements.task_id.value = detail.task_id;
   form.elements.enabled.checked = detail.agent?.enabled !== false;
-  form.elements.system_prompt.value = "";
+  form.elements.system_prompt.value = detail.agent?.system_prompt || "";
   form.elements.recovery.checked = Boolean(settings.recovery);
   form.elements.task_done.checked = Boolean(settings.task_done);
   form.elements.check_all.checked = Boolean(settings.check_all);
@@ -158,7 +169,6 @@ function openAgentSettings(detail) {
   form.elements.teams.value = (settings.teams || []).join(", ");
   form.elements.states.value = (settings.states || []).join(", ");
   form.elements.role_completed.value = (settings.role_completed || []).join(", ");
-  form.elements.new_chat_next_job.checked = Boolean(detail.agent?.new_chat_next_job);
   roots.agentSettingsDialog.showModal();
 }
 
@@ -668,8 +678,10 @@ roots.detail.addEventListener("click", event => {
         taskId,
         endpoint: `/api/independent-agents/${encodeURIComponent(taskId)}/run`,
         body: {trigger_type: "manual"},
-        label: `Run now · ${state.selectedDetail?.agent?.name || taskId}`,
+        label: `Run once · ${state.selectedDetail?.agent?.name || taskId}`,
       });
+    } else if (action === "command") {
+      openAgentCommand(state.selectedDetail);
     } else if (action === "settings") {
       openAgentSettings(state.selectedDetail);
     } else if (action === "history") {
@@ -744,6 +756,7 @@ document.addEventListener("click", event => {
   if (event.target.closest("[data-close-create]")) closeCreate();
   if (event.target.closest("[data-open-agent]")) roots.agentDialog.showModal();
   if (event.target.closest("[data-close-agent]")) roots.agentDialog.close();
+  if (event.target.closest("[data-close-agent-command]")) roots.agentCommandDialog.close();
   if (event.target.closest("[data-close-agent-settings]")) roots.agentSettingsDialog.close();
   const view = event.target.closest("[data-view]")?.dataset.view;
   if (view) openDrawer(view);
@@ -824,6 +837,23 @@ roots.agentForm.addEventListener("submit", event => {
   roots.agentDialog.close();
 });
 
+roots.agentCommandForm.addEventListener("submit", event => {
+  event.preventDefault();
+  const values = new FormData(roots.agentCommandForm);
+  const taskId = String(values.get("task_id") || "");
+  const instruction = String(values.get("instruction") || "").trim();
+  if (!taskId || !instruction) return;
+  queueCommand({
+    kind: "independent_command",
+    taskId,
+    endpoint: `/api/independent-agents/${encodeURIComponent(taskId)}/run`,
+    body: {trigger_type: "manual", instruction},
+    label: `Command · ${state.selectedDetail?.agent?.name || taskId}`,
+  });
+  roots.agentCommandForm.reset();
+  roots.agentCommandDialog.close();
+});
+
 roots.agentSettingsForm.addEventListener("submit", event => {
   event.preventDefault();
   const values = new FormData(roots.agentSettingsForm);
@@ -839,13 +869,13 @@ roots.agentSettingsForm.addEventListener("submit", event => {
     states: commaValues(values.get("states")).map(value => value.toUpperCase()),
     check_all: values.has("check_all"),
   };
+  const systemPrompt = String(values.get("system_prompt") || "").trim();
+  if (!systemPrompt) return;
   const body = {
     enabled: values.has("enabled"),
+    system_prompt: systemPrompt,
     trigger_settings: triggerSettings,
-    new_chat_next_job: values.has("new_chat_next_job"),
   };
-  const systemPrompt = String(values.get("system_prompt") || "").trim();
-  if (systemPrompt) body.system_prompt = systemPrompt;
   queueCommand({
     kind: "independent_settings",
     taskId,
@@ -858,6 +888,9 @@ roots.agentSettingsForm.addEventListener("submit", event => {
 
 roots.agentDialog.addEventListener("click", event => {
   if (event.target === roots.agentDialog) roots.agentDialog.close();
+});
+roots.agentCommandDialog.addEventListener("click", event => {
+  if (event.target === roots.agentCommandDialog) roots.agentCommandDialog.close();
 });
 roots.agentSettingsDialog.addEventListener("click", event => {
   if (event.target === roots.agentSettingsDialog) roots.agentSettingsDialog.close();

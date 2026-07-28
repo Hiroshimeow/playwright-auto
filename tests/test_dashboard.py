@@ -262,10 +262,11 @@ def test_seven_lane_board_and_independent_agent_controls_are_explicit():
     assert 'INDEPENDENT_AGENTS: "INDEPENDENT AGENTS"' in board
     assert 'task.task_mode === "independent"' in board
     assert 'RUNNING for ${agent.target_team}' in board
-    assert '"Run now"' in detail
+    assert '"Run once"' in detail
+    assert '"Command"' in detail
     assert '"Stop current job"' in detail
     assert '"Close tab"' in detail
-    assert '"New Chat next job"' in detail
+    assert '"Renew"' in detail
     assert '"Settings"' in detail
     assert '"Reports"' in detail
     assert 'data-open-agent' in html

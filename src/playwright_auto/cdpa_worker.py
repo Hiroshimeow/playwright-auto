@@ -1435,11 +1435,33 @@ class CDPAWorker:
                 hop["state"] = "pre_send"
             return {"event_key": independent["active_event"].get("event_key")}
         if action == "new_chat":
+            status = str(state.get("status") or "").upper()
+            if active or status not in {"WAITING", "PAUSED"}:
+                raise RuntimeError("Renew requires an idle independent agent")
+            if hop is not None and (
+                str(hop.get("state") or "") in IN_FLIGHT
+                or hop.get("receipt") is not None
+            ):
+                raise RuntimeError(
+                    "cannot Renew across an accepted in-flight request"
+                )
+            selected = await actions.preflight_team(state)
+            closed = await actions.close_team(state, preflighted_pages=selected)
+            if await actions.preflight_team(state):
+                raise IneffectiveControlError(
+                    "Renew did not remove every exact independent-agent tab"
+                )
+            record = state["roles"][role]
+            record["page_id"] = None
+            record["page_url"] = None
+            record["online"] = False
+            record["last_activity_at"] = utc_now()
+            if hop is not None:
+                hop["conversation_url"] = None
             independent["new_chat_next_job"] = True
-            independent["new_chat_deferred_task_id"] = (
-                str(state.get("task_id") or "") if active else None
-            )
-            return {"deferred": True}
+            independent["new_chat_deferred_task_id"] = None
+            independent["idle_tab_closed_at"] = utc_now()
+            return {"renewed": True, "closed_tabs": closed}
         if action == "open_tab":
             acquired = await actions.locate_owned(state, role)
             reopened = False
@@ -4362,7 +4384,12 @@ class CDPAWorker:
             idle_since = parse_time(independent.get("idle_since"))
             if idle_since is None:
                 continue
-            if current_epoch - idle_since.timestamp() < self.config.independent_idle_close_seconds:
+            immediate_close = independent.get("close_tab_when_idle") is True
+            if (
+                not immediate_close
+                and current_epoch - idle_since.timestamp()
+                < self.config.independent_idle_close_seconds
+            ):
                 continue
             role_record = (snapshot.get("roles") or {}).get(INDEPENDENT_ROLE)
             if not isinstance(role_record, Mapping):
@@ -4393,6 +4420,7 @@ class CDPAWorker:
                 ):
                     return state
                 current["idle_tab_closed_at"] = utc_now()
+                current["close_tab_when_idle"] = False
                 current["idle_tab_closed_count"] = int(
                     current.get("idle_tab_closed_count") or 0
                 ) + int(closed)
@@ -4807,6 +4835,11 @@ class CDPAWorker:
                 state = self.store.run_independent_now(
                     current["manifest_path"],
                     trigger_type=str(payload.get("trigger_type") or "manual"),
+                    instruction=(
+                        str(payload.get("instruction"))
+                        if payload.get("instruction") is not None
+                        else None
+                    ),
                     external_command_id=command_id,
                 )
                 self._publish_command_state(state)

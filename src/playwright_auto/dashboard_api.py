@@ -20,6 +20,7 @@ from .cdpa_identity import generate_idempotent_task_id, validate_task_id
 from .cdpa_independent import (
     normalize_agent_name,
     normalize_completion_request,
+    normalize_manual_instruction,
     normalize_system_prompt,
     validate_trigger_settings,
 )
@@ -287,6 +288,32 @@ class DashboardAPI:
             "reason": reason,
             "confirmed": confirmed,
         }
+
+    def normalize_independent_run(self, raw: Mapping[str, Any]) -> dict[str, Any]:
+        unknown = set(raw) - {"trigger_type", "instruction"}
+        if unknown:
+            raise APIError(400, "invalid_request", f"unknown fields: {sorted(unknown)!r}")
+        trigger_type = str(raw.get("trigger_type") or "manual").strip().lower()
+        if trigger_type not in {"manual", "check_all"}:
+            raise APIError(
+                400,
+                "invalid_request",
+                "trigger_type must be manual or check_all",
+            )
+        payload = {"trigger_type": trigger_type}
+        if "instruction" in raw:
+            try:
+                instruction = normalize_manual_instruction(raw.get("instruction"))
+            except ValueError as exc:
+                raise APIError(400, "invalid_request", str(exc)) from exc
+            if trigger_type != "manual":
+                raise APIError(
+                    400,
+                    "invalid_request",
+                    "instruction is valid only for a manual run",
+                )
+            payload["instruction"] = instruction
+        return payload
 
     def normalize_independent_settings(
         self, raw: Mapping[str, Any]
@@ -687,16 +714,7 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                     payload = {"reason": reason}
                     kind = "independent_continue"
                 elif operation == "run":
-                    if set(raw) - {"trigger_type"}:
-                        raise APIError(400, "invalid_request", "run accepts only trigger_type")
-                    trigger_type = str(raw.get("trigger_type") or "manual").strip().lower()
-                    if trigger_type not in {"manual", "check_all"}:
-                        raise APIError(
-                            400,
-                            "invalid_request",
-                            "trigger_type must be manual or check_all",
-                        )
-                    payload = {"trigger_type": trigger_type}
+                    payload = app.normalize_independent_run(raw)
                     kind = "independent_run_now"
                 elif operation == "activate":
                     payload = app.normalize_independent_activation(raw)

@@ -23,6 +23,7 @@ from .cdpa_independent import (
     is_independent_task,
     normalize_agent_name,
     normalize_completion_request,
+    normalize_manual_instruction,
     normalize_system_prompt,
     record_consumed_event,
     task_mode,
@@ -2159,6 +2160,7 @@ class TaskStore:
         last_outcome: Mapping[str, Any] | None = None,
         new_chat_next_job: bool = False,
         new_chat_deferred_task_id: str | None = None,
+        close_tab_when_idle: bool = False,
         now: str | None = None,
     ) -> dict[str, Any]:
         created = now or utc_now()
@@ -2273,6 +2275,7 @@ class TaskStore:
                 "continuation_request": None,
                 "new_chat_next_job": bool(new_chat_next_job),
                 "new_chat_deferred_task_id": new_chat_deferred_task_id,
+                "close_tab_when_idle": bool(close_tab_when_idle),
                 "idle_since": created if enabled else None,
                 "last_outcome": dict(last_outcome)
                 if last_outcome is not None
@@ -2701,6 +2704,9 @@ class TaskStore:
                     independent.update(
                         active_event=None,
                         completion_request=request,
+                        close_tab_when_idle=(
+                            str(active.get("trigger_type") or "").lower() == "manual"
+                        ),
                         continuation_request=None,
                         last_outcome=request,
                         successor_task_id=successor_id,
@@ -2773,6 +2779,9 @@ class TaskStore:
                     ),
                     new_chat_deferred_task_id=independent.get(
                         "new_chat_deferred_task_id"
+                    ),
+                    close_tab_when_idle=bool(
+                        independent.get("close_tab_when_idle")
                     ),
                 )
                 successor = self._save_unlocked(successor_path, successor)
@@ -2878,11 +2887,17 @@ class TaskStore:
         path: str | Path,
         *,
         trigger_type: str = "manual",
+        instruction: str | None = None,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
         normalized_type = str(trigger_type or "manual").strip().lower()
         if normalized_type not in {"manual", "check_all"}:
             raise ValueError("run-now trigger_type must be manual or check_all")
+        normalized_instruction = (
+            normalize_manual_instruction(instruction) if instruction is not None else None
+        )
+        if normalized_instruction is not None and normalized_type != "manual":
+            raise ValueError("instruction is valid only for a manual run")
 
         def mutate(state: dict[str, Any]) -> dict[str, Any]:
             if not is_independent_task(state):
@@ -2909,6 +2924,8 @@ class TaskStore:
                 "occurrence_count": count,
                 "check_count": count,
             }
+            if normalized_instruction is not None:
+                event["instruction"] = normalized_instruction
             independent["active_event"] = event
             independent["cycle"] = 1
             independent["completion_request"] = None

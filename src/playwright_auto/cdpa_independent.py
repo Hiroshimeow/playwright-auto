@@ -18,6 +18,7 @@ INDEPENDENT_COLUMN = "INDEPENDENT_AGENTS"
 MIN_INDEPENDENT_INTERVAL_MINUTES = 20
 MAX_AGENT_NAME_CHARS = 80
 MAX_SYSTEM_PROMPT_CHARS = 50_000
+MAX_MANUAL_INSTRUCTION_CHARS = 4_000
 MAX_TRIGGER_TEAMS = 100
 MAX_TRIGGER_ROLES = 5
 MAX_SEEN_EVENT_KEYS = 500
@@ -178,6 +179,19 @@ def normalize_system_prompt(value: Any) -> str:
     return prompt
 
 
+def normalize_manual_instruction(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("instruction must be a string")
+    instruction = sanitize_text(value, max_chars=MAX_MANUAL_INSTRUCTION_CHARS).strip()
+    if not instruction:
+        raise ValueError("instruction must not be empty")
+    if len(value.strip()) > MAX_MANUAL_INSTRUCTION_CHARS:
+        raise ValueError(
+            f"instruction must be at most {MAX_MANUAL_INSTRUCTION_CHARS} characters"
+        )
+    return instruction
+
+
 def _string_list(
     value: Any,
     *,
@@ -302,6 +316,8 @@ def validate_independent_object(value: Any) -> str | None:
         return "independent enabled must be a boolean"
     if not isinstance(value.get("new_chat_next_job"), bool):
         return "independent new_chat_next_job must be a boolean"
+    if not isinstance(value.get("close_tab_when_idle", False), bool):
+        return "independent close_tab_when_idle must be a boolean"
     watermarks = value.get("watermarks")
     if not isinstance(watermarks, Mapping):
         return "independent watermarks must be an object"
@@ -384,6 +400,8 @@ def normalize_event(value: Any) -> dict[str, Any]:
         "occurrence_count": int(value.get("occurrence_count") or 1),
         "check_count": int(value.get("check_count") or 1),
     }
+    if value.get("instruction") is not None:
+        event["instruction"] = normalize_manual_instruction(value.get("instruction"))
     if event["target_hop_id"] is not None and (
         isinstance(event["target_hop_id"], bool)
         or not isinstance(event["target_hop_id"], int)

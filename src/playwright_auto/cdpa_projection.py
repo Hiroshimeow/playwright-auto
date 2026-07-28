@@ -969,6 +969,11 @@ def build_task_projection(
     private_identities = _private_identity_values(raw)
     summary = _redact_private_identities(summary, private_identities)
     detail = _redact_private_identities(detail, private_identities)
+    if independent is not None:
+        detail["agent"] = dict(detail["agent"])
+        detail["agent"]["system_prompt"] = str(
+            independent.get("system_prompt") or ""
+        )
     # Stable content fingerprints drive no-op DB writes and client detail caching.
     summary["projection_sha256"] = hashlib.sha256(
         json.dumps(summary, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()

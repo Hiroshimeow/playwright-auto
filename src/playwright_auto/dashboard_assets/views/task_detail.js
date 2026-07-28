@@ -94,14 +94,23 @@ function build(detail, timeline, selectedRole) {
   const controls = el("div", null, "control-grid");
   if (detail.task_mode === "independent") {
     const enabled = detail.agent?.enabled !== false;
-    controls.append(independentButton("run", "Run now", detail));
-    controls.append(button(enabled ? "pause" : "resume", enabled ? "Pause" : "Enable", detail));
-    controls.append(button("stop", "Stop current job", detail));
-    controls.append(button("retry", "Retry", detail));
-    controls.append(button("open_tab", "Open tab", detail));
-    controls.append(button("close_tab", "Close tab", detail));
-    controls.append(button("new_chat", "New Chat next job", detail));
-    controls.append(independentButton("settings", "Settings", detail));
+    const active = Boolean(detail.agent?.trigger_type);
+    const terminal = ["DONE", "STOPPED"].includes(detail.status);
+    const inFlight = ["sending", "sent", "waiting"].includes(detail.active_hop?.state);
+    const idle = !active && ["WAITING", "PAUSED"].includes(detail.status);
+    if (idle && enabled) {
+      controls.append(independentButton("run", "Run once", detail));
+      controls.append(independentButton("command", "Command", detail));
+    }
+    if (!terminal) {
+      controls.append(button(enabled ? "pause" : "resume", enabled ? "Pause" : "Enable", detail));
+      if (active) controls.append(button("stop", "Stop current job", detail));
+      if (active && detail.status === "BLOCKED") controls.append(button("retry", "Retry", detail));
+      controls.append(button("open_tab", "Open tab", detail));
+      if (!inFlight) controls.append(button("close_tab", "Close tab", detail));
+      if (idle && !inFlight) controls.append(button("new_chat", "Renew", detail));
+      controls.append(independentButton("settings", "Settings", detail));
+    }
     controls.append(independentButton("history", "History", detail));
     controls.append(independentButton("reports", "Reports", detail));
   } else {

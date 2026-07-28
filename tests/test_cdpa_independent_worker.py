@@ -85,7 +85,7 @@ def test_independent_responded_waits_for_explicit_completion_without_route_parse
     assert len(state["hops"]) == 1
 
 
-def test_independent_new_chat_is_deferred_without_replacing_active_conversation(tmp_path: Path):
+def test_independent_renew_rejects_active_job_without_replacing_conversation(tmp_path: Path):
     _config, store, _blocked, state, worker = setup_agent(tmp_path)
     state["roles"]["AGENT"]["page_id"] = "page-agent"
     state["roles"]["AGENT"]["page_url"] = "https://chatgpt.com/c/exact-agent"
@@ -97,16 +97,13 @@ def test_independent_new_chat_is_deferred_without_replacing_active_conversation(
 
     assert asyncio.run(worker._apply_control(state, actions)) is True
 
-    assert state["independent"]["new_chat_next_job"] is True
+    assert state["independent"]["new_chat_next_job"] is False
     assert state["roles"]["AGENT"]["page_url"] == "https://chatgpt.com/c/exact-agent"
-    assert state["controls"][-1]["result"] == {"deferred": True}
+    control = state["controls"][-1]
+    assert control["status"] == "rejected"
+    assert "Renew requires an idle independent agent" in control["result"]
+    assert actions.closed_teams == 0
     assert actions.located_roles == []
-
-    hop = _active_hop(state)
-    asyncio.run(worker._pre_send(state, hop, actions))
-
-    assert state["roles"]["AGENT"]["page_id"] == "page-agent-maintainers-agent"
-    assert state["independent"]["new_chat_next_job"] is True
 
 
 def test_independent_pause_and_resume_preserve_active_event(tmp_path: Path):

@@ -277,6 +277,7 @@ def test_independent_projection_exposes_agent_job_without_system_prompt(tmp_path
     assert projection.summary["agent"]["occurrence_count"] == 2
     assert projection.summary["agent"]["cycle"] == 3
     assert projection.detail["roles"][0]["logical_role"] == "AGENT"
+    assert projection.detail["agent"]["system_prompt"] == "SECRET SYSTEM PROMPT"
 
     def nested_keys(value):
         if isinstance(value, dict):
@@ -300,7 +301,8 @@ def test_independent_projection_exposes_agent_job_without_system_prompt(tmp_path
         "response",
     }
     assert forbidden_keys.isdisjoint(set(nested_keys(projection.summary)))
-    assert forbidden_keys.isdisjoint(set(nested_keys(projection.detail)))
+    detail_forbidden = forbidden_keys - {"system_prompt"}
+    assert detail_forbidden.isdisjoint(set(nested_keys(projection.detail)))
     for secret in (
         "page-agent",
         "https://chatgpt.com/c/agent",
@@ -315,7 +317,7 @@ def test_independent_projection_exposes_agent_job_without_system_prompt(tmp_path
     ):
         assert secret not in public
     assert "https://example.com/help" in public
-    assert "SECRET SYSTEM PROMPT" not in public
+    assert "SECRET SYSTEM PROMPT" not in json.dumps(projection.summary)
     assert "private constructor" not in public
 
 
