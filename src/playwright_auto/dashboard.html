@@ -3,924 +3,153 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
   <title>CDPA Control Center</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%230f141e'/%3E%3Cpath d='M14 18h36v8H14zm0 14h24v8H14zm0 14h31v5H14z' fill='%23059669'/%3E%3C/svg%3E">
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script>
-    tailwind.config = {
-      theme: {
-        extend: {
-          colors: {
-            dark: '#0f141e',
-            panel: '#151b28',
-            borderDark: '#262f3f',
-            accent: '#059669',
-            danger: '#e11d48',
-            warning: '#d97706',
-            textDim: '#94a3b8'
-          }
-        }
-      }
-    };
-  </script>
-  <style>
-    ::-webkit-scrollbar { width: 8px; height: 8px; }
-    ::-webkit-scrollbar-track { background: #0f141e; }
-    ::-webkit-scrollbar-thumb { background: #262f3f; border-radius: 4px; }
-    ::-webkit-scrollbar-thumb:hover { background: #059669; }
-  </style>
+  <link rel="stylesheet" href="/assets/dashboard.css">
 </head>
-<body class="h-screen overflow-hidden bg-dark text-white font-sans flex" data-testid="app-root">
-  <aside class="w-20 shrink-0 h-screen overflow-hidden bg-panel border-r border-borderDark flex flex-col items-center py-3 gap-3 z-20" data-testid="sidebar">
-    <div class="text-accent text-2xl font-bold py-2" aria-label="CDPA">C</div>
-    <button type="button" class="min-h-10 w-16 rounded-lg border border-accent bg-accent/10 text-accent text-[10px] font-semibold focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" data-nav-target="kanban-section">Kanban</button>
-    <button type="button" class="min-h-10 w-16 rounded-lg border border-borderDark text-textDim hover:text-white hover:bg-borderDark text-[10px] focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" data-nav-target="detail-section">Team</button>
-    <button type="button" class="min-h-10 w-16 rounded-lg border border-borderDark text-textDim hover:text-white hover:bg-borderDark text-[10px] focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" data-nav-target="tabs-section">Tabs</button>
-    <button type="button" class="min-h-10 w-16 rounded-lg border border-borderDark text-textDim hover:text-white hover:bg-borderDark text-[10px] focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" data-nav-target="history-section">History</button>
-    <button type="button" class="min-h-10 w-16 rounded-lg border border-borderDark text-textDim hover:text-white hover:bg-borderDark text-[10px] focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" data-nav-target="logs-panel">Logs</button>
-  </aside>
+<body>
+  <header class="app-header">
+    <a class="brand" href="/" aria-label="CDPA Control Center home">
+      <span class="brand-mark" aria-hidden="true">C</span>
+      <span class="brand-copy"><strong>CDPA</strong><small>Control Center</small></span>
+    </a>
 
-  <div class="flex-1 min-w-0 flex flex-col overflow-hidden">
-    <header class="h-14 shrink-0 border-b border-borderDark bg-dark flex items-center justify-between gap-2 px-2 md:px-4" data-testid="header">
-      <div class="min-w-0 hidden sm:block">
-        <h1 class="text-sm lg:text-lg font-semibold text-white truncate">CDPA Control Center</h1>
-        <p class="text-[10px] lg:text-xs text-textDim truncate">Durable workflow monitor</p>
-      </div>
-      <div class="flex-1 min-w-0 flex items-center justify-end gap-1.5 lg:gap-3 text-xs">
-        <div class="hidden lg:flex items-center gap-1.5 rounded-full border border-borderDark bg-panel px-2 py-1" title="Browser connection">
-          <span id="connection-dot" class="w-2 h-2 rounded-full bg-danger"></span>
-          <span class="text-textDim">Browser</span><span id="connection-state" class="text-white">Connecting</span>
+    <div id="service-status" class="service-strip" aria-live="polite"></div>
+
+    <nav class="header-actions" aria-label="Dashboard actions">
+      <button type="button" class="button primary" data-open-create>Create task</button>
+      <button type="button" class="button" data-open-agent>Add independent agent</button>
+      <button type="button" class="button" data-action="reload_catalog">Reload catalog</button>
+      <button type="button" class="button" data-view="resume">Resume teams</button>
+      <button type="button" class="button" data-view="history">History</button>
+      <button type="button" class="button" data-view="runtime">Runtime</button>
+    </nav>
+  </header>
+
+  <main class="app-main">
+    <section class="board-section" aria-labelledby="board-title">
+      <header class="section-header">
+        <div>
+          <p class="eyebrow">Operational queue</p>
+          <h1 id="board-title">Task board</h1>
         </div>
-        <div class="hidden md:flex items-center gap-1.5 text-textDim"><span id="page-count">0 tabs</span></div>
-        <div class="hidden md:flex items-center gap-1.5 text-textDim"><span id="task-count">0 tasks</span></div>
-        <div class="hidden xl:flex items-center gap-1.5 text-textDim"><span id="updated-at">No sample</span></div>
-        <button type="button" id="manual-refresh" class="min-h-10 min-w-10 rounded-lg border border-borderDark bg-panel text-textDim hover:text-white hover:bg-borderDark px-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" aria-label="Refresh dashboard">↻</button>
-        <button type="button" id="open-resume" class="min-h-10 rounded-lg border border-borderDark bg-panel text-white hover:bg-borderDark px-2 lg:px-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" aria-label="Resume exact team"><span aria-hidden="true">▶</span><span class="hidden lg:inline ml-1">Resume</span></button>
-        <button type="button" id="open-create" class="min-h-10 rounded-lg border border-accent bg-accent text-white hover:bg-accent/90 px-2 lg:px-3 font-semibold focus-visible:outline focus-visible:outline-2 focus-visible:outline-white" aria-label="Create Team / Task"><span aria-hidden="true">＋</span><span class="hidden md:inline ml-1">Create</span></button>
-      </div>
-    </header>
+        <div id="catalog-health" class="catalog-health" aria-live="polite"></div>
+      </header>
+      <div id="board" class="board-grid" aria-live="polite"></div>
+    </section>
 
-    <main class="flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-2 md:p-4 flex flex-col gap-4" data-testid="workspace">
-      <div id="error-banner" class="hidden rounded-lg border border-danger bg-danger/10 px-3 py-2 text-xs text-danger" role="status"></div>
+    <section class="task-workspace" aria-label="Selected task workspace">
+      <article id="task-detail" class="surface task-detail empty-state">
+        <p class="eyebrow">Task detail</p>
+        <h2>Select a task</h2>
+        <p>Task detail is loaded only after selection and remains stable while the dashboard polls.</p>
+      </article>
+      <aside id="commands" class="surface command-panel" aria-live="polite"></aside>
+    </section>
+  </main>
 
-      <section id="kanban-section" class="bg-panel border border-borderDark rounded-xl p-3 md:p-4 shrink-0" aria-labelledby="kanban-title">
-        <div class="flex items-center justify-between gap-3 mb-3">
-          <div class="min-w-0"><p class="text-[10px] uppercase tracking-wider text-textDim">Monitor first</p><h2 id="kanban-title" class="text-white font-semibold">Kanban Board</h2></div>
-          <span class="text-[10px] text-textDim">INBOX, PLANNING, WORKING and VERIFYING remain visible as phase metadata.</span>
+  <dialog id="secondary-dialog" class="secondary-dialog" aria-labelledby="secondary-title">
+    <section class="secondary-shell">
+      <header class="secondary-header">
+        <div>
+          <p class="eyebrow">Secondary view</p>
+          <h2 id="secondary-title">History</h2>
         </div>
-        <div class="flex gap-4 overflow-x-auto pb-2" data-testid="kanban-scroller" id="kanban-lanes">
-          <section class="w-[300px] shrink-0 flex flex-col gap-3" data-lane="RUNNING"><header class="flex justify-between items-center border-b border-borderDark pb-2"><span class="text-accent text-sm font-semibold tracking-wider">RUNNING</span><span class="bg-borderDark text-white px-2 py-0.5 rounded-full text-xs" data-lane-count="RUNNING">0</span></header><div class="flex flex-col gap-3 min-h-28" data-lane-cards="RUNNING"></div><div class="hidden h-28 border border-dashed border-borderDark rounded-lg text-textDim text-xs items-center justify-center" data-lane-empty="RUNNING">No running tasks</div></section>
-          <section class="w-[300px] shrink-0 flex flex-col gap-3" data-lane="WAITING"><header class="flex justify-between items-center border-b border-borderDark pb-2"><span class="text-warning text-sm font-semibold tracking-wider">WAITING</span><span class="bg-borderDark text-white px-2 py-0.5 rounded-full text-xs" data-lane-count="WAITING">0</span></header><div class="flex flex-col gap-3 min-h-28" data-lane-cards="WAITING"></div><div class="hidden h-28 border border-dashed border-borderDark rounded-lg text-textDim text-xs items-center justify-center" data-lane-empty="WAITING">No waiting tasks</div></section>
-          <section class="w-[300px] shrink-0 flex flex-col gap-3" data-lane="BLOCKED"><header class="flex justify-between items-center border-b border-borderDark pb-2"><span class="text-danger text-sm font-semibold tracking-wider">BLOCKED</span><span class="bg-borderDark text-white px-2 py-0.5 rounded-full text-xs" data-lane-count="BLOCKED">0</span></header><div class="flex flex-col gap-3 min-h-28" data-lane-cards="BLOCKED"></div><div class="hidden h-28 border border-dashed border-borderDark rounded-lg text-textDim text-xs items-center justify-center" data-lane-empty="BLOCKED">No blocked tasks</div></section>
-          <section class="w-[300px] shrink-0 flex flex-col gap-3" data-lane="PAUSED"><header class="flex justify-between items-center border-b border-borderDark pb-2"><span class="text-warning text-sm font-semibold tracking-wider">PAUSED</span><span class="bg-borderDark text-white px-2 py-0.5 rounded-full text-xs" data-lane-count="PAUSED">0</span></header><div class="flex flex-col gap-3 min-h-28" data-lane-cards="PAUSED"></div><div class="hidden h-28 border border-dashed border-borderDark rounded-lg text-textDim text-xs items-center justify-center" data-lane-empty="PAUSED">No paused tasks</div></section>
-          <section class="w-[300px] shrink-0 flex flex-col gap-3" data-lane="DONE"><header class="flex justify-between items-center border-b border-borderDark pb-2"><span class="text-textDim text-sm font-semibold tracking-wider">DONE</span><span class="bg-borderDark text-white px-2 py-0.5 rounded-full text-xs" data-lane-count="DONE">0</span></header><div class="flex flex-col gap-3 min-h-28" data-lane-cards="DONE"></div><div class="hidden h-28 border border-dashed border-borderDark rounded-lg text-textDim text-xs items-center justify-center" data-lane-empty="DONE">No recoverable completed tasks</div></section>
-          <section class="w-[300px] shrink-0 flex flex-col gap-3" data-lane="STOPPED"><header class="flex justify-between items-center border-b border-borderDark pb-2"><span class="text-textDim text-sm font-semibold tracking-wider">STOPPED</span><span class="bg-borderDark text-white px-2 py-0.5 rounded-full text-xs" data-lane-count="STOPPED">0</span></header><div class="flex flex-col gap-3 min-h-28" data-lane-cards="STOPPED"></div><div class="hidden h-28 border border-dashed border-borderDark rounded-lg text-textDim text-xs items-center justify-center" data-lane-empty="STOPPED">No recoverable stopped tasks</div></section>
-        </div>
-      </section>
-
-      <section id="detail-section" class="shrink-0" data-testid="detail-grid">
-        <article class="bg-panel border border-borderDark rounded-xl p-3 md:p-4 min-w-0" aria-labelledby="team-title">
-          <div id="team-heading" class="border-b border-borderDark pb-3 mb-3">
-            <p class="text-[10px] uppercase tracking-wider text-textDim">Selected team / task</p>
-            <h2 id="team-title" class="text-white text-lg font-semibold break-words">Select a task from Kanban or History.</h2>
-            <p id="team-meta" class="text-xs text-textDim mt-1 break-words"></p>
-          </div>
-
-          <section id="primary-problem-section" class="hidden rounded-lg border border-danger bg-danger/10 p-3 mb-3" aria-labelledby="primary-problem-title">
-            <div class="flex flex-wrap items-center justify-between gap-2"><h3 id="primary-problem-title" class="text-sm font-semibold text-danger"></h3><time id="primary-problem-at" class="text-[10px] text-textDim"></time></div>
-            <p id="primary-problem-message" class="text-sm text-white mt-2 break-words"></p>
-            <p id="primary-problem-meta" class="text-xs text-textDim mt-1"></p>
-            <p id="primary-problem-recommended" class="text-xs text-textDim mt-2"></p>
-            <a id="primary-problem-report" class="hidden min-h-10 mt-2 items-center rounded-lg border border-borderDark px-3 text-xs text-white hover:bg-borderDark" target="_blank" rel="noopener">Open Maintainers report</a>
-          </section>
-
-          <section id="maintenance-section" class="hidden rounded-lg border border-borderDark bg-dark p-3 mb-3" aria-labelledby="maintenance-title">
-            <div class="flex flex-wrap items-center justify-between gap-2"><h3 id="maintenance-title" class="text-sm font-semibold text-white">Global Maintainers</h3><span id="maintenance-state" class="text-[10px] text-textDim"></span></div>
-            <p id="maintenance-message" class="text-xs text-textDim mt-2 break-words"></p>
-            <a id="maintenance-report" class="hidden min-h-10 mt-2 items-center rounded-lg border border-borderDark px-3 text-xs text-white hover:bg-borderDark" target="_blank" rel="noopener">Open latest report</a>
-          </section>
-
-          <section class="border-t border-borderDark pt-3 mb-3" aria-labelledby="controls-title">
-            <div class="mb-3"><p class="text-[10px] uppercase tracking-wider text-textDim">Explicit targets</p><h3 id="controls-title" class="text-white font-medium">Controls</h3></div>
-            <div id="controls-content" class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              <section id="task-controls-section">
-                <p class="text-[10px] uppercase tracking-wider text-textDim">Task controls</p>
-                <p id="task-control-target" class="text-[10px] text-textDim mb-2">Target: no selected task</p>
-                <p id="blocked-guidance" class="hidden rounded-lg border border-danger bg-danger/10 p-3 text-xs text-textDim mb-2"></p>
-                <div id="task-primary" class="grid gap-2"></div>
-                <div id="task-secondary" class="grid gap-2 mt-2"></div>
-                <details id="more-actions" data-testid="more-actions" class="hidden group mt-2 rounded-lg border border-borderDark bg-dark">
-                  <summary class="min-h-10 cursor-pointer px-3 py-2 text-xs text-textDim hover:text-white">More Actions...</summary>
-                  <div class="grid grid-cols-1 gap-2 border-t border-borderDark p-2"><div id="more-action-buttons" class="grid gap-2"></div><div id="clear-confirmation" class="hidden rounded-lg border border-danger bg-danger/10 p-2"><p class="text-xs text-textDim mb-2">Confirm durable ownership cleanup for the selected task.</p><button type="button" data-confirm-clear class="min-h-10 w-full rounded-lg border border-danger bg-danger text-white px-3">Confirm Clear Team</button></div></div>
-                </details>
-                <p id="task-control-result" class="text-[10px] text-textDim mt-2" role="status"></p>
-              </section>
-              <section id="role-controls-section" class="lg:border-l lg:border-borderDark lg:pl-4">
-                <p class="text-[10px] uppercase tracking-wider text-textDim">Role / Tab controls</p>
-                <p id="role-control-target" class="text-[10px] text-textDim mb-2">Target: no selected role</p>
-                <div id="role-actions" class="grid gap-2"></div>
-                <p id="role-guidance" class="text-[10px] text-textDim mt-2">Select a role row.</p>
-                <p id="role-control-result" class="text-[10px] text-textDim mt-2" role="status"></p>
-              </section>
-            </div>
-          </section>
-
-          <section id="dependency-summary" class="border-t border-borderDark pt-3 mb-3" aria-labelledby="dependency-title">
-            <p class="text-[10px] uppercase tracking-wider text-textDim">Scheduling</p>
-            <h3 id="dependency-title" class="text-white font-medium">Dependencies / Queue</h3>
-            <div id="dependency-content" class="grid grid-cols-1 md:grid-cols-2 gap-2 mt-2 text-xs text-textDim"></div>
-          </section>
-
-          <section id="repair-summary" class="hidden border-t border-borderDark pt-3 mb-3" aria-labelledby="repair-title">
-            <p class="text-[10px] uppercase tracking-wider text-textDim">Operational repair</p>
-            <h3 id="repair-title" class="text-white font-medium">Repair Relationships</h3>
-            <div id="repair-content" class="grid grid-cols-1 gap-2 mt-2 text-xs text-textDim"></div>
-          </section>
-
-          <section id="attachments-summary" class="border-t border-borderDark pt-3 mb-3" aria-labelledby="attachments-title">
-            <p class="text-[10px] uppercase tracking-wider text-textDim">Durable context</p>
-            <h3 id="attachments-title" class="text-white font-medium">Attachments</h3>
-            <div id="attachment-content" class="grid grid-cols-1 md:grid-cols-2 gap-2 mt-2 text-xs text-textDim"></div>
-          </section>
-
-          <section class="border-t border-borderDark pt-3 mb-3" aria-labelledby="roles-title">
-            <p class="text-[10px] uppercase tracking-wider text-textDim">Exact ownership</p>
-            <h3 id="roles-title" class="text-white font-medium mb-2">Roles</h3>
-            <div class="overflow-x-auto">
-              <table class="w-full min-w-[760px] text-left text-xs" data-testid="role-table">
-                <thead class="text-textDim border-b border-borderDark"><tr><th class="pb-2 font-normal">Function</th><th class="pb-2 font-normal">Physical role / Tab</th><th class="pb-2 font-normal">URL</th><th class="pb-2 font-normal">Availability</th><th class="pb-2 font-normal">Status</th><th class="pb-2 font-normal text-right">Actions</th></tr></thead>
-                <tbody id="role-table-body"></tbody>
-              </table>
-            </div>
-          </section>
-
-          <section id="logs-panel" class="border-t border-borderDark pt-3 mb-3" aria-labelledby="logs-title">
-            <p class="text-[10px] uppercase tracking-wider text-textDim">Real timestamps</p>
-            <h3 id="logs-title" class="text-white font-medium mb-2">Chronological Timeline</h3>
-            <div id="logs-content" class="grid gap-2 max-h-96 overflow-y-auto pr-1"></div>
-          </section>
-
-          <section class="border-t border-borderDark pt-3" aria-labelledby="selected-reports-title">
-            <p class="text-[10px] uppercase tracking-wider text-textDim">Validated artifacts</p>
-            <h3 id="selected-reports-title" class="text-white font-medium mb-2">Reports</h3>
-            <div id="selected-reports" class="flex flex-wrap gap-2 max-h-96 overflow-y-auto"></div>
-          </section>
-        </article>
-      </section>
-
-      <section id="tabs-section" class="bg-panel border border-borderDark rounded-xl p-4 shrink-0" aria-labelledby="tabs-title">
-        <div class="border-b border-borderDark pb-3 mb-3"><p class="text-[10px] uppercase tracking-wider text-textDim">Read-only browser ownership</p><h2 id="tabs-title" class="text-white font-semibold">Live Browser Tabs</h2><p class="text-xs text-textDim mt-1">Arbitrary Set role and Clear role are unavailable because production exposes no safe ownership-mutation endpoint.</p></div>
-        <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3" id="tab-grid"></div>
-      </section>
-
-      <section id="history-section" class="bg-panel border border-borderDark rounded-xl p-4 shrink-0" aria-labelledby="history-title">
-        <div class="flex items-center justify-between gap-3 mb-3"><div><p class="text-[10px] uppercase tracking-wider text-textDim">Retained independently</p><h2 id="history-title" class="text-white font-semibold">History / Reports</h2></div><span id="history-count" class="text-xs text-textDim">0 records</span></div>
-        <div id="history-list" class="grid gap-2 max-h-96 overflow-y-auto pr-1"></div>
-      </section>
-    </main>
-  </div>
-
-  <template id="task-card-template">
-    <button type="button" class="w-full bg-dark border border-borderDark rounded-lg p-3 hover:border-textDim transition cursor-pointer relative overflow-hidden text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" data-task-card>
-      <span class="absolute top-0 left-0 w-1 h-full bg-borderDark" data-card-accent></span>
-      <span class="flex justify-between items-start gap-2 mb-2"><strong class="text-white font-semibold text-base break-words" data-card-team></strong><span class="text-xs text-textDim whitespace-nowrap" data-card-turn></span></span>
-      <span class="flex flex-wrap gap-1 mb-3" data-card-functions></span>
-      <span class="text-xs text-textDim mb-1 flex justify-between gap-2"><span>Active: <strong class="text-white" data-card-active></strong></span><span class="px-1.5 py-0.5 rounded border border-borderDark" data-card-phase></span></span>
-      <span class="block text-xs text-textDim mb-1">Physical role / Tab: <strong class="text-white" data-card-role></strong></span>
-      <span class="block text-[11px] text-textDim truncate mb-2" data-card-task-id></span>
-      <span class="flex items-center justify-between gap-2"><span class="text-[10px] font-semibold tracking-wider" data-card-status></span><span class="text-[10px] text-textDim text-right" data-card-availability></span></span>
-      <span class="hidden mt-2 rounded border border-warning bg-warning/10 px-2 py-1 text-[10px] text-textDim" data-card-warning></span>
-    </button>
-  </template>
-
-  <dialog id="task-dialog" class="w-[calc(100vw-1rem)] max-w-3xl max-h-[calc(100dvh-1rem)] overflow-y-auto overflow-x-hidden rounded-xl border border-borderDark bg-panel text-white p-0 backdrop:bg-dark/80" aria-labelledby="dialog-title">
-    <div class="p-4 md:p-5">
-      <div class="flex items-start justify-between gap-3 border-b border-borderDark pb-3 mb-4"><div><p class="text-[10px] uppercase tracking-wider text-textDim">Task entry</p><h2 id="dialog-title" class="text-lg font-semibold text-white">Create work or resume exact durable work</h2><p class="text-xs text-textDim mt-1">Configuration stays outside the monitoring workspace.</p></div><button type="button" id="dialog-close" class="min-h-10 min-w-10 rounded-lg border border-borderDark text-textDim hover:text-white hover:bg-borderDark" aria-label="Close dialog">×</button></div>
-      <div class="inline-grid grid-cols-2 gap-1 rounded-lg border border-borderDark bg-dark p-1 mb-4" role="group" aria-label="Task entry mode"><button type="button" id="mode-create" class="min-h-10 rounded-md px-4 text-xs font-semibold">Create Team / Task</button><button type="button" id="mode-resume" class="min-h-10 rounded-md px-4 text-xs font-semibold">Resume exact team</button></div>
-
-      <form id="create-mode-panel" class="grid gap-4">
-        <label class="text-xs text-white">Task text<textarea id="create-task-input" class="mt-1 min-h-24 w-full rounded-lg border border-borderDark bg-dark px-3 py-2 text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" required></textarea></label>
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-3"><label class="text-xs text-white">Team base or exact team<input id="create-team-input" class="mt-1 min-h-10 w-full rounded-lg border border-borderDark bg-dark px-3 text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" required autocomplete="off"></label><label class="text-xs text-white">Repository / workspace<input id="create-repository-input" class="mt-1 min-h-10 w-full rounded-lg border border-borderDark bg-dark px-3 text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" required autocomplete="off"></label></div>
-        <label class="min-h-10 inline-flex items-center gap-2 text-xs text-white"><input id="create-reuse-team-input" type="checkbox" class="accent-accent">Queue this task on the exact existing team instead of allocating a suffix</label>
-        <label class="text-xs text-white">Dependency task IDs<input id="create-dependencies-input" class="mt-1 min-h-10 w-full rounded-lg border border-borderDark bg-dark px-3 text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" autocomplete="off" placeholder="task-a, task-b"><span class="mt-1 block text-[10px] text-textDim">Optional comma-separated durable task IDs. All must exist and form a DAG.</span></label>
-        <label class="text-xs text-white">Upload paths<textarea id="create-uploads-input" class="mt-1 min-h-20 w-full rounded-lg border border-borderDark bg-dark px-3 py-2 text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" autocomplete="off" placeholder="/absolute/path/context.md&#10;/absolute/path/logs.txt"></textarea><span class="mt-1 block text-[10px] text-textDim">Optional absolute file paths, one per line. Public task payloads omit raw paths.</span></label>
-        <fieldset class="rounded-lg border border-borderDark bg-dark p-3"><legend class="px-1 text-xs text-white">Fresh conversation on first use</legend><p class="text-xs text-textDim mb-2">Select logical roles that should lazily start in a fresh conversation.</p><div class="flex flex-wrap gap-2"><label class="min-h-10 inline-flex items-center gap-2 rounded-lg border border-borderDark px-3 text-xs"><input type="checkbox" name="new_role" value="PLAN" class="accent-accent">PLAN</label><label class="min-h-10 inline-flex items-center gap-2 rounded-lg border border-borderDark px-3 text-xs"><input type="checkbox" name="new_role" value="DEV" class="accent-accent">DEV</label><label class="min-h-10 inline-flex items-center gap-2 rounded-lg border border-borderDark px-3 text-xs"><input type="checkbox" name="new_role" value="TEST" class="accent-accent">TEST</label><label class="min-h-10 inline-flex items-center gap-2 rounded-lg border border-borderDark px-3 text-xs"><input type="checkbox" name="new_role" value="REVIEW" class="accent-accent">REVIEW</label><label class="min-h-10 inline-flex items-center gap-2 rounded-lg border border-borderDark px-3 text-xs"><input type="checkbox" name="new_role" value="AUDIT" class="accent-accent">AUDIT</label></div><label class="min-h-10 mt-2 inline-flex items-center gap-2 text-xs text-white"><input id="new-all-input" type="checkbox" class="accent-accent">Fresh conversation for every role on first use</label></fieldset>
-        <button type="submit" id="create-submit" class="min-h-10 rounded-lg border border-accent bg-accent text-white font-semibold px-4 disabled:border-borderDark disabled:bg-borderDark disabled:text-textDim">Create task</button>
-      </form>
-
-      <form id="resume-mode-panel" class="hidden grid gap-4">
-        <div class="rounded-lg border border-warning bg-warning/10 p-3"><p class="text-xs text-textDim">Enter the exact allocated team, including any suffix. Task ID, manifest, active hop, reports, and role history continue unchanged.</p></div>
-        <label class="text-xs text-white">Exact allocated team<input id="resume-team-input" class="mt-1 min-h-10 w-full rounded-lg border border-borderDark bg-dark px-3 text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" required autocomplete="off"></label>
-        <button type="submit" id="resume-submit" class="min-h-10 rounded-lg border border-accent bg-accent text-white font-semibold px-4">Resume exact team</button>
-      </form>
-      <p id="dialog-result" class="text-xs text-textDim mt-4" role="status" aria-live="polite"></p>
-    </div>
+        <button type="button" class="button icon-button" data-close-secondary aria-label="Close secondary view">Close</button>
+      </header>
+      <div id="secondary-content" class="secondary-content" aria-live="polite"></div>
+    </section>
   </dialog>
 
-  <script>
-    (() => {
-      'use strict';
-      const LANES = ['RUNNING', 'WAITING', 'BLOCKED', 'PAUSED', 'DONE', 'STOPPED'];
-      const CONTROL_LABELS = {pause: 'Pause', resume: 'Resume', retry: 'Retry hop', stop: 'Stop', restart_role: 'Restart role', open_tab: 'Open tab', new_chat: 'New Chat', route_plan: 'Route PLAN', clear_team: 'Clear Team'};
-      const state = {tasks: [], pages: [], events: [], connected: false, repository: '', selectedTaskId: null, selectedRoleByTask: new Map(), refreshing: false, dialogMode: 'create', dialogOpener: null};
-      const byId = id => document.getElementById(id);
-      const make = (tag, className, parent) => { const node = document.createElement(tag); if (className) node.className = className; if (parent) parent.appendChild(node); return node; };
-      const setText = (node, value) => { const next = String(value ?? ''); if (node.textContent !== next) node.textContent = next; };
-      const setClass = (node, value) => { if (node.className !== value) node.className = value; };
-      const clearNode = node => { while (node.firstChild) node.removeChild(node.firstChild); };
-      const field = (parent, name) => parent.querySelector(`[data-field="${name}"]`);
-      const validConversationUrl = value => /^https:\/\/chatgpt\.com\/c\/[A-Za-z0-9_-]+$/.test(String(value || ''));
-      const formatTime = value => { const date = value ? new Date(value) : null; return date && !Number.isNaN(date.getTime()) ? date.toLocaleTimeString() : '—'; };
-      const activityEpoch = task => { const date = task?.effective_activity_at ? new Date(task.effective_activity_at) : null; return date && !Number.isNaN(date.getTime()) ? date.getTime() : Number.NEGATIVE_INFINITY; };
-      const short = (value, count = 18) => String(value || '—').slice(0, count);
-      function keyed(container, selector, key, creator) {
-        let node = [...container.querySelectorAll(selector)].find(item => item.dataset.key === String(key));
-        if (!node) { node = creator(); node.dataset.key = String(key); container.appendChild(node); }
-        return node;
-      }
-      function removeStale(container, selector, liveKeys) {
-        container.querySelectorAll(selector).forEach(node => { if (!liveKeys.has(node.dataset.key)) node.remove(); });
-      }
-      function placeInOrder(container, node, index) {
-        const reference = container.children[index] || null;
-        if (reference !== node) container.insertBefore(node, reference);
-      }
-      function laneFor(task) {
-        const status = String(task.status || 'INBOX').toUpperCase();
-        if (status === 'INBOX' || status === 'RUNNING') return 'RUNNING';
-        return LANES.includes(status) ? status : 'RUNNING';
-      }
-      function selectedTask() { return state.tasks.find(task => task.task_id === state.selectedTaskId) || null; }
-      function selectedRole(task) {
-        if (!task) return null;
-        const roles = task.roles || [];
-        const saved = state.selectedRoleByTask.get(task.task_id);
-        const logical = roles.some(role => role.logical_role === saved) ? saved : (task.active_role || roles[0]?.logical_role || null);
-        if (logical) state.selectedRoleByTask.set(task.task_id, logical);
-        return roles.find(role => role.logical_role === logical) || null;
-      }
-      function exactPage(task, role) {
-        return state.pages.find(page => page.role === role.physical_role && page.team === task.team && page.task_id === task.task_id) || null;
-      }
-      function statusClasses(task) {
-        const status = laneFor(task);
-        if (status === 'RUNNING') return {accent: 'absolute top-0 left-0 w-1 h-full bg-accent', text: 'text-[10px] font-semibold tracking-wider text-accent', phase: 'px-1.5 py-0.5 rounded border border-accent bg-accent/10 text-accent'};
-        if (status === 'BLOCKED') return {accent: 'absolute top-0 left-0 w-1 h-full bg-danger', text: 'text-[10px] font-semibold tracking-wider text-danger', phase: 'px-1.5 py-0.5 rounded border border-danger bg-danger/10 text-danger'};
-        if (status === 'WAITING') return {accent: 'absolute top-0 left-0 w-1 h-full bg-warning', text: 'text-[10px] font-semibold tracking-wider text-warning', phase: 'px-1.5 py-0.5 rounded border border-warning bg-warning/10 text-warning'};
-        if (status === 'PAUSED') return {accent: 'absolute top-0 left-0 w-1 h-full bg-warning', text: 'text-[10px] font-semibold tracking-wider text-warning', phase: 'px-1.5 py-0.5 rounded border border-warning bg-warning/10 text-warning'};
-        return {accent: 'absolute top-0 left-0 w-1 h-full bg-borderDark', text: 'text-[10px] font-semibold tracking-wider text-textDim', phase: 'px-1.5 py-0.5 rounded border border-borderDark bg-panel text-textDim'};
-      }
-      function createChip(functionName, active) {
-        const chip = make('span', active ? 'bg-accent text-white text-[10px] px-1.5 py-0.5 rounded' : 'bg-borderDark text-textDim text-[10px] px-1.5 py-0.5 rounded');
-        setText(chip, functionName);
-        return chip;
-      }
-      function createTaskCard() {
-        const fragment = byId('task-card-template').content.cloneNode(true);
-        return fragment.querySelector('[data-task-card]');
-      }
-      function upsertTaskCard(task, position) {
-        const lane = laneFor(task);
-        const host = document.querySelector(`[data-lane-cards="${lane}"]`);
-        let card = document.querySelector(`[data-task-id="${CSS.escape(task.task_id)}"]`);
-        if (!card) {
-          card = createTaskCard();
-          card.dataset.taskId = task.task_id;
-          card.addEventListener('click', () => selectTask(card.dataset.taskId));
-        }
-        if (card.parentElement !== host) host.appendChild(card);
-        const classes = statusClasses(task);
-        setClass(card.querySelector('[data-card-accent]'), classes.accent);
-        setText(card.querySelector('[data-card-team]'), task.team || 'Unassigned team');
-        setText(card.querySelector('[data-card-turn]'), `Turn ${(task.roles || []).reduce((max, role) => Math.max(max, Number(role.turn || 0)), 0)} · Hop ${task.active_hop_id || '—'}`);
-        const functions = card.querySelector('[data-card-functions]');
-        clearNode(functions);
-        (task.roles || []).forEach(role => functions.appendChild(createChip(role.logical_role, role.logical_role === task.active_role)));
-        const active = (task.roles || []).find(role => role.logical_role === task.active_role);
-        setText(card.querySelector('[data-card-active]'), task.active_role || 'terminal');
-        setText(card.querySelector('[data-card-phase]'), task.column || task.status || 'INBOX');
-        setClass(card.querySelector('[data-card-phase]'), classes.phase);
-        setText(card.querySelector('[data-card-role]'), active ? `${active.physical_role} / ${active.page_id || 'no live tab'}` : 'none');
-        setText(card.querySelector('[data-card-task-id]'), `Task ID: ${task.task_id}`);
-        setText(card.querySelector('[data-card-status]'), String(task.status || 'INBOX').toUpperCase());
-        setClass(card.querySelector('[data-card-status]'), classes.text);
-        setText(card.querySelector('[data-card-availability]'), task.availability || 'unknown');
-        const warning = card.querySelector('[data-card-warning]');
-        setText(warning, task.surface_warning || '');
-        setClass(warning, task.surface_warning ? 'block mt-2 rounded border border-warning bg-warning/10 px-2 py-1 text-[10px] text-textDim' : 'hidden mt-2 rounded border border-warning bg-warning/10 px-2 py-1 text-[10px] text-textDim');
-        card.setAttribute('aria-pressed', String(task.task_id === state.selectedTaskId));
-        setClass(card, task.task_id === state.selectedTaskId ? 'w-full bg-dark border border-accent rounded-lg p-3 transition cursor-pointer relative overflow-hidden text-left ring-2 ring-accent focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent' : 'w-full bg-dark border border-borderDark rounded-lg p-3 hover:border-textDim transition cursor-pointer relative overflow-hidden text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent');
-        placeInOrder(host, card, position);
-        return task.task_id;
-      }
-      function renderBoard() {
-        const live = new Set();
-        const counts = Object.fromEntries(LANES.map(lane => [lane, 0]));
-        [...state.tasks].sort((a, b) => activityEpoch(b) - activityEpoch(a)).forEach(task => {
-          if (task.surface === 'history') return;
-          const lane = laneFor(task);
-          live.add(upsertTaskCard(task, counts[lane]));
-          counts[lane] += 1;
-        });
-        document.querySelectorAll('[data-task-card][data-task-id]').forEach(card => { if (!live.has(card.dataset.taskId)) card.remove(); });
-        LANES.forEach(lane => {
-          setText(document.querySelector(`[data-lane-count="${lane}"]`), counts[lane]);
-          const empty = document.querySelector(`[data-lane-empty="${lane}"]`);
-          setClass(empty, counts[lane] ? 'hidden h-28 border border-dashed border-borderDark rounded-lg text-textDim text-xs items-center justify-center' : 'flex h-28 border border-dashed border-borderDark rounded-lg text-textDim text-xs items-center justify-center');
-        });
-      }
-      function selectTask(taskId) {
-        if (!state.tasks.some(task => task.task_id === taskId)) return;
-        state.selectedTaskId = taskId;
-        renderBoard();
-        renderSelectedTask();
-      }
-      function createLogRow() {
-        const row = make('div', 'rounded-lg border border-borderDark bg-dark px-3 py-2 text-xs');
-        const header = make('div', 'flex flex-wrap gap-2 mb-1', row); header.dataset.header = 'true';
-        make('time', 'text-textDim', header).dataset.field = 'time';
-        make('span', 'text-white font-semibold', header).dataset.field = 'level';
-        make('span', 'text-textDim', header).dataset.field = 'source';
-        make('p', 'text-textDim leading-5 break-words', row).dataset.message = 'true';
-        return row;
-      }
-      function renderLogs(task) {
-        const host = byId('logs-content');
-        const scrollTop = host.scrollTop;
-        const items = [...(task.timeline || [])];
-        state.events.map((event, index) => ({event, index})).filter(item => item.event.task_id === task.task_id).slice(-24).forEach(({event, index}) => items.push({key: event.event_id ? `event:${event.event_id}` : `event:${event.at || 'untimed'}:${event.pid || ''}:${event.page_id || ''}:${event.action || ''}:${event.phase || ''}:${event.detail || ''}:${index}`, at: event.at, level: 'EVENT', source: event.role || event.action || 'browser', message: `${event.action || 'action'} · ${event.phase || 'state'}${event.detail ? ` · ${event.detail}` : ''}`}));
-        if (task.surface_warning) items.push({key: 'surface-warning', at: task.effective_activity_at || task.updated_at, level: 'WARN', source: 'availability', message: task.surface_warning});
-        items.sort((a, b) => {
-          const left = a.at ? new Date(a.at).getTime() : Number.NEGATIVE_INFINITY;
-          const right = b.at ? new Date(b.at).getTime() : Number.NEGATIVE_INFINITY;
-          return right - left;
-        });
-        const keys = new Set(items.map(item => String(item.key)));
-        if (!items.length) keys.add('empty');
-        removeStale(host, '[data-key]', keys);
-        items.forEach((item, index) => {
-          const row = keyed(host, '[data-key]', item.key, createLogRow);
-          setText(field(row, 'time'), formatTime(item.at));
-          const levelClass = item.level === 'ERROR' ? 'text-danger font-semibold' : item.level === 'WARN' || item.level === 'DEPENDENCY' ? 'text-warning font-semibold' : item.level === 'STATE' ? 'text-accent font-semibold' : 'text-white font-semibold';
-          setClass(field(row, 'level'), levelClass);
-          setText(field(row, 'level'), item.level);
-          setText(field(row, 'source'), item.source);
-          setText(row.querySelector('[data-message]'), item.message);
-          placeInOrder(host, row, index);
-        });
-        if (!items.length) {
-          const empty = keyed(host, '[data-key]', 'empty', () => make('div', 'rounded-lg border border-dashed border-borderDark bg-dark p-3 text-xs text-textDim'));
-          setText(empty, 'No timestamped task activity.');
-        }
-        if (host.scrollTop !== scrollTop) host.scrollTop = scrollTop;
-      }
-      function renderPrimaryProblem(task) {
-        const section = byId('primary-problem-section');
-        const problem = task.primary_problem;
-        if (!problem) {
-          setClass(section, 'hidden rounded-lg border border-danger bg-danger/10 p-3 mb-3');
-          setText(byId('primary-problem-title'), '');
-          setText(byId('primary-problem-message'), '');
-          setText(byId('primary-problem-meta'), '');
-          setText(byId('primary-problem-recommended'), '');
-          setClass(byId('primary-problem-report'), 'hidden min-h-10 mt-2 items-center rounded-lg border border-borderDark px-3 text-xs text-white hover:bg-borderDark');
-          byId('primary-problem-report').removeAttribute('href');
-          return;
-        }
-        const waiting = String(problem.kind || '').toUpperCase() === 'WAITING';
-        setClass(section, waiting ? 'block rounded-lg border border-warning bg-warning/10 p-3 mb-3' : 'block rounded-lg border border-danger bg-danger/10 p-3 mb-3');
-        setClass(byId('primary-problem-title'), waiting ? 'text-sm font-semibold text-warning' : 'text-sm font-semibold text-danger');
-        setText(byId('primary-problem-title'), `${problem.kind || 'ERROR'} · ${problem.code || 'unknown'}`);
-        setText(byId('primary-problem-at'), formatTime(problem.at));
-        setText(byId('primary-problem-message'), problem.message || 'No reason recorded.');
-        setText(byId('primary-problem-meta'), `${problem.role || 'task'} · hop ${problem.hop_id || '—'}${problem.maintenance_incident_id ? ` · ${problem.maintenance_incident_id}` : ''}`);
-        setText(byId('primary-problem-recommended'), problem.recommended ? `Recommended: ${problem.recommended}` : '');
-        const report = problem.maintenance_report;
-        const link = byId('primary-problem-report');
-        if (report?.url) {
-          link.href = report.url;
-          setClass(link, 'inline-flex min-h-10 mt-2 items-center rounded-lg border border-borderDark px-3 text-xs text-white hover:bg-borderDark');
-        } else {
-          link.removeAttribute('href');
-          setClass(link, 'hidden min-h-10 mt-2 items-center rounded-lg border border-borderDark px-3 text-xs text-white hover:bg-borderDark');
-        }
-      }
-      function renderMaintenance(task) {
-        const section = byId('maintenance-section');
-        const incident = task.active_maintenance_incident;
-        const report = incident ? task.active_maintenance_report : task.latest_maintenance_report;
-        const projectionErrors = task.projection_errors || [];
-        if (!incident && !report && !projectionErrors.length) {
-          setClass(section, 'hidden rounded-lg border border-borderDark bg-dark p-3 mb-3');
-          return;
-        }
-        setClass(section, projectionErrors.length ? 'block rounded-lg border border-danger bg-danger/10 p-3 mb-3' : 'block rounded-lg border border-borderDark bg-dark p-3 mb-3');
-        setText(byId('maintenance-state'), incident ? `${incident.state || 'unknown'} · ${incident.incident_id || 'incident'}` : report ? `${report.state || 'reported'} · turn ${report.turn || '—'}` : 'projection error');
-        const decision = incident?.decision || {};
-        const detail = projectionErrors.length ? `Dashboard projection error: ${projectionErrors.join(' · ')}` : incident ? `${incident.trigger_code || 'incident'} · ${decision.action || incident.state || 'unknown'} · ${decision.reason || incident.trigger_reason || 'No reason recorded.'}` : 'Latest Maintainers report is available.';
-        setText(byId('maintenance-message'), detail);
-        const link = byId('maintenance-report');
-        if (report?.url) {
-          link.href = report.url;
-          setClass(link, 'inline-flex min-h-10 mt-2 items-center rounded-lg border border-borderDark px-3 text-xs text-white hover:bg-borderDark');
-        } else {
-          link.removeAttribute('href');
-          setClass(link, 'hidden min-h-10 mt-2 items-center rounded-lg border border-borderDark px-3 text-xs text-white hover:bg-borderDark');
-        }
-      }
-      function createSummaryItem() {
-        const item = make('div', 'rounded-lg border border-borderDark bg-dark px-3 py-2');
-        make('p', 'text-[10px] uppercase tracking-wider text-textDim', item).dataset.field = 'label';
-        make('p', 'text-xs text-white mt-1 break-words', item).dataset.field = 'value';
-        return item;
-      }
-      function renderDependencySummary(task) {
-        const host = byId('dependency-content');
-        const formatEdges = rows => (rows || []).map(item => `${item.task_id} (${item.status})`).join(', ') || 'None';
-        const rows = [
-          ['parents', 'Parents', formatEdges(task.parents)],
-          ['children', 'Children', formatEdges(task.children)],
-          ['waiting', 'Waiting on', (task.waiting_on_task_ids || []).join(', ') || task.waiting_reason || 'Nothing'],
-          ['stopped', 'Stopped dependencies', (task.stopped_dependency_task_ids || []).join(', ') || 'None'],
-          ['missing', 'Missing dependencies', (task.missing_dependency_task_ids || []).join(', ') || 'None'],
-          ['owner', 'Active team owner', task.active_team_owner_task_id || 'None'],
-          ['queue', 'Team queue', task.queue_position ? `Position ${task.queue_position}${task.queue_length ? ` of ${task.queue_length}` : ''}${task.queue_blocked_by_task_id ? ` · blocked by ${task.queue_blocked_by_task_id}` : ''}` : 'Not queued'],
-          ['queue-ready', 'Dependency-ready team work', (task.dependency_ready_task_ids || []).join(', ') || 'None'],
-        ];
-        const keys = new Set();
-        rows.forEach(([key, label, value], index) => {
-          keys.add(key);
-          const item = keyed(host, '[data-key]', key, createSummaryItem);
-          setText(field(item, 'label'), label);
-          setText(field(item, 'value'), value);
-          placeInOrder(host, item, index);
-        });
-        removeStale(host, '[data-key]', keys);
-      }
-      function createRepairRelationshipItem() {
-        const card = make('article', 'rounded-lg border border-borderDark bg-dark p-3');
-        const grid = make('div', 'grid grid-cols-1 md:grid-cols-2 gap-2', card);
-        for (const name of ['repair-task', 'affected-task', 'disposition', 'blocker', 'dependency-gate', 'release-event']) {
-          const item = createSummaryItem();
-          item.dataset.field = name;
-          grid.appendChild(item);
-        }
-        return card;
-      }
-      function setRepairSummaryField(card, name, label, value) {
-        const item = field(card, name);
-        setText(field(item, 'label'), label);
-        setText(field(item, 'value'), value);
-      }
-      function renderRepairRelationships(task) {
-        const section = byId('repair-summary');
-        const host = byId('repair-content');
-        const relationships = (task.repair_relationships || []).length
-          ? task.repair_relationships
-          : task.repair_relationship
-            ? [task.repair_relationship]
-            : [];
-        setClass(section, relationships.length ? 'block border-t border-borderDark pt-3 mb-3' : 'hidden border-t border-borderDark pt-3 mb-3');
-        const keys = new Set();
-        relationships.forEach((relationship, index) => {
-          const key = relationship.operation_key || [
-            relationship.repair_task_id || 'repair',
-            relationship.affected_task_id || 'affected',
-            relationship.incident_id || 'incident',
-            relationship.disposition || 'disposition',
-            index,
-          ].join(':');
-          keys.add(key);
-          const card = keyed(host, 'article[data-key]', key, createRepairRelationshipItem);
-          const priority = relationship.repair_priority || 'ordinary';
-          setRepairSummaryField(
-            card,
-            'repair-task',
-            'Repair task',
-            `${relationship.repair_task_id || 'unknown'} · ${relationship.repair_team || 'unknown team'} · ${relationship.repair_status || 'UNKNOWN'} · priority ${priority}`,
-          );
-          setRepairSummaryField(
-            card,
-            'affected-task',
-            'Affected task',
-            `${relationship.affected_task_id || 'unknown'} · ${relationship.affected_team || 'unknown team'} · ${relationship.affected_status || 'UNKNOWN'}`,
-          );
-          setRepairSummaryField(
-            card,
-            'disposition',
-            'Disposition',
-            `${relationship.disposition || 'unknown'}${relationship.previous_disposition ? ` · previously ${relationship.previous_disposition}` : ''}`,
-          );
-          setRepairSummaryField(card, 'blocker', 'Blocker', relationship.blocker || 'None recorded');
-          setRepairSummaryField(
-            card,
-            'dependency-gate',
-            'Dependency gate',
-            relationship.dependency_gate ? 'Active · affected task waits on repair' : 'Not active',
-          );
-          setRepairSummaryField(
-            card,
-            'release-event',
-            'Release event',
-            relationship.release_event || 'Pending repair completion or not required',
-          );
-          placeInOrder(host, card, index);
-        });
-        removeStale(host, 'article[data-key]', keys);
-      }
-      function formatBytes(value) {
-        const size = Number(value || 0);
-        if (size < 1024) return `${size} B`;
-        if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KiB`;
-        return `${(size / (1024 * 1024)).toFixed(1)} MiB`;
-      }
-      function renderAttachments(task) {
-        const host = byId('attachment-content');
-        const rows = task.attachments || [];
-        const keys = new Set();
-        rows.forEach((item, index) => {
-          const key = `${item.name || 'attachment'}:${item.sha256_prefix || index}`;
-          keys.add(key);
-          const row = keyed(host, '[data-key]', key, createSummaryItem);
-          setText(field(row, 'label'), item.name || 'Attachment');
-          setText(field(row, 'value'), `${formatBytes(item.size)} · ${item.mime_type || 'application/octet-stream'} · sha256 ${item.sha256_prefix || 'unknown'}…`);
-          placeInOrder(host, row, index);
-        });
-        if (!rows.length) {
-          keys.add('empty');
-          const empty = keyed(host, '[data-key]', 'empty', createSummaryItem);
-          setText(field(empty, 'label'), 'Task context');
-          setText(field(empty, 'value'), 'No attachments.');
-        }
-        removeStale(host, '[data-key]', keys);
-      }
-      function createReportLink() {
-        const link = make('a', 'min-h-10 inline-flex items-center rounded-lg border border-borderDark px-3 text-xs text-textDim hover:text-white hover:bg-borderDark');
-        link.target = '_blank'; link.rel = 'noopener';
-        return link;
-      }
-      function renderSelectedReports(task) {
-        const host = byId('selected-reports');
-        const reports = (task.reports || []).map((report, index) => ({key: `role:${report.report_id || index}`, url: report.url, label: `${report.physical_role || 'Report'} turn ${report.turn || '—'}`}));
-        if (task.latest_maintenance_report?.url) reports.unshift({key: `maint:${task.latest_maintenance_report.incident_id}`, url: task.latest_maintenance_report.url, label: `Maintainers turn ${task.latest_maintenance_report.turn || '—'}`});
-        const keys = new Set();
-        reports.forEach((report, index) => {
-          keys.add(report.key);
-          const link = keyed(host, 'a[data-key]', report.key, createReportLink);
-          link.href = report.url;
-          setText(link, report.label);
-          placeInOrder(host, link, index);
-        });
-        if (!reports.length) {
-          const empty = keyed(host, '[data-key]', 'empty', () => make('span', 'text-xs text-textDim'));
-          setText(empty, 'No reports.');
-          keys.add('empty');
-        }
-        removeStale(host, '[data-key]', keys);
-      }
-      function createRoleRow() {
-        const row = document.createElement('tr');
-        row.className = 'border-b border-borderDark/50 cursor-pointer hover:bg-borderDark/50';
-        for (const name of ['function', 'physical', 'url', 'availability', 'status', 'actions']) { const cell = document.createElement('td'); cell.className = name === 'actions' ? 'py-2 text-right' : 'py-2 pr-2'; cell.dataset.field = name; row.appendChild(cell); }
-        row.addEventListener('click', event => { if (!event.target.closest('button')) selectRole(row.dataset.role); });
-        return row;
-      }
-      function actionButtonClass(action, primary = false) {
-        if (action === 'stop' || action === 'clear_team') return primary ? 'min-h-10 rounded-lg border border-warning bg-warning text-white font-semibold px-3' : 'min-h-10 rounded-lg border border-danger text-danger hover:bg-danger/10 px-3';
-        return primary ? 'min-h-10 rounded-lg border border-accent bg-accent text-white font-semibold px-3' : 'min-h-10 rounded-lg border border-borderDark text-textDim hover:text-white hover:bg-borderDark px-3';
-      }
-      function syncActionButtons(container, specs, callback) {
-        const keys = new Set();
-        specs.forEach(spec => {
-          keys.add(spec.action);
-          const button = keyed(container, 'button[data-key]', spec.action, () => { const node = document.createElement('button'); node.type = 'button'; return node; });
-          button.dataset.action = spec.action;
-          button.onclick = () => callback(spec.action);
-          setText(button, spec.label || CONTROL_LABELS[spec.action] || spec.action);
-          setClass(button, actionButtonClass(spec.action, Boolean(spec.primary)));
-        });
-        removeStale(container, 'button[data-key]', keys);
-      }
-      function selectRole(logicalRole) {
-        const task = selectedTask();
-        if (!task || !(task.roles || []).some(role => role.logical_role === logicalRole)) return;
-        state.selectedRoleByTask.set(task.task_id, logicalRole);
-        renderRoles(task);
-        renderControls(task);
-      }
-      function renderRoles(task) {
-        const host = byId('role-table-body');
-        const keys = new Set();
-        const selected = selectedRole(task);
-        (task.roles || []).forEach(role => {
-          keys.add(role.logical_role);
-          const row = keyed(host, 'tr[data-key]', role.logical_role, createRoleRow);
-          row.dataset.role = role.logical_role;
-          setClass(row, role.logical_role === selected?.logical_role ? 'border-b border-borderDark/50 cursor-pointer bg-accent/10' : 'border-b border-borderDark/50 cursor-pointer hover:bg-borderDark/50');
-          const page = exactPage(task, role);
-          const availability = !state.connected ? 'unknown' : page ? 'online' : 'offline';
-          const url = page?.url || role.page_url || '';
-          setText(field(row, 'function'), role.logical_role);
-          setClass(field(row, 'function'), 'py-2 pr-2 text-white font-semibold');
-          setText(field(row, 'physical'), `${role.physical_role} / ${page?.page_id || role.page_id || 'no live tab'}`);
-          setClass(field(row, 'physical'), 'py-2 pr-2 text-white');
-          setText(field(row, 'url'), url || 'No valid URL recorded');
-          setClass(field(row, 'url'), 'py-2 pr-2 text-textDim max-w-[190px] break-all');
-          setText(field(row, 'availability'), availability);
-          setClass(field(row, 'availability'), availability === 'online' ? 'py-2 pr-2 text-accent' : availability === 'offline' ? 'py-2 pr-2 text-warning' : 'py-2 pr-2 text-textDim');
-          const uploadedGeneration = role.attachments_uploaded_generation;
-          const uploadState = (task.attachments || []).length
-            ? ` · attachments ${uploadedGeneration === null || uploadedGeneration === undefined ? 'pending' : `gen ${uploadedGeneration}`}`
-            : '';
-          setText(field(row, 'status'), `${role.status || 'unknown'} · turn ${role.turn || 0} · gen ${role.conversation_generation || 0}${uploadState}`);
-          setClass(field(row, 'status'), 'py-2 pr-2 text-textDim');
-          const actions = field(row, 'actions');
-          clearNode(actions);
-          if (!['DONE', 'STOPPED'].includes(String(task.status).toUpperCase()) && task.cleanup?.state !== 'CLEARED') {
-            const select = make('button', 'min-h-10 rounded-lg border border-borderDark text-textDim hover:text-white hover:bg-borderDark px-3', actions);
-            select.type = 'button'; setText(select, role.logical_role === selected?.logical_role ? 'Selected' : 'Select'); select.addEventListener('click', () => selectRole(role.logical_role));
-          } else {
-            const none = make('span', 'text-textDim', actions); setText(none, 'No role actions');
-          }
-        });
-        if (!(task.roles || []).length) {
-          const row = keyed(host, 'tr[data-key]', 'empty', createRoleRow); keys.add('empty');
-          setText(field(row, 'function'), 'No configured roles'); field(row, 'function').colSpan = 6;
-          for (const name of ['physical', 'url', 'availability', 'status', 'actions']) setClass(field(row, name), 'hidden');
-        }
-        removeStale(host, 'tr[data-key]', keys);
-      }
-      function returnedOwnership(task) {
-        return task.surface === 'offline_recoverable' && ['DONE', 'STOPPED'].includes(String(task.status).toUpperCase()) && ['terminal_tab_present', 'cleared_tab_present'].includes(task.availability);
-      }
-      function taskActionSpec(task) {
-        const status = String(task.status || 'INBOX').toUpperCase();
-        const allowed = new Set(task.controls || []);
-        const keepAllowed = specs => specs.filter(spec => allowed.has(spec.action));
-        if (returnedOwnership(task)) return {primary: keepAllowed([{action: 'clear_team', label: 'Re-verify cleanup', primary: true}]), secondary: [], more: []};
-        if (status === 'DONE' || status === 'STOPPED' || task.cleanup?.state === 'CLEARED') return {primary: [], secondary: [], more: []};
-        const primary = status === 'PAUSED' ? 'resume' : status === 'BLOCKED' ? (task.block_retryable ? 'retry' : 'resume') : ['INBOX', 'RUNNING'].includes(status) ? 'pause' : null;
-        const resumableSecondary = ['INBOX', 'RUNNING'].includes(status) || (status === 'BLOCKED' && task.block_retryable);
-        return {primary: keepAllowed(primary ? [{action: primary, primary: true}] : []), secondary: keepAllowed([...(resumableSecondary ? [{action: 'resume'}] : []), {action: 'stop'}]), more: keepAllowed([{action: 'route_plan'}, {action: 'clear_team'}])};
-      }
-      function renderControls(task) {
-        const role = selectedRole(task);
-        setText(byId('task-control-target'), `Target: durable task ${task.task_id}`);
-        const guidance = byId('blocked-guidance');
-        const nonRetryable = String(task.status).toUpperCase() === 'BLOCKED' && !task.block_retryable;
-        setText(guidance, nonRetryable ? `${task.block_code || 'BLOCKED'} · ${task.block_reason || 'Manual recovery required. Open New Chat for the missing role, then use the role-scoped control.'}` : '');
-        setClass(guidance, nonRetryable ? 'block rounded-lg border border-danger bg-danger/10 p-3 text-xs text-textDim mb-2' : 'hidden rounded-lg border border-danger bg-danger/10 p-3 text-xs text-textDim mb-2');
-        const spec = taskActionSpec(task);
-        syncActionButtons(byId('task-primary'), spec.primary, action => handleTaskAction(action));
-        syncActionButtons(byId('task-secondary'), spec.secondary, action => handleTaskAction(action));
-        const more = byId('more-actions');
-        const oldTask = more.dataset.targetTaskId;
-        if (oldTask && oldTask !== task.task_id) more.open = false;
-        more.dataset.targetTaskId = task.task_id;
-        setClass(more, spec.more.length ? 'group mt-2 rounded-lg border border-borderDark bg-dark' : 'hidden group mt-2 rounded-lg border border-borderDark bg-dark');
-        syncActionButtons(byId('more-action-buttons'), spec.more, action => handleTaskAction(action));
-        const confirmation = byId('clear-confirmation');
-        if (confirmation.dataset.targetTaskId && confirmation.dataset.targetTaskId !== task.task_id) setClass(confirmation, 'hidden rounded-lg border border-danger bg-danger/10 p-2');
-        confirmation.dataset.targetTaskId = task.task_id;
-        setText(byId('role-control-target'), role ? `Target: task ${task.task_id} / function ${role.logical_role} / physical role ${role.physical_role}` : 'Target: no selected role');
-        const terminal = ['DONE', 'STOPPED'].includes(String(task.status).toUpperCase()) || task.cleanup?.state === 'CLEARED';
-        const page = role ? exactPage(task, role) : null;
-        const url = page?.url || role?.page_url || '';
-        const allowed = new Set(task.controls || []);
-        const roleSpecs = !role || terminal ? [] : [{action: 'restart_role'}, ...(validConversationUrl(url) ? [{action: 'open_tab'}] : []), {action: 'new_chat'}].filter(spec => allowed.has(spec.action));
-        syncActionButtons(byId('role-actions'), roleSpecs, action => requestControl(task.task_id, action, role.logical_role, false, byId('role-control-result')));
-        setText(byId('role-guidance'), !role ? 'Select a role row.' : terminal ? 'Terminal work exposes no role-scoped controls.' : validConversationUrl(url) ? `Latest recoverable URL: ${url}` : 'No valid /c/... URL. Use New Chat for this exact role.');
-      }
-      function handleTaskAction(action) {
-        const task = selectedTask();
-        if (!task) return;
-        if (action === 'clear_team') {
-          setClass(byId('clear-confirmation'), 'block rounded-lg border border-danger bg-danger/10 p-2');
-          return;
-        }
-        requestControl(task.task_id, action, null, false, byId('task-control-result'));
-      }
-      async function requestControl(taskId, action, role, confirmed, resultNode) {
-        const body = {action};
-        if (role) body.role = role;
-        if (confirmed) body.confirmed = true;
-        setText(resultNode, `Requesting ${CONTROL_LABELS[action] || action}…`);
-        try {
-          const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/controls`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
-          const payload = await response.json();
-          if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-          setText(resultNode, `${CONTROL_LABELS[action] || action} accepted by server.`);
-          await refreshDashboard();
-        } catch (error) {
-          setText(resultNode, `${CONTROL_LABELS[action] || action} failed: ${error.message}`);
-        }
-      }
-      function renderSelectedTask() {
-        const task = selectedTask();
-        if (!task) {
-          setText(byId('team-title'), 'No task available.');
-          setText(byId('team-meta'), '');
-          clearNode(byId('logs-content')); clearNode(byId('role-table-body')); clearNode(byId('dependency-content')); clearNode(byId('repair-content')); clearNode(byId('attachment-content')); clearNode(byId('selected-reports'));
-          setClass(byId('repair-summary'), 'hidden border-t border-borderDark pt-3 mb-3');
-          setClass(byId('primary-problem-section'), 'hidden rounded-lg border border-danger bg-danger/10 p-3 mb-3');
-          setClass(byId('maintenance-section'), 'hidden rounded-lg border border-borderDark bg-dark p-3 mb-3');
-          setText(byId('task-control-target'), 'Target: no selected task');
-          setText(byId('role-control-target'), 'Target: no selected role');
-          syncActionButtons(byId('task-primary'), [], () => {}); syncActionButtons(byId('task-secondary'), [], () => {}); syncActionButtons(byId('more-action-buttons'), [], () => {}); syncActionButtons(byId('role-actions'), [], () => {});
-          return;
-        }
-        setText(byId('team-title'), task.team || 'Unassigned team');
-        setText(byId('team-meta'), `${task.task_title || task.task_id} · ${task.status} · ${task.column || '—'} · ${task.task_id}`);
-        renderPrimaryProblem(task);
-        renderMaintenance(task);
-        renderControls(task);
-        renderDependencySummary(task);
-        renderRepairRelationships(task);
-        renderAttachments(task);
-        renderRoles(task);
-        renderLogs(task);
-        renderSelectedReports(task);
-      }
-      function createTabCard() {
-        const card = make('article', 'rounded-lg border border-borderDark bg-dark p-3 min-w-0');
-        make('p', 'text-[10px] uppercase tracking-wider text-textDim', card).dataset.field = 'label';
-        make('h3', 'text-white font-semibold break-words mt-1', card).dataset.field = 'identity';
-        make('p', 'text-xs text-textDim break-all mt-1', card).dataset.field = 'url';
-        make('p', 'text-xs text-textDim mt-2', card).dataset.field = 'ownership';
-        make('p', 'text-xs text-textDim mt-1', card).dataset.field = 'state';
-        make('p', 'text-xs text-textDim mt-1 break-words', card).dataset.field = 'composer';
-        card.addEventListener('click', () => {
-          const page = state.pages.find(item => item.page_id === card.dataset.pageId);
-          const task = selectedTask();
-          if (!page || !task || page.task_id !== task.task_id) return;
-          const role = (task.roles || []).find(item => item.physical_role === page.role);
-          if (role) selectRole(role.logical_role);
-        });
-        return card;
-      }
-      function renderTabs() {
-        const host = byId('tab-grid');
-        const keys = new Set();
-        state.pages.forEach(page => {
-          const key = page.page_id || `${page.role || 'free'}:${page.url || ''}`;
-          keys.add(key);
-          const card = keyed(host, 'article[data-key]', key, createTabCard);
-          card.dataset.pageId = page.page_id || '';
-          setText(field(card, 'label'), page.role ? 'Assigned role tab' : 'Unassigned tab');
-          setText(field(card, 'identity'), page.identity || page.role || 'UNASSIGNED');
-          setText(field(card, 'url'), page.url || 'No URL');
-          setText(field(card, 'ownership'), `Team ${page.team || 'none'} · Task ${page.task_id || 'none'}`);
-          setText(field(card, 'state'), `${state.connected ? 'online' : 'unknown'} · ${page.state || 'unknown'} · ${page.message_count || 0} messages`);
-          setText(field(card, 'composer'), page.composer_preview ? `Composer: ${page.composer_preview}` : 'Composer empty');
-        });
-        if (!state.pages.length) { const empty = keyed(host, '[data-key]', 'empty', () => make('div', 'rounded-lg border border-dashed border-borderDark bg-dark p-3 text-xs text-textDim')); setText(empty, state.connected ? 'No supported browser tabs detected.' : 'Browser availability is unknown.'); keys.add('empty'); }
-        removeStale(host, '[data-key]', keys);
-      }
-      function createHistoryRow() {
-        const row = make('article', 'rounded-lg border border-borderDark bg-dark p-3');
-        const button = make('button', 'min-h-10 w-full text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent', row); button.type = 'button';
-        make('strong', 'text-white', button).dataset.field = 'team';
-        make('span', 'text-xs text-textDim', button).dataset.field = 'meta';
-        make('p', 'text-[10px] text-textDim mt-1 break-words', button).dataset.field = 'task';
-        make('div', 'flex flex-wrap gap-2 mt-2', row).dataset.field = 'reports';
-        button.addEventListener('click', () => selectTask(row.dataset.historyTaskId));
-        return row;
-      }
-      function renderHistory() {
-        const host = byId('history-list');
-        const scrollTop = host.scrollTop;
-        const rows = state.tasks.filter(task => task.surface === 'history' || ['DONE', 'STOPPED'].includes(String(task.status).toUpperCase())).sort((a, b) => activityEpoch(b) - activityEpoch(a));
-        const keys = new Set(rows.map(task => String(task.task_id)));
-        if (!rows.length) keys.add('empty');
-        removeStale(host, ':scope > [data-key]', keys);
-        rows.forEach((task, index) => {
-          const row = keyed(host, 'article[data-key]', task.task_id, createHistoryRow);
-          row.dataset.historyTaskId = task.task_id;
-          setText(field(row, 'team'), task.team);
-          setText(field(row, 'meta'), ` · ${task.status} · ${task.availability || 'unknown'}`);
-          setText(field(row, 'task'), `${task.task_id} · ${task.task_title || ''}`);
-          const reports = field(row, 'reports');
-          const reportRows = (task.reports || []).map((report, reportIndex) => ({key: `role:${report.report_id || reportIndex}`, url: report.url, label: `${report.physical_role || 'Report'} turn ${report.turn || '—'}`}));
-          const reportKeys = new Set(reportRows.map(report => report.key));
-          if (!reportRows.length) reportKeys.add('empty');
-          removeStale(reports, ':scope > [data-key]', reportKeys);
-          reportRows.forEach((report, reportIndex) => {
-            const link = keyed(reports, 'a[data-key]', report.key, createReportLink);
-            if (link.getAttribute('href') !== report.url) link.href = report.url;
-            setText(link, report.label);
-            placeInOrder(reports, link, reportIndex);
-          });
-          if (!reportRows.length) {
-            const none = keyed(reports, ':scope > [data-key]', 'empty', () => make('span', 'text-xs text-textDim'));
-            setText(none, 'No reports.');
-          }
-          placeInOrder(host, row, index);
-        });
-        if (!rows.length) { const empty = keyed(host, ':scope > [data-key]', 'empty', () => make('div', 'rounded-lg border border-dashed border-borderDark bg-dark p-3 text-xs text-textDim')); setText(empty, 'No terminal history or reports.'); }
-        if (host.scrollTop !== scrollTop) host.scrollTop = scrollTop;
-        setText(byId('history-count'), `${rows.length} record${rows.length === 1 ? '' : 's'}`);
-      }
-      function ensureSelection() {
-        if (state.tasks.some(task => task.task_id === state.selectedTaskId)) return;
-        const operational = state.tasks.find(task => task.surface !== 'history');
-        state.selectedTaskId = operational?.task_id || state.tasks[0]?.task_id || null;
-      }
-      function updateHeader(tasksPayload, dashboardState) {
-        setClass(byId('connection-dot'), dashboardState.connected ? 'w-2 h-2 rounded-full bg-accent' : 'w-2 h-2 rounded-full bg-danger');
-        setText(byId('connection-state'), dashboardState.connected ? 'Connected' : 'Unavailable');
-        setText(byId('page-count'), `${dashboardState.page_count || 0} tab${dashboardState.page_count === 1 ? '' : 's'}`);
-        setText(byId('task-count'), `${(tasksPayload.tasks || []).length} task${(tasksPayload.tasks || []).length === 1 ? '' : 's'}`);
-        setText(byId('updated-at'), dashboardState.updated_at ? new Date(dashboardState.updated_at).toLocaleTimeString() : 'No sample');
-      }
-      async function refreshDashboard() {
-        if (state.refreshing) return;
-        state.refreshing = true;
-        try {
-          const [tasksResponse, stateResponse] = await Promise.all([fetch('/api/tasks', {cache: 'no-store'}), fetch('/api/state', {cache: 'no-store'})]);
-          const tasksPayload = await tasksResponse.json();
-          const dashboardState = await stateResponse.json();
-          if (!tasksResponse.ok) throw new Error(tasksPayload.error || `Tasks HTTP ${tasksResponse.status}`);
-          if (!stateResponse.ok) throw new Error(dashboardState.error || `State HTTP ${stateResponse.status}`);
-          state.tasks = tasksPayload.tasks || [];
-          state.pages = dashboardState.pages || [];
-          state.events = dashboardState.events || [];
-          state.connected = Boolean(dashboardState.connected);
-          state.repository = tasksPayload.repository || state.repository;
-          if (!byId('create-repository-input').value && state.repository) byId('create-repository-input').value = state.repository;
-          ensureSelection();
-          renderBoard(); renderSelectedTask(); renderTabs(); renderHistory(); updateHeader(tasksPayload, dashboardState);
-          const manifestErrors = (tasksPayload.errors || []).map(item => `${item.manifest_path}: ${item.error}`);
-          const error = dashboardState.error || manifestErrors.join(' · ');
-          setText(byId('error-banner'), error || '');
-          setClass(byId('error-banner'), error ? 'block rounded-lg border border-danger bg-danger/10 px-3 py-2 text-xs text-danger' : 'hidden rounded-lg border border-danger bg-danger/10 px-3 py-2 text-xs text-danger');
-        } catch (error) {
-          setText(byId('error-banner'), `Dashboard refresh failed: ${error.message}`);
-          setClass(byId('error-banner'), 'block rounded-lg border border-danger bg-danger/10 px-3 py-2 text-xs text-danger');
-        } finally {
-          state.refreshing = false;
-        }
-      }
-      function setDialogMode(mode) {
-        state.dialogMode = mode;
-        const create = mode === 'create';
-        setClass(byId('mode-create'), create ? 'min-h-10 rounded-md px-4 text-xs font-semibold bg-accent text-white' : 'min-h-10 rounded-md px-4 text-xs font-semibold text-textDim hover:text-white');
-        setClass(byId('mode-resume'), create ? 'min-h-10 rounded-md px-4 text-xs font-semibold text-textDim hover:text-white' : 'min-h-10 rounded-md px-4 text-xs font-semibold bg-accent text-white');
-        setClass(byId('create-mode-panel'), create ? 'grid gap-4' : 'hidden grid gap-4');
-        setClass(byId('resume-mode-panel'), create ? 'hidden grid gap-4' : 'grid gap-4');
-        setText(byId('dialog-result'), '');
-      }
-      function openDialog(mode, opener) {
-        state.dialogOpener = opener;
-        setDialogMode(mode);
-        const dialog = byId('task-dialog');
-        if (!dialog.open) dialog.showModal();
-        requestAnimationFrame(() => byId(mode === 'create' ? 'create-task-input' : 'resume-team-input').focus());
-      }
-      async function submitEntry(event, mode) {
-        event.preventDefault();
-        const create = mode === 'create';
-        const submit = byId(create ? 'create-submit' : 'resume-submit');
-        const newRoles = [...document.querySelectorAll('input[name="new_role"]:checked')].map(node => node.value);
-        const dependencies = [...new Set(byId('create-dependencies-input').value.split(',').map(value => value.trim()).filter(Boolean))];
-        const uploadPaths = byId('create-uploads-input').value.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
-        const teamValue = byId('create-team-input').value.trim();
-        const reuseTeam = create && byId('create-reuse-team-input').checked;
-        const body = create ? {task: byId('create-task-input').value.trim(), repository: byId('create-repository-input').value, new_roles: newRoles, new_all: byId('new-all-input').checked} : {repository: state.repository, team: byId('resume-team-input').value};
-        if (create) body[reuseTeam ? 'reuse_team' : 'team'] = teamValue;
-        if (create && dependencies.length) body.depends_on_task_ids = dependencies;
-        if (create && uploadPaths.length) body.upload_paths = uploadPaths;
-        if (create && (!body.task || !body.repository || !teamValue)) { setText(byId('dialog-result'), 'Task text, repository, and team are required.'); return; }
-        if (!create && !body.team) { setText(byId('dialog-result'), 'Exact allocated team is required.'); return; }
-        submit.disabled = true;
-        setText(byId('dialog-result'), create ? 'Creating durable task…' : 'Resuming exact durable team…');
-        try {
-          const endpoint = create ? '/api/tasks' : '/api/tasks/resume';
-          const response = await fetch(endpoint, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
-          const payload = await response.json();
-          if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-          setText(byId('dialog-result'), `${create ? 'Created' : 'Resumed'} ${payload.task_id} · team ${payload.team} · ${payload.manifest_path}`);
-          await refreshDashboard();
-        } catch (error) {
-          setText(byId('dialog-result'), `${create ? 'Create' : 'Resume'} failed: ${error.message}`);
-        } finally {
-          submit.disabled = false;
-        }
-      }
-      byId('manual-refresh').addEventListener('click', refreshDashboard);
-      byId('open-create').addEventListener('click', event => openDialog('create', event.currentTarget));
-      byId('open-resume').addEventListener('click', event => openDialog('resume', event.currentTarget));
-      byId('mode-create').addEventListener('click', () => setDialogMode('create'));
-      byId('mode-resume').addEventListener('click', () => setDialogMode('resume'));
-      byId('dialog-close').addEventListener('click', () => { const dialog = byId('task-dialog'); dialog.close(); });
-      byId('task-dialog').addEventListener('close', () => { const opener = state.dialogOpener; state.dialogOpener = null; if (opener?.isConnected) opener.focus(); });
-      byId('create-mode-panel').addEventListener('submit', event => submitEntry(event, 'create'));
-      byId('resume-mode-panel').addEventListener('submit', event => submitEntry(event, 'resume'));
-      byId('clear-confirmation').querySelector('[data-confirm-clear]').addEventListener('click', () => { const task = selectedTask(); if (task) { setClass(byId('clear-confirmation'), 'hidden rounded-lg border border-danger bg-danger/10 p-2'); requestControl(task.task_id, 'clear_team', null, true, byId('task-control-result')); } });
-      document.querySelectorAll('[data-nav-target]').forEach(button => button.addEventListener('click', () => byId(button.dataset.navTarget)?.scrollIntoView({block: 'start'})));
-      setDialogMode('create');
-      refreshDashboard();
-      setInterval(refreshDashboard, 1000);
-    })();
-  </script>
+  <dialog id="create-dialog" class="create-dialog">
+    <form id="create-form" method="dialog" class="create-form">
+      <header class="secondary-header">
+        <div>
+          <p class="eyebrow">Queue work</p>
+          <h2>Create task</h2>
+        </div>
+        <button type="button" class="button icon-button" data-close-create aria-label="Close create task form">Close</button>
+      </header>
+      <label>Task<textarea name="task" rows="7" required></textarea></label>
+      <fieldset class="action-fieldset">
+        <legend>Team allocation</legend>
+        <div class="form-grid">
+          <label>New team<input name="requested_team" autocomplete="off"></label>
+          <label>Reuse exact team<select name="reuse_team"><option value="">Do not reuse</option></select></label>
+        </div>
+        <p class="form-help">Choose one allocation path. Reuse eligibility is published by the worker.</p>
+      </fieldset>
+      <label>Repository<input name="repository" autocomplete="off"></label>
+      <section class="action-fieldset" aria-labelledby="dependency-title">
+        <div class="section-inline">
+          <div>
+            <h3 id="dependency-title">Dependencies by exact team</h3>
+            <p class="form-help">A team shortcut is available only when it resolves to one canonical task.</p>
+          </div>
+        </div>
+        <div id="dependency-options" class="action-options" aria-live="polite"></div>
+        <details data-advanced-dependencies>
+          <summary>Advanced: exact task IDs</summary>
+          <label>Dependency task IDs<input name="depends_on_task_ids" placeholder="task-a, task-b" autocomplete="off"></label>
+        </details>
+      </section>
+      <footer class="dialog-actions">
+        <button type="button" class="button" data-close-create>Cancel</button>
+        <button type="submit" class="button primary">Queue task</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="agent-dialog" class="create-dialog">
+    <form id="agent-form" method="dialog" class="create-form">
+      <header class="secondary-header">
+        <div>
+          <p class="eyebrow">Worker-owned agent</p>
+          <h2>Add independent agent</h2>
+        </div>
+        <button type="button" class="button icon-button" data-close-agent aria-label="Close independent agent form">Close</button>
+      </header>
+      <label>Name<input name="name" maxlength="80" autocomplete="off" required></label>
+      <label>System prompt<textarea name="system_prompt" rows="10" required></textarea></label>
+      <label>Mode<select name="mode"><option value="Independent" selected>Independent</option></select></label>
+      <footer class="dialog-actions">
+        <button type="button" class="button" data-close-agent>Cancel</button>
+        <button type="submit" class="button primary">Create agent</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="agent-settings-dialog" class="create-dialog">
+    <form id="agent-settings-form" method="dialog" class="create-form">
+      <header class="secondary-header">
+        <div>
+          <p class="eyebrow">Independent agent</p>
+          <h2>Settings</h2>
+        </div>
+        <button type="button" class="button icon-button" data-close-agent-settings aria-label="Close agent settings">Close</button>
+      </header>
+      <input type="hidden" name="task_id">
+      <label class="check-row"><input type="checkbox" name="enabled"> Enabled</label>
+      <label>Replace system prompt (optional)<textarea name="system_prompt" rows="6"></textarea></label>
+      <fieldset class="action-fieldset">
+        <legend>Triggers</legend>
+        <label class="check-row"><input type="checkbox" name="recovery"> Exclusive recovery</label>
+        <label class="check-row"><input type="checkbox" name="task_done"> Task DONE</label>
+        <label class="check-row"><input type="checkbox" name="check_all"> CHECK_ALL</label>
+        <label>Interval minutes<input type="number" name="interval_minutes" min="20" step="1"></label>
+        <label>Selected exact teams<input name="teams" placeholder="team-a, team-b" autocomplete="off"></label>
+        <label>Selected states<input name="states" placeholder="RUNNING, WAITING, BLOCKED" autocomplete="off"></label>
+        <label>Completed roles<input name="role_completed" placeholder="PLAN, DEV, TEST" autocomplete="off"></label>
+      </fieldset>
+      <label class="check-row"><input type="checkbox" name="new_chat_next_job"> New Chat on next job</label>
+      <footer class="dialog-actions">
+        <button type="button" class="button" data-close-agent-settings>Cancel</button>
+        <button type="submit" class="button primary">Save settings</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" hidden role="status"></div>
+  <script type="module" src="/assets/app.js"></script>
 </body>
 </html>

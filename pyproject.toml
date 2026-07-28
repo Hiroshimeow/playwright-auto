@@ -12,6 +12,7 @@ playwright-role-ui = "playwright_auto.role_ui_daemon:main"
 playwright-dashboard = "playwright_auto.dashboard:main"
 cdpa = "playwright_auto.cdpa_cli:main"
 cdpa-worker = "playwright_auto.cdpa_worker:main"
+playwright-dashboard-api = "playwright_auto.dashboard_api:main"
 playwright-roles = "playwright_auto.role_cli:main"
 
 [dependency-groups]

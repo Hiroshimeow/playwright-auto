@@ -13,6 +13,22 @@ from .connection import connect
 from .role_indicator import ensure_role_indicator
 
 SUPPORTED_HOSTS = frozenset({"chatgpt.com", "www.chatgpt.com", "auth.openai.com"})
+_BINDING_READ_SCRIPT = "() => window.__PLAYWRIGHT_AUTO_ROLE_BINDING_READ__?.() || null"
+_BINDING_INSTALL_SCRIPT = """() => {
+  window.__PLAYWRIGHT_AUTO_ROLE_BINDING_READ__ = () => {
+    const api = window.__PLAYWRIGHT_AUTO_ROLE_INDICATOR__;
+    if (!api?.readBinding) return null;
+    const value = api.readBinding({createPageId: false}) || {};
+    return {
+      role: value.role || null,
+      pageId: value.pageId || null,
+      taskId: value.taskId || null,
+      title: document.title || '',
+      badgePresent: Boolean(document.getElementById('playwright-auto-role-badge-v3')),
+    };
+  };
+  return true;
+}"""
 
 
 def supported_url(url: str) -> bool:
@@ -45,7 +61,7 @@ class RoleUIDaemon:
         self,
         *,
         cdp_url: str = "http://127.0.0.1:9222",
-        poll_seconds: float = 0.5,
+        poll_seconds: float = 5.0,
         reconnect_seconds: float = 2.0,
         event_log: Path = Path(".runtime/role-ui-events.jsonl"),
     ) -> None:
@@ -58,6 +74,17 @@ class RoleUIDaemon:
         self.reconnect_seconds = reconnect_seconds
         self.event_log = event_log
         self._known: dict[str, VisibleRoleState] = {}
+        self._registry_signatures: dict[str, tuple[object, ...]] = {}
+        self._wake = asyncio.Event()
+        self._watched_pages: set[int] = set()
+        self.metrics = {
+            "registry_publications": 0,
+            "registry_noops": 0,
+            "binding_reads": 0,
+            "indicator_repairs": 0,
+            "event_wakes": 0,
+            "timer_reconciliations": 0,
+        }
 
     def _append_event(self, event_type: str, state: VisibleRoleState, **extra: Any) -> None:
         self.event_log.parent.mkdir(parents=True, exist_ok=True)
@@ -70,17 +97,76 @@ class RoleUIDaemon:
         with self.event_log.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
 
+    def _wake_now(self, *_args: Any) -> None:
+        self._wake.set()
+
+    def _watch_page(self, page: Any) -> None:
+        identity = id(page)
+        if identity in self._watched_pages:
+            return
+        self._watched_pages.add(identity)
+        try:
+            page.on("close", self._wake_now)
+            page.on("domcontentloaded", self._wake_now)
+            page.on(
+                "framenavigated",
+                lambda frame: self._wake_now()
+                if frame == getattr(page, "main_frame", None)
+                else None,
+            )
+        except Exception:
+            # The bounded reconciliation timer remains the fail-safe.
+            self._watched_pages.discard(identity)
+
+    def _install_event_wakes(self, browser: Any) -> None:
+        for context in browser.contexts:
+            for page in context.pages:
+                self._watch_page(page)
+            try:
+                context.on(
+                    "page",
+                    lambda page: (self._watch_page(page), self._wake_now()),
+                )
+            except Exception:
+                continue
+        try:
+            browser.on("disconnected", self._wake_now)
+        except Exception:
+            pass
+
+    async def _wait_for_change(self) -> None:
+        try:
+            await asyncio.wait_for(self._wake.wait(), timeout=self.poll_seconds)
+        except TimeoutError:
+            self.metrics["timer_reconciliations"] += 1
+        else:
+            self.metrics["event_wakes"] += 1
+
+    async def _read_binding(self, page: Any) -> dict[str, Any] | None:
+        try:
+            result = await page.evaluate(_BINDING_READ_SCRIPT)
+            if not isinstance(result, dict):
+                await page.evaluate(_BINDING_INSTALL_SCRIPT)
+                result = await page.evaluate(_BINDING_READ_SCRIPT)
+        except Exception:
+            return None
+        self.metrics["binding_reads"] += 1
+        return result if isinstance(result, dict) else None
+
     async def _inspect_pages(self, browser: Any) -> list[tuple[Any, VisibleRoleState]]:
         rows: list[tuple[Any, VisibleRoleState]] = []
         for context in browser.contexts:
             for page in context.pages:
                 if page.is_closed() or not supported_url(page.url):
                     continue
-                try:
-                    result = await ensure_role_indicator(page)
-                except Exception:
-                    # Navigation can replace the document between URL filtering and evaluate.
-                    continue
+                result = await self._read_binding(page)
+                if not result or not result.get("pageId") or not result.get("badgePresent"):
+                    try:
+                        result = await ensure_role_indicator(page)
+                        self.metrics["indicator_repairs"] += 1
+                    except Exception:
+                        # Navigation can replace the document between URL filtering and evaluate.
+                        continue
                 page_id = str(result.get("pageId") or "").strip()
                 if not page_id:
                     continue
@@ -100,14 +186,21 @@ class RoleUIDaemon:
             if state.role:
                 role_pages.setdefault(state.role, []).append(state)
         roles = sorted(role_pages)
+        live_ids = {state.page_id for _, state in rows}
+        for stale_id in set(self._registry_signatures) - live_ids:
+            self._registry_signatures.pop(stale_id, None)
         for page, state in rows:
             duplicates = role_pages.get(state.role or "", []) if state.role else []
             conflict = None
             if len(duplicates) > 1:
                 ids = ", ".join(item.page_id[:8] for item in duplicates)
                 conflict = f"Duplicate role {state.role}: tabs {ids}. Rename one role, e.g. {state.role}1."
+            signature = (tuple(roles), conflict, state.role, state.task_id, state.url)
+            if self._registry_signatures.get(state.page_id) == signature:
+                self.metrics["registry_noops"] += 1
+                continue
             try:
-                await page.evaluate(
+                applied = await page.evaluate(
                     """({roles, conflict}) => {
                       const api = window.__PLAYWRIGHT_AUTO_ROLE_INDICATOR__;
                       if (!api) return false;
@@ -120,6 +213,9 @@ class RoleUIDaemon:
                 )
             except Exception:
                 continue
+            if applied is not False:
+                self._registry_signatures[state.page_id] = signature
+                self.metrics["registry_publications"] += 1
 
     def _record_changes(self, rows: list[tuple[Any, VisibleRoleState]]) -> None:
         current = {state.page_id: state for _, state in rows}
@@ -155,10 +251,15 @@ class RoleUIDaemon:
 
     async def _serve_connection(self) -> None:
         playwright, browser = await connect(self.cdp_url)
+        self._install_event_wakes(browser)
         try:
             while browser.is_connected():
+                self._wake.clear()
                 await self.sync_once(browser)
-                await asyncio.sleep(self.poll_seconds)
+                if self._wake.is_set():
+                    self.metrics["event_wakes"] += 1
+                    continue
+                await self._wait_for_change()
         finally:
             await playwright.stop()
 
@@ -208,7 +309,7 @@ async def async_main(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Keep visible manual role controls on persistent browser tabs")
     parser.add_argument("--cdp", default="http://127.0.0.1:9222")
-    parser.add_argument("--poll", type=float, default=0.5)
+    parser.add_argument("--poll", type=float, default=5.0)
     parser.add_argument("--reconnect", type=float, default=2.0)
     parser.add_argument("--event-log", default=".runtime/role-ui-events.jsonl")
     parser.add_argument("--once", action="store_true")

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import random
 import re
 import time
 import weakref
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlparse
@@ -274,6 +275,7 @@ class TaskBindingError(ChatGPTAutomationError):
 
 _PAGE_WORKFLOW_LOCKS: weakref.WeakKeyDictionary[Any, asyncio.Lock] = weakref.WeakKeyDictionary()
 _PAGE_MUTATION_LOCKS: weakref.WeakKeyDictionary[Any, asyncio.Lock] = weakref.WeakKeyDictionary()
+_PAGE_WAIT_STATES: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
 _RATE_LIMIT_MARKERS = (
     "too many requests",
     "making requests too quickly",
@@ -287,6 +289,24 @@ def _page_lock(registry: weakref.WeakKeyDictionary[Any, asyncio.Lock], page: Any
         lock = asyncio.Lock()
         registry[page] = lock
     return lock
+
+
+def _page_wait_state(page: Any) -> dict[str, Any]:
+    state = {
+        "probe": None,
+        "snapshot": None,
+        "receipt_key": None,
+        "full_snapshot_at": 0.0,
+    }
+    try:
+        existing = _PAGE_WAIT_STATES.get(page)
+        if existing is not None:
+            return existing
+        _PAGE_WAIT_STATES[page] = state
+    except TypeError:
+        # Tiny fake page objects in unit tests may not support weak references.
+        pass
+    return state
 
 
 class ChatGPTState(str, Enum):
@@ -468,11 +488,13 @@ class ChatGPTSnapshot:
     error_texts: tuple[str, ...]
     messages: tuple[MessageSnapshot, ...]
     choice_prompt_labels: tuple[str, ...] = ()
+    retry_visible: bool = False
     page_task_id: str | None = None
     page_team: str | None = None
     response_activity_text: str = ""
     response_activity_structure: str = ""
     response_activity_turn_id: str | None = None
+    response_activity_length: int = 0
 
     @property
     def conversation_url(self) -> str | None:
@@ -510,6 +532,7 @@ class ChatGPTSnapshot:
             "response_activity_text": self.response_activity_text,
             "response_activity_structure": self.response_activity_structure,
             "response_activity_turn_id": self.response_activity_turn_id,
+            "response_activity_length": self.response_activity_length,
             "state": self.state.value,
             "requires_login": self.requires_login,
             "composer_present": self.composer_present,
@@ -523,11 +546,117 @@ class ChatGPTSnapshot:
             "attachment_markers": list(self.attachment_markers),
             "choice_prompt_pending": self.choice_prompt_pending,
             "choice_prompt_labels": list(self.choice_prompt_labels),
+            "retry_visible": self.retry_visible,
             "manual_input_pending": self.manual_input_pending,
             "image_count": self.image_count,
             "error_texts": list(self.error_texts),
             "messages": [message.to_dict() for message in self.messages],
         }
+
+
+@dataclass(frozen=True)
+class WaitProbe:
+    url: str
+    session_id: str | None
+    page_id: str | None
+    page_role: str | None
+    page_task_id: str | None
+    page_team: str | None
+    requires_login: bool
+    composer_present: bool
+    composer_text: str
+    attachment_count: int
+    stop_visible: bool
+    transport_active: bool
+    error_texts: tuple[str, ...]
+    blocking_dialogs: tuple[str, ...]
+    choice_prompt_labels: tuple[str, ...]
+    last_user_message_id: str | None
+    last_user_turn_id: str | None
+    last_assistant_message_id: str | None
+    last_assistant_turn_id: str | None
+    assistant_text_length: int
+    assistant_text_tail: str
+    response_activity_length: int
+    response_activity_tail: str
+    response_activity_turn_id: str | None
+
+    @property
+    def composer_empty(self) -> bool:
+        return not self.composer_text.strip()
+
+    @property
+    def manual_input_pending(self) -> bool:
+        return bool(self.composer_text.strip() or self.attachment_count)
+
+    @property
+    def choice_prompt_pending(self) -> bool:
+        return bool(self.choice_prompt_labels) and not self.composer_present
+
+    @property
+    def identity_signature(self) -> tuple[str | None, ...]:
+        return (
+            self.last_user_message_id,
+            self.last_user_turn_id,
+            self.last_assistant_message_id,
+            self.last_assistant_turn_id,
+            self.response_activity_turn_id,
+        )
+
+    def to_raw(self) -> dict[str, Any]:
+        return {
+            "url": self.url,
+            "page_role": self.page_role,
+            "page_id": self.page_id,
+            "page_task_id": self.page_task_id,
+            "page_team": self.page_team,
+            "requires_login": self.requires_login,
+            "composer_present": self.composer_present,
+            "composer_text": self.composer_text,
+            "attachment_count": self.attachment_count,
+            "stop_visible": self.stop_visible,
+            "transport_active": self.transport_active,
+            "error_texts": list(self.error_texts),
+            "blocking_dialogs": list(self.blocking_dialogs),
+            "choice_prompt_labels": list(self.choice_prompt_labels),
+            "last_user_message_id": self.last_user_message_id,
+            "last_user_turn_id": self.last_user_turn_id,
+            "last_assistant_message_id": self.last_assistant_message_id,
+            "last_assistant_turn_id": self.last_assistant_turn_id,
+            "assistant_text_length": self.assistant_text_length,
+            "assistant_text_tail": self.assistant_text_tail,
+            "response_activity_length": self.response_activity_length,
+            "response_activity_tail": self.response_activity_tail,
+            "response_activity_turn_id": self.response_activity_turn_id,
+        }
+
+    @property
+    def transition_signature(self) -> str:
+        return json.dumps(
+            [
+                self.url,
+                self.page_id,
+                self.page_role,
+                self.page_task_id,
+                self.page_team,
+                self.requires_login,
+                self.composer_present,
+                self.composer_text,
+                self.attachment_count,
+                self.stop_visible,
+                self.transport_active,
+                list(self.error_texts),
+                list(self.blocking_dialogs),
+                list(self.choice_prompt_labels),
+                self.last_user_message_id,
+                self.last_user_turn_id,
+                self.last_assistant_message_id,
+                self.last_assistant_turn_id,
+                self.response_activity_turn_id,
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
 
 
 @dataclass(frozen=True)
@@ -657,6 +786,25 @@ def receipt_user_message_seen(
     return _receipt_user_index(messages, receipt) is not None
 
 
+def all_assistant_turns_for_receipt(
+    messages: Sequence[MessageSnapshot], receipt: SendReceipt
+) -> tuple[MessageSnapshot, ...]:
+    user_index = _receipt_user_index(messages, receipt)
+    if user_index is None:
+        return ()
+    selected: list[MessageSnapshot] = []
+    seen: set[str] = set()
+    for message in messages[user_index + 1 :]:
+        if message.role != "assistant":
+            continue
+        identity = message.turn_id or message.message_id
+        if identity in receipt.baseline.assistant_turn_ids or identity in seen:
+            continue
+        seen.add(identity)
+        selected.append(message)
+    return tuple(selected)
+
+
 def assistant_turns_for_receipt(
     messages: Sequence[MessageSnapshot], receipt: SendReceipt
 ) -> tuple[MessageSnapshot, ...]:
@@ -667,7 +815,8 @@ def assistant_turns_for_receipt(
     seen: set[str] = set()
     for message in messages[user_index + 1 :]:
         if message.role == "user":
-            break
+            selected.clear()
+            continue
         if message.role != "assistant":
             continue
         identity = message.turn_id or message.message_id
@@ -806,6 +955,7 @@ def response_activity_signature(
     )
     length = max(
         len(latest.text) if latest is not None else 0,
+        int(getattr(snapshot, "response_activity_length", 0) or 0),
         len(activity_text),
     )
     state = getattr(snapshot, "state", ChatGPTState.UNKNOWN)
@@ -1510,39 +1660,38 @@ async def click_safe_choice_prompt(page: Any) -> str:
           const visible = (element) => Boolean(
             element && (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
           );
-          const positive = [
-            'continue', 'proceed', 'start', 'yes', 'ok', 'okay', 'accept',
-            'approve', 'allow', 'run', 'go ahead', 'make a plan',
-            'create plan', 'use plan'
-          ];
-          const negative = [
-            'cancel', 'stop', 'not now', 'no thanks', 'dismiss', 'close',
-            'delete', 'remove', 'archive', 'share', 'copy'
-          ];
+          const overlaySelector = [
+            '#playwright-auto-role-badge-v3',
+            '#playwright-auto-role-control-v1',
+            '#playwright-auto-role-badge',
+            '#playwright-auto-role-badge-v2'
+          ].join(',');
+          const positive = /\b(?:continue|proceed|start|yes|ok|okay|accept|approve|allow|run)\b|\bgo ahead\b|\b(?:make|create|use) a plan\b/i;
+          const negative = /\b(?:cancel|stop|dismiss|close|delete|remove|archive|share|copy)\b|\b(?:not now|no thanks)\b/i;
+          const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+          const candidateLabel = (button) => {
+            const textLabel = normalize(button.innerText || button.textContent);
+            const ariaLabel = normalize(button.getAttribute('aria-label'));
+            const testId = normalize(button.getAttribute('data-testid'));
+            if ([textLabel, ariaLabel, testId].some((label) => negative.test(label))) return '';
+            return [textLabel, ariaLabel].find((label) => positive.test(label)) || '';
+          };
           const candidates = [...document.querySelectorAll('button,[role="button"]')]
-            .map((button) => {
-              const label = [
-                button.innerText || button.textContent || '',
-                button.getAttribute('aria-label') || '',
-                button.getAttribute('data-testid') || ''
-              ].join(' ').replace(/\\s+/g, ' ').trim();
-              const lower = label.toLowerCase();
-              return {button, label, lower};
-            })
-            .filter(({button, label, lower}) =>
+            .map((button) => ({button, label: candidateLabel(button)}))
+            .filter(({button, label}) =>
               label && visible(button) && !button.disabled &&
               button.getAttribute('aria-disabled') !== 'true' &&
-              positive.some((marker) => lower.includes(marker)) &&
-              !negative.some((marker) => lower.includes(marker))
+              !button.closest(overlaySelector) &&
+              Boolean(button.closest('main,[role="dialog"],[data-testid^="modal-"]'))
             );
-          const target = candidates[0] || null;
-          if (!target) return {ok: false, label: ''};
+          if (candidates.length !== 1) return {ok: false, label: ''};
+          const target = candidates[0];
           target.button.click();
           return {ok: true, label: target.label};
         }"""
     )
     if not result.get("ok"):
-        raise ChoicePromptBlockedError("no safe positive choice prompt is clickable")
+        raise ChoicePromptBlockedError("safe positive choice prompt is missing or ambiguous")
     return str(result.get("label") or "safe choice")
 
 
@@ -1742,6 +1891,267 @@ async def assign_page_role(
     return assigned
 
 
+_WAIT_PROBE_READ_SCRIPT = "() => window.__PLAYWRIGHT_AUTO_WAIT_PROBE__?.() || null"
+_WAIT_PROBE_WAIT_SCRIPT = "([signature, timeoutMs, fallback]) => window.__PLAYWRIGHT_AUTO_WAIT_PROBE_WAIT__?.(signature, timeoutMs, fallback) || null"
+_WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windowNamePrefix]) => {
+          window.__PLAYWRIGHT_AUTO_WAIT_PROBE__ = () => {
+          const visible = (element) => Boolean(
+            element && window.getComputedStyle(element).visibility !== 'hidden' &&
+            (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
+          );
+          const boundedText = (element, limit = 512) => {
+            const value = (element?.innerText || element?.textContent || '')
+              .replace(/\s+/g, ' ').trim();
+            return value.length <= limit ? value : value.slice(0, limit);
+          };
+          const firstVisible = (selector) => [...document.querySelectorAll(selector)].find(visible) || null;
+          const latest = (selector) => [...document.querySelectorAll(selector)].filter(visible).at(-1) || null;
+          const identity = (element) => ({
+            messageId: element?.getAttribute('data-message-id') || null,
+            turnId: element?.closest('[data-turn-id]')?.getAttribute('data-turn-id') || null,
+          });
+          const textShape = (element) => {
+            const value = (element?.innerText || element?.textContent || '').replace(/\s+/g, ' ').trim();
+            return {length: value.length, tail: value.slice(-160)};
+          };
+
+          const composer = firstVisible('[contenteditable="true"][role="textbox"]');
+          const composerRoot = composer?.closest('form') || composer?.closest('[data-testid="composer"]') || null;
+          const stop = firstVisible('button[data-testid="stop-button"], button[aria-label*="Stop"]');
+          const activeResponse = latest('[data-streaming-response-status]');
+          const lastUser = latest('[data-message-author-role="user"][data-message-id]');
+          const lastAssistant = latest('[data-message-author-role="assistant"][data-message-id]');
+          const userIdentity = identity(lastUser);
+          const assistantIdentity = identity(lastAssistant);
+          const assistantShape = textShape(lastAssistant);
+          const activityShape = textShape(activeResponse);
+          const errors = [...document.querySelectorAll('[role="alert"]')]
+            .filter(visible).slice(-4).map((element) => boundedText(element, 240)).filter(Boolean);
+          const dialogs = [...document.querySelectorAll('[role="dialog"], [data-testid^="modal-"]')]
+            .filter(visible).slice(-4).map((element) => boundedText(element, 240) || 'dialog');
+          const overlaySelector = '#playwright-auto-role-badge-v3,#playwright-auto-role-control-v1,#playwright-auto-role-badge,#playwright-auto-role-badge-v2';
+          const positiveChoice = /\b(?:continue|proceed|start|yes|ok|okay|accept|approve|allow|run)\b|\bgo ahead\b|\b(?:make|create|use) a plan\b/i;
+          const negativeChoice = /\b(?:cancel|stop|dismiss|close|delete|remove|archive|share|copy)\b|\b(?:not now|no thanks)\b/i;
+          const choiceLabel = (element) => {
+            const textLabel = boundedText(element, 120);
+            const ariaLabel = (element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+            const testId = (element.getAttribute('data-testid') || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+            if ([textLabel, ariaLabel, testId].some((label) => negativeChoice.test(label))) return '';
+            return [textLabel, ariaLabel].find((label) => positiveChoice.test(label)) || '';
+          };
+          const choices = composer ? [] : [...document.querySelectorAll('button,[role="button"]')]
+            .filter((element) =>
+              visible(element) && !element.disabled &&
+              element.getAttribute('aria-disabled') !== 'true' &&
+              !element.closest(overlaySelector) &&
+              Boolean(element.closest('main,[role="dialog"],[data-testid^="modal-"]'))
+            )
+            .map(choiceLabel)
+            .filter(Boolean)
+            .slice(0, 8);
+          const attachmentCount = composerRoot ? composerRoot.querySelectorAll(
+            '[data-filename], [data-file-name], [data-testid*="attachment"], [data-testid*="file"]'
+          ).length : 0;
+
+          let pageRole = null;
+          let pageId = null;
+          let pageTaskId = null;
+          let pageTeam = null;
+          try {
+            pageRole = sessionStorage.getItem(roleKey);
+            pageId = sessionStorage.getItem(pageIdKey);
+            pageTaskId = sessionStorage.getItem(taskIdKey);
+            pageTeam = sessionStorage.getItem(teamKey);
+          } catch (_) {}
+          if ((!pageRole || !pageId || !pageTaskId || !pageTeam) && window.name?.startsWith(windowNamePrefix)) {
+            try {
+              const binding = JSON.parse(window.name.slice(windowNamePrefix.length));
+              pageRole = pageRole || binding.role || null;
+              pageId = pageId || binding.pageId || null;
+              pageTaskId = pageTaskId || binding.taskId || null;
+              pageTeam = pageTeam || binding.team || null;
+            } catch (_) {}
+          }
+          return {
+            url: location.href,
+            page_role: pageRole,
+            page_id: pageId,
+            page_task_id: pageTaskId,
+            page_team: pageTeam,
+            requires_login: location.hostname === 'auth.openai.com' || Boolean(firstVisible('[data-testid="login-button"]')),
+            composer_present: Boolean(composer),
+            composer_text: boundedText(composer, 512),
+            attachment_count: attachmentCount,
+            stop_visible: Boolean(stop),
+            transport_active: Boolean(activeResponse),
+            error_texts: errors,
+            blocking_dialogs: dialogs,
+            choice_prompt_labels: [...new Set(choices)],
+            last_user_message_id: userIdentity.messageId,
+            last_user_turn_id: userIdentity.turnId,
+            last_assistant_message_id: assistantIdentity.messageId,
+            last_assistant_turn_id: assistantIdentity.turnId,
+            assistant_text_length: assistantShape.length,
+            assistant_text_tail: assistantShape.tail,
+            response_activity_length: activityShape.length,
+            response_activity_tail: activityShape.tail,
+            response_activity_turn_id: activeResponse?.closest('[data-turn-id]')?.getAttribute('data-turn-id') || null,
+          };
+          };
+          const transitionSignature = (probe) => JSON.stringify([
+            probe.url,
+            probe.page_id,
+            probe.page_role,
+            probe.page_task_id,
+            probe.page_team,
+            probe.requires_login,
+            probe.composer_present,
+            probe.composer_text,
+            probe.attachment_count,
+            probe.stop_visible,
+            probe.transport_active,
+            probe.error_texts,
+            probe.blocking_dialogs,
+            probe.choice_prompt_labels,
+            probe.last_user_message_id,
+            probe.last_user_turn_id,
+            probe.last_assistant_message_id,
+            probe.last_assistant_turn_id,
+            probe.response_activity_turn_id,
+          ]);
+          window.__PLAYWRIGHT_AUTO_WAIT_PROBE_WAIT__ = (previous, timeoutMs, fallback) => new Promise((resolve) => {
+            let settled = false;
+            let debounce = null;
+            let observer = null;
+            let timer = null;
+            const root = document.documentElement || document;
+            const relevantSelector = [
+              'button[data-testid="stop-button"]',
+              'button[aria-label*="Stop"]',
+              '[data-streaming-response-status]',
+              '[data-message-author-role][data-message-id]',
+              '[contenteditable="true"][role="textbox"]',
+              '[role="alert"]',
+              '[role="dialog"]',
+              '[data-testid^="modal-"]',
+              '[data-filename]',
+              '[data-file-name]',
+            ].join(',');
+            const nodeIsRelevant = (node) => {
+              if (!(node instanceof Element)) return false;
+              return node.matches(relevantSelector) || Boolean(node.querySelector(relevantSelector));
+            };
+            const mutationIsRelevant = (mutation) => {
+              if (mutation.type === 'attributes') {
+                return [
+                  'data-streaming-response-status', 'data-message-id', 'data-turn-id',
+                  'contenteditable', 'aria-disabled', 'data-testid', 'role',
+                  'data-filename', 'data-file-name',
+                ].includes(mutation.attributeName || '');
+              }
+              return [...mutation.addedNodes, ...mutation.removedNodes].some(nodeIsRelevant);
+            };
+            const finish = (probe) => {
+              if (settled) return;
+              settled = true;
+              if (debounce) clearTimeout(debounce);
+              if (timer) clearTimeout(timer);
+              if (observer) observer.disconnect();
+              root.removeEventListener('input', onInput, true);
+              resolve(probe);
+            };
+            const check = () => {
+              const probe = window.__PLAYWRIGHT_AUTO_WAIT_PROBE__();
+              if (transitionSignature(probe) !== previous) finish(probe);
+            };
+            const onInput = () => check();
+            observer = new MutationObserver((mutations) => {
+              if (!mutations.some(mutationIsRelevant)) return;
+              if (debounce) clearTimeout(debounce);
+              debounce = setTimeout(check, 50);
+            });
+            observer.observe(root, {
+              subtree: true,
+              childList: true,
+              attributes: true,
+              attributeFilter: [
+                'data-streaming-response-status', 'data-message-id', 'data-turn-id',
+                'contenteditable', 'aria-disabled', 'data-testid', 'role',
+                'data-filename', 'data-file-name',
+              ],
+            });
+            root.addEventListener('input', onInput, true);
+            timer = setTimeout(() => {
+              const probe = window.__PLAYWRIGHT_AUTO_WAIT_PROBE__();
+              finish(transitionSignature(probe) === previous ? fallback : probe);
+            }, Math.max(0, Number(timeoutMs) || 0));
+            check();
+          });
+          return true;
+        }"""
+
+
+async def inspect_chatgpt_wait_probe(
+    page: Any,
+    *,
+    previous_transition_signature: str | None = None,
+    previous_probe: WaitProbe | None = None,
+    wait_ms: int = 0,
+) -> WaitProbe:
+    """Read bounded wait-state evidence without walking or serializing the transcript."""
+    use_wait = bool(
+        previous_transition_signature and previous_probe is not None and wait_ms > 0
+    )
+    script = _WAIT_PROBE_WAIT_SCRIPT if use_wait else _WAIT_PROBE_READ_SCRIPT
+    argument = (
+        [previous_transition_signature, wait_ms, previous_probe.to_raw()]
+        if use_wait and previous_probe is not None
+        else None
+    )
+    raw = await page.evaluate(script, argument) if argument is not None else await page.evaluate(script)
+    if not isinstance(raw, dict):
+        await page.evaluate(
+            _WAIT_PROBE_INSTALL_SCRIPT,
+            [
+                ROLE_STORAGE_KEY,
+                PAGE_ID_STORAGE_KEY,
+                TASK_ID_STORAGE_KEY,
+                TEAM_STORAGE_KEY,
+                WINDOW_NAME_PREFIX,
+            ],
+        )
+        raw = await page.evaluate(script, argument) if argument is not None else await page.evaluate(script)
+    if not isinstance(raw, dict):
+        raise RuntimeError("ChatGPT wait probe did not install")
+    url = str(raw.get("url") or page.url)
+    return WaitProbe(
+        url=url,
+        session_id=extract_session_id(url),
+        page_id=raw.get("page_id"),
+        page_role=raw.get("page_role"),
+        page_task_id=raw.get("page_task_id"),
+        page_team=raw.get("page_team"),
+        requires_login=bool(raw.get("requires_login")),
+        composer_present=bool(raw.get("composer_present")),
+        composer_text=str(raw.get("composer_text") or ""),
+        attachment_count=max(0, int(raw.get("attachment_count") or 0)),
+        stop_visible=bool(raw.get("stop_visible")),
+        transport_active=bool(raw.get("transport_active")),
+        error_texts=tuple(str(value) for value in raw.get("error_texts") or ()),
+        blocking_dialogs=tuple(str(value) for value in raw.get("blocking_dialogs") or ()),
+        choice_prompt_labels=tuple(str(value) for value in raw.get("choice_prompt_labels") or ()),
+        last_user_message_id=(str(raw["last_user_message_id"]) if raw.get("last_user_message_id") else None),
+        last_user_turn_id=(str(raw["last_user_turn_id"]) if raw.get("last_user_turn_id") else None),
+        last_assistant_message_id=(str(raw["last_assistant_message_id"]) if raw.get("last_assistant_message_id") else None),
+        last_assistant_turn_id=(str(raw["last_assistant_turn_id"]) if raw.get("last_assistant_turn_id") else None),
+        assistant_text_length=max(0, int(raw.get("assistant_text_length") or 0)),
+        assistant_text_tail=str(raw.get("assistant_text_tail") or ""),
+        response_activity_length=max(0, int(raw.get("response_activity_length") or 0)),
+        response_activity_tail=str(raw.get("response_activity_tail") or ""),
+        response_activity_turn_id=(str(raw["response_activity_turn_id"]) if raw.get("response_activity_turn_id") else None),
+    )
+
+
 async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
     raw = await page.evaluate(
         r"""
@@ -1877,23 +2287,25 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
           });
           const attachmentMarkers = attachmentRecords.map((item) => item.filename);
 
-          const positiveChoiceMarkers = [
-            'continue', 'proceed', 'start', 'yes', 'ok', 'okay', 'accept',
-            'approve', 'allow', 'run', 'go ahead', 'make a plan',
-            'create plan', 'use plan'
-          ];
-          const negativeChoiceMarkers = [
-            'cancel', 'stop', 'not now', 'no thanks', 'dismiss', 'close',
-            'delete', 'remove', 'archive', 'share', 'copy'
-          ];
+          const choiceOverlaySelector = '#playwright-auto-role-badge-v3,#playwright-auto-role-control-v1,#playwright-auto-role-badge,#playwright-auto-role-badge-v2';
+          const positiveChoice = /\b(?:continue|proceed|start|yes|ok|okay|accept|approve|allow|run)\b|\bgo ahead\b|\b(?:make|create|use) a plan\b/i;
+          const negativeChoice = /\b(?:cancel|stop|dismiss|close|delete|remove|archive|share|copy)\b|\b(?:not now|no thanks)\b/i;
+          const choiceLabel = (button) => {
+            const textLabel = text(button).slice(0, 120);
+            const ariaLabel = (button.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+            const testId = (button.getAttribute('data-testid') || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+            if ([textLabel, ariaLabel, testId].some((label) => negativeChoice.test(label))) return '';
+            return [textLabel, ariaLabel].find((label) => positiveChoice.test(label)) || '';
+          };
           const choicePromptLabels = composer ? [] : [...document.querySelectorAll('button,[role="button"]')]
-            .filter((button) => visible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true')
-            .map((button) => attachmentLabel(button))
-            .filter((label) => {
-              const lower = label.toLowerCase();
-              return label && positiveChoiceMarkers.some((marker) => lower.includes(marker)) &&
-                !negativeChoiceMarkers.some((marker) => lower.includes(marker));
-            })
+            .filter((button) =>
+              visible(button) && !button.disabled &&
+              button.getAttribute('aria-disabled') !== 'true' &&
+              !button.closest(choiceOverlaySelector) &&
+              Boolean(button.closest('main,[role="dialog"],[data-testid^="modal-"]'))
+            )
+            .map(choiceLabel)
+            .filter(Boolean)
             .slice(0, 12);
 
           const chatRoot = document.querySelector('main') || document.body;
@@ -1981,6 +2393,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             attachment_markers: attachmentMarkers,
             choice_prompt_labels: [...new Set(choicePromptLabels)],
             error_present: Boolean(retry || authCallbackError || alertError),
+            retry_visible: Boolean(retry),
             error_texts: errorTexts,
             response_activity_text: responseActivityText,
             response_activity_structure: responseActivityStructure,
@@ -2026,6 +2439,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             if raw.get("response_activity_turn_id") is not None
             else None
         ),
+        response_activity_length=len(str(raw.get("response_activity_text") or "")),
         state=classify_chatgpt_state(raw_for_state),
         requires_login=bool(raw.get("requires_login")),
         composer_present=bool(raw.get("composer_present")),
@@ -2045,6 +2459,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
         choice_prompt_labels=tuple(
             str(value) for value in raw.get("choice_prompt_labels") or []
         ),
+        retry_visible=bool(raw.get("retry_visible")),
     )
 
 
@@ -2062,6 +2477,46 @@ class ChatGPTPage:
         self.timeout_ms = timeout_ms
         self.binding: PageBinding | None = None
         self._owned_composer_text: str | None = None
+        self._wait_state = _page_wait_state(page)
+        self._wait_metrics: dict[str, Any] = {
+            "sparse_probes": 0,
+            "full_snapshots": 0,
+            "unchanged_ticks": 0,
+            "sparse_errors": 0,
+            "full_snapshot_reasons": {},
+        }
+
+    @property
+    def _wait_probe(self) -> WaitProbe | None:
+        return self._wait_state["probe"]
+
+    @_wait_probe.setter
+    def _wait_probe(self, value: WaitProbe | None) -> None:
+        self._wait_state["probe"] = value
+
+    @property
+    def _wait_snapshot_cache(self) -> ChatGPTSnapshot | None:
+        return self._wait_state["snapshot"]
+
+    @_wait_snapshot_cache.setter
+    def _wait_snapshot_cache(self, value: ChatGPTSnapshot | None) -> None:
+        self._wait_state["snapshot"] = value
+
+    @property
+    def _wait_receipt_key(self) -> tuple[object, ...] | None:
+        return self._wait_state["receipt_key"]
+
+    @_wait_receipt_key.setter
+    def _wait_receipt_key(self, value: tuple[object, ...] | None) -> None:
+        self._wait_state["receipt_key"] = value
+
+    @property
+    def _wait_full_snapshot_at(self) -> float:
+        return float(self._wait_state["full_snapshot_at"])
+
+    @_wait_full_snapshot_at.setter
+    def _wait_full_snapshot_at(self, value: float) -> None:
+        self._wait_state["full_snapshot_at"] = float(value)
 
     @asynccontextmanager
     async def workflow_guard(self):
@@ -2075,6 +2530,207 @@ class ChatGPTPage:
 
     async def snapshot(self) -> ChatGPTSnapshot:
         return await inspect_chatgpt_page(self.page)
+
+    @property
+    def wait_metrics(self) -> dict[str, Any]:
+        return {
+            **self._wait_metrics,
+            "full_snapshot_reasons": dict(self._wait_metrics["full_snapshot_reasons"]),
+        }
+
+    def invalidate_wait_cache(self) -> None:
+        self._wait_probe = None
+        self._wait_snapshot_cache = None
+        self._wait_receipt_key = None
+        self._wait_full_snapshot_at = 0.0
+
+    def _assert_wait_probe_ownership(self, probe: WaitProbe) -> None:
+        current_hostname = urlparse(probe.url).hostname
+        current_path = urlparse(probe.url).path
+        if probe.requires_login or current_hostname == "auth.openai.com" or (
+            current_hostname in {"chatgpt.com", "www.chatgpt.com"}
+            and current_path == "/auth/error"
+        ):
+            raise AuthenticationRequiredError(
+                f"tab requires authentication at {probe.url!r}; "
+                f"visible binding role={probe.page_role!r} page_id={probe.page_id!r}"
+            )
+        if self.binding is None:
+            raise PageOwnershipError("ChatGPT tab is not bound; run SetRoleBlock before mutation")
+        if probe.page_id != self.binding.page_id:
+            raise PageOwnershipError(
+                f"physical tab changed: expected page_id={self.binding.page_id!r}, got {probe.page_id!r}"
+            )
+        if probe.page_role != self.binding.role:
+            raise PageOwnershipError(
+                f"logical role changed: expected role={self.binding.role!r}, got {probe.page_role!r}"
+            )
+
+    @staticmethod
+    def _wait_key(receipt: SendReceipt) -> tuple[object, ...]:
+        return (
+            receipt.prompt_sha256,
+            receipt.binding.page_id,
+            receipt.binding.role,
+            receipt.user_message_id,
+            receipt.user_turn_id,
+            tuple(sorted(receipt.baseline.message_ids)),
+        )
+
+    def _wait_full_reason(
+        self,
+        probe: WaitProbe,
+        *,
+        force_full: bool,
+        safety_interval_ms: int,
+    ) -> str | None:
+        previous = self._wait_probe
+        cached = self._wait_snapshot_cache
+        if force_full:
+            return "forced"
+        if previous is None or cached is None:
+            return "initial"
+        if probe.identity_signature != previous.identity_signature:
+            return "message_identity_changed"
+        if previous.transport_active and not probe.transport_active:
+            return "transport_completed"
+        if previous.stop_visible and not probe.stop_visible:
+            return "stop_completed"
+        if (
+            probe.error_texts != previous.error_texts
+            or probe.blocking_dialogs != previous.blocking_dialogs
+        ):
+            return "error_or_dialog"
+        if (
+            probe.manual_input_pending != previous.manual_input_pending
+            or probe.choice_prompt_pending != previous.choice_prompt_pending
+            or probe.composer_text != previous.composer_text
+            or probe.attachment_count != previous.attachment_count
+        ):
+            return "manual_or_choice"
+        assistant_changed = (
+            probe.assistant_text_length != previous.assistant_text_length
+            or probe.assistant_text_tail != previous.assistant_text_tail
+        )
+        if assistant_changed and not probe.stop_visible and not probe.transport_active:
+            return "assistant_changed_without_transport"
+        if (time.monotonic() - self._wait_full_snapshot_at) * 1000 >= safety_interval_ms:
+            return "safety_interval"
+        return None
+
+    @staticmethod
+    def _snapshot_from_probe(cached: ChatGPTSnapshot, probe: WaitProbe) -> ChatGPTSnapshot:
+        if probe.requires_login:
+            state = ChatGPTState.AUTH_REQUIRED
+        elif probe.error_texts:
+            state = ChatGPTState.ERROR
+        elif probe.stop_visible or probe.transport_active:
+            state = ChatGPTState.RESPONDING
+        else:
+            state = cached.state
+        markers = tuple(f"attachment-{index + 1}" for index in range(probe.attachment_count))
+        return replace(
+            cached,
+            url=probe.url,
+            session_id=probe.session_id,
+            page_id=probe.page_id,
+            page_role=probe.page_role,
+            page_task_id=probe.page_task_id,
+            page_team=probe.page_team,
+            state=state,
+            requires_login=probe.requires_login,
+            composer_present=probe.composer_present,
+            composer_text=probe.composer_text,
+            stop_visible=probe.stop_visible,
+            blocking_dialogs=probe.blocking_dialogs,
+            attachment_markers=markers,
+            error_texts=probe.error_texts,
+            choice_prompt_labels=probe.choice_prompt_labels,
+            response_activity_text=probe.response_activity_tail,
+            response_activity_structure=f"bounded:{probe.response_activity_length}",
+            response_activity_turn_id=probe.response_activity_turn_id,
+            response_activity_length=probe.response_activity_length,
+        )
+
+    async def wait_snapshot(
+        self,
+        receipt: SendReceipt,
+        *,
+        force_full: bool = False,
+        probe_wait_ms: int = 0,
+        safety_interval_ms: int = 600_000,
+    ) -> ChatGPTSnapshot:
+        key = self._wait_key(receipt)
+        if key != self._wait_receipt_key:
+            self.invalidate_wait_cache()
+            self._wait_receipt_key = key
+            force_full = True
+        try:
+            probe = await inspect_chatgpt_wait_probe(
+                self.page,
+                previous_transition_signature=(
+                    self._wait_probe.transition_signature
+                    if self._wait_probe is not None
+                    else None
+                ),
+                previous_probe=self._wait_probe,
+                wait_ms=max(0, int(probe_wait_ms)),
+            )
+            self._wait_metrics["sparse_probes"] += 1
+            self._assert_wait_probe_ownership(probe)
+        except (AuthenticationRequiredError, PageOwnershipError):
+            raise
+        except Exception:
+            self._wait_metrics["sparse_errors"] += 1
+            probe = None
+
+        reason = "sparse_error" if probe is None else self._wait_full_reason(
+            probe,
+            force_full=force_full,
+            safety_interval_ms=safety_interval_ms,
+        )
+        if reason is not None:
+            full = await self.assert_ownership()
+            self._wait_snapshot_cache = full
+            self._wait_full_snapshot_at = time.monotonic()
+            self._wait_metrics["full_snapshots"] += 1
+            reasons = self._wait_metrics["full_snapshot_reasons"]
+            reasons[reason] = int(reasons.get(reason, 0)) + 1
+            if probe is None:
+                self._wait_probe = WaitProbe(
+                    url=full.url,
+                    session_id=full.session_id,
+                    page_id=full.page_id,
+                    page_role=full.page_role,
+                    page_task_id=full.page_task_id,
+                    page_team=full.page_team,
+                    requires_login=full.requires_login,
+                    composer_present=full.composer_present,
+                    composer_text=full.composer_text,
+                    attachment_count=len(full.attachment_markers),
+                    stop_visible=full.stop_visible,
+                    transport_active=bool(full.response_activity_turn_id),
+                    error_texts=full.error_texts,
+                    blocking_dialogs=full.blocking_dialogs,
+                    choice_prompt_labels=full.choice_prompt_labels,
+                    last_user_message_id=next((item.message_id for item in reversed(full.messages) if item.role == "user"), None),
+                    last_user_turn_id=next((item.turn_id for item in reversed(full.messages) if item.role == "user"), None),
+                    last_assistant_message_id=next((item.message_id for item in reversed(full.messages) if item.role == "assistant"), None),
+                    last_assistant_turn_id=next((item.turn_id for item in reversed(full.messages) if item.role == "assistant"), None),
+                    assistant_text_length=len(next((item.text for item in reversed(full.messages) if item.role == "assistant"), "")),
+                    assistant_text_tail=next((item.text[-160:] for item in reversed(full.messages) if item.role == "assistant"), ""),
+                    response_activity_length=full.response_activity_length,
+                    response_activity_tail=full.response_activity_text[-160:],
+                    response_activity_turn_id=full.response_activity_turn_id,
+                )
+            else:
+                self._wait_probe = probe
+            return full
+
+        assert probe is not None and self._wait_snapshot_cache is not None
+        self._wait_probe = probe
+        self._wait_metrics["unchanged_ticks"] += 1
+        return self._snapshot_from_probe(self._wait_snapshot_cache, probe)
 
     async def assert_ownership(
         self,
@@ -2150,6 +2806,24 @@ class ChatGPTPage:
         ):
             return PageHealth(True, "healthy", "none")
         return PageHealth(False, "empty_snapshot", "reload")
+
+    async def known_rate_limit_visible(self) -> bool:
+        """Lightweight read-only check for the known account-throttle dialog."""
+        return bool(
+            await self.page.evaluate(
+                r"""markers => {
+                  const visible = (element) => Boolean(
+                    element && (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
+                  );
+                  const text = (element) => (element?.innerText || element?.textContent || '')
+                    .replace(/\s+/g, ' ').trim().toLowerCase();
+                  return [...document.querySelectorAll('[role=\"dialog\"], [data-testid^=\"modal-\"]')]
+                    .filter(visible)
+                    .some((dialog) => markers.some((marker) => text(dialog).includes(marker)));
+                }""",
+                list(_RATE_LIMIT_MARKERS),
+            )
+        )
 
     async def dismiss_known_rate_limit(
         self, *, timeout_ms: int | None = None
@@ -3135,6 +3809,154 @@ class ChatGPTPage:
                 f"{type(last_error).__name__}: {last_error}"
             ) from last_error
 
+    async def retry_generation(
+        self,
+        receipt: SendReceipt,
+        *,
+        expected_task_id: str,
+        expected_team: str,
+        timeout_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Retry one already accepted user turn and prove new transport progress."""
+        if self.binding != receipt.binding:
+            raise PageOwnershipError("receipt belongs to another physical/logical tab")
+        task_id = str(expected_task_id or "").strip()
+        team = str(expected_team or "").strip()
+        if not task_id or not team:
+            raise ValueError("expected task ID and team are required")
+        timeout = timeout_ms or self.timeout_ms
+        async with self.mutation_guard():
+            before = await self.assert_ownership()
+            if before.page_task_id != task_id or before.page_team != team:
+                raise TaskBindingError("exact task/team ownership does not match before Retry")
+            if before.composer_text.strip() or before.attachment_markers:
+                raise ComposerConflictError(
+                    "Retry generation blocked by manual draft or attachments"
+                )
+            if before.blocking_dialogs:
+                raise UnsafePageStateError("Retry generation blocked by a dialog")
+            if not receipt_user_message_seen(before.messages, receipt):
+                raise SendRecoveryError(
+                    "Retry generation requires the exact accepted user turn"
+                )
+            before_assistants = new_assistant_turns(before.messages, receipt.baseline)
+            before_assistant_fingerprint = message_fingerprint(
+                before_assistants[-1] if before_assistants else None
+            )
+            before_activity = (
+                str(before.response_activity_turn_id or ""),
+                str(before.response_activity_text or ""),
+                str(before.response_activity_structure or ""),
+                int(before.response_activity_length or 0),
+            )
+            click_result = await self.page.evaluate(
+                r"""([roleKey, pageIdKey, taskIdKey, teamKey, expectedRole,
+                       expectedPageId, expectedTaskId, expectedTeam]) => {
+                  const visible = (element) => Boolean(
+                    element && (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
+                  );
+                  const composer = [...document.querySelectorAll(
+                    '[contenteditable="true"][role="textbox"]'
+                  )].find(visible) || null;
+                  const composerText = (composer?.innerText || '').replace(/\s+/g, ' ').trim();
+                  const composerHost = composer?.closest('form') || composer?.parentElement || null;
+                  const attachments = composerHost ? [...composerHost.querySelectorAll(
+                    '[data-filename], [data-file-name], [data-testid*=attachment], [data-testid*=file]'
+                  )].filter(visible) : [];
+                  if (sessionStorage.getItem(roleKey) !== expectedRole ||
+                      sessionStorage.getItem(pageIdKey) !== expectedPageId ||
+                      sessionStorage.getItem(taskIdKey) !== expectedTaskId ||
+                      sessionStorage.getItem(teamKey) !== expectedTeam) {
+                    return {clicked: false, reason: 'ownership_changed'};
+                  }
+                  if (composerText || attachments.length) {
+                    return {clicked: false, reason: 'composer_conflict'};
+                  }
+                  if ([...document.querySelectorAll('[role="dialog"], [data-testid^="modal-"]')].some(visible)) {
+                    return {clicked: false, reason: 'blocking_dialog'};
+                  }
+                  const retry = [...document.querySelectorAll(
+                    '[data-testid="regenerate-thread-error-button"]'
+                  )].find(visible) || null;
+                  if (!retry || retry.disabled || retry.getAttribute('aria-disabled') === 'true') {
+                    return {clicked: false, reason: 'retry_unavailable'};
+                  }
+                  retry.click();
+                  return {clicked: true, reason: null};
+                }""",
+                [
+                    ROLE_STORAGE_KEY,
+                    PAGE_ID_STORAGE_KEY,
+                    TASK_ID_STORAGE_KEY,
+                    TEAM_STORAGE_KEY,
+                    receipt.binding.role,
+                    receipt.binding.page_id,
+                    task_id,
+                    team,
+                ],
+            )
+            if not isinstance(click_result, Mapping) or not click_result.get("clicked"):
+                reason = (
+                    str(click_result.get("reason") or "retry_unavailable")
+                    if isinstance(click_result, Mapping)
+                    else "retry_unavailable"
+                )
+                if reason == "composer_conflict":
+                    raise ComposerConflictError(
+                        "Retry generation blocked by manual draft or attachments"
+                    )
+                if reason == "ownership_changed":
+                    raise PageOwnershipError("exact ownership changed before Retry click")
+                raise UnsafePageStateError(f"Retry generation was not available: {reason}")
+
+            deadline = time.monotonic() + timeout / 1000
+            while time.monotonic() < deadline:
+                current = await self.assert_ownership()
+                if current.page_task_id != task_id or current.page_team != team:
+                    raise TaskBindingError(
+                        "exact task/team ownership changed after Retry click"
+                    )
+                if current.composer_text.strip() or current.attachment_markers:
+                    raise ComposerConflictError(
+                        "manual draft or attachments appeared after Retry click"
+                    )
+                if not receipt_user_message_seen(current.messages, receipt):
+                    raise SendRecoveryError(
+                        "accepted user-turn identity disappeared after Retry click"
+                    )
+                assistants = new_assistant_turns(current.messages, receipt.baseline)
+                assistant_fingerprint = message_fingerprint(
+                    assistants[-1] if assistants else None
+                )
+                activity = (
+                    str(current.response_activity_turn_id or ""),
+                    str(current.response_activity_text or ""),
+                    str(current.response_activity_structure or ""),
+                    int(current.response_activity_length or 0),
+                )
+                assistant_progress = bool(assistant_fingerprint) and (
+                    assistant_fingerprint != before_assistant_fingerprint
+                )
+                activity_progress = any(activity) and activity != before_activity
+                transport_active = bool(
+                    current.stop_visible or current.response_activity_turn_id
+                )
+                if transport_active or assistant_progress or activity_progress:
+                    self.invalidate_wait_cache()
+                    return {
+                        "progress": True,
+                        "transport_active": transport_active,
+                    }
+                await asyncio.sleep(0.05)
+        raise TimeoutError("Retry generation produced no verified progress")
+
+    @staticmethod
+    def _adaptive_wait_seconds(poll_ms: int, unchanged_ticks: int) -> float:
+        base = poll_ms / 1000
+        if unchanged_ticks < 4:
+            return base
+        return min(0.5, base * min(5.0, 1.0 + (unchanged_ticks - 3) * 0.5))
+
     async def wait_for_response(
         self,
         receipt: SendReceipt,
@@ -3186,15 +4008,17 @@ class ChatGPTPage:
         choice_prompt_pending = False
         last_snapshot: ChatGPTSnapshot | None = None
         last_error: BaseException | None = None
+        unchanged_ticks = 0
 
         while time.monotonic() < deadline:
             try:
-                snapshot = await self.assert_ownership()
+                snapshot = await self.wait_snapshot(receipt)
             except PageOwnershipError:
                 raise
             except Exception as exc:
                 last_error = exc
-                await asyncio.sleep(poll_ms / 1000)
+                unchanged_ticks += 1
+                await asyncio.sleep(self._adaptive_wait_seconds(poll_ms, unchanged_ticks))
                 continue
 
             now = time.monotonic()
@@ -3215,8 +4039,10 @@ class ChatGPTPage:
                 activity_fingerprint = current_activity
                 activity_since = now
                 activity_samples = 1
+                unchanged_ticks = 0
             else:
                 activity_samples += 1
+                unchanged_ticks += 1
 
             if choice_prompt_pending:
                 if resolve_choice_prompt:
@@ -3226,25 +4052,31 @@ class ChatGPTPage:
                     candidate_since = None
                     candidate_samples = 0
                     continue
-                await asyncio.sleep(poll_ms / 1000)
+                await asyncio.sleep(self._adaptive_wait_seconds(poll_ms, unchanged_ticks))
                 continue
 
             if manual_input_pending:
-                await asyncio.sleep(poll_ms / 1000)
+                await asyncio.sleep(self._adaptive_wait_seconds(poll_ms, unchanged_ticks))
                 continue
 
             user_provenance = receipt_user_message_seen(snapshot.messages, receipt)
             assistants = assistant_turns_for_receipt(snapshot.messages, receipt)
             expected_turn = str(expected_assistant_turn_id or "").strip()
             expected_message = str(expected_assistant_message_id or "").strip()
+            if expected_turn or expected_message:
+                exact_assistants = all_assistant_turns_for_receipt(
+                    snapshot.messages, receipt
+                )
+            else:
+                exact_assistants = assistants
             if expected_turn:
                 candidate = next(
-                    (item for item in assistants if item.turn_id == expected_turn),
+                    (item for item in exact_assistants if item.turn_id == expected_turn),
                     None,
                 )
             elif expected_message:
                 candidate = next(
-                    (item for item in assistants if item.message_id == expected_message),
+                    (item for item in exact_assistants if item.message_id == expected_message),
                     None,
                 )
             else:
@@ -3350,7 +4182,7 @@ class ChatGPTPage:
                         ),
                     )
                     await refresh_page(self.page, timeout_ms=timeout)
-                    await self.assert_ownership()
+                    await self.wait_snapshot(receipt, force_full=True)
                     reload_used = True
                     recovery_suspected = skeptical_after_reload
                     candidate_fingerprint = ""
@@ -3366,7 +4198,7 @@ class ChatGPTPage:
             else:
                 active_since = None
 
-            await asyncio.sleep(poll_ms / 1000)
+            await asyncio.sleep(self._adaptive_wait_seconds(poll_ms, unchanged_ticks))
 
         if manual_input_pending:
             raise ManualInputPendingError(

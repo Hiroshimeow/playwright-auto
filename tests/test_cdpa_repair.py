@@ -8,9 +8,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from playwright_auto.cdpa_commands import RepairRequest, WorkerCommand
+from playwright_auto.cdpa_config import load_cdpa_config
 from playwright_auto.cdpa_store import TaskStore
 from playwright_auto.cdpa_worker import _active_hop
 
+from test_cdpa_core import write_config
 from test_cdpa_worker import setup_task
 
 
@@ -91,6 +93,137 @@ def test_hold_for_repair_atomically_gates_same_existing_task(tmp_path: Path):
     ) == 1
 
 
+@pytest.mark.parametrize("disposition", ["CONTINUE_IN_PARALLEL", "HOLD_FOR_REPAIR"])
+def test_cross_repository_repair_is_created_in_control_repository_with_provenance(
+    tmp_path: Path,
+    disposition: str,
+):
+    control_root = tmp_path / "control"
+    product_root = tmp_path / "product"
+    control_root.mkdir()
+    product_root.mkdir()
+    config = load_cdpa_config(write_config(control_root), repository_root=control_root)
+    store = TaskStore(config)
+    state = store.create_task(
+        "Cross-repository affected task",
+        requested_team="product-task",
+        task_id=f"task-cross-repair-{disposition.lower()}",
+        repository=product_root,
+    )
+    state = block_task(store, state, hop_state="waiting")
+    request = RepairRequest.create(
+        root_cause="cross-repository-route-report-recovery",
+        affected_state=state,
+        repair_repository=control_root,
+        incident_id=f"incident-{disposition.lower()}",
+        disposition=disposition,
+        reason="repair the CDPA runtime without moving the product task",
+        reproduction="A valid file-mode route names a report that the role cannot materialize.",
+        source_areas=("cdpa_worker", "cdpa_store", "tests"),
+        required_tests=("cross-repository repair provenance",),
+        lesson=None,
+    )
+
+    result = store.create_or_gate_repair(request)
+    repair = result["repair"]
+    affected = result["affected"]
+    operation = repair["repair"]["affected_operations"][-1]
+    link = affected["repair_links"][-1]
+
+    assert request.repository == str(product_root.resolve())
+    assert request.repair_repository == str(control_root.resolve())
+    assert repair["repository"] == str(control_root.resolve())
+    assert repair["repair"]["repository"] == str(product_root.resolve())
+    assert repair["repair"]["repair_repository"] == str(control_root.resolve())
+    assert operation["affected_repository"] == str(product_root.resolve())
+    assert operation["repair_repository"] == str(control_root.resolve())
+    assert link["affected_repository"] == str(product_root.resolve())
+    assert link["repair_repository"] == str(control_root.resolve())
+    if disposition == "HOLD_FOR_REPAIR":
+        assert affected["status"] == "WAITING"
+        assert affected["depends_on_task_ids"] == [repair["task_id"]]
+    else:
+        assert affected["status"] == "BLOCKED"
+        assert affected["depends_on_task_ids"] == []
+
+    repeated = store.create_or_gate_repair(request)
+    assert repeated["repair"]["task_id"] == repair["task_id"]
+
+
+def test_cross_repository_repair_cannot_select_repository_outside_allowlist(
+    tmp_path: Path,
+):
+    control_root = tmp_path / "control"
+    product_root = tmp_path / "product"
+    control_root.mkdir()
+    product_root.mkdir()
+    config = load_cdpa_config(write_config(control_root), repository_root=control_root)
+    store = TaskStore(config)
+    state = store.create_task(
+        "Cross-repository allowlist target",
+        requested_team="allowlist-target",
+        task_id="task-cross-repair-allowlist",
+        repository=product_root,
+    )
+    state = block_task(store, state, hop_state="waiting")
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-repair"
+    request = RepairRequest.create(
+        root_cause="cross-repository-repair-allowlist",
+        affected_state=state,
+        repair_repository=str(outside),
+        incident_id="incident-cross-repair-allowlist",
+        disposition="CONTINUE_IN_PARALLEL",
+        reason="prove repair repository selection remains bounded",
+        reproduction="Attempt to place the repair task outside repositories.allowed_roots.",
+        source_areas=("cdpa_store", "tests"),
+        required_tests=("reject out-of-allowlist repair repository",),
+        lesson=None,
+    )
+
+    with pytest.raises(ValueError, match="outside repositories.allowed_roots"):
+        store.create_or_gate_repair(request)
+
+    assert not outside.exists()
+    assert not any(
+        isinstance(item.get("repair"), dict) for item in store.discover()
+    )
+
+
+@pytest.mark.parametrize(
+    "action",
+    ["pause", "stop", "clear_team", "restart_role", "new_chat"],
+)
+def test_repair_creation_rejects_pending_operator_lifecycle_control(
+    tmp_path: Path,
+    action: str,
+):
+    _config, store, state, _worker = setup_task(
+        tmp_path,
+        task_id=f"task-pending-operator-{action}",
+    )
+    state = block_task(store, state, hop_state="waiting")
+    request = repair_request(state, "HOLD_FOR_REPAIR")
+    role = "PLAN" if action in {"restart_role", "new_chat"} else None
+    state = store.request_control(
+        state["manifest_path"],
+        action,
+        role=role,
+        confirmed=action == "clear_team",
+    )
+
+    with pytest.raises(ValueError, match="pending operator lifecycle control"):
+        store.create_or_gate_repair(request)
+
+    unchanged = store.load(state["manifest_path"])
+    assert unchanged["status"] == "BLOCKED"
+    assert unchanged.get("repair_links") is None
+    assert unchanged["depends_on_task_ids"] == []
+    assert unchanged["controls"][-1]["status"] == "requested"
+    assert not any(
+        isinstance(item.get("repair"), dict) for item in store.discover()
+    )
+
+
 def test_continue_in_parallel_creates_repair_without_dependency_gate(tmp_path: Path):
     _config, store, state, _worker = setup_task(tmp_path, task_id="task-parallel")
     state = block_task(store, state)
@@ -157,9 +290,9 @@ def test_open_tab_wrong_conversation_is_ineffective_and_keeps_block(tmp_path: Pa
             "open_tab",
             role="PLAN",
             reason="reopen exact role",
-            origin="maintainers",
-            maintenance_incident_id="maint-1",
-            maintenance_request_id="maint-1-turn1",
+            origin="independent_agent",
+            source_task_id="agent-maintainers-g1",
+            source_event_key="recovery:task-wrong-tab:role-offline",
         )
         return current
 
@@ -207,99 +340,6 @@ def test_urgent_repair_waiter_precedes_ordinary_ready_waiter():
 
     ordered = exact_team_ready_waiters([ordinary, repair], "shared-team")
     assert [item["task_id"] for item in ordered] == ["repair", "ordinary"]
-
-
-def test_worker_executes_validated_hold_repair_and_coordinator_resolves_incident(tmp_path: Path):
-    from datetime import datetime, timezone
-
-    from playwright_auto.cdpa_maintenance import (
-        MaintainerCoordinator,
-        MaintenanceDecision,
-        ensure_maintenance_incident,
-    )
-
-    _config, store, state, worker = setup_task(tmp_path, task_id="task-repair-command")
-    state = block_task(store, state)
-    path = Path(state["manifest_path"])
-    incident = ensure_maintenance_incident(state)
-    assert incident is not None
-    incident["turn"] = 1
-    incident["request_id"] = f"{incident['incident_id']}-turn1"
-    state = store.save_maintenance(path, state)
-    coordinator = MaintainerCoordinator(_config, store=store)
-    decision = MaintenanceDecision(
-        action="CREATE_REPAIR_TASK",
-        reason="Prevent recurrence before resuming.",
-        lesson="Recovery is applied only after its operational postcondition passes.",
-        repair={
-            "root_cause": "role-offline-open-tab-postcondition",
-            "reason": "Prevent a false-positive exact-tab recovery.",
-            "disposition": "HOLD_FOR_REPAIR",
-            "reproduction": "Reopen a mismatched role conversation while blocked.",
-            "source_areas": ["cdpa_worker", "cdpa_store", "tests", "prompts"],
-            "required_tests": ["focused role-offline regression", "controlled live recovery"],
-        },
-        version=2,
-    )
-    committed, committed_incident, _evidence, control, stale = coordinator._commit_response(
-        path,
-        incident_id=str(incident["incident_id"]),
-        expected_incident_key=str(incident["key"]),
-        request_id=str(incident["request_id"]),
-        turn=1,
-        report="# Repair report\n\nCreate the bounded repair task.\n",
-        report_at=datetime.now(timezone.utc),
-        decision=decision,
-    )
-    assert stale is False
-    assert control["action"] == "create_repair_task"
-    assert control["origin"] == "maintainers"
-
-    class NoopActions:
-        pass
-
-    persisted: list[bool] = []
-    assert asyncio.run(
-        worker._apply_control(
-            committed,
-            NoopActions(),
-            manifest_path=path,
-            persisted_result=persisted,
-        )
-    ) is True
-    assert persisted == [True]
-    held = store.load(path)
-    assert held["status"] == "WAITING"
-    assert held["controls"][-1]["status"] == "applied"
-    repair_task_id = held["controls"][-1]["result"]["repair_task_id"]
-    assert repair_task_id in held["depends_on_task_ids"]
-
-    assert coordinator._reconcile_active(path, held) is True
-    resolved = store.load(path)
-    resolved_incident = resolved["maintenance"]["incidents"][0]
-    assert resolved_incident["state"] == "RESOLVED"
-    assert resolved_incident["repair_task_id"] == repair_task_id
-    assert resolved_incident["pending_lesson"] == decision.lesson
-
-
-def test_operator_stop_does_not_create_maintenance_incident(tmp_path: Path):
-    from playwright_auto.cdpa_maintenance import ensure_maintenance_incident
-
-    _config, store, state, worker = setup_task(tmp_path, task_id="task-operator-stop")
-    path = Path(state["manifest_path"])
-    state = store.request_control(path, "stop", reason="operator stop")
-
-    class StopActions:
-        async def locate_owned(self, *_args, **_kwargs):
-            return None
-
-        async def stop_if_active(self, *_args, **_kwargs):
-            return False
-
-    assert asyncio.run(worker._apply_control(state, StopActions())) is True
-    assert state["status"] == "STOPPED"
-    assert state["controls"][-1]["origin"] == "operator"
-    assert ensure_maintenance_incident(state) is None
 
 
 def test_repair_done_releases_same_pre_send_hop_without_new_hop(tmp_path: Path):
@@ -481,59 +521,6 @@ def test_existing_repair_accepts_durable_parallel_to_hold_disposition_change(tmp
     ] == ["CONTINUE_IN_PARALLEL", "HOLD_FOR_REPAIR"]
 
 
-def test_worker_applies_hold_to_existing_deduplicated_repair(tmp_path: Path):
-    _config, store, task_a, worker = setup_task(tmp_path, task_id="task-worker-shared-a")
-    task_a = block_task(store, task_a, hop_state="waiting")
-    repair = store.create_or_gate_repair(
-        repair_request_for(task_a, "HOLD_FOR_REPAIR", incident_id="maint-worker-a")
-    )["repair"]
-    task_b = store.create_task(
-        "Worker affected task",
-        requested_team="beta",
-        task_id="task-worker-shared-b",
-    )
-    task_b = block_task(store, task_b, hop_state="waiting")
-    request_b = repair_request_for(
-        task_b,
-        "HOLD_FOR_REPAIR",
-        incident_id="maint-worker-b",
-    )
-    path_b = Path(task_b["manifest_path"])
-
-    def queue(current: dict) -> dict:
-        store._queue_control(
-            current,
-            "create_repair_task",
-            reason=request_b.reason,
-            origin="maintainers",
-            maintenance_incident_id=request_b.incident_id,
-            maintenance_request_id=f"{request_b.incident_id}-repair",
-            repair=request_b,
-        )
-        return current
-
-    task_b = store.update(path_b, queue)
-
-    class NoopActions:
-        pass
-
-    persisted: list[bool] = []
-    assert asyncio.run(
-        worker._apply_control(
-            task_b,
-            NoopActions(),
-            manifest_path=path_b,
-            persisted_result=persisted,
-        )
-    ) is True
-    assert persisted == [True]
-    held = store.load(path_b)
-    assert held["status"] == "WAITING"
-    assert held["depends_on_task_ids"] == [repair["task_id"]]
-    assert held["controls"][-1]["status"] == "applied"
-    assert held["controls"][-1]["result"]["repair_task_id"] == repair["task_id"]
-
-
 def test_existing_repair_transaction_recovers_after_partial_attach(
     tmp_path: Path,
     monkeypatch,
@@ -624,104 +611,6 @@ def test_shared_repair_done_releases_every_held_task(tmp_path: Path):
     assert _active_hop(released_b) == before_b
     assert released_a["repair_wait"]["state"] == "RELEASED"
     assert released_b["repair_wait"]["state"] == "RELEASED"
-
-
-def test_worker_replays_hold_after_gate_before_control_result(tmp_path: Path):
-    _config, store, state, worker = setup_task(tmp_path, task_id="task-replay-hold")
-    state = block_task(store, state, hop_state="waiting")
-    request = repair_request_for(
-        state,
-        "HOLD_FOR_REPAIR",
-        incident_id="maint-replay-hold",
-    )
-    path = Path(state["manifest_path"])
-
-    def queue(current: dict) -> dict:
-        store._queue_control(
-            current,
-            "create_repair_task",
-            reason=request.reason,
-            origin="maintainers",
-            maintenance_incident_id=request.incident_id,
-            maintenance_request_id=f"{request.incident_id}-repair",
-            repair=request,
-        )
-        return current
-
-    queued = store.update(path, queue)
-    store.create_or_gate_repair(request)
-    replay = store.load(path)
-    assert replay["status"] == "WAITING"
-    assert replay["controls"][-1]["status"] == "requested"
-
-    class NoopActions:
-        pass
-
-    persisted: list[bool] = []
-    assert asyncio.run(
-        worker._apply_control(
-            replay,
-            NoopActions(),
-            manifest_path=path,
-            persisted_result=persisted,
-        )
-    ) is True
-    assert persisted == [True]
-    applied = store.load(path)
-    assert applied["status"] == "WAITING"
-    assert applied["controls"][-1]["status"] == "applied"
-    assert applied["controls"][-1]["command_state"] == "APPLIED"
-
-
-def test_worker_applies_durable_hold_to_parallel_disposition_change(tmp_path: Path):
-    _config, store, state, worker = setup_task(tmp_path, task_id="task-hold-to-parallel")
-    state = block_task(store, state, hop_state="waiting")
-    hold = repair_request_for(
-        state,
-        "HOLD_FOR_REPAIR",
-        incident_id="maint-hold-first",
-    )
-    repair = store.create_or_gate_repair(hold)["repair"]
-    held = store.load(state["manifest_path"])
-    parallel = repair_request_for(
-        held,
-        "CONTINUE_IN_PARALLEL",
-        incident_id="maint-parallel-second",
-    )
-    path = Path(held["manifest_path"])
-
-    def queue(current: dict) -> dict:
-        store._queue_control(
-            current,
-            "create_repair_task",
-            reason=parallel.reason,
-            origin="maintainers",
-            maintenance_incident_id=parallel.incident_id,
-            maintenance_request_id=f"{parallel.incident_id}-repair",
-            repair=parallel,
-        )
-        return current
-
-    held = store.update(path, queue)
-
-    class NoopActions:
-        pass
-
-    persisted: list[bool] = []
-    assert asyncio.run(
-        worker._apply_control(
-            held,
-            NoopActions(),
-            manifest_path=path,
-            persisted_result=persisted,
-        )
-    ) is True
-    assert persisted == [True]
-    resumed = store.load(path)
-    assert resumed["status"] == "RUNNING"
-    assert repair["task_id"] not in resumed["depends_on_task_ids"]
-    assert resumed["repair_wait"]["state"] == "DISPOSITION_CHANGED"
-    assert resumed["controls"][-1]["status"] == "applied"
 
 
 def test_done_repair_prevents_new_call_for_same_known_root_cause(tmp_path: Path):

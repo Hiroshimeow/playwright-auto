@@ -70,7 +70,8 @@ def observe_response_activity(
     changed = previous is None or str(previous) != str(signature)
     wait["activity_signature"] = str(signature)
     wait["activity_length"] = max(0, int(length))
-    wait["activity_observed_at"] = iso(current)
+    if changed or parse_time(wait.get("activity_observed_at")) is None:
+        wait["activity_observed_at"] = iso(current)
     if changed:
         wait["activity_changed_at"] = iso(current)
     elif parse_time(wait.get("activity_changed_at")) is None:

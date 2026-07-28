@@ -9,9 +9,11 @@ import pytest
 
 import playwright_auto.cdpa_store as store_module
 from playwright_auto.cdpa_config import CDPAConfigError, load_cdpa_config
+from playwright_auto.cdpa_projection import build_dashboard_actions
 from playwright_auto.cdpa_prompts import PromptBuilder
 from playwright_auto.cdpa_routes import RouteContractError, parse_route_response, validate_report
 from playwright_auto.cdpa_store import TaskStore, utc_now
+from playwright_auto.cdpa_worker import CDPAWorker
 from playwright_auto.cdpa_team import (
     cleanup_eligible,
     is_active_team_owner,
@@ -31,7 +33,7 @@ def write_config(root: Path) -> Path:
                         role: f"prompts/cdpa/{role}.md"
                         for role in ("PLAN", "DEV", "REVIEW", "TEST", "AUDIT")
                     },
-                    "maintainers_constructor": "prompts/cdpa/MAINTAINERS.md",
+                    "independent_rule": "prompts/cdpa/INDEPENDENT_RULE.md",
                     "response_guide": "prompts/cdpa/RESPONSE_GUIDE.md",
                 },
                 "roles": ["PLAN", "DEV", "REVIEW", "TEST", "AUDIT"],
@@ -39,7 +41,10 @@ def write_config(root: Path) -> Path:
                 "browser": {"cdp_url": "http://127.0.0.1:9222", "workspace_timeout_seconds": 15},
                 "route_repair": {"max_attempts": 3},
                 "response": {"timeout_seconds": 7200, "refresh_after_seconds": 1200, "stable_ms": 1000, "poll_ms": 100},
-                "maintenance": {"timeout_seconds": 300, "refresh_after_seconds": 120, "stable_ms": 1000, "poll_ms": 100},
+                "independent_agents": {
+                    "seed_builtins": False,
+                    "idle_close_seconds": 1800,
+                },
                 "cleanup": {"terminal_idle_seconds": 3600},
                 "worker": {"poll_seconds": 1},
                 "delays": {"minimum_seconds": 1.0, "maximum_seconds": 1.5, "multipliers": {"send": 3}},
@@ -52,8 +57,9 @@ def write_config(root: Path) -> Path:
         target = root / "prompts" / "cdpa" / f"{role}.md"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(f"# {role}\nConstructor for {role}.\n", encoding="utf-8")
-    (root / "prompts" / "cdpa" / "MAINTAINERS.md").write_text(
-        "# MAINTAINERS\nConstructor for Maintainers.\n", encoding="utf-8"
+    (root / "prompts" / "cdpa" / "INDEPENDENT_RULE.md").write_text(
+        "INDEPENDENT_AGENT_OPERATING_RULE\nAct directly and use explicit completion controls.\n",
+        encoding="utf-8",
     )
     (root / "prompts" / "cdpa" / "RESPONSE_GUIDE.md").write_text(
         "Return only the strict route JSON.\nReport: .plan/<team>/<physical-role>_turn<N>_<task-id>.md", encoding="utf-8"
@@ -267,8 +273,9 @@ def test_constructor_is_once_per_generation_and_prompt_is_compact_allowlist(tmp_
         validation_error="bad keys at .plan/alpha/alpha-plan_turn1_task-a.md",
     )
 
+    assert first.text.startswith("alpha · role: plan\n{")
     envelope_text = first.text.split("\n\n# PLAN", 1)[0].removeprefix(
-        "CDPA_TASK_ENVELOPE\n"
+        "alpha · role: plan\n"
     )
     envelope = json.loads(envelope_text)
     assert envelope == {
@@ -912,6 +919,47 @@ def test_malformed_noncanonical_evidence_outside_task_layout_is_ignored(tmp_path
     assert created["team"] == "alpha"
 
 
+def test_discovery_ignores_full_manifest_snapshots_outside_declared_task_directory(
+    tmp_path: Path,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_task("Task", requested_team="alpha", task_id="task-a")
+    manifest = Path(state["manifest_path"])
+    artifact_dir = config.plans_root / "alpha" / "test1-artifacts"
+    artifact_dir.mkdir(parents=True)
+    for name in ("isolated_manifest_before.json", "isolated_manifest_after.json"):
+        (artifact_dir / name).write_text(
+            json.dumps(json.loads(manifest.read_text(encoding="utf-8"))),
+            encoding="utf-8",
+        )
+
+    tasks, errors = store.discover_with_errors()
+
+    assert [task["task_id"] for task in tasks] == ["task-a"]
+    assert errors == []
+    assert store.discover_paths() == [manifest.resolve()]
+
+
+def test_discovery_ignores_unlocked_malformed_json_artifacts_at_manifest_depth(
+    tmp_path: Path,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_task("Task", requested_team="alpha", task_id="task-a")
+    artifact_dir = config.plans_root / "alpha" / "dev2-artifacts"
+    artifact_dir.mkdir(parents=True)
+    artifact = artifact_dir / "exact_one_wait_300s_summary.json"
+    artifact.write_bytes(b"")
+
+    tasks, errors = store.discover_with_errors()
+
+    assert [task["task_id"] for task in tasks] == ["task-a"]
+    assert errors == []
+    assert artifact.with_suffix(".json.lock").exists() is False
+    assert store.discover_paths() == [Path(state["manifest_path"]).resolve()]
+
+
 def test_discover_paths_ignores_request_ledgers_inside_task_directory(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
@@ -1133,9 +1181,14 @@ def test_reuse_team_creates_waiting_task_without_allocating_suffix(tmp_path: Pat
     store = TaskStore(config)
     first = store.create_task("one", requested_team="alpha", task_id="task-one")
 
+    assert build_dashboard_actions([first])["reuse_teams"] == [
+        {"team": "alpha", "status": "available"}
+    ]
+
     second = store.create_task("two", reuse_team="alpha", task_id="task-two")
 
     assert second["team"] == "alpha"
+    assert second["reusable_teams"] == ["alpha"]
     assert second["team_suffix"] == first["team_suffix"]
     assert second["roles"]["PLAN"]["physical_role"] == first["roles"]["PLAN"]["physical_role"]
     assert second["status"] == "WAITING"
@@ -1938,16 +1991,14 @@ def test_catalog_status_tracks_manifest_saves_without_becoming_a_manifest(tmp_pa
     assert config.plans_root / ".cdpa-catalog.json" not in store.discover_paths()
 
 
-def test_maintainers_config_is_dedicated_and_not_a_normal_route(tmp_path: Path):
+def test_independent_agent_config_is_shared_and_not_a_normal_route(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
 
-    assert config.maintainers_constructor_path.name == "MAINTAINERS.md"
-    assert config.maintainers_constructor_path.is_file()
-    assert config.maintenance_timeout_seconds == 300
-    assert config.maintenance_refresh_after_seconds == 120
-    assert config.maintenance_stable_ms == 1000
-    assert config.maintenance_poll_ms == 100
+    assert config.independent_rule_path.name == "INDEPENDENT_RULE.md"
+    assert config.independent_rule_path.is_file()
+    assert config.independent_idle_close_seconds == 1800
     assert "MAINTAINERS" not in config.roles
+    assert "MONITOR" not in config.roles
 
 
 def test_optional_maintenance_manifest_state_round_trips(tmp_path: Path):
@@ -2019,28 +2070,6 @@ def test_global_maintainers_state_is_excluded_from_task_discovery(tmp_path: Path
     )
 
     assert store.discover_paths() == [Path(task["manifest_path"])]
-
-
-def test_maintenance_save_merges_only_metadata_and_preserves_newer_task_changes(
-    tmp_path: Path,
-):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    store = TaskStore(config)
-    original = store.create_task("Task", requested_team="alpha", task_id="task-maint-merge")
-    path = Path(original["manifest_path"])
-    stale = store.load(path)
-    stale["maintenance"] = {
-        "active_incident_id": "maint-1",
-        "incidents": [{"incident_id": "maint-1", "key": "snapshot", "state": "OPEN"}],
-        "last_resolved_at": None,
-    }
-    newer = store.request_control(path, "pause", reason="operator pause")
-
-    saved = store.save_maintenance(path, stale)
-
-    assert saved["controls"] == newer["controls"]
-    assert saved["maintenance"]["active_incident_id"] == "maint-1"
-
 
 
 def test_task_report_mode_defaults_file_and_validates_inline(tmp_path: Path):
@@ -2156,6 +2185,8 @@ def test_inline_first_generation_payload_is_authoritative_for_all_roles():
             conversation_generation=0,
             report_mode="inline",
         ).text
+        assert "CDPA_SYSTEM_PRIORITY" in prompt
+        assert "single-operator local runtime" in prompt
         assert "Do not create, edit, or write any role-report file" in prompt
         assert "the worker owns report materialization" in prompt
         assert '"handoff":"INLINE"' in prompt
@@ -2183,6 +2214,8 @@ def test_file_mode_response_guide_wording_remains_unchanged():
         conversation_generation=0,
         report_mode="file",
     ).text
+    assert "CDPA_SYSTEM_PRIORITY" in prompt
+    assert "single-operator local runtime" in prompt
     assert "Write the complete role report to the exact expected Markdown path" in prompt
     assert '"handoff":".plan/<team>/<physical-role>_turn<N>_<task-id>.md"' in prompt
 
@@ -2207,6 +2240,41 @@ def test_repository_and_packaged_role_contracts_are_report_mode_neutral():
     assert "In file report mode" in agents
     assert "In inline report mode" in agents
     assert "the worker materializes" in agents
+
+
+def test_role_constructors_use_superpowers_and_bounded_stopping_rules():
+    repository = Path(__file__).resolve().parents[1]
+    runtime = repository / "prompts" / "cdpa"
+    packaged = repository / "src" / "playwright_auto" / "cdpa_defaults" / "prompts" / "cdpa"
+    sentence = "Use the appropriate Superpower skill before acting."
+
+    for role in ("PLAN", "DEV", "TEST", "REVIEW", "AUDIT", "MAINTAINERS", "MONITOR"):
+        runtime_prompt = (runtime / f"{role}.md").read_text(encoding="utf-8")
+        packaged_prompt = (packaged / f"{role}.md").read_text(encoding="utf-8")
+        assert packaged_prompt == runtime_prompt
+        assert sentence in runtime_prompt
+        assert "single-operator local runtime" in runtime_prompt
+        assert "Stable operation" in runtime_prompt or "stable operation" in runtime_prompt
+
+    for name in ("INDEPENDENT_RULE.md", "RESPONSE_GUIDE.md"):
+        runtime_prompt = (runtime / name).read_text(encoding="utf-8")
+        packaged_prompt = (packaged / name).read_text(encoding="utf-8")
+        assert packaged_prompt == runtime_prompt
+        assert "single-operator local runtime" in runtime_prompt
+
+    assert "proportional to the task" in (runtime / "PLAN.md").read_text(encoding="utf-8")
+    assert "root cause rather than patching a symptom" in (runtime / "DEV.md").read_text(encoding="utf-8")
+    assert "one bounded verification pass" in (runtime / "TEST.md").read_text(encoding="utf-8")
+    assert "Do not scan the entire repository" in (runtime / "REVIEW.md").read_text(encoding="utf-8")
+    assert "only the named cross-cutting boundaries" in (runtime / "AUDIT.md").read_text(encoding="utf-8")
+    assert "trusted-local metadata visibility" in (runtime / "REVIEW.md").read_text(encoding="utf-8")
+    assert "Do not run recursive privacy scans" in (runtime / "AUDIT.md").read_text(encoding="utf-8")
+    assert "do not block completion" in (runtime / "PLAN.md").read_text(encoding="utf-8")
+    assert "Reuse trustworthy fresh evidence" in (runtime / "TEST.md").read_text(encoding="utf-8")
+    assert "PLAN -> DEV -> REVIEW -> PLAN -> DONE" in (runtime / "PLAN.md").read_text(encoding="utf-8")
+    assert "DEV and REVIEW are the only substantive worker roles" in (runtime / "RESPONSE_GUIDE.md").read_text(encoding="utf-8")
+    assert "TEST is an opt-in role" in (runtime / "TEST.md").read_text(encoding="utf-8")
+    assert "AUDIT is an opt-in role" in (runtime / "AUDIT.md").read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(
@@ -2320,15 +2388,20 @@ def test_dependency_creation_rejects_missing_self_duplicate_and_cycle_before_wri
             )
     assert sorted(str(path) for path in store.discover_paths()) == before
 
-    # Corrupting an existing graph is rejected by the primary manifest validator.
+    # Ordinary single-manifest loads remain local; one-time runtime hydration owns
+    # repository-wide dependency validation.
     raw_a = json.loads(Path(a["manifest_path"]).read_text(encoding="utf-8"))
     raw_a["depends_on_task_ids"] = ["task-b"]
     Path(a["manifest_path"]).write_text(json.dumps(raw_a), encoding="utf-8")
-    with pytest.raises(ValueError, match="cycle"):
-        store.load(a["manifest_path"])
+    assert store.load(a["manifest_path"])["depends_on_task_ids"] == ["task-b"]
+    worker = CDPAWorker(config, store=store)
+    catalog = worker.hydrate_runtime()
+    assert catalog["complete"] is False
+    assert any("cycle" in item["error"] for item in catalog["errors"])
+    assert worker.runtime_degraded is True
 
 
-def test_missing_edge_does_not_mask_cycle_before_atomic_update(tmp_path: Path):
+def test_ordinary_update_rejects_dependency_mutation_before_write(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
     missing_parent = store.create_task(
@@ -2351,7 +2424,7 @@ def test_missing_edge_does_not_mask_cycle_before_atomic_update(tmp_path: Path):
     before_manifest = a_path.read_bytes()
     before_catalog = store.catalog_path.read_bytes()
 
-    with pytest.raises(ValueError, match="cycle"):
+    with pytest.raises(ValueError, match="explicit dependency mutation"):
         store.update(
             a_path,
             lambda state: {
@@ -2389,108 +2462,59 @@ def test_missing_edge_cycle_excludes_every_cycle_participant_from_discovery(tmp_
     raw_a["depends_on_task_ids"] = ["missing-parent", "task-b"]
     a_path.write_text(json.dumps(raw_a), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="cycle"):
-        store.load(a_path)
-    with pytest.raises(ValueError, match="cycle"):
-        store.load(b["manifest_path"])
+    assert store.load(a_path)["depends_on_task_ids"] == ["missing-parent", "task-b"]
+    assert store.load(b["manifest_path"])["depends_on_task_ids"] == ["task-a"]
 
     tasks, errors = store.discover_with_errors()
-    assert tasks == []
-    cycle_errors = {
-        Path(item["manifest_path"]).resolve(): item["error"]
-        for item in errors
-        if "cycle" in item["error"]
-    }
-    assert set(cycle_errors) == {
-        a_path.resolve(),
-        Path(b["manifest_path"]).resolve(),
-    }
-    assert all("cycle" in error for error in cycle_errors.values())
+    assert {task["task_id"] for task in tasks} == {"task-a", "task-b"}
+    assert any("MissingManifestError" in item["error"] for item in errors)
+    assert any("DependencyGraphError" in item["error"] and "cycle" in item["error"] for item in errors)
 
 
-def test_three_node_cycle_excludes_only_its_dependency_closure(tmp_path: Path):
+def test_dependency_cycle_degrades_hydration_without_erasing_last_known_good(
+    tmp_path: Path,
+):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
     a = store.create_task("A", requested_team="a", task_id="task-a")
-    b = store.create_task(
+    store.create_task(
         "B",
         requested_team="b",
         task_id="task-b",
         depends_on_task_ids=("task-a",),
     )
-    c = store.create_task(
+    store.create_task(
         "C",
         requested_team="c",
         task_id="task-c",
         depends_on_task_ids=("task-b",),
     )
-    unrelated = store.create_task(
+    store.create_task(
         "Unrelated", requested_team="unrelated", task_id="unrelated-task"
     )
+    worker = CDPAWorker(config, store=store)
+    assert worker.hydrate_runtime()["complete"] is True
+    before = {
+        item["task_id"]
+        for item in worker.runtime_db.list_task_summaries(surfaces=(), limit=100)
+    }
+
     a_path = Path(a["manifest_path"])
     raw_a = json.loads(a_path.read_text(encoding="utf-8"))
     raw_a["depends_on_task_ids"] = ["task-c"]
     a_path.write_text(json.dumps(raw_a), encoding="utf-8")
 
-    for state in (a, b, c):
-        with pytest.raises(ValueError, match="cycle"):
-            store.load(state["manifest_path"])
-    assert store.load(unrelated["manifest_path"])["task_id"] == "unrelated-task"
+    assert store.load(a_path)["depends_on_task_ids"] == ["task-c"]
+    catalog = worker.hydrate_runtime(startup=False)
 
-    tasks, errors = store.discover_with_errors()
-    assert [task["task_id"] for task in tasks] == ["unrelated-task"]
-    assert sum("cycle" in item["error"] for item in errors) == 3
-
-
-def test_unrelated_tasks_remain_operable_with_diagnostic_cycle(tmp_path: Path):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    store = TaskStore(config)
-    states = install_cycle_isolation_graph(store)
-    cycle_paths = [Path(states[key]["manifest_path"]) for key in ("a", "b")]
-    cycle_bytes = {path: path.read_bytes() for path in cycle_paths}
-    catalog_before = json.loads(store.catalog_path.read_text(encoding="utf-8"))
-    cycle_catalog = {
-        store._catalog_key(path): catalog_before["entries"][store._catalog_key(path)]
-        for path in cycle_paths
+    assert catalog["complete"] is False
+    assert any("DependencyGraphError" in item["error"] for item in catalog["errors"])
+    assert worker.runtime_degraded is True
+    after = {
+        item["task_id"]
+        for item in worker.runtime_db.list_task_summaries(surfaces=(), limit=100)
     }
-
-    for key in ("a", "b"):
-        with pytest.raises(ValueError, match="cycle"):
-            store.load(states[key]["manifest_path"])
-    assert store.load(states["unrelated"]["manifest_path"])["task_id"] == "unrelated-task"
-    assert store.load(states["missing_only"]["manifest_path"])["depends_on_task_ids"] == [
-        "missing-parent"
-    ]
-
-    tasks, errors = store.discover_with_errors()
-    assert {task["task_id"] for task in tasks} == {"missing-only", "unrelated-task"}
-    assert {
-        Path(item["manifest_path"]).resolve()
-        for item in errors
-        if "cycle" in item["error"]
-    } == {path.resolve() for path in cycle_paths}
-
-    created = store.create_task(
-        "Later unrelated", requested_team="later", task_id="later-unrelated"
-    )
-    assert created["task_id"] == "later-unrelated"
-    for path, data in cycle_bytes.items():
-        assert path.read_bytes() == data
-    catalog_after_create = json.loads(store.catalog_path.read_text(encoding="utf-8"))
-    for key, entry in cycle_catalog.items():
-        assert catalog_after_create["entries"][key] == entry
-
-    before_paths = store.discover_paths()
-    before_catalog = store.catalog_path.read_bytes()
-    with pytest.raises(ValueError, match="missing dependency"):
-        store.create_task(
-            "Invalid cycle dependent",
-            requested_team="invalid-cycle-dependent",
-            task_id="invalid-cycle-dependent",
-            depends_on_task_ids=("task-a",),
-        )
-    assert store.discover_paths() == before_paths
-    assert store.catalog_path.read_bytes() == before_catalog
+    assert after == before == {"task-a", "task-b", "task-c", "unrelated-task"}
 
 
 def test_manifest_rejects_invalid_dependency_field_shapes(tmp_path: Path):
@@ -2517,47 +2541,19 @@ def test_manifest_rejects_invalid_dependency_field_shapes(tmp_path: Path):
     manifest.write_text(json.dumps(base), encoding="utf-8")
 
 
-def test_duplicate_task_ids_fail_closed_without_poisoning_unrelated_tasks(tmp_path: Path):
+def test_duplicate_task_ids_degrade_hydration_without_global_load_scans(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
     states = install_duplicate_task_graph(store)
 
-    for key in ("alpha", "beta"):
-        with pytest.raises(ValueError, match="duplicate task ID 'dup-task'"):
-            store.load(states[key]["manifest_path"])
-    assert store.load(states["unique"]["manifest_path"])["task_id"] == "unique-task"
-    with pytest.raises(ValueError, match="ambiguous dependency task.*dup-task"):
-        store.load(states["child"]["manifest_path"])
+    assert store.load(states["alpha"]["manifest_path"])["task_id"] == "dup-task"
+    assert store.load(states["beta"]["manifest_path"])["task_id"] == "dup-task"
+    worker = CDPAWorker(config, store=store)
+    catalog = worker.hydrate_runtime()
 
-    tasks, errors = store.discover_with_errors()
-    assert [(task["team"], task["task_id"]) for task in tasks] == [
-        ("unique", "unique-task")
-    ]
-    by_path = {item["manifest_path"]: item["error"] for item in errors}
-    assert "duplicate task ID 'dup-task'" in by_path[states["alpha"]["manifest_path"]]
-    assert "duplicate task ID 'dup-task'" in by_path[states["beta"]["manifest_path"]]
-    assert "ambiguous dependency task" in by_path[states["child"]["manifest_path"]]
-
-
-def test_unrelated_creation_survives_duplicate_identity_diagnostics(tmp_path: Path):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    store = TaskStore(config)
-    install_duplicate_task_graph(store)
-
-    created = store.create_task(
-        "Unrelated after duplicate identity corruption",
-        requested_team="gamma",
-        task_id="unrelated-after-duplicate",
-    )
-
-    assert created["team"] == "gamma"
-    assert store.load(created["manifest_path"])["task_id"] == "unrelated-after-duplicate"
-    tasks, errors = store.discover_with_errors()
-    assert {task["task_id"] for task in tasks} == {
-        "unique-task",
-        "unrelated-after-duplicate",
-    }
-    assert len(errors) == 3
+    assert catalog["complete"] is False
+    assert any("duplicate task ID" in item["error"] for item in catalog["errors"])
+    assert worker.runtime_degraded is True
 
 
 def test_dependency_creation_rejects_ambiguous_duplicate_parent_without_write(tmp_path: Path):
@@ -3252,95 +3248,6 @@ def test_phase4_recovery_does_not_reconcile_unrelated_catalog_invalid_owner(
     assert list(restarted.root.rglob("*.phase4.rollback.tmp")) == []
 
 
-def test_phase4_recovery_ignores_unrelated_duplicate_diagnostics(
-    tmp_path: Path, monkeypatch
-):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    store = TaskStore(config)
-    duplicate_states = install_duplicate_task_graph(store)
-    diagnostic_paths = {
-        Path(duplicate_states[key]["manifest_path"])
-        for key in ("alpha", "beta", "child")
-    }
-    diagnostic_bytes = {path: path.read_bytes() for path in diagnostic_paths}
-    catalog_before = json.loads(store.catalog_path.read_text(encoding="utf-8"))
-    diagnostic_catalog = {
-        store._catalog_key(path): catalog_before["entries"][store._catalog_key(path)]
-        for path in diagnostic_paths
-    }
-
-    parent = store.create_task(
-        "Recovery target", requested_team="recovery-parent", task_id="recovery-target"
-    )
-    child = store.create_task(
-        "Recovery child",
-        requested_team="recovery-child",
-        task_id="recovery-child",
-        depends_on_task_ids=("recovery-target",),
-    )
-    parent = _stop_task(store, parent)
-    parent_path = Path(parent["manifest_path"])
-    child_path = Path(child["manifest_path"])
-    parent_before = parent_path.read_bytes()
-    original_replace = store_module.os.replace
-    installs = 0
-
-    def interrupt_before_second_manifest(source, target):
-        nonlocal installs
-        if Path(source).name.endswith(".json.phase4.tmp"):
-            installs += 1
-            if installs == 2:
-                raise SystemExit("simulated duplicate-diagnostic recovery interruption")
-        return original_replace(source, target)
-
-    monkeypatch.setattr(store_module.os, "replace", interrupt_before_second_manifest)
-    with pytest.raises(SystemExit, match="duplicate-diagnostic recovery interruption"):
-        store.replace_task_and_rewire(
-            "recovery-target",
-            "Continue recovery target safely",
-            reuse_team=True,
-            rewire_children=True,
-            incident_id="maint-duplicate-diagnostic-recovery",
-        )
-    assert store.phase4_journal_path.exists()
-    assert parent_path.read_bytes() == parent_before
-
-    monkeypatch.setattr(store_module.os, "replace", original_replace)
-    restarted = TaskStore(config)
-    recovered = restarted.recover_phase4_replacement()
-    assert recovered is not None
-    replacement = recovered["replacement"]
-    current_child = restarted.load(child_path)
-
-    assert replacement["replaces_task_id"] == "recovery-target"
-    assert replacement["replacement_incident_id"] == "maint-duplicate-diagnostic-recovery"
-    assert current_child["depends_on_task_ids"] == [replacement["task_id"]]
-    assert current_child["depends_on_task_ids"].count(replacement["task_id"]) == 1
-    assert parent_path.read_bytes() == parent_before
-    for path, data in diagnostic_bytes.items():
-        assert path.read_bytes() == data
-    catalog_after = json.loads(restarted.catalog_path.read_text(encoding="utf-8"))
-    for key, entry in diagnostic_catalog.items():
-        assert catalog_after["entries"][key] == entry
-    for task in restarted.discover():
-        key = restarted._catalog_key(task["manifest_path"])
-        assert catalog_after["entries"][key] == restarted._catalog_entry(task)
-    assert not restarted.phase4_journal_path.exists()
-    assert list(restarted.root.rglob("*.phase4.tmp")) == []
-    assert list(restarted.root.rglob("*.phase4.rollback.tmp")) == []
-
-    later = restarted.create_task(
-        "Unrelated after recovered journal",
-        requested_team="later",
-        task_id="later-after-recovery",
-    )
-    updated = restarted.update(
-        later["manifest_path"],
-        lambda state: {**state, "active_action": "verified_after_recovery"},
-    )
-    assert updated["active_action"] == "verified_after_recovery"
-
-
 def test_phase4_recovery_ignores_unrelated_missing_dependency(
     tmp_path: Path, monkeypatch
 ):
@@ -3466,214 +3373,6 @@ def test_phase4_recovery_rejects_tampered_journal_without_deleting_evidence(
         assert path.read_bytes() == data
 
 
-def _pending_phase4_operation(
-    tmp_path: Path,
-    monkeypatch,
-    *,
-    parent_team: str = "aaa",
-    child_team: str = "zzz",
-    incident_id: str = "maint-writer-preflight",
-):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    store = TaskStore(config)
-    parent = store.create_task(
-        "Parent", requested_team=parent_team, task_id="task-parent"
-    )
-    child = store.create_task(
-        "Child",
-        requested_team=child_team,
-        task_id="task-child",
-        depends_on_task_ids=("task-parent",),
-    )
-    parent = _stop_task(store, parent)
-    parent_path = Path(parent["manifest_path"])
-    child_path = Path(child["manifest_path"])
-    parent_before = parent_path.read_bytes()
-    original_replace = store_module.os.replace
-    installs = 0
-
-    def interrupt_before_second_manifest(source, target):
-        nonlocal installs
-        if Path(source).name.endswith(".json.phase4.tmp"):
-            installs += 1
-            if installs == 2:
-                raise SystemExit("simulated pending Phase-4 operation")
-        return original_replace(source, target)
-
-    monkeypatch.setattr(store_module.os, "replace", interrupt_before_second_manifest)
-    with pytest.raises(SystemExit, match="pending Phase-4"):
-        store.replace_task_and_rewire(
-            "task-parent",
-            "Continue parent safely",
-            reuse_team=True,
-            rewire_children=True,
-            incident_id=incident_id,
-        )
-    monkeypatch.setattr(store_module.os, "replace", original_replace)
-    assert store.phase4_journal_path.exists()
-    return config, TaskStore(config), parent_path, child_path, parent_before
-
-
-@pytest.mark.parametrize(
-    ("parent_team", "child_team", "mutation"),
-    (
-        ("aaa", "zzz", "update"),
-        ("zzz", "aaa", "update"),
-        ("aaa", "zzz", "request_control"),
-        ("zzz", "aaa", "request_control"),
-    ),
-)
-def test_pending_phase4_recovery_precedes_old_parent_mutation(
-    tmp_path: Path,
-    monkeypatch,
-    parent_team: str,
-    child_team: str,
-    mutation: str,
-):
-    config, store, parent_path, child_path, parent_before = _pending_phase4_operation(
-        tmp_path,
-        monkeypatch,
-        parent_team=parent_team,
-        child_team=child_team,
-        incident_id=f"maint-{mutation}-{parent_team}",
-    )
-
-    if mutation == "update":
-        call = lambda: store.update(
-            parent_path,
-            lambda state: {
-                **state,
-                "errors": [*state.get("errors", []), {"at": utc_now(), "error": "late"}],
-            },
-        )
-    else:
-        call = lambda: store.request_control(
-            parent_path,
-            "clear_team",
-            reason="dashboard clear during recovery",
-            confirmed=True,
-        )
-
-    with pytest.raises(ValueError, match="immutable history"):
-        call()
-
-    assert parent_path.read_bytes() == parent_before
-    current_child = store.load(child_path)
-    replacements = [
-        task
-        for task in store.discover()
-        if task.get("replacement_incident_id") == f"maint-{mutation}-{parent_team}"
-    ]
-    assert len(replacements) == 1
-    replacement_id = replacements[0]["task_id"]
-    assert current_child["depends_on_task_ids"] == [replacement_id]
-    assert not store.phase4_journal_path.exists()
-    catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
-    for task in store.discover():
-        assert catalog["entries"][store._catalog_key(task["manifest_path"])] == store._catalog_entry(task)
-
-
-def test_pending_phase4_recovery_precedes_maintenance_writers_and_preserves_rewire(
-    tmp_path: Path, monkeypatch
-):
-    from playwright_auto.cdpa_maintenance import ensure_maintenance_incident
-
-    config, store, _parent_path, child_path, _parent_before = _pending_phase4_operation(
-        tmp_path,
-        monkeypatch,
-        parent_team="zzz",
-        child_team="aaa",
-        incident_id="maint-maintenance-writers",
-    )
-    child = store.load(child_path)
-    child.update(
-        status="BLOCKED",
-        kanban_column="BLOCKED",
-        block_code="send_failed",
-        block_reason="child failure",
-    )
-    incident = ensure_maintenance_incident(child)
-    assert incident is not None
-    saved = store.save_maintenance(child_path, child)
-    first_updated_at = saved["maintenance"]["worker_updated_at"]
-
-    updated = store.update_maintenance(
-        child_path,
-        lambda current: {
-            **current,
-            "maintenance": {
-                **current["maintenance"],
-                "last_resolved_at": utc_now(),
-            },
-        },
-    )
-
-    replacement = next(
-        task
-        for task in store.discover()
-        if task.get("replacement_incident_id") == "maint-maintenance-writers"
-    )
-    assert updated["depends_on_task_ids"] == [replacement["task_id"]]
-    assert updated["maintenance"]["worker_updated_at"] >= first_updated_at
-    assert updated["maintenance"]["last_resolved_at"]
-    assert not store.phase4_journal_path.exists()
-
-
-def test_pending_phase4_recovery_rejects_stale_full_save_without_overwriting_rewire(
-    tmp_path: Path, monkeypatch
-):
-    config, store, _parent_path, child_path, _parent_before = _pending_phase4_operation(
-        tmp_path,
-        monkeypatch,
-        incident_id="maint-stale-save",
-    )
-    stale = json.loads(child_path.read_text(encoding="utf-8"))
-    stale["errors"].append({"at": utc_now(), "error": "stale full save"})
-
-    with pytest.raises(ValueError, match="reload before saving"):
-        store.save(child_path, stale)
-
-    current = store.load(child_path)
-    replacement = next(
-        task
-        for task in store.discover()
-        if task.get("replacement_incident_id") == "maint-stale-save"
-    )
-    assert current["depends_on_task_ids"] == [replacement["task_id"]]
-    assert not any(item.get("error") == "stale full save" for item in current["errors"])
-    assert not store.phase4_journal_path.exists()
-
-
-def test_failed_pending_phase4_preflight_leaves_public_mutation_target_unchanged(
-    tmp_path: Path, monkeypatch
-):
-    config, store, parent_path, child_path, _parent_before = _pending_phase4_operation(
-        tmp_path,
-        monkeypatch,
-        incident_id="maint-preflight-fail",
-    )
-    journal = json.loads(store.phase4_journal_path.read_text(encoding="utf-8"))
-    journal["writes"][0]["after_sha256"] = "0" * 64
-    store.phase4_journal_path.write_text(
-        json.dumps(journal, indent=2, sort_keys=True), encoding="utf-8"
-    )
-    before = {
-        parent_path: parent_path.read_bytes(),
-        child_path: child_path.read_bytes(),
-        store.catalog_path: store.catalog_path.read_bytes(),
-    }
-
-    with pytest.raises(ValueError, match="after hash"):
-        store.update(
-            parent_path,
-            lambda state: {**state, "errors": [*state["errors"], {"at": utc_now(), "error": "must not persist"}]},
-        )
-
-    for path, data in before.items():
-        assert path.read_bytes() == data
-    assert store.phase4_journal_path.exists()
-
-
 def test_completed_phase4_replacement_rejects_stale_child_full_save(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
@@ -3774,61 +3473,6 @@ def test_resume_team_still_works_for_unreplaced_blocked_task(tmp_path: Path):
     assert resumed["task_id"] == "task-blocked"
     assert resumed["controls"][-1]["action"] == "resume"
     assert resumed["controls"][-1]["reason"] == "normal blocked resume"
-
-
-def test_resume_team_recovers_pending_blocked_replacement_then_rejects_history(
-    tmp_path: Path, monkeypatch
-):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    store = TaskStore(config)
-    parent = store.create_task("Parent", requested_team="parent", task_id="task-parent")
-    child = store.create_task(
-        "Child",
-        requested_team="child",
-        task_id="task-child",
-        depends_on_task_ids=("task-parent",),
-    )
-    parent = _block_task_for_replacement(store, parent)
-    parent_path = Path(parent["manifest_path"])
-    child_path = Path(child["manifest_path"])
-    parent_before = parent_path.read_bytes()
-    original_replace = store_module.os.replace
-    installs = 0
-
-    def interrupt_before_second_manifest(source, target):
-        nonlocal installs
-        if Path(source).name.endswith(".json.phase4.tmp"):
-            installs += 1
-            if installs == 2:
-                raise SystemExit("pending blocked replacement")
-        return original_replace(source, target)
-
-    monkeypatch.setattr(store_module.os, "replace", interrupt_before_second_manifest)
-    with pytest.raises(SystemExit, match="pending blocked replacement"):
-        store.replace_task_and_rewire(
-            "task-parent",
-            "Replacement parent",
-            reuse_team=False,
-            rewire_children=True,
-            incident_id="maint-pending-resume-immutable",
-        )
-    monkeypatch.setattr(store_module.os, "replace", original_replace)
-    restarted = TaskStore(config)
-
-    with pytest.raises(ValueError, match="immutable history"):
-        restarted.resume_team("parent", reason="recover then reject")
-
-    replacement = next(
-        task
-        for task in restarted.discover()
-        if task.get("replacement_incident_id") == "maint-pending-resume-immutable"
-    )
-    assert parent_path.read_bytes() == parent_before
-    assert restarted.load(child_path)["depends_on_task_ids"] == [replacement["task_id"]]
-    assert not restarted.phase4_journal_path.exists()
-    catalog = json.loads(restarted.catalog_path.read_text(encoding="utf-8"))
-    for task in restarted.discover():
-        assert catalog["entries"][restarted._catalog_key(task["manifest_path"])] == restarted._catalog_entry(task)
 
 
 def test_replacement_context_bounds_retained_report_references():
@@ -3997,11 +3641,16 @@ def test_phase7_documentation_contract_is_complete():
         assert example in readme
 
     for invariant in (
-        "one global `MAINTAINERS` role for CDP 9222",
-        "never a normal route",
+        'task_mode="independent"',
+        "one `AGENT` role",
+        "exactly one nonterminal task",
+        "`independent_continue`",
+        "`independent_complete`",
+        "Maintainers and Monitor are built-in identities on the same engine",
+        "`operator`, `independent_agent`, `worker`, or `repair_task`",
+        "`independent_create_repair`",
         "Only PLAN may mark the task DONE",
         "persist only `depends_on_task_ids`",
-        "A STOPPED parent keeps its child WAITING",
         "`--reuse-team` queues work for that exact team",
         "the worker materializes",
         "once per role conversation generation",
@@ -4021,55 +3670,106 @@ def test_phase7_documentation_contract_is_complete():
     assert "--report-to" not in combined
 
 
-def test_config_loads_tooling_probe_profile_without_secret(tmp_path: Path):
-    config_path = write_config(tmp_path)
-    raw = json.loads(config_path.read_text(encoding="utf-8"))
-    raw["maintenance"]["tooling_probe"] = {
-        "dependency": "mcp-g8",
-        "endpoint": "http://127.0.0.1:8101/mcp",
-        "auth_profile": "local_mcp_static_bearer",
-        "required_tools": ["shell_execute"],
-    }
-    config_path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+def test_load_known_manifest_does_not_scan_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    task = store.create_task("scan-free load", requested_team="scan-free", task_id="scan-free-load")
 
-    config = load_cdpa_config(config_path, repository_root=tmp_path)
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("repository scan is forbidden during TaskStore.load")
 
-    assert config.maintenance_tooling_probe is not None
-    assert config.maintenance_tooling_probe.dependency == "mcp-g8"
-    assert config.maintenance_tooling_probe.endpoint == "http://127.0.0.1:8101/mcp"
-    assert config.maintenance_tooling_probe.auth_profile == "local_mcp_static_bearer"
-    assert config.maintenance_tooling_probe.required_tools == ("shell_execute",)
-    assert "secret" not in repr(config.maintenance_tooling_probe).casefold()
-    assert "token" not in repr(config.maintenance_tooling_probe).casefold()
+    monkeypatch.setattr(store, "_dependency_states", forbidden)
+    monkeypatch.setattr(store, "_filesystem_manifest_like_paths", forbidden)
+
+    assert store.load(task["manifest_path"])["task_id"] == "scan-free-load"
 
 
-@pytest.mark.parametrize(
-    ("field", "value", "message"),
-    [
-        ("endpoint", "http://example.com:8101/mcp", "loopback HTTP"),
-        ("endpoint", "http://127.0.0.1/mcp", "loopback HTTP"),
-        ("auth_profile", "persisted_token", "auth_profile is unsupported"),
-        ("required_tools", ["shell_execute", "shell_execute"], "must be unique"),
-        ("required_tools", ["bad tool"], "invalid name"),
-    ],
-)
-def test_config_rejects_unsafe_tooling_probe_shapes(
+def test_ordinary_update_does_not_scan_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    task = store.create_task("scan-free update", requested_team="scan-free-update", task_id="scan-free-update")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("repository scan is forbidden during ordinary TaskStore.update")
+
+    monkeypatch.setattr(store, "_dependency_states", forbidden)
+    monkeypatch.setattr(store, "_filesystem_manifest_like_paths", forbidden)
+    monkeypatch.setattr(store, "_filesystem_primary_paths", forbidden)
+    monkeypatch.setattr(store, "_recover_phase4_replacement_unlocked", forbidden)
+
+    updated = store.update(
+        task["manifest_path"],
+        lambda state: {**state, "active_action": "scan-free"},
+    )
+
+    assert updated["active_action"] == "scan-free"
+
+
+def test_generic_update_rejects_dependency_change_without_repository_scan(
     tmp_path: Path,
-    field: str,
-    value: object,
-    message: str,
+    monkeypatch: pytest.MonkeyPatch,
 ):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task("parent", requested_team="parent-scan", task_id="parent-scan")
+    child = store.create_task("child", requested_team="child-scan", task_id="child-scan")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("generic dependency mutation must fail before repository scan")
+
+    monkeypatch.setattr(store, "_dependency_states", forbidden)
+    monkeypatch.setattr(store, "_filesystem_manifest_like_paths", forbidden)
+    monkeypatch.setattr(store, "_filesystem_primary_paths", forbidden)
+    monkeypatch.setattr(store, "_recover_phase4_replacement_unlocked", forbidden)
+
+    with pytest.raises(ValueError, match="explicit dependency mutation"):
+        store.update(
+            child["manifest_path"],
+            lambda state: {**state, "depends_on_task_ids": [parent["task_id"]]},
+        )
+
+
+def test_runtime_config_defaults_to_loopback_three_process_layout(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+
+    assert config.runtime_database == (tmp_path / ".runtime" / "cdpa-control.sqlite3").resolve()
+    assert config.dashboard_api_host == "127.0.0.1"
+    assert config.dashboard_api_port == 9225
+    assert config.dashboard_api_port != config.dashboard_port
+    assert config.command_poll_seconds == 1
+    assert config.heartbeat_seconds == 5
+    assert config.browser_inventory_seconds == 5
+    assert config.repository_allowed_roots == (tmp_path.parent.resolve(),)
+
+
+def test_runtime_config_rejects_non_loopback_api_and_external_database(tmp_path: Path):
     config_path = write_config(tmp_path)
     raw = json.loads(config_path.read_text(encoding="utf-8"))
-    probe = {
-        "dependency": "mcp-g8",
-        "endpoint": "http://127.0.0.1:8101/mcp",
-        "auth_profile": "local_mcp_static_bearer",
-        "required_tools": ["shell_execute"],
-    }
-    probe[field] = value
-    raw["maintenance"]["tooling_probe"] = probe
-    config_path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+    raw["runtime"] = {"database": str(tmp_path.parent / "external.sqlite3")}
+    raw["dashboard"]["api_host"] = "0.0.0.0"
+    raw["dashboard"]["api_port"] = 9225
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
 
-    with pytest.raises(CDPAConfigError, match=message):
+    with pytest.raises(CDPAConfigError, match="api_host"):
         load_cdpa_config(config_path, repository_root=tmp_path)
+
+    raw["dashboard"]["api_host"] = "127.0.0.1"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(CDPAConfigError, match="runtime.database"):
+        load_cdpa_config(config_path, repository_root=tmp_path)
+
+
+def test_noop_manifest_update_performs_no_replace_or_timestamp_write(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_task("noop", requested_team="noop", task_id="task-noop")
+    manifest = Path(state["manifest_path"])
+    before_stat = manifest.stat()
+    before = store.load(manifest)
+
+    returned = store.update(manifest, lambda current: current)
+
+    after_stat = manifest.stat()
+    assert returned == before
+    assert after_stat.st_ino == before_stat.st_ino
+    assert after_stat.st_mtime_ns == before_stat.st_mtime_ns

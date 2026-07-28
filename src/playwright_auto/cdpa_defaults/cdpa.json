@@ -9,7 +9,7 @@
       "AUDIT": "prompts/cdpa/AUDIT.md"
     },
     "response_guide": "prompts/cdpa/RESPONSE_GUIDE.md",
-    "maintainers_constructor": "prompts/cdpa/MAINTAINERS.md"
+    "independent_rule": "prompts/cdpa/INDEPENDENT_RULE.md"
   },
   "roles": [
     "PLAN",
@@ -25,7 +25,9 @@
   "dashboard": {
     "url": "http://127.0.0.1:9224",
     "port": 9224,
-    "poll_seconds": 1
+    "poll_seconds": 1,
+    "api_host": "127.0.0.1",
+    "api_port": 9225
   },
   "worker": {
     "poll_seconds": 1
@@ -37,7 +39,11 @@
     "timeout_seconds": 7200,
     "refresh_after_seconds": 1200,
     "stable_ms": 1000,
-    "poll_ms": 100
+    "poll_ms": 1000
+  },
+  "independent_agents": {
+    "seed_builtins": true,
+    "idle_close_seconds": 1800
   },
   "cleanup": {
     "terminal_idle_seconds": 3600
@@ -54,11 +60,16 @@
       "close_tab": 4
     }
   },
-  "maintenance": {
-    "timeout_seconds": 300,
-    "refresh_after_seconds": 120,
-    "stable_ms": 1000,
-    "poll_ms": 100,
-    "tooling_probe": null
+  "runtime": {
+    "database": ".runtime/cdpa-control.sqlite3",
+    "worker_stale_seconds": 15,
+    "command_poll_seconds": 1,
+    "heartbeat_seconds": 5,
+    "browser_inventory_seconds": 5
+  },
+  "repositories": {
+    "allowed_roots": [
+      ".."
+    ]
   }
 }

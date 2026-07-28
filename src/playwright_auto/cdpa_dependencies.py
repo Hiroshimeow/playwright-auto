@@ -33,6 +33,10 @@ def _parents(task: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(result)
 
 
+def dependency_parent_ids(task: Mapping[str, Any]) -> tuple[str, ...]:
+    return _parents(task)
+
+
 def task_index(tasks: Sequence[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
     result: dict[str, Mapping[str, Any]] = {}
     for task in tasks:

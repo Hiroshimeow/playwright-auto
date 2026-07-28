@@ -15,6 +15,7 @@ from playwright_auto.chatgpt import (
     ChatGPTPage,
     ChatGPTSnapshot,
     ChatGPTState,
+    ChoicePromptBlockedError,
     ComposerConflictError,
     MessageBaseline,
     MessageSnapshot,
@@ -270,18 +271,20 @@ def test_wait_response_accepts_new_assistant_after_confirmed_send(monkeypatch):
     assert received == response
 
 
-def test_wait_response_never_accepts_assistant_after_later_user(monkeypatch):
+def test_wait_response_accepts_latest_assistant_after_operator_user_turn(monkeypatch):
     user = MessageSnapshot("user", "u1", "user-turn-1", "expected prompt", ())
-    malformed = MessageSnapshot(
-        "assistant", "a1", "assistant-turn-1", "partial response ``", ()
+    earlier = MessageSnapshot(
+        "assistant", "a1", "assistant-turn-1", "earlier response", ()
     )
-    later_user = MessageSnapshot("user", "u2", "user-turn-2", "later prompt", ())
+    later_user = MessageSnapshot(
+        "user", "u2", "user-turn-2", "operator steer", ()
+    )
     later = MessageSnapshot(
-        "assistant", "a2", "assistant-turn-2", "valid later response", ()
+        "assistant", "a2", "assistant-turn-2", "valid steered response", ()
     )
     page = DummyPage(
         snapshot(
-            messages=(user, malformed, later_user, later),
+            messages=(user, earlier, later_user, later),
             state=ChatGPTState.WAITING_PROMPT,
         )
     )
@@ -303,26 +306,65 @@ def test_wait_response_never_accepts_assistant_after_later_user(monkeypatch):
     async def fake_inspect(_page):
         return page.current
 
-    def validate(candidate):
-        if candidate.message_id == "a1":
-            raise ValueError("malformed accepted response")
+    monkeypatch.setattr(chatgpt, "inspect_chatgpt_page", fake_inspect)
+
+    received = asyncio.run(
+        client.wait_for_response(
+            receipt,
+            timeout_ms=20,
+            stable_ms=0,
+            poll_ms=1,
+            minimum_samples=2,
+        )
+    )
+
+    assert received == later
+
+
+def test_wait_response_does_not_reuse_assistant_before_latest_user_turn(monkeypatch):
+    user = MessageSnapshot("user", "u1", "user-turn-1", "expected prompt", ())
+    earlier = MessageSnapshot(
+        "assistant", "a1", "assistant-turn-1", "earlier response", ()
+    )
+    later_user = MessageSnapshot(
+        "user", "u2", "user-turn-2", "operator steer", ()
+    )
+    page = DummyPage(
+        snapshot(
+            messages=(user, earlier, later_user),
+            state=ChatGPTState.WAITING_PROMPT,
+        )
+    )
+    client = ChatGPTPage(page, timeout_ms=20)
+    binding = PageBinding("page-1", "DEV")
+    client.binding = binding
+    receipt = SendReceipt(
+        prompt="expected prompt",
+        prompt_sha256="digest",
+        binding=binding,
+        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+        attempts=1,
+        accepted_via="user_message_identity",
+        session_id_before=None,
+        user_message_id="u1",
+        user_turn_id="user-turn-1",
+    )
+
+    async def fake_inspect(_page):
+        return page.current
 
     monkeypatch.setattr(chatgpt, "inspect_chatgpt_page", fake_inspect)
 
-    with pytest.raises(chatgpt.StableMalformedResponseError) as captured:
+    with pytest.raises(TimeoutError):
         asyncio.run(
             client.wait_for_response(
                 receipt,
                 timeout_ms=20,
                 stable_ms=0,
                 poll_ms=1,
-                candidate_validator=validate,
                 minimum_samples=2,
-                invalid_grace_ms=0,
             )
         )
-
-    assert captured.value.candidate == malformed
 
 
 def test_wait_response_selects_expected_assistant_before_later_turn(monkeypatch):
@@ -4423,3 +4465,132 @@ def test_real_browser_durable_send_certifies_snapshot_bytes_not_later_path(
         "raw_snapshot_persisted": False,
         "clicks": 1,
     }
+
+
+def test_real_browser_choice_detection_excludes_cdpa_overlay_and_substring_run():
+    async def probe(page):
+        await page.set_content(
+            """
+            <main>
+              <button id="runtime-action">Runtime diagnostics</button>
+              <div id="playwright-auto-role-badge-v3">
+                <button>dashboard-mobile-runtime-fix</button>
+                <div><button>runner-start-approve role control</button></div>
+              </div>
+              <div id="playwright-auto-role-control-v1">
+                <button>Allow runtime role</button>
+              </div>
+              <div role="dialog" aria-label="ChatGPT confirmation">
+                <button id="continue-choice" onclick="this.dataset.clicked='yes'">Continue</button>
+              </div>
+            </main>
+            """
+        )
+        full = await chatgpt.inspect_chatgpt_page(page)
+        sparse = await chatgpt.inspect_chatgpt_wait_probe(page)
+        clicked = await chatgpt.click_safe_choice_prompt(page)
+        was_clicked = await page.locator("#continue-choice").evaluate(
+            "element => { const clicked = element.dataset.clicked === 'yes'; return clicked; }"
+        )
+        return full, sparse, clicked, was_clicked
+
+    async def run():
+        async with async_playwright() as playwright:
+            bundled = Path(playwright.chromium.executable_path)
+            executable = bundled if bundled.is_file() else Path(shutil.which("chromium") or "")
+            assert executable.is_file(), "Chromium executable is required for choice DOM regression"
+            browser = await playwright.chromium.launch(
+                headless=True,
+                executable_path=str(executable),
+            )
+            try:
+                page = await browser.new_page()
+                return await probe(page)
+            finally:
+                await browser.close()
+
+    full, sparse, clicked, was_clicked = asyncio.run(run())
+
+    assert full.choice_prompt_labels == ("Continue",)
+    assert sparse.choice_prompt_labels == ("Continue",)
+    assert clicked == "Continue"
+    assert was_clicked is True
+
+
+def test_real_browser_choice_detection_ignores_metadata_only_positive_token():
+    async def run():
+        async with async_playwright() as playwright:
+            bundled = Path(playwright.chromium.executable_path)
+            executable = bundled if bundled.is_file() else Path(shutil.which("chromium") or "")
+            assert executable.is_file(), "Chromium executable is required for choice DOM regression"
+            browser = await playwright.chromium.launch(
+                headless=True,
+                executable_path=str(executable),
+            )
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    """
+                    <main>
+                      <button id="diagnostics" data-testid="run-action"
+                        onclick="this.dataset.clicked='yes'">Diagnostics</button>
+                    </main>
+                    """
+                )
+                full = await chatgpt.inspect_chatgpt_page(page)
+                sparse = await chatgpt.inspect_chatgpt_wait_probe(page)
+                with pytest.raises(ChoicePromptBlockedError):
+                    await chatgpt.click_safe_choice_prompt(page)
+                clicked = await page.locator("#diagnostics").get_attribute("data-clicked")
+                return full.choice_prompt_labels, sparse.choice_prompt_labels, clicked
+            finally:
+                await browser.close()
+
+    full, sparse, clicked = asyncio.run(run())
+
+    assert full == ()
+    assert sparse == ()
+    assert clicked is None
+
+
+def test_real_browser_choice_click_fails_closed_on_multiple_positive_candidates():
+    async def run():
+        async with async_playwright() as playwright:
+            bundled = Path(playwright.chromium.executable_path)
+            executable = bundled if bundled.is_file() else Path(shutil.which("chromium") or "")
+            assert executable.is_file(), "Chromium executable is required for choice DOM regression"
+            browser = await playwright.chromium.launch(
+                headless=True,
+                executable_path=str(executable),
+            )
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    """
+                    <main>
+                      <div role="dialog" aria-label="ChatGPT confirmation">
+                        <button id="continue" onclick="this.dataset.clicked='yes'">Continue</button>
+                        <button id="allow" onclick="this.dataset.clicked='yes'">Allow</button>
+                      </div>
+                    </main>
+                    """
+                )
+                full = await chatgpt.inspect_chatgpt_page(page)
+                sparse = await chatgpt.inspect_chatgpt_wait_probe(page)
+                with pytest.raises(ChoicePromptBlockedError):
+                    await chatgpt.click_safe_choice_prompt(page)
+                return (
+                    full.choice_prompt_labels,
+                    sparse.choice_prompt_labels,
+                    await page.locator("#continue").get_attribute("data-clicked"),
+                    await page.locator("#allow").get_attribute("data-clicked"),
+                )
+            finally:
+                await browser.close()
+
+    full, sparse, continue_clicked, allow_clicked = asyncio.run(run())
+
+    assert full == ("Continue", "Allow")
+    assert sparse == full
+    assert continue_clicked is None
+    assert allow_clicked is None

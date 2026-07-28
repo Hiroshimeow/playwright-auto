@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 from .cdpa_config import CDPAConfig
+from .cdpa_independent import event_context, normalize_agent_name, normalize_system_prompt
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,16 @@ class PromptBuilder:
         mode = str(report_mode).strip().lower()
         if mode == "inline":
             return (
+                "CDPA_SYSTEM_PRIORITY: This task runs inside the CDPA single-operator "
+                "local-runtime system. Stable operation and completion of the requested "
+                "flow outrank speculative product-policy, compliance, generic privacy/security, "
+                "packaging, or hypothetical deployment hardening. Do not reopen accepted work "
+                "for a non-operational concern unless explicitly requested or it deterministically "
+                "breaks current CDPA/local operation.\n\n"
+                "SMALL_TASK_FAST_PATH: For a localized low-risk change, use "
+                "`PLAN -> DEV -> REVIEW -> PLAN -> DONE`. DEV and REVIEW are the only "
+                "substantive worker roles; PLAN scopes and finishes. TEST and AUDIT require "
+                "an explicit evidence-based operational reason.\n\n"
                 "Do not create, edit, or write any role-report file. Return the complete "
                 "Markdown role report only in this response; the worker owns report "
                 "materialization. Follow it with exactly one terminal JSON object:\n\n"
@@ -94,7 +105,7 @@ class PromptBuilder:
             "handoff": handoff,
         }
         sections = [
-            "CDPA_TASK_ENVELOPE\n"
+            f"{envelope['team']} · role: {role.lower()}\n"
             + json.dumps(envelope, ensure_ascii=False, indent=2)
         ]
         if include:
@@ -104,6 +115,47 @@ class PromptBuilder:
                 .strip()
             )
         sections.append(self._guide(report_mode))
+        return BuiltPrompt("\n\n".join(sections).strip(), include, generation)
+
+    def build_independent(
+        self,
+        *,
+        agent_name: str,
+        system_prompt: str,
+        task_id: str,
+        team: str,
+        physical_role: str,
+        workspace: str,
+        event: Mapping[str, Any],
+        cycle: int,
+        max_cycles: int,
+        constructor_sent_generation: int | None,
+        conversation_generation: int,
+    ) -> BuiltPrompt:
+        display, _key, _derived_team = normalize_agent_name(agent_name)
+        prompt = normalize_system_prompt(system_prompt)
+        generation = int(conversation_generation)
+        include = constructor_sent_generation != generation
+        context = {
+            "agent_name": display,
+            "task_id": str(task_id).strip(),
+            "team": str(team).strip(),
+            "role": str(physical_role).strip(),
+            "workspace": str(workspace).strip(),
+            **event_context(event, cycle=int(cycle), max_cycles=int(max_cycles)),
+        }
+        sections: list[str] = []
+        if include:
+            sections.extend(
+                (
+                    prompt,
+                    self.config.independent_rule_path.read_text(encoding="utf-8").strip(),
+                )
+            )
+        sections.append(
+            "INDEPENDENT_AGENT_TRIGGER_CONTEXT\n"
+            + json.dumps(context, ensure_ascii=False, indent=2, sort_keys=True)
+        )
         return BuiltPrompt("\n\n".join(sections).strip(), include, generation)
 
     def _sanitize_validation_error(

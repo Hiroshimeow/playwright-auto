@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, fields
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 
-COMMAND_ORIGINS = frozenset({"operator", "maintainers", "worker", "repair_task"})
+COMMAND_ORIGINS = frozenset({"operator", "independent_agent", "worker", "repair_task"})
 COMMAND_STATES = frozenset(
     {"PENDING", "RUNNING", "APPLIED", "INEFFECTIVE", "REJECTED", "SUSPENDED"}
 )
@@ -17,7 +17,6 @@ REPAIR_SOURCE_AREAS = frozenset(
     {
         "cdpa_worker",
         "cdpa_store",
-        "cdpa_maintenance",
         "cdpa_actions",
         "dashboard",
         "dependencies",
@@ -177,6 +176,7 @@ class RepairRequest:
     root_cause_key: str
     root_cause: str
     repository: str
+    repair_repository: str
     incident_id: str
     affected_task_id: str
     affected_team: str
@@ -259,6 +259,7 @@ class RepairRequest:
         root_cause_key: Any,
         root_cause: Any,
         repository: Any,
+        repair_repository: Any,
         incident_id: Any,
         affected_task_id: Any,
         affected_team: Any,
@@ -285,6 +286,11 @@ class RepairRequest:
         )
         repository_value = _bounded_text(
             "request identity repository", repository, REPAIR_REPOSITORY_MAX_CHARS
+        )
+        repair_repository_value = _bounded_text(
+            "request identity repair repository",
+            repair_repository,
+            REPAIR_REPOSITORY_MAX_CHARS,
         )
         incident = _bounded_text(
             "request identity incident", incident_id, REPAIR_IDENTITY_MAX_CHARS
@@ -320,6 +326,7 @@ class RepairRequest:
         if provided_key != expected_key:
             raise ValueError("repair root cause key does not match root cause")
         assert isinstance(repository_value, str)
+        assert isinstance(repair_repository_value, str)
         assert isinstance(incident, str)
         assert isinstance(task_id, str)
         assert isinstance(team, str)
@@ -327,6 +334,7 @@ class RepairRequest:
             root_cause_key=expected_key,
             root_cause=root_cause_value,
             repository=repository_value,
+            repair_repository=repair_repository_value,
             incident_id=incident,
             affected_task_id=task_id,
             affected_team=team,
@@ -355,12 +363,16 @@ class RepairRequest:
         source_areas: Sequence[str],
         required_tests: Sequence[str],
         lesson: str | None,
+        repair_repository: str | None = None,
     ) -> "RepairRequest":
         snapshot = command_snapshot(affected_state)
         return cls._validated(
             root_cause_key=None,
             root_cause=root_cause,
             repository=affected_state.get("repository"),
+            repair_repository=str(
+                repair_repository or affected_state.get("repository") or ""
+            ),
             incident_id=incident_id,
             affected_task_id=affected_state.get("task_id"),
             affected_team=affected_state.get("team"),
@@ -391,6 +403,7 @@ class RepairRequest:
             root_cause_key=value.get("root_cause_key"),
             root_cause=value.get("root_cause"),
             repository=value.get("repository"),
+            repair_repository=value.get("repair_repository"),
             incident_id=value.get("incident_id"),
             affected_task_id=value.get("affected_task_id"),
             affected_team=value.get("affected_team"),
@@ -415,9 +428,10 @@ class RepairRequest:
                 f"Repair CDPA root cause {self.root_cause_key}.",
                 "",
                 "Repository/worktree:",
-                self.repository,
+                self.repair_repository,
                 "",
                 "Affected operation:",
+                f"- repository: {self.repository}",
                 f"- task: {self.affected_task_id}",
                 f"- team: {self.affected_team}",
                 f"- hop: {self.affected_hop_id}",
@@ -460,10 +474,9 @@ class WorkerCommand:
     team: str
     repository: str
     role: str | None
-    incident_id: str | None
-    request_id: str | None
+    source_task_id: str | None
+    source_event_key: str | None
     snapshot: dict[str, Any]
-    repair: RepairRequest | None = None
 
     @classmethod
     def create(
@@ -474,9 +487,8 @@ class WorkerCommand:
         reason: str,
         state: Mapping[str, Any],
         role: str | None = None,
-        incident_id: str | None = None,
-        request_id: str | None = None,
-        repair: RepairRequest | None = None,
+        source_task_id: str | None = None,
+        source_event_key: str | None = None,
     ) -> "WorkerCommand":
         normalized_origin = str(origin).strip().lower()
         normalized_action = str(action).strip().lower()
@@ -491,17 +503,14 @@ class WorkerCommand:
             raise ValueError("worker command identity is incomplete")
         if logical_role == "MAINTAINERS":
             raise ValueError("worker command cannot target Maintainers")
-        incident = str(incident_id or "").strip() or None
-        request = str(request_id or "").strip() or None
-        if (incident is None) != (request is None):
-            raise ValueError("worker command incident provenance requires both IDs")
-        if normalized_origin == "maintainers" and incident is None:
-            raise ValueError("Maintainers command requires incident provenance")
-        if normalized_action == "create_repair_task" and repair is None:
-            raise ValueError("repair task command requires a repair request")
-        if repair is not None:
-            if repair.repository != repository or repair.affected_task_id != task_id:
-                raise ValueError("repair command must target the exact affected repository/task")
+        source_task = str(source_task_id or "").strip() or None
+        source_event = str(source_event_key or "").strip() or None
+        if (source_task is None) != (source_event is None):
+            raise ValueError("worker command agent provenance requires both source fields")
+        if normalized_origin == "independent_agent" and source_task is None:
+            raise ValueError("independent-agent command requires source provenance")
+        if normalized_origin != "independent_agent" and source_task is not None:
+            raise ValueError("only independent-agent commands may carry source provenance")
         snapshot = command_snapshot(state, role=logical_role)
         identity = {
             "origin": normalized_origin,
@@ -511,10 +520,9 @@ class WorkerCommand:
             "team": team,
             "repository": repository,
             "role": logical_role,
-            "incident_id": incident,
-            "request_id": request,
+            "source_task_id": source_task,
+            "source_event_key": source_event,
             "snapshot": snapshot,
-            "repair": repair.to_dict() if repair is not None else None,
         }
         command_id = "cmd-" + _sha_json(identity)[:24]
         return cls(
@@ -526,26 +534,17 @@ class WorkerCommand:
             team=team,
             repository=repository,
             role=logical_role,
-            incident_id=incident,
-            request_id=request,
+            source_task_id=source_task,
+            source_event_key=source_event,
             snapshot=snapshot,
-            repair=repair,
         )
 
     def to_dict(self) -> dict[str, Any]:
-        value = asdict(self)
-        value["repair"] = self.repair.to_dict() if self.repair is not None else None
-        return _json_clone(value)
+        return _json_clone(asdict(self))
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "WorkerCommand":
         data = dict(value)
-        repair_value = data.get("repair")
-        data["repair"] = (
-            RepairRequest.from_dict(repair_value)
-            if isinstance(repair_value, Mapping)
-            else None
-        )
         data["snapshot"] = _json_clone(data.get("snapshot") or {})
         command = cls(**data)
         if command.origin not in COMMAND_ORIGINS:
@@ -590,9 +589,8 @@ class WorkerCommand:
                 "block_code": command.snapshot.get("block_code"),
             },
             role=command.role,
-            incident_id=command.incident_id,
-            request_id=command.request_id,
-            repair=command.repair,
+            source_task_id=command.source_task_id,
+            source_event_key=command.source_event_key,
         )
         # Recomputing from a synthetic state cannot reproduce hashed handoff/receipt, so
         # validate the durable ID directly from the serialized identity instead.
@@ -634,7 +632,7 @@ def validate_worker_command(command: WorkerCommand, state: Mapping[str, Any]) ->
     for field, label in comparisons:
         if current.get(field) != expected.get(field):
             raise ValueError(f"worker command {label} snapshot is stale")
-    if command.origin == "maintainers":
+    if command.origin == "independent_agent":
         if command.action in {"resume", "open_tab", "retry", "restart_role", "new_chat"}:
             if current.get("status") != expected.get("status"):
                 raise ValueError("worker command task status snapshot is stale")

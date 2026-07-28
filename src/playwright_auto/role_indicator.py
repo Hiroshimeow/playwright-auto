@@ -380,7 +380,10 @@ ROLE_INDICATOR_SCRIPT = r"""
           {subtree: true, childList: true, characterData: true}
         );
       }
-      window.setInterval(apply, 500);
+      // Role changes call apply synchronously. This slow safety repair only
+      // restores the badge after an unusual document replacement; it must not
+      // wake every ChatGPT renderer twice per second while responses stream.
+      window.setInterval(apply, 5000);
     };
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", start, {once: true});

@@ -350,6 +350,72 @@ def test_exact_role_team_task_reconciles_despite_stale_recorded_page_id(tmp_path
     assert [snapshot.page_id for _client, snapshot in matches] == ["current"]
 
 
+def test_independent_successor_reuses_recorded_same_team_conversation(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    page = FakePage(
+        page_id="agent-page",
+        role="agent-maintainers-agent",
+        team="agent-maintainers",
+        task_id="agent-old",
+    )
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    actions = CDPATabActions(SimpleNamespace(pages=[page]), config)
+    state = {
+        "task_mode": "independent",
+        "task_id": "agent-new",
+        "team": "agent-maintainers",
+        "reusable_teams": ["agent-maintainers"],
+        "active_hop_id": 1,
+        "hops": [
+            {
+                "hop_id": 1,
+                "target_role": "AGENT",
+                "conversation_url": "https://chatgpt.com/c/test",
+            }
+        ],
+        "roles": {
+            "AGENT": {
+                "physical_role": "agent-maintainers-agent",
+                "page_id": "agent-page",
+                "page_url": "https://chatgpt.com/c/test",
+            }
+        },
+    }
+
+    acquired = asyncio.run(actions.acquire(state, "AGENT"))
+
+    assert acquired.page_id == "agent-page"
+    assert acquired.new_chat is False
+    assert acquired.client.preflight_calls == ["agent-new"]
+    assert acquired.client.bind_calls == [("agent-new", "agent-maintainers")]
+    assert page.snapshot_value.page_task_id == "agent-new"
+
+
+def test_independent_preflight_matches_recorded_page_across_respawn(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    page = FakePage(
+        page_id="agent-page",
+        role="agent-maintainers-agent",
+        team="agent-maintainers",
+        task_id="agent-old",
+    )
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    actions = CDPATabActions(SimpleNamespace(pages=[page]), config)
+    state = {
+        "task_mode": "independent",
+        "task_id": "agent-new",
+        "team": "agent-maintainers",
+        "roles": {
+            "AGENT": {
+                "physical_role": "agent-maintainers-agent",
+                "page_id": "agent-page",
+            }
+        },
+    }
+
+    assert asyncio.run(actions.preflight_team(state)) == [page]
+
+
 def test_recorded_page_requires_matching_team_and_task_identity(tmp_path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     pages = [
@@ -597,3 +663,112 @@ def test_global_maintainer_opens_role_without_task_binding(tmp_path, monkeypatch
     assert acquired.client.page.snapshot_value.page_role == "MAINTAINERS"
     assert acquired.client.page.snapshot_value.page_team is None
     assert acquired.client.page.snapshot_value.page_task_id is None
+
+
+def test_reopen_accepted_waiting_skips_clean_composer_requirement(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    monkeypatch.setattr(
+        actions_module,
+        "random_delay",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+    actions = CDPATabActions(FakeContext(), config)
+    state = manifest(
+        page_id="closed-page",
+        page_url="https://chatgpt.com/c/exact-conversation",
+        conversation_url="https://chatgpt.com/c/exact-conversation",
+    )
+
+    reopened = asyncio.run(
+        actions.reopen(state, "PLAN", require_clean_ready=False)
+    )
+
+    assert reopened.url == "https://chatgpt.com/c/exact-conversation"
+    assert reopened.client.clean_ready_calls == []
+
+
+def test_reopen_repairs_wrong_url_on_existing_exact_owned_tab(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    existing = FakePage(
+        page_id="closed-page",
+        role="PLAN",
+        team="new-team",
+        task_id="task-1",
+    )
+    existing.url = "https://chatgpt.com/c/wrong-conversation"
+    existing.snapshot_value.url = existing.url
+    context = FakeContext([existing])
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    actions = CDPATabActions(context, config)
+    state = manifest(
+        page_id="closed-page",
+        page_url="https://chatgpt.com/c/exact-conversation",
+        conversation_url="https://chatgpt.com/c/exact-conversation",
+    )
+
+    reopened = asyncio.run(
+        actions.reopen(state, "PLAN", require_clean_ready=False)
+    )
+
+    assert reopened.created is False
+    assert reopened.page_id == "closed-page"
+    assert reopened.url == "https://chatgpt.com/c/exact-conversation"
+    assert existing.url == "https://chatgpt.com/c/exact-conversation"
+    assert existing.front is True
+
+
+def test_reopen_uses_exact_role_url_when_active_hop_url_is_temporary(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    monkeypatch.setattr(
+        actions_module,
+        "random_delay",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+    actions = CDPATabActions(FakeContext(), config)
+    state = manifest(
+        page_id="closed-page",
+        page_url="https://chatgpt.com/c/exact-from-role",
+        conversation_url="https://chatgpt.com/c/WEB:temporary-id",
+    )
+
+    reopened = asyncio.run(
+        actions.reopen(state, "PLAN", require_clean_ready=False)
+    )
+
+    assert reopened.url == "https://chatgpt.com/c/exact-from-role"
+    assert reopened.client.clean_ready_calls == []
+
+
+def test_reopen_restores_recorded_page_id_on_existing_exact_conversation(
+    tmp_path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    existing = FakePage(
+        page_id="live-drifted-page",
+        role="PLAN",
+        team="new-team",
+        task_id="task-1",
+    )
+    existing.url = "https://chatgpt.com/c/exact-conversation"
+    existing.snapshot_value.url = existing.url
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    actions = CDPATabActions(FakeContext([existing]), config)
+    state = manifest(
+        page_id="recorded-accepted-page",
+        page_url="https://chatgpt.com/c/exact-conversation",
+        conversation_url="https://chatgpt.com/c/exact-conversation",
+    )
+
+    reopened = asyncio.run(
+        actions.reopen(state, "PLAN", require_clean_ready=False)
+    )
+
+    assert reopened.created is False
+    assert reopened.page_id == "recorded-accepted-page"
+    assert reopened.url == "https://chatgpt.com/c/exact-conversation"
+    assert reopened.client.binding.page_id == "recorded-accepted-page"
+    assert existing.snapshot_value.page_id == "recorded-accepted-page"
+    assert existing.front is True

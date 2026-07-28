@@ -1,94 +1,151 @@
 from pathlib import Path
 
-
-ROOT = Path(__file__).resolve().parents[1]
-RUNTIME_PROMPT = ROOT / "prompts" / "cdpa" / "MAINTAINERS.md"
-PACKAGED_PROMPT = (
-    ROOT
-    / "src"
-    / "playwright_auto"
-    / "cdpa_defaults"
-    / "prompts"
-    / "cdpa"
-    / "MAINTAINERS.md"
+from playwright_auto.cdpa_independent import (
+    BUILTIN_MAINTAINERS_PROMPT,
+    BUILTIN_MONITOR_PROMPT,
 )
 
 
-def test_maintainers_prompt_states_recovery_boundary_and_lesson_rule():
-    prompt = RUNTIME_PROMPT.read_text(encoding="utf-8")
-
-    assert PACKAGED_PROMPT.read_text(encoding="utf-8") == prompt
-    assert "recover, diagnose, prevent recurrence, and delegate repairs" in prompt
-    assert "smallest safe action" in prompt
-    assert "worker alone validates and applies" in prompt
-    assert "without waiting for user approval" in prompt
-    assert "verified role-offline true list" in prompt
-    assert "call the affected team through ROUTE_PLAN" in prompt
-    assert "PLAN selects DEV, TEST, REVIEW, or AUDIT" in prompt
-    assert "worker automatically appends" in prompt
-    assert "not already present in CURRENT LEARNING.md" in prompt
-    assert "Use `null` only when no new reusable lesson exists" in prompt
-    assert "repository-root `PROBLEM.md`" in prompt
-    assert "one stable root cause rather than one entry per incident" in prompt
-    assert "Do not record an intentional operator action itself as a problem" in prompt
-    assert "include an exact `PROBLEM.md update` section" in prompt
-    assert "never claim that the file changed when it did not" in prompt
+ROOT = Path(__file__).resolve().parents[1]
+PROMPT_ROOTS = (
+    ROOT / "prompts" / "cdpa",
+    ROOT / "src" / "playwright_auto" / "cdpa_defaults" / "prompts" / "cdpa",
+)
+LEARNING_COMMAND = "uv run python -m playwright_auto.cdpa_learning"
 
 
-def test_maintainers_prompt_states_autonomy_repair_and_operator_invariants():
-    prompt = RUNTIME_PROMPT.read_text(encoding="utf-8")
+def prompt(name: str) -> str:
+    runtime = (PROMPT_ROOTS[0] / name).read_text(encoding="utf-8")
+    packaged = (PROMPT_ROOTS[1] / name).read_text(encoding="utf-8")
+    assert packaged == runtime
+    return runtime
 
-    assert "default recovery authority" in prompt
-    assert "accepted-send receipts" in prompt
-    assert "at most three" in prompt
-    assert "CONTINUE_IN_PARALLEL" in prompt
-    assert "HOLD_FOR_REPAIR" in prompt
-    assert "operator Pause, Stop, Restart role, New Chat, Clear Team" in prompt
-    assert "at most three evidence-recorded attempts" in prompt
-    assert "bounded CDP round trip" in prompt
-    assert "MCP/tooling is distinct" in prompt
-    assert "preflighted by the worker before browser acquisition or Send" in prompt
-    assert "auth-profile reference" in prompt
-    assert "credentials remain worker-runtime-only" in prompt
-    assert "authenticated Streamable HTTP lifecycle" in prompt
-    assert "performs `initialize`" in prompt
-    assert "only when the server returns a session ID" in prompt
-    assert "accepts only an empty successful notification response" in prompt
-    assert "verifies `tools/list` contains every required capability" in prompt
-    assert "requires successful deletion of that temporary session" in prompt
-    assert "Stateless servers use `initialize` followed directly by `tools/list`" in prompt
-    assert "bounded no-redirect probe of the exact relevant endpoint" in prompt
-    assert "Repair creation is valid only through the version-2 top-level `repair` object" in prompt
-    assert "Never emit `CREATE_REPAIR_TASK` as a legacy action or as a recovery step" in prompt
-    assert "root cause and reason are at most 1200 characters each" in prompt
-    assert "reproduction is at most 2400 characters" in prompt
-    assert "source areas contain 1–8 allowlisted values" in prompt
-    assert "required tests contain 1–16 one-line items" in prompt
-    assert "lesson is null or one paragraph of at most 600 characters" in prompt
-    assert "Every declared textual field must already be a JSON string" in prompt
-    assert "checks the raw array length before trimming" in prompt
-    assert "requires every item to be a string" in prompt
-    assert "rejects exact duplicates" in prompt
-    assert "become duplicates after trimming" in prompt
-    assert "never repairs malformed input with `str()` coercion or silent duplicate collapse" in prompt
-    assert "sanitized allowlisted projection" in prompt
-    assert "URL path credentials are secret material too" in prompt
-    assert "exact or tokenized compound high-risk route markers" in prompt
-    assert "camelCase/acronym boundaries are canonicalized" in prompt
-    assert "bounded exact credential-operation grammar" in prompt
-    assert "explicit qualifier+noun pairs" in prompt
-    assert "explicit operation+suffix rules" in prompt
-    assert "exact compact identities only" in prompt
-    assert "generic prefix, suffix, and substring matching are forbidden" in prompt
-    assert "marker segment itself and every remaining non-empty path segment" in prompt
-    assert "including bare markers and marker-plus-payload forms" in prompt
-    assert "static intermediary labels, version segments, callbacks" in prompt
-    assert "unprobeable without an explicit worker-owned secret-free descriptor" in prompt
-    assert "exception-derived block, waiting, role, hop, refresh, cleanup" in prompt
-    assert "dashboard operational projections sanitize them again" in prompt
-    assert "excludes stored full Maintainers prompts plus raw evidence arrays" in prompt
-    assert "keep the incident suspended rather than persisting or probing the secret-bearing URL" in prompt
-    assert "unallowlisted descriptors" in prompt
-    assert "unrelated HTTP success are never recovery evidence" in prompt
-    assert "repair DONE" in prompt
-    assert '"version":2' in prompt
+
+def test_maintainers_prompt_uses_direct_shared_independent_controls():
+    text = prompt("MAINTAINERS.md")
+    assert BUILTIN_MAINTAINERS_PROMPT == text.rstrip("\n")
+
+    for required in (
+        "normal one-agent CDPA task",
+        "independent_task_control",
+        "independent_create_repair",
+        "independent_continue",
+        "independent_complete",
+        "no more than five",
+        "HOLD_FOR_REPAIR",
+        "CONTINUE_IN_PARALLEL",
+        "accepted-send receipt",
+        "operator Pause, Stop, Clear Team, Restart role, or New Chat",
+        "SUCCESS",
+        "NO_ACTION",
+        "REPAIR_REQUIRED",
+        "OPERATOR_REQUIRED",
+    ):
+        assert required in text
+
+    for retired in (
+        '"version":2',
+        "CREATE_REPAIR_TASK",
+        "REPLACE_TASK",
+        "worker alone validates and applies the proposal",
+        "maintenance decision JSON v1",
+    ):
+        assert retired not in text
+
+    assert "Never emit route JSON, maintenance decision JSON, recovery arrays" in text
+    assert "single-operator local runtime" in text
+    assert "trusted-local metadata visibility" in text
+    assert "single-operator local runtime" in BUILTIN_MAINTAINERS_PROMPT
+    assert "generic privacy/security" in BUILTIN_MAINTAINERS_PROMPT
+    assert "independent_task_control" in BUILTIN_MAINTAINERS_PROMPT
+    assert "independent_create_repair" in BUILTIN_MAINTAINERS_PROMPT
+    assert "route/action JSON" in BUILTIN_MAINTAINERS_PROMPT
+
+
+def test_monitor_prompt_uses_the_same_engine_and_dispatcher():
+    text = prompt("MONITOR.md")
+
+    for required in (
+        "same one-agent CDPA task engine",
+        "independent_activate_agent",
+        "immutable agent name",
+        "independent_continue",
+        "independent_complete",
+        "CHECK_ALL",
+        "not a coordinator, sidecar, scheduler, or routing role",
+    ):
+        assert required in text
+
+    assert "single-operator local runtime" in text
+    assert "Trusted-local metadata visibility is not an incident" in text
+    assert "single-operator local runtime" in BUILTIN_MONITOR_PROMPT
+    assert "generic privacy/security" in BUILTIN_MONITOR_PROMPT
+    assert "independent_activate_agent" in BUILTIN_MONITOR_PROMPT
+    assert "second scheduler" in BUILTIN_MONITOR_PROMPT
+    assert "action JSON" in BUILTIN_MONITOR_PROMPT
+
+
+
+def test_maintainers_prompt_requires_bounded_evidence_backed_learning():
+    text = prompt("MAINTAINERS.md")
+
+    for required in (
+        "one bounded post-incident learning pass",
+        "only after the operational outcome is verified",
+        "Facts, Inference, and Proposed reusable rule",
+        "same root cause in retained evidence",
+        "deterministic invariant or regression",
+        "SKIPPED — insufficient reusable evidence",
+        "prefer revising the matching lesson over adding a duplicate",
+        "REVISED",
+        "SUPERSEDED",
+        "not an incident log",
+        "secrets, credentials, raw paths, transient IDs, or timestamps",
+        "read repository-root `LEARNING.md` immediately before mutation",
+        "bounded exact-content section or bullet edit",
+        "reject stale or conflicting target content",
+        "preserve unrelated concurrent edits",
+        "read back and validate UTF-8, Markdown structure, repository containment",
+        "Repair creation and learning are separate decisions",
+    ):
+        assert required in text
+
+    assert text.count("one bounded post-incident learning pass") == 1
+    assert "Improver" not in text
+    assert "second memory store" not in text
+    assert "approval engine" not in text
+    assert "special scheduler" not in text
+
+
+def test_plan_and_maintainers_use_one_shared_learning_mutation_boundary():
+    agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    plan = prompt("PLAN.md")
+    maintainers = prompt("MAINTAINERS.md")
+
+    for text in (agents, plan, maintainers):
+        assert LEARNING_COMMAND in text
+        assert "generic file tools" in text
+        for field in ("disposition", "old_text", "new_text"):
+            assert field in text
+    assert "@mcp-g8 edit_file" not in maintainers
+    assert "using existing `@mcp-g8` file tools" not in maintainers
+
+
+def test_builtin_maintainers_prompt_preserves_the_same_learning_contract():
+    for required in (
+        "operational outcome is verified",
+        "one bounded learning pass",
+        "same root cause in retained evidence",
+        "deterministic invariant or regression",
+        "SKIPPED — insufficient reusable evidence",
+        "prefer revising the matching lesson over adding a duplicate",
+        "REVISED",
+        "SUPERSEDED",
+        "read repository-root `LEARNING.md` immediately before mutation",
+        "bounded exact-content section or bullet edit",
+        "reject stale or conflicting target content",
+        "preserve unrelated concurrent edits",
+        "read back and validate",
+        "Repair creation and learning are separate decisions",
+    ):
+        assert required in BUILTIN_MAINTAINERS_PROMPT

@@ -39,6 +39,16 @@ module.exports = {
       restart_delay: 1000,
     },
     {
+      name: "playwright-dashboard-api",
+      cwd: root,
+      script: path.join(root, "scripts/dashboard-api-start.sh"),
+      interpreter: "/bin/bash",
+      autorestart: true,
+      min_uptime: "5s",
+      max_restarts: 20,
+      restart_delay: 1000,
+    },
+    {
       name: "playwright-dashboard",
       cwd: root,
       script: path.join(root, "scripts/dashboard-start.sh"),

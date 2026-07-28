@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,7 +17,10 @@ from playwright_auto.cdpa_actions import (
     TeamCloseError,
 )
 from playwright_auto.cdpa_config import load_cdpa_config
-from playwright_auto.cdpa_maintenance import ensure_maintenance_incident
+from playwright_auto.cdpa_independent import (
+    canonical_independent_events,
+    validate_trigger_settings,
+)
 from playwright_auto.cdpa_routes import RouteContractError
 from playwright_auto.cdpa_store import TaskStore, utc_now
 from playwright_auto.cdpa_worker import CDPAWorker, _active_hop, _report_mode
@@ -44,6 +48,29 @@ from test_cdpa_core import (
     poison_catalog_identity_entry,
     write_config,
 )
+
+
+def canonical_recovery_events(state: dict) -> list[dict]:
+    agent = {
+        "task_mode": "independent",
+        "task_id": "agent-test-maintainers-g1",
+        "team": "agent-test-maintainers",
+        "status": "WAITING",
+        "independent": {
+            "agent_name": "Test Maintainers",
+            "agent_key": "test maintainers",
+            "enabled": True,
+            "trigger_settings": validate_trigger_settings({"recovery": True}),
+            "active_event": None,
+            "watermarks": {"seen_event_keys": []},
+            "occurrence_counts": {},
+        },
+    }
+    return [
+        event
+        for event in canonical_independent_events(agent, [state, agent])
+        if event["trigger_type"] == "recovery"
+    ]
 
 
 class FakeActions:
@@ -331,8 +358,11 @@ def test_pre_send_lazily_acquires_only_plan_and_persists_constructor(tmp_path: P
     assert "Constructor for PLAN" in hop["prompt"]
     assert ".plan/alpha/alpha-plan_turn1_task-a.md" not in hop["prompt"]
     assert ".plan/<team>/<physical-role>_turn<N>_<task-id>.md" in hop["prompt"]
+    assert hop["prompt"].startswith("alpha · role: plan\n{")
     envelope = json.loads(
-        hop["prompt"].split("\n\n# PLAN", 1)[0].removeprefix("CDPA_TASK_ENVELOPE\n")
+        hop["prompt"].split("\n\n# PLAN", 1)[0].removeprefix(
+            "alpha · role: plan\n"
+        )
     )
     assert envelope == {
         "title": "Implement exact production behavior",
@@ -361,6 +391,7 @@ def test_normal_cdpa_send_keeps_transport_identity_out_of_actual_payload(tmp_pat
 
     record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
     assert client.send_calls == [hop["prompt"]]
+    assert client.send_calls[0].startswith("alpha · role: plan\n{")
     assert hop["receipt"]["prompt"] == hop["prompt"]
     assert record is not None
     assert record.rendered_prompt == hop["prompt"]
@@ -442,6 +473,73 @@ def test_valid_report_routes_to_lazy_dev_child_and_records_sha(tmp_path: Path):
     assert len(state["reports"][0]["sha256"]) == 64
 
 
+def test_cross_repository_task_routes_reports_from_control_plane_plan_root(
+    tmp_path: Path,
+):
+    control_root = tmp_path / "control"
+    target_root = tmp_path / "target"
+    control_root.mkdir(parents=True)
+    target_root.mkdir(parents=True)
+    config = load_cdpa_config(
+        write_config(control_root), repository_root=control_root
+    )
+    store = TaskStore(config)
+    state = store.create_task(
+        "Cross repository task",
+        requested_team="alpha",
+        task_id="task-cross-repo",
+        repository=target_root,
+    )
+    worker = CDPAWorker(config, store=store)
+
+    plan_hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, plan_hop, FakeActions()))
+    plan_report = (
+        control_root
+        / ".plan"
+        / "alpha"
+        / "alpha-plan_turn1_task-cross-repo.md"
+    )
+    plan_report.parent.mkdir(parents=True, exist_ok=True)
+    plan_report.write_text("plan evidence", encoding="utf-8")
+    plan_hop["response"] = (
+        '{"route":"DEV","handoff":'
+        '".plan/alpha/alpha-plan_turn1_task-cross-repo.md"}'
+    )
+    plan_hop["state"] = "responded"
+
+    worker._responded(state, plan_hop)
+
+    dev_hop = _active_hop(state)
+    assert plan_hop["state"] == "routed"
+    assert plan_hop["report_path"] == str(plan_report.resolve())
+    assert dev_hop["target_role"] == "DEV"
+    assert state["repository"] == str(target_root.resolve())
+
+    asyncio.run(worker._pre_send(state, dev_hop, FakeActions()))
+    dev_report = (
+        control_root
+        / ".plan"
+        / "alpha"
+        / "alpha-dev_turn1_task-cross-repo.md"
+    )
+    dev_report.write_text("dev evidence", encoding="utf-8")
+    dev_hop["response"] = (
+        '{"route":"TEST","handoff":'
+        '".plan/alpha/alpha-dev_turn1_task-cross-repo.md"}'
+    )
+    dev_hop["state"] = "responded"
+
+    worker._responded(state, dev_hop)
+
+    test_hop = _active_hop(state)
+    assert dev_hop["state"] == "routed"
+    assert dev_hop["route"] == "TEST"
+    assert dev_hop["report_path"] == str(dev_report.resolve())
+    assert test_hop["target_role"] == "TEST"
+    assert test_hop["handoff"] == ".plan/alpha/alpha-dev_turn1_task-cross-repo.md"
+
+
 def test_successful_route_clears_stale_block_state(tmp_path: Path):
     _, _, state, worker = setup_task(tmp_path)
     hop = _active_hop(state)
@@ -486,6 +584,708 @@ def test_malformed_response_creates_same_turn_guide_only_repair(tmp_path: Path):
     assert repair["handoff"] == "route repair"
 
 
+@pytest.mark.parametrize("role", ["PLAN", "DEV", "TEST", "REVIEW"])
+def test_identical_missing_file_repair_routes_once_to_plan_without_replay(
+    tmp_path: Path,
+    role: str,
+):
+    _, _, state, worker = setup_task(
+        tmp_path,
+        task_id=f"task-missing-report-{role.lower()}",
+    )
+    retained_path = ".plan/alpha/retained-report.md"
+    state["reports"] = [
+        {
+            "report_id": 1,
+            "role": "PLAN",
+            "physical_role": "alpha-plan",
+            "turn": 1,
+            "path": retained_path,
+            "sha256": "a" * 64,
+            "size": 17,
+            "created_at": utc_now(),
+        }
+    ]
+    reports_before = json.loads(json.dumps(state["reports"]))
+    if role == "PLAN":
+        hop = _active_hop(state)
+    else:
+        parent = _active_hop(state)
+        parent["state"] = "routed"
+        parent["route"] = role
+        hop = worker._append_hop(
+            state,
+            source_role="PLAN",
+            target_role=role,
+            handoff=retained_path,
+        )
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    response = json.dumps(
+        {"route": "PLAN", "handoff": hop["expected_report_path"]},
+        separators=(",", ":"),
+    )
+    response_sha256 = worker_module.hashlib.sha256(response.encode("utf-8")).hexdigest()
+    hop.update(
+        state="responded",
+        response=response,
+        response_sha256=response_sha256,
+        message_identity={"message_id": "assistant-first", "turn_id": "turn-first"},
+        receipt={"user_message_id": "user-first", "user_turn_id": "user-turn-first"},
+        conversation_url="https://chatgpt.com/c/exact-missing-file",
+    )
+
+    worker._responded(state, hop)
+
+    repair = _active_hop(state)
+    assert repair["kind"] == "route_repair"
+    asyncio.run(worker._pre_send(state, repair, FakeActions()))
+    repair.update(
+        state="responded",
+        response=response,
+        response_sha256=response_sha256,
+        message_identity={"message_id": "assistant-repair", "turn_id": "turn-repair"},
+        receipt={"user_message_id": "user-repair", "user_turn_id": "user-turn-repair"},
+        conversation_url="https://chatgpt.com/c/exact-missing-file",
+    )
+    preserved = {
+        key: json.loads(json.dumps(repair.get(key)))
+        for key in (
+            "request_id",
+            "receipt",
+            "message_identity",
+            "response",
+            "response_sha256",
+            "conversation_url",
+        )
+    }
+
+    worker._responded(state, repair)
+
+    continuation = _active_hop(state)
+    assert repair["state"] == "abandoned"
+    assert continuation["target_role"] == "PLAN"
+    assert continuation["handoff"] == retained_path
+    assert continuation["request_id"] != repair["request_id"]
+    assert state["reports"] == reports_before
+    assert {
+        item["hop_id"]
+        for item in state["hops"]
+        if item.get("kind") == "route_repair"
+    } == {repair["hop_id"]}
+    assert state["route_timeline"][-1]["kind"] == "missing_file_fallback"
+    assert not (tmp_path / repair["expected_report_path"]).exists()
+    for key, value in preserved.items():
+        assert repair.get(key) == value
+
+
+def test_repeated_plan_missing_file_fallback_blocks_once_and_restart_is_idempotent(
+    tmp_path: Path,
+):
+    _, store, state, worker = setup_task(
+        tmp_path,
+        task_id="task-missing-report-fallback-ceiling",
+    )
+    path = Path(state["manifest_path"])
+    retained_path = ".plan/alpha/retained-fallback-ceiling.md"
+    state["reports"] = [
+        {
+            "report_id": 1,
+            "role": "PLAN",
+            "physical_role": "alpha-plan",
+            "turn": 1,
+            "path": retained_path,
+            "sha256": "e" * 64,
+            "size": 27,
+            "created_at": utc_now(),
+        }
+    ]
+    reports_before = json.loads(json.dumps(state["reports"]))
+    conversation = "https://chatgpt.com/c/fallback-ceiling"
+
+    first = _active_hop(state)
+    asyncio.run(worker._pre_send(state, first, FakeActions()))
+    first_response = json.dumps(
+        {"route": "PLAN", "handoff": first["expected_report_path"]},
+        separators=(",", ":"),
+    )
+    first.update(
+        state="responded",
+        response=first_response,
+        response_sha256=worker_module.hashlib.sha256(
+            first_response.encode("utf-8")
+        ).hexdigest(),
+        conversation_url=conversation,
+    )
+    worker._responded(state, first)
+    first_repair = _active_hop(state)
+    asyncio.run(worker._pre_send(state, first_repair, FakeActions()))
+    first_repair.update(
+        state="responded",
+        response=first_response,
+        response_sha256=first["response_sha256"],
+        conversation_url=conversation,
+    )
+    worker._responded(state, first_repair)
+
+    continuation = _active_hop(state)
+    assert continuation["kind"] == "missing_file_fallback"
+    asyncio.run(worker._pre_send(state, continuation, FakeActions()))
+    second_response = json.dumps(
+        {"route": "PLAN", "handoff": continuation["expected_report_path"]},
+        separators=(",", ":"),
+    )
+    continuation.update(
+        state="responded",
+        response=second_response,
+        response_sha256=worker_module.hashlib.sha256(
+            second_response.encode("utf-8")
+        ).hexdigest(),
+        conversation_url=conversation,
+    )
+    worker._responded(state, continuation)
+    second_repair = _active_hop(state)
+    asyncio.run(worker._pre_send(state, second_repair, FakeActions()))
+
+    ledger = RequestLedger(second_repair["ledger_path"])
+    record = ledger.begin(
+        role=second_repair["physical_role"],
+        prompt=second_repair["prompt"],
+        request_id=second_repair["request_id"],
+        render_request_marker=False,
+    )
+    baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
+    receipt = SendReceipt(
+        prompt=second_repair["prompt"],
+        prompt_sha256=prompt_digest(second_repair["prompt"]),
+        binding=PageBinding("page-alpha-plan", "alpha-plan"),
+        baseline=baseline,
+        attempts=1,
+        accepted_via="user_message_identity",
+        session_id_before="fallback-ceiling",
+        user_message_id="user-fallback-ceiling",
+        user_turn_id="user-turn-fallback-ceiling",
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=receipt.binding,
+        baseline=baseline,
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENT,
+        accepted_at=2.0,
+        receipt=receipt.to_dict(),
+    )
+    second_repair["receipt"] = receipt.to_dict()
+    second_repair["conversation_url"] = conversation
+    worker._record_response(
+        state,
+        second_repair,
+        MessageSnapshot(
+            "assistant",
+            "assistant-fallback-ceiling",
+            "assistant-turn-fallback-ceiling",
+            second_response,
+            (),
+        ),
+    )
+    preserved = {
+        key: json.loads(json.dumps(second_repair.get(key)))
+        for key in (
+            "request_id",
+            "receipt",
+            "message_identity",
+            "response",
+            "response_sha256",
+            "conversation_url",
+        )
+    }
+    hop_ids_before = {item["hop_id"] for item in state["hops"]}
+
+    worker._responded(state, second_repair)
+
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "report_materialization_unavailable"
+    assert state["block_retryable"] is False
+    assert state["active_hop_id"] == second_repair["hop_id"]
+    assert {item["hop_id"] for item in state["hops"]} == hop_ids_before
+    assert sum(
+        item.get("kind") == "missing_file_fallback" for item in state["hops"]
+    ) == 1
+    assert sum(item.get("kind") == "route_repair" for item in state["hops"]) == 2
+    assert state["reports"] == reports_before
+    for key, value in preserved.items():
+        assert second_repair.get(key) == value
+    completed = ledger.get(second_repair["request_id"])
+    assert completed is not None
+    assert completed.status is RequestStatus.COMPLETED
+    assert completed.receipt == receipt.to_dict()
+    assert completed.response["message_id"] == "assistant-fallback-ceiling"
+
+    persisted = store.save(path, state)
+    manifest_before = path.read_bytes()
+    restarted = CDPAWorker(worker.config, store=store)
+    result = asyncio.run(
+        restarted.advance(
+            path,
+            SimpleNamespace(pages=[]),
+            scheduling_tasks=[persisted],
+        )
+    )
+
+    assert result == persisted
+    assert path.read_bytes() == manifest_before
+    assert len(result["hops"]) == len(persisted["hops"])
+    assert ledger.get(second_repair["request_id"]) == completed
+
+
+def test_changed_conversation_cannot_reset_missing_file_fallback_ceiling(
+    tmp_path: Path,
+):
+    _, store, state, worker = setup_task(
+        tmp_path,
+        task_id="task-missing-report-changed-conversation-ceiling",
+    )
+    path = Path(state["manifest_path"])
+    retained_path = ".plan/alpha/retained-changed-conversation.md"
+    state["reports"] = [
+        {
+            "report_id": 1,
+            "role": "PLAN",
+            "physical_role": "alpha-plan",
+            "turn": 1,
+            "path": retained_path,
+            "sha256": "f" * 64,
+            "size": 31,
+            "created_at": utc_now(),
+        }
+    ]
+    reports_before = json.loads(json.dumps(state["reports"]))
+    conversation_a = "https://chatgpt.com/c/fallback-ancestry-a"
+    conversation_b = "https://chatgpt.com/c/fallback-ancestry-b"
+
+    def respond_missing(hop: dict[str, Any], conversation: str, suffix: str) -> str:
+        asyncio.run(worker._pre_send(state, hop, FakeActions()))
+        response = json.dumps(
+            {"route": "PLAN", "handoff": hop["expected_report_path"]},
+            separators=(",", ":"),
+        )
+        hop.update(
+            state="responded",
+            response=response,
+            response_sha256=worker_module.hashlib.sha256(
+                response.encode("utf-8")
+            ).hexdigest(),
+            message_identity={
+                "message_id": f"assistant-{suffix}",
+                "turn_id": f"assistant-turn-{suffix}",
+            },
+            receipt={
+                "user_message_id": f"user-{suffix}",
+                "user_turn_id": f"user-turn-{suffix}",
+            },
+            conversation_url=conversation,
+        )
+        worker._responded(state, hop)
+        return response
+
+    first = _active_hop(state)
+    respond_missing(first, conversation_a, "first")
+    first_repair = _active_hop(state)
+    respond_missing(first_repair, conversation_a, "first-repair")
+
+    fallback = _active_hop(state)
+    assert fallback["kind"] == "missing_file_fallback"
+    second_response = respond_missing(fallback, conversation_a, "fallback")
+
+    changed_conversation_repair = _active_hop(state)
+    assert changed_conversation_repair["kind"] == "route_repair"
+    asyncio.run(worker._pre_send(state, changed_conversation_repair, FakeActions()))
+    changed_conversation_repair.update(
+        state="responded",
+        response=second_response,
+        response_sha256=worker_module.hashlib.sha256(
+            second_response.encode("utf-8")
+        ).hexdigest(),
+        conversation_url=conversation_b,
+    )
+    worker._responded(state, changed_conversation_repair)
+
+    retry = _active_hop(state)
+    assert retry["kind"] == "route_repair"
+    assert retry["repair_attempt"] == 2
+    assert retry["parent_hop_id"] == changed_conversation_repair["hop_id"]
+    asyncio.run(worker._pre_send(state, retry, FakeActions()))
+    ledger = RequestLedger(retry["ledger_path"])
+    record = ledger.begin(
+        role=retry["physical_role"],
+        prompt=retry["prompt"],
+        request_id=retry["request_id"],
+        render_request_marker=False,
+    )
+    baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
+    receipt = SendReceipt(
+        prompt=retry["prompt"],
+        prompt_sha256=prompt_digest(retry["prompt"]),
+        binding=PageBinding("page-alpha-plan", "alpha-plan"),
+        baseline=baseline,
+        attempts=1,
+        accepted_via="user_message_identity",
+        session_id_before="fallback-ancestry",
+        user_message_id="user-fallback-ancestry",
+        user_turn_id="user-turn-fallback-ancestry",
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=receipt.binding,
+        baseline=baseline,
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENT,
+        accepted_at=3.0,
+        receipt=receipt.to_dict(),
+    )
+    retry["receipt"] = receipt.to_dict()
+    retry["conversation_url"] = conversation_b
+    worker._record_response(
+        state,
+        retry,
+        MessageSnapshot(
+            "assistant",
+            "assistant-fallback-ancestry",
+            "assistant-turn-fallback-ancestry",
+            second_response,
+            (),
+        ),
+    )
+    preserved = {
+        key: json.loads(json.dumps(retry.get(key)))
+        for key in (
+            "request_id",
+            "receipt",
+            "message_identity",
+            "response",
+            "response_sha256",
+            "conversation_url",
+        )
+    }
+    hop_ids_before = {item["hop_id"] for item in state["hops"]}
+
+    worker._responded(state, retry)
+
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "report_materialization_unavailable"
+    assert state["block_retryable"] is False
+    assert state["active_hop_id"] == retry["hop_id"]
+    assert {item["hop_id"] for item in state["hops"]} == hop_ids_before
+    assert sum(
+        item.get("kind") == "missing_file_fallback" for item in state["hops"]
+    ) == 1
+    assert sum(item.get("kind") == "route_repair" for item in state["hops"]) == 3
+    assert state["reports"] == reports_before
+    for key, value in preserved.items():
+        assert retry.get(key) == value
+    completed = ledger.get(retry["request_id"])
+    assert completed is not None
+    assert completed.status is RequestStatus.COMPLETED
+    assert completed.receipt == receipt.to_dict()
+    assert completed.response["message_id"] == "assistant-fallback-ancestry"
+
+    persisted = store.save(path, state)
+    manifest_before = path.read_bytes()
+    restarted = CDPAWorker(worker.config, store=store)
+    result = asyncio.run(
+        restarted.advance(
+            path,
+            SimpleNamespace(pages=[]),
+            scheduling_tasks=[persisted],
+        )
+    )
+
+    assert result == persisted
+    assert path.read_bytes() == manifest_before
+    assert len(result["hops"]) == len(persisted["hops"])
+    assert ledger.get(retry["request_id"]) == completed
+
+
+def test_missing_file_repair_in_new_conversation_uses_normal_retry(
+    tmp_path: Path,
+):
+    _, _, state, worker = setup_task(
+        tmp_path,
+        task_id="task-missing-report-new-conversation",
+    )
+    state["reports"] = [
+        {
+            "report_id": 1,
+            "role": "PLAN",
+            "physical_role": "alpha-plan",
+            "turn": 1,
+            "path": ".plan/alpha/retained-new-conversation.md",
+            "sha256": "d" * 64,
+            "size": 28,
+            "created_at": utc_now(),
+        }
+    ]
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    response = json.dumps(
+        {"route": "PLAN", "handoff": hop["expected_report_path"]},
+        separators=(",", ":"),
+    )
+    response_sha256 = worker_module.hashlib.sha256(response.encode("utf-8")).hexdigest()
+    hop.update(
+        state="responded",
+        response=response,
+        response_sha256=response_sha256,
+        conversation_url="https://chatgpt.com/c/original-conversation",
+    )
+    worker._responded(state, hop)
+    repair = _active_hop(state)
+    asyncio.run(worker._pre_send(state, repair, FakeActions()))
+    repair.update(
+        state="responded",
+        response=response,
+        response_sha256=response_sha256,
+        conversation_url="https://chatgpt.com/c/new-conversation",
+    )
+
+    worker._responded(state, repair)
+
+    next_repair = _active_hop(state)
+    assert repair["state"] == "routed"
+    assert next_repair["kind"] == "route_repair"
+    assert next_repair["repair_attempt"] == 2
+    assert not any(
+        item.get("kind") == "missing_file_fallback"
+        for item in state.get("route_timeline") or []
+    )
+
+
+def test_identical_missing_file_repair_without_retained_report_blocks_once(
+    tmp_path: Path,
+):
+    _, _, state, worker = setup_task(
+        tmp_path,
+        task_id="task-missing-report-initial-plan",
+    )
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    response = json.dumps(
+        {"route": "PLAN", "handoff": hop["expected_report_path"]},
+        separators=(",", ":"),
+    )
+    response_sha256 = worker_module.hashlib.sha256(response.encode("utf-8")).hexdigest()
+    hop.update(state="responded", response=response, response_sha256=response_sha256)
+    worker._responded(state, hop)
+    repair = _active_hop(state)
+    asyncio.run(worker._pre_send(state, repair, FakeActions()))
+    repair.update(state="responded", response=response, response_sha256=response_sha256)
+
+    worker._responded(state, repair)
+    hop_ids = {item["hop_id"] for item in state["hops"]}
+
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "report_materialization_unavailable"
+    assert state["block_retryable"] is False
+    assert state["active_hop_id"] == repair["hop_id"]
+    events = canonical_recovery_events(state)
+    assert len(events) == 1
+    assert events[0]["failure_signature"].startswith(
+        "report_materialization_unavailable:"
+    )
+    assert state["task_text"] not in [
+        str(item.get("handoff") or "") for item in state["hops"] if item is not hop
+    ]
+
+    worker._responded(state, repair)
+
+    assert {item["hop_id"] for item in state["hops"]} == hop_ids
+    assert state["block_code"] == "report_materialization_unavailable"
+
+
+def test_missing_file_fallback_preserves_completed_request_ledgers_and_identities(
+    tmp_path: Path,
+):
+    _store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path,
+        task_id="task-missing-report-ledger",
+    )
+    retained_path = ".plan/alpha/retained-ledger-report.md"
+    state["reports"] = [
+        {
+            "report_id": 1,
+            "role": "PLAN",
+            "physical_role": "alpha-plan",
+            "turn": 1,
+            "path": retained_path,
+            "sha256": "b" * 64,
+            "size": 22,
+            "created_at": utc_now(),
+        }
+    ]
+    response = json.dumps(
+        {"route": "PLAN", "handoff": hop["expected_report_path"]},
+        separators=(",", ":"),
+    )
+    original_request_id = hop["request_id"]
+    original_receipt = json.loads(json.dumps(hop["receipt"]))
+    hop["conversation_url"] = "https://chatgpt.com/c/exact-repair-ledger"
+    worker._record_response(
+        state,
+        hop,
+        MessageSnapshot(
+            "assistant",
+            "assistant-original",
+            "assistant-turn-original",
+            response,
+            (),
+        ),
+    )
+
+    worker._responded(state, hop)
+
+    original_record = RequestLedger(hop["ledger_path"]).get(original_request_id)
+    assert original_record is not None
+    assert original_record.status is RequestStatus.COMPLETED
+    assert original_record.receipt == original_receipt
+    assert original_record.response["message_id"] == "assistant-original"
+    repair = _active_hop(state)
+    asyncio.run(worker._pre_send(state, repair, FakeActions()))
+    repair_ledger = RequestLedger(repair["ledger_path"])
+    repair_record = repair_ledger.begin(
+        role=repair["physical_role"],
+        prompt=repair["prompt"],
+        request_id=repair["request_id"],
+        render_request_marker=False,
+    )
+    repair_baseline = MessageBaseline(
+        frozenset(), frozenset(), frozenset(), frozenset()
+    )
+    repair_receipt = SendReceipt(
+        prompt=repair["prompt"],
+        prompt_sha256=prompt_digest(repair["prompt"]),
+        binding=PageBinding("page-alpha-plan", "alpha-plan"),
+        baseline=repair_baseline,
+        attempts=1,
+        accepted_via="user_message_identity",
+        session_id_before="repair-session",
+        user_message_id="user-repair",
+        user_turn_id="user-turn-repair",
+    )
+    repair_ledger.update(
+        repair_record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=repair_receipt.binding,
+        baseline=repair_baseline,
+    )
+    repair_ledger.update(
+        repair_record.request_id,
+        status=RequestStatus.SENT,
+        accepted_at=2.0,
+        receipt=repair_receipt.to_dict(),
+    )
+    repair["receipt"] = repair_receipt.to_dict()
+    repair["conversation_url"] = "https://chatgpt.com/c/exact-repair-ledger"
+    worker._record_response(
+        state,
+        repair,
+        MessageSnapshot(
+            "assistant",
+            "assistant-repair",
+            "assistant-turn-repair",
+            response,
+            (),
+        ),
+    )
+    repair_identity = json.loads(json.dumps(repair["message_identity"]))
+    repair_conversation = repair["conversation_url"]
+
+    worker._responded(state, repair)
+
+    continuation = _active_hop(state)
+    original_after = RequestLedger(hop["ledger_path"]).get(original_request_id)
+    repair_after = repair_ledger.get(repair["request_id"])
+    assert original_after == original_record
+    assert repair_after is not None
+    assert repair_after.status is RequestStatus.COMPLETED
+    assert repair_after.receipt == repair_receipt.to_dict()
+    assert repair_after.response["message_id"] == "assistant-repair"
+    assert repair["message_identity"] == repair_identity
+    assert repair["conversation_url"] == repair_conversation
+    assert repair["state"] == "abandoned"
+    assert continuation["handoff"] == retained_path
+    assert continuation["request_id"] not in {original_request_id, repair["request_id"]}
+    assert RequestLedger(continuation["ledger_path"]).get(
+        continuation["request_id"]
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "action",
+    ["pause", "stop", "clear_team", "restart_role", "new_chat"],
+)
+def test_pending_operator_lifecycle_control_suppresses_missing_file_fallback(
+    tmp_path: Path,
+    action: str,
+):
+    _, _, state, worker = setup_task(
+        tmp_path,
+        task_id=f"task-missing-report-operator-{action}",
+    )
+    state["reports"] = [
+        {
+            "report_id": 1,
+            "role": "PLAN",
+            "physical_role": "alpha-plan",
+            "turn": 1,
+            "path": ".plan/alpha/operator-retained.md",
+            "sha256": "c" * 64,
+            "size": 24,
+            "created_at": utc_now(),
+        }
+    ]
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    response = json.dumps(
+        {"route": "PLAN", "handoff": hop["expected_report_path"]},
+        separators=(",", ":"),
+    )
+    response_sha256 = worker_module.hashlib.sha256(response.encode("utf-8")).hexdigest()
+    hop.update(state="responded", response=response, response_sha256=response_sha256)
+    worker._responded(state, hop)
+    repair = _active_hop(state)
+    asyncio.run(worker._pre_send(state, repair, FakeActions()))
+    repair.update(state="responded", response=response, response_sha256=response_sha256)
+    state["controls"] = [
+        {
+            "control_id": 1,
+            "action": action,
+            "role": "PLAN",
+            "origin": "operator",
+            "status": "requested",
+        }
+    ]
+    hop_ids = {item["hop_id"] for item in state["hops"]}
+
+    worker._responded(state, repair)
+
+    assert {item["hop_id"] for item in state["hops"]} == hop_ids
+    assert state["active_hop_id"] == repair["hop_id"]
+    assert repair["state"] == "responded"
+    assert state["controls"][0]["status"] == "requested"
+    assert not any(
+        item.get("kind") == "missing_file_fallback"
+        for item in state.get("route_timeline") or []
+    )
+
+
 def test_only_plan_done_can_make_task_terminal(tmp_path: Path):
     _, _, state, worker = setup_task(tmp_path)
     hop = _active_hop(state)
@@ -523,8 +1323,11 @@ def test_resume_and_retry_controls_have_distinct_state_contracts(tmp_path: Path)
     assert asyncio.run(worker._apply_control(paused, FakeActions())) is True
     assert paused["status"] == "RUNNING"
     assert paused["kanban_column"] == "PLANNING"
-    assert paused["controls"][0]["status"] == "applied"
-    assert paused["controls"][0]["result"]["request_id"] == paused_request_id
+    assert paused["controls"][0]["status"] == "recovering"
+    assert paused["controls"][0]["command_state"] == "RUNNING"
+    assert paused["controls"][0]["applied_at"] is None
+    assert paused["controls"][0]["result"]["outcome"] == "recovering"
+    assert paused["controls"][0]["result"]["before"]["active_request_id"] == paused_request_id
     assert _active_hop(paused)["request_id"] == paused_request_id
 
     _, _, blocked, worker = setup_task(tmp_path, task_id="task-blocked")
@@ -547,8 +1350,11 @@ def test_resume_and_retry_controls_have_distinct_state_contracts(tmp_path: Path)
     assert blocked["status"] == "RUNNING"
     assert blocked["kanban_column"] == "PLANNING"
     assert blocked["block_reason"] is None
-    assert blocked["controls"][0]["status"] == "applied"
-    assert blocked["controls"][0]["result"]["request_id"] == blocked_request_id
+    assert blocked["controls"][0]["status"] == "recovering"
+    assert blocked["controls"][0]["command_state"] == "RUNNING"
+    assert blocked["controls"][0]["applied_at"] is None
+    assert blocked["controls"][0]["result"]["outcome"] == "recovering"
+    assert blocked["controls"][0]["result"]["before"]["active_request_id"] == blocked_request_id
     assert _active_hop(blocked)["repair_attempt"] == 2
     assert _active_hop(blocked)["request_id"] == blocked_request_id
 
@@ -641,16 +1447,13 @@ def test_resume_recheck_ownership_failure_reblocks_once(
     first = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
     control = first["controls"][0]
     assert first["status"] == "BLOCKED"
-    assert control["status"] == "reblocked"
+    assert control["status"] == "recovery_required"
+    assert control["command_state"] == "RECOVERY_REQUIRED"
     assert control["applied_at"] is not None
-    assert control["result"] == {
-        "block_code": "role_offline",
-        "block_retryable": False,
-        "block_reason": (
-            "RoleOwnershipError: recorded 'alpha-plan' tab is offline; "
-            "use Open tab for controlled recovery"
-        ),
-    }
+    assert control["result"]["outcome"] == "recovery_required"
+    assert control["result"]["reason_code"] == "role_offline"
+    assert control["result"]["postcondition"] is None
+    assert control["result"]["next_safe_action"]
     assert _active_hop(first)["state"] == "pre_send"
     assert _active_hop(first).get("receipt") is None
 
@@ -659,7 +1462,7 @@ def test_resume_recheck_ownership_failure_reblocks_once(
     persisted_once = path.read_bytes()
     for _ in range(3):
         later = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
-        assert later["controls"][0]["status"] == "reblocked"
+        assert later["controls"][0]["status"] == "recovery_required"
         assert len(later["errors"]) == task_error_count
         assert len(_active_hop(later)["errors"]) == hop_error_count
         assert path.read_bytes() == persisted_once
@@ -677,7 +1480,7 @@ def test_terminal_idle_cleanup_preflight_failure_preserves_terminal_result(
     state["last_role_activity_at"] = "2026-07-20T00:00:00+00:00"
     state["active_role"] = None
     state["active_hop_id"] = None
-    store.save(path, state)
+    state = store.save(path, state)
 
     class DuplicateActions(FakeActions):
         async def preflight_team(self, _state):
@@ -686,7 +1489,11 @@ def test_terminal_idle_cleanup_preflight_failure_preserves_terminal_result(
 
     actions = DuplicateActions()
     monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
-    result = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+    result = asyncio.run(
+        worker.advance(
+            path, SimpleNamespace(pages=[]), scheduling_tasks=[state]
+        )
+    )
 
     assert result["status"] == "DONE"
     assert result["terminal_state"] == "DONE"
@@ -729,7 +1536,11 @@ def test_automatic_cleanup_preflight_failure_preserves_concurrent_control_atomic
     actions = DuplicateActions()
     monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
 
-    result = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+    result = asyncio.run(
+        worker.advance(
+            path, SimpleNamespace(pages=[]), scheduling_tasks=[state]
+        )
+    )
 
     persisted = store.load(path)
     assert result == persisted
@@ -831,7 +1642,11 @@ def test_clear_team_preflight_failure_preserves_concurrent_control_atomically(
     monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
 
     result = asyncio.run(
-        worker.advance(owner["manifest_path"], SimpleNamespace(pages=[]))
+        worker.advance(
+            owner["manifest_path"],
+            SimpleNamespace(pages=[]),
+            scheduling_tasks=[owner],
+        )
     )
 
     persisted = store.load(owner["manifest_path"])
@@ -1257,13 +2072,13 @@ def test_worker_restart_resumes_every_persisted_cleanup_phase(
         "closed_tabs": 0,
         "retry_count": 0,
     })
-    store.save(path, state)
+    state = store.save(path, state)
 
     actions = FakeActions()
     if phase == "verify_pending":
         actions.pages.clear()
         state["cleanup"]["closed_tabs"] = 1
-        store.save(path, state)
+        state = store.save(path, state)
     monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
     result = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
 
@@ -1375,7 +2190,7 @@ def test_later_handoff_prompt_preserves_original_goal_and_source_role(tmp_path: 
     asyncio.run(worker._pre_send(state, dev_hop, FakeActions()))
     envelope = json.loads(
         dev_hop["prompt"].split("\n\n# DEV", 1)[0].removeprefix(
-            "CDPA_TASK_ENVELOPE\n"
+            "alpha · role: dev\n"
         )
     )
     assert envelope["role"] == "alpha-dev"
@@ -1453,7 +2268,8 @@ def test_open_tab_recovers_presend_role_offline_and_sends_original_once(
         async def locate_owned(self, _state, _role):
             return acquired if self.recovered else None
 
-        async def reopen(self, _state, _role):
+        async def reopen(self, _state, _role, *, require_clean_ready=True):
+            assert require_clean_ready is True
             self.recovered = True
             return acquired
 
@@ -1586,19 +2402,21 @@ def test_open_tab_recovers_waiting_accepted_send_on_exact_conversation_without_r
 
     class ExactWaitingRecovery:
         def __init__(self):
-            self.reopen_calls = 0
+            self.reopen_clean = []
 
         async def locate_owned(self, *_args, **_kwargs):
             return None
 
-        async def reopen(self, *_args, **_kwargs):
-            self.reopen_calls += 1
+        async def reopen(self, *_args, require_clean_ready=True, **_kwargs):
+            self.reopen_clean.append(require_clean_ready)
+            if require_clean_ready:
+                raise RuntimeError("accepted waiting has no clean editable composer")
             return acquired
 
     actions = ExactWaitingRecovery()
 
     assert asyncio.run(worker._apply_control(state, actions)) is True
-    assert actions.reopen_calls == 1
+    assert actions.reopen_clean == [False]
     assert state["status"] == "RUNNING"
     assert state["block_code"] is None
     assert state["roles"]["PLAN"]["page_id"] == "closed-page"
@@ -1609,6 +2427,102 @@ def test_open_tab_recovers_waiting_accepted_send_on_exact_conversation_without_r
     assert state["controls"][0]["status"] == "applied"
     assert state["controls"][0]["result"] == {
         "page_id": "closed-page",
+        "recovered": True,
+        "resumed": True,
+        "hop_id": hop["hop_id"],
+        "request_id": original_request_id,
+    }
+
+
+def test_open_tab_recovers_waiting_exact_tab_with_drifted_accepted_page_id(
+    tmp_path: Path,
+):
+    _, _, state, worker = setup_task(
+        tmp_path, task_id="task-open-tab-waiting-page-drift"
+    )
+    hop = _active_hop(state)
+    conversation_url = "https://chatgpt.com/c/owned-plan-drift"
+    original_request_id = hop["request_id"]
+    receipt = {
+        "prompt": "accepted prompt",
+        "prompt_sha256": "digest",
+        "binding": {"page_id": "accepted-page", "role": "alpha-plan"},
+        "accepted_via": "user_message_identity",
+        "user_message_id": "accepted-user-message",
+        "user_turn_id": "accepted-user-turn",
+    }
+    hop.update(
+        state="waiting",
+        conversation_url=conversation_url,
+        receipt=receipt,
+    )
+    state.update(
+        status="BLOCKED",
+        kanban_column="BLOCKED",
+        block_code="role_offline",
+        block_retryable=False,
+        block_reason="owned alpha-plan tab is offline",
+    )
+    state["roles"]["PLAN"].update(
+        page_id="accepted-page",
+        page_url=conversation_url,
+        online=False,
+    )
+    state["controls"] = [
+        {
+            "control_id": 1,
+            "action": "open_tab",
+            "role": "PLAN",
+            "reason": "restore accepted page identity",
+            "status": "requested",
+        }
+    ]
+
+    drifted = AcquiredRole(
+        client=SimpleNamespace(),
+        page_id="drifted-live-page",
+        url=conversation_url,
+        created=False,
+        new_chat=False,
+    )
+    restored = AcquiredRole(
+        client=SimpleNamespace(),
+        page_id="accepted-page",
+        url=conversation_url,
+        created=False,
+        new_chat=False,
+    )
+
+    class DriftRecovery:
+        def __init__(self):
+            self.reopen_clean = []
+            self.open_calls = 0
+
+        async def locate_owned(self, *_args, **_kwargs):
+            return drifted
+
+        async def reopen(self, *_args, require_clean_ready=True, **_kwargs):
+            self.reopen_clean.append(require_clean_ready)
+            return restored
+
+        async def open_tab(self, *_args, **_kwargs):
+            self.open_calls += 1
+
+    actions = DriftRecovery()
+
+    assert asyncio.run(worker._apply_control(state, actions)) is True
+    assert actions.reopen_clean == [False]
+    assert actions.open_calls == 0
+    assert state["status"] == "RUNNING"
+    assert state["block_code"] is None
+    assert state["roles"]["PLAN"]["page_id"] == "accepted-page"
+    assert state["roles"]["PLAN"]["page_url"] == conversation_url
+    assert hop["state"] == "waiting"
+    assert hop["request_id"] == original_request_id
+    assert hop["receipt"] == receipt
+    assert state["controls"][0]["status"] == "applied"
+    assert state["controls"][0]["result"] == {
+        "page_id": "accepted-page",
         "recovered": True,
         "resumed": True,
         "hop_id": hop["hop_id"],
@@ -1917,50 +2831,6 @@ def test_route_plan_abandons_superseded_unsent_hop(tmp_path: Path):
     assert state["route_timeline"][-1]["new_hop_id"] == new_hop["hop_id"]
 
 
-def test_maintainers_route_plan_delivers_repair_brief_to_team(tmp_path: Path):
-    _, _, state, worker = setup_task(tmp_path, task_id="task-maintainer-repair-plan")
-    plan_hop = _active_hop(state)
-    asyncio.run(worker._pre_send(state, plan_hop, FakeActions()))
-    report = (
-        tmp_path
-        / ".plan"
-        / "alpha"
-        / "alpha-plan_turn1_task-maintainer-repair-plan.md"
-    )
-    report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text("plan evidence", encoding="utf-8")
-    plan_hop["response"] = (
-        '{"route":"DEV","handoff":'
-        '".plan/alpha/alpha-plan_turn1_task-maintainer-repair-plan.md"}'
-    )
-    plan_hop["state"] = "responded"
-    worker._responded(state, plan_hop)
-    dev_hop = _active_hop(state)
-    state["controls"] = [
-        {
-            "control_id": 1,
-            "action": "route_plan",
-            "role": "DEV",
-            "reason": "Repeated role-offline classification requires a durable repair.",
-            "status": "requested",
-            "maintenance_incident_id": "maint-role-offline-pattern",
-            "maintenance_request_id": "maint-role-offline-pattern-turn1",
-        }
-    ]
-
-    assert asyncio.run(worker._apply_control(state, FakeActions())) is True
-
-    repair_hop = _active_hop(state)
-    assert dev_hop["state"] == "abandoned"
-    assert repair_hop["target_role"] == "PLAN"
-    assert repair_hop["kind"] == "maintenance_repair"
-    assert "CDPA_MAINTENANCE_REPAIR_REQUEST" in repair_hop["handoff"]
-    assert "maint-role-offline-pattern" in repair_hop["handoff"]
-    assert "Repeated role-offline classification" in repair_hop["handoff"]
-    assert str(report) in repair_hop["handoff"]
-    assert "PLAN must inspect the evidence" in repair_hop["handoff"]
-
-
 def test_new_chat_remains_rejected_at_inflight_boundary(tmp_path: Path):
     _, _, state, worker = setup_task(tmp_path, task_id="task-new-chat")
     hop = _active_hop(state)
@@ -1991,10 +2861,14 @@ def test_terminal_task_without_due_cleanup_is_not_rewritten(tmp_path: Path):
     state["active_hop_id"] = None
     state["completed_at"] = state["created_at"]
     state["last_role_activity_at"] = state["created_at"]
-    store.save(path, state)
+    state = store.save(path, state)
     before = path.read_bytes()
 
-    result = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+    result = asyncio.run(
+        worker.advance(
+            path, SimpleNamespace(pages=[]), scheduling_tasks=[state]
+        )
+    )
 
     assert result["status"] == "DONE"
     assert path.read_bytes() == before
@@ -2260,9 +3134,336 @@ def _prepare_sent_waiting_task(
     hop["timestamps"]["sent_at"] = sent_at.isoformat()
     worker._start_wait_budget_from_sent(hop)
     state["roles"]["PLAN"]["page_id"] = "page-alpha-plan"
-    store.save(path, state)
+    state = store.save(path, state)
+    hop = _active_hop(state)
     return store, state, worker, path, hop, receipt, sent_at
 
+
+def test_unchanged_wait_does_not_touch_manifest_or_republish_projection(
+    tmp_path: Path,
+    monkeypatch,
+):
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path,
+        task_id="task-unchanged-wait",
+    )
+    snapshot = SimpleNamespace(
+        state=ChatGPTState.RESPONDING,
+        stop_visible=True,
+        composer_empty=True,
+        manual_input_pending=False,
+        error_texts=(),
+        blocking_dialogs=(),
+        messages=(
+            MessageSnapshot("user", "u1", "t1", receipt.prompt, ()),
+            MessageSnapshot("assistant", "a1", "ta1", "still working", ()),
+        ),
+    )
+    signature, length = response_activity_signature(snapshot, receipt.baseline)
+    wait = hop["wait"]
+    anchor = str(wait["started_at"])
+    wait.update(
+        {
+            "activity_signature": signature,
+            "activity_length": length,
+            "activity_changed_at": anchor,
+            "activity_observed_at": anchor,
+            "continuous_responding_since": anchor,
+            "transport_ui_active": False,
+            "last_stop_visible": True,
+        }
+    )
+    role = state["roles"]["PLAN"]
+    role.update(
+        {
+            "status": "active",
+            "page_id": "page-alpha-plan",
+            "page_url": "https://chatgpt.com/c/exact",
+            "online": True,
+            "last_error": None,
+        }
+    )
+    state["last_role_activity_at"] = role["last_activity_at"]
+    state["active_action"] = "wait_response"
+    state = store.save(path, state)
+    worker.hydrate_runtime()
+
+    class Client:
+        async def assert_ownership(self):
+            return snapshot
+
+        async def wait_snapshot(self, _receipt, *, force_full=False):
+            assert force_full is False
+            return snapshot
+
+        async def wait_for_response(self, _receipt, **_kwargs):
+            raise TimeoutError("unchanged wait")
+
+    acquired = AcquiredRole(
+        client=Client(),
+        page_id="page-alpha-plan",
+        url="https://chatgpt.com/c/exact",
+        created=False,
+        new_chat=False,
+    )
+
+    class Actions:
+        async def locate_owned(self, _state, _role):
+            return acquired
+
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
+
+    before_bytes = path.read_bytes()
+    before_mtime = path.stat().st_mtime_ns
+    before_generation = worker.runtime_db.get_board()["generation"]
+    before_version = worker.runtime_db.get_task_version(state["task_id"])
+    before_detail = worker.runtime_db.get_task_detail(state["task_id"])
+    scheduling_tasks = list(worker.registry.tasks_by_id.values())
+
+    persist_calls = 0
+    load_calls = 0
+    original_persist = worker._persist_transport_result
+    original_load = store.load
+
+    def counted_persist(*args, **kwargs):
+        nonlocal persist_calls
+        persist_calls += 1
+        return original_persist(*args, **kwargs)
+
+    def counted_load(*args, **kwargs):
+        nonlocal load_calls
+        load_calls += 1
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(worker, "_persist_transport_result", counted_persist)
+    monkeypatch.setattr(store, "load", counted_load)
+
+    for _index in range(2):
+        result = asyncio.run(
+            worker.advance(
+                path,
+                SimpleNamespace(pages=[]),
+                scheduling_tasks=scheduling_tasks,
+            )
+        )
+        assert result is not None
+        affected = worker.registry.update_task(result, now=time.time())
+        worker._publish_affected(affected)
+        scheduling_tasks = list(worker.registry.tasks_by_id.values())
+
+    assert persist_calls == 0
+    assert load_calls == 0
+    assert path.read_bytes() == before_bytes
+    assert path.stat().st_mtime_ns == before_mtime
+    assert worker.runtime_db.get_board()["generation"] == before_generation
+    assert worker.runtime_db.get_task_version(state["task_id"]) == before_version
+    after_detail = worker.runtime_db.get_task_detail(state["task_id"])
+    assert after_detail["projection_sha256"] == before_detail["projection_sha256"]
+
+
+
+
+def test_publish_affected_reprojects_all_waiting_ranks_after_dependency_transition(
+    tmp_path: Path,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    first = store.create_task(
+        "first",
+        requested_team="first",
+        task_id="rank-first",
+    )
+    second = store.create_task(
+        "second",
+        requested_team="second",
+        task_id="rank-second",
+        depends_on_task_ids=("rank-first",),
+    )
+    third = store.create_task(
+        "third",
+        requested_team="third",
+        task_id="rank-third",
+        depends_on_task_ids=("rank-second",),
+    )
+
+    def make_waiting(current: dict) -> dict:
+        current["status"] = "WAITING"
+        current["kanban_column"] = "WAITING"
+        current["waiting_reason"] = "Waiting for dependency"
+        return current
+
+    first = store.update(first["manifest_path"], make_waiting)
+    worker = CDPAWorker(config, store=store)
+    worker.hydrate_runtime()
+
+    assert worker.runtime_db.get_task_detail(first["task_id"])["waiting_order"]["rank"] == 1
+    assert worker.runtime_db.get_task_detail(second["task_id"])["waiting_order"]["rank"] == 2
+    assert worker.runtime_db.get_task_detail(third["task_id"])["waiting_order"]["rank"] == 3
+    third_version = worker.runtime_db.get_task_version(third["task_id"])
+
+    def complete(current: dict) -> dict:
+        current["status"] = "DONE"
+        current["terminal_state"] = "DONE"
+        current["kanban_column"] = "DONE"
+        current["completed_at"] = utc_now()
+        current["active_role"] = None
+        current["active_hop_id"] = None
+        current["active_action"] = "completed"
+        current["waiting_reason"] = None
+        return current
+
+    completed = store.update(first["manifest_path"], complete)
+    affected = worker.registry.update_task(completed, now=time.time())
+    assert third["task_id"] not in affected
+
+    worker._publish_affected(affected)
+
+    assert worker.runtime_db.get_task_detail(second["task_id"])["waiting_order"]["rank"] == 1
+    assert worker.runtime_db.get_task_detail(third["task_id"])["waiting_order"]["rank"] == 2
+    assert worker.runtime_db.get_task_version(third["task_id"]) > third_version
+
+
+def test_manifest_cache_reuses_parse_until_file_identity_changes(
+    tmp_path: Path, monkeypatch
+):
+    _config, store, state, worker = setup_task(
+        tmp_path, task_id="task-manifest-cache-identity"
+    )
+    path = Path(state["manifest_path"])
+    original_load = store.load
+    load_calls = 0
+
+    def counted_load(*args, **kwargs):
+        nonlocal load_calls
+        load_calls += 1
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(store, "load", counted_load)
+
+    first = worker._load_manifest_cached(path)
+    second = worker._load_manifest_cached(path)
+
+    assert first is second
+    assert load_calls == 1
+
+    path.write_bytes(path.read_bytes() + b"\n")
+    third = worker._load_manifest_cached(path)
+
+    assert third is not first
+    assert third == first
+    assert load_calls == 2
+
+
+
+def test_refresh_scheduling_rejects_stale_preloaded_state(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    parent = store.create_task(
+        "parent", requested_team="parent", task_id="task-cache-parent"
+    )
+    child = store.create_task(
+        "child",
+        requested_team="child",
+        task_id="task-cache-child",
+        depends_on_task_ids=(parent["task_id"],),
+    )
+    child_path = Path(child["manifest_path"])
+    stale = store.load(child_path)
+    store.update(
+        child_path,
+        lambda state: {**state, "waiting_reason": "external writer touched task"},
+    )
+    parent = store.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "kanban_column": "DONE_STOPPED",
+            "active_role": None,
+            "active_hop_id": None,
+            "active_action": "done",
+            "completed_at": utc_now(),
+        },
+    )
+    tasks = [parent, store.load(child_path)]
+
+    with pytest.raises(ValueError, match="task changed while refreshing scheduling state"):
+        store.refresh_scheduling(child_path, tasks=tasks, state=stale)
+
+def test_refresh_scheduling_uses_preloaded_running_state_without_reload(
+    tmp_path: Path, monkeypatch
+):
+    _config, store, state, _worker = setup_task(
+        tmp_path, task_id="task-preloaded-scheduling-state"
+    )
+    path = Path(state["manifest_path"])
+    loaded = store.load(path)
+
+    def forbidden_load(*_args, **_kwargs):
+        raise AssertionError("preloaded scheduling state must not reload the manifest")
+
+    monkeypatch.setattr(store, "load", forbidden_load)
+
+    refreshed, changed = store.refresh_scheduling(
+        path,
+        tasks=[loaded],
+        state=loaded,
+    )
+
+    assert changed is False
+    assert refreshed is loaded
+
+def test_waiting_copy_on_write_does_not_duplicate_large_inert_history():
+    large_history = "x" * 4_000_000
+    state = {
+        "active_hop_id": 2,
+        "hops": [
+            {"hop_id": 1, "state": "routed", "prompt": large_history},
+            {
+                "hop_id": 2,
+                "state": "waiting",
+                "wait": {"activity_signature": "same"},
+                "timestamps": {"sent_at": "2026-07-26T00:00:00+00:00"},
+                "errors": [],
+            },
+        ],
+        "roles": {"PLAN": {"status": "active", "online": True}},
+        "errors": [{"error": "historic"}],
+    }
+
+    working = worker_module._waiting_working_copy(state)
+
+    assert working is not state
+    assert working["hops"] is not state["hops"]
+    assert working["hops"][0] is state["hops"][0]
+    assert working["hops"][0]["prompt"] is large_history
+    assert working["hops"][1] is not state["hops"][1]
+    assert working["hops"][1]["wait"] is not state["hops"][1]["wait"]
+    assert working["roles"] is not state["roles"]
+    assert working["roles"]["PLAN"] is not state["roles"]["PLAN"]
+    assert working["errors"] is not state["errors"]
+
+
+def test_running_refresh_scheduling_skips_full_manifest_clone(tmp_path: Path, monkeypatch):
+    _config, store, state, _worker = setup_task(
+        tmp_path, task_id="task-running-scheduling-no-clone"
+    )
+    path = Path(state["manifest_path"])
+    state["hops"][0]["historic_payload"] = "y" * 2_000_000
+    state = store.save(path, state)
+
+    import playwright_auto.cdpa_store as store_module
+
+    def forbidden_dumps(*_args, **_kwargs):
+        raise AssertionError("RUNNING scheduling refresh must not serialize the full manifest")
+
+    monkeypatch.setattr(store_module.json, "dumps", forbidden_dumps)
+
+    refreshed, changed = store.refresh_scheduling(path, tasks=[state])
+
+    assert changed is False
+    assert refreshed == state
 
 def test_waiting_requires_valid_route_report_and_two_samples_before_hop_response(tmp_path: Path):
     store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
@@ -2418,7 +3619,8 @@ def test_timeout_banner_without_stop_refreshes_after_no_progress_and_accepts_reh
         }
     )
     hop["timestamps"]["sent_at"] = old.isoformat()
-    store.save(path, state)
+    state = store.save(path, state)
+    hop = _active_hop(state)
 
     class Client:
         def __init__(self):
@@ -2703,7 +3905,8 @@ def test_waiting_persists_pre_refresh_provenance_before_f5(tmp_path: Path):
         }
     )
     state["roles"]["PLAN"]["page_id"] = "page-PLAN"
-    store.save(path, state)
+    state = store.save(path, state)
+    hop = _active_hop(state)
 
     snapshot = SimpleNamespace(
         state=ChatGPTState.RESPONDING,
@@ -3442,6 +4645,7 @@ def test_worker_reconnect_supervisor_preserves_inflight_identity(tmp_path: Path,
     TargetClosedError = type("TargetClosedError", (RuntimeError,), {})
     connections: list[int] = []
     observed: list[tuple[object, ...]] = []
+    disconnects: list[str] = []
 
     @asynccontextmanager
     async def fake_connected_browser(_url):
@@ -3452,6 +4656,21 @@ def test_worker_reconnect_supervisor_preserves_inflight_identity(tmp_path: Path,
     class FakeWorker:
         def __init__(self, _config):
             self.calls = 0
+            self.command_loop_started = asyncio.Event()
+            self.runtime_db = SimpleNamespace(close=lambda: None)
+
+        def hydrate_runtime(self):
+            return {"complete": True}
+
+        def _publish_heartbeat(self, **_kwargs):
+            return None
+
+        def _publish_browser_disconnected(self):
+            disconnects.append("disconnected")
+
+        async def run_command_loop(self):
+            self.command_loop_started.set()
+            await asyncio.Event().wait()
 
         async def run_forever(self, _context):
             self.calls += 1
@@ -3483,6 +4702,7 @@ def test_worker_reconnect_supervisor_preserves_inflight_identity(tmp_path: Path,
         asyncio.run(worker_module._run(config))
 
     assert connections == [1, 2]
+    assert disconnects == ["disconnected"]
     assert observed == [identity, identity]
     current = store.load(path)
     assert _active_hop(current)["request_id"] == hop["request_id"]
@@ -3603,216 +4823,19 @@ def test_clear_team_failed_reverify_clears_old_verification_evidence(
     assert actions.pages == ["surviving-tab"]
 
 
-def test_run_once_passes_locked_task_path_to_global_maintainers(
+def test_run_once_activates_independent_recovery_after_task_iteration(
     tmp_path: Path, monkeypatch
 ):
-    _, store, state, worker = setup_task(
-        tmp_path, task_id="task-maintainer-locked-path"
-    )
-    path = Path(state["manifest_path"])
-    calls = []
-
-    async def locked_advance(
-        _manifest_path, _browser_context, *, scheduling_tasks=None
-    ):
-        return None
-
-    class FakeCoordinator:
-        async def advance(self, tasks, browser_context):
-            calls.append((tasks, browser_context))
-            return False
-
-    monkeypatch.setattr(worker, "advance", locked_advance)
-    worker.maintainers = FakeCoordinator()
-    browser_context = SimpleNamespace(pages=[])
-
-    results = asyncio.run(worker.run_once(browser_context))
-
-    assert results == [None]
-    assert len(calls) == 1
-    tasks, observed_context = calls[0]
-    assert observed_context is browser_context
-    assert tasks == [(path, {})]
-
-
-def test_run_once_keeps_locked_active_a_serialized_before_b(
-    tmp_path: Path, monkeypatch
-):
-    import hashlib
-
-    import playwright_auto.cdpa_maintenance as maintenance_module
-    from playwright_auto.cdpa_actions import AcquiredRole
-
-    config, store, state_a, worker = setup_task(
-        tmp_path, task_id="task-maintainer-active-a"
-    )
-    state_b = store.create_task(
-        "Blocked task B",
-        requested_team="beta",
-        task_id="task-maintainer-waiting-b",
-    )
-    path_a = Path(state_a["manifest_path"])
-    path_b = Path(state_b["manifest_path"])
-
-    state_a.update(
-        status="BLOCKED",
-        kanban_column="BLOCKED",
-        block_code="role_offline",
-        block_reason="failure A",
-    )
-    state_a = store.save(path_a, state_a)
-    incident_a = ensure_maintenance_incident(state_a)
-    assert incident_a is not None
-    report = tmp_path / ".plan" / "maintainers" / "alpha_turn1_20260723T010203Z.md"
-    report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text("# Active A report\n", encoding="utf-8")
-    report_sha256 = hashlib.sha256(report.read_bytes()).hexdigest()
-    incident_a.update(
-        state="RUNNING",
-        turn=1,
-        request_id="request-a",
-        decision={
-            "action": "OPEN_ROLE_TAB",
-            "reason": "recover A",
-            "role": "PLAN",
-            "lesson": None,
-            "replacement": None,
-        },
-        report_at="2026-07-23T01:02:03+00:00",
-        report_path=str(report),
-        report_sha256=report_sha256,
-        report_size=report.stat().st_size,
-        applied_snapshot_key=incident_a["key"],
-    )
-    state_a = store.save_maintenance(path_a, state_a)
-    state_a = store.request_control(
-        path_a,
-        "open_tab",
-        role="PLAN",
-        reason="recover A",
-        maintenance_incident_id=incident_a["incident_id"],
-        maintenance_request_id=incident_a["request_id"],
-    )
-    incident_a = next(
-        item
-        for item in state_a["maintenance"]["incidents"]
-        if item["incident_id"] == incident_a["incident_id"]
-    )
-    incident_a["control_id"] = state_a["controls"][-1]["control_id"]
-    state_a = store.save_maintenance(path_a, state_a)
-
-    state_b.update(
-        status="BLOCKED",
-        kanban_column="BLOCKED",
-        block_code="send_failed",
-        block_reason="failure B",
-    )
-    state_b = store.save(path_b, state_b)
-
-    global_state = worker.maintainers.state_store.load()
-    global_state["active_incident"] = worker.maintainers._active_projection(
-        state_a, incident_a
-    )
-    history_entry = worker.maintainers._history_entry(state_a, incident_a)
-    assert history_entry is not None
-    global_state["history"] = [history_entry]
-    worker.maintainers.state_store.save(global_state)
-    sends = []
-
-    class FakeActions:
-        def __init__(self, _context, _config):
-            pass
-
-        async def acquire_global_role(self, role):
-            return AcquiredRole(
-                client=SimpleNamespace(binding=SimpleNamespace(role=role)),
-                page_id="maint-page",
-                url="https://chatgpt.com/c/maint",
-                created=False,
-                new_chat=False,
-            )
-
-    class FakeSendBlock:
-        def __init__(self, prompt, **_kwargs):
-            sends.append(prompt)
-
-        async def run(self, _context):
-            return {
-                "response": {
-                    "text": (
-                        "# Maintenance report\n\nWait.\n\n"
-                        "```json\n"
-                        '{"action":"WAIT","reason":"Wait for changed evidence.",'
-                        '"role":null,"lesson":null,"replacement":null}\n'
-                        "```"
-                    )
-                }
-            }
-
-    monkeypatch.setattr(maintenance_module, "CDPATabActions", FakeActions)
-    monkeypatch.setattr(maintenance_module, "DurableSendBlock", FakeSendBlock)
-
-    with store.task_run_lock(path_a, blocking=True):
-        first = asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
-        second = asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
-
-    assert first[0] is None
-    assert second[0] is None
-    assert sends == []
-    current_a = store.load(path_a)
-    current_b = store.load(path_b)
-    assert current_a["maintenance"]["active_incident_id"] == incident_a["incident_id"]
-    assert current_a["maintenance"]["incidents"][0]["state"] == "RUNNING"
-    assert current_b.get("maintenance") is None
-    assert worker.maintainers.state_store.load()["active_incident"] == global_state["active_incident"]
-
-
-def test_run_once_clears_genuinely_missing_global_task_without_browser(
-    tmp_path: Path, monkeypatch
-):
-    import playwright_auto.cdpa_maintenance as maintenance_module
-
-    _, store, state, worker = setup_task(
-        tmp_path, task_id="task-maintainer-existing-b"
-    )
-    path = Path(state["manifest_path"])
-    state.update(
-        status="BLOCKED",
-        kanban_column="BLOCKED",
-        block_code="send_failed",
-        block_reason="failure B",
-    )
-    store.save(path, state)
-    global_state = worker.maintainers.state_store.load()
-    global_state["active_incident"] = {
-        "task_id": "task-deleted-a",
-        "incident_id": "maint-deleted-a",
-        "turn": 1,
-        "request_id": "request-deleted-a",
-    }
-    worker.maintainers.state_store.save(global_state)
-
-    class NoBrowserWork:
-        def __init__(self, *_args, **_kwargs):
-            raise AssertionError("missing-task reconciliation must not touch browser")
-
-    monkeypatch.setattr(maintenance_module, "CDPATabActions", NoBrowserWork)
-
-    results = asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
-
-    assert len(results) == 1
-    assert worker.maintainers.state_store.load()["active_incident"] is None
-    assert store.load(path).get("maintenance") is None
-
-
-def test_run_once_advances_global_maintainers_after_task_iteration(
-    tmp_path: Path, monkeypatch
-):
-    config, store, state, worker = setup_task(
+    _config, store, state, worker = setup_task(
         tmp_path, task_id="task-maintainer-run-once"
     )
-    path = Path(state["manifest_path"])
-    calls = []
+    store.create_independent_agent(
+        "Maintainers",
+        system_prompt="Recover tasks directly.",
+        task_id="agent-maintainers-g1",
+        trigger_settings={"recovery": True},
+        max_cycles=5,
+    )
 
     async def fake_advance(
         manifest_path, _browser_context, *, scheduling_tasks=None
@@ -3824,26 +4847,20 @@ def test_run_once_advances_global_maintainers_after_task_iteration(
         current["block_reason"] = "offline"
         return store.save(manifest_path, current)
 
-    class FakeCoordinator:
-        async def advance(self, tasks, browser_context):
-            calls.append((tasks, browser_context))
-            return True
-
     monkeypatch.setattr(worker, "advance", fake_advance)
-    worker.maintainers = FakeCoordinator()
-    browser_context = SimpleNamespace(pages=[])
-
-    results = asyncio.run(worker.run_once(browser_context))
+    results = asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
+    agent = next(
+        item
+        for item in store.discover()
+        if item.get("task_mode") == "independent"
+        and item["independent"]["agent_name"] == "Maintainers"
+    )
 
     assert len(results) == 1
     assert results[0]["status"] == "BLOCKED"
-    assert len(calls) == 1
-    tasks, observed_context = calls[0]
-    assert observed_context is browser_context
-    assert tasks[0][0] == path
-    assert tasks[0][1]["block_code"] == "role_offline"
-
-
+    assert agent["status"] == "RUNNING"
+    assert agent["independent"]["active_event"]["target_task_id"] == state["task_id"]
+    assert not hasattr(worker, "maintainers")
 
 def _inline_response(route="DONE", body="# Inline report\n\nEvidence."):
     return f'{body}\n\n```json\n{{"route":"{route}","handoff":"INLINE"}}\n```'
@@ -3927,9 +4944,11 @@ def test_inline_materialization_failure_blocks_operationally_without_path_or_rep
     assert state["block_code"] == "inline_report_materialization_failed"
     assert state["block_reason"] == "inline report materialization failed"
     assert internal not in state["block_reason"]
-    incident = ensure_maintenance_incident(state)
-    assert incident is not None
-    assert incident["trigger_code"] == "inline_report_materialization_failed"
+    events = canonical_recovery_events(state)
+    assert len(events) == 1
+    assert events[0]["failure_signature"].startswith(
+        "inline_report_materialization_failed:"
+    )
 
 
 
@@ -3984,12 +5003,13 @@ def test_inline_raw_filesystem_failure_blocks_without_route_repair(
     assert str(target) not in state["block_reason"]
     assert all(str(target) not in str(item) for item in hop.get("errors") or ())
 
-    first = ensure_maintenance_incident(state)
-    second = ensure_maintenance_incident(state)
-    assert first is second
-    assert first is not None
-    assert first["trigger_code"] == "inline_report_materialization_failed"
-    assert len(state["maintenance"]["incidents"]) == 1
+    first = canonical_recovery_events(state)
+    second = canonical_recovery_events(state)
+    assert len(first) == len(second) == 1
+    assert first[0]["event_key"] == second[0]["event_key"]
+    assert first[0]["failure_signature"].startswith(
+        "inline_report_materialization_failed:"
+    )
 
 
 @pytest.mark.parametrize("local_failure", ["different_bytes", "target_symlink"])
@@ -4031,12 +5051,13 @@ def test_inline_local_report_state_failure_preserves_sent_request_and_blocks(
     assert str(target) not in state["block_reason"]
     assert all(str(target) not in str(item) for item in hop.get("errors") or ())
 
-    first = ensure_maintenance_incident(state)
-    second = ensure_maintenance_incident(state)
-    assert first is second
-    assert first is not None
-    assert first["trigger_code"] == "inline_report_materialization_failed"
-    assert len(state["maintenance"]["incidents"]) == 1
+    first = canonical_recovery_events(state)
+    second = canonical_recovery_events(state)
+    assert len(first) == len(second) == 1
+    assert first[0]["event_key"] == second[0]["event_key"]
+    assert first[0]["failure_signature"].startswith(
+        "inline_report_materialization_failed:"
+    )
 
 def test_inline_materialization_is_restart_idempotent_and_ledger_completes_once(
     tmp_path: Path
@@ -4109,7 +5130,11 @@ def test_inline_materialization_is_restart_idempotent_and_ledger_completes_once(
     assert persisted.status is RequestStatus.COMPLETED
 
     manifest_before = path.read_bytes()
-    result_again = asyncio.run(restarted.advance(path, SimpleNamespace(pages=[])))
+    result_again = asyncio.run(
+        restarted.advance(
+            path, SimpleNamespace(pages=[]), scheduling_tasks=[result]
+        )
+    )
     assert result_again["status"] == "DONE"
     assert path.read_bytes() == manifest_before
     assert len(result_again["reports"]) == 1
@@ -4126,11 +5151,11 @@ def test_exhausted_inline_validation_block_creates_one_maintenance_incident(tmp_
 
     assert state["status"] == "BLOCKED"
     assert state["block_code"] == "route_validation_exhausted"
-    first = ensure_maintenance_incident(state)
-    second = ensure_maintenance_incident(state)
-    assert first is second
-    assert first["trigger_code"] == "route_validation_exhausted"
-    assert len(state["maintenance"]["incidents"]) == 1
+    first = canonical_recovery_events(state)
+    second = canonical_recovery_events(state)
+    assert len(first) == len(second) == 1
+    assert first[0]["event_key"] == second[0]["event_key"]
+    assert first[0]["failure_signature"].startswith("route_validation_exhausted:")
 
 
 
@@ -4503,11 +5528,11 @@ def test_queue_owner_loss_stays_waiting_before_browser_and_opens_one_incident(
     assert result["queue"]["released_at"] is None
     assert result["active_hop_id"] == before["active_hop_id"]
     assert result["hops"] == before["hops"]
-    first = ensure_maintenance_incident(result)
-    second = ensure_maintenance_incident(result)
-    assert first is second
-    assert first["trigger_code"] == "queue_release_failed"
-    assert len(result["maintenance"]["incidents"]) == 1
+    first = canonical_recovery_events(result)
+    second = canonical_recovery_events(result)
+    assert len(first) == len(second) == 1
+    assert first[0]["event_key"] == second[0]["event_key"]
+    assert first[0]["failure_signature"].startswith("queue_release_failed:")
 
 
 def test_queue_catalog_mismatch_persists_across_two_worker_polls_without_reconciliation(
@@ -4528,10 +5553,9 @@ def test_queue_catalog_mismatch_persists_across_two_worker_polls_without_reconci
     first = asyncio.run(
         worker.advance(queued["manifest_path"], ExplodingBrowserContext())
     )
-    first_incident = ensure_maintenance_incident(first)
-    assert first_incident is not None
-    first_incident_id = first_incident["incident_id"]
-    store.save_maintenance(queued["manifest_path"], first)
+    first_events = canonical_recovery_events(first)
+    assert len(first_events) == 1
+    first_event_key = first_events[0]["event_key"]
 
     after_first = json.loads(store.catalog_path.read_text(encoding="utf-8"))
     assert after_first["entries"][owner_key] == poisoned_owner_entry
@@ -4543,7 +5567,7 @@ def test_queue_catalog_mismatch_persists_across_two_worker_polls_without_reconci
     second = asyncio.run(
         worker.advance(queued["manifest_path"], ExplodingBrowserContext())
     )
-    second_incident = ensure_maintenance_incident(second)
+    second_events = canonical_recovery_events(second)
 
     after_second = json.loads(store.catalog_path.read_text(encoding="utf-8"))
     assert after_second["entries"][owner_key] == poisoned_owner_entry
@@ -4551,270 +5575,8 @@ def test_queue_catalog_mismatch_persists_across_two_worker_polls_without_reconci
     assert second["waiting_code"] == "queue_release_failed"
     assert second["queue"]["released_at"] is None
     assert second["hops"] == before["hops"]
-    assert second_incident is not None
-    assert second_incident["incident_id"] == first_incident_id
-    assert len(second["maintenance"]["incidents"]) == 1
-
-
-@pytest.mark.parametrize(
-    "catalog_corruption",
-    [
-        "status_mismatch",
-        "non_mapping",
-        "missing_manifest_path",
-        "wrong_three_part_key",
-        "backslash_key",
-        "identity_missing_path",
-        "identity_outside_path",
-    ],
-)
-def test_run_once_preserves_catalog_mismatch_and_queue_incident_across_polls(
-    tmp_path: Path,
-    monkeypatch,
-    catalog_corruption: str,
-):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    store = TaskStore(config)
-    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
-    queued = store.create_task("queued", reuse_team="alpha", task_id="task-queued")
-    unrelated = store.create_task(
-        "unrelated", requested_team="beta", task_id="task-unrelated"
-    )
-    queued_before = store.load(queued["manifest_path"])
-    unrelated_before = store.load(unrelated["manifest_path"])
-    owner_key = store._catalog_key(owner["manifest_path"])
-    catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
-    poisoned_key = owner_key
-    if catalog_corruption == "status_mismatch":
-        catalog["entries"][owner_key]["status"] = "DONE"
-    elif catalog_corruption == "non_mapping":
-        catalog["entries"][owner_key] = "corrupt"
-    elif catalog_corruption == "missing_manifest_path":
-        del catalog["entries"][owner_key]["manifest_path"]
-    else:
-        entry = catalog["entries"].pop(owner_key)
-        if catalog_corruption == "wrong_three_part_key":
-            poisoned_key = "wrong/task-owner/owner.json"
-        elif catalog_corruption == "backslash_key":
-            poisoned_key = "alpha\\bad/task-owner/owner.json"
-        else:
-            poisoned_key = "bad"
-            if catalog_corruption == "identity_missing_path":
-                del entry["manifest_path"]
-            else:
-                entry["manifest_path"] = str((tmp_path / "outside-owner.json").resolve())
-        catalog["entries"][poisoned_key] = entry
-    poisoned = json.loads(json.dumps(catalog["entries"][poisoned_key]))
-    store.catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
-    worker = CDPAWorker(config, store=store)
-    real_advance = worker.advance
-    advanced: list[str] = []
-    incident_ids: list[str] = []
-
-    async def selective_advance(path, browser_context, *, scheduling_tasks=None):
-        state = store.load(path)
-        advanced.append(state["task_id"])
-        if state["task_id"] == queued["task_id"]:
-            return await real_advance(
-                path,
-                browser_context,
-                scheduling_tasks=scheduling_tasks,
-            )
-        return state
-
-    class RecordingCoordinator:
-        async def advance(self, tasks, _browser_context):
-            for path, state in tasks:
-                if state.get("waiting_code") != "queue_release_failed":
-                    continue
-                incident = ensure_maintenance_incident(state)
-                assert incident is not None
-                incident_ids.append(incident["incident_id"])
-                store.save_maintenance(path, state)
-            return False
-
-    monkeypatch.setattr(worker, "advance", selective_advance)
-    worker.maintainers = RecordingCoordinator()
-
-    first = asyncio.run(worker.run_once(ExplodingBrowserContext()))
-    second = asyncio.run(worker.run_once(ExplodingBrowserContext()))
-
-    after = json.loads(store.catalog_path.read_text(encoding="utf-8"))
-    queued_after = store.load(queued["manifest_path"])
-    unrelated_after = store.load(unrelated["manifest_path"])
-    assert after["entries"][poisoned_key] == poisoned
-    if poisoned_key != owner_key:
-        assert owner_key not in after["entries"]
-    assert incident_ids[0] == incident_ids[1]
-    assert len(queued_after["maintenance"]["incidents"]) == 1
-    assert queued_after["status"] == "WAITING"
-    assert queued_after["waiting_code"] == "queue_release_failed"
-    assert queued_after["queue"]["released_at"] is None
-    assert queued_after["hops"] == queued_before["hops"]
-    assert unrelated_after == unrelated_before
-    assert owner["task_id"] not in advanced
-    assert advanced.count(unrelated["task_id"]) == 2
-    assert all(
-        result is None or result.get("task_id") != queued["task_id"]
-        or result.get("waiting_code") == "queue_release_failed"
-        for result in (*first, *second)
-    )
-
-
-@pytest.mark.parametrize("parent_status", ["DONE", "STOPPED"])
-def test_run_once_keeps_catalog_invalid_dependency_parent_fail_closed_across_polls(
-    tmp_path: Path,
-    monkeypatch,
-    parent_status: str,
-):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    store = TaskStore(config)
-    parent = store.create_task(
-        "Parent", requested_team="alpha", task_id="task-parent"
-    )
-    child = store.create_task(
-        "Child",
-        requested_team="beta",
-        task_id="task-child",
-        depends_on_task_ids=("task-parent",),
-    )
-    unrelated = store.create_task(
-        "Unrelated", requested_team="gamma", task_id="task-unrelated"
-    )
-    parent = store.update(
-        parent["manifest_path"],
-        lambda state: {
-            **state,
-            "status": parent_status,
-            "terminal_state": parent_status,
-            "active_role": None,
-            "active_hop_id": None,
-            **(
-                {"completed_at": utc_now()}
-                if parent_status == "DONE"
-                else {"stopped_at": utc_now(), "stop_reason": "failed parent"}
-            ),
-        },
-    )
-    parent_path = Path(parent["manifest_path"])
-    child_path = Path(child["manifest_path"])
-    parent_before = parent_path.read_bytes()
-    child_before = store.load(child_path)
-    poisoned = poison_catalog_identity_entry(store, parent)
-    worker = CDPAWorker(config, store=store)
-    real_advance = worker.advance
-    advanced: list[str] = []
-    incident_ids: list[str] = []
-
-    class CountingBrowserContext:
-        def __init__(self):
-            self.page_reads = 0
-
-        @property
-        def pages(self):
-            self.page_reads += 1
-            raise AssertionError("catalog-invalid dependency must not inspect browser pages")
-
-    async def selective_advance(path, browser_context, *, scheduling_tasks=None):
-        state = store.load(path)
-        advanced.append(state["task_id"])
-        if state["task_id"] == child["task_id"]:
-            return await real_advance(
-                path,
-                browser_context,
-                scheduling_tasks=scheduling_tasks,
-            )
-        return state
-
-    class RecordingCoordinator:
-        async def advance(self, tasks, _browser_context):
-            for path, state in tasks:
-                incident = ensure_maintenance_incident(state)
-                if incident is None:
-                    continue
-                incident_ids.append(incident["incident_id"])
-                store.save_maintenance(path, state)
-            return False
-
-    monkeypatch.setattr(worker, "advance", selective_advance)
-    worker.maintainers = RecordingCoordinator()
-    browser_context = CountingBrowserContext()
-
-    asyncio.run(worker.run_once(browser_context))
-    asyncio.run(worker.run_once(browser_context))
-
-    current = store.load(child_path)
-    catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
-    assert parent["task_id"] not in advanced
-    assert advanced.count(child["task_id"]) == 2
-    assert advanced.count(unrelated["task_id"]) == 2
-    assert current["status"] == "WAITING"
-    assert current["waiting_code"] == "dependency_missing"
-    assert current["waiting"]["missing"] == [parent["task_id"]]
-    assert current["hops"] == child_before["hops"]
-    assert not any(
-        item["status"] == "RELEASED" for item in current["dependency_events"]
-    )
-    assert browser_context.page_reads == 0
-    assert len(incident_ids) == 2
-    assert incident_ids[0] == incident_ids[1]
-    assert len(current["maintenance"]["incidents"]) == 1
-    assert parent_path.read_bytes() == parent_before
-    assert catalog["entries"]["bad"] == poisoned
-
-
-def test_unrelated_create_keeps_catalog_invalid_owner_out_of_worker_loop(
-    tmp_path: Path,
-    monkeypatch,
-):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    store = TaskStore(config)
-    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
-    owner_key = store._catalog_key(owner["manifest_path"])
-    poisoned = poison_catalog_identity_entry(store, owner)
-    unrelated = store.create_task(
-        "Unrelated", requested_team="beta", task_id="task-unrelated"
-    )
-    worker = CDPAWorker(config, store=store)
-    real_advance = worker.advance
-    advanced: list[str] = []
-
-    class CountingBrowserContext:
-        def __init__(self):
-            self.page_reads = 0
-
-        @property
-        def pages(self):
-            self.page_reads += 1
-            raise AssertionError("catalog-invalid owner must not inspect browser pages")
-
-    async def selective_advance(path, browser_context, *, scheduling_tasks=None):
-        state = store.load(path)
-        advanced.append(state["task_id"])
-        if state["task_id"] == owner["task_id"]:
-            return await real_advance(
-                path,
-                browser_context,
-                scheduling_tasks=scheduling_tasks,
-            )
-        return state
-
-    class FakeCoordinator:
-        async def advance(self, _tasks, _browser_context):
-            return False
-
-    monkeypatch.setattr(worker, "advance", selective_advance)
-    worker.maintainers = FakeCoordinator()
-    browser_context = CountingBrowserContext()
-
-    results = asyncio.run(worker.run_once(browser_context))
-
-    assert advanced == [unrelated["task_id"]]
-    assert [state["task_id"] for state in results if state] == [unrelated["task_id"]]
-    assert browser_context.page_reads == 0
-    catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
-    assert owner_key not in catalog["entries"]
-    assert catalog["entries"]["bad"] == poisoned
+    assert len(second_events) == 1
+    assert second_events[0]["event_key"] == first_event_key
 
 
 def test_queue_release_is_restart_idempotent_and_preserves_unsent_plan_identity(tmp_path: Path):
@@ -4887,11 +5649,11 @@ def test_queue_owner_conflict_remains_waiting_and_opens_one_incident(tmp_path: P
     assert result["status"] == "WAITING"
     assert result["waiting_code"] == "team_owner_conflict"
     assert result["queue"]["released_at"] is None
-    first_incident = ensure_maintenance_incident(result)
-    second_incident = ensure_maintenance_incident(result)
-    assert first_incident is second_incident
-    assert first_incident["trigger_code"] == "team_owner_conflict"
-    assert len(result["maintenance"]["incidents"]) == 1
+    first_events = canonical_recovery_events(result)
+    second_events = canonical_recovery_events(result)
+    assert len(first_events) == len(second_events) == 1
+    assert first_events[0]["event_key"] == second_events[0]["event_key"]
+    assert first_events[0]["failure_signature"].startswith("team_owner_conflict:")
 
 
 def test_queue_release_failure_remains_waiting_and_opens_one_incident(
@@ -4913,11 +5675,11 @@ def test_queue_release_failure_remains_waiting_and_opens_one_incident(
 
     assert result["status"] == "WAITING"
     assert result["waiting_code"] == "queue_release_failed"
-    first = ensure_maintenance_incident(result)
-    second = ensure_maintenance_incident(result)
-    assert first is second
-    assert first["trigger_code"] == "queue_release_failed"
-    assert len(result["maintenance"]["incidents"]) == 1
+    first = canonical_recovery_events(result)
+    second = canonical_recovery_events(result)
+    assert len(first) == len(second) == 1
+    assert first[0]["event_key"] == second[0]["event_key"]
+    assert first[0]["failure_signature"].startswith("queue_release_failed:")
 
 
 @pytest.mark.parametrize(
@@ -5023,7 +5785,9 @@ def test_terminal_cleanup_is_suppressed_while_same_team_queue_exists(tmp_path: P
 
     result = asyncio.run(
         CDPAWorker(config, store=store).advance(
-            owner["manifest_path"], ExplodingBrowserContext()
+            owner["manifest_path"],
+            ExplodingBrowserContext(),
+            scheduling_tasks=[owner, released],
         )
     )
 
@@ -5099,11 +5863,11 @@ def test_queue_rebind_failure_blocks_for_maintainers(tmp_path: Path):
 
     assert blocked["status"] == "BLOCKED"
     assert blocked["block_code"] == "queue_rebind_failed"
-    first = ensure_maintenance_incident(blocked)
-    second = ensure_maintenance_incident(blocked)
-    assert first is second
-    assert first["trigger_code"] == "queue_rebind_failed"
-    assert len(blocked["maintenance"]["incidents"]) == 1
+    first = canonical_recovery_events(blocked)
+    second = canonical_recovery_events(blocked)
+    assert len(first) == len(second) == 1
+    assert first[0]["event_key"] == second[0]["event_key"]
+    assert first[0]["failure_signature"].startswith("queue_rebind_failed:")
 
 
 def test_clear_team_rejects_terminal_cleanup_when_queue_exists(
@@ -5330,7 +6094,11 @@ def test_clear_team_preserves_concurrent_target_control_during_preflight(
     monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
 
     result = asyncio.run(
-        worker.advance(owner["manifest_path"], SimpleNamespace(pages=[]))
+        worker.advance(
+            owner["manifest_path"],
+            SimpleNamespace(pages=[]),
+            scheduling_tasks=[owner],
+        )
     )
 
     persisted = store.load(owner["manifest_path"])
@@ -5484,7 +6252,11 @@ def test_automatic_cleanup_preserves_concurrent_target_control_during_preflight(
     monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
 
     result = asyncio.run(
-        worker.advance(owner["manifest_path"], SimpleNamespace(pages=[]))
+        worker.advance(
+            owner["manifest_path"],
+            SimpleNamespace(pages=[]),
+            scheduling_tasks=[owner],
+        )
     )
 
     persisted = store.load(owner["manifest_path"])
@@ -5555,249 +6327,12 @@ def test_run_once_refreshes_automatic_cleanup_sibling_guard_after_snapshot(
     assert actions.closed_teams == 0
 
 
-def test_run_once_never_reclassifies_missing_edge_cycle_as_dependency_missing(
-    tmp_path: Path, monkeypatch
-):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    store = TaskStore(config)
-    missing_parent = store.create_task(
-        "Missing parent", requested_team="missing-parent", task_id="missing-parent"
-    )
-    a = store.create_task(
-        "A",
-        requested_team="a",
-        task_id="task-a",
-        depends_on_task_ids=("missing-parent",),
-    )
-    store.create_task(
-        "B",
-        requested_team="b",
-        task_id="task-b",
-        depends_on_task_ids=("task-a",),
-    )
-    Path(missing_parent["manifest_path"]).unlink()
-    a_path = Path(a["manifest_path"])
-    raw_a = json.loads(a_path.read_text(encoding="utf-8"))
-    raw_a["depends_on_task_ids"] = ["missing-parent", "task-b"]
-    a_path.write_text(json.dumps(raw_a), encoding="utf-8")
-    worker = CDPAWorker(config, store=store)
-
-    async def forbidden_advance(*_args, **_kwargs):
-        raise AssertionError("cyclic manifests must never enter worker scheduling")
-
-    class FakeCoordinator:
-        async def advance(self, tasks, _browser_context):
-            assert tasks == []
-            return False
-
-    monkeypatch.setattr(worker, "advance", forbidden_advance)
-    worker.maintainers = FakeCoordinator()
-
-    assert asyncio.run(worker.run_once(SimpleNamespace(pages=[]))) == []
-    tasks, errors = store.discover_with_errors()
-    assert tasks == []
-    assert sum("cycle" in item["error"] for item in errors) == 2
-
-
-def test_run_once_isolates_diagnostic_cycle_from_unrelated_tasks(
-    tmp_path: Path, monkeypatch
-):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    store = TaskStore(config)
-    install_cycle_isolation_graph(store)
-    worker = CDPAWorker(config, store=store)
-    advanced: list[str] = []
-
-    async def no_browser_advance(path, _browser_context, *, scheduling_tasks=None):
-        state = store.load(path)
-        advanced.append(state["task_id"])
-        return state
-
-    class FakeCoordinator:
-        async def advance(self, tasks, _browser_context):
-            assert {state["task_id"] for _path, state in tasks} == {
-                "missing-only",
-                "unrelated-task",
-            }
-            return False
-
-    monkeypatch.setattr(worker, "advance", no_browser_advance)
-    worker.maintainers = FakeCoordinator()
-
-    results = asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
-
-    assert {state["task_id"] for state in results if state} == {
-        "missing-only",
-        "unrelated-task",
-    }
-    assert set(advanced) == {"missing-only", "unrelated-task"}
-    _tasks, errors = store.discover_with_errors()
-    assert sum("cycle" in item["error"] for item in errors) == 2
-
-
-def test_run_once_skips_duplicate_identity_manifests_and_advances_unrelated_task(
-    tmp_path: Path,
-):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    store = TaskStore(config)
-    states = install_duplicate_task_graph(store)
-    store.update(
-        states["unique"]["manifest_path"],
-        lambda state: {
-            **state,
-            "status": "PAUSED",
-            "kanban_column": "PAUSED",
-            "active_action": "paused",
-            "pause_reason": "test boundary",
-        },
-    )
-    worker = CDPAWorker(config, store=store)
-
-    class FakeCoordinator:
-        async def advance(self, tasks, _browser_context):
-            assert [path for path, _state in tasks] == [
-                Path(states["unique"]["manifest_path"])
-            ]
-            return False
-
-    worker.maintainers = FakeCoordinator()
-
-    results = asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
-
-    assert [result["task_id"] for result in results] == ["unique-task"]
-    assert results[0]["status"] == "PAUSED"
-
-
-def test_run_once_recovers_phase4_journal_with_unrelated_missing_dependency(
-    tmp_path: Path, monkeypatch
-):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    store = TaskStore(config)
-    missing_parent = store.create_task(
-        "Missing parent", requested_team="missing-parent", task_id="missing-parent"
-    )
-    missing_child = store.create_task(
-        "Missing child",
-        requested_team="missing-child",
-        task_id="missing-child",
-        depends_on_task_ids=("missing-parent",),
-    )
-    target = store.create_task(
-        "Recovery target", requested_team="recovery-target", task_id="recovery-target"
-    )
-    target_child = store.create_task(
-        "Recovery child",
-        requested_team="recovery-child",
-        task_id="recovery-child",
-        depends_on_task_ids=("recovery-target",),
-    )
-    store.update(
-        target["manifest_path"],
-        lambda state: {
-            **state,
-            "status": "STOPPED",
-            "terminal_state": "STOPPED",
-            "active_role": None,
-            "active_hop_id": None,
-            "stopped_at": utc_now(),
-            "stop_reason": "replacement probe",
-        },
-    )
-    original_replace = store_module.os.replace
-    installs = 0
-
-    def interrupt_before_second_manifest(source, target_path):
-        nonlocal installs
-        if Path(source).name.endswith(".json.phase4.tmp"):
-            installs += 1
-            if installs == 2:
-                raise SystemExit("simulated worker recovery interruption")
-        return original_replace(source, target_path)
-
-    monkeypatch.setattr(store_module.os, "replace", interrupt_before_second_manifest)
-    with pytest.raises(SystemExit, match="worker recovery interruption"):
-        store.replace_task_and_rewire(
-            "recovery-target",
-            "Continue recovery target safely",
-            reuse_team=True,
-            rewire_children=True,
-            incident_id="maint-worker-missing-recovery",
-        )
-    monkeypatch.setattr(store_module.os, "replace", original_replace)
-    Path(missing_parent["manifest_path"]).unlink()
-
-    restarted_store = TaskStore(config)
-    worker = CDPAWorker(config, store=restarted_store)
-    advanced: list[str] = []
-
-    async def no_browser_advance(path, _browser_context, *, scheduling_tasks=None):
-        state = restarted_store.load(path)
-        advanced.append(state["task_id"])
-        return state
-
-    class FakeCoordinator:
-        async def advance(self, tasks, _browser_context):
-            assert "missing-child" in [state["task_id"] for _path, state in tasks]
-            return False
-
-    monkeypatch.setattr(worker, "advance", no_browser_advance)
-    worker.maintainers = FakeCoordinator()
-
-    results = asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
-
-    replacement = next(
-        state
-        for state in results
-        if state and state.get("replacement_incident_id") == "maint-worker-missing-recovery"
-    )
-    assert "missing-child" in advanced
-    assert restarted_store.load(missing_child["manifest_path"])["depends_on_task_ids"] == [
-        "missing-parent"
-    ]
-    assert restarted_store.load(target_child["manifest_path"])["depends_on_task_ids"] == [
-        replacement["task_id"]
-    ]
-    assert not restarted_store.phase4_journal_path.exists()
-    assert list(restarted_store.root.rglob("*.phase4.tmp")) == []
-    assert list(restarted_store.root.rglob("*.phase4.rollback.tmp")) == []
-
-
-def test_run_once_recovers_phase4_journal_before_task_discovery(tmp_path: Path, monkeypatch):
-    _, store, _state, worker = setup_task(
-        tmp_path, task_id="task-phase4-recovery-order"
-    )
-    calls: list[str] = []
-
-    def recover():
-        calls.append("recover")
-        return None
-
-    def discover_paths():
-        assert calls == ["recover"]
-        calls.append("discover")
-        return []
-
-    class FakeCoordinator:
-        async def advance(self, tasks, _browser_context):
-            assert calls == ["recover", "discover"]
-            assert tasks == []
-            calls.append("maintainers")
-            return False
-
-    monkeypatch.setattr(store, "recover_phase4_replacement", recover)
-    monkeypatch.setattr(store, "discover_paths", discover_paths)
-    worker.maintainers = FakeCoordinator()
-
-    assert asyncio.run(worker.run_once(SimpleNamespace(pages=[]))) == []
-    assert calls == ["recover", "discover", "maintainers"]
-
-
 def test_run_once_skips_replaced_immutable_history_without_log_noise(
     tmp_path: Path,
     monkeypatch,
     capsys,
 ):
-    from playwright_auto.dashboard import build_task_payload
+    from playwright_auto.cdpa_projection import build_task_projection
 
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
@@ -5861,9 +6396,10 @@ def test_run_once_skips_replaced_immutable_history_without_log_noise(
     first = asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
     second = asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
 
-    expected_operational = {"task-child-history", replacement["task_id"]}
-    assert {item["task_id"] for item in first if item} == expected_operational
-    assert {item["task_id"] for item in second if item} == expected_operational
+    expected_due = {replacement["task_id"]}
+    assert {item["task_id"] for item in first if item} == expected_due
+    assert second == []
+    assert "task-child-history" not in advanced
     assert advanced.count("task-parent-history") == 0
     assert all("task-parent-history" not in batch for batch in maintenance_batches)
     assert parent_path.read_bytes() == before_bytes
@@ -5874,11 +6410,11 @@ def test_run_once_skips_replaced_immutable_history_without_log_noise(
     ]
 
     tasks = store.discover()
-    payload = build_task_payload(store.load(parent_path), tasks=tasks)
+    payload = build_task_projection(store.load(parent_path), tasks=tasks).detail
     assert payload["status"] == "STOPPED"
     assert payload["immutable_history"] is True
     assert payload["controls"] == []
-    assert payload["maintenance_replacement_task_id"] == replacement["task_id"]
+    assert payload["replacement_task_id"] == replacement["task_id"]
 
 
 def test_replacement_plan_first_prompt_contains_immutable_parent_context(tmp_path: Path):
@@ -6142,13 +6678,14 @@ def test_upload_mutated_after_worker_preflight_blocks_before_ledger_or_browser_m
     assert hop["state"] == "sending"
     assert hop["request_id"] == original_request_id
     assert not Path(hop["ledger_path"]).exists()
-    first = ensure_maintenance_incident(result)
-    second = ensure_maintenance_incident(result)
-    assert first is second
-    assert first["trigger_code"] == "attachment_identity_changed"
+    first = canonical_recovery_events(result)
+    second = canonical_recovery_events(result)
+    assert len(first) == len(second) == 1
+    assert first[0]["event_key"] == second[0]["event_key"]
+    assert first[0]["failure_signature"].startswith("attachment_identity_changed:")
 
 
-def test_changed_upload_file_blocks_before_browser_acquisition_and_opens_one_incident(
+def test_changed_upload_file_blocks_without_legacy_maintenance_state(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -6185,19 +6722,8 @@ def test_changed_upload_file_blocks_before_browser_acquisition_and_opens_one_inc
     assert "context.txt" in result["block_reason"]
     assert str(attachment.resolve()) not in result["block_reason"]
     assert actions.acquire_calls == 0
-    first = ensure_maintenance_incident(result)
-    second = ensure_maintenance_incident(result)
-    assert first is second
-    assert first["trigger_code"] == "attachment_identity_changed"
-    maintenance_prompt = worker.maintainers._prompt(
-        result,
-        first,
-        include_constructor=False,
-        tasks=[result],
-    )
-    assert str(attachment.resolve()) not in maintenance_prompt
-    assert "attachment_identity_changed" in maintenance_prompt
-
+    assert result.get("maintenance") in (None, {})
+    assert not hasattr(worker, "maintainers")
 
 def test_cdpa_uploads_once_per_role_conversation_generation(tmp_path: Path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
@@ -6397,10 +6923,11 @@ def test_attachment_upload_failure_is_sanitized_and_creates_one_maintainers_inci
     assert "private-context.txt" in result["block_reason"]
     assert str(attachment.resolve()) not in result["block_reason"]
     assert _active_hop(result)["state"] == "sending"
-    first = ensure_maintenance_incident(result)
-    second = ensure_maintenance_incident(result)
-    assert first is second
-    assert first["trigger_code"] == "attachment_upload_failed"
+    first = canonical_recovery_events(result)
+    second = canonical_recovery_events(result)
+    assert len(first) == len(second) == 1
+    assert first[0]["event_key"] == second[0]["event_key"]
+    assert first[0]["failure_signature"].startswith("attachment_upload_failed:")
 
 
 def test_attachment_generation_marker_persists_after_normal_advance_and_restart(
@@ -6567,10 +7094,11 @@ def test_normal_worker_rejects_prompt_set_unowned_attachment_before_send(
     assert persisted is not None
     assert persisted.status is RequestStatus.PROMPT_SET
     assert persisted.upload_receipt is None
-    first = ensure_maintenance_incident(result)
-    second = ensure_maintenance_incident(result)
-    assert first is second
-    assert first["trigger_code"] == "attachment_upload_failed"
+    first = canonical_recovery_events(result)
+    second = canonical_recovery_events(result)
+    assert len(first) == len(second) == 1
+    assert first[0]["event_key"] == second[0]["event_key"]
+    assert first[0]["failure_signature"].startswith("attachment_upload_failed:")
 
 
 @pytest.mark.parametrize(
@@ -6745,10 +7273,11 @@ def test_normal_worker_blocks_locked_send_boundary_conflict(
     assert persisted is not None
     assert persisted.status is RequestStatus.SENDING
     assert persisted.receipt is None
-    first = ensure_maintenance_incident(result)
-    second = ensure_maintenance_incident(result)
-    assert first is second
-    assert first["trigger_code"] == "attachment_upload_failed"
+    first = canonical_recovery_events(result)
+    second = canonical_recovery_events(result)
+    assert len(first) == len(second) == 1
+    assert first[0]["event_key"] == second[0]["event_key"]
+    assert first[0]["failure_signature"].startswith("attachment_upload_failed:")
 
 
 def test_normal_worker_valid_multi_attachment_sends_once_and_persists_generation(
@@ -6868,7 +7397,7 @@ def test_normal_worker_valid_multi_attachment_sends_once_and_persists_generation
 def test_worker_operational_failures_are_sanitized_before_manifest_and_dashboard(
     tmp_path: Path,
 ):
-    from playwright_auto.dashboard import build_task_payload
+    from playwright_auto.cdpa_projection import build_task_projection
 
     _config, store, state, worker = setup_task(
         tmp_path,
@@ -6904,7 +7433,7 @@ def test_worker_operational_failures_are_sanitized_before_manifest_and_dashboard
         f"{type(error).__name__}: {error}",
         action="pause",
     )
-    payload = build_task_payload(saved, tasks=[saved])
+    payload = build_task_projection(saved, tasks=[saved]).detail
     manifest_text = path.read_text(encoding="utf-8")
     dashboard_text = json.dumps(payload, ensure_ascii=False)
 
@@ -7047,7 +7576,7 @@ def test_worker_multi_segment_high_risk_paths_never_persist(
     tmp_path: Path,
     path_template: str,
 ):
-    from playwright_auto.dashboard import build_task_payload
+    from playwright_auto.cdpa_projection import build_task_projection
 
     _config, store, state, worker = setup_task(
         tmp_path,
@@ -7082,7 +7611,7 @@ def test_worker_multi_segment_high_risk_paths_never_persist(
         f"{type(error).__name__}: {error}",
         action="pause",
     )
-    payload = build_task_payload(saved, tasks=[saved])
+    payload = build_task_projection(saved, tasks=[saved]).detail
 
     assert secret not in manifest_path.read_text(encoding="utf-8")
     assert secret not in json.dumps(payload, ensure_ascii=False)
@@ -7115,7 +7644,7 @@ def test_worker_direct_marker_value_segment_never_persists(
     tmp_path: Path,
     path_template: str,
 ):
-    from playwright_auto.dashboard import build_task_payload
+    from playwright_auto.cdpa_projection import build_task_projection
 
     _config, store, state, worker = setup_task(
         tmp_path,
@@ -7150,7 +7679,7 @@ def test_worker_direct_marker_value_segment_never_persists(
         f"{type(error).__name__}: {error}",
         action="pause",
     )
-    payload = build_task_payload(saved, tasks=[saved])
+    payload = build_task_projection(saved, tasks=[saved]).detail
 
     assert secret not in manifest_path.read_text(encoding="utf-8")
     assert secret not in json.dumps(payload, ensure_ascii=False)
@@ -7243,7 +7772,7 @@ def test_worker_canonicalized_high_risk_route_never_persists(
     tmp_path: Path,
     path_template: str,
 ):
-    from playwright_auto.dashboard import build_task_payload
+    from playwright_auto.cdpa_projection import build_task_projection
 
     _config, store, state, worker = setup_task(
         tmp_path,
@@ -7278,7 +7807,7 @@ def test_worker_canonicalized_high_risk_route_never_persists(
         f"{type(error).__name__}: {error}",
         action="pause",
     )
-    payload = build_task_payload(saved, tasks=[saved])
+    payload = build_task_projection(saved, tasks=[saved]).detail
 
     assert secret not in manifest_path.read_text(encoding="utf-8")
     assert secret not in json.dumps(payload, ensure_ascii=False)
@@ -7288,3 +7817,891 @@ def test_worker_canonicalized_high_risk_route_never_persists(
     assert all(secret not in str(item) for item in _active_hop(saved)["errors"])
     assert secret not in str(saved["controls"][-1]["result"])
     assert all(secret not in item["message"] for item in payload["timeline"])
+
+
+def test_runtime_worker_discovers_once_and_idle_cycles_do_not_scan(tmp_path: Path, monkeypatch):
+    _config, store, state, worker = setup_task(tmp_path, task_id="task-runtime-once")
+    discover_calls = 0
+    recover_calls = 0
+    original_discover = store.discover_with_errors
+    original_recover = store.recover_phase4_replacement
+
+    def counted_discover():
+        nonlocal discover_calls
+        discover_calls += 1
+        return original_discover()
+
+    def counted_recover():
+        nonlocal recover_calls
+        recover_calls += 1
+        return original_recover()
+
+    async def inert_advance(path, _browser_context, *, scheduling_tasks=None):
+        assert scheduling_tasks is not None
+        return store.load(path)
+
+    class InertMaintainers:
+        async def advance(self, tasks, _browser_context):
+            assert len(tasks) == 1
+            return False
+
+    monkeypatch.setattr(store, "discover_with_errors", counted_discover)
+    monkeypatch.setattr(store, "recover_phase4_replacement", counted_recover)
+    monkeypatch.setattr(worker, "advance", inert_advance)
+    worker.maintainers = InertMaintainers()
+
+    asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
+    asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
+    asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
+
+    assert discover_calls == 1
+    assert recover_calls == 1
+
+
+def test_runtime_worker_does_not_advance_idle_terminal_or_blocked_tasks(tmp_path: Path, monkeypatch):
+    _config, store, running, worker = setup_task(tmp_path, task_id="task-runtime-running")
+    done = store.create_task("done", requested_team="done", task_id="task-runtime-done")
+    blocked = store.create_task("blocked", requested_team="blocked", task_id="task-runtime-blocked")
+    store.update(
+        done["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": utc_now(),
+        },
+    )
+    store.update(
+        blocked["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "BLOCKED",
+            "kanban_column": "BLOCKED",
+            "block_code": "manual",
+            "block_reason": "blocked",
+        },
+    )
+    advanced = []
+
+    async def record_advance(path, _browser_context, *, scheduling_tasks=None):
+        advanced.append(store.load(path)["task_id"])
+        return store.load(path)
+
+    class InertMaintainers:
+        async def advance(self, tasks, _browser_context):
+            assert {state["task_id"] for _path, state in tasks} == {
+                "task-runtime-running",
+                "task-runtime-done",
+                "task-runtime-blocked",
+            }
+            return False
+
+    monkeypatch.setattr(worker, "advance", record_advance)
+    worker.maintainers = InertMaintainers()
+
+    worker.hydrate_runtime()
+    worker.registry._due_at["task-runtime-running"] = 0.0
+    asyncio.run(worker.run_once(SimpleNamespace(pages=[])))
+
+    assert advanced == ["task-runtime-running"]
+
+
+def test_worker_browser_inventory_respects_cadence_and_page_count_change(tmp_path: Path, monkeypatch):
+    _config, _store, _state, worker = setup_task(tmp_path, task_id="task-browser-cadence")
+    evaluations = []
+
+    class Page:
+        def __init__(self, page_id):
+            self.page_id = page_id
+            self.url = "https://chatgpt.com/c/test"
+
+        def is_closed(self):
+            return False
+
+        async def evaluate(self, script):
+            evaluations.append((self.page_id, script))
+            return {
+                "url": self.url,
+                "title": "ChatGPT",
+                "role": "PLAN",
+                "page_id": self.page_id,
+                "task_id": "task-browser-cadence",
+                "team": "alpha",
+            }
+
+    class InertMaintainers:
+        async def advance(self, _tasks, _browser_context):
+            return False
+
+    async def inert_advance(path, _browser_context, *, scheduling_tasks=None):
+        return worker.store.load(path)
+
+    worker.maintainers = InertMaintainers()
+    monkeypatch.setattr(worker, "advance", inert_advance)
+    context = SimpleNamespace(pages=[Page("one")])
+
+    asyncio.run(worker.run_once(context))
+    asyncio.run(worker.run_once(context))
+    assert [page_id for page_id, _script in evaluations] == ["one"]
+
+    context.pages.append(Page("two"))
+    asyncio.run(worker.run_once(context))
+    assert [page_id for page_id, _script in evaluations] == ["one", "one", "two"]
+    assert all("data-message-author-role" not in script for _page_id, script in evaluations)
+
+
+def test_browser_disconnect_publishes_unknown_projection_and_reconnects(tmp_path: Path):
+    _config, store, state, worker = setup_task(
+        tmp_path, task_id="task-browser-disconnect-projection"
+    )
+    state["roles"]["PLAN"].update(page_id="page-one", online=True)
+    state = store.save(state["manifest_path"], state)
+    worker.hydrate_runtime()
+
+    class Page:
+        url = "https://chatgpt.com/c/test"
+
+        def is_closed(self):
+            return False
+
+        async def evaluate(self, _script):
+            return {
+                "url": self.url,
+                "title": "ChatGPT",
+                "role": "PLAN",
+                "page_id": "page-one",
+                "task_id": state["task_id"],
+                "team": state["team"],
+            }
+
+    context = SimpleNamespace(pages=[Page()])
+    asyncio.run(worker._publish_browser_inventory(context))
+    connected = worker.runtime_db.get_snapshot("browser")["payload"]
+    connected_detail = worker.runtime_db.get_task_detail(state["task_id"])
+    assert connected["connected"] is True
+    connected_plan = next(
+        role for role in connected_detail["roles"] if role["logical_role"] == "PLAN"
+    )
+    assert connected_detail["availability"] == "online"
+    assert connected_plan["online"] is True
+
+    worker._publish_browser_disconnected()
+    disconnected = worker.runtime_db.get_snapshot("browser")["payload"]
+    disconnected_detail = worker.runtime_db.get_task_detail(state["task_id"])
+    assert disconnected["connected"] is False
+    assert disconnected["page_count"] is None
+    assert disconnected["pages"] == []
+    assert disconnected["observed_at"]
+    disconnected_plan = next(
+        role for role in disconnected_detail["roles"] if role["logical_role"] == "PLAN"
+    )
+    assert disconnected_detail["availability"] == "unknown"
+    assert disconnected_plan["online"] is None
+
+    asyncio.run(worker._publish_browser_inventory(context))
+    reconnected = worker.runtime_db.get_snapshot("browser")["payload"]
+    reconnected_detail = worker.runtime_db.get_task_detail(state["task_id"])
+    assert reconnected["connected"] is True
+    assert reconnected["page_count"] == 1
+    reconnected_plan = next(
+        role for role in reconnected_detail["roles"] if role["logical_role"] == "PLAN"
+    )
+    assert reconnected_detail["availability"] == "online"
+    assert reconnected_plan["online"] is True
+
+
+def test_dashboard_actions_snapshot_tracks_browser_and_command_changes(tmp_path: Path):
+    _config, _store, state, worker = setup_task(
+        tmp_path, task_id="task-dashboard-actions"
+    )
+    worker.hydrate_runtime()
+
+    initial = worker.runtime_db.get_snapshot("dashboard_actions")
+    assert initial is not None
+    assert initial["payload"]["resume_teams"] == []
+    assert initial["payload"]["dependency_teams"][0]["team"] == state["team"]
+
+    asyncio.run(worker._publish_browser_inventory(SimpleNamespace(pages=[])))
+    connected = worker.runtime_db.get_snapshot("dashboard_actions")["payload"]
+    assert connected["resume_teams"] == [
+        {
+            "team": state["team"],
+            "task_id": state["task_id"],
+            "title": state["task_title"],
+            "status": "INBOX",
+            "reason": "offline",
+        }
+    ]
+
+    worker._publish_browser_disconnected()
+    disconnected = worker.runtime_db.get_snapshot("dashboard_actions")["payload"]
+    assert disconnected["resume_teams"] == []
+
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-dashboard-actions-create",
+        idempotency_key="dashboard-actions-create",
+        kind="create_task",
+        task_id="task-dashboard-actions-created",
+        expected_task_version=None,
+        payload={
+            "task": "Created dashboard action dependency",
+            "requested_team": "mailbox",
+            "repository": str(tmp_path),
+            "report_mode": "file",
+        },
+    )
+    assert worker._apply_next_command()["status"] == "applied"
+    after_create = worker.runtime_db.get_snapshot("dashboard_actions")["payload"]
+    assert {item["team"] for item in after_create["dependency_teams"]} == {
+        state["team"],
+        "mailbox",
+    }
+
+
+def test_runtime_create_command_applies_once_and_publishes_projection(tmp_path: Path):
+    config, store, _state, worker = setup_task(tmp_path, task_id="task-existing-command")
+    worker.hydrate_runtime()
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-create-once",
+        idempotency_key="create-once",
+        kind="create_task",
+        task_id="task-created-command",
+        expected_task_version=None,
+        payload={
+            "task": "Created through mailbox",
+            "requested_team": "mailbox",
+            "repository": str(tmp_path),
+            "report_mode": "file",
+        },
+    )
+
+    result = worker._apply_next_command()
+
+    assert result["status"] == "applied"
+    created = store.load_task_id("task-created-command")
+    assert created is not None
+    assert created["applied_command_ids"] == ["cmd-create-once"]
+    assert worker.runtime_db.get_task_detail("task-created-command")["task_id"] == "task-created-command"
+
+
+def test_runtime_create_command_replay_uses_manifest_provenance(tmp_path: Path):
+    _config, store, _state, worker = setup_task(tmp_path, task_id="task-existing-replay")
+    worker.hydrate_runtime()
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-create-replay",
+        idempotency_key="create-replay",
+        kind="create_task",
+        task_id="task-created-replay",
+        expected_task_version=None,
+        payload={
+            "task": "Replay-safe create",
+            "requested_team": "replay",
+            "repository": str(tmp_path),
+        },
+    )
+    assert worker.runtime_db.claim_next_command()["status"] == "running"
+    first = store.create_task(
+        "Replay-safe create",
+        requested_team="replay",
+        repository=tmp_path,
+        task_id="task-created-replay",
+        external_command_id="cmd-create-replay",
+    )
+    worker.runtime_db.requeue_running_commands()
+
+    result = worker._apply_next_command()
+
+    assert result["status"] == "applied"
+    assert store.load_task_id("task-created-replay")["manifest_path"] == first["manifest_path"]
+    assert len([item for item in worker.registry.tasks_by_id if item == "task-created-replay"]) == 1
+
+
+def test_degraded_dispatch_runs_reload_and_rejects_other_commands(tmp_path: Path):
+    _config, store, state, worker = setup_task(tmp_path, task_id="task-degraded-dispatch")
+    worker.hydrate_runtime()
+    worker.runtime_degraded = True
+    worker.registry = None
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-degraded-create",
+        idempotency_key="degraded-create",
+        kind="create_task",
+        task_id="task-should-not-create",
+        expected_task_version=None,
+        payload={
+            "task": "must be rejected while degraded",
+            "requested_team": "degraded",
+            "repository": str(tmp_path),
+            "report_mode": "file",
+            "depends_on_task_ids": [],
+            "upload_paths": [],
+            "reuse_team": False,
+        },
+    )
+
+    rejected = worker.dispatch_command_once()
+
+    assert rejected["status"] == "failed"
+    assert "catalog is degraded" in rejected["error"]
+    assert store.load_task_id("task-should-not-create") is None
+
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-degraded-reload",
+        idempotency_key="degraded-reload",
+        kind="reload_catalog",
+        task_id=None,
+        expected_task_version=None,
+        payload={},
+    )
+
+    recovered = worker.dispatch_command_once()
+
+    assert recovered["status"] == "applied"
+    assert worker.runtime_degraded is False
+    assert worker.registry is not None
+    assert "task-degraded-dispatch" in worker.registry.tasks_by_id
+
+
+def test_browser_cycle_does_not_head_of_line_block_state_commands(tmp_path: Path):
+    _config, store, _state, worker = setup_task(tmp_path, task_id="task-browser-cycle")
+    worker.hydrate_runtime()
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-reload-behind-browser",
+        idempotency_key="reload-behind-browser",
+        kind="reload_catalog",
+        task_id=None,
+        expected_task_version=None,
+        payload={},
+    )
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-create-during-browser",
+        idempotency_key="create-during-browser",
+        kind="create_task",
+        task_id="task-created-during-browser",
+        expected_task_version=None,
+        payload={
+            "task": "create while browser cycle is active",
+            "requested_team": "parallel",
+            "repository": str(tmp_path),
+            "report_mode": "file",
+            "depends_on_task_ids": [],
+            "upload_paths": [],
+            "reuse_team": False,
+        },
+    )
+    worker._browser_cycle_active = True
+
+    applied = worker.dispatch_command_once()
+
+    assert applied["command_id"] == "cmd-create-during-browser"
+    assert applied["status"] == "applied", applied
+    assert store.load_task_id("task-created-during-browser") is not None
+    assert worker.runtime_db.get_command("cmd-reload-behind-browser")["status"] == "queued"
+
+    worker._browser_cycle_active = False
+    reloaded = worker.dispatch_command_once()
+    assert reloaded["command_id"] == "cmd-reload-behind-browser"
+    assert reloaded["status"] == "applied"
+
+
+def test_independent_recovery_claim_is_idempotent_without_coordinator_cooldown(
+    tmp_path: Path,
+):
+    _config, store, state, worker = setup_task(
+        tmp_path, task_id="task-maintainers-cooldown"
+    )
+    store.update(
+        state["manifest_path"],
+        lambda current: {
+            **current,
+            "status": "BLOCKED",
+            "kanban_column": "BLOCKED",
+            "block_code": "role_offline",
+            "block_reason": "blocked",
+            "updated_at": "2026-07-26T00:00:00+00:00",
+        },
+    )
+    standby = store.create_independent_agent(
+        "Maintainers",
+        system_prompt="Recover tasks directly.",
+        task_id="agent-maintainers-g1",
+        trigger_settings={"recovery": True},
+        max_cycles=5,
+    )
+    worker.hydrate_runtime()
+
+    first = worker._activate_independent_agents()
+    claimed = store.load(standby["manifest_path"])
+    second = worker._activate_independent_agents()
+    replay = store.load(standby["manifest_path"])
+
+    assert first == {standby["task_id"]}
+    assert second == set()
+    assert claimed["independent"]["active_event"] == replay["independent"]["active_event"]
+    assert not hasattr(worker, "_maintainers_next_due_at")
+
+def test_independent_activation_refreshes_registry_and_projection(tmp_path: Path):
+    _config, store, state, worker = setup_task(
+        tmp_path, task_id="task-maintainers-refresh"
+    )
+    store.update(
+        state["manifest_path"],
+        lambda current: {
+            **current,
+            "status": "BLOCKED",
+            "kanban_column": "BLOCKED",
+            "block_code": "role_offline",
+            "block_reason": "blocked",
+            "updated_at": "2026-07-26T00:00:00+00:00",
+        },
+    )
+    standby = store.create_independent_agent(
+        "Maintainers",
+        system_prompt="Recover tasks directly.",
+        task_id="agent-maintainers-g1",
+        trigger_settings={"recovery": True},
+        max_cycles=5,
+    )
+    worker.hydrate_runtime()
+
+    worker._activate_independent_agents()
+
+    assert worker.registry.tasks_by_id[standby["task_id"]]["status"] == "RUNNING"
+    projected = worker.runtime_db.get_task_detail(standby["task_id"])
+    assert projected["status"] == "RUNNING"
+    assert projected["column"] == "INDEPENDENT_AGENTS"
+    assert projected["agent"]["target_task_id"] == state["task_id"]
+
+def test_runtime_reload_command_requeues_and_applies_after_interruption(tmp_path: Path):
+    _config, _store, _state, worker = setup_task(tmp_path, task_id="task-reload-replay")
+    worker.hydrate_runtime()
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-reload-replay",
+        idempotency_key="reload-replay",
+        kind="reload_catalog",
+        task_id=None,
+        expected_task_version=None,
+        payload={},
+    )
+    assert worker.runtime_db.claim_next_command()["status"] == "running"
+    worker.runtime_db.requeue_running_commands()
+
+    result = worker._apply_next_command()
+
+    assert result["status"] == "applied"
+    assert result["result"]["catalog"]["complete"] is True
+
+
+def test_coalesced_resume_commands_keep_exact_replay_provenance(tmp_path: Path):
+    _config, store, state, worker = setup_task(tmp_path, task_id="task-resume-coalesced")
+    blocked = store.update(
+        state["manifest_path"],
+        lambda current: {
+            **current,
+            "status": "BLOCKED",
+            "kanban_column": "BLOCKED",
+            "block_code": "manual",
+            "block_reason": "blocked",
+        },
+    )
+    first = store.resume_team(
+        blocked["team"],
+        reason="first resume",
+        external_command_id="cmd-resume-first",
+    )
+    second = store.resume_team(
+        blocked["team"],
+        reason="second resume",
+        external_command_id="cmd-resume-second",
+    )
+    assert len(second["controls"]) == len(first["controls"]) == 1
+    provenance = second["controls"][0]["external_commands"]
+    assert provenance == [
+        {"command_id": "cmd-resume-first", "reason": "first resume"},
+        {"command_id": "cmd-resume-second", "reason": "second resume"},
+    ]
+
+    worker.hydrate_runtime()
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-resume-second",
+        idempotency_key="resume-second",
+        kind="resume_team",
+        task_id=None,
+        expected_task_version=None,
+        payload={"team": blocked["team"], "reason": "second resume"},
+    )
+
+    result = worker._apply_next_command()
+
+    assert result["status"] == "running"
+    assert result["result"] is None
+    saved = store.load(state["manifest_path"])
+    assert len(saved["controls"]) == 1
+    assert saved["controls"][0]["status"] == "requested"
+
+
+def test_runtime_control_command_replay_reconciles_before_stale_version(tmp_path: Path):
+    _config, store, state, worker = setup_task(tmp_path, task_id="task-control-replay")
+    worker.hydrate_runtime()
+    version = worker.runtime_db.get_task_version("task-control-replay")
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-control-replay",
+        idempotency_key="control-replay",
+        kind="task_control",
+        task_id="task-control-replay",
+        expected_task_version=version,
+        payload={"action": "pause", "reason": "operator pause", "confirmed": False},
+    )
+    assert worker.runtime_db.claim_next_command()["status"] == "running"
+    mutated = store.request_control(
+        state["manifest_path"],
+        "pause",
+        reason="operator pause",
+        external_command_id="cmd-control-replay",
+    )
+    assert mutated["applied_command_ids"][-1] == "cmd-control-replay"
+    worker.runtime_db.requeue_running_commands()
+
+    result = worker._apply_next_command()
+
+    assert result["status"] == "applied"
+    assert result["result"]["reconciled"] is True
+    controls = store.load(state["manifest_path"])["controls"]
+    assert [item["external_command_id"] for item in controls] == ["cmd-control-replay"]
+
+
+def test_runtime_resume_command_replay_reconciles_exact_control(tmp_path: Path):
+    _config, store, state, worker = setup_task(tmp_path, task_id="task-resume-replay")
+    blocked = store.update(
+        state["manifest_path"],
+        lambda current: {
+            **current,
+            "status": "BLOCKED",
+            "kanban_column": "BLOCKED",
+            "block_code": "manual",
+            "block_reason": "blocked",
+        },
+    )
+    worker.hydrate_runtime()
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-resume-replay",
+        idempotency_key="resume-replay",
+        kind="resume_team",
+        task_id=None,
+        expected_task_version=None,
+        payload={"team": blocked["team"], "reason": "resume exact team"},
+    )
+    assert worker.runtime_db.claim_next_command()["status"] == "running"
+    store.resume_team(
+        blocked["team"],
+        reason="resume exact team",
+        external_command_id="cmd-resume-replay",
+    )
+    worker.runtime_db.requeue_running_commands()
+
+    result = worker._apply_next_command()
+
+    assert result["status"] == "running"
+    assert result["result"] is None
+    saved = store.load(state["manifest_path"])
+    assert saved["controls"][-1]["external_command_id"] == "cmd-resume-replay"
+    assert saved["controls"][-1]["status"] == "requested"
+
+
+def test_runtime_ambiguous_command_provenance_requires_recovery(tmp_path: Path):
+    _config, store, state, worker = setup_task(tmp_path, task_id="task-recovery-required")
+    worker.hydrate_runtime()
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-recovery-required",
+        idempotency_key="recovery-required",
+        kind="task_control",
+        task_id="task-recovery-required",
+        expected_task_version=worker.runtime_db.get_task_version("task-recovery-required"),
+        payload={"action": "pause", "confirmed": False},
+    )
+    assert worker.runtime_db.claim_next_command()["status"] == "running"
+    store.update(
+        state["manifest_path"],
+        lambda current: {
+            **current,
+            "applied_command_ids": [
+                *current.get("applied_command_ids", []),
+                "cmd-recovery-required",
+            ],
+        },
+    )
+    worker.runtime_db.requeue_running_commands()
+
+    result = worker._apply_next_command()
+
+    assert result["status"] == "recovery_required"
+    assert "exact control record" in result["error"]
+
+
+def test_runtime_command_stale_version_fails_without_mutation(tmp_path: Path):
+    _config, store, state, worker = setup_task(tmp_path, task_id="task-stale-command")
+    worker.hydrate_runtime()
+    before = store.load(state["manifest_path"])
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-stale",
+        idempotency_key="stale",
+        kind="task_control",
+        task_id="task-stale-command",
+        expected_task_version=99,
+        payload={"action": "pause"},
+    )
+
+    result = worker._apply_next_command()
+
+    assert result["status"] == "failed"
+    assert "stale task version" in result["error"]
+    after = store.load(state["manifest_path"])
+    assert after["controls"] == before["controls"]
+    assert "cmd-stale" not in after.get("applied_command_ids", [])
+
+
+def test_active_presend_offline_reopens_exact_conversation_before_block(tmp_path: Path):
+    _, _, state, worker = setup_task(
+        tmp_path, task_id="task-auto-recover-presend"
+    )
+    hop = _active_hop(state)
+    original_request_id = hop["request_id"]
+    exact_url = "https://chatgpt.com/c/presend-exact"
+    hop["conversation_url"] = exact_url
+    state["roles"]["PLAN"].update(
+        page_id="closed-page",
+        page_url=exact_url,
+        online=False,
+    )
+
+    acquired = AcquiredRole(
+        client=SimpleNamespace(),
+        page_id="closed-page",
+        url=exact_url,
+        created=True,
+        new_chat=False,
+    )
+
+    class Actions:
+        def __init__(self):
+            self.reopen_clean = []
+
+        async def acquire(self, *_args, **_kwargs):
+            raise RoleOwnershipError("recorded role tab is offline", code="role_offline")
+
+        async def reopen(self, *_args, require_clean_ready=True, **_kwargs):
+            self.reopen_clean.append(require_clean_ready)
+            return acquired
+
+    actions = Actions()
+    asyncio.run(worker._pre_send(state, hop, actions))
+
+    assert actions.reopen_clean == [True]
+    assert hop["state"] == "sending"
+    assert hop["request_id"] == original_request_id
+    assert state["status"] == "RUNNING"
+    assert state.get("maintenance") in (None, {})
+
+
+def test_active_accepted_waiting_offline_reopens_without_resend_or_clean_composer(
+    tmp_path: Path,
+):
+    _, _, state, worker = setup_task(
+        tmp_path, task_id="task-auto-recover-waiting"
+    )
+    hop = _active_hop(state)
+    exact_url = "https://chatgpt.com/c/waiting-exact"
+    original_request_id = hop["request_id"]
+    receipt = {
+        "binding": {"page_id": "closed-page", "role": "alpha-plan"},
+        "accepted_via": "user_message_identity",
+        "user_message_id": "accepted-user",
+        "user_turn_id": "accepted-turn",
+    }
+    hop.update(state="waiting", conversation_url=exact_url, receipt=receipt)
+    state["roles"]["PLAN"].update(
+        page_id="closed-page",
+        page_url=exact_url,
+        online=False,
+    )
+    acquired = AcquiredRole(
+        client=SimpleNamespace(),
+        page_id="closed-page",
+        url=exact_url,
+        created=True,
+        new_chat=False,
+    )
+
+    class Actions:
+        def __init__(self):
+            self.reopen_clean = []
+
+        async def locate_owned(self, *_args, **_kwargs):
+            return None
+
+        async def reopen(self, *_args, require_clean_ready=True, **_kwargs):
+            self.reopen_clean.append(require_clean_ready)
+            return acquired
+
+    actions = Actions()
+    result = asyncio.run(worker._owned_or_block(state, "PLAN", actions))
+
+    assert result == acquired
+    assert actions.reopen_clean == [False]
+    assert hop["state"] == "waiting"
+    assert hop["request_id"] == original_request_id
+    assert hop["receipt"] == receipt
+    assert state["status"] != "BLOCKED"
+    assert state.get("maintenance") in (None, {})
+
+
+def test_unresolved_active_role_recovery_emits_one_canonical_event(
+    tmp_path: Path,
+):
+    _, store, state, worker = setup_task(
+        tmp_path, task_id="task-atomic-role-incident"
+    )
+    hop = _active_hop(state)
+    exact_url = "https://chatgpt.com/c/unresolved-exact"
+    hop["conversation_url"] = exact_url
+    state["roles"]["PLAN"].update(
+        page_id="closed-page",
+        page_url=exact_url,
+        online=False,
+    )
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            return None
+
+        async def reopen(self, *_args, **_kwargs):
+            raise RoleOwnershipError(
+                "recorded exact conversation is unavailable",
+                code="role_offline",
+            )
+
+    actions = Actions()
+    assert asyncio.run(worker._owned_or_block(state, "PLAN", actions)) is None
+    assert state["status"] == "BLOCKED"
+    assert state.get("maintenance") in (None, {})
+    standby = store.create_independent_agent(
+        "Maintainers",
+        system_prompt="Recover tasks directly.",
+        task_id="agent-maintainers-g1",
+        trigger_settings={"recovery": True},
+        max_cycles=5,
+    )
+    first = canonical_independent_events(standby, [state, standby])
+
+    assert asyncio.run(worker._owned_or_block(state, "PLAN", actions)) is None
+    second = canonical_independent_events(standby, [state, standby])
+    assert len(first) == 1
+    assert [item["event_key"] for item in first] == [item["event_key"] for item in second]
+    assert first[0]["trigger_type"] == "recovery"
+    assert first[0]["target_task_id"] == state["task_id"]
+
+def test_waiting_promotes_live_exact_url_before_later_offline_recovery(tmp_path: Path):
+    _, _, state, worker = setup_task(
+        tmp_path, task_id="task-promote-live-conversation"
+    )
+    hop = _active_hop(state)
+    exact_url = "https://chatgpt.com/c/promoted-exact"
+    hop.update(
+        state="waiting",
+        conversation_url="https://chatgpt.com/c/WEB:temporary-id",
+        receipt={
+            "binding": {"page_id": "accepted-page", "role": "alpha-plan"},
+            "accepted_via": "user_message_identity",
+            "user_message_id": "accepted-user",
+            "user_turn_id": "accepted-turn",
+        },
+    )
+    state["roles"]["PLAN"].update(
+        page_id="accepted-page",
+        page_url="https://chatgpt.com/c/WEB:temporary-id",
+        online=True,
+    )
+    acquired = AcquiredRole(
+        client=SimpleNamespace(),
+        page_id="accepted-page",
+        url=exact_url,
+        created=False,
+        new_chat=False,
+    )
+
+    class Actions:
+        def __init__(self):
+            self.online = True
+            self.reopen_clean = []
+
+        async def locate_owned(self, *_args, **_kwargs):
+            return acquired if self.online else None
+
+        async def reopen(self, *_args, require_clean_ready=True, **_kwargs):
+            self.reopen_clean.append(require_clean_ready)
+            return acquired
+
+    actions = Actions()
+    assert asyncio.run(worker._owned_or_block(state, "PLAN", actions)) == acquired
+    assert hop["conversation_url"] == exact_url
+    assert state["roles"]["PLAN"]["page_url"] == exact_url
+
+    actions.online = False
+    assert asyncio.run(worker._owned_or_block(state, "PLAN", actions)) == acquired
+    assert actions.reopen_clean == [False]
+    assert state["status"] != "BLOCKED"
+    assert state.get("maintenance") in (None, {})
+
+
+def test_accepted_waiting_restores_drifted_page_id_without_resend_or_incident(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import playwright_auto.cdpa_actions as actions_module
+    from test_cdpa_actions import FakeClient, FakeContext, FakePage
+
+    _, _, state, worker = setup_task(
+        tmp_path, task_id="task-recover-drifted-accepted-page"
+    )
+    role_record = state["roles"]["PLAN"]
+    physical_role = role_record["physical_role"]
+    hop = _active_hop(state)
+    exact_url = "https://chatgpt.com/c/exact-drifted-page"
+    original_request_id = hop["request_id"]
+    receipt = {
+        "binding": {
+            "page_id": "recorded-accepted-page",
+            "role": physical_role,
+        },
+        "accepted_via": "user_message_identity",
+        "user_message_id": "accepted-user",
+        "user_turn_id": "accepted-turn",
+    }
+    hop.update(state="waiting", conversation_url=exact_url, receipt=receipt)
+    role_record.update(
+        page_id="recorded-accepted-page",
+        page_url=exact_url,
+        online=True,
+    )
+    live = FakePage(
+        page_id="live-drifted-page",
+        role=physical_role,
+        team=state["team"],
+        task_id=state["task_id"],
+    )
+    live.url = exact_url
+    live.snapshot_value.url = exact_url
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    actions = actions_module.CDPATabActions(FakeContext([live]), worker.config)
+
+    recovered = asyncio.run(worker._owned_or_block(state, "PLAN", actions))
+
+    assert recovered is not None
+    assert recovered.page_id == "recorded-accepted-page"
+    assert live.snapshot_value.page_id == "recorded-accepted-page"
+    assert hop["state"] == "waiting"
+    assert hop["request_id"] == original_request_id
+    assert hop["receipt"] == receipt
+    assert state["status"] != "BLOCKED"
+    assert state.get("maintenance") in (None, {})

@@ -92,6 +92,38 @@ def is_team_availability_barrier(manifest: Mapping[str, Any]) -> bool:
     )
 
 
+def exact_team_reuse_eligible(
+    manifests: Iterable[Mapping[str, Any]],
+    exact_team: str,
+) -> bool:
+    team = validate_exact_team(exact_team)
+    team_tasks = [
+        manifest
+        for manifest in manifests
+        if str(manifest.get("team") or "") == team
+    ]
+    if not team_tasks:
+        return False
+    identities = {
+        (
+            str(manifest.get("team_base") or manifest.get("team") or ""),
+            int(manifest.get("team_suffix") or 1),
+        )
+        for manifest in team_tasks
+    }
+    if len(identities) != 1:
+        return False
+    return sum(is_team_availability_barrier(manifest) for manifest in team_tasks) <= 1
+
+
+def exact_team_waiter_order_key(item: Mapping[str, Any]) -> tuple[int, str, str]:
+    return (
+        0 if item.get("priority") == "urgent_repair" else 1,
+        str(item.get("created_at") or ""),
+        str(item.get("task_id") or ""),
+    )
+
+
 def exact_team_ready_waiters(
     manifests: Iterable[Mapping[str, Any]],
     exact_team: str,
@@ -120,11 +152,7 @@ def exact_team_ready_waiters(
             )
             and dependency_readiness(manifest, graph_tasks).ready
         ),
-        key=lambda item: (
-            0 if item.get("priority") == "urgent_repair" else 1,
-            str(item.get("created_at") or ""),
-            str(item.get("task_id") or ""),
-        ),
+        key=exact_team_waiter_order_key,
     )
 
 
@@ -189,7 +217,7 @@ def queued_team_tasks(
 
 def physical_role(logical_role: str, team_base: str, team_suffix: int) -> str:
     role = str(logical_role).strip().upper()
-    if role not in {"PLAN", "DEV", "REVIEW", "TEST", "AUDIT"}:
+    if role not in {"PLAN", "DEV", "REVIEW", "TEST", "AUDIT", "AGENT"}:
         raise ValueError(f"unsupported CDPA role {role!r}")
     suffix = int(team_suffix)
     if suffix <= 0:

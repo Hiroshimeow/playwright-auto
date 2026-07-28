@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 import webbrowser
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -47,18 +48,28 @@ def _read_json(url: str, *, timeout: float) -> Mapping[str, Any]:
     return value
 
 
+def _api_base_url(config: CDPAConfig) -> str:
+    host = "127.0.0.1" if config.dashboard_api_host in {"localhost", "::1"} else config.dashboard_api_host
+    return f"http://{host}:{config.dashboard_api_port}"
+
+
 def _post(
     config: CDPAConfig,
     path: str,
     payload_value: Mapping[str, Any],
     *,
-    expected_status: int,
+    idempotency_key: str,
+    expected_status: int = 202,
 ) -> Mapping[str, Any]:
     payload = json.dumps(dict(payload_value), ensure_ascii=False).encode("utf-8")
+    api_url = _api_base_url(config)
     request = Request(
-        f"{config.dashboard_url}{path}",
+        f"{api_url}{path}",
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Idempotency-Key": idempotency_key,
+        },
         method="POST",
     )
     try:
@@ -68,20 +79,22 @@ def _post(
     except HTTPError as exc:
         body = exc.read()
         try:
-            detail = json.loads(body.decode("utf-8")).get("error")
+            decoded = json.loads(body.decode("utf-8"))
+            error = decoded.get("error") if isinstance(decoded, Mapping) else decoded
+            detail = error.get("message") if isinstance(error, Mapping) else error
         except Exception:
             detail = body.decode("utf-8", errors="replace") or exc.reason
-        raise RuntimeError(f"dashboard rejected request: {detail}") from exc
+        raise RuntimeError(f"CDPA API rejected request: {detail}") from exc
     except URLError as exc:
         raise RuntimeError(
-            f"dashboard is unavailable at {config.dashboard_url}: {exc.reason}; "
-            "run `cdpa` in another terminal to start the UI and worker"
+            f"CDPA API is unavailable at {api_url}: {exc.reason}; "
+            "start the API and worker before creating tasks"
         ) from exc
     if status != expected_status:
-        raise RuntimeError(f"dashboard returned unexpected HTTP {status}")
+        raise RuntimeError(f"CDPA API returned unexpected HTTP {status}")
     value = json.loads(body.decode("utf-8"))
     if not isinstance(value, Mapping):
-        raise RuntimeError("dashboard response must be a JSON object")
+        raise RuntimeError("CDPA API response must be a JSON object")
     return value
 
 
@@ -97,6 +110,7 @@ def submit_task(
     report_mode: str = "file",
     depends_on_task_ids: Sequence[str] = (),
     upload_paths: Sequence[str | Path] = (),
+    idempotency_key: str | None = None,
 ) -> Mapping[str, Any]:
     return _post(
         config,
@@ -104,7 +118,7 @@ def submit_task(
         {
             "task": task,
             "repository": str(repository),
-            "team": team,
+            "requested_team": team,
             "reuse_team": reuse_team,
             "new_roles": list(new_roles),
             "new_all": bool(new_all),
@@ -112,25 +126,41 @@ def submit_task(
             "depends_on_task_ids": list(depends_on_task_ids),
             "upload_paths": [str(Path(path).expanduser().resolve()) for path in upload_paths],
         },
-        expected_status=201,
+        idempotency_key=idempotency_key or str(uuid.uuid4()),
     )
 
 
-def resume_task(config: CDPAConfig, *, repository: Path, team: str) -> Mapping[str, Any]:
+def resume_task(
+    config: CDPAConfig,
+    *,
+    repository: Path,
+    team: str,
+    idempotency_key: str | None = None,
+) -> Mapping[str, Any]:
+    del repository
     return _post(
         config,
         "/api/tasks/resume",
-        {"repository": str(repository), "team": team},
-        expected_status=202,
+        {"team": team},
+        idempotency_key=idempotency_key or str(uuid.uuid4()),
     )
 
 
-def _runtime_commands(config: CDPAConfig) -> tuple[list[str], list[str]]:
+def _runtime_commands(config: CDPAConfig) -> tuple[list[str], list[str], list[str]]:
     config_path = str(config.config_path)
-    dashboard = [
+    frontend = [
         sys.executable,
         "-m",
         "playwright_auto.dashboard",
+        "--config",
+        config_path,
+    ]
+    api = [
+        sys.executable,
+        "-m",
+        "playwright_auto.dashboard_api",
+        "--repository",
+        str(config.repository_root),
         "--config",
         config_path,
     ]
@@ -143,7 +173,7 @@ def _runtime_commands(config: CDPAConfig) -> tuple[list[str], list[str]]:
         "--config",
         config_path,
     ]
-    return dashboard, worker
+    return frontend, api, worker
 
 
 def _interrupt_signal() -> int:
@@ -189,13 +219,7 @@ def open_runtime_ui(
     config_path: str | Path | None,
 ) -> int:
     config = load_cdpa_config(config_path, repository_root=repository)
-    payload = _read_json(f"{config.dashboard_url}/api/tasks", timeout=2)
-    active_repository = Path(str(payload.get("repository") or "")).expanduser().resolve()
-    if active_repository != repository:
-        raise RuntimeError(
-            f"dashboard is bound to {active_repository}, not {repository}; "
-            "stop that runtime before switching repositories"
-        )
+    _read_json(f"{config.dashboard_url}/health", timeout=2)
     _open_dashboard(config.dashboard_url)
     print(f"dashboard={config.dashboard_url}", flush=True)
     return 0
@@ -210,80 +234,72 @@ def start_runtime(
     if not repository.is_dir():
         raise ValueError(f"repository does not exist or is not a directory: {repository}")
     config = load_cdpa_config(config_path, repository_root=repository)
-
     try:
-        existing = _read_json(f"{config.dashboard_url}/api/tasks", timeout=1)
+        frontend_health = _read_json(f"{config.dashboard_url}/health", timeout=1)
+        api_health = _read_json(f"{_api_base_url(config)}/health", timeout=1)
     except RuntimeError:
-        existing = None
-    if existing is not None:
-        active_repository = Path(
-            str(existing.get("repository") or "")
-        ).expanduser().resolve()
-        if active_repository != repository:
-            raise RuntimeError(
-                f"port {config.dashboard_port} is already serving {active_repository}; "
-                "stop that CDPA runtime before switching repositories"
-            )
+        frontend_health = api_health = None
+    if frontend_health is not None and api_health is not None:
         if open_ui:
             _open_dashboard(config.dashboard_url)
         print("runtime=already-running", flush=True)
-        print(f"repository={repository}", flush=True)
         print(f"dashboard={config.dashboard_url}", flush=True)
+        print(f"api={_api_base_url(config)}", flush=True)
         return 0
 
-    dashboard_command, worker_command = _runtime_commands(config)
-    dashboard: subprocess.Popen[Any] | None = None
+    frontend_command, api_command, worker_command = _runtime_commands(config)
+    frontend: subprocess.Popen[Any] | None = None
+    api: subprocess.Popen[Any] | None = None
     worker: subprocess.Popen[Any] | None = None
     try:
-        dashboard = _start_process(dashboard_command, cwd=repository)
+        api = _start_process(api_command, cwd=repository)
+        frontend = _start_process(frontend_command, cwd=repository)
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
-            code = dashboard.poll()
-            if code is not None:
-                raise RuntimeError(f"dashboard exited during startup with code {code}")
+            if api.poll() is not None:
+                raise RuntimeError(f"API exited during startup with code {api.returncode}")
+            if frontend.poll() is not None:
+                raise RuntimeError(f"frontend exited during startup with code {frontend.returncode}")
             try:
-                health = _read_json(f"{config.dashboard_url}/health", timeout=0.5)
+                _read_json(f"{_api_base_url(config)}/health", timeout=0.5)
+                _read_json(f"{config.dashboard_url}/health", timeout=0.5)
             except RuntimeError:
                 time.sleep(0.2)
                 continue
-            if health.get("task_store_ready"):
-                break
-            time.sleep(0.2)
+            break
         else:
-            raise RuntimeError(f"dashboard did not become ready at {config.dashboard_url}")
-
+            raise RuntimeError("CDPA API/frontend did not become ready")
         worker = _start_process(worker_command, cwd=repository)
         print("runtime=running", flush=True)
-        print(f"repository={repository}", flush=True)
         print(f"dashboard={config.dashboard_url}", flush=True)
-        print("Press Ctrl+C to stop the dashboard and worker; Chrome remains open.", flush=True)
+        print(f"api={_api_base_url(config)}", flush=True)
+        print("Press Ctrl+C to stop frontend, API, and worker; Chrome remains open.", flush=True)
         if open_ui:
             _open_dashboard(config.dashboard_url)
-
         while True:
-            dashboard_code = dashboard.poll()
-            worker_code = worker.poll()
-            if dashboard_code is not None:
-                raise RuntimeError(f"dashboard exited with code {dashboard_code}")
-            if worker_code is not None:
-                raise RuntimeError(f"worker exited with code {worker_code}")
+            for label, process in (("frontend", frontend), ("API", api), ("worker", worker)):
+                code = process.poll()
+                if code is not None:
+                    raise RuntimeError(f"{label} exited with code {code}")
             time.sleep(0.5)
     except KeyboardInterrupt:
         return 130
     finally:
         _stop_process(worker)
-        _stop_process(dashboard)
+        _stop_process(frontend)
+        _stop_process(api)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Create or resume a durable CDPA task",
         epilog=(
-            "Run `cdpa` or `cdpa start` to start the dashboard and worker for the "
+            "Run `cdpa` or `cdpa start` to start the frontend, API, and worker for the "
             "current repository. Run `cdpa ui` to reopen the dashboard."
         ),
     )
     parser.add_argument("task", nargs="?", help="complete task text; omit to resume --team")
+    parser.add_argument("--task", dest="task_option", help="complete task text (explicit form)")
     parser.add_argument("--new", dest="new_roles", help="comma-separated roles reset lazily once")
     parser.add_argument("--new-all", action="store_true", help="reset every selected role lazily once")
     parser.add_argument("--team", default=None, help="new-task team base or exact team to resume")
@@ -351,7 +367,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         args = build_parser().parse_args(raw)
         repository = Path(args.repository).expanduser().resolve()
         config = load_cdpa_config(args.config, repository_root=repository)
-        task = str(args.task or "").strip()
+        if args.task and args.task_option:
+            raise ValueError("provide task text either positionally or with --task, not both")
+        task = str(args.task_option or args.task or "").strip()
         new_roles = parse_new_roles(args.new_roles)
         dependencies = parse_dependency_ids(args.depends_on)
         if task:
@@ -387,9 +405,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"cdpa: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
     print(f"mode={mode}")
-    print(f"task_id={state['task_id']}")
-    print(f"team={state['team']}")
-    print(f"manifest={state['manifest_path']}")
+    if state.get("command_id"):
+        print(f"command_id={state['command_id']}")
+    if state.get("task_id"):
+        print(f"task_id={state['task_id']}")
+    if state.get("status"):
+        print(f"status={state['status']}")
+    print(f"api={_api_base_url(config)}")
     print(f"dashboard={config.dashboard_url}", flush=True)
     return 0
 

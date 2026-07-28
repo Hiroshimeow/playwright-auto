@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 
+from .cdpa_browser_projection import inspect_page_metadata
 from .cdpa_config import CDPAConfig
+from .cdpa_independent import is_independent_task
 from .chatgpt import (
     ChatGPTPage,
     PageBinding,
@@ -16,6 +19,23 @@ from .chatgpt import (
 from .workspace import ChatGPTWorkspace
 
 _CHATGPT_HOSTS = frozenset({"chatgpt.com", "www.chatgpt.com"})
+
+
+def _reopenable_conversation_identity(value: Any) -> str | None:
+    try:
+        parsed = urlparse(str(value or ""))
+    except ValueError:
+        return None
+    path = parsed.path.rstrip("/")
+    conversation_id = path.rsplit("/", 1)[-1]
+    if (
+        (parsed.hostname or "").lower() not in _CHATGPT_HOSTS
+        or not path.startswith("/c/")
+        or len(path) <= 3
+        or conversation_id.startswith("WEB:")
+    ):
+        return None
+    return path
 
 
 class RoleOwnershipError(RuntimeError):
@@ -79,16 +99,33 @@ class CDPATabActions:
                 page,
                 timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
             )
-            try:
-                snapshot = await client.snapshot()
-            except Exception:
-                continue
+            metadata = await inspect_page_metadata(page)
+            if metadata.get("page_id") and metadata.get("role"):
+                snapshot = SimpleNamespace(
+                    page_id=metadata.get("page_id"),
+                    page_role=metadata.get("role"),
+                    page_team=metadata.get("team"),
+                    page_task_id=metadata.get("task_id"),
+                    url=metadata.get("url") or str(page.url),
+                )
+            else:
+                try:
+                    snapshot = await client.snapshot()
+                except Exception:
+                    continue
             if snapshot.page_role != physical or not snapshot.page_id:
                 continue
-            client.binding = PageBinding(snapshot.page_id, physical)
+            client.binding = PageBinding(str(snapshot.page_id), physical)
             item = (client, snapshot)
             if snapshot.page_team == team and snapshot.page_task_id == task_id:
                 exact.append(item)
+            elif (
+                is_independent_task(manifest)
+                and recorded_page_id
+                and str(snapshot.page_id) == recorded_page_id
+                and snapshot.page_team == team
+            ):
+                reusable.append((-1, item))
             elif not recorded_page_id and snapshot.page_team in reusable_rank:
                 reusable.append((reusable_rank[str(snapshot.page_team)], item))
         if len(exact) > 1:
@@ -97,8 +134,6 @@ class CDPATabActions:
             )
         if exact:
             return exact
-        if recorded_page_id:
-            return []
         if reusable:
             best_rank = min(rank for rank, _item in reusable)
             best = [item for rank, item in reusable if rank == best_rank]
@@ -107,6 +142,8 @@ class CDPATabActions:
                     f"multiple reusable terminal tabs match {physical!r} for team {team!r}"
                 )
             return best
+        if recorded_page_id:
+            return []
         return []
 
     async def acquire_global_role(self, physical_role: str) -> AcquiredRole:
@@ -176,7 +213,6 @@ class CDPATabActions:
         if not matches:
             return None
         client, snapshot = matches[0]
-        await client.assert_ownership()
         return AcquiredRole(
             client=client,
             page_id=str(snapshot.page_id),
@@ -251,6 +287,8 @@ class CDPATabActions:
         self,
         manifest: Mapping[str, Any],
         logical_role: str,
+        *,
+        require_clean_ready: bool = True,
     ) -> AcquiredRole:
         logical_role = str(logical_role).upper()
         role_record = manifest["roles"][logical_role]
@@ -266,20 +304,21 @@ class CDPATabActions:
             ),
             None,
         )
-        page_url = str(
-            (active_hop or {}).get("conversation_url")
-            or role_record.get("page_url")
-            or ""
-        ).strip()
-        existing = await self.locate_owned(manifest, logical_role)
-        if existing is not None:
-            await self.open_tab(existing)
-            return existing
+        candidate_urls = (
+            str((active_hop or {}).get("conversation_url") or "").strip(),
+            str(role_record.get("page_url") or "").strip(),
+        )
+        page_url = next(
+            (value for value in candidate_urls if _reopenable_conversation_identity(value) is not None),
+            next((value for value in candidate_urls if value), ""),
+        )
         if not page_id or not page_url:
             raise RoleOwnershipError("role has no recorded page identity to reopen")
         parsed_url = urlparse(page_url)
         if (parsed_url.hostname or "").lower() not in _CHATGPT_HOSTS:
-            raise RoleOwnershipError(f"recorded role URL is not a ChatGPT conversation: {page_url!r}")
+            raise RoleOwnershipError(
+                f"recorded role URL is not a ChatGPT conversation: {page_url!r}"
+            )
         conversation_id = parsed_url.path.rstrip("/").rsplit("/", 1)[-1]
         if conversation_id.startswith("WEB:"):
             raise RoleOwnershipError(
@@ -289,40 +328,87 @@ class CDPATabActions:
             raise RoleOwnershipError(
                 f"recorded role URL is not an exact conversation URL: {page_url!r}"
             )
-        await random_delay(action_delay_multiplier("open_tab"))
-        page = await self.browser_context.new_page()
+
+        existing = await self.locate_owned(manifest, logical_role)
+        created = existing is None
+        if created:
+            await random_delay(action_delay_multiplier("open_tab"))
+            page = await self.browser_context.new_page()
+            client = ChatGPTPage(
+                page,
+                timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
+            )
+        else:
+            client = existing.client
+            page = client.page
         timeout = round(self.config.workspace_timeout_seconds * 1000)
         try:
-            await page.goto(page_url, wait_until="domcontentloaded", timeout=timeout)
-            await page.locator("body").wait_for(state="visible", timeout=timeout)
             actual_url = urlparse(str(page.url))
+            exact_url = (
+                actual_url.scheme == parsed_url.scheme
+                and actual_url.netloc == parsed_url.netloc
+                and actual_url.path.rstrip("/") == parsed_url.path.rstrip("/")
+            )
+            if not exact_url:
+                await page.goto(
+                    page_url, wait_until="domcontentloaded", timeout=timeout
+                )
+                await page.locator("body").wait_for(
+                    state="visible", timeout=timeout
+                )
+                actual_url = urlparse(str(page.url))
+                if (
+                    actual_url.scheme != parsed_url.scheme
+                    or actual_url.netloc != parsed_url.netloc
+                    or actual_url.path.rstrip("/") != parsed_url.path.rstrip("/")
+                ):
+                    raise RoleOwnershipError(
+                        "conversation reopen redirected away from the recorded URL: "
+                        f"{page.url!r}"
+                    )
+                await client.restore_identity(
+                    page_id=page_id,
+                    role=physical,
+                    task_id=str(manifest["task_id"]),
+                    team=str(manifest["team"]),
+                )
+            else:
+                snapshot = await client.assert_ownership()
+                if (
+                    str(snapshot.page_id or "") != page_id
+                    or str(snapshot.page_role or "") != physical
+                    or str(snapshot.page_task_id or "") != str(manifest["task_id"])
+                    or str(snapshot.page_team or "") != str(manifest["team"])
+                ):
+                    await client.restore_identity(
+                        page_id=page_id,
+                        role=physical,
+                        task_id=str(manifest["task_id"]),
+                        team=str(manifest["team"]),
+                    )
+            if require_clean_ready:
+                await client.wait_until_clean_ready(timeout_ms=timeout)
+            snapshot = await client.assert_ownership()
             if (
-                actual_url.scheme != parsed_url.scheme
-                or actual_url.netloc != parsed_url.netloc
-                or actual_url.path.rstrip("/") != parsed_url.path.rstrip("/")
+                str(snapshot.page_id or "") != page_id
+                or str(snapshot.page_role or "") != physical
+                or str(snapshot.page_task_id or "") != str(manifest["task_id"])
+                or str(snapshot.page_team or "") != str(manifest["team"])
             ):
                 raise RoleOwnershipError(
-                    f"conversation reopen redirected away from the recorded URL: {page.url!r}"
+                    "conversation reopen did not restore exact role/task ownership"
                 )
-            client = ChatGPTPage(page, timeout_ms=timeout)
-            await client.restore_identity(
-                page_id=page_id,
-                role=physical,
-                task_id=str(manifest["task_id"]),
-                team=str(manifest["team"]),
-            )
-            await client.wait_until_clean_ready(timeout_ms=timeout)
-            snapshot = await client.assert_ownership()
             await page.bring_to_front()
             return AcquiredRole(
                 client=client,
                 page_id=page_id,
                 url=str(snapshot.url),
-                created=True,
+                created=created,
                 new_chat=False,
             )
         except Exception:
-            await page.close()
+            if created:
+                await page.close()
             raise
 
     async def restart(
@@ -439,6 +525,12 @@ class CDPATabActions:
             if isinstance(record, Mapping) and record.get("physical_role")
         }
         matches: dict[str, list[Any]] = {role: [] for role in assigned_roles}
+        independent = is_independent_task(manifest)
+        recorded_page_ids = {
+            str(record.get("physical_role")): str(record.get("page_id") or "")
+            for record in manifest.get("roles", {}).values()
+            if isinstance(record, Mapping) and record.get("physical_role")
+        }
         for page in tuple(self.browser_context.pages):
             if page.is_closed() or not self._supported(page):
                 continue
@@ -451,11 +543,15 @@ class CDPATabActions:
                     f"{getattr(page, 'url', '<unknown>')!r}: {type(exc).__name__}: {exc}"
                 ) from exc
             role = str(snapshot.page_role or "")
-            if (
-                role in assigned_roles
-                and snapshot.page_team == team
-                and snapshot.page_task_id == task_id
-            ):
+            if role not in assigned_roles or snapshot.page_team != team:
+                continue
+            exact_task = snapshot.page_task_id == task_id
+            same_recorded_agent = (
+                independent
+                and bool(recorded_page_ids.get(role))
+                and str(snapshot.page_id or "") == recorded_page_ids[role]
+            )
+            if exact_task or same_recorded_agent:
                 matches[role].append(page)
         duplicates = [role for role, pages in matches.items() if len(pages) > 1]
         if duplicates:

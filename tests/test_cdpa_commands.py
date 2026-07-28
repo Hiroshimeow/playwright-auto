@@ -54,13 +54,13 @@ def test_worker_command_is_frozen_and_round_trips_complete_snapshot():
     current = state()
     snapshot = command_snapshot(current, role="DEV")
     command = WorkerCommand.create(
-        origin="maintainers",
+        origin="independent_agent",
         action="open_tab",
         reason="restore exact role ownership",
         state=current,
         role="DEV",
-        incident_id="maint-1",
-        request_id="maint-1-turn1",
+        source_task_id="agent-maintainers-g1",
+        source_event_key="recovery:task-a:role-offline",
     )
 
     assert command.snapshot == snapshot
@@ -72,13 +72,13 @@ def test_worker_command_is_frozen_and_round_trips_complete_snapshot():
 def test_worker_command_rejects_stale_hop_conversation_and_receipt():
     current = state()
     command = WorkerCommand.create(
-        origin="maintainers",
+        origin="independent_agent",
         action="open_tab",
         reason="restore exact role ownership",
         state=current,
         role="DEV",
-        incident_id="maint-1",
-        request_id="maint-1-turn1",
+        source_task_id="agent-maintainers-g1",
+        source_event_key="recovery:task-a:role-offline",
     )
     validate_worker_command(command, current)
 
