@@ -16,6 +16,7 @@ SNAPSHOT_NAMES = frozenset(
 COMMAND_KINDS = frozenset(
     {
         "create_task",
+    "change_goal",
         "create_independent_agent",
         "independent_complete",
         "independent_continue",

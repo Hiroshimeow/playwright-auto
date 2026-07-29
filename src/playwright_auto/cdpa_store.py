@@ -105,6 +105,34 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def effective_task_goal(state: Mapping[str, Any]) -> str:
+    value = state.get("effective_goal")
+    if isinstance(value, str) and value.strip():
+        return value
+    return str(state.get("task_text") or "")
+
+
+def task_goal_for_hop(state: Mapping[str, Any], hop_id: int) -> str:
+    selected = str(state.get("task_text") or "")
+    revisions = state.get("goal_revisions")
+    if not isinstance(revisions, list):
+        return selected
+    for revision in revisions:
+        if not isinstance(revision, Mapping):
+            continue
+        applies_from = revision.get("applies_from_hop_id")
+        goal = revision.get("goal")
+        if (
+            isinstance(applies_from, int)
+            and not isinstance(applies_from, bool)
+            and applies_from <= int(hop_id)
+            and isinstance(goal, str)
+            and goal.strip()
+        ):
+            selected = goal
+    return selected
+
+
 def retained_report_references(
     state: Mapping[str, Any], *, limit: int = 20
 ) -> list[dict[str, Any]]:
@@ -573,6 +601,55 @@ class TaskStore:
             or len(set(applied_command_ids)) != len(applied_command_ids)
         ):
             return "task manifest applied_command_ids must be a unique string array"
+        effective_goal = state.get("effective_goal")
+        goal_revisions = state.get("goal_revisions")
+        if effective_goal is not None and (
+            not isinstance(effective_goal, str) or not effective_goal.strip()
+        ):
+            return "effective_goal must be a non-empty string"
+        if goal_revisions is not None:
+            if not isinstance(goal_revisions, list):
+                return "goal_revisions must be a list"
+            expected_revision = 1
+            latest_goal = None
+            for revision in goal_revisions:
+                if not isinstance(revision, Mapping):
+                    return "goal revision must be an object"
+                if set(revision) != {
+                    "revision", "changed_at", "applies_from_hop_id", "goal",
+                    "external_command_id",
+                }:
+                    return "goal revision keys are invalid"
+                if revision.get("revision") != expected_revision:
+                    return "goal revisions must be consecutively ordered"
+                changed_at = revision.get("changed_at")
+                applies_from = revision.get("applies_from_hop_id")
+                goal = revision.get("goal")
+                command_id = revision.get("external_command_id")
+                if not isinstance(changed_at, str) or not changed_at.strip():
+                    return "goal revision changed_at must be a non-empty string"
+                if (
+                    isinstance(applies_from, bool)
+                    or not isinstance(applies_from, int)
+                    or applies_from < 2
+                ):
+                    return "goal revision applies_from_hop_id must be at least 2"
+                if not isinstance(goal, str) or not goal.strip():
+                    return "goal revision goal must be a non-empty string"
+                if not isinstance(command_id, str) or not command_id.strip():
+                    return "goal revision external_command_id must be a non-empty string"
+                latest_goal = goal
+                expected_revision += 1
+            if goal_revisions and effective_goal != latest_goal:
+                return "effective_goal must match the latest goal revision"
+            if not goal_revisions and effective_goal is not None:
+                return "effective_goal requires at least one goal revision"
+        elif effective_goal is not None:
+            return "effective_goal requires goal_revisions"
+        if mode == TASK_MODE_INDEPENDENT and (
+            effective_goal is not None or goal_revisions is not None
+        ):
+            return "independent task must not contain workflow goal revisions"
         try:
             report_mode_from_options(state["options"])
             dependencies = normalize_dependency_ids(state.get("depends_on_task_ids"))
@@ -5540,6 +5617,57 @@ class TaskStore:
             control["source_event_key"] = source_event
         state.setdefault("controls", []).append(control)
         return control
+
+    def change_goal(
+        self,
+        path: str | Path,
+        goal: str,
+        *,
+        external_command_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(goal, str) or not goal.strip():
+            raise ValueError("goal must not be blank")
+        command_id = str(external_command_id or "").strip()
+
+        def mutate(state: dict[str, Any]) -> dict[str, Any]:
+            if is_independent_task(state):
+                raise ValueError("Change goal is available only for workflow tasks")
+            if str(state.get("status") or "").upper() != "RUNNING":
+                raise ValueError("Change goal is available only while the task is RUNNING")
+            active_hop_id = state.get("active_hop_id")
+            if (
+                isinstance(active_hop_id, bool)
+                or not isinstance(active_hop_id, int)
+                or active_hop_id < 1
+            ):
+                raise ValueError("RUNNING task has no active hop")
+            revisions = state.get("goal_revisions") or []
+            if command_id and command_id in state.get("applied_command_ids", []):
+                matching = [
+                    item for item in revisions
+                    if isinstance(item, Mapping)
+                    and item.get("external_command_id") == command_id
+                ]
+                if len(matching) != 1 or matching[0].get("goal") != goal:
+                    raise ValueError("change-goal command provenance does not match its payload")
+                return state
+            if effective_task_goal(state) == goal:
+                raise ValueError("replacement goal is unchanged")
+            if not command_id:
+                raise ValueError("external_command_id is required for a goal change")
+            revision = {
+                "revision": len(revisions) + 1,
+                "changed_at": utc_now(),
+                "applies_from_hop_id": active_hop_id + 1,
+                "goal": goal,
+                "external_command_id": command_id,
+            }
+            state["effective_goal"] = goal
+            state.setdefault("goal_revisions", []).append(revision)
+            self._record_external_command(state, command_id)
+            return state
+
+        return self.update(path, mutate)
 
     def request_control(
         self,

@@ -66,6 +66,7 @@ from .cdpa_routes import (
 from .cdpa_store import (
     TaskStore,
     is_replaced_immutable_history,
+    task_goal_for_hop,
     report_mode_from_options,
     utc_now,
 )
@@ -2237,7 +2238,7 @@ class CDPAWorker:
                 workspace=str(state["repository"]),
                 source_physical_role=source_physical,
                 handoff=str(hop["handoff"]),
-                goal=str(state["task_text"]),
+                goal=task_goal_for_hop(state, int(hop["hop_id"])),
                 constructor_sent_generation=role_record.get(
                     "constructor_sent_generation"
                 ),
@@ -4618,6 +4619,15 @@ class CDPAWorker:
             if not is_independent_task(state):
                 raise RuntimeError("independent command provenance belongs to a workflow task")
             return state
+        if kind == "change_goal":
+            revisions = [
+                item for item in state.get("goal_revisions") or []
+                if isinstance(item, Mapping)
+                and item.get("external_command_id") == command_id
+            ]
+            if len(revisions) != 1 or revisions[0].get("goal") != payload.get("goal"):
+                raise RuntimeError("change-goal command provenance does not match its payload")
+            return state
         if kind == "create_task":
             if (
                 str(state.get("task_id") or "") != task_id
@@ -4925,6 +4935,23 @@ class CDPAWorker:
                 )
                 self._publish_command_state(state)
                 result = {"task_id": state["task_id"], "status": state["status"]}
+            elif kind == "change_goal":
+                if task_id is None:
+                    raise ValueError("change_goal requires task_id")
+                current = self._command_task_state(task_id)
+                if current is None:
+                    raise ValueError(f"task does not exist: {task_id}")
+                state = self.store.change_goal(
+                    current["manifest_path"],
+                    str(payload.get("goal") or ""),
+                    external_command_id=command_id,
+                )
+                self._publish_command_state(state)
+                result = {
+                    "task_id": task_id,
+                    "status": state.get("status"),
+                    "goal_revision": len(state.get("goal_revisions") or []),
+                }
             elif kind == "resume_team":
                 state = self.store.resume_team(
                     str(payload.get("team") or ""),
@@ -4967,6 +4994,7 @@ class CDPAWorker:
             rejected = self.runtime_db.claim_next_command(
                 kinds=(
                     "create_task",
+                    "change_goal",
                     "create_independent_agent",
                     "independent_complete",
                     "independent_continue",
@@ -4991,6 +5019,7 @@ class CDPAWorker:
             return self.runtime_db.get_command(str(rejected["command_id"]))
         browser_safe_commands = (
             "create_task",
+            "change_goal",
             "create_independent_agent",
             "independent_complete",
             "independent_continue",

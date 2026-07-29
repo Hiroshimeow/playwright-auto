@@ -22,7 +22,6 @@
       <button type="button" class="button" data-action="reload_catalog">Reload catalog</button>
       <button type="button" class="button" data-view="resume">Resume teams</button>
       <button type="button" class="button" data-view="history">History</button>
-      <button type="button" class="button" data-view="runtime">Runtime</button>
     </nav>
   </header>
 
@@ -100,6 +99,23 @@
     </form>
   </dialog>
 
+  <dialog id="change-goal-dialog" class="create-dialog">
+    <form id="change-goal-form" method="dialog" class="create-form">
+      <header class="secondary-header">
+        <div><p class="eyebrow">Running workflow</p><h2>Change goal</h2></div>
+        <button type="button" class="button icon-button" data-close-change-goal aria-label="Close change goal form">Close</button>
+      </header>
+      <input type="hidden" name="task_id">
+      <input type="hidden" name="expected_task_version">
+      <label>Full replacement goal<textarea name="goal" rows="12" required></textarea></label>
+      <p class="form-help">Applies from the next route/hop. The current hop is not changed or resent.</p>
+      <footer class="dialog-actions">
+        <button type="button" class="button" data-close-change-goal>Cancel</button>
+        <button type="submit" class="button primary">Save goal</button>
+      </footer>
+    </form>
+  </dialog>
+
   <dialog id="agent-dialog" class="create-dialog">
     <form id="agent-form" method="dialog" class="create-form">
       <header class="secondary-header">
@@ -169,6 +185,6 @@
   </dialog>
 
   <div id="toast" class="toast" hidden role="status"></div>
-  <script type="module" src="/assets/app.js"></script>
+  <script type="module" src="/assets/app.js?v=20260728-system-status-2"></script>
 </body>
 </html>

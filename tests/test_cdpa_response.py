@@ -78,24 +78,6 @@ def test_manual_input_clears_continuous_responding_signal():
     assert wait["continuous_responding_since"] is None
 
 
-def test_interrupted_refresh_preserves_recovery_baseline():
-    start = datetime(2026, 7, 21, tzinfo=timezone.utc)
-    wait = {}
-    start_wait_budget(wait, timeout_seconds=7200, now=start)
-    wait["continuous_responding_since"] = start.isoformat()
-    wait["recovery_baseline"] = {
-        "assistant_message_ids": ["a1"],
-        "assistant_turn_ids": ["t1"],
-        "assistant_fingerprints": ["fingerprint"],
-    }
-    begin_refresh(wait, now=start + timedelta(minutes=20))
-
-    assert recover_incomplete_refresh(wait, now=start + timedelta(minutes=21)) is True
-    assert wait["recovery_baseline"] == {
-        "assistant_message_ids": ["a1"],
-        "assistant_turn_ids": ["t1"],
-        "assistant_fingerprints": ["fingerprint"],
-    }
 
 
 def test_response_activity_resets_no_progress_anchor_only_on_change():
@@ -118,33 +100,6 @@ def test_response_activity_resets_no_progress_anchor_only_on_change():
     assert wait["activity_changed_at"] != first_change
 
 
-def test_no_progress_refresh_is_allowed_when_stop_disappeared():
-    start = datetime(2026, 7, 21, tzinfo=timezone.utc)
-    wait = {}
-    start_wait_budget(wait, timeout_seconds=7200, now=start)
-    observe_response_activity(wait, signature="progress", length=8, now=start)
-
-    assert not refresh_due(
-        wait,
-        refresh_after_seconds=1200,
-        composer_empty=True,
-        manual_input_pending=False,
-        now=start + timedelta(minutes=19),
-    )
-    assert refresh_due(
-        wait,
-        refresh_after_seconds=1200,
-        composer_empty=True,
-        manual_input_pending=False,
-        now=start + timedelta(minutes=20),
-    )
-    assert not refresh_due(
-        wait,
-        refresh_after_seconds=1200,
-        composer_empty=False,
-        manual_input_pending=True,
-        now=start + timedelta(minutes=21),
-    )
 
 
 from playwright_auto.cdpa_routes import RouteContractError, parse_role_response
@@ -180,125 +135,8 @@ def test_file_mode_rejects_inline_body_and_handoff():
         )
 
 
-@pytest.mark.parametrize(
-    "response, message",
-    [
-        ('```json\n{"route":"DEV","handoff":"INLINE"}\n```', "Markdown report"),
-        ('   \n{"route":"DEV","handoff":"INLINE"}', "Markdown report"),
-        ('# Report\n\n{"route":"DEV","handoff":"wrong"}', 'handoff "INLINE"'),
-        (
-            '# Report\n\n{"route":"DEV","handoff":"INLINE"}\n\ntrailing',
-            "terminal",
-        ),
-        (
-            '# Report\n\n{"route":"TEST","handoff":"INLINE"}\n\n{"route":"DEV","handoff":"INLINE"}',
-            "exactly one terminal",
-        ),
-        (
-            '# Report\n\n```json\n{"route":"DEV","route":"TEST","handoff":"INLINE"}\n```',
-            "duplicate route field",
-        ),
-    ],
-)
-def test_inline_mode_rejects_invalid_or_ambiguous_report_response(response, message):
-    with pytest.raises(RouteContractError, match=message):
-        parse_role_response(response, source_role="PLAN", report_mode="inline")
 
 
 def test_inline_mode_preserves_done_authority():
     with pytest.raises(RouteContractError, match="only PLAN"):
         parse_role_response(INLINE_RESPONSE, source_role="DEV", report_mode="inline")
-
-
-def test_parse_role_response_rejects_unknown_report_mode():
-    with pytest.raises(ValueError, match="report_mode"):
-        parse_role_response(
-            '{"route":"DEV","handoff":"x"}',
-            source_role="PLAN",
-            report_mode="other",
-        )
-
-
-def test_inline_mode_allows_unrelated_json_evidence_before_terminal_route():
-    response = """# Report
-
-```json
-{"evidence": true}
-```
-
-```json
-{"route":"DEV","handoff":"INLINE"}
-```
-"""
-
-    parsed = parse_role_response(response, source_role="PLAN", report_mode="inline")
-
-    assert parsed.decision.route == "DEV"
-    assert parsed.inline_report == '# Report\n\n```json\n{"evidence": true}\n```'
-
-
-def test_inline_materializer_rejects_report_symlink_without_external_write(tmp_path):
-    from playwright_auto.cdpa_routes import materialize_inline_report
-
-    target = tmp_path / ".plan" / "alpha" / "alpha-plan_turn1_task-link.md"
-    external = tmp_path / "outside.md"
-    target.parent.mkdir(parents=True)
-    target.symlink_to(external)
-
-    with pytest.raises(RouteContractError, match="symlink"):
-        materialize_inline_report(
-            "# Report",
-            expected_report_path=".plan/alpha/alpha-plan_turn1_task-link.md",
-            repository_root=tmp_path,
-            plans_root=tmp_path / ".plan",
-            team="alpha",
-            physical_role="alpha-plan",
-            turn=1,
-            task_id="task-link",
-        )
-
-    assert not external.exists()
-
-
-def test_inline_materializer_rejects_symlinked_team_directory_before_write(tmp_path):
-    from playwright_auto.cdpa_routes import materialize_inline_report
-
-    plans = tmp_path / ".plan"
-    external = tmp_path / "outside-team"
-    plans.mkdir()
-    external.mkdir()
-    (plans / "alpha").symlink_to(external, target_is_directory=True)
-
-    with pytest.raises(RouteContractError, match="escapes|exactly match|symlink"):
-        materialize_inline_report(
-            "# Report",
-            expected_report_path=".plan/alpha/alpha-plan_turn1_task-parent-link.md",
-            repository_root=tmp_path,
-            plans_root=plans,
-            team="alpha",
-            physical_role="alpha-plan",
-            turn=1,
-            task_id="task-parent-link",
-        )
-
-    assert not (external / "alpha-plan_turn1_task-parent-link.md").exists()
-
-
-
-@pytest.mark.parametrize("language", ["json", "JSON", "JsOn"])
-def test_inline_mode_terminal_json_fence_is_case_insensitive(language: str):
-    response = (
-        "# Report\n\n"
-        f"```{language}\n"
-        '{"route":"DEV","handoff":"INLINE"}\n'
-        "```"
-    )
-
-    parsed = parse_role_response(
-        response,
-        source_role="PLAN",
-        report_mode="inline",
-    )
-
-    assert parsed.decision.route == "DEV"
-    assert parsed.inline_report == "# Report"

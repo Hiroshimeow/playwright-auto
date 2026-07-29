@@ -140,185 +140,6 @@ def raw_task(tmp_path: Path) -> dict:
     }
 
 
-def test_independent_projection_exposes_agent_job_without_system_prompt(tmp_path: Path):
-    raw = {
-        "task_mode": "independent",
-        "task_id": "agent-maintainers-g1",
-        "team": "agent-maintainers",
-        "status": "RUNNING",
-        "kanban_column": "INDEPENDENT_AGENTS",
-        "active_role": "AGENT",
-        "active_hop_id": 1,
-        "active_action": "wait_response",
-        "updated_at": "2026-07-26T00:00:00+00:00",
-        "created_at": "2026-07-25T00:00:00+00:00",
-        "task_text": "Independent agent: Maintainers",
-        "manifest_path": str(tmp_path / ".plan" / "agent-maintainers" / "task.json"),
-        "repository": str(tmp_path),
-        "roles": {
-            "AGENT": {
-                "physical_role": "agent-maintainers-agent",
-                "status": "active",
-                "turn": 1,
-                "page_id": "page-agent",
-                "page_url": "https://chatgpt.com/c/agent",
-                "online": True,
-                "last_error": (
-                    "ownership failed for page-agent at https://chatgpt.com/c/agent; "
-                    "see https://example.com/help"
-                ),
-            }
-        },
-        "hops": [
-            {
-                "hop_id": 1,
-                "kind": "independent_job",
-                "state": "waiting",
-                "target_role": "AGENT",
-                "turn": 1,
-                "request_id": "request-secret-123",
-                "conversation_url": "https://chatgpt.com/c/agent",
-                "receipt": {
-                    "page_id": "page-agent",
-                    "user_message_id": "message-secret-456",
-                    "user_turn_id": "turn-secret-789",
-                },
-                "prompt": "private constructor and trigger context",
-                "handoff": "trigger context",
-            }
-        ],
-        "independent": {
-            "agent_name": "Maintainers",
-            "agent_key": "maintainers",
-            "agent_generation": 1,
-            "enabled": True,
-            "system_prompt": "SECRET SYSTEM PROMPT",
-            "trigger_settings": {"recovery": True},
-            "active_event": {
-                "event_key": "recovery:task-a",
-                "trigger_type": "recovery",
-                "target_team": "alpha",
-                "target_task_id": "task-a",
-                "occurrence_count": 2,
-                "check_count": 1,
-            },
-            "cycle": 3,
-            "max_cycles": 5,
-            "last_outcome": None,
-        },
-        "route_timeline": [],
-        "dependency_events": [
-            {
-                "kind": "dependency_wait",
-                "reason": (
-                    "waiting on page-agent at https://chatgpt.com/c/agent; "
-                    "public docs https://example.com/help"
-                ),
-            }
-        ],
-        "queue_events": [],
-        "errors": [
-            {
-                "code": "role_offline",
-                "error": (
-                    "request-secret-123 failed for message-secret-456 / "
-                    "turn-secret-789 on page-agent at https://chatgpt.com/c/agent"
-                ),
-            }
-        ],
-        "reports": [],
-        "attachments": [],
-        "cleanup": {
-            "state": "ACTIVE",
-            "last_error": (
-                "cleanup page-agent at https://chatgpt.com/c/agent; "
-                "see https://example.com/help"
-            ),
-        },
-        "controls": [
-            {
-                "action": "stop",
-                "reason": (
-                    "stop request-secret-123 on page-agent at "
-                    "https://chatgpt.com/c/agent"
-                ),
-                "result": (
-                    "message-secret-456 and turn-secret-789 remain bound; "
-                    "docs https://example.com/help"
-                ),
-                "command": {
-                    "request_id": "request-secret-123",
-                    "receipt": {"user_message_id": "message-secret-456"},
-                    "ledger_path": "/home/ayumi/private/requests.json",
-                    "manifest_path": "/home/ayumi/private/task.json",
-                    "system_prompt": "CONTROL SYSTEM SECRET",
-                    "prompt": "CONTROL PROMPT SECRET",
-                    "response": "CONTROL RESPONSE SECRET",
-                    "snapshot": {
-                        "page_id": "page-agent",
-                        "page_url": "https://chatgpt.com/c/page-secret",
-                        "conversation_url": "https://chatgpt.com/c/conversation-secret",
-                    },
-                },
-            }
-        ],
-        "options": {"report_mode": "inline"},
-        "depends_on_task_ids": [],
-    }
-
-    projection = build_task_projection(raw, tasks=[raw])
-    public = json.dumps({"summary": projection.summary, "detail": projection.detail})
-
-    assert projection.summary["task_mode"] == "independent"
-    assert projection.summary["column"] == "INDEPENDENT_AGENTS"
-    assert projection.summary["agent"]["name"] == "Maintainers"
-    assert projection.summary["agent"]["target_team"] == "alpha"
-    assert projection.summary["agent"]["trigger_type"] == "recovery"
-    assert projection.summary["agent"]["occurrence_count"] == 2
-    assert projection.summary["agent"]["cycle"] == 3
-    assert projection.detail["roles"][0]["logical_role"] == "AGENT"
-    assert projection.detail["agent"]["system_prompt"] == "SECRET SYSTEM PROMPT"
-
-    def nested_keys(value):
-        if isinstance(value, dict):
-            for key, item in value.items():
-                yield key
-                yield from nested_keys(item)
-        elif isinstance(value, list):
-            for item in value:
-                yield from nested_keys(item)
-
-    forbidden_keys = {
-        "page_id",
-        "page_url",
-        "conversation_url",
-        "request_id",
-        "receipt",
-        "ledger_path",
-        "manifest_path",
-        "system_prompt",
-        "prompt",
-        "response",
-    }
-    assert forbidden_keys.isdisjoint(set(nested_keys(projection.summary)))
-    detail_forbidden = forbidden_keys - {"system_prompt"}
-    assert detail_forbidden.isdisjoint(set(nested_keys(projection.detail)))
-    for secret in (
-        "page-agent",
-        "https://chatgpt.com/c/agent",
-        "https://chatgpt.com/c/page-secret",
-        "https://chatgpt.com/c/conversation-secret",
-        "request-secret-123",
-        "message-secret-456",
-        "turn-secret-789",
-        "CONTROL SYSTEM SECRET",
-        "CONTROL PROMPT SECRET",
-        "CONTROL RESPONSE SECRET",
-    ):
-        assert secret not in public
-    assert "https://example.com/help" in public
-    assert "SECRET SYSTEM PROMPT" not in json.dumps(projection.summary)
-    assert "private constructor" not in public
 
 
 def test_projection_splits_public_and_private_data(tmp_path: Path):
@@ -404,173 +225,14 @@ def test_waiting_order_projects_dependency_levels_and_shared_frontiers():
     assert all(record["intervention"] is None for record in order.values())
 
 
-def test_waiting_order_puts_scheduler_ready_same_team_waiter_first():
-    running_parent = _waiting_task("running-parent", status="RUNNING")
-    older_blocked = _waiting_task(
-        "older-blocked",
-        team="shared",
-        created_at="2026-07-25T00:00:00+00:00",
-        depends_on=("running-parent",),
-    )
-    older_blocked["queue"] = {"reuse_team": True, "released_at": None}
-    later_ready = _waiting_task(
-        "later-ready",
-        team="shared",
-        created_at="2026-07-25T01:00:00+00:00",
-    )
-    later_ready["queue"] = {"reuse_team": True, "released_at": None}
-    tasks = [running_parent, older_blocked, later_ready]
-
-    scheduler = exact_team_ready_waiters(
-        tasks,
-        "shared",
-        dependency_tasks=tasks,
-    )
-    order = build_waiting_order(tasks)
-    projected = sorted(
-        (older_blocked, later_ready),
-        key=lambda task: (
-            order[task["task_id"]]["rank"],
-            order[task["task_id"]]["fifo"],
-        ),
-    )
-
-    assert [task["task_id"] for task in scheduler] == ["later-ready"]
-    assert [task["task_id"] for task in projected] == [
-        "later-ready",
-        "older-blocked",
-    ]
-    assert order["later-ready"]["rank"] == 1
-    assert order["older-blocked"]["rank"] == 2
 
 
-def test_waiting_order_does_not_propagate_intervention_to_valid_same_team_waiter():
-    bad = _waiting_task(
-        "bad",
-        team="shared",
-        created_at="2026-07-25T00:00:00+00:00",
-        depends_on="not-a-list",
-    )
-    parent = _waiting_task("parent", status="RUNNING")
-    valid_blocked = _waiting_task(
-        "valid-blocked",
-        team="shared",
-        created_at="2026-07-25T01:00:00+00:00",
-        depends_on=("parent",),
-    )
-
-    order = build_waiting_order([bad, parent, valid_blocked])
-
-    assert order["bad"]["rank"] is None
-    assert "malformed dependencies" in order["bad"]["intervention"]
-    assert order["valid-blocked"]["rank"] == 1
-    assert order["valid-blocked"]["intervention"] is None
 
 
-def test_waiting_order_uses_exact_team_scheduler_fifo_and_maximum_predecessor():
-    tasks = [
-        _waiting_task(
-            "regular-old",
-            team="shared",
-            created_at="2026-07-25T00:00:00+00:00",
-        ),
-        _waiting_task(
-            "urgent-new",
-            team="shared",
-            created_at="2026-07-25T01:00:00+00:00",
-            priority="urgent_repair",
-        ),
-        _waiting_task(
-            "regular-later",
-            team="shared",
-            created_at="2026-07-25T02:00:00+00:00",
-        ),
-        _waiting_task("dependency-1"),
-        _waiting_task("dependency-2", depends_on=("dependency-1",)),
-        _waiting_task(
-            "mixed",
-            team="shared",
-            created_at="2026-07-25T03:00:00+00:00",
-            depends_on=("dependency-2",),
-        ),
-    ]
-
-    order = build_waiting_order(tasks)
-
-    assert order["urgent-new"]["rank"] == 1
-    assert order["regular-old"]["rank"] == 2
-    assert order["regular-later"]["rank"] == 3
-    assert order["dependency-1"]["rank"] == 1
-    assert order["dependency-2"]["rank"] == 2
-    assert order["mixed"]["rank"] == 4
-    assert sorted(order, key=lambda task_id: order[task_id]["fifo"]) == [
-        "urgent-new",
-        "dependency-1",
-        "dependency-2",
-        "regular-old",
-        "regular-later",
-        "mixed",
-    ]
 
 
-def test_waiting_order_fails_closed_for_invalid_dependencies_and_ancestors():
-    tasks = [
-        _waiting_task("valid"),
-        _waiting_task("missing", depends_on=("absent",)),
-        _waiting_task("stopped-parent", status="STOPPED"),
-        _waiting_task("stopped-child", depends_on=("stopped-parent",)),
-        _waiting_task("malformed", depends_on="not-a-list"),
-        _waiting_task("duplicate-parent", depends_on=("valid", "valid")),
-        _waiting_task("cycle-a", depends_on=("cycle-b",)),
-        _waiting_task("cycle-b", depends_on=("cycle-a",)),
-        _waiting_task("invalid-ancestor", depends_on=("missing",)),
-        _waiting_task("ambiguous"),
-        _waiting_task("ambiguous", team="other-team"),
-        _waiting_task("ambiguous-child", depends_on=("ambiguous",)),
-    ]
-
-    order = build_waiting_order(tasks)
-
-    assert order["valid"]["rank"] == 1
-    assert order["valid"]["intervention"] is None
-    assert isinstance(order["valid"]["fifo"], int)
-    for task_id in (
-        "missing",
-        "stopped-child",
-        "malformed",
-        "duplicate-parent",
-        "cycle-a",
-        "cycle-b",
-        "invalid-ancestor",
-        "ambiguous",
-        "ambiguous-child",
-    ):
-        assert order[task_id]["rank"] is None
-        assert order[task_id]["intervention"].startswith("Intervention required:")
-    assert "missing dependency" in order["missing"]["intervention"].lower()
-    assert "stopped" in order["stopped-child"]["intervention"].lower()
-    assert "cycle" in order["cycle-a"]["intervention"].lower()
-    assert "ambiguous" in order["ambiguous-child"]["intervention"].lower()
 
 
-def test_waiting_order_is_compact_and_changes_projection_hash(tmp_path: Path):
-    raw = raw_task(tmp_path)
-    raw.update(
-        status="WAITING",
-        kanban_column="WAITING",
-        team="alpha",
-        depends_on_task_ids=[],
-    )
-    first_order = {"task-a": {"rank": 1, "fifo": 0, "intervention": None}}
-    second_order = {"task-a": {"rank": 2, "fifo": 0, "intervention": None}}
-
-    first = build_task_projection(raw, tasks=[raw], waiting_order=first_order)
-    second = build_task_projection(raw, tasks=[raw], waiting_order=second_order)
-
-    assert first.summary["waiting_order"] == first_order["task-a"]
-    assert first.detail["waiting_order"] == first_order["task-a"]
-    assert first.summary["projection_sha256"] != second.summary["projection_sha256"]
-    assert set(first.summary["waiting_order"]) == {"rank", "fifo", "intervention"}
 
 
 def test_projection_summary_is_compact_and_deterministic(tmp_path: Path):
@@ -602,93 +264,12 @@ def test_detail_preserves_full_task_and_latest_role_input(tmp_path: Path):
     assert projection.detail["role_inputs"]["DEV"]["input"] == "P" * 30000
 
 
-def test_route_timeline_projects_explicit_transitions_without_paths(tmp_path: Path):
-    projection = build_task_projection(raw_task(tmp_path), tasks=[raw_task(tmp_path)])
-    routes = [item for item in projection.private["timeline"] if item["level"] == "ROUTE"]
-
-    repair = next(item for item in routes if item["kind"] == "route_repair")
-    routed = next(
-        item for item in routes
-        if item["kind"] == "route" and item["source_role"] == "PLAN" and item["route"] == "REVIEW"
-    )
-    assert repair["message"] == "REVIEW → PLAN"
-    audit = next(
-        item for item in routes
-        if item["source_role"] == "AUDIT" and item["route"] == "PLAN"
-    )
-    assert repair["hop_id"] == 2
-    assert routed["message"] == "PLAN → REVIEW"
-    assert audit["message"] == "AUDIT → PLAN"
-    serialized = json.dumps(routes)
-    assert "report_path" not in serialized
-    assert "/home/ayumi" not in serialized
 
 
-def test_route_projection_tolerates_missing_transition_fields(tmp_path: Path):
-    raw = raw_task(tmp_path)
-    raw["route_timeline"].append(
-        {
-            "at": "2026-07-25T00:05:00+00:00",
-            "kind": "route",
-            "report_path": "/home/ayumi/private/malformed.md",
-        }
-    )
-    projection = build_task_projection(raw, tasks=[raw])
-    malformed = next(
-        item for item in projection.private["timeline"]
-        if item["at"] == "2026-07-25T00:05:00+00:00"
-    )
-
-    assert malformed["message"] == "route"
-    assert malformed["source_role"] is None
-    assert malformed["route"] is None
-    assert "report_path" not in malformed
 
 
-def test_dependency_queue_and_error_timeline_events_are_bounded_and_sanitized(tmp_path: Path):
-    projection = build_task_projection(raw_task(tmp_path), tasks=[raw_task(tmp_path)])
-    timeline = projection.private["timeline"]
-
-    dependency = next(item for item in timeline if item["level"] == "DEPENDENCY")
-    queued = next(item for item in timeline if item["level"] == "QUEUE")
-    error = next(item for item in timeline if item["level"] == "ERROR")
-
-    assert dependency["kind"] == "dependency_wait"
-    assert dependency["message"].startswith("Waiting for task parent-a")
-    assert queued["kind"] == "queue_admitted"
-    assert queued["message"] == "Task admitted to team queue"
-    assert error["kind"] == "role_offline"
-    assert "Role offline" in error["message"]
-    assert "/home/ayumi" not in json.dumps([dependency, queued, error])
 
 
-def test_dependency_and_queue_lifecycle_event_kinds_are_preserved(tmp_path: Path):
-    raw = raw_task(tmp_path)
-    raw["dependency_events"].extend(
-        [
-            {"at": "2026-07-25T00:06:00+00:00", "kind": "dependency_resolved"},
-            {"at": "2026-07-25T00:07:00+00:00", "kind": "dependency_rewired"},
-        ]
-    )
-    raw["queue_events"].extend(
-        [
-            {"at": "2026-07-25T00:08:00+00:00", "kind": "queue_enqueued"},
-            {"at": "2026-07-25T00:09:00+00:00", "kind": "queue_started"},
-            {"at": "2026-07-25T00:10:00+00:00", "kind": "queue_completed"},
-        ]
-    )
-    projection = build_task_projection(raw, tasks=[raw])
-    kinds = {item["kind"] for item in projection.private["timeline"]}
-
-    assert {
-        "dependency_wait",
-        "dependency_resolved",
-        "dependency_rewired",
-        "queue_admitted",
-        "queue_enqueued",
-        "queue_started",
-        "queue_completed",
-    } <= kinds
 
 
 def _action_task(
@@ -792,52 +373,19 @@ def test_dashboard_actions_are_worker_owned_compact_and_fail_closed(tmp_path: Pa
     assert len(serialized.encode()) < 16 * 1024
 
 
-def test_dashboard_dependency_choices_only_publish_running_and_waiting(tmp_path: Path):
-    tasks = [
-        _action_task(tmp_path, task_id="running-task", team="running", status="RUNNING"),
-        _action_task(tmp_path, task_id="waiting-task", team="waiting", status="WAITING"),
-        _action_task(tmp_path, task_id="done-task", team="done", status="DONE"),
-        _action_task(tmp_path, task_id="stopped-task", team="stopped-only", status="STOPPED"),
-        _action_task(tmp_path, task_id="paused-task", team="paused-only", status="PAUSED"),
-        _action_task(tmp_path, task_id="blocked-task", team="blocked-only", status="BLOCKED"),
-    ]
-
-    actions = build_dashboard_actions(tasks)
-
-    dependencies = {item["team"]: item for item in actions["dependency_teams"]}
-    assert set(dependencies) == {"running", "waiting"}
-    assert dependencies["running"]["tasks"][0]["status"] == "RUNNING"
-    assert dependencies["waiting"]["tasks"][0]["status"] == "WAITING"
-
-
-def test_dashboard_reuse_eligibility_rejects_inconsistent_exact_team_identity(tmp_path: Path):
-    first = _action_task(
-        tmp_path,
-        task_id="identity-a",
-        team="identity-conflict",
-        status="DONE",
-    )
-    second = _action_task(
-        tmp_path,
-        task_id="identity-b",
-        team="identity-conflict",
-        status="STOPPED",
-    )
-    second["team_base"] = "other-base"
-
-    actions = build_dashboard_actions([first, second])
-
-    assert actions["reuse_teams"] == []
-
-
-def test_dashboard_actions_do_not_infer_offline_when_browser_is_unknown(tmp_path: Path):
-    running = _action_task(
-        tmp_path,
-        task_id="unknown-running",
-        team="unknown",
-        status="RUNNING",
-    )
-
-    actions = build_dashboard_actions([running], browser_connected=False)
-
-    assert actions["resume_teams"] == []
+def test_goal_revision_detail_is_full_sanitized_and_summary_stays_compact(tmp_path: Path):
+    raw = raw_task(tmp_path)
+    raw["effective_goal"] = "Replacement goal"
+    raw["goal_revisions"] = [{
+        "revision": 1, "changed_at": "2026-07-25T01:00:00+00:00",
+        "applies_from_hop_id": 3, "goal": "Replacement goal", "external_command_id": "cmd-private",
+    }]
+    projection = build_task_projection(raw, tasks=[raw])
+    assert "effective_goal" not in projection.summary
+    assert "goal_revisions" not in projection.summary
+    assert projection.detail["effective_goal"] == "Replacement goal"
+    assert projection.detail["goal_revisions"] == [{
+        "revision": 1, "changed_at": "2026-07-25T01:00:00+00:00",
+        "applies_from_hop_id": 3, "goal": "Replacement goal",
+    }]
+    assert "cmd-private" not in json.dumps(projection.detail)

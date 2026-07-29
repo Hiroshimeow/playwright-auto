@@ -25,7 +25,6 @@ from .cdpa_independent import (
     validate_trigger_settings,
 )
 from .cdpa_runtime_db import IdempotencyConflict, RuntimeDB, RuntimeDBError
-from .cdpa_telemetry import TelemetrySampler
 
 STATUSES = ("RUNNING", "WAITING", "BLOCKED", "PAUSED", "DONE", "STOPPED")
 LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -68,26 +67,48 @@ class DashboardAPI:
         config: CDPAConfig,
         *,
         db: RuntimeDB | None = None,
-        telemetry: Any | None = None,
     ) -> None:
         self.config = config
         self.db = db or RuntimeDB(config.runtime_database)
         self.db.ensure_schema()
-        self.telemetry = telemetry or TelemetrySampler(
-            disk_path=config.repository_root,
-            worker_pid_provider=self._worker_pid,
-        )
+        self._system_lock = threading.Lock()
+        self._previous_cpu = self._read_cpu()
+
+    @staticmethod
+    def _read_cpu() -> tuple[int, int] | None:
+        try:
+            with Path("/proc/stat").open(encoding="utf-8") as handle:
+                values = [int(value) for value in handle.readline().split()[1:]]
+        except (OSError, ValueError):
+            return None
+        if len(values) < 4:
+            return None
+        return sum(values), values[3] + (values[4] if len(values) > 4 else 0)
+
+    def system_status(self) -> dict[str, Any]:
+        current = self._read_cpu()
+        with self._system_lock:
+            previous = self._previous_cpu
+            self._previous_cpu = current
+        cpu_percent: float | None = None
+        if current is not None and previous is not None:
+            total_delta = current[0] - previous[0]
+            idle_delta = current[1] - previous[1]
+            if total_delta > 0:
+                cpu_percent = round(
+                    max(0.0, min(100.0, 100.0 * (total_delta - idle_delta) / total_delta)),
+                    1,
+                )
+        try:
+            disk = os.statvfs(self.config.repository_root)
+            disk_free_bytes: int | None = disk.f_bavail * disk.f_frsize
+        except OSError:
+            disk_free_bytes = None
+        return {"cpu_percent": cpu_percent, "disk_free_bytes": disk_free_bytes}
 
     def _worker_snapshot(self) -> dict[str, Any] | None:
         snapshot = self.db.get_snapshot("worker")
         return dict(snapshot["payload"]) if snapshot else None
-
-    def _worker_pid(self) -> int | None:
-        worker = self._worker_snapshot()
-        try:
-            return int((worker or {}).get("pid"))
-        except (TypeError, ValueError):
-            return None
 
     def worker_health(self) -> dict[str, Any]:
         worker = self._worker_snapshot()
@@ -354,6 +375,25 @@ class DashboardAPI:
             payload["new_chat_next_job"] = raw["new_chat_next_job"]
         return payload
 
+    @staticmethod
+    def normalize_goal_change(raw: Mapping[str, Any]) -> tuple[dict[str, Any], int | None]:
+        if set(raw) - {"goal", "expected_task_version"}:
+            raise APIError(400, "invalid_request", "goal change accepts only goal and expected_task_version")
+        goal = raw.get("goal")
+        if not isinstance(goal, str) or not goal.strip():
+            raise APIError(400, "invalid_request", "goal must not be blank")
+        expected = raw.get("expected_task_version")
+        if expected is not None:
+            if isinstance(expected, bool):
+                raise APIError(400, "invalid_request", "expected_task_version must be an integer")
+            try:
+                expected = int(expected)
+            except (TypeError, ValueError) as exc:
+                raise APIError(400, "invalid_request", "expected_task_version must be an integer") from exc
+            if expected < 0:
+                raise APIError(400, "invalid_request", "expected_task_version must be non-negative")
+        return {"goal": goal}, expected
+
     def enqueue(
         self,
         *,
@@ -591,7 +631,7 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
             )
             return
         if path == "/api/system":
-            self._json(200, app.telemetry.snapshot())
+            self._json(200, app.system_status(), headers={"Cache-Control": "no-store"})
             return
         parts = [unquote(part) for part in path.strip("/").split("/") if part]
         if len(parts) == 3 and parts[:2] == ["api", "commands"]:
@@ -737,30 +777,41 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                     payload=payload,
                 )
             else:
-                if len(parts) != 4 or parts[:2] != ["api", "tasks"] or parts[3] != "controls":
-                    raise APIError(404, "not_found", "endpoint does not exist")
-                task_id = validate_task_id(parts[2])
-                action = str(raw.get("action") or "").strip().lower()
-                if not action:
-                    raise APIError(400, "invalid_request", "action must not be empty")
-                expected = raw.get("expected_task_version")
-                if expected is not None:
-                    try:
-                        expected = int(expected)
-                    except (TypeError, ValueError) as exc:
-                        raise APIError(400, "invalid_request", "expected_task_version must be an integer") from exc
-                command = app.enqueue(
-                    idempotency_key=key,
-                    kind="task_control",
-                    task_id=task_id,
-                    expected_task_version=expected,
-                    payload={
-                        "action": action,
-                        "role": raw.get("role"),
-                        "reason": raw.get("reason"),
-                        "confirmed": bool(raw.get("confirmed")),
-                    },
-                )
+                if len(parts) == 4 and parts[:2] == ["api", "tasks"] and parts[3] == "goal":
+                    task_id = validate_task_id(parts[2])
+                    payload, expected = app.normalize_goal_change(raw)
+                    command = app.enqueue(
+                        idempotency_key=key,
+                        kind="change_goal",
+                        task_id=task_id,
+                        expected_task_version=expected,
+                        payload=payload,
+                    )
+                else:
+                    if len(parts) != 4 or parts[:2] != ["api", "tasks"] or parts[3] != "controls":
+                        raise APIError(404, "not_found", "endpoint does not exist")
+                    task_id = validate_task_id(parts[2])
+                    action = str(raw.get("action") or "").strip().lower()
+                    if not action:
+                        raise APIError(400, "invalid_request", "action must not be empty")
+                    expected = raw.get("expected_task_version")
+                    if expected is not None:
+                        try:
+                            expected = int(expected)
+                        except (TypeError, ValueError) as exc:
+                            raise APIError(400, "invalid_request", "expected_task_version must be an integer") from exc
+                    command = app.enqueue(
+                        idempotency_key=key,
+                        kind="task_control",
+                        task_id=task_id,
+                        expected_task_version=expected,
+                        payload={
+                            "action": action,
+                            "role": raw.get("role"),
+                            "reason": raw.get("reason"),
+                            "confirmed": bool(raw.get("confirmed")),
+                        },
+                    )
         self._json(
             202,
             {
@@ -782,13 +833,12 @@ def create_server(
     host: str | None = None,
     port: int | None = None,
     db: RuntimeDB | None = None,
-    telemetry: Any | None = None,
 ) -> APIServer:
     bind_host = host or config.dashboard_api_host
     if bind_host not in LOOPBACK:
         raise ValueError("CDPA API must bind to loopback")
     server = APIServer((bind_host, config.dashboard_api_port if port is None else port), DashboardAPIHandler)
-    server.application = DashboardAPI(config, db=db, telemetry=telemetry)
+    server.application = DashboardAPI(config, db=db)
     return server
 
 
@@ -802,18 +852,12 @@ def main(argv: list[str] | None = None) -> int:
         repository_root=Path(args.repository).expanduser().resolve(),
     )
     server = create_server(config)
-    sampler = server.application.telemetry
-    stop = threading.Event()
-    thread = threading.Thread(target=sampler.run, args=(stop,), daemon=True)
-    thread.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         return 130
     finally:
-        stop.set()
         server.server_close()
-        thread.join(timeout=3)
         server.application.db.close()
     return 0
 

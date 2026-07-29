@@ -14,6 +14,14 @@ function button(action, label, task) {
   return node;
 }
 
+function changeGoalButton(task) {
+  const node = el("button", "Change goal");
+  node.type = "button";
+  node.dataset.changeGoal = task.task_id;
+  node.dataset.version = String(task.version || 0);
+  return node;
+}
+
 function independentButton(action, label, task) {
   const node = el("button", label);
   node.type = "button";
@@ -69,6 +77,23 @@ function build(detail, timeline, selectedRole) {
   const taskSection = el("section", null, "detail-section");
   taskSection.append(el("h3", detail.task_mode === "independent" ? "Independent agent" : "Task"));
   taskSection.append(el("pre", detail.task_text || detail.task_title || detail.task_id, "task-text"));
+  if (detail.task_mode !== "independent") {
+    taskSection.append(el("h3", "Effective goal"));
+    taskSection.append(el("pre", detail.effective_goal || detail.task_text || detail.task_id, "task-text"));
+    const revisions = detail.goal_revisions || [];
+    if (revisions.length) {
+      const history = el("div", null, "goal-revision-list");
+      history.append(el("h3", "Goal revisions"));
+      for (const revision of revisions) {
+        const item = el("article", null, "history-card");
+        item.append(el("strong", `Revision ${revision.revision} · from hop ${revision.applies_from_hop_id}`));
+        item.append(el("p", revision.changed_at || "", "muted"));
+        item.append(el("pre", revision.goal || "", "task-text"));
+        history.append(item);
+      }
+      taskSection.append(history);
+    }
+  }
   if (detail.task_mode === "independent") {
     const agent = detail.agent || {};
     const context = el("div", null, "agent-detail-grid");
@@ -114,6 +139,7 @@ function build(detail, timeline, selectedRole) {
     controls.append(independentButton("history", "History", detail));
     controls.append(independentButton("reports", "Reports", detail));
   } else {
+    if (detail.status === "RUNNING") controls.append(changeGoalButton(detail));
     for (const [action, label] of [
       ["pause", "Pause"], ["resume", "Resume"], ["retry", "Retry hop"],
       ["restart_role", "Restart role"], ["new_chat", "New chat"],

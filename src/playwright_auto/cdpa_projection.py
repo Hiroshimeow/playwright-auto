@@ -936,9 +936,25 @@ def build_task_projection(
             ) or None,
             "last_outcome": _public_value(independent.get("last_outcome")),
         }
+    goal_revisions = []
+    for revision in raw.get("goal_revisions") or []:
+        if not isinstance(revision, Mapping):
+            continue
+        goal_revisions.append(
+            {
+                "revision": revision.get("revision"),
+                "changed_at": str(revision.get("changed_at") or ""),
+                "applies_from_hop_id": revision.get("applies_from_hop_id"),
+                "goal": _public_text(revision.get("goal"), max_chars=None),
+            }
+        )
     detail = {
         **summary,
         "task_text": _public_text(raw.get("task_text"), max_chars=None),
+        "effective_goal": _public_text(
+            raw.get("effective_goal") or raw.get("task_text"), max_chars=None
+        ),
+        "goal_revisions": goal_revisions,
         "roles": roles,
         "active_hop": active_input,
         "active_input": active_input,

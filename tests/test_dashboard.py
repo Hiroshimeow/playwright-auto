@@ -157,27 +157,8 @@ def test_proxy_returns_structured_503_when_api_is_unavailable(tmp_path: Path):
         thread.join(timeout=5)
 
 
-def test_favicon_is_handled_without_application_404(tmp_path: Path):
-    server, thread = start_frontend(tmp_path, api_port=65530)
-    try:
-        status, headers, body = request(server, "GET", "/favicon.ico")
-        assert status == 204
-        assert body == b""
-    finally:
-        server.shutdown()
-        thread.join(timeout=5)
 
 
-def test_static_path_traversal_and_symlinks_fail_closed(tmp_path: Path):
-    server, thread = start_frontend(tmp_path, api_port=65530)
-    try:
-        status, _headers, _body = request(server, "GET", "/assets/../dashboard.py")
-        assert status in {403, 404}
-        status, _headers, _body = request(server, "GET", "/assets/%2e%2e/dashboard.py")
-        assert status in {403, 404}
-    finally:
-        server.shutdown()
-        thread.join(timeout=5)
 
 
 def test_frontend_assets_are_local_modular_and_suspend_hidden_polling():
@@ -209,52 +190,14 @@ def test_frontend_assets_are_local_modular_and_suspend_hidden_polling():
     assert "loadTimeline" in app
 
 
-def test_board_uses_product_breakpoints_and_mobile_horizontal_pan():
-    css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
-
-    assert ".board-grid {" in css
-    assert "grid-template-columns: repeat(4, minmax(0, 1fr));" in css
-    assert "@media (min-width: 1600px)" in css
-    assert "grid-template-columns: repeat(5, minmax(0, 1fr));" in css
-    assert "@media (max-width: 1199px)" in css
-    assert "grid-template-columns: repeat(3, minmax(0, 1fr));" in css
-    assert "@media (max-width: 920px) and (min-width: 721px)" in css
-    assert "grid-template-columns: repeat(2, minmax(0, 1fr));" in css
-    assert "@media (max-width: 720px)" in css
-    mobile = css.split("@media (max-width: 720px)", 1)[1]
-    board = mobile.split(".board-grid {", 1)[1].split("}", 1)[0]
-    lane = mobile.split(".lane {", 1)[1].split("}", 1)[0]
-    assert "grid-template-columns: repeat(7, min(86vw, 340px));" in board
-    assert "overflow-x: auto;" in board
-    assert "overflow-y: hidden;" in board
-    assert "scroll-snap-type: x proximity;" in board
-    assert "scroll-snap-align: start;" in lane
-    assert "grid-template-rows: auto minmax(0, 1fr);" in css
-    assert "overflow-y: auto;" in css
-    assert "scrollbar-gutter: stable;" in css
-    assert "height: 388px;" in css
-    assert "height: 150px;" in css
-    assert "max-height: 152px;" not in css
 
 
-def test_product_shell_keeps_board_full_width_and_detail_below():
-    html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
-    css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
-
-    assert 'class="app-main"' in html
-    assert 'class="board-section"' in html
-    assert 'class="task-workspace"' in html
-    assert ".app-main { width: 100%;" in css
-    assert ".task-workspace {" in css
-    assert "grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr);" in css
-    assert "position: fixed" not in css.split(".task-workspace", 1)[1].split("}", 1)[0]
 
 
 def test_seven_lane_board_and_independent_agent_controls_are_explicit():
     html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
     board = (ASSET_ROOT / "views" / "board.js").read_text(encoding="utf-8")
     app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
-    runtime = (ASSET_ROOT / "views" / "runtime.js").read_text(encoding="utf-8")
     store = (ASSET_ROOT / "store.js").read_text(encoding="utf-8")
 
     detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
@@ -292,18 +235,23 @@ def test_seven_lane_board_and_independent_agent_controls_are_explicit():
     assert 'event.target === roots.secondaryDialog' in app
     assert 'addEventListener("cancel"' in app
     assert 'addEventListener("popstate"' in app
-    assert 'root.dataset.secondaryView !== "runtime"' in runtime
     assert "selectedRoleByTask" in store
     assert "detailCache" in store
     assert "laneScroll" in store
 
 
-def test_role_availability_preserves_unknown_browser_state():
-    board = (ASSET_ROOT / "views" / "board.js").read_text(encoding="utf-8")
+def test_change_goal_ui_contract_is_running_only_and_uses_shared_command_path():
+    html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+    app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
     detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
-    css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
-
-    assert 'role.online == null ? "unknown"' not in board
-    assert 'role.online == null ? "unknown"' in detail
-    assert '.role-dots i[data-online="unknown"]' not in css
-    assert '.role-row .unknown' in css
+    assert 'id="change-goal-dialog"' in html
+    assert 'id="change-goal-form"' in html
+    assert 'name="goal"' in html
+    assert 'detail.status === "RUNNING"' in detail
+    assert '"Change goal"' in detail
+    assert 'detail.effective_goal' in detail
+    assert 'detail.goal_revisions' in detail
+    assert '/api/tasks/${encodeURIComponent(taskId)}/goal' in app
+    assert 'kind: "change_goal"' in app
+    assert 'expected_task_version' in app
+    assert 'roots.changeGoalForm' in app

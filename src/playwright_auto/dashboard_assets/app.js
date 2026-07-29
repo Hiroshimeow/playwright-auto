@@ -7,7 +7,7 @@ import {
 import {renderBoard, refreshElapsed} from "./views/board.js";
 import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js";
 import {renderHistory} from "./views/history.js";
-import {renderRuntime} from "./views/runtime.js";
+import {renderRuntime} from "./views/runtime.js?v=20260728-system-status-1";
 import {
   renderCreateActions, renderResume, selectedDependencyIds,
   selectedResumeTeams, updateResumeButton,
@@ -24,6 +24,8 @@ const roots = {
   secondaryContent: document.querySelector("#secondary-content"),
   dialog: document.querySelector("#create-dialog"),
   form: document.querySelector("#create-form"),
+  changeGoalDialog: document.querySelector("#change-goal-dialog"),
+  changeGoalForm: document.querySelector("#change-goal-form"),
   dependencyOptions: document.querySelector("#dependency-options"),
   reuseTeam: document.querySelector('#create-form select[name="reuse_team"]'),
   requestedTeam: document.querySelector('#create-form input[name="requested_team"]'),
@@ -277,7 +279,7 @@ function render(current) {
     current.selectedDetailError,
   );
   renderCommands(current);
-  renderRuntime(roots.services, roots.secondaryContent, current);
+  renderRuntime(roots.services, current);
   renderCreateActions(roots.dependencyOptions, roots.reuseTeam, current);
 
   const catalog = current.catalog;
@@ -294,13 +296,11 @@ function render(current) {
   if (historyButton && historyButton.textContent !== historyLabel) historyButton.textContent = historyLabel;
 
   if (current.drawer) {
-    const title = current.drawer === "runtime"
-      ? "Runtime"
-      : current.drawer === "resume"
-        ? "Resume teams"
-        : current.drawer === "reports"
-          ? "Reports"
-          : current.drawer === "agent-history" ? "Agent history" : "History";
+    const title = current.drawer === "resume"
+      ? "Resume teams"
+      : current.drawer === "reports"
+        ? "Reports"
+        : current.drawer === "agent-history" ? "Agent history" : "History";
     if (roots.secondaryTitle.textContent !== title) roots.secondaryTitle.textContent = title;
     if (current.drawer === "history") renderHistory(roots.secondaryContent, current);
     if (current.drawer === "agent-history") renderAgentHistory(roots.secondaryContent, current.selectedDetail);
@@ -489,15 +489,38 @@ export async function loadDashboardActions() {
 }
 
 async function loadRuntime() {
-  const [runtime, system] = await Promise.allSettled([
-    client.request("state", "/api/state"),
-    client.request("system", "/api/system"),
-  ]);
-  commit(current => {
-    if (runtime.status === "fulfilled" && !runtime.value.notModified) current.runtime = runtime.value.data;
-    if (system.status === "fulfilled" && !system.value.notModified) current.system = system.value.data;
-    if (runtime.status === "rejected") current.apiError = runtime.reason.message;
-  });
+  try {
+    const response = await client.request("state", "/api/state");
+    if (!response.notModified) commit(current => { current.runtime = response.data; });
+  } catch (error) {
+    commit(current => { current.apiError = error.message; });
+  }
+}
+
+function updateSystemChip(name, text) {
+  const chip = roots.services.querySelector(`[data-service="${name}"]`);
+  if (chip && chip.textContent !== text) chip.textContent = text;
+}
+
+async function loadSystem() {
+  try {
+    const response = await fetch("/api/system", {
+      headers: {Accept: "application/json"},
+      cache: "no-store",
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const system = await response.json();
+    const cpu = system.cpu_percent == null ? Number.NaN : Number(system.cpu_percent);
+    const free = system.disk_free_bytes == null ? Number.NaN : Number(system.disk_free_bytes);
+    updateSystemChip("cpu", Number.isFinite(cpu) ? `CPU ${cpu.toFixed(1)}%` : "CPU —");
+    updateSystemChip(
+      "disk",
+      Number.isFinite(free) ? `Disk ${(free / 1000000000).toFixed(1)} GB free` : "Disk —",
+    );
+  } catch {
+    updateSystemChip("cpu", "CPU —");
+    updateSystemChip("disk", "Disk —");
+  }
 }
 
 async function pollCommands() {
@@ -593,6 +616,19 @@ function closeDrawer() {
   }
 }
 
+function openChangeGoal(detail) {
+  if (!detail || detail.status !== "RUNNING" || detail.task_mode === "independent") return;
+  roots.changeGoalForm.elements.task_id.value = detail.task_id;
+  roots.changeGoalForm.elements.expected_task_version.value = String(detail.version || 0);
+  roots.changeGoalForm.elements.goal.value = detail.effective_goal || detail.task_text || "";
+  roots.changeGoalDialog.showModal();
+  roots.changeGoalForm.elements.goal.focus();
+}
+
+function closeChangeGoal() {
+  if (roots.changeGoalDialog.open) roots.changeGoalDialog.close();
+}
+
 function openCreate() {
   if (!state.modalOpen) pushOverlay("modal");
   commit(current => { current.modalOpen = true; });
@@ -668,6 +704,11 @@ roots.detail.addEventListener("scroll", () => {
 }, {passive: true});
 
 roots.detail.addEventListener("click", event => {
+  const changeGoal = event.target.closest("[data-change-goal]");
+  if (changeGoal) {
+    openChangeGoal(state.selectedDetail);
+    return;
+  }
   const independent = event.target.closest("[data-independent-action]");
   if (independent) {
     const action = independent.dataset.independentAction;
@@ -896,6 +937,28 @@ roots.agentSettingsDialog.addEventListener("click", event => {
   if (event.target === roots.agentSettingsDialog) roots.agentSettingsDialog.close();
 });
 
+roots.changeGoalForm.addEventListener("submit", event => {
+  event.preventDefault();
+  const taskId = roots.changeGoalForm.elements.task_id.value;
+  const goal = roots.changeGoalForm.elements.goal.value;
+  const expected = Number(roots.changeGoalForm.elements.expected_task_version.value);
+  if (!goal.trim()) { toast("Goal must not be blank."); return; }
+  queueCommand({
+    kind: "change_goal",
+    taskId,
+    endpoint: `/api/tasks/${encodeURIComponent(taskId)}/goal`,
+    body: {goal, expected_task_version: expected},
+    label: `Change goal · ${state.selectedDetail?.team || taskId}`,
+  });
+  closeChangeGoal();
+});
+for (const close of document.querySelectorAll("[data-close-change-goal]")) {
+  close.addEventListener("click", closeChangeGoal);
+}
+roots.changeGoalDialog.addEventListener("click", event => {
+  if (event.target === roots.changeGoalDialog) closeChangeGoal();
+});
+
 roots.dialog.addEventListener("click", event => {
   if (event.target === roots.dialog) closeCreate();
 });
@@ -918,6 +981,8 @@ render(state);
 roots.detail.scrollTop = state.scrollState.detailTop;
 const poller = new PollController(refresh, 1000);
 poller.start();
+const systemPoller = new PollController(loadSystem, 2000);
+systemPoller.start();
 const elapsedTimer = setInterval(() => {
   refreshElapsed(roots.board);
   refreshTimelineTimes(roots.detail);
@@ -927,4 +992,5 @@ window.addEventListener("beforeunload", () => {
   clearTimeout(viewSaveTimer);
   persistViewState();
   poller.destroy();
+  systemPoller.destroy();
 });

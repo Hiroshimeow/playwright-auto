@@ -24,7 +24,6 @@ export const state = {
   history: [],
   historyCursor: null,
   runtime: null,
-  system: null,
   dashboardActions: null,
   dashboardActionsStatus: "idle",
   dashboardActionsError: null,
@@ -32,7 +31,7 @@ export const state = {
   pendingCommands: savedMap(saved.pendingCommands),
   etags: new Map(),
   inflight: new Map(),
-  drawer: saved.drawer || null,
+  drawer: saved.drawer === "runtime" ? null : saved.drawer || null,
   modalOpen: Boolean(saved.modalOpen),
   scrollState: {
     boardLeft: Number(saved.scrollState?.boardLeft || 0),
