@@ -2039,6 +2039,11 @@ class CDPAWorker:
         repair_attempt: int = 0,
         validation_error: str | None = None,
     ) -> dict[str, Any]:
+        target_role = str(target_role).strip().upper()
+        if target_role not in state["roles"]:
+            raise RouteContractError(
+                f"route {target_role!r} is not selected for this task"
+            )
         hop_id = max((int(item.get("hop_id") or 0) for item in state.get("hops") or []), default=0) + 1
         role_record = state["roles"][target_role]
         target_turn = int(turn or (int(role_record.get("turn") or 0) + 1))
@@ -2234,7 +2239,12 @@ class CDPAWorker:
                 logical_role=role,
                 physical_role=str(hop["physical_role"]),
                 turn=int(hop["turn"]),
-                allowed_routes=("PLAN", "DEV", "TEST", "REVIEW", "AUDIT", "DONE"),
+                allowed_routes=tuple(
+                    configured
+                    for configured in ("PLAN", "DEV", "TEST", "REVIEW", "AUDIT")
+                    if configured in state["roles"]
+                )
+                + ("DONE",),
                 workspace=str(state["repository"]),
                 source_physical_role=source_physical,
                 handoff=str(hop["handoff"]),
@@ -3025,6 +3035,10 @@ class CDPAWorker:
                 report_mode=_report_mode(state),
             )
             decision = parsed.decision
+            if decision.route != "DONE" and decision.route not in state["roles"]:
+                raise RouteContractError(
+                    f"route {decision.route!r} is not selected for this task"
+                )
             if parsed.inline_report is None:
                 evidence = validate_report(
                     decision.handoff,
@@ -4637,6 +4651,20 @@ class CDPAWorker:
                 != str(self._repository_allowed(payload.get("repository")))
             ):
                 raise RuntimeError("create command provenance does not match its payload")
+            if "roles" in payload:
+                selected_roles = {
+                    str(role).strip().upper() for role in payload["roles"]
+                }
+                expected_roles = tuple(
+                    role for role in self.config.roles if role in selected_roles
+                )
+                actual_roles = tuple(
+                    role for role in self.config.roles if role in state.get("roles", {})
+                )
+                if actual_roles != expected_roles:
+                    raise RuntimeError(
+                        "create command role provenance does not match its payload"
+                    )
             return state
         if kind not in {"task_control", "resume_team"}:
             return None
@@ -4745,6 +4773,11 @@ class CDPAWorker:
                         str(payload.get("task") or ""),
                         requested_team=payload.get("requested_team"),
                         reuse_team=payload.get("reuse_team") or None,
+                        roles=(
+                            tuple(payload.get("roles") or ())
+                            if "roles" in payload
+                            else None
+                        ),
                         new_roles=tuple(payload.get("new_roles") or ()),
                         new_all=bool(payload.get("new_all")),
                         repository=self._repository_allowed(payload.get("repository")),

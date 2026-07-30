@@ -24,13 +24,29 @@ function actionTaskCopy(task) {
   return copy;
 }
 
+const DEFAULT_WORKFLOW_ROLES = new Set(["PLAN", "DEV", "REVIEW"]);
+
+export function applyReuseRoleSelection(roleInputs, item = null, {reset = false} = {}) {
+  const locked = Boolean(item);
+  const selected = locked
+    ? new Set(Array.isArray(item.roles) ? item.roles : [])
+    : reset
+      ? DEFAULT_WORKFLOW_ROLES
+      : new Set([...roleInputs].filter(input => input.checked).map(input => input.value));
+  for (const input of roleInputs) {
+    if (locked || reset) input.checked = selected.has(input.value);
+    if (input.value === "PLAN") input.checked = true;
+    input.disabled = locked || input.value === "PLAN";
+  }
+}
+
 export function selectedDependencyIds(root) {
   return [...root.querySelectorAll("input[data-dependency-task-id]:checked")]
     .map(input => input.dataset.dependencyTaskId)
     .filter(Boolean);
 }
 
-export function renderCreateActions(dependencyRoot, reuseSelect, current) {
+export function renderCreateActions(dependencyRoot, reuseSelect, current, roleInputs = []) {
   const actions = current.dashboardActions;
   const signature = JSON.stringify([
     current.dashboardActionsStatus,
@@ -50,6 +66,11 @@ export function renderCreateActions(dependencyRoot, reuseSelect, current) {
   reuseSelect.replaceChildren(...reuseOptions);
   reuseSelect.value = [...reuseSelect.options].some(option => option.value === selectedReuse)
     ? selectedReuse : "";
+  const selectedReuseItem = (actions?.reuse_teams || [])
+    .find(item => item.team === reuseSelect.value) || null;
+  applyReuseRoleSelection(roleInputs, selectedReuseItem, {
+    reset: Boolean(selectedReuse && !selectedReuseItem),
+  });
 
   const fragment = document.createDocumentFragment();
   if (current.dashboardActionsStatus === "loading" && !actions) {

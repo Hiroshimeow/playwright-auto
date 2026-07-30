@@ -67,16 +67,25 @@ function timelineTime(value, now = Date.now()) {
 
 function build(detail, timeline, selectedRole) {
   const fragment = document.createDocumentFragment();
+  const agent = detail.task_mode === "independent" ? (detail.agent || {}) : null;
+  const displayTitle = agent && !agent.is_builtin
+    ? `Custom Agent · ${agent.name || detail.team || detail.task_id}`
+    : (detail.task_title || detail.task_id);
   const head = el("div", null, "detail-head");
   const identity = el("div");
   identity.append(el("p", detail.status, "eyebrow"), el("h2", detail.team || detail.task_id));
-  identity.append(el("p", detail.task_title || detail.task_id, "detail-subtitle"));
+  identity.append(el("p", displayTitle, "detail-subtitle"));
   head.append(identity, el("span", detail.active_role || "No active role", "status-badge"));
   fragment.append(head);
 
   const taskSection = el("section", null, "detail-section");
-  taskSection.append(el("h3", detail.task_mode === "independent" ? "Independent agent" : "Task"));
-  taskSection.append(el("pre", detail.task_text || detail.task_title || detail.task_id, "task-text"));
+  taskSection.append(el("h3", detail.task_mode === "independent"
+    ? (agent.is_builtin ? "Built-in agent" : "Custom Agent")
+    : "Task"));
+  const taskText = agent && !agent.is_builtin
+    ? `Custom Agent: ${agent.name || detail.team || detail.task_id}`
+    : (detail.task_text || detail.task_title || detail.task_id);
+  taskSection.append(el("pre", taskText, "task-text"));
   if (detail.task_mode !== "independent") {
     taskSection.append(el("h3", "Effective goal"));
     taskSection.append(el("pre", detail.effective_goal || detail.task_text || detail.task_id, "task-text"));
@@ -95,7 +104,6 @@ function build(detail, timeline, selectedRole) {
     }
   }
   if (detail.task_mode === "independent") {
-    const agent = detail.agent || {};
     const context = el("div", null, "agent-detail-grid");
     context.append(
       el("span", `Name: ${agent.name || detail.team}`),

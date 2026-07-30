@@ -61,6 +61,11 @@ def test_create_independent_agent_command_is_idempotent(tmp_path: Path):
             "name": "Release Watcher",
             "system_prompt": "Review releases.",
             "mode": "Independent",
+            "trigger_settings": {
+                "task_done": True,
+                "teams": ["unused-team"],
+                "states": ["BLOCKED"],
+            },
         },
     )
 
@@ -77,6 +82,16 @@ def test_create_independent_agent_command_is_idempotent(tmp_path: Path):
     assert replay is None
     assert len(agents) == 1
     assert agents[0]["status"] == "WAITING"
+    assert agents[0]["independent"]["system_prompt"] == "Review releases."
+    assert agents[0]["independent"]["trigger_settings"] == {
+        "recovery": False,
+        "interval_minutes": None,
+        "task_done": True,
+        "role_completed": [],
+        "teams": ["unused-team"],
+        "states": ["BLOCKED"],
+        "check_all": False,
+    }
 
 
 
@@ -266,6 +281,10 @@ def test_dashboard_normalizes_independent_creation_completion_activation_repair_
             "name": "Monitor Two",
             "system_prompt": "Inspect progress.",
             "mode": "Independent",
+            "trigger_settings": {
+                "interval_minutes": 20,
+                "role_completed": ["dev"],
+            },
         }
     )
     completed = api.normalize_independent_completion(
@@ -300,6 +319,15 @@ def test_dashboard_normalizes_independent_creation_completion_activation_repair_
         "name": "Monitor Two",
         "system_prompt": "Inspect progress.",
         "mode": "Independent",
+        "trigger_settings": {
+            "recovery": False,
+            "interval_minutes": 20,
+            "task_done": False,
+            "role_completed": ["DEV"],
+            "teams": [],
+            "states": [],
+            "check_all": False,
+        },
     }
     assert completed["outcome"] == "SUCCESS"
     assert completed["summary"] == "Checks passed."

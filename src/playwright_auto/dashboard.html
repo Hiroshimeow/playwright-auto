@@ -18,7 +18,7 @@
 
     <nav class="header-actions" aria-label="Dashboard actions">
       <button type="button" class="button primary" data-open-create>Create task</button>
-      <button type="button" class="button" data-open-agent>Add independent agent</button>
+      <button type="button" class="button" data-open-agent>Add custom agent</button>
       <button type="button" class="button" data-action="reload_catalog">Reload catalog</button>
       <button type="button" class="button" data-view="resume">Resume teams</button>
       <button type="button" class="button" data-view="history">History</button>
@@ -78,6 +78,17 @@
         </div>
         <p class="form-help">Choose one allocation path. Reuse eligibility is published by the worker.</p>
       </fieldset>
+      <fieldset class="action-fieldset">
+        <legend>Workflow agents</legend>
+        <div class="form-grid">
+          <label class="check-row"><input type="checkbox" name="roles" value="PLAN" checked disabled> PLAN</label>
+          <label class="check-row"><input type="checkbox" name="roles" value="DEV" checked> DEV</label>
+          <label class="check-row"><input type="checkbox" name="roles" value="TEST"> TEST</label>
+          <label class="check-row"><input type="checkbox" name="roles" value="REVIEW" checked> REVIEW</label>
+          <label class="check-row"><input type="checkbox" name="roles" value="AUDIT"> AUDIT</label>
+        </div>
+        <p class="form-help">PLAN is required. Exact-team reuse inherits and locks the existing agent set.</p>
+      </fieldset>
       <label>Repository<input name="repository" autocomplete="off"></label>
       <section class="action-fieldset" aria-labelledby="dependency-title">
         <div class="section-inline">
@@ -120,17 +131,29 @@
     <form id="agent-form" method="dialog" class="create-form">
       <header class="secondary-header">
         <div>
-          <p class="eyebrow">Worker-owned agent</p>
-          <h2>Add independent agent</h2>
+          <p class="eyebrow">Custom Agent</p>
+          <h2>Add custom agent</h2>
         </div>
-        <button type="button" class="button icon-button" data-close-agent aria-label="Close independent agent form">Close</button>
+        <button type="button" class="button icon-button" data-close-agent aria-label="Close custom agent form">Close</button>
       </header>
       <label>Name<input name="name" maxlength="80" autocomplete="off" required></label>
       <label>System prompt<textarea name="system_prompt" rows="10" required></textarea></label>
-      <label>Mode<select name="mode"><option value="Independent" selected>Independent</option></select></label>
+      <fieldset class="action-fieldset">
+        <legend>Triggers</legend>
+        <div class="form-grid agent-trigger-grid">
+          <label class="check-row"><input type="checkbox" name="recovery"> Exclusive recovery</label>
+          <label class="check-row"><input type="checkbox" name="task_done"> Task DONE</label>
+          <label class="check-row"><input type="checkbox" name="check_all"> CHECK_ALL</label>
+          <label>Interval minutes<input type="number" name="interval_minutes" min="20" step="1"></label>
+          <label>Exact teams<input name="teams" placeholder="team-a, team-b" autocomplete="off"></label>
+          <label>Selected states<input name="states" placeholder="RUNNING, WAITING, BLOCKED" autocomplete="off"></label>
+          <label>Completed roles<input name="role_completed" placeholder="PLAN, DEV, TEST" autocomplete="off"></label>
+        </div>
+        <p class="form-help">No selected trigger creates a manual-only Custom Agent. Exclusive recovery can have only one enabled owner.</p>
+      </fieldset>
       <footer class="dialog-actions">
         <button type="button" class="button" data-close-agent>Cancel</button>
-        <button type="submit" class="button primary">Create agent</button>
+        <button type="submit" class="button primary">Create custom agent</button>
       </footer>
     </form>
   </dialog>
@@ -139,7 +162,7 @@
     <form id="agent-command-form" method="dialog" class="create-form">
       <header class="secondary-header">
         <div>
-          <p class="eyebrow">Independent agent</p>
+          <p class="eyebrow">Agent</p>
           <h2>Command</h2>
         </div>
         <button type="button" class="button icon-button" data-close-agent-command aria-label="Close agent command">Close</button>
@@ -157,7 +180,7 @@
     <form id="agent-settings-form" method="dialog" class="create-form">
       <header class="secondary-header">
         <div>
-          <p class="eyebrow">Independent agent</p>
+          <p class="eyebrow">Agent</p>
           <h2>Settings</h2>
         </div>
         <button type="button" class="button icon-button" data-close-agent-settings aria-label="Close agent settings">Close</button>
@@ -185,6 +208,6 @@
   </dialog>
 
   <div id="toast" class="toast" hidden role="status"></div>
-  <script type="module" src="/assets/app.js?v=20260728-system-status-2"></script>
+  <script type="module" src="/assets/app.js?v=20260730-custom-agent-ui-1"></script>
 </body>
 </html>

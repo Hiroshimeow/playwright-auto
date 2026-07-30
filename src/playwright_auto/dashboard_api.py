@@ -165,11 +165,43 @@ class DashboardAPI:
             raise APIError(400, "invalid_request", f"{field} must be an array")
         return value
 
+    def _workflow_roles(self, value: object) -> list[str]:
+        raw_roles = self._list(value, "roles")
+        roles: list[str] = []
+        for item in raw_roles:
+            if not isinstance(item, str) or not item.strip():
+                raise APIError(
+                    400,
+                    "invalid_request",
+                    "roles must contain non-empty strings",
+                )
+            roles.append(item.strip().upper())
+        if not roles:
+            raise APIError(400, "invalid_request", "roles must not be empty")
+        if len(set(roles)) != len(roles):
+            raise APIError(
+                400,
+                "invalid_request",
+                "roles must not contain duplicates",
+            )
+        unknown = set(roles) - set(self.config.roles)
+        if unknown:
+            raise APIError(
+                400,
+                "invalid_request",
+                f"unknown workflow roles: {sorted(unknown)!r}",
+            )
+        if "PLAN" not in roles:
+            raise APIError(400, "invalid_request", "roles must include PLAN")
+        selected = set(roles)
+        return [role for role in self.config.roles if role in selected]
+
     def normalize_create(self, raw: Mapping[str, Any]) -> dict[str, Any]:
         allowed = {
             "task",
             "requested_team",
             "reuse_team",
+            "roles",
             "new_roles",
             "new_all",
             "repository",
@@ -183,7 +215,7 @@ class DashboardAPI:
         task = str(raw.get("task") or "").strip()
         if not task:
             raise APIError(400, "invalid_request", "task must not be empty")
-        return {
+        normalized = {
             "task": task,
             "requested_team": raw.get("requested_team"),
             "reuse_team": raw.get("reuse_team") or None,
@@ -196,9 +228,12 @@ class DashboardAPI:
             ),
             "upload_paths": self._list(raw.get("upload_paths"), "upload_paths"),
         }
+        if "roles" in raw:
+            normalized["roles"] = self._workflow_roles(raw.get("roles"))
+        return normalized
 
     def normalize_independent_create(self, raw: Mapping[str, Any]) -> dict[str, Any]:
-        allowed = {"name", "system_prompt", "mode"}
+        allowed = {"name", "system_prompt", "mode", "trigger_settings"}
         unknown = set(raw) - allowed
         if unknown:
             raise APIError(400, "invalid_request", f"unknown fields: {sorted(unknown)!r}")
@@ -208,9 +243,17 @@ class DashboardAPI:
         try:
             name, _key, _team = normalize_agent_name(raw.get("name"))
             prompt = normalize_system_prompt(raw.get("system_prompt"))
+            settings = (
+                validate_trigger_settings(raw.get("trigger_settings"))
+                if "trigger_settings" in raw
+                else None
+            )
         except ValueError as exc:
             raise APIError(400, "invalid_request", str(exc)) from exc
-        return {"name": name, "system_prompt": prompt, "mode": "Independent"}
+        payload = {"name": name, "system_prompt": prompt, "mode": "Independent"}
+        if settings is not None:
+            payload["trigger_settings"] = settings
+        return payload
 
     def normalize_independent_completion(
         self, raw: Mapping[str, Any]

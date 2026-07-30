@@ -141,7 +141,13 @@ class FakeActions:
         return len(selected)
 
 
-def setup_task(tmp_path: Path, *, task_id="task-a", report_mode="file"):
+def setup_task(
+    tmp_path: Path,
+    *,
+    task_id="task-a",
+    report_mode="file",
+    roles=None,
+):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
     state = store.create_task(
@@ -149,6 +155,7 @@ def setup_task(tmp_path: Path, *, task_id="task-a", report_mode="file"):
         requested_team="alpha",
         task_id=task_id,
         report_mode=report_mode,
+        roles=roles,
     )
     return config, store, state, CDPAWorker(config, store=store)
 
@@ -381,6 +388,21 @@ def test_pre_send_lazily_acquires_only_plan_and_persists_constructor(tmp_path: P
     assert state["roles"]["PLAN"]["constructor_sent_generation"] == 0
 
 
+def test_pre_send_limits_allowed_routes_to_selected_workflow_roles(tmp_path: Path):
+    _, _, state, worker = setup_task(tmp_path, roles=("PLAN", "REVIEW"))
+    hop = _active_hop(state)
+
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+
+    envelope = json.loads(
+        hop["prompt"].split("\n\n# PLAN", 1)[0].removeprefix(
+            "alpha · role: plan\n"
+        )
+    )
+    assert envelope["allowed-routes"] == ["PLAN", "REVIEW", "DONE"]
+    assert list(state["roles"]) == ["PLAN", "REVIEW"]
+
+
 def test_normal_cdpa_send_keeps_transport_identity_out_of_actual_payload(tmp_path: Path):
     _, _, state, worker = setup_task(tmp_path)
     hop = _active_hop(state)
@@ -438,6 +460,28 @@ def test_valid_report_routes_to_lazy_dev_child_and_records_sha(tmp_path: Path):
 
 
 
+
+
+def test_unselected_route_enters_safe_repair_without_materializing_report(tmp_path: Path):
+    _, _, state, worker = setup_task(
+        tmp_path,
+        task_id="task-unselected-route",
+        report_mode="inline",
+        roles=("PLAN", "REVIEW"),
+    )
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    hop["response"] = _inline_response(route="DEV")
+    hop["state"] = "responded"
+
+    worker._responded(state, hop)
+
+    repair = _active_hop(state)
+    assert repair["kind"] == "route_repair"
+    assert repair["target_role"] == "PLAN"
+    assert "not selected" in repair["validation_error"]
+    assert state["reports"] == []
+    assert not (tmp_path / hop["expected_report_path"]).exists()
 
 
 def test_malformed_response_creates_same_turn_guide_only_repair(tmp_path: Path):
@@ -1572,6 +1616,7 @@ def test_dashboard_actions_snapshot_tracks_browser_and_command_changes(tmp_path:
             "requested_team": "mailbox",
             "repository": str(tmp_path),
             "report_mode": "file",
+            "roles": ["PLAN", "REVIEW"],
         },
     )
     assert worker._apply_next_command()["status"] == "applied"
@@ -1596,6 +1641,7 @@ def test_runtime_create_command_applies_once_and_publishes_projection(tmp_path: 
             "requested_team": "mailbox",
             "repository": str(tmp_path),
             "report_mode": "file",
+            "roles": ["REVIEW", "PLAN"],
         },
     )
 
@@ -1605,7 +1651,22 @@ def test_runtime_create_command_applies_once_and_publishes_projection(tmp_path: 
     created = store.load_task_id("task-created-command")
     assert created is not None
     assert created["applied_command_ids"] == ["cmd-create-once"]
+    assert list(created["roles"]) == ["PLAN", "REVIEW"]
     assert worker.runtime_db.get_task_detail("task-created-command")["task_id"] == "task-created-command"
+
+    with worker.runtime_db.connection() as connection:
+        connection.execute(
+            "UPDATE command_queue SET status = 'queued', started_at = NULL, "
+            "finished_at = NULL, result_json = NULL, error = NULL "
+            "WHERE command_id = ?",
+            ("cmd-create-once",),
+        )
+    reconciled = worker._apply_next_command()
+    assert reconciled["status"] == "applied"
+    assert reconciled["result"]["reconciled"] is True
+    assert store.load_task_id("task-created-command")["applied_command_ids"] == [
+        "cmd-create-once"
+    ]
 
 
 

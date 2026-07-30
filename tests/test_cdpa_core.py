@@ -204,6 +204,64 @@ def test_manifest_path_and_initial_plan_are_lazy(tmp_path: Path):
     assert state["hops"][0]["state"] == "pre_send"
 
 
+def test_workflow_role_subset_is_canonical_and_exact_team_reuse_inherits(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+
+    first = store.create_task(
+        "small workflow",
+        requested_team="alpha",
+        task_id="task-subset",
+        roles=("REVIEW", "PLAN"),
+    )
+    assert list(first["roles"]) == ["PLAN", "REVIEW"]
+    assert list(store.load(first["manifest_path"])["roles"]) == ["PLAN", "REVIEW"]
+
+    inherited = store.create_task(
+        "reuse subset",
+        reuse_team="alpha",
+        task_id="task-subset-reuse",
+    )
+    assert list(inherited["roles"]) == ["PLAN", "REVIEW"]
+
+    matched = store.create_task(
+        "reuse matching subset",
+        reuse_team="alpha",
+        task_id="task-subset-match",
+        roles=("PLAN", "REVIEW"),
+    )
+    assert list(matched["roles"]) == ["PLAN", "REVIEW"]
+
+    with pytest.raises(ValueError, match="role composition"):
+        store.create_task(
+            "reuse mismatched subset",
+            reuse_team="alpha",
+            task_id="task-subset-mismatch",
+            roles=("PLAN", "DEV"),
+        )
+    with pytest.raises(ValueError, match="must include PLAN"):
+        store.create_task(
+            "missing plan",
+            requested_team="missing-plan",
+            task_id="task-missing-plan",
+            roles=("DEV",),
+        )
+    with pytest.raises(ValueError, match="must not contain duplicates"):
+        store.create_task(
+            "duplicate plan",
+            requested_team="duplicate-plan",
+            task_id="task-duplicate-plan",
+            roles=("PLAN", "PLAN"),
+        )
+
+    legacy = store.create_task(
+        "legacy full workflow",
+        requested_team="legacy",
+        task_id="task-legacy-full",
+    )
+    assert set(store.load(legacy["manifest_path"])["roles"]) == set(config.roles)
+
+
 def _prompt_kwargs(config, tmp_path: Path, **overrides):
     value = {
         "task_title": "full task",
@@ -486,7 +544,11 @@ def test_reuse_team_creates_waiting_task_without_allocating_suffix(tmp_path: Pat
     first = store.create_task("one", requested_team="alpha", task_id="task-one")
 
     assert build_dashboard_actions([first])["reuse_teams"] == [
-        {"team": "alpha", "status": "available"}
+        {
+            "team": "alpha",
+            "status": "available",
+            "roles": list(config.roles),
+        }
     ]
 
     second = store.create_task("two", reuse_team="alpha", task_id="task-two")

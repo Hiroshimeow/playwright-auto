@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .cdpa_config import CDPA_ROLES
 from .cdpa_dependencies import dependency_parent_ids
 from .cdpa_independent import is_independent_task
 from .cdpa_safety import sanitize_text, sanitize_value
@@ -916,6 +917,7 @@ def build_task_projection(
         summary["task_mode"] = "independent"
         summary["agent"] = {
             "name": _public_text(independent.get("agent_name"), max_chars=80),
+            "is_builtin": str(independent.get("agent_key") or "").casefold() in {"maintainers", "monitor"},
             "generation": _int_or_zero(independent.get("agent_generation")),
             "enabled": bool(independent.get("enabled")),
             "trigger_type": str(active_event.get("trigger_type") or "") or None,
@@ -1022,6 +1024,13 @@ def _dashboard_action_task(raw: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
+def _workflow_role_composition(raw: Mapping[str, Any]) -> tuple[str, ...]:
+    roles = raw.get("roles")
+    if not isinstance(roles, Mapping):
+        return ()
+    return tuple(role for role in CDPA_ROLES if role in roles)
+
+
 def build_dashboard_actions(
     tasks: Sequence[Mapping[str, Any]],
     *,
@@ -1040,7 +1049,7 @@ def build_dashboard_actions(
 
     dependency_teams: list[dict[str, Any]] = []
     resume_teams: list[dict[str, Any]] = []
-    reuse_teams: list[dict[str, str]] = []
+    reuse_teams: list[dict[str, Any]] = []
     for team in sorted(grouped):
         team_tasks = sorted(
             grouped[team],
@@ -1089,8 +1098,20 @@ def build_dashboard_actions(
                     }
                 )
 
-        if exact_team_reuse_eligible(team_tasks, team):
-            reuse_teams.append({"team": team, "status": "available"})
+        compositions = {
+            _workflow_role_composition(item) for item in team_tasks
+        }
+        if (
+            exact_team_reuse_eligible(team_tasks, team)
+            and len(compositions) == 1
+        ):
+            reuse_teams.append(
+                {
+                    "team": team,
+                    "status": "available",
+                    "roles": list(compositions.pop()),
+                }
+            )
 
     return {
         "dependency_teams": dependency_teams,

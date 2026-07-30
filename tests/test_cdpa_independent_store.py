@@ -32,6 +32,15 @@ def test_independent_agent_is_one_waiting_task_with_one_agent_role(tmp_path: Pat
     assert state["independent"]["agent_name"] == "Release Watcher"
     assert state["independent"]["agent_generation"] == 1
     assert state["independent"]["active_event"] is None
+    assert state["independent"]["trigger_settings"] == {
+        "recovery": False,
+        "interval_minutes": None,
+        "task_done": False,
+        "role_completed": [],
+        "teams": [],
+        "states": [],
+        "check_all": False,
+    }
     assert store.load(state["manifest_path"])["task_mode"] == "independent"
 
 
@@ -48,11 +57,14 @@ def test_same_agent_name_reuses_current_identity_and_exact_team(tmp_path: Path):
         " monitor ",
         system_prompt="Ignored because settings are changed explicitly.",
         task_id="different-id-must-not-be-created",
+        trigger_settings={"task_done": True, "interval_minutes": 20},
     )
 
     assert second["task_id"] == first["task_id"]
     assert second["team"] == "agent-monitor"
     assert second["independent"]["system_prompt"] == "Inspect progress."
+    assert second["independent"]["trigger_settings"]["task_done"] is False
+    assert second["independent"]["trigger_settings"]["interval_minutes"] is None
     assert len([item for item in store.discover() if item.get("task_mode") == "independent"]) == 1
 
 

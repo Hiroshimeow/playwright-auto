@@ -9,9 +9,9 @@ import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./
 import {renderHistory} from "./views/history.js";
 import {renderRuntime} from "./views/runtime.js?v=20260728-system-status-1";
 import {
-  renderCreateActions, renderResume, selectedDependencyIds,
+  applyReuseRoleSelection, renderCreateActions, renderResume, selectedDependencyIds,
   selectedResumeTeams, updateResumeButton,
-} from "./views/dashboard_actions.js";
+} from "./views/dashboard_actions.js?v=20260730-workflow-roles-1";
 
 const roots = {
   board: document.querySelector("#board"),
@@ -29,6 +29,7 @@ const roots = {
   dependencyOptions: document.querySelector("#dependency-options"),
   reuseTeam: document.querySelector('#create-form select[name="reuse_team"]'),
   requestedTeam: document.querySelector('#create-form input[name="requested_team"]'),
+  roleInputs: [...document.querySelectorAll('#create-form input[name="roles"]')],
   agentDialog: document.querySelector("#agent-dialog"),
   agentForm: document.querySelector("#agent-form"),
   agentCommandDialog: document.querySelector("#agent-command-dialog"),
@@ -63,13 +64,30 @@ function commaValues(value) {
   return String(value || "").split(",").map(item => item.trim()).filter(Boolean);
 }
 
+function independentTriggerSettings(values) {
+  const intervalRaw = String(values.get("interval_minutes") || "").trim();
+  return {
+    recovery: values.has("recovery"),
+    interval_minutes: intervalRaw ? Number(intervalRaw) : null,
+    task_done: values.has("task_done"),
+    role_completed: commaValues(values.get("role_completed")).map(value => value.toUpperCase()),
+    teams: commaValues(values.get("teams")),
+    states: commaValues(values.get("states")).map(value => value.toUpperCase()),
+    check_all: values.has("check_all"),
+  };
+}
+
+function selectedWorkflowRoles() {
+  return roots.roleInputs.filter(input => input.checked).map(input => input.value);
+}
+
 function renderAgentHistory(root, detail) {
   const fragment = document.createDocumentFragment();
   const historyItems = detail?.independent_history || [];
   if (!historyItems.length) {
     const empty = document.createElement("p");
     empty.className = "muted";
-    empty.textContent = "No lifecycle records for this independent agent.";
+    empty.textContent = "No lifecycle records for this agent.";
     fragment.append(empty);
   }
   for (const item of historyItems) {
@@ -99,7 +117,7 @@ function renderAgentReports(root, detail) {
   if (!reports.length) {
     const empty = document.createElement("p");
     empty.className = "muted";
-    empty.textContent = "No reports for this independent agent.";
+    empty.textContent = "No reports for this agent.";
     fragment.append(empty);
   }
   for (const report of reports) {
@@ -280,7 +298,12 @@ function render(current) {
   );
   renderCommands(current);
   renderRuntime(roots.services, current);
-  renderCreateActions(roots.dependencyOptions, roots.reuseTeam, current);
+  renderCreateActions(
+    roots.dependencyOptions,
+    roots.reuseTeam,
+    current,
+    roots.roleInputs,
+  );
 
   const catalog = current.catalog;
   const catalogText = catalog?.complete
@@ -820,12 +843,18 @@ window.addEventListener("popstate", () => {
 });
 
 roots.reuseTeam.addEventListener("change", () => {
-  const reuse = Boolean(roots.reuseTeam.value);
+  const selectedItem = (state.dashboardActions?.reuse_teams || [])
+    .find(item => item.team === roots.reuseTeam.value) || null;
+  const reuse = Boolean(selectedItem);
   if (reuse) roots.requestedTeam.value = "";
   roots.requestedTeam.disabled = reuse;
+  applyReuseRoleSelection(roots.roleInputs, selectedItem, {reset: !selectedItem});
 });
 roots.requestedTeam.addEventListener("input", () => {
-  if (roots.requestedTeam.value.trim()) roots.reuseTeam.value = "";
+  if (roots.requestedTeam.value.trim() && roots.reuseTeam.value) {
+    roots.reuseTeam.value = "";
+    applyReuseRoleSelection(roots.roleInputs, null, {reset: true});
+  }
   roots.requestedTeam.disabled = false;
 });
 
@@ -847,6 +876,7 @@ roots.form.addEventListener("submit", event => {
     repository: String(values.get("repository") || "").trim() || null,
     depends_on_task_ids: dependencies,
   };
+  body.roles = selectedWorkflowRoles();
   if (reuseTeam) body.reuse_team = reuseTeam;
   else if (requestedTeam) body.requested_team = requestedTeam;
   queueCommand({
@@ -858,6 +888,7 @@ roots.form.addEventListener("submit", event => {
   });
   roots.form.reset();
   roots.requestedTeam.disabled = false;
+  applyReuseRoleSelection(roots.roleInputs, null, {reset: true});
   closeCreate();
 });
 
@@ -871,8 +902,13 @@ roots.agentForm.addEventListener("submit", event => {
     kind: "create_independent_agent",
     taskId: "new-agent",
     endpoint: "/api/independent-agents",
-    body: {name, system_prompt: systemPrompt, mode: "Independent"},
-    label: `Create agent · ${name}`,
+    body: {
+      name,
+      system_prompt: systemPrompt,
+      mode: "Independent",
+      trigger_settings: independentTriggerSettings(values),
+    },
+    label: `Create custom agent · ${name}`,
   });
   roots.agentForm.reset();
   roots.agentDialog.close();
@@ -900,22 +936,12 @@ roots.agentSettingsForm.addEventListener("submit", event => {
   const values = new FormData(roots.agentSettingsForm);
   const taskId = String(values.get("task_id") || "");
   if (!taskId) return;
-  const intervalRaw = String(values.get("interval_minutes") || "").trim();
-  const triggerSettings = {
-    recovery: values.has("recovery"),
-    interval_minutes: intervalRaw ? Number(intervalRaw) : null,
-    task_done: values.has("task_done"),
-    role_completed: commaValues(values.get("role_completed")).map(value => value.toUpperCase()),
-    teams: commaValues(values.get("teams")),
-    states: commaValues(values.get("states")).map(value => value.toUpperCase()),
-    check_all: values.has("check_all"),
-  };
   const systemPrompt = String(values.get("system_prompt") || "").trim();
   if (!systemPrompt) return;
   const body = {
     enabled: values.has("enabled"),
     system_prompt: systemPrompt,
-    trigger_settings: triggerSettings,
+    trigger_settings: independentTriggerSettings(values),
   };
   queueCommand({
     kind: "independent_settings",

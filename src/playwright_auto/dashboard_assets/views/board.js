@@ -1,5 +1,5 @@
 const COLUMNS = ["RUNNING", "WAITING", "BLOCKED", "PAUSED", "DONE", "STOPPED", "INDEPENDENT_AGENTS"];
-const COLUMN_LABELS = {INDEPENDENT_AGENTS: "INDEPENDENT AGENTS"};
+const COLUMN_LABELS = {INDEPENDENT_AGENTS: "AGENTS"};
 const roleClocks = new Map();
 
 function text(tag, value, className) {
@@ -120,6 +120,7 @@ function card(task, selected, board) {
   node.className = `task-card${selected ? " selected" : ""}`;
   node.dataset.taskId = task.task_id;
   node.dataset.signature = taskSignature(task, board);
+  const agent = task.task_mode === "independent" ? task.agent : null;
 
   const head = document.createElement("div");
   head.className = "task-card-head";
@@ -128,9 +129,12 @@ function card(task, selected, board) {
   select.className = "task-select";
   select.dataset.selectTask = task.task_id;
   select.setAttribute("aria-label", `Select ${task.team || task.task_id}`);
-  const cardName = task.task_mode === "independent"
-    ? (task.agent?.name || task.team || task.task_id)
+  const cardName = agent
+    ? (agent.name || task.team || task.task_id)
     : (task.team || task.task_id);
+  if (agent && !agent.is_builtin) {
+    select.append(text("span", "Custom Agent", "task-agent-context"));
+  }
   select.append(text("strong", cardName, "task-team"));
   const roleGroup = document.createElement("span");
   roleGroup.className = "task-role-group";
@@ -149,7 +153,6 @@ function card(task, selected, board) {
   summary.type = "button";
   summary.className = "task-summary";
   summary.dataset.selectTask = task.task_id;
-  const agent = task.task_mode === "independent" ? task.agent : null;
   const agentTarget = agent?.target_team
     ? `RUNNING for ${agent.target_team}`
     : task.status === "WAITING" ? "Waiting for trigger" : task.status;

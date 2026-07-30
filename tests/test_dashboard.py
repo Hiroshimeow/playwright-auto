@@ -202,9 +202,14 @@ def test_seven_lane_board_and_independent_agent_controls_are_explicit():
 
     detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
     assert 'const COLUMNS = ["RUNNING", "WAITING", "BLOCKED", "PAUSED", "DONE", "STOPPED", "INDEPENDENT_AGENTS"]' in board
-    assert 'INDEPENDENT_AGENTS: "INDEPENDENT AGENTS"' in board
+    assert 'INDEPENDENT_AGENTS: "AGENTS"' in board
     assert 'task.task_mode === "independent"' in board
     assert 'RUNNING for ${agent.target_team}' in board
+    assert '"Custom Agent"' in board
+    assert '!agent.is_builtin' in board
+    assert 'agent.is_builtin ? "Built-in agent" : "Custom Agent"' in detail
+    assert '`Custom Agent · ${agent.name || detail.team || detail.task_id}`' in detail
+    assert '`Custom Agent: ${agent.name || detail.team || detail.task_id}`' in detail
     assert '"Run once"' in detail
     assert '"Command"' in detail
     assert '"Stop current job"' in detail
@@ -212,12 +217,17 @@ def test_seven_lane_board_and_independent_agent_controls_are_explicit():
     assert '"Renew"' in detail
     assert '"Settings"' in detail
     assert '"Reports"' in detail
-    assert 'data-open-agent' in html
+    assert 'data-open-agent>Add custom agent</button>' in html
     assert 'id="agent-form"' in html
-    assert 'name="mode"' in html
-    assert '>Independent<' in html
+    assert '<h2>Add custom agent</h2>' in html
+    assert 'aria-label="Close custom agent form"' in html
+    assert '>Create custom agent</button>' in html
+    assert 'name="mode"' not in html
+    assert 'Add independent agent' not in html
     assert 'id="agent-settings-form"' in html
     assert '/api/independent-agents' in app
+    assert 'mode: "Independent"' in app
+    assert 'Create custom agent · ${name}' in app
     assert "data-copy-task-id" in board
     assert 'task.started_at || task.created_at' in board
     assert 'text("span", task.active_role || "—", "task-role")' in board
@@ -238,6 +248,25 @@ def test_seven_lane_board_and_independent_agent_controls_are_explicit():
     assert "selectedRoleByTask" in store
     assert "detailCache" in store
     assert "laneScroll" in store
+
+
+def test_create_task_role_selection_defaults_and_reuse_lock_are_explicit():
+    html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+    app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
+    actions = (ASSET_ROOT / "views" / "dashboard_actions.js").read_text(encoding="utf-8")
+
+    for role in ("PLAN", "DEV", "TEST", "REVIEW", "AUDIT"):
+        assert f'name="roles" value="{role}"' in html
+    assert 'name="roles" value="PLAN" checked disabled' in html
+    assert 'name="roles" value="DEV" checked' in html
+    assert 'name="roles" value="REVIEW" checked' in html
+    assert 'name="roles" value="TEST" checked' not in html
+    assert 'name="roles" value="AUDIT" checked' not in html
+    assert "selectedWorkflowRoles" in app
+    assert "body.roles = selectedWorkflowRoles" in app
+    assert "applyReuseRoleSelection" in actions
+    assert "item.roles" in actions
+    assert 'input.disabled = locked || input.value === "PLAN"' in actions
 
 
 def test_change_goal_ui_contract_is_running_only_and_uses_shared_command_path():

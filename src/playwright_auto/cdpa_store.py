@@ -75,6 +75,33 @@ def report_mode_from_options(options: Mapping[str, Any]) -> str:
     return normalize_report_mode(options["report_mode"])
 
 
+def normalize_workflow_roles(
+    value: Any,
+    configured_roles: Sequence[str],
+) -> tuple[str, ...]:
+    available = tuple(str(role).strip().upper() for role in configured_roles)
+    if value is None:
+        return available
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError("roles must be a list of workflow roles")
+    requested: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("roles must contain non-empty strings")
+        requested.append(item.strip().upper())
+    if not requested:
+        raise ValueError("roles must not be empty")
+    if len(set(requested)) != len(requested):
+        raise ValueError("roles must not contain duplicates")
+    unknown = set(requested) - set(available)
+    if unknown:
+        raise ValueError(f"unknown workflow roles: {sorted(unknown)!r}")
+    if "PLAN" not in requested:
+        raise ValueError("roles must include PLAN")
+    selected = set(requested)
+    return tuple(role for role in available if role in selected)
+
+
 def normalize_dependency_ids(value: Any) -> tuple[str, ...]:
     if value is None:
         return ()
@@ -828,7 +855,16 @@ class TaskStore:
         else:
             if "independent" in state:
                 return "workflow task must not contain independent state"
-            configured_roles = tuple(str(role).upper() for role in self.config.roles)
+            available_roles = tuple(str(role).upper() for role in self.config.roles)
+            role_names = tuple(str(role).upper() for role in roles)
+            unknown_roles = set(role_names) - set(available_roles)
+            if unknown_roles:
+                return "roles contain unsupported workflow logical roles"
+            if "PLAN" not in role_names:
+                return "workflow roles must include PLAN"
+            configured_roles = tuple(
+                role for role in available_roles if role in role_names
+            )
         if set(roles) != set(configured_roles):
             return "roles must contain exactly the task-mode logical roles"
         for logical in configured_roles:
@@ -1989,6 +2025,7 @@ class TaskStore:
         reusable_teams: list[str],
         target: Path,
         normalized_new: tuple[str, ...],
+        workflow_roles: tuple[str, ...],
         new_all: bool,
         normalized_report_mode: str,
         normalized_dependencies: tuple[str, ...],
@@ -2001,7 +2038,7 @@ class TaskStore:
         now: str,
     ) -> dict[str, Any]:
         roles = {}
-        for logical in self.config.roles:
+        for logical in workflow_roles:
             roles[logical] = {
                 "logical_role": logical,
                 "physical_role": physical_role(logical, base, suffix),
@@ -2253,6 +2290,7 @@ class TaskStore:
             reusable_teams=[team],
             target=target,
             normalized_new=(),
+            workflow_roles=tuple(self.config.roles),
             new_all=False,
             normalized_report_mode="inline",
             normalized_dependencies=(),
@@ -3157,6 +3195,7 @@ class TaskStore:
         *,
         requested_team: str | None = None,
         reuse_team: str | None = None,
+        roles: Sequence[str] | None = None,
         new_roles: Sequence[str] = (),
         new_all: bool = False,
         repository: str | Path | None = None,
@@ -3173,6 +3212,11 @@ class TaskStore:
         if not text:
             raise ValueError("task must not be empty")
         task_id = _validate_task_id(task_id or generate_task_id(text))
+        requested_roles = (
+            normalize_workflow_roles(roles, self.config.roles)
+            if roles is not None
+            else None
+        )
         normalized_new = tuple(dict.fromkeys(str(role).strip().upper() for role in new_roles))
         unknown = set(normalized_new) - set(self.config.roles)
         if unknown:
@@ -3269,6 +3313,28 @@ class TaskStore:
                         f"exact team {exact_reuse_team!r} has inconsistent identity"
                     )
                 base, suffix = identities.pop()
+                compositions = {
+                    tuple(
+                        role
+                        for role in self.config.roles
+                        if role in item.get("roles", {})
+                    )
+                    for item in exact_states
+                }
+                if len(compositions) != 1:
+                    raise ValueError(
+                        f"exact team {exact_reuse_team!r} has inconsistent role composition"
+                    )
+                inherited_roles = compositions.pop()
+                if requested_roles is None:
+                    workflow_roles = inherited_roles
+                elif requested_roles != inherited_roles:
+                    raise ValueError(
+                        f"exact team {exact_reuse_team!r} role composition is locked to "
+                        f"{list(inherited_roles)!r}"
+                    )
+                else:
+                    workflow_roles = requested_roles
                 team = exact_reuse_team
                 availability_barriers = [
                     item for item in exact_states if is_team_availability_barrier(item)
@@ -3341,6 +3407,7 @@ class TaskStore:
                     ),
                     reverse=True,
                 )
+                workflow_roles = requested_roles or tuple(self.config.roles)
                 reusable_teams = list(
                     dict.fromkeys(
                         str(item.get("team"))
@@ -3348,6 +3415,8 @@ class TaskStore:
                         if item.get("team")
                     )
                 )
+            if set(normalized_new) - set(workflow_roles):
+                raise ValueError("new_roles must be selected workflow roles")
             title_slug = slugify(text)
             target = (self.root / team / task_id / f"{title_slug}.json").resolve()
             if target.exists():
@@ -3364,6 +3433,7 @@ class TaskStore:
                 reusable_teams=reusable_teams,
                 target=target,
                 normalized_new=normalized_new,
+                workflow_roles=workflow_roles,
                 new_all=new_all,
                 normalized_report_mode=normalized_report_mode,
                 normalized_dependencies=normalized_dependencies,
@@ -4131,6 +4201,7 @@ class TaskStore:
                     reusable_teams=[],
                     target=repair_path,
                     normalized_new=(),
+                    workflow_roles=tuple(self.config.roles),
                     new_all=False,
                     normalized_report_mode="file",
                     normalized_dependencies=(),
@@ -4839,6 +4910,11 @@ class TaskStore:
                     reusable_teams=reusable_teams,
                     target=replacement_path,
                     normalized_new=(),
+                    workflow_roles=tuple(
+                        role
+                        for role in self.config.roles
+                        if role in target_state["roles"]
+                    ),
                     new_all=False,
                     normalized_report_mode=report_mode,
                     normalized_dependencies=dependencies,

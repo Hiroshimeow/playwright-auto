@@ -209,7 +209,34 @@ def test_mutations_require_idempotency_and_reuse_identical_command(tmp_path: Pat
         status, _headers, data = request(server, "POST", "/api/tasks", body=body, headers=headers)
         assert status == 202
         assert json.loads(data) == first
-        assert db.get_command(first["command_id"])["status"] == "queued"
+        command = db.get_command(first["command_id"])
+        assert command["status"] == "queued"
+        assert "roles" not in command["payload"]
+
+        explicit_body = {**body, "task": "selected roles", "roles": ["REVIEW", "PLAN"]}
+        status, _headers, explicit_data = request(
+            server,
+            "POST",
+            "/api/tasks",
+            body=explicit_body,
+            headers={"Idempotency-Key": "selected-role-key"},
+        )
+        assert status == 202
+        explicit = json.loads(explicit_data)
+        assert db.get_command(explicit["command_id"])["payload"]["roles"] == [
+            "PLAN",
+            "REVIEW",
+        ]
+
+        for index, roles in enumerate(([], ["DEV"], ["PLAN", "UNKNOWN"], ["PLAN", "PLAN"])):
+            status, _headers, _data = request(
+                server,
+                "POST",
+                "/api/tasks",
+                body={**body, "task": f"bad roles {index}", "roles": roles},
+                headers={"Idempotency-Key": f"bad-role-key-{index}"},
+            )
+            assert status == 400
 
         status, _headers, _data = request(
             server,
@@ -226,6 +253,86 @@ def test_mutations_require_idempotency_and_reuse_identical_command(tmp_path: Pat
 
 
 
+
+
+def test_independent_create_accepts_initial_triggers_and_preserves_idempotency(
+    tmp_path: Path,
+):
+    _config, db, server, thread = start_api(tmp_path)
+    body = {
+        "name": "Initial Trigger Agent",
+        "system_prompt": "Inspect only matching work.",
+        "mode": "Independent",
+        "trigger_settings": {
+            "task_done": True,
+            "interval_minutes": 20,
+            "role_completed": ["dev"],
+            "teams": ["unused-team"],
+            "states": ["blocked"],
+        },
+    }
+    headers = {"Idempotency-Key": "initial-trigger-agent"}
+    try:
+        status, _headers, data = request(
+            server,
+            "POST",
+            "/api/independent-agents",
+            body=body,
+            headers=headers,
+        )
+        assert status == 202
+        first = json.loads(data)
+        command = db.get_command(first["command_id"])
+        assert command["payload"]["trigger_settings"] == {
+            "recovery": False,
+            "interval_minutes": 20,
+            "task_done": True,
+            "role_completed": ["DEV"],
+            "teams": ["unused-team"],
+            "states": ["BLOCKED"],
+            "check_all": False,
+        }
+
+        status, _headers, data = request(
+            server,
+            "POST",
+            "/api/independent-agents",
+            body=body,
+            headers=headers,
+        )
+        assert status == 202
+        assert json.loads(data) == first
+
+        status, _headers, data = request(
+            server,
+            "POST",
+            "/api/independent-agents",
+            body={**body, "system_prompt": "Changed prompt."},
+            headers=headers,
+        )
+        assert status == 409
+        assert json.loads(data)["error"]["code"] == "idempotency_conflict"
+
+        invalid_payloads = (
+            {**body, "trigger_settings": {"unknown": True}},
+            {**body, "trigger_settings": {"interval_minutes": 19}},
+            {**body, "trigger_settings": {"role_completed": ["UNKNOWN"]}},
+            {**body, "trigger_settings": {"states": ["BLOCKED"]}},
+            {**body, "unexpected": True},
+        )
+        for index, invalid in enumerate(invalid_payloads):
+            status, _headers, data = request(
+                server,
+                "POST",
+                "/api/independent-agents",
+                body=invalid,
+                headers={"Idempotency-Key": f"invalid-agent-{index}"},
+            )
+            assert status == 400
+            assert json.loads(data)["error"]["code"] == "invalid_request"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
 
 
 def test_report_uses_exact_hashed_private_locator(tmp_path: Path):

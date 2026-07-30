@@ -163,6 +163,30 @@ def test_projection_splits_public_and_private_data(tmp_path: Path):
     assert "secret-value" not in public
 
 
+def test_independent_projection_identifies_only_canonical_builtins(tmp_path: Path):
+    raw = raw_task(tmp_path)
+    raw["independent"] = {
+        "agent_key": "maintainers",
+        "agent_name": "Maintainers",
+        "agent_generation": 1,
+        "enabled": True,
+    }
+
+    builtin = build_task_projection(raw, tasks=[raw])
+    assert builtin.summary["agent"]["is_builtin"] is True
+    assert builtin.detail["agent"]["is_builtin"] is True
+
+    raw["independent"]["agent_key"] = "monitor"
+    raw["independent"]["agent_name"] = "Monitor"
+    assert build_task_projection(raw, tasks=[raw]).summary["agent"]["is_builtin"] is True
+
+    raw["independent"]["agent_key"] = "release-watcher"
+    raw["independent"]["agent_name"] = "Release Watcher"
+    custom = build_task_projection(raw, tasks=[raw])
+    assert custom.summary["agent"]["is_builtin"] is False
+    assert custom.detail["agent"]["is_builtin"] is False
+
+
 def test_disconnected_browser_marks_role_availability_unknown(tmp_path: Path):
     raw = raw_task(tmp_path)
 
@@ -279,8 +303,14 @@ def _action_task(
     team: str,
     status: str,
     title: str | None = None,
+    roles: tuple[str, ...] = ("DEV",),
 ) -> dict:
     task = raw_task(tmp_path)
+    template = next(iter(task["roles"].values()))
+    task["roles"] = {
+        role: {**template, "physical_role": f"{team}-{role.lower()}"}
+        for role in roles
+    }
     task.update(
         task_id=task_id,
         team=team,
@@ -303,7 +333,14 @@ def _action_task(
 
 def test_dashboard_actions_are_worker_owned_compact_and_fail_closed(tmp_path: Path):
     tasks = [
-        _action_task(tmp_path, task_id="dep-one", team="single", status="DONE", title="Single dependency"),
+        _action_task(
+            tmp_path,
+            task_id="dep-one",
+            team="single",
+            status="DONE",
+            title="Single dependency",
+            roles=("PLAN", "REVIEW"),
+        ),
         _action_task(tmp_path, task_id="dep-a", team="ambiguous", status="RUNNING"),
         _action_task(tmp_path, task_id="dep-b", team="ambiguous", status="PAUSED"),
         _action_task(tmp_path, task_id="stopped-hidden", team="stopped", status="STOPPED"),
@@ -316,6 +353,20 @@ def test_dashboard_actions_are_worker_owned_compact_and_fail_closed(tmp_path: Pa
         _action_task(tmp_path, task_id="conflict-a", team="conflict", status="BLOCKED"),
         _action_task(tmp_path, task_id="conflict-b", team="conflict", status="PAUSED"),
         _action_task(tmp_path, task_id="conflict-done", team="conflict", status="DONE"),
+        _action_task(
+            tmp_path,
+            task_id="mixed-a",
+            team="mixed",
+            status="DONE",
+            roles=("PLAN", "REVIEW"),
+        ),
+        _action_task(
+            tmp_path,
+            task_id="mixed-b",
+            team="mixed",
+            status="DONE",
+            roles=("PLAN", "DEV"),
+        ),
     ]
     actions = build_dashboard_actions(
         tasks,
@@ -359,14 +410,15 @@ def test_dashboard_actions_are_worker_owned_compact_and_fail_closed(tmp_path: Pa
     assert "stopped" not in resume
 
     assert actions["reuse_teams"] == [
-        {"team": "blocked", "status": "available"},
-        {"team": "offline", "status": "available"},
-        {"team": "online", "status": "available"},
-        {"team": "paused", "status": "available"},
-        {"team": "reuse", "status": "available"},
-        {"team": "single", "status": "available"},
-        {"team": "stopped", "status": "available"},
+        {"team": "blocked", "status": "available", "roles": ["DEV"]},
+        {"team": "offline", "status": "available", "roles": ["DEV"]},
+        {"team": "online", "status": "available", "roles": ["DEV"]},
+        {"team": "paused", "status": "available", "roles": ["DEV"]},
+        {"team": "reuse", "status": "available", "roles": ["DEV"]},
+        {"team": "single", "status": "available", "roles": ["PLAN", "REVIEW"]},
+        {"team": "stopped", "status": "available", "roles": ["DEV"]},
     ]
+    assert "mixed" not in {item["team"] for item in actions["reuse_teams"]}
     serialized = json.dumps(actions, separators=(",", ":"))
     assert str(tmp_path) not in serialized
     assert "secret=hidden" not in serialized
