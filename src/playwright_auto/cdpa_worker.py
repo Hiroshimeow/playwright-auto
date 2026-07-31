@@ -34,6 +34,7 @@ from .cdpa_independent import (
     independent_tags,
     is_independent_task,
     normalize_agent_name,
+    refresh_recovery_warmup_on_enable,
     validate_trigger_settings,
 )
 from .cdpa_projection import (
@@ -1397,7 +1398,23 @@ class CDPAWorker:
             if str(state.get("status") or "").upper() in TERMINAL:
                 raise RuntimeError("cannot enable a terminal independent task")
             self.store.assert_independent_enable_allowed(state["manifest_path"])
+            was_recovery_owner = bool(independent.get("enabled")) and bool(
+                validate_trigger_settings(
+                    independent.get("trigger_settings")
+                )["recovery"]
+            )
+            at = utc_now()
             independent["enabled"] = True
+            refresh_recovery_warmup_on_enable(
+                independent,
+                was_owner=was_recovery_owner,
+                is_owner=bool(
+                    validate_trigger_settings(
+                        independent.get("trigger_settings")
+                    )["recovery"]
+                ),
+                enabled_at=at,
+            )
             state["status"] = "RUNNING" if active else "WAITING"
             state["kanban_column"] = INDEPENDENT_COLUMN
             state["active_action"] = "resuming" if active else "waiting_trigger"
@@ -1410,7 +1427,6 @@ class CDPAWorker:
                 state["waiting_reason"] = None
                 state["waiting_code"] = None
             else:
-                at = utc_now()
                 state["waiting"] = {
                     "reason": "trigger",
                     "waiting_on": [],

@@ -30,6 +30,7 @@ from .cdpa_independent import (
     normalize_system_prompt,
     record_consumed_event,
     record_recovery_release,
+    refresh_recovery_warmup_on_enable,
     task_mode,
     validate_independent_object,
     validate_trigger_settings,
@@ -3539,6 +3540,12 @@ class TaskStore:
                         )
 
                 independent = current["independent"]
+                previous_recovery_owner = bool(independent.get("enabled")) and bool(
+                    validate_trigger_settings(
+                        independent.get("trigger_settings")
+                    )["recovery"]
+                )
+                transition_at = utc_now()
                 if external_command_id in current.get("applied_command_ids", []):
                     return current
                 if independent.get("deleted_at"):
@@ -3554,14 +3561,6 @@ class TaskStore:
                     )
                     previous_interval = previous_settings["interval_minutes"]
                     independent["trigger_settings"] = normalized_settings
-                    if (
-                        prospective_enabled
-                        and normalized_settings["recovery"]
-                        and not previous_settings["recovery"]
-                    ):
-                        independent.setdefault("watermarks", {})[
-                            "recovery_enabled_at"
-                        ] = utc_now()
                     next_interval = normalized_settings["interval_minutes"]
                     if next_interval is None:
                         independent.setdefault("watermarks", {}).pop(
@@ -3614,7 +3613,7 @@ class TaskStore:
                         )
                         current["pause_reason"] = None
                         if not active:
-                            now = utc_now()
+                            now = transition_at
                             current["waiting"] = {
                                 "reason": "trigger",
                                 "waiting_on": [],
@@ -3626,10 +3625,6 @@ class TaskStore:
                             current["waiting_code"] = "trigger"
                             independent["idle_since"] = now
                             independent["tab_keep_open_until"] = None
-                            if prospective_settings["recovery"]:
-                                independent.setdefault("watermarks", {})[
-                                    "recovery_enabled_at"
-                                ] = now
                     else:
                         current["status"] = "PAUSED"
                         current["kanban_column"] = "PAUSED"
@@ -3638,6 +3633,17 @@ class TaskStore:
                         current["waiting"] = None
                         current["waiting_reason"] = None
                         current["waiting_code"] = None
+                refresh_recovery_warmup_on_enable(
+                    independent,
+                    was_owner=previous_recovery_owner,
+                    is_owner=bool(independent.get("enabled"))
+                    and bool(
+                        validate_trigger_settings(
+                            independent.get("trigger_settings")
+                        )["recovery"]
+                    ),
+                    enabled_at=transition_at,
+                )
                 self._record_external_command(current, external_command_id)
                 saved = self._save_unlocked(target, current)
             catalog["entries"][self._catalog_key(target)] = self._catalog_entry(saved)

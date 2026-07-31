@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from playwright_auto.cdpa_config import load_cdpa_config
-from playwright_auto.cdpa_independent import canonical_independent_events, claim_oldest_event
+from playwright_auto.cdpa_independent import (
+    RECOVERY_WARMUP_SECONDS,
+    canonical_independent_events,
+    claim_oldest_event,
+)
 from playwright_auto.cdpa_store import TaskStore
 from playwright_auto.cdpa_worker import CDPAWorker, _active_hop
 
@@ -224,3 +228,157 @@ def test_worker_activates_oldest_independent_event_and_persists_claim(tmp_path: 
     assert persisted["independent"]["active_event"]["target_task_id"] == "older"
     assert persisted["hops"][0]["state"] == "pre_send"
     assert persisted["task_id"] in changed
+
+
+
+def _blocked_target(store: TaskStore, task_id: str, *, blocked_at: datetime) -> dict:
+    state = store.create_task(
+        f"Blocked {task_id}",
+        requested_team=task_id,
+        task_id=task_id,
+    )
+    state = store.update(
+        state["manifest_path"],
+        lambda current: {
+            **current,
+            "status": "BLOCKED",
+            "kanban_column": "BLOCKED",
+            "block_code": "role_offline",
+            "block_reason": "DEV tab is offline",
+            "updated_at": blocked_at.isoformat(),
+        },
+    )
+    return store.update(
+        state["manifest_path"],
+        lambda current: {**current, "blocked_at": blocked_at.isoformat()},
+    )
+
+
+def test_idle_recovery_pause_resume_restarts_warmup(tmp_path: Path, monkeypatch):
+    enabled_at = datetime(2026, 7, 31, 8, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        "playwright_auto.cdpa_worker.utc_now", lambda: enabled_at.isoformat()
+    )
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    target = _blocked_target(
+        store,
+        "resume-warmup-target",
+        blocked_at=enabled_at - timedelta(minutes=10),
+    )
+    state = store.create_independent_agent(
+        "Resume warmup",
+        system_prompt="Recover.",
+        task_id="agent-resume-warmup-g1",
+        trigger_settings={"recovery": True},
+    )
+    state = store.update(
+        state["manifest_path"],
+        lambda current: {
+            **current,
+            "independent": {
+                **current["independent"],
+                "watermarks": {
+                    **current["independent"]["watermarks"],
+                    "recovery_enabled_at": "2026-07-31T07:00:00+00:00",
+                },
+            },
+        },
+    )
+    state = store.update_independent_agent(state["manifest_path"], enabled=False)
+    worker = CDPAWorker(config, store=store)
+    state = store.request_control(state["manifest_path"], "resume", role="AGENT")
+
+    assert asyncio.run(worker._apply_control(state, FakeActions())) is True
+    assert state["independent"]["watermarks"]["recovery_enabled_at"] == enabled_at.isoformat()
+    assert canonical_independent_events(
+        state,
+        [state, target],
+        now=enabled_at + timedelta(seconds=RECOVERY_WARMUP_SECONDS - 1),
+    ) == []
+    assert canonical_independent_events(
+        state,
+        [state, target],
+        now=enabled_at + timedelta(seconds=RECOVERY_WARMUP_SECONDS),
+    )
+
+
+def test_active_recovery_resume_preserves_job_and_gates_next_target(
+    tmp_path: Path, monkeypatch
+):
+    enabled_at = datetime(2026, 7, 31, 8, 15, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        "playwright_auto.cdpa_worker.utc_now", lambda: enabled_at.isoformat()
+    )
+    monkeypatch.setattr(
+        "playwright_auto.cdpa_store.utc_now", lambda: enabled_at.isoformat()
+    )
+    _config, store, _blocked, state, worker = setup_agent(tmp_path)
+    event_key = state["independent"]["active_event"]["event_key"]
+    state = store.request_control(state["manifest_path"], "pause", role="AGENT")
+    assert asyncio.run(worker._apply_control(state, FakeActions())) is True
+    state = store.save(state["manifest_path"], state)
+    state = store.request_control(state["manifest_path"], "resume", role="AGENT")
+
+    assert asyncio.run(worker._apply_control(state, FakeActions())) is True
+    assert state["independent"]["active_event"]["event_key"] == event_key
+    assert state["independent"]["watermarks"]["recovery_enabled_at"] == enabled_at.isoformat()
+    state = store.save(state["manifest_path"], state)
+    released = store.reset_independent_task(
+        state["manifest_path"], reason="Release current recovery job"
+    )
+    next_target = _blocked_target(
+        store,
+        "next-recovery-target",
+        blocked_at=enabled_at - timedelta(minutes=10),
+    )
+
+    assert canonical_independent_events(
+        released,
+        [released, next_target],
+        now=enabled_at + timedelta(seconds=RECOVERY_WARMUP_SECONDS - 1),
+    ) == []
+    assert canonical_independent_events(
+        released,
+        [released, next_target],
+        now=enabled_at + timedelta(seconds=RECOVERY_WARMUP_SECONDS),
+    )
+
+
+def test_redundant_recovery_resume_keeps_existing_warmup_boundary(
+    tmp_path: Path, monkeypatch
+):
+    resume_at = datetime(2026, 7, 31, 8, 30, tzinfo=timezone.utc)
+    existing_enabled_at = "2026-07-31T08:29:45+00:00"
+    monkeypatch.setattr(
+        "playwright_auto.cdpa_worker.utc_now", lambda: resume_at.isoformat()
+    )
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_independent_agent(
+        "Redundant resume",
+        system_prompt="Recover.",
+        task_id="agent-redundant-resume-g1",
+        trigger_settings={"recovery": True},
+    )
+    state = store.update(
+        state["manifest_path"],
+        lambda current: {
+            **current,
+            "independent": {
+                **current["independent"],
+                "watermarks": {
+                    **current["independent"]["watermarks"],
+                    "recovery_enabled_at": existing_enabled_at,
+                },
+            },
+        },
+    )
+    worker = CDPAWorker(config, store=store)
+    state = store.request_control(state["manifest_path"], "resume", role="AGENT")
+
+    assert asyncio.run(worker._apply_control(state, FakeActions())) is True
+    assert (
+        state["independent"]["watermarks"]["recovery_enabled_at"]
+        == existing_enabled_at
+    )

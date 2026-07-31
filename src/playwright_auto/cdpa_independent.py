@@ -235,6 +235,20 @@ def independent_tags(settings: Mapping[str, Any] | None) -> list[str]:
     return ["Recovery"] if validate_trigger_settings(settings)["recovery"] else []
 
 
+def refresh_recovery_warmup_on_enable(
+    independent: dict[str, Any],
+    *,
+    was_owner: bool,
+    is_owner: bool,
+    enabled_at: str,
+) -> bool:
+    """Restart warm-up only when Recovery ownership becomes enabled."""
+    if was_owner or not is_owner:
+        return False
+    independent.setdefault("watermarks", {})["recovery_enabled_at"] = enabled_at
+    return True
+
+
 def trigger_learning_path(repository: str | Path, trigger_type: str) -> Path:
     normalized = str(trigger_type or "").strip().lower()
     filename = _TRIGGER_LEARNING_FILES.get(normalized)
