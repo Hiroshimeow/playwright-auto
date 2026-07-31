@@ -9,9 +9,9 @@ import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./
 import {renderHistory} from "./views/history.js";
 import {renderRuntime} from "./views/runtime.js?v=20260728-system-status-1";
 import {
-  applyReuseRoleSelection, renderCreateActions, renderResume, selectedDependencyIds,
-  selectedResumeTeams, updateResumeButton,
-} from "./views/dashboard_actions.js?v=20260730-workflow-roles-1";
+  applyReuseRoleSelection, renderCreateActions, renderResume, renderWorkflowAgentOptions,
+  selectedDependencyIds, selectedResumeTeams, updateResumeButton,
+} from "./views/dashboard_actions.js?v=20260731-add-agents-1";
 
 const roots = {
   board: document.querySelector("#board"),
@@ -29,13 +29,23 @@ const roots = {
   dependencyOptions: document.querySelector("#dependency-options"),
   reuseTeam: document.querySelector('#create-form select[name="reuse_team"]'),
   requestedTeam: document.querySelector('#create-form input[name="requested_team"]'),
-  roleInputs: [...document.querySelectorAll('#create-form input[name="roles"]')],
-  agentDialog: document.querySelector("#agent-dialog"),
+  workflowAgentOptions: document.querySelector("#workflow-agent-options"),
+  createSummary: document.querySelector("#create-selection-summary"),
+  createValidation: document.querySelector("#create-validation"),
+  roleInputs: [],
+  agentPanel: document.querySelector("#agents-panel"),
+  agentOpener: document.querySelector("[data-open-agent]"),
+  workflowTaskTeamOptions: document.querySelector("#workflow-task-team-options"),
+  agentSelect: document.querySelector('#agents-panel select[name="agent_select"]'),
   agentForm: document.querySelector("#agent-form"),
+  independentSettings: document.querySelector("#independent-settings"),
+  deleteAgent: document.querySelector("[data-delete-agent]"),
   agentCommandDialog: document.querySelector("#agent-command-dialog"),
   agentCommandForm: document.querySelector("#agent-command-form"),
   agentSettingsDialog: document.querySelector("#agent-settings-dialog"),
   agentSettingsForm: document.querySelector("#agent-settings-form"),
+  agentSettingsCaption: document.querySelector("#agent-settings-caption"),
+  agentSettingsTriggerHelp: document.querySelector("#independent-settings-trigger-help"),
   toast: document.querySelector("#toast"),
 };
 const client = new APIClient(state.etags, state.inflight);
@@ -60,91 +70,294 @@ function toast(message) {
   toast.timer = setTimeout(() => { roots.toast.hidden = true; }, 3500);
 }
 
-function commaValues(value) {
-  return String(value || "").split(",").map(item => item.trim()).filter(Boolean);
-}
-
-function independentTriggerSettings(values) {
-  const intervalRaw = String(values.get("interval_minutes") || "").trim();
-  return {
-    recovery: values.has("recovery"),
-    interval_minutes: intervalRaw ? Number(intervalRaw) : null,
-    task_done: values.has("task_done"),
-    role_completed: commaValues(values.get("role_completed")).map(value => value.toUpperCase()),
-    teams: commaValues(values.get("teams")),
-    states: commaValues(values.get("states")).map(value => value.toUpperCase()),
-    check_all: values.has("check_all"),
-  };
-}
-
 function selectedWorkflowRoles() {
   return roots.roleInputs.filter(input => input.checked).map(input => input.value);
 }
 
-function renderAgentHistory(root, detail) {
-  const fragment = document.createDocumentFragment();
-  const historyItems = detail?.independent_history || [];
-  if (!historyItems.length) {
-    const empty = document.createElement("p");
-    empty.className = "muted";
-    empty.textContent = "No lifecycle records for this agent.";
-    fragment.append(empty);
+function basicTriggerSettings(values) {
+  const settings = {
+    recovery: false,
+    interval_minutes: null,
+    task_done: false,
+    role_completed: [],
+    teams: [],
+    states: [],
+    check_all: false,
+  };
+  const type = String(values.get("trigger_type") || "manual");
+  const team = String(values.get("trigger_team") || "").trim();
+  if (type === "interval") {
+    const minutes = Number(values.get("interval_minutes"));
+    settings.interval_minutes = Number.isFinite(minutes) ? minutes : null;
+  } else if (type === "task_done") {
+    settings.task_done = true;
+    if (team) settings.teams = [team];
+  } else if (type === "role_completed") {
+    const role = String(values.get("trigger_role") || "").trim().toUpperCase();
+    if (team) settings.teams = [team];
+    if (role) settings.role_completed = [role];
+  } else if (type === "task_state") {
+    const taskState = String(values.get("trigger_state") || "").trim().toUpperCase();
+    if (team) settings.teams = [team];
+    if (taskState) settings.states = [taskState];
+  } else if (type === "check_all") {
+    settings.check_all = true;
+    const minutes = Number(values.get("interval_minutes"));
+    settings.interval_minutes = Number.isFinite(minutes) ? minutes : null;
   }
-  for (const item of historyItems) {
-    const article = document.createElement("article");
-    article.className = "history-card";
-    const title = document.createElement("strong");
-    title.textContent = `Generation ${item.generation} · ${item.status}`;
-    const meta = document.createElement("p");
-    meta.className = "muted";
-    meta.textContent = `${item.task_id} · ${item.completed_at || item.updated_at || item.created_at || "—"}`;
-    article.append(title, meta);
-    const outcome = item.last_outcome;
-    if (outcome?.summary || outcome?.outcome) {
-      const summary = document.createElement("p");
-      summary.textContent = [outcome.outcome, outcome.summary].filter(Boolean).join(" · ");
-      article.append(summary);
-    }
-    fragment.append(article);
-  }
-  root.replaceChildren(fragment);
-  root.dataset.secondaryView = "agent-history";
+  else if (type === "recovery") settings.recovery = true;
+  return settings;
 }
 
-function renderAgentReports(root, detail) {
-  const fragment = document.createDocumentFragment();
-  const reports = [...(detail?.reports || []), ...(detail?.maintenance_reports || [])];
-  if (!reports.length) {
-    const empty = document.createElement("p");
-    empty.className = "muted";
-    empty.textContent = "No reports for this agent.";
-    fragment.append(empty);
+function normalizedTriggerSettings(settings = {}) {
+  return {
+    recovery: Boolean(settings.recovery),
+    interval_minutes: settings.interval_minutes == null ? null : Number(settings.interval_minutes),
+    task_done: Boolean(settings.task_done),
+    role_completed: [...(settings.role_completed || [])],
+    teams: [...(settings.teams || [])],
+    states: [...(settings.states || [])],
+    check_all: Boolean(settings.check_all),
+  };
+}
+
+function rememberTriggerSettings(form, settings = {}) {
+  const normalized = normalizedTriggerSettings(settings);
+  form.dataset.originalTriggerSettings = JSON.stringify(normalized);
+  form.dataset.originalTriggerType = triggerTypeFromSettings(normalized);
+}
+
+function configuredTriggerSettings(form, values) {
+  const selectedType = String(values.get("trigger_type") || "manual");
+  const basic = basicTriggerSettings(values);
+  if (form.dataset.originalTriggerType !== selectedType) return basic;
+  let original;
+  try {
+    original = JSON.parse(form.dataset.originalTriggerSettings || "{}");
+  } catch {
+    return basic;
   }
-  for (const report of reports) {
-    const article = document.createElement("article");
-    article.className = "history-card";
-    const title = document.createElement("strong");
-    title.textContent = report.summary || report.outcome || report.role || "Report";
-    article.append(title);
-    if (report.url) {
-      const link = document.createElement("a");
-      link.href = report.url;
-      link.target = "_blank";
-      link.rel = "noopener";
-      link.textContent = report.url;
-      article.append(link);
+  const merged = normalizedTriggerSettings(original);
+  if (selectedType === "manual") return basic;
+  if (selectedType === "interval") merged.interval_minutes = basic.interval_minutes;
+  else if (selectedType === "task_done") {
+    merged.task_done = true;
+    merged.teams = basic.teams;
+  } else if (selectedType === "role_completed") {
+    merged.role_completed = basic.role_completed;
+    merged.teams = basic.teams;
+  } else if (selectedType === "task_state") {
+    merged.states = basic.states;
+    merged.teams = basic.teams;
+  } else if (selectedType === "check_all") {
+    merged.check_all = true;
+    merged.interval_minutes = basic.interval_minutes;
+  }
+  else if (selectedType === "recovery") merged.recovery = true;
+  return merged;
+}
+
+function triggerTypeFromSettings(settings = {}) {
+  if (settings.recovery) return "recovery";
+  if (settings.check_all) return "check_all";
+  if (settings.interval_minutes != null) return "interval";
+  if (settings.task_done) return "task_done";
+  if ((settings.role_completed || []).length) return "role_completed";
+  if ((settings.states || []).length) return "task_state";
+  return "manual";
+}
+
+const triggerFieldsByType = {
+  interval: ["interval"],
+  task_done: ["task_team"],
+  role_completed: ["role_team", "role"],
+  task_state: ["state_team", "state"],
+  check_all: ["interval"],
+};
+
+const triggerHelpByType = {
+  manual: "Runs only when started manually.",
+  interval: "Runs on the saved interval.",
+  task_done: "Runs when a workflow task reaches DONE.",
+  role_completed: "Runs when the selected workflow agent completes for the selected team.",
+  task_state: "Runs when the exact team enters the selected state.",
+  check_all: "Runs on the interval and reviews all active workflow tasks.",
+  recovery: "Claims exclusive recovery events.",
+};
+
+function updateTriggerFields(container, type) {
+  const visible = new Set(triggerFieldsByType[type] || []);
+  for (const label of container.querySelectorAll("[data-trigger-field]")) {
+    const tokens = label.dataset.triggerField.split(/\s+/).filter(Boolean);
+    const shown = tokens.some(token => visible.has(token));
+    label.hidden = !shown;
+    for (const control of label.querySelectorAll("input, select, textarea")) {
+      control.disabled = !shown;
     }
-    const loaded = report.url ? agentReportBodies.get(report.url) : null;
-    const body = document.createElement("pre");
-    if (loaded?.status === "ready") body.textContent = loaded.body;
-    else if (loaded?.status === "error") body.textContent = `Report load failed: ${loaded.error}`;
-    else if (report.content || report.message) body.textContent = report.content || report.message;
-    else body.textContent = "Loading report body…";
-    article.append(body);
-    fragment.append(article);
   }
-  root.replaceChildren(fragment);
-  root.dataset.secondaryView = "reports";
+}
+
+function updateBasicTriggerFields() {
+  const form = roots.agentForm;
+  const independent = form.elements.independent.checked;
+  roots.independentSettings.hidden = !independent;
+  const type = String(form.elements.trigger_type.value || "manual");
+  updateTriggerFields(roots.independentSettings, type);
+}
+
+function updateAgentSettingsTriggerFields() {
+  const type = String(roots.agentSettingsForm.elements.trigger_type.value || "manual");
+  updateTriggerFields(roots.agentSettingsForm, type);
+  roots.agentSettingsTriggerHelp.textContent = triggerHelpByType[type] || triggerHelpByType.manual;
+}
+
+function showCreateValidation(message = "") {
+  roots.createValidation.textContent = message;
+  roots.createValidation.hidden = !message;
+}
+
+function updateCreateSummary() {
+  const roles = selectedWorkflowRoles();
+  const dependencies = selectedDependencyIds(roots.dependencyOptions);
+  const reuse = roots.reuseTeam.value.trim();
+  const requested = roots.requestedTeam.value.trim();
+  const team = reuse ? `Reuse ${reuse}` : requested ? `New ${requested}` : "Automatic team";
+  const roleCopy = roles.length ? roles.join(" · ") : "No workflow agents";
+  const dependencyCopy = dependencies.length ? `${dependencies.length} dependencies` : "No dependencies";
+  roots.createSummary.textContent = `${team} · ${roleCopy} · ${dependencyCopy}`;
+}
+
+function renderTriggerChoices(current) {
+  const activeWorkflowTasks = [...current.board.values()]
+    .filter(task => task.task_mode !== "independent" && ["WAITING", "RUNNING"].includes(task.status))
+    .sort((a, b) => String(a.team).localeCompare(String(b.team)));
+  const taskSignature = JSON.stringify(activeWorkflowTasks.map(task => [
+    task.team, task.task_id, task.status, task.task_title,
+  ]));
+  if (roots.workflowTaskTeamOptions.dataset.signature !== taskSignature) {
+    const seen = new Set();
+    const options = [];
+    for (const task of activeWorkflowTasks) {
+      const value = task.team || task.task_id;
+      if (!value || seen.has(value)) continue;
+      seen.add(value);
+      const option = document.createElement("option");
+      option.value = value;
+      option.label = `${task.status} · ${task.task_id} · ${task.task_title || task.team || task.task_id}`;
+      options.push(option);
+    }
+    roots.workflowTaskTeamOptions.replaceChildren(...options);
+    roots.workflowTaskTeamOptions.dataset.signature = taskSignature;
+  }
+
+  const workflowAgents = (current.agents?.workflow || []).filter(agent => !agent.deleted_at);
+  const agentSignature = JSON.stringify(workflowAgents.map(agent => [agent.route_key, agent.display_name]));
+  for (const select of document.querySelectorAll("[data-workflow-agent-select]")) {
+    if (select.dataset.signature === agentSignature) continue;
+    const selected = select.value;
+    const options = workflowAgents.map(agent => new Option(agent.display_name || agent.route_key, agent.route_key));
+    select.replaceChildren(...options);
+    select.dataset.signature = agentSignature;
+    if ([...select.options].some(option => option.value === selected)) select.value = selected;
+  }
+}
+
+function setAgentPanelOpen(open, {restoreFocus = false} = {}) {
+  roots.agentPanel.hidden = !open;
+  roots.agentOpener.setAttribute("aria-expanded", String(open));
+  if (open) fetchAgents();
+  else if (restoreFocus) roots.agentOpener.focus();
+}
+
+function resetAgentEditor() {
+  const form = roots.agentForm;
+  form.reset();
+  form.elements.agent_kind.value = "new";
+  form.elements.agent_id.value = "";
+  form.elements.is_system.value = "false";
+  form.elements.independent.disabled = false;
+  form.elements.independent.checked = false;
+  form.elements.trigger_type.value = "manual";
+  form.elements.max_cycles.value = "0";
+  rememberTriggerSettings(form, {});
+  roots.deleteAgent.hidden = true;
+  document.querySelector("#agent-editor-help").textContent =
+    "New agents are Custom Workflow Agents unless Independent agent is enabled.";
+  updateBasicTriggerFields();
+}
+
+function selectAgentRecord(value) {
+  const [kind, id] = String(value || "").split(":", 2);
+  if (kind === "workflow") {
+    const agent = (state.agents.workflow || []).find(item => item.route_key === id);
+    return agent ? {kind, id, agent} : null;
+  }
+  if (kind === "independent") {
+    const agent = (state.agents.independent || []).find(item => item.task_id === id);
+    return agent ? {kind, id, agent} : null;
+  }
+  return null;
+}
+
+function loadAgentEditor(value) {
+  const selected = selectAgentRecord(value);
+  if (!selected) { resetAgentEditor(); return; }
+  const {kind, id, agent} = selected;
+  const form = roots.agentForm;
+  form.elements.agent_kind.value = kind;
+  form.elements.agent_id.value = id;
+  form.elements.name.value = kind === "workflow" ? agent.display_name : agent.name;
+  form.elements.system_prompt.value = agent.system_prompt || "";
+  form.elements.is_system.value = String(Boolean(agent.is_system || agent.is_builtin));
+  form.elements.independent.checked = kind === "independent";
+  form.elements.independent.disabled = true;
+  roots.deleteAgent.hidden = Boolean(agent.is_system || agent.is_builtin);
+  if (kind === "independent") {
+    const settings = agent.trigger_settings || {};
+    rememberTriggerSettings(form, settings);
+    form.elements.trigger_type.value = triggerTypeFromSettings(settings);
+    form.elements.max_cycles.value = Number.isFinite(Number(agent.max_cycles)) ? String(Number(agent.max_cycles)) : "0";
+    form.elements.interval_minutes.value = settings.interval_minutes || "";
+    form.elements.trigger_team.value = (settings.teams || [])[0] || "";
+    form.elements.trigger_role.value = (settings.role_completed || [])[0] || "";
+    form.elements.trigger_state.value = (settings.states || [])[0] || "";
+  } else {
+    form.elements.trigger_type.value = "manual";
+    form.elements.max_cycles.value = "0";
+    rememberTriggerSettings(form, {});
+  }
+  document.querySelector("#agent-editor-help").textContent = agent.is_system
+    ? "System route identity is immutable. Changes apply only to future task snapshots."
+    : kind === "workflow"
+      ? "Workflow identity is immutable. Delete is blocked while a nonterminal task depends on it."
+      : "Independent identity is immutable. This editor uses the existing independent runtime.";
+  updateBasicTriggerFields();
+}
+
+function renderAgents(current) {
+  renderWorkflowAgentOptions(roots.workflowAgentOptions, current.agents?.workflow || []);
+  roots.roleInputs = [...roots.workflowAgentOptions.querySelectorAll('input[name="roles"]')];
+  const selected = roots.agentSelect.value;
+  const signature = JSON.stringify([
+    current.agents?.workflow || [], current.agents?.independent || [],
+  ]);
+  if (roots.agentSelect.dataset.signature === signature) return;
+  const placeholder = new Option("Select an agent", "");
+  const workflowGroup = document.createElement("optgroup");
+  workflowGroup.label = "Workflow agents";
+  for (const agent of current.agents?.workflow || []) {
+    workflowGroup.append(new Option(agent.display_name, `workflow:${agent.route_key}`));
+  }
+  const independentGroup = document.createElement("optgroup");
+  independentGroup.label = "Independent agents";
+  for (const agent of current.agents?.independent || []) {
+    independentGroup.append(new Option(agent.name, `independent:${agent.task_id}`));
+  }
+  roots.agentSelect.replaceChildren(placeholder, workflowGroup, independentGroup);
+  roots.agentSelect.dataset.signature = signature;
+  roots.agentSelect.value = [...roots.agentSelect.options].some(option => option.value === selected)
+    ? selected : "";
+  if (selected && !roots.agentSelect.value) resetAgentEditor();
 }
 
 async function loadAgentReports(detail) {
@@ -159,8 +372,8 @@ async function loadAgentReports(detail) {
     } catch (error) {
       agentReportBodies.set(report.url, {status: "error", error: error.message});
     }
-    if (state.drawer === "reports" && state.selectedDetail?.task_id === detail?.task_id) {
-      renderAgentReports(roots.secondaryContent, state.selectedDetail);
+    if (state.selectedDetail?.task_id === detail?.task_id) {
+      commit(current => { current.agentReportsRevision += 1; });
     }
   }));
 }
@@ -179,16 +392,20 @@ function openAgentSettings(detail) {
   if (!detail || detail.task_mode !== "independent") return;
   const form = roots.agentSettingsForm;
   const settings = detail.agent?.trigger_settings || {};
+  const name = detail.agent?.name || detail.team || detail.task_id;
   form.elements.task_id.value = detail.task_id;
+  form.elements.display_name.value = detail.agent?.name || "";
   form.elements.enabled.checked = detail.agent?.enabled !== false;
   form.elements.system_prompt.value = detail.agent?.system_prompt || "";
-  form.elements.recovery.checked = Boolean(settings.recovery);
-  form.elements.task_done.checked = Boolean(settings.task_done);
-  form.elements.check_all.checked = Boolean(settings.check_all);
+  form.elements.max_cycles.value = Number.isFinite(Number(detail.agent?.max_cycles)) ? String(Number(detail.agent.max_cycles)) : "0";
+  form.elements.trigger_type.value = triggerTypeFromSettings(settings);
   form.elements.interval_minutes.value = settings.interval_minutes || "";
-  form.elements.teams.value = (settings.teams || []).join(", ");
-  form.elements.states.value = (settings.states || []).join(", ");
-  form.elements.role_completed.value = (settings.role_completed || []).join(", ");
+  form.elements.trigger_team.value = (settings.teams || [])[0] || "";
+  form.elements.trigger_role.value = (settings.role_completed || [])[0] || "";
+  form.elements.trigger_state.value = (settings.states || [])[0] || "RUNNING";
+  rememberTriggerSettings(form, settings);
+  roots.agentSettingsCaption.textContent = name;
+  updateAgentSettingsTriggerFields();
   roots.agentSettingsDialog.showModal();
 }
 
@@ -278,7 +495,8 @@ function renderCommands(current) {
     const action = button.dataset.control || `independent_${button.dataset.independentAction}`;
     const key = commandKey(action, button.dataset.taskId);
     const pending = current.pendingCommands.get(key);
-    button.disabled = Boolean(pending && activeStatuses.has(pending.status));
+    button.disabled = button.dataset.renderDisabled === "true"
+      || Boolean(pending && activeStatuses.has(pending.status));
   }
   const reload = document.querySelector('[data-action="reload_catalog"]');
   const pendingReload = current.pendingCommands.get(commandKey("reload_catalog"));
@@ -295,15 +513,21 @@ function render(current) {
     current.selectedTaskId,
     current.selectedDetailStatus,
     current.selectedDetailError,
+    current.selectedIndependentTabByTask.get(current.selectedTaskId) || "overview",
+    agentReportBodies,
+    current.agentReportsRevision,
   );
   renderCommands(current);
   renderRuntime(roots.services, current);
+  renderAgents(current);
+  renderTriggerChoices(current);
   renderCreateActions(
     roots.dependencyOptions,
     roots.reuseTeam,
     current,
     roots.roleInputs,
   );
+  updateCreateSummary();
 
   const catalog = current.catalog;
   const catalogText = catalog?.complete
@@ -319,16 +543,10 @@ function render(current) {
   if (historyButton && historyButton.textContent !== historyLabel) historyButton.textContent = historyLabel;
 
   if (current.drawer) {
-    const title = current.drawer === "resume"
-      ? "Resume teams"
-      : current.drawer === "reports"
-        ? "Reports"
-        : current.drawer === "agent-history" ? "Agent history" : "History";
+    const title = current.drawer === "resume" ? "Resume teams" : "History";
     if (roots.secondaryTitle.textContent !== title) roots.secondaryTitle.textContent = title;
     if (current.drawer === "history") renderHistory(roots.secondaryContent, current);
-    if (current.drawer === "agent-history") renderAgentHistory(roots.secondaryContent, current.selectedDetail);
     if (current.drawer === "resume") renderResume(roots.secondaryContent, current);
-    if (current.drawer === "reports") renderAgentReports(roots.secondaryContent, current.selectedDetail);
     if (!roots.secondaryDialog.open) roots.secondaryDialog.showModal();
   } else if (roots.secondaryDialog.open) {
     roots.secondaryDialog.close();
@@ -511,6 +729,24 @@ export async function loadDashboardActions() {
   }
 }
 
+export async function fetchAgents() {
+  if (state.agentsStatus === "idle") {
+    commit(current => { current.agentsStatus = "loading"; current.agentsError = null; });
+  }
+  try {
+    const response = await client.request("agents", "/api/agents");
+    commit(current => {
+      if (!response.notModified) current.agents = response.data;
+      current.agentsStatus = "ready";
+      current.agentsError = null;
+    });
+    return response.notModified ? state.agents : response.data;
+  } catch (error) {
+    commit(current => { current.agentsStatus = "error"; current.agentsError = error.message; });
+    return null;
+  }
+}
+
 async function loadRuntime() {
   try {
     const response = await client.request("state", "/api/state");
@@ -566,6 +802,11 @@ async function pollCommands() {
         if (["create_task", "resume_team"].includes(command.kind)) {
           await loadDashboardActions();
         }
+        if ([
+          "create_workflow_agent", "update_workflow_agent", "delete_workflow_agent",
+          "create_independent_agent", "update_independent_agent", "delete_independent_agent",
+          "independent_settings",
+        ].includes(command.kind)) await fetchAgents();
         if (response.data.status === "applied" && state.selectedTaskId === command.taskId) {
           await loadTaskDetail(command.taskId, {force: true});
         }
@@ -607,7 +848,7 @@ async function queueCommand({kind, taskId = "runtime", endpoint, body, label}) {
 }
 
 async function refresh() {
-  await Promise.all([loadBoard(), loadRuntime(), pollCommands()]);
+  await Promise.all([loadBoard(), loadRuntime(), fetchAgents(), pollCommands()]);
 }
 
 function overlayName() {
@@ -655,6 +896,8 @@ function closeChangeGoal() {
 function openCreate() {
   if (!state.modalOpen) pushOverlay("modal");
   commit(current => { current.modalOpen = true; });
+  showCreateValidation();
+  updateCreateSummary();
   loadDashboardActions();
 }
 
@@ -732,27 +975,33 @@ roots.detail.addEventListener("click", event => {
     openChangeGoal(state.selectedDetail);
     return;
   }
+  const independentTab = event.target.closest("[data-independent-tab]");
+  if (independentTab) {
+    const taskId = independentTab.dataset.taskId;
+    const tab = independentTab.dataset.independentTab;
+    commit(current => { current.selectedIndependentTabByTask.set(taskId, tab); });
+    if (tab === "reports") loadAgentReports(state.selectedDetail);
+    return;
+  }
   const independent = event.target.closest("[data-independent-action]");
   if (independent) {
     const action = independent.dataset.independentAction;
     const taskId = independent.dataset.taskId;
-    if (action === "run") {
-      queueCommand({
-        kind: "independent_run",
-        taskId,
-        endpoint: `/api/independent-agents/${encodeURIComponent(taskId)}/run`,
-        body: {trigger_type: "manual"},
-        label: `Run once · ${state.selectedDetail?.agent?.name || taskId}`,
-      });
-    } else if (action === "command") {
+    if (action === "run-task") {
       openAgentCommand(state.selectedDetail);
     } else if (action === "settings") {
       openAgentSettings(state.selectedDetail);
-    } else if (action === "history") {
-      openDrawer("agent-history");
-    } else if (action === "reports") {
-      openDrawer("reports");
-      loadAgentReports(state.selectedDetail);
+    } else if (action === "delete") {
+      const name = state.selectedDetail?.agent?.name || taskId;
+      if (window.confirm(`Delete ${name}? Existing task history will be retained.`)) {
+        queueCommand({
+          kind: "delete_independent_agent",
+          taskId,
+          endpoint: `/api/independent-agents/${encodeURIComponent(taskId)}/delete`,
+          body: {},
+          label: `Delete agent · ${name}`,
+        });
+      }
     }
     return;
   }
@@ -765,6 +1014,7 @@ roots.detail.addEventListener("click", event => {
   if (control) {
     const taskId = control.dataset.taskId;
     const detail = state.selectedDetail;
+    const isReset = control.dataset.control === "reset";
     queueCommand({
       kind: control.dataset.control,
       taskId,
@@ -773,7 +1023,7 @@ roots.detail.addEventListener("click", event => {
         action: control.dataset.control,
         role: selectedRole(state),
         expected_task_version: Number(control.dataset.version),
-        confirmed: ["stop", "clear_team"].includes(control.dataset.control),
+        confirmed: !isReset && ["stop", "clear_team"].includes(control.dataset.control),
       },
       label: `${control.textContent} · ${detail?.team || taskId}`,
     });
@@ -818,8 +1068,22 @@ roots.secondaryDialog.addEventListener("close", () => {
 document.addEventListener("click", event => {
   if (event.target.closest("[data-open-create]")) openCreate();
   if (event.target.closest("[data-close-create]")) closeCreate();
-  if (event.target.closest("[data-open-agent]")) roots.agentDialog.showModal();
-  if (event.target.closest("[data-close-agent]")) roots.agentDialog.close();
+  if (event.target.closest("[data-open-agent]")) {
+    setAgentPanelOpen(roots.agentPanel.hidden, {restoreFocus: !roots.agentPanel.hidden});
+    return;
+  }
+  if (event.target.closest("[data-close-agent]")) {
+    setAgentPanelOpen(false, {restoreFocus: true});
+    return;
+  }
+  if (!roots.agentPanel.hidden && !roots.agentPanel.contains(event.target)) {
+    setAgentPanelOpen(false);
+  }
+  if (event.target.closest("[data-new-agent]")) {
+    roots.agentSelect.value = "";
+    resetAgentEditor();
+    roots.agentForm.elements.name.focus();
+  }
   if (event.target.closest("[data-close-agent-command]")) roots.agentCommandDialog.close();
   if (event.target.closest("[data-close-agent-settings]")) roots.agentSettingsDialog.close();
   const view = event.target.closest("[data-view]")?.dataset.view;
@@ -833,6 +1097,10 @@ document.addEventListener("click", event => {
 });
 
 document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && !roots.agentPanel.hidden) {
+    setAgentPanelOpen(false, {restoreFocus: true});
+    return;
+  }
   if (event.key === "Escape" && state.modalOpen) closeCreate();
 });
 
@@ -849,6 +1117,8 @@ roots.reuseTeam.addEventListener("change", () => {
   if (reuse) roots.requestedTeam.value = "";
   roots.requestedTeam.disabled = reuse;
   applyReuseRoleSelection(roots.roleInputs, selectedItem, {reset: !selectedItem});
+  showCreateValidation();
+  updateCreateSummary();
 });
 roots.requestedTeam.addEventListener("input", () => {
   if (roots.requestedTeam.value.trim() && roots.reuseTeam.value) {
@@ -856,13 +1126,23 @@ roots.requestedTeam.addEventListener("input", () => {
     applyReuseRoleSelection(roots.roleInputs, null, {reset: true});
   }
   roots.requestedTeam.disabled = false;
+  showCreateValidation();
+  updateCreateSummary();
 });
 
 roots.form.addEventListener("submit", event => {
   event.preventDefault();
+  showCreateValidation();
+  if (!roots.form.reportValidity()) {
+    showCreateValidation("Complete the required task details before queueing.");
+    return;
+  }
   const values = new FormData(roots.form);
   const task = String(values.get("task") || "").trim();
-  if (!task) return;
+  if (!task) {
+    showCreateValidation("Task details are required.");
+    return;
+  }
   const manualDependencies = String(values.get("depends_on_task_ids") || "")
     .split(",").map(value => value.trim()).filter(Boolean);
   const dependencies = [...new Set([
@@ -889,29 +1169,91 @@ roots.form.addEventListener("submit", event => {
   roots.form.reset();
   roots.requestedTeam.disabled = false;
   applyReuseRoleSelection(roots.roleInputs, null, {reset: true});
+  updateCreateSummary();
   closeCreate();
 });
+
+roots.form.addEventListener("input", event => {
+  if (event.target.matches('input[name="roles"], input[name="depends_on_task_ids"], textarea[name="task"]')) {
+    showCreateValidation();
+    updateCreateSummary();
+  }
+});
+roots.dependencyOptions.addEventListener("change", updateCreateSummary);
+roots.workflowAgentOptions.addEventListener("change", updateCreateSummary);
+
+roots.agentSelect.addEventListener("change", () => loadAgentEditor(roots.agentSelect.value));
+roots.agentForm.elements.independent.addEventListener("change", updateBasicTriggerFields);
+roots.agentForm.elements.trigger_type.addEventListener("change", updateBasicTriggerFields);
+roots.agentSettingsForm.elements.trigger_type.addEventListener("change", updateAgentSettingsTriggerFields);
 
 roots.agentForm.addEventListener("submit", event => {
   event.preventDefault();
   const values = new FormData(roots.agentForm);
+  const kind = String(values.get("agent_kind") || "new");
+  const id = String(values.get("agent_id") || "");
   const name = String(values.get("name") || "").trim();
   const systemPrompt = String(values.get("system_prompt") || "").trim();
   if (!name || !systemPrompt) return;
+  if (kind === "new" && values.has("independent")) {
+    queueCommand({
+      kind: "create_independent_agent",
+      taskId: "agent-catalog",
+      endpoint: "/api/independent-agents",
+      body: {
+        name, system_prompt: systemPrompt, mode: "Independent",
+        max_cycles: Math.max(0, Number(values.get("max_cycles") || 0)),
+        trigger_settings: basicTriggerSettings(values),
+      },
+      label: `Create independent agent · ${name}`,
+    });
+  } else if (kind === "new") {
+    queueCommand({
+      kind: "create_workflow_agent",
+      taskId: "agent-catalog",
+      endpoint: "/api/workflow-agents",
+      body: {name, system_prompt: systemPrompt},
+      label: `Create workflow agent · ${name}`,
+    });
+  } else if (kind === "workflow") {
+    queueCommand({
+      kind: "update_workflow_agent",
+      taskId: id,
+      endpoint: `/api/workflow-agents/${encodeURIComponent(id)}/settings`,
+      body: {name, system_prompt: systemPrompt},
+      label: `Save workflow agent · ${name}`,
+    });
+  } else {
+    queueCommand({
+      kind: "update_independent_agent",
+      taskId: id,
+      endpoint: `/api/independent-agents/${encodeURIComponent(id)}/settings`,
+      body: {
+        display_name: name,
+        system_prompt: systemPrompt,
+        max_cycles: Math.max(0, Number(values.get("max_cycles") || 0)),
+        trigger_settings: configuredTriggerSettings(roots.agentForm, values),
+      },
+      label: `Save independent agent · ${name}`,
+    });
+  }
+});
+
+roots.deleteAgent.addEventListener("click", () => {
+  const selected = selectAgentRecord(roots.agentSelect.value);
+  if (!selected || selected.agent.is_system || selected.agent.is_builtin) return;
+  const name = selected.kind === "workflow" ? selected.agent.display_name : selected.agent.name;
+  if (!window.confirm(`Delete ${name}? Existing task history will be retained.`)) return;
+  const workflow = selected.kind === "workflow";
   queueCommand({
-    kind: "create_independent_agent",
-    taskId: "new-agent",
-    endpoint: "/api/independent-agents",
-    body: {
-      name,
-      system_prompt: systemPrompt,
-      mode: "Independent",
-      trigger_settings: independentTriggerSettings(values),
-    },
-    label: `Create custom agent · ${name}`,
+    kind: workflow ? "delete_workflow_agent" : "delete_independent_agent",
+    taskId: selected.id,
+    endpoint: workflow
+      ? `/api/workflow-agents/${encodeURIComponent(selected.id)}/delete`
+      : `/api/independent-agents/${encodeURIComponent(selected.id)}/delete`,
+    body: {},
+    label: `Delete agent · ${name}`,
   });
-  roots.agentForm.reset();
-  roots.agentDialog.close();
 });
 
 roots.agentCommandForm.addEventListener("submit", event => {
@@ -921,11 +1263,11 @@ roots.agentCommandForm.addEventListener("submit", event => {
   const instruction = String(values.get("instruction") || "").trim();
   if (!taskId || !instruction) return;
   queueCommand({
-    kind: "independent_command",
+    kind: "independent_run",
     taskId,
     endpoint: `/api/independent-agents/${encodeURIComponent(taskId)}/run`,
     body: {trigger_type: "manual", instruction},
-    label: `Command · ${state.selectedDetail?.agent?.name || taskId}`,
+    label: `Run task · ${state.selectedDetail?.agent?.name || taskId}`,
   });
   roots.agentCommandForm.reset();
   roots.agentCommandDialog.close();
@@ -940,8 +1282,10 @@ roots.agentSettingsForm.addEventListener("submit", event => {
   if (!systemPrompt) return;
   const body = {
     enabled: values.has("enabled"),
+    display_name: String(values.get("display_name") || "").trim(),
     system_prompt: systemPrompt,
-    trigger_settings: independentTriggerSettings(values),
+    max_cycles: Math.max(0, Number(values.get("max_cycles") || 0)),
+    trigger_settings: configuredTriggerSettings(roots.agentSettingsForm, values),
   };
   queueCommand({
     kind: "independent_settings",
@@ -953,9 +1297,6 @@ roots.agentSettingsForm.addEventListener("submit", event => {
   roots.agentSettingsDialog.close();
 });
 
-roots.agentDialog.addEventListener("click", event => {
-  if (event.target === roots.agentDialog) roots.agentDialog.close();
-});
 roots.agentCommandDialog.addEventListener("click", event => {
   if (event.target === roots.agentCommandDialog) roots.agentCommandDialog.close();
 });

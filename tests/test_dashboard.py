@@ -194,74 +194,89 @@ def test_frontend_assets_are_local_modular_and_suspend_hidden_polling():
 
 
 
-def test_seven_lane_board_and_independent_agent_controls_are_explicit():
+def test_independent_agents_have_one_lane_and_operator_facing_controls():
     html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
     board = (ASSET_ROOT / "views" / "board.js").read_text(encoding="utf-8")
+    detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
     app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
     store = (ASSET_ROOT / "store.js").read_text(encoding="utf-8")
 
-    detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
-    assert 'const COLUMNS = ["RUNNING", "WAITING", "BLOCKED", "PAUSED", "DONE", "STOPPED", "INDEPENDENT_AGENTS"]' in board
-    assert 'INDEPENDENT_AGENTS: "AGENTS"' in board
-    assert 'task.task_mode === "independent"' in board
-    assert 'RUNNING for ${agent.target_team}' in board
-    assert '"Custom Agent"' in board
-    assert '!agent.is_builtin' in board
-    assert 'agent.is_builtin ? "Built-in agent" : "Custom Agent"' in detail
-    assert '`Custom Agent · ${agent.name || detail.team || detail.task_id}`' in detail
-    assert '`Custom Agent: ${agent.name || detail.team || detail.task_id}`' in detail
-    assert '"Run once"' in detail
-    assert '"Command"' in detail
-    assert '"Stop current job"' in detail
-    assert '"Close tab"' in detail
-    assert '"Renew"' in detail
-    assert '"Settings"' in detail
-    assert '"Reports"' in detail
-    assert 'data-open-agent>Add custom agent</button>' in html
-    assert 'id="agent-form"' in html
-    assert '<h2>Add custom agent</h2>' in html
-    assert 'aria-label="Close custom agent form"' in html
-    assert '>Create custom agent</button>' in html
-    assert 'name="mode"' not in html
-    assert 'Add independent agent' not in html
-    assert 'id="agent-settings-form"' in html
-    assert '/api/independent-agents' in app
-    assert 'mode: "Independent"' in app
-    assert 'Create custom agent · ${name}' in app
-    assert "data-copy-task-id" in board
-    assert 'task.started_at || task.created_at' in board
-    assert 'text("span", task.active_role || "—", "task-role")' in board
-    assert '"task-role-clock"' in board
-    assert "taskSignature(task, state.board)" in board
-    assert "activeRoleStartedAt(task)" in board
-    assert 'const identity = `${task.active_role}:${task.active_hop_id ?? "none"}`' in board
-    assert "waitingDisplay(task, board)" in board
-    assert "Waiting for ${teams.join" in board
-    assert 'current.dataset.signature !== signature' in board
-    assert 'current.classList.toggle("selected", selected)' in board
-    assert 'id="secondary-dialog"' in html
-    assert '<dialog id="secondary-dialog"' in html
-    assert 'roots.secondaryDialog.showModal()' in app
-    assert 'event.target === roots.secondaryDialog' in app
-    assert 'addEventListener("cancel"' in app
-    assert 'addEventListener("popstate"' in app
-    assert "selectedRoleByTask" in store
-    assert "detailCache" in store
-    assert "laneScroll" in store
+    assert 'task.task_mode === "independent" ? "INDEPENDENT_AGENTS"' in board
+    assert 'text("span", "Independent Agent", "task-agent-context")' in board
+    assert 'agent.tags' in board
+    assert '"Custom Agent"' not in board
+    assert 'task.task_mode !== "independent" && task.status === "RUNNING"' in board
+    assert 'task.status === "DONE"' in board
+    assert 'completed_at' in board
+    assert 'data-elapsed-at' not in board.split('if (agent)', 1)[-1].split('function ensureLane', 1)[0]
 
+    for label in [
+        '"Run task"', '"Pause"', '"Enable"', '"Reset"', '"Settings"',
+        '"Delete"', '"Open tab"', '"Close tab"', '"History"', '"Reports"',
+    ]:
+        assert label in detail
+    for removed in ['"Run once"', '"Command"', '"Stop current job"', '"Renew"']:
+        assert removed not in detail
+    assert 'dataset.independentTab' in detail
+    assert 'Overview' in detail
+    assert 'Max turns per job' in detail
+    assert 'Unlimited' in detail
+    assert 'agent.tab_open' in detail
+    assert 'agent.tab_keep_open_until' in detail
+    assert 'selectedIndependentTabByTask' in store
+    assert 'dataset.renderDisabled' in detail
+    assert 'button.dataset.renderDisabled === "true"' in app
+    assert '/api/independent-agents/${encodeURIComponent(taskId)}/run' in app
+    assert 'body: {trigger_type: "manual", instruction}' in app
+    assert 'action: control.dataset.control' in app
+    assert 'control.dataset.control === "reset"' in app
+    assert '/api/independent-agents/${encodeURIComponent(taskId)}/delete' in app
+
+    assert '<h2>Run task</h2>' in html
+    assert '>Run task</button>' in html
+    assert 'name="max_cycles"' in html
+    assert 'Max turns per job' in html
+    assert 'Workflow agent completed' in html
+    assert 'Review all active workflow tasks' in html
+    assert 'CHECK_ALL' not in html
+
+
+def test_create_task_sections_summary_validation_and_agent_panel_dismissal_are_explicit():
+    html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+    app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
+    css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
+
+    for section in ["task-details", "team-repository", "workflow-agents", "dependencies-output"]:
+        assert f'data-create-section="{section}"' in html
+    assert 'id="create-selection-summary"' in html
+    assert 'id="create-validation"' in html
+    assert 'aria-live="assertive"' in html
+    assert 'create-dialog-footer' in html
+    assert 'position: sticky' in css
+    assert 'updateCreateSummary' in app
+    assert 'showCreateValidation' in app
+    assert 'roots.form.reportValidity()' in app
+
+    assert 'aria-expanded="false"' in html
+    assert 'setAgentPanelOpen' in app
+    assert 'roots.agentPanel.contains(event.target)' in app
+    assert 'event.key === "Escape" && !roots.agentPanel.hidden' in app
+    assert 'roots.agentOpener.focus()' in app
+    assert 'workflow-task-team-options' in html
+    assert 'data-workflow-agent-select' in html
+    assert 'renderTriggerChoices' in app
 
 def test_create_task_role_selection_defaults_and_reuse_lock_are_explicit():
     html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
     app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
     actions = (ASSET_ROOT / "views" / "dashboard_actions.js").read_text(encoding="utf-8")
 
-    for role in ("PLAN", "DEV", "TEST", "REVIEW", "AUDIT"):
-        assert f'name="roles" value="{role}"' in html
-    assert 'name="roles" value="PLAN" checked disabled' in html
-    assert 'name="roles" value="DEV" checked' in html
-    assert 'name="roles" value="REVIEW" checked' in html
-    assert 'name="roles" value="TEST" checked' not in html
-    assert 'name="roles" value="AUDIT" checked' not in html
+    assert 'id="workflow-agent-options"' in html
+    assert "renderWorkflowAgentOptions" in actions
+    assert 'input.name = "roles"' in actions
+    assert 'input.value = agent.route_key' in actions
+    assert 'if (agent.route_key === "PLAN")' in actions
+    assert 'DEFAULT_WORKFLOW_ROLES.has(agent.route_key)' in actions
     assert "selectedWorkflowRoles" in app
     assert "body.roles = selectedWorkflowRoles" in app
     assert "applyReuseRoleSelection" in actions

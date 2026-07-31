@@ -9,21 +9,33 @@ function text(tag, value, className) {
   return node;
 }
 
-function elapsed(value, now = Date.now()) {
-  const started = Date.parse(value || "");
-  if (!Number.isFinite(started)) return "—";
-  const seconds = Math.max(0, Math.floor((now - started) / 1000));
-  const days = Math.floor(seconds / 86400);
-  const hours = Math.floor((seconds % 86400) / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
+function durationSeconds(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "—";
+  const whole = Math.floor(seconds);
+  const days = Math.floor(whole / 86400);
+  const hours = Math.floor((whole % 86400) / 3600);
+  const minutes = Math.floor((whole % 3600) / 60);
   if (days) return `${days}d ${hours}h`;
   if (hours) return `${hours}h ${minutes}m`;
   if (minutes) return `${minutes}m`;
-  return `${seconds}s`;
+  return `${whole}s`;
+}
+
+function elapsed(value, now = Date.now()) {
+  const started = Date.parse(value || "");
+  if (!Number.isFinite(started)) return "—";
+  return durationSeconds((now - started) / 1000);
+}
+
+function fixedDuration(startedAt, completedAt) {
+  const started = Date.parse(startedAt || "");
+  const completed = Date.parse(completedAt || "");
+  if (!Number.isFinite(started) || !Number.isFinite(completed) || completed < started) return null;
+  return durationSeconds((completed - started) / 1000);
 }
 
 function activeRoleStartedAt(task, now = Date.now()) {
-  if (task.status !== "RUNNING" || !task.active_role) {
+  if (task.task_mode === "independent" || task.status !== "RUNNING" || !task.active_role) {
     roleClocks.delete(task.task_id);
     return null;
   }
@@ -101,6 +113,7 @@ function taskSignature(task, board) {
     task.active_hop_id,
     task.active_action,
     task.started_at,
+    task.completed_at,
     task.created_at,
     task.effective_activity_at,
     task.updated_at,
@@ -115,12 +128,21 @@ function taskSignature(task, board) {
   ]);
 }
 
+function appendAgentTags(root, tags) {
+  const values = Array.isArray(tags) ? tags.filter(Boolean) : [];
+  if (!values.length) return;
+  const list = document.createElement("span");
+  list.className = "agent-tags";
+  for (const tag of values) list.append(text("span", tag, "agent-tag"));
+  root.append(list);
+}
+
 function card(task, selected, board) {
   const node = document.createElement("article");
   node.className = `task-card${selected ? " selected" : ""}`;
   node.dataset.taskId = task.task_id;
   node.dataset.signature = taskSignature(task, board);
-  const agent = task.task_mode === "independent" ? task.agent : null;
+  const agent = task.task_mode === "independent" ? (task.agent || {}) : null;
 
   const head = document.createElement("div");
   head.className = "task-card-head";
@@ -132,19 +154,23 @@ function card(task, selected, board) {
   const cardName = agent
     ? (agent.name || task.team || task.task_id)
     : (task.team || task.task_id);
-  if (agent && !agent.is_builtin) {
-    select.append(text("span", "Custom Agent", "task-agent-context"));
-  }
+  if (agent) select.append(text("span", "Independent Agent", "task-agent-context"));
   select.append(text("strong", cardName, "task-team"));
+  if (agent) appendAgentTags(select, agent.tags);
+
   const roleGroup = document.createElement("span");
   roleGroup.className = "task-role-group";
-  roleGroup.append(text("span", task.active_role || "—", "task-role"));
-  const roleTimestamp = activeRoleStartedAt(task);
-  if (roleTimestamp) {
-    const roleClock = text("span", elapsed(roleTimestamp), "task-role-clock");
-    roleClock.dataset.elapsedAt = roleTimestamp;
-    roleClock.dataset.roleTimer = `${task.active_role}:${task.active_hop_id ?? "none"}`;
-    roleGroup.append(roleClock);
+  if (agent) {
+    roleGroup.append(text("span", agent.trigger_type ? "ACTIVE" : "IDLE", "task-role"));
+  } else {
+    roleGroup.append(text("span", task.active_role || "—", "task-role"));
+    const roleTimestamp = activeRoleStartedAt(task);
+    if (roleTimestamp) {
+      const roleClock = text("span", elapsed(roleTimestamp), "task-role-clock");
+      roleClock.dataset.elapsedAt = roleTimestamp;
+      roleClock.dataset.roleTimer = `${task.active_role}:${task.active_hop_id ?? "none"}`;
+      roleGroup.append(roleClock);
+    }
   }
   head.append(select, roleGroup);
   node.append(head);
@@ -154,20 +180,21 @@ function card(task, selected, board) {
   summary.className = "task-summary";
   summary.dataset.selectTask = task.task_id;
   const agentTarget = agent?.target_team
-    ? `RUNNING for ${agent.target_team}`
-    : task.status === "WAITING" ? "Waiting for trigger" : task.status;
+    ? `Working on ${agent.target_team}`
+    : agent?.trigger_type ? "Active job" : "Waiting for trigger";
   summary.append(text(
     "span",
     agent ? agentTarget : (task.task_title || task.task_id),
     "task-title",
   ));
   if (agent?.trigger_type) {
+    const maxTurns = agent.max_cycles === 0 ? "unlimited turns" : `turn ${agent.cycle || 0}/${agent.max_cycles}`;
     const trigger = [
       agent.trigger_type,
       agent.target_task_id,
       agent.occurrence_count ? `occurrence ${agent.occurrence_count}` : null,
       agent.check_count ? `check ${agent.check_count}` : null,
-      agent.max_cycles ? `cycle ${agent.cycle}/${agent.max_cycles}` : null,
+      maxTurns,
     ].filter(Boolean).join(" · ");
     summary.append(text("span", trigger, "task-agent-context"));
   }
@@ -195,16 +222,24 @@ function card(task, selected, board) {
 
   const meta = document.createElement("div");
   meta.className = "task-meta";
-  const normalWaiting = task.status === "WAITING" && task.task_mode !== "independent";
-  meta.append(normalWaiting ? waitingOrderField(task) : field("Status", task.status));
-  meta.append(field("Action", task.active_action));
-  const taskStartedAt = task.started_at || task.created_at;
-  const timestamp = task.status === "WAITING"
-    ? (task.effective_activity_at || task.updated_at || task.created_at)
-    : taskStartedAt;
-  const running = field("Total", elapsed(timestamp), "task-field task-elapsed");
-  running.dataset.elapsedAt = timestamp || "";
-  meta.append(running);
+  if (agent) {
+    meta.append(field("Status", task.status));
+    meta.append(field("Action", task.active_action));
+    meta.append(field("Tab", agent.tab_open ? "Open" : "Closed"));
+  } else {
+    const normalWaiting = task.status === "WAITING";
+    meta.append(normalWaiting ? waitingOrderField(task) : field("Status", task.status));
+    meta.append(field("Action", task.active_action));
+    if (task.task_mode !== "independent" && task.status === "RUNNING") {
+      const timestamp = task.started_at || task.created_at;
+      const running = field("Total", elapsed(timestamp), "task-field task-elapsed");
+      running.dataset.elapsedAt = timestamp || "";
+      meta.append(running);
+    } else if (task.status === "DONE") {
+      const duration = fixedDuration(task.started_at || task.created_at, task.completed_at);
+      if (duration) meta.append(field("Duration", duration, "task-field task-elapsed"));
+    }
+  }
   node.append(meta);
   return node;
 }
@@ -242,7 +277,8 @@ export function renderBoard(root, state) {
 
   const grouped = new Map(COLUMNS.map(column => [column, []]));
   for (const task of state.board.values()) {
-    const column = grouped.has(task.column) ? task.column : task.status;
+    const column = task.task_mode === "independent" ? "INDEPENDENT_AGENTS"
+      : grouped.has(task.column) ? task.column : task.status;
     if (grouped.has(column)) grouped.get(column).push(task);
   }
   for (const [column, tasks] of grouped.entries()) {

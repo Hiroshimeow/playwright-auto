@@ -5,12 +5,15 @@ function el(tag, value, className) {
   return node;
 }
 
-function button(action, label, task) {
+function button(action, label, task, {disabled = false, emphasized = false} = {}) {
   const node = el("button", label);
   node.type = "button";
   node.dataset.control = action;
   node.dataset.taskId = task.task_id;
   node.dataset.version = String(task.version || 0);
+  node.dataset.renderDisabled = String(Boolean(disabled));
+  node.disabled = Boolean(disabled);
+  if (emphasized) node.classList.add("control-emphasis");
   return node;
 }
 
@@ -22,12 +25,15 @@ function changeGoalButton(task) {
   return node;
 }
 
-function independentButton(action, label, task) {
+function independentButton(action, label, task, {disabled = false, emphasized = false} = {}) {
   const node = el("button", label);
   node.type = "button";
   node.dataset.independentAction = action;
   node.dataset.taskId = task.task_id;
   node.dataset.version = String(task.version || 0);
+  node.dataset.renderDisabled = String(Boolean(disabled));
+  node.disabled = Boolean(disabled);
+  if (emphasized) node.classList.add("control-emphasis");
   return node;
 }
 
@@ -65,98 +71,27 @@ function timelineTime(value, now = Date.now()) {
   return `${local} · ${relativeTime(value, now)}`;
 }
 
-function build(detail, timeline, selectedRole) {
-  const fragment = document.createDocumentFragment();
-  const agent = detail.task_mode === "independent" ? (detail.agent || {}) : null;
-  const displayTitle = agent && !agent.is_builtin
-    ? `Custom Agent · ${agent.name || detail.team || detail.task_id}`
-    : (detail.task_title || detail.task_id);
-  const head = el("div", null, "detail-head");
-  const identity = el("div");
-  identity.append(el("p", detail.status, "eyebrow"), el("h2", detail.team || detail.task_id));
-  identity.append(el("p", displayTitle, "detail-subtitle"));
-  head.append(identity, el("span", detail.active_role || "No active role", "status-badge"));
-  fragment.append(head);
+function fixedDuration(startedAt, endedAt) {
+  const started = Date.parse(startedAt || "");
+  const ended = Date.parse(endedAt || "");
+  if (!Number.isFinite(started) || !Number.isFinite(ended) || ended < started) return null;
+  const seconds = Math.floor((ended - started) / 1000);
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (hours) return `${hours}h ${minutes}m`;
+  if (minutes) return `${minutes}m`;
+  return `${seconds}s`;
+}
 
-  const taskSection = el("section", null, "detail-section");
-  taskSection.append(el("h3", detail.task_mode === "independent"
-    ? (agent.is_builtin ? "Built-in agent" : "Custom Agent")
-    : "Task"));
-  const taskText = agent && !agent.is_builtin
-    ? `Custom Agent: ${agent.name || detail.team || detail.task_id}`
-    : (detail.task_text || detail.task_title || detail.task_id);
-  taskSection.append(el("pre", taskText, "task-text"));
-  if (detail.task_mode !== "independent") {
-    taskSection.append(el("h3", "Effective goal"));
-    taskSection.append(el("pre", detail.effective_goal || detail.task_text || detail.task_id, "task-text"));
-    const revisions = detail.goal_revisions || [];
-    if (revisions.length) {
-      const history = el("div", null, "goal-revision-list");
-      history.append(el("h3", "Goal revisions"));
-      for (const revision of revisions) {
-        const item = el("article", null, "history-card");
-        item.append(el("strong", `Revision ${revision.revision} · from hop ${revision.applies_from_hop_id}`));
-        item.append(el("p", revision.changed_at || "", "muted"));
-        item.append(el("pre", revision.goal || "", "task-text"));
-        history.append(item);
-      }
-      taskSection.append(history);
-    }
+function tags(values) {
+  const list = el("div", null, "agent-tags detail-agent-tags");
+  for (const value of Array.isArray(values) ? values.filter(Boolean) : []) {
+    list.append(el("span", value, "agent-tag"));
   }
-  if (detail.task_mode === "independent") {
-    const context = el("div", null, "agent-detail-grid");
-    context.append(
-      el("span", `Name: ${agent.name || detail.team}`),
-      el("span", `Generation: ${agent.generation || 1}`),
-      el("span", `Trigger: ${agent.trigger_type || "waiting"}`),
-      el("span", `Target: ${agent.target_team || "—"}`),
-      el("span", `Task: ${agent.target_task_id || "—"}`),
-      el("span", `Cycle: ${agent.cycle || 0}/${agent.max_cycles || 1}`),
-    );
-    taskSection.append(context);
-  }
-  fragment.append(taskSection);
+  return list;
+}
 
-  if (detail.primary_problem) {
-    const problem = el("section", null, "problem-box");
-    problem.append(el("strong", detail.primary_problem.code || detail.primary_problem.kind));
-    problem.append(el("p", detail.primary_problem.message));
-    fragment.append(problem);
-  }
-
-  const controls = el("div", null, "control-grid");
-  if (detail.task_mode === "independent") {
-    const enabled = detail.agent?.enabled !== false;
-    const active = Boolean(detail.agent?.trigger_type);
-    const terminal = ["DONE", "STOPPED"].includes(detail.status);
-    const inFlight = ["sending", "sent", "waiting"].includes(detail.active_hop?.state);
-    const idle = !active && ["WAITING", "PAUSED"].includes(detail.status);
-    if (idle && enabled) {
-      controls.append(independentButton("run", "Run once", detail));
-      controls.append(independentButton("command", "Command", detail));
-    }
-    if (!terminal) {
-      controls.append(button(enabled ? "pause" : "resume", enabled ? "Pause" : "Enable", detail));
-      if (active) controls.append(button("stop", "Stop current job", detail));
-      if (active && detail.status === "BLOCKED") controls.append(button("retry", "Retry", detail));
-      controls.append(button("open_tab", "Open tab", detail));
-      if (!inFlight) controls.append(button("close_tab", "Close tab", detail));
-      if (idle && !inFlight) controls.append(button("new_chat", "Renew", detail));
-      controls.append(independentButton("settings", "Settings", detail));
-    }
-    controls.append(independentButton("history", "History", detail));
-    controls.append(independentButton("reports", "Reports", detail));
-  } else {
-    if (detail.status === "RUNNING") controls.append(changeGoalButton(detail));
-    for (const [action, label] of [
-      ["pause", "Pause"], ["resume", "Resume"], ["retry", "Retry hop"],
-      ["restart_role", "Restart role"], ["new_chat", "New chat"],
-      ["open_tab", "Open tab"], ["route_plan", "Route PLAN"],
-      ["stop", "Stop"], ["clear_team", "Clear team"],
-    ]) controls.append(button(action, label, detail));
-  }
-  fragment.append(controls);
-
+function rolesSection(detail, selectedRole) {
   const roles = el("section", null, "detail-section");
   roles.append(el("h3", "Roles / tabs"));
   const roleList = el("div", null, "role-list");
@@ -179,9 +114,11 @@ function build(detail, timeline, selectedRole) {
   else inputSection.append(el("p", "No input is available for this role.", "muted"));
   if (input?.handoff) inputSection.append(el("p", `Handoff: ${input.handoff}`, "handoff-label"));
   roles.append(inputSection);
-  fragment.append(roles);
+  return roles;
+}
 
-  const timelineSection = el("section", null, "detail-section");
+function timelineSection(detail, timeline) {
+  const section = el("section", null, "detail-section");
   const title = el("div", null, "section-inline");
   title.append(el("h3", "Timeline"));
   if (detail.timeline_total > timeline.length) {
@@ -190,7 +127,7 @@ function build(detail, timeline, selectedRole) {
     more.dataset.loadTimeline = detail.task_id;
     title.append(more);
   }
-  timelineSection.append(title);
+  section.append(title);
   const list = el("ol", null, "timeline");
   for (const item of timeline) {
     const row = el("li");
@@ -204,8 +141,213 @@ function build(detail, timeline, selectedRole) {
     row.append(el("p", item.message || item.status || ""));
     list.append(row);
   }
-  timelineSection.append(list);
-  fragment.append(timelineSection);
+  section.append(list);
+  return section;
+}
+
+function independentControls(detail) {
+  const controls = el("div", null, "control-grid independent-controls");
+  const agent = detail.agent || {};
+  const enabled = agent.enabled !== false;
+  const active = Boolean(agent.trigger_type);
+  const inFlight = ["sending", "sent", "waiting"].includes(detail.active_hop?.state);
+  const tabOpen = Boolean(agent.tab_open);
+
+  controls.append(independentButton("run-task", "Run task", detail, {disabled: active}));
+  controls.append(button(enabled ? "pause" : "resume", enabled ? "Pause" : "Enable", detail));
+  controls.append(button("reset", "Reset", detail, {disabled: !active}));
+  controls.append(independentButton("settings", "Settings", detail));
+  controls.append(independentButton("delete", "Delete", detail));
+  controls.append(button("open_tab", "Open tab", detail, {disabled: tabOpen, emphasized: !tabOpen}));
+  controls.append(button("close_tab", "Close tab", detail, {disabled: !tabOpen || inFlight, emphasized: tabOpen && !inFlight}));
+  return controls;
+}
+
+function independentOverview(detail, timeline, selectedRole) {
+  const fragment = document.createDocumentFragment();
+  const agent = detail.agent || {};
+  const section = el("section", null, "detail-section independent-overview");
+  section.append(el("h3", "Independent Agent"));
+  const prompt = agent.system_prompt || detail.task_text || "No system prompt projected.";
+  section.append(el("pre", prompt, "task-text"));
+  if ((agent.tags || []).length) section.append(tags(agent.tags));
+
+  const maxTurns = Number(agent.max_cycles) === 0 ? "Unlimited" : String(agent.max_cycles ?? 0);
+  const context = el("div", null, "agent-detail-grid");
+  context.append(
+    el("span", `Name: ${agent.name || detail.team}`),
+    el("span", `Generation: ${agent.generation || 1}`),
+    el("span", `Trigger: ${agent.trigger_type || "waiting"}`),
+    el("span", `Target: ${agent.target_team || "—"}`),
+    el("span", `Task: ${agent.target_task_id || "—"}`),
+    el("span", `Max turns per job: ${maxTurns}`),
+  );
+  section.append(context);
+  fragment.append(section);
+
+  if (detail.primary_problem) {
+    const problem = el("section", null, "problem-box");
+    problem.append(el("strong", detail.primary_problem.code || detail.primary_problem.kind));
+    problem.append(el("p", detail.primary_problem.message));
+    fragment.append(problem);
+  }
+
+  fragment.append(independentControls(detail));
+  const tabState = el("p", null, "tab-state-help");
+  if (agent.tab_open) {
+    const keepOpen = agent.tab_keep_open_until
+      ? ` Idle keep-open until ${agent.tab_keep_open_until}.`
+      : " The tab remains available for the configured idle keep-open window.";
+    tabState.textContent = `Tab is open.${keepOpen} Close tab acts immediately when no send is in flight.`;
+  } else {
+    tabState.textContent = "Tab is closed. Open tab keeps it available for up to 10 idle minutes when the backend contract is active.";
+  }
+  fragment.append(tabState);
+  fragment.append(rolesSection(detail, selectedRole), timelineSection(detail, timeline));
+  return fragment;
+}
+
+function independentHistory(detail) {
+  const section = el("section", null, "detail-section independent-history");
+  const items = detail.independent_history || [];
+  if (!items.length) {
+    section.append(el("p", "No lifecycle records for this agent.", "muted"));
+    return section;
+  }
+  const list = el("div", null, "history-list");
+  for (const item of items) {
+    const article = el("article", null, "history-card");
+    article.append(el("strong", `Generation ${item.generation || "—"} · ${item.status || "UNKNOWN"}`));
+    const endedAt = item.completed_at || item.stopped_at || null;
+    const duration = fixedDuration(item.started_at, endedAt);
+    const meta = [item.task_id, endedAt || item.updated_at || item.created_at, duration ? `Duration ${duration}` : null]
+      .filter(Boolean).join(" · ");
+    article.append(el("p", meta || "—", "muted"));
+    const outcome = item.last_outcome;
+    if (outcome?.summary || outcome?.outcome) {
+      article.append(el("p", [outcome.outcome, outcome.summary].filter(Boolean).join(" · ")));
+    }
+    list.append(article);
+  }
+  section.append(list);
+  return section;
+}
+
+function independentReports(detail, reportBodies) {
+  const section = el("section", null, "detail-section independent-reports");
+  const reports = [...(detail.reports || []), ...(detail.maintenance_reports || [])];
+  if (!reports.length) {
+    section.append(el("p", "No reports for this agent.", "muted"));
+    return section;
+  }
+  const list = el("div", null, "history-list");
+  for (const report of reports) {
+    const article = el("article", null, "history-card");
+    article.append(el("strong", report.summary || report.outcome || report.role || "Report"));
+    if (report.url) {
+      const link = el("a", report.url);
+      link.href = report.url;
+      link.target = "_blank";
+      link.rel = "noopener";
+      article.append(link);
+    }
+    const loaded = report.url ? reportBodies.get(report.url) : null;
+    const body = el("pre", null, "task-text");
+    if (loaded?.status === "ready") body.textContent = loaded.body;
+    else if (loaded?.status === "error") body.textContent = `Report load failed: ${loaded.error}`;
+    else if (report.content || report.message) body.textContent = report.content || report.message;
+    else body.textContent = "Loading report body…";
+    article.append(body);
+    list.append(article);
+  }
+  section.append(list);
+  return section;
+}
+
+function independentTabs(detail, selectedTab) {
+  const tabs = el("div", null, "independent-tabs");
+  tabs.setAttribute("role", "tablist");
+  tabs.setAttribute("aria-label", "Independent agent detail");
+  for (const [id, label] of [["overview", "Overview"], ["history", "History"], ["reports", "Reports"]]) {
+    const tab = el("button", label);
+    tab.type = "button";
+    tab.dataset.independentTab = id;
+    tab.dataset.taskId = detail.task_id;
+    tab.setAttribute("role", "tab");
+    tab.setAttribute("aria-selected", String(selectedTab === id));
+    if (selectedTab === id) tab.classList.add("selected");
+    tabs.append(tab);
+  }
+  return tabs;
+}
+
+function workflowContent(detail, timeline, selectedRole) {
+  const fragment = document.createDocumentFragment();
+  const taskSection = el("section", null, "detail-section");
+  taskSection.append(el("h3", "Task"));
+  taskSection.append(el("pre", detail.task_text || detail.task_title || detail.task_id, "task-text"));
+  taskSection.append(el("h3", "Effective goal"));
+  taskSection.append(el("pre", detail.effective_goal || detail.task_text || detail.task_id, "task-text"));
+  const revisions = detail.goal_revisions || [];
+  if (revisions.length) {
+    const history = el("div", null, "goal-revision-list");
+    history.append(el("h3", "Goal revisions"));
+    for (const revision of revisions) {
+      const item = el("article", null, "history-card");
+      item.append(el("strong", `Revision ${revision.revision} · from hop ${revision.applies_from_hop_id}`));
+      item.append(el("p", revision.changed_at || "", "muted"));
+      item.append(el("pre", revision.goal || "", "task-text"));
+      history.append(item);
+    }
+    taskSection.append(history);
+  }
+  fragment.append(taskSection);
+
+  if (detail.primary_problem) {
+    const problem = el("section", null, "problem-box");
+    problem.append(el("strong", detail.primary_problem.code || detail.primary_problem.kind));
+    problem.append(el("p", detail.primary_problem.message));
+    fragment.append(problem);
+  }
+
+  const controls = el("div", null, "control-grid");
+  if (detail.status === "RUNNING") controls.append(changeGoalButton(detail));
+  for (const [action, label] of [
+    ["pause", "Pause"], ["resume", "Resume"], ["retry", "Retry hop"],
+    ["restart_role", "Restart role"], ["new_chat", "New chat"],
+    ["open_tab", "Open tab"], ["route_plan", "Route PLAN"],
+    ["stop", "Stop"], ["clear_team", "Clear team"],
+  ]) controls.append(button(action, label, detail));
+  fragment.append(controls, rolesSection(detail, selectedRole), timelineSection(detail, timeline));
+  return fragment;
+}
+
+function build(detail, timeline, selectedRole, selectedTab, reportBodies) {
+  const fragment = document.createDocumentFragment();
+  const agent = detail.task_mode === "independent" ? (detail.agent || {}) : null;
+  const displayTitle = agent
+    ? `Independent Agent · ${agent.name || detail.team || detail.task_id}`
+    : (detail.task_title || detail.task_id);
+  const head = el("div", null, "detail-head");
+  const identity = el("div");
+  identity.append(el("p", detail.status, "eyebrow"), el("h2", detail.team || detail.task_id));
+  identity.append(el("p", displayTitle, "detail-subtitle"));
+  head.append(identity, el("span", agent ? (agent.trigger_type ? "Active job" : "Idle") : (detail.active_role || "No active role"), "status-badge"));
+  fragment.append(head);
+
+  if (!agent) {
+    fragment.append(workflowContent(detail, timeline, selectedRole));
+    return fragment;
+  }
+
+  const tab = ["overview", "history", "reports"].includes(selectedTab) ? selectedTab : "overview";
+  fragment.append(independentTabs(detail, tab));
+  const panel = el("div", null, "independent-tab-panel");
+  panel.setAttribute("role", "tabpanel");
+  if (tab === "history") panel.append(independentHistory(detail));
+  else if (tab === "reports") panel.append(independentReports(detail, reportBodies));
+  else panel.append(independentOverview(detail, timeline, selectedRole));
+  fragment.append(panel);
   return fragment;
 }
 
@@ -236,6 +378,9 @@ export function renderTaskDetail(
   selectedTaskId = null,
   status = "idle",
   error = null,
+  selectedTab = "overview",
+  reportBodies = new Map(),
+  reportRevision = 0,
 ) {
   if (!detail || detail.task_id !== selectedTaskId) {
     const signature = JSON.stringify(["unavailable", selectedTaskId, status, error]);
@@ -248,7 +393,10 @@ export function renderTaskDetail(
     root.scrollTop = 0;
     return;
   }
-  const signature = JSON.stringify([detail.projection_sha256, detail.version, timeline, selectedRole]);
+  const signature = JSON.stringify([
+    detail.projection_sha256, detail.version, timeline, selectedRole,
+    selectedTab, reportRevision,
+  ]);
   if (root.dataset.signature === signature) return;
   const sameTask = root.dataset.taskId === selectedTaskId;
   if (!sameTask) root._pendingRender = null;
@@ -256,11 +404,12 @@ export function renderTaskDetail(
   if (sameTask && selection && !selection.isCollapsed && root.contains(selection.anchorNode)) {
     root._pendingRender = () => renderTaskDetail(
       root, detail, timeline, selectedRole, selectedTaskId, status, error,
+      selectedTab, reportBodies, reportRevision,
     );
     return;
   }
   const scroll = root.scrollTop;
-  root.replaceChildren(build(detail, timeline, selectedRole));
+  root.replaceChildren(build(detail, timeline, selectedRole, selectedTab, reportBodies));
   root.className = "panel";
   root.dataset.signature = signature;
   root.dataset.taskId = detail.task_id;

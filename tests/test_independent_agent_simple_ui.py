@@ -274,8 +274,7 @@ def test_manual_completion_requests_immediate_existing_idle_close_and_retains_ur
     assert successor2["task_id"] not in changed2
     assert actions2.closed_teams == 0
 
-
-def test_board_uses_simple_labels_command_dialog_and_restored_settings():
+def test_board_uses_operator_labels_run_task_and_restored_settings():
     html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
     app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
     detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
@@ -284,46 +283,52 @@ def test_board_uses_simple_labels_command_dialog_and_restored_settings():
     ]
 
     for label in (
-        "Run once",
-        "Command",
+        "Run task",
         "Open tab",
         "Close tab",
-        "Renew",
+        "Reset",
         "Settings",
         "History",
         "Reports",
     ):
         assert f'"{label}"' in detail
-    assert '"Run now"' not in detail
-    assert '"New Chat next job"' not in detail
-    assert 'data-open-agent>Add custom agent</button>' in html
-    assert '<h2>Add custom agent</h2>' in create_form
-    assert 'aria-label="Close custom agent form"' in create_form
-    assert '>Create custom agent</button>' in create_form
-    assert 'manual-only Custom Agent' in create_form
+    for removed in ("Run once", "Command", "Stop current job", "Renew"):
+        assert f'"{removed}"' not in detail
+    assert 'aria-expanded="false"' in html
+    assert 'data-open-agent>Add Agents</button>' in html
+    assert '<h2 id="agents-panel-title">Add Agents</h2>' in html
+    assert 'aria-label="Close Add Agents panel"' in html
+    assert 'data-new-agent>New agent</button>' in html
+    assert 'name="independent"' in create_form
+    assert 'New agents are Custom Workflow Agents' in create_form
     assert 'name="mode"' not in create_form
     assert 'Add independent agent' not in html
-    assert '<p class="eyebrow">Agent</p>' in html[html.index('id="agent-command-dialog"') :]
-    assert 'id="agent-command-dialog"' in html
-    assert 'name="instruction"' in html
-    for field in (
-        "recovery",
+    command_form = html[html.index('id="agent-command-dialog"') :]
+    assert '<h2>Run task</h2>' in command_form
+    assert 'name="instruction"' in command_form
+    assert 'name="max_cycles"' in create_form
+    assert 'Max turns per job' in html
+    assert '0 means Unlimited.' in html
+    for trigger in (
+        "manual",
+        "interval",
         "task_done",
-        "check_all",
-        "interval_minutes",
-        "teams",
-        "states",
         "role_completed",
+        "task_state",
+        "check_all",
+        "recovery",
     ):
-        assert f'name="{field}"' in create_form
-    assert "checked" not in create_form[create_form.index("Triggers") :]
-    assert "function independentTriggerSettings(values)" in app
-    assert app.count("trigger_settings: independentTriggerSettings(values)") == 2
+        assert f'value="{trigger}"' in create_form
+    assert "function basicTriggerSettings(values)" in app
+    assert "function configuredTriggerSettings(form, values)" in app
+    assert app.count("configuredTriggerSettings(roots.agentForm, values)") == 1
+    assert app.count("configuredTriggerSettings(roots.agentSettingsForm, values)") == 1
+    assert 'task_done: ["task_team"]' in app
     assert 'mode: "Independent"' in app
-    assert 'Create custom agent · ${name}' in app
-    assert "No lifecycle records for this agent." in app
-    assert "No reports for this agent." in app
+    assert 'Create independent agent · ${name}' in app
+    assert 'Create workflow agent · ${name}' in app
+    assert "No lifecycle records for this agent." in detail
+    assert "No reports for this agent." in detail
     assert "this independent agent" not in app
-    assert "detail.agent?.system_prompt || \"\"" in app
+    assert 'body: {trigger_type: "manual", instruction}' in app
     assert "new_chat_next_job" not in html[html.index('id="agent-settings-dialog"') :]
-    assert "instruction" in app

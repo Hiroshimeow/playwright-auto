@@ -26,6 +26,47 @@ function actionTaskCopy(task) {
 
 const DEFAULT_WORKFLOW_ROLES = new Set(["PLAN", "DEV", "REVIEW"]);
 
+export function renderWorkflowAgentOptions(root, agents = []) {
+  // Independent agents must not appear in Create Task.
+  const workflow = Array.isArray(agents) ? agents.filter(agent => !agent.deleted_at) : [];
+  const signature = JSON.stringify(workflow.map(agent => [
+    agent.route_key, agent.display_name, agent.is_system,
+  ]));
+  if (root.dataset.signature === signature) return;
+  const selected = new Set(
+    [...root.querySelectorAll('input[name="roles"]:checked')].map(input => input.value),
+  );
+  const fragment = document.createDocumentFragment();
+  for (const agent of workflow) {
+    const label = document.createElement("label");
+    label.className = "workflow-agent-card";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.name = "roles";
+    input.value = agent.route_key;
+    input.checked = selected.size
+      ? selected.has(agent.route_key)
+      : DEFAULT_WORKFLOW_ROLES.has(agent.route_key);
+    if (agent.route_key === "PLAN") {
+      input.checked = true;
+      input.disabled = true;
+    }
+    const copy = document.createElement("span");
+    copy.className = "workflow-agent-copy";
+    const name = document.createElement("strong");
+    name.textContent = agent.display_name || agent.route_key;
+    const meta = document.createElement("small");
+    meta.textContent = agent.is_system
+      ? `${agent.route_key} · built-in`
+      : `${agent.route_key} · custom`;
+    copy.append(name, meta);
+    label.append(input, copy);
+    fragment.append(label);
+  }
+  root.replaceChildren(fragment);
+  root.dataset.signature = signature;
+}
+
 export function applyReuseRoleSelection(roleInputs, item = null, {reset = false} = {}) {
   const locked = Boolean(item);
   const selected = locked
