@@ -145,6 +145,10 @@ function timelineSection(detail, timeline) {
   return section;
 }
 
+export function independentDeleteDisabled(agent = {}, active = false) {
+  return Boolean(agent.is_builtin) || Boolean(active);
+}
+
 function independentControls(detail) {
   const controls = el("div", null, "control-grid independent-controls");
   const agent = detail.agent || {};
@@ -157,7 +161,9 @@ function independentControls(detail) {
   controls.append(button(enabled ? "pause" : "resume", enabled ? "Pause" : "Enable", detail));
   controls.append(button("reset", "Reset", detail, {disabled: !active}));
   controls.append(independentButton("settings", "Settings", detail));
-  controls.append(independentButton("delete", "Delete", detail));
+  controls.append(independentButton("delete", "Delete", detail, {
+    disabled: independentDeleteDisabled(agent, active),
+  }));
   controls.append(button("open_tab", "Open tab", detail, {disabled: tabOpen, emphasized: !tabOpen}));
   controls.append(button("close_tab", "Close tab", detail, {disabled: !tabOpen || inFlight, emphasized: tabOpen && !inFlight}));
   return controls;

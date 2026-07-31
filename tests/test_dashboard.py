@@ -241,6 +241,26 @@ def test_independent_agents_have_one_lane_and_operator_facing_controls():
     assert 'CHECK_ALL' not in html
 
 
+def test_independent_delete_is_disabled_for_builtin_or_active_agents():
+    module = (ASSET_ROOT / "views" / "task_detail.js").resolve().as_uri()
+    script = f"""
+      import {{ independentDeleteDisabled }} from {json.dumps(module)};
+      const cases = [
+        independentDeleteDisabled({{is_builtin: true}}, false),
+        independentDeleteDisabled({{is_builtin: false}}, true),
+        independentDeleteDisabled({{is_builtin: false}}, false),
+      ];
+      console.log(JSON.stringify(cases));
+    """
+    result = __import__("subprocess").run(
+        ["node", "--input-type=module", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == [True, True, False]
+
+
 def test_create_task_sections_summary_validation_and_agent_panel_dismissal_are_explicit():
     html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
     app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
