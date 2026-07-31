@@ -6,7 +6,7 @@ import json
 import os
 import re
 from contextlib import ExitStack, contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any, Callable, Iterator, Mapping, Sequence
@@ -20,12 +20,16 @@ from .cdpa_independent import (
     INDEPENDENT_ROLE,
     TASK_MODE_INDEPENDENT,
     TASK_MODE_WORKFLOW,
+    independent_cycle_limit_reached,
     is_independent_task,
     normalize_agent_name,
     normalize_completion_request,
+    normalize_event,
     normalize_manual_instruction,
+    normalize_max_cycles,
     normalize_system_prompt,
     record_consumed_event,
+    record_recovery_release,
     task_mode,
     validate_independent_object,
     validate_trigger_settings,
@@ -1595,6 +1599,17 @@ class TaskStore:
                     raise ValueError(
                         "dependency change requires an explicit dependency mutation"
                     )
+                before_status = str(original.get("status") or "").upper()
+                after_status = str(candidate.get("status") or "").upper()
+                if after_status == "BLOCKED":
+                    if before_status != "BLOCKED":
+                        candidate["blocked_at"] = utc_now()
+                    elif not candidate.get("blocked_at"):
+                        candidate["blocked_at"] = str(
+                            original.get("updated_at") or utc_now()
+                        )
+                else:
+                    candidate.pop("blocked_at", None)
                 if candidate == original:
                     return original
                 saved = self._save_unlocked(target, candidate)
@@ -2268,6 +2283,7 @@ class TaskStore:
         target: Path,
         enabled: bool,
         max_cycles: int,
+        max_cycles_explicit: bool,
         inherited_role: Mapping[str, Any] | None = None,
         watermarks: Mapping[str, Any] | None = None,
         occurrence_counts: Mapping[str, Any] | None = None,
@@ -2312,6 +2328,10 @@ class TaskStore:
         inherited_watermarks["seen_event_keys"] = list(
             inherited_watermarks.get("seen_event_keys") or []
         )
+        if trigger_settings.get("recovery") and not inherited_watermarks.get(
+            "recovery_enabled_at"
+        ):
+            inherited_watermarks["recovery_enabled_at"] = created
         if inherited_watermarks.get("last_interval_slot") is not None:
             inherited_watermarks["last_interval_slot"] = int(
                 inherited_watermarks["last_interval_slot"]
@@ -2385,13 +2405,17 @@ class TaskStore:
                 "active_event": None,
                 "occurrence_counts": dict(occurrence_counts or {}),
                 "max_cycles": int(max_cycles),
+                "max_cycles_explicit": bool(max_cycles_explicit),
                 "cycle": 0,
                 "completion_request": None,
                 "continuation_request": None,
+                "settings_reset_request": None,
+                "job_history": [],
                 "new_chat_next_job": bool(new_chat_next_job),
                 "new_chat_deferred_task_id": new_chat_deferred_task_id,
                 "close_tab_when_idle": bool(close_tab_when_idle),
                 "idle_since": created if enabled else None,
+                "tab_keep_open_until": None,
                 "last_outcome": dict(last_outcome)
                 if last_outcome is not None
                 else None,
@@ -2455,6 +2479,173 @@ class TaskStore:
                     f"{owner['independent']['agent_name']!r}"
                 )
 
+    def _migrate_legacy_independent_defaults(
+        self, path: str | Path
+    ) -> dict[str, Any]:
+        def mutate(state: dict[str, Any]) -> dict[str, Any]:
+            if not is_independent_task(state):
+                return state
+            independent = state["independent"]
+            if independent.get("deleted_at") or "max_cycles_explicit" in independent:
+                return state
+            legacy_max_cycles = normalize_max_cycles(
+                independent.get("max_cycles"), default=0
+            )
+            legacy_default = legacy_max_cycles in {1, 5}
+            independent["max_cycles_explicit"] = not legacy_default
+            if not legacy_default:
+                return state
+            independent["max_cycles"] = 0
+            active_event = independent.get("active_event")
+            if not isinstance(active_event, Mapping):
+                independent["cycle"] = 0
+                independent["settings_reset_request"] = None
+                return state
+            hop = self._active_independent_hop(state)
+            accepted = hop.get("receipt") is not None or str(
+                hop.get("state") or ""
+            ) in {"sending", "sent", "waiting"}
+            if accepted and hop.get("state") != "responded":
+                independent["settings_reset_request"] = {
+                    "event_key": active_event.get("event_key"),
+                    "requested_at": utc_now(),
+                    "max_cycles": 0,
+                    "source_hop_id": hop.get("hop_id"),
+                    "reason": "MIGRATED_LEGACY_DEFAULT",
+                }
+                return state
+            return self._reset_independent_cycle_by_settings(state, now=utc_now())
+
+        return self.update(path, mutate)
+
+    def normalize_legacy_independent_agents(self) -> list[dict[str, Any]]:
+        """Migrate old defaults and reactivate only the latest orphan identity."""
+        tasks = self.discover()
+        normalized: list[dict[str, Any]] = []
+        migrated_tasks: list[dict[str, Any]] = []
+        for state in tasks:
+            independent = state.get("independent")
+            if (
+                is_independent_task(state)
+                and isinstance(independent, Mapping)
+                and not independent.get("deleted_at")
+                and "max_cycles_explicit" not in independent
+            ):
+                migrated = self._migrate_legacy_independent_defaults(
+                    state["manifest_path"]
+                )
+                if migrated != state:
+                    normalized.append(migrated)
+                state = migrated
+            migrated_tasks.append(state)
+        tasks = migrated_tasks
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for state in tasks:
+            if not is_independent_task(state):
+                continue
+            independent = state.get("independent")
+            if not isinstance(independent, Mapping) or independent.get("deleted_at"):
+                continue
+            grouped.setdefault(str(independent.get("agent_key") or ""), []).append(state)
+
+        for states in grouped.values():
+            nonterminal = [
+                state
+                for state in states
+                if str(state.get("status") or "").upper() not in TERMINAL
+            ]
+            if nonterminal:
+                continue
+            latest = max(
+                states,
+                key=lambda state: int(
+                    (state.get("independent") or {}).get("agent_generation") or 0
+                ),
+            )
+            latest_path = Path(str(latest["manifest_path"])).expanduser().resolve()
+
+            def migrate(current: dict[str, Any]) -> dict[str, Any]:
+                if not is_independent_task(current):
+                    return current
+                independent = current["independent"]
+                if independent.get("deleted_at"):
+                    return current
+                if str(current.get("status") or "").upper() not in TERMINAL:
+                    return current
+                if any(
+                    str(item.get("task_id") or "")
+                    == str(independent.get("successor_task_id") or "")
+                    for item in tasks
+                ):
+                    return current
+                now = utc_now()
+                independent.setdefault("job_history", []).append(
+                    {
+                        "event_key": f"legacy:{current['task_id']}",
+                        "trigger_type": "legacy",
+                        "target_task_id": None,
+                        "target_team": None,
+                        "target_role": None,
+                        "target_hop_id": None,
+                        "cycle": int(independent.get("cycle") or 0),
+                        "disposition": "MIGRATED_LEGACY",
+                        "released_at": now,
+                        "result": independent.get("last_outcome"),
+                        "reason": "Collapsed terminal generation into long-lived identity",
+                    }
+                )
+                if len(independent["job_history"]) > 200:
+                    del independent["job_history"][:-200]
+                independent.update(
+                    active_event=None,
+                    cycle=0,
+                    completion_request=None,
+                    continuation_request=None,
+                    settings_reset_request=None,
+                    successor_task_id=None,
+                    idle_since=now,
+                    tab_keep_open_until=None,
+                )
+                current.pop("completed_at", None)
+                current.pop("stopped_at", None)
+                current.pop("stop_reason", None)
+                current["terminal_state"] = None
+                current["kanban_column"] = INDEPENDENT_COLUMN
+                current["block_code"] = None
+                current["block_retryable"] = False
+                current["block_reason"] = None
+                TaskStore._append_independent_waiting_hop(current, now=now)
+                if independent.get("enabled") is True:
+                    current.update(
+                        status="WAITING",
+                        active_action="waiting_trigger",
+                        pause_reason=None,
+                        waiting_reason="waiting for trigger",
+                        waiting_code="trigger",
+                        waiting={
+                            "reason": "trigger",
+                            "waiting_on": [],
+                            "stopped": [],
+                            "missing": [],
+                            "since": now,
+                        },
+                    )
+                else:
+                    current.update(
+                        status="PAUSED",
+                        active_action="paused",
+                        pause_reason="independent agent disabled",
+                        waiting=None,
+                        waiting_reason=None,
+                        waiting_code=None,
+                    )
+                return current
+
+            migrated = self.update(latest_path, migrate)
+            if migrated != latest:
+                normalized.append(migrated)
+        return normalized
+
     def create_independent_agent(
         self,
         agent_name: str,
@@ -2475,12 +2666,8 @@ class TaskStore:
             if trigger_settings is not None
             else None
         )
-        if max_cycles is not None and (
-            isinstance(max_cycles, bool)
-            or not isinstance(max_cycles, int)
-            or max_cycles < 1
-        ):
-            raise ValueError("max_cycles must be a positive integer")
+        if max_cycles is not None:
+            normalize_max_cycles(max_cycles)
         requested_id = _validate_task_id(task_id) if task_id is not None else None
         self.root.mkdir(parents=True, exist_ok=True)
         with exclusive_file_lock(self.allocation_lock):
@@ -2533,12 +2720,14 @@ class TaskStore:
                 )
             )
             effective_max_cycles = (
-                int(max_cycles)
+                normalize_max_cycles(max_cycles)
                 if max_cycles is not None
                 else (
-                    int(previous["independent"].get("max_cycles") or 1)
+                    normalize_max_cycles(
+                        previous["independent"].get("max_cycles"), default=0
+                    )
                     if previous is not None
-                    else 1
+                    else 0
                 )
             )
             repository_path = Path(
@@ -2593,6 +2782,7 @@ class TaskStore:
                 target=target,
                 enabled=enabled,
                 max_cycles=effective_max_cycles,
+                max_cycles_explicit=max_cycles is not None,
                 inherited_role=(
                     previous["roles"][INDEPENDENT_ROLE]
                     if previous is not None
@@ -2636,7 +2826,7 @@ class TaskStore:
         *,
         system_prompt: str,
         trigger_settings: Mapping[str, Any] | None = None,
-        max_cycles: int = 1,
+        max_cycles: int = 0,
     ) -> dict[str, Any]:
         return self.create_independent_agent(
             agent_name,
@@ -2720,7 +2910,12 @@ class TaskStore:
             if independent.get("completion_request") is not None:
                 raise ValueError("independent completion is already requested")
             cycle = int(independent.get("cycle") or 0)
-            if cycle >= int(independent.get("max_cycles") or 1):
+            if independent_cycle_limit_reached(
+                cycle=cycle,
+                max_cycles=normalize_max_cycles(
+                    independent.get("max_cycles"), default=0
+                ),
+            ):
                 raise ValueError("independent maximum cycles reached")
             existing = independent.get("continuation_request")
             if existing is not None and str(existing.get("reason") or "") != normalized:
@@ -2749,6 +2944,202 @@ class TaskStore:
 
         return self.update(path, mutate)
 
+    @staticmethod
+    def _active_independent_hop(state: Mapping[str, Any]) -> dict[str, Any]:
+        active_hop_id = state.get("active_hop_id")
+        return next(
+            item
+            for item in state.get("hops") or []
+            if isinstance(item, dict) and item.get("hop_id") == active_hop_id
+        )
+
+    @staticmethod
+    def _append_independent_waiting_hop(
+        state: dict[str, Any], *, now: str
+    ) -> dict[str, Any]:
+        try:
+            previous = TaskStore._active_independent_hop(state)
+        except StopIteration:
+            previous = next(
+                (
+                    item
+                    for item in reversed(state.get("hops") or [])
+                    if isinstance(item, dict)
+                ),
+                None,
+            )
+            if previous is None:
+                raise ValueError("independent task has no reusable hop template")
+        next_hop_id = max(int(item["hop_id"]) for item in state["hops"]) + 1
+        hop = json.loads(json.dumps(previous, ensure_ascii=False))
+        hop.update(
+            hop_id=next_hop_id,
+            parent_hop_id=previous.get("hop_id"),
+            source_role=INDEPENDENT_ROLE,
+            target_role=INDEPENDENT_ROLE,
+            turn=next_hop_id,
+            kind="independent_job",
+            handoff="Waiting for trigger",
+            state="waiting_trigger",
+            request_id=f"{state['task_id']}-hop{next_hop_id}",
+            prompt=None,
+            prompt_sha256=None,
+            rendered_prompt_sha256=None,
+            receipt=None,
+            message_identity=None,
+            response=None,
+            response_sha256=None,
+            report_path=None,
+            report_sha256=None,
+            report_size=None,
+            route=None,
+            repair_attempt=0,
+            validation_error=None,
+            wait={key: None for key in (previous.get("wait") or {})},
+            timestamps={"created_at": now},
+            errors=[],
+        )
+        hop["wait"].update(
+            activity_length=0,
+            transport_ui_active=False,
+            last_stop_visible=False,
+            refresh_count=0,
+        )
+        state["hops"].append(hop)
+        state["active_hop_id"] = next_hop_id
+        state["active_role"] = INDEPENDENT_ROLE
+        return hop
+
+    @staticmethod
+    def _append_independent_job_history(
+        independent: dict[str, Any],
+        event: Mapping[str, Any],
+        *,
+        disposition: str,
+        released_at: str,
+        cycle: int,
+        result: Mapping[str, Any] | None = None,
+        reason: str | None = None,
+    ) -> None:
+        normalized = normalize_event(event)
+        entry = {
+            "event_key": normalized["event_key"],
+            "trigger_type": normalized["trigger_type"],
+            "target_task_id": normalized.get("target_task_id"),
+            "target_team": normalized.get("target_team"),
+            "target_role": normalized.get("target_role"),
+            "target_hop_id": normalized.get("target_hop_id"),
+            "cycle": int(cycle),
+            "disposition": str(disposition),
+            "released_at": released_at,
+            "result": dict(result) if result is not None else None,
+            "reason": sanitize_text(reason, max_chars=1200).strip() or None,
+        }
+        history = independent.setdefault("job_history", [])
+        identity = (entry["event_key"], entry["disposition"], entry["released_at"])
+        if any(
+            (
+                item.get("event_key"),
+                item.get("disposition"),
+                item.get("released_at"),
+            )
+            == identity
+            for item in history
+            if isinstance(item, Mapping)
+        ):
+            return
+        history.append(entry)
+        if len(history) > 200:
+            del history[:-200]
+
+    def _release_independent_job(
+        self,
+        state: dict[str, Any],
+        *,
+        disposition: str,
+        now: str,
+        completion: Mapping[str, Any] | None = None,
+        reason: str | None = None,
+        consume_event: bool = True,
+        preserve_enabled: bool = False,
+    ) -> dict[str, Any]:
+        independent = state["independent"]
+        event = independent.get("active_event")
+        if not isinstance(event, Mapping):
+            raise ValueError("independent task has no active event")
+        cycle = int(independent.get("cycle") or 0)
+        if consume_event:
+            record_consumed_event(independent, event)
+            record_recovery_release(
+                independent,
+                event,
+                now=datetime.fromisoformat(now.replace("Z", "+00:00")),
+            )
+        self._append_independent_job_history(
+            independent,
+            event,
+            disposition=disposition,
+            released_at=now,
+            cycle=cycle,
+            result=completion,
+            reason=reason,
+        )
+        trigger_type = str(event.get("trigger_type") or "").strip().lower()
+        if not preserve_enabled and disposition == "COMPLETED":
+            independent["enabled"] = bool(independent.get("enabled")) and trigger_type in {
+                "recovery",
+                "interval",
+                "check_all",
+            }
+        independent.update(
+            active_event=None,
+            cycle=0,
+            completion_request=None,
+            continuation_request=None,
+            settings_reset_request=None,
+            idle_since=now,
+            tab_keep_open_until=(
+                datetime.fromisoformat(now.replace("Z", "+00:00"))
+                + timedelta(seconds=int(self.config.independent_idle_close_seconds))
+            ).isoformat(),
+            close_tab_when_idle=False,
+            successor_task_id=None,
+        )
+        state.pop("completed_at", None)
+        state.pop("stopped_at", None)
+        state.pop("stop_reason", None)
+        state["terminal_state"] = None
+        state["kanban_column"] = INDEPENDENT_COLUMN
+        state["block_code"] = None
+        state["block_retryable"] = False
+        state["block_reason"] = None
+        self._append_independent_waiting_hop(state, now=now)
+        if independent.get("enabled") is True:
+            state.update(
+                status="WAITING",
+                active_action="waiting_trigger",
+                pause_reason=None,
+                waiting_reason="waiting for trigger",
+                waiting_code="trigger",
+                waiting={
+                    "reason": "trigger",
+                    "waiting_on": [],
+                    "stopped": [],
+                    "missing": [],
+                    "since": now,
+                },
+            )
+        else:
+            state.update(
+                status="PAUSED",
+                active_action="paused",
+                pause_reason="independent agent disabled",
+                waiting=None,
+                waiting_reason=None,
+                waiting_code=None,
+            )
+        return state
+
     def complete_independent_task(
         self,
         path: str | Path,
@@ -2758,8 +3149,7 @@ class TaskStore:
         target_task_id: str | None = None,
         repair_task_id: str | None = None,
         external_command_id: str | None = None,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        target = Path(path).expanduser().resolve()
+    ) -> dict[str, Any]:
         request = normalize_completion_request(
             {
                 "outcome": outcome,
@@ -2769,150 +3159,112 @@ class TaskStore:
                 "requested_at": utc_now(),
             }
         )
-        self.root.mkdir(parents=True, exist_ok=True)
-        with exclusive_file_lock(self.allocation_lock):
-            catalog = self._load_catalog_unlocked(reconcile=False)
-            tasks, _errors = self._discover_with_catalog_unlocked(catalog)
-            with exclusive_file_lock(self._lock_path(target)):
-                current = self._load_current_manifest_unlocked(target)
-                if not is_independent_task(current):
-                    raise ValueError("task is not independent")
-                independent = current["independent"]
-                generation = int(independent["agent_generation"])
-                successor_id = self._independent_task_id(
-                    str(independent["agent_key"]), generation + 1
-                )
-                recorded = independent.get("successor_task_id")
-                if recorded not in {None, successor_id}:
-                    raise ValueError("independent successor identity is inconsistent")
-                if str(current.get("status") or "").upper() != "DONE":
-                    active = independent.get("active_event")
-                    if not isinstance(active, Mapping):
-                        raise ValueError(
-                            "independent task has no active event to complete"
-                        )
-                    hop = next(
-                        item
-                        for item in current["hops"]
-                        if item.get("hop_id") == current.get("active_hop_id")
+
+        def mutate(state: dict[str, Any]) -> dict[str, Any]:
+            if not is_independent_task(state):
+                raise ValueError("task is not independent")
+            independent = state["independent"]
+            if external_command_id in state.get("applied_command_ids", []):
+                return state
+            active = independent.get("active_event")
+            if not isinstance(active, Mapping):
+                last = independent.get("last_outcome")
+                history = independent.get("job_history") or []
+                if (
+                    isinstance(last, Mapping)
+                    and {
+                        key: value for key, value in normalize_completion_request(last).items()
+                        if key != "requested_at"
+                    }
+                    == {
+                        key: value for key, value in request.items()
+                        if key != "requested_at"
+                    }
+                    and history
+                    and history[-1].get("disposition") == "COMPLETED"
+                ):
+                    return state
+                raise ValueError("independent task has no active event to complete")
+            hop = self._active_independent_hop(state)
+            if hop.get("state") != "responded":
+                raise ValueError("independent completion requires a durable response")
+            finalized_request = request
+            pending = independent.get("completion_request")
+            if pending is not None:
+                normalized_pending = normalize_completion_request(pending)
+                if {
+                    key: value for key, value in normalized_pending.items()
+                    if key != "requested_at"
+                } != {
+                    key: value for key, value in request.items()
+                    if key != "requested_at"
+                }:
+                    raise ValueError("completion request changed before finalization")
+                finalized_request = normalized_pending
+            now = utc_now()
+            response = str(hop.get("response") or "").strip()
+            if response:
+                report_id = f"{state['task_id']}-independent-hop{hop['hop_id']}"
+                reports = state.setdefault("reports", [])
+                if not any(item.get("report_id") == report_id for item in reports):
+                    reports.append(
+                        {
+                            "report_id": report_id,
+                            "role": INDEPENDENT_ROLE,
+                            "hop_id": hop["hop_id"],
+                            "created_at": now,
+                            "content": response,
+                            "sha256": hop.get("response_sha256"),
+                            "outcome": finalized_request["outcome"],
+                            "summary": finalized_request["summary"],
+                        }
                     )
-                    if hop.get("state") != "responded":
-                        raise ValueError(
-                            "independent completion requires a durable response"
-                        )
-                    record_consumed_event(independent, active)
-                    self._record_external_command(current, external_command_id)
-                    pending = independent.get("completion_request")
-                    if pending is not None:
-                        normalized_pending = normalize_completion_request(pending)
-                        if {
-                            key: value
-                            for key, value in normalized_pending.items()
-                            if key != "requested_at"
-                        } != {
-                            key: value
-                            for key, value in request.items()
-                            if key != "requested_at"
-                        }:
-                            raise ValueError("completion request changed before finalization")
-                        request = normalized_pending
-                    independent.update(
-                        active_event=None,
-                        completion_request=request,
-                        close_tab_when_idle=(
-                            str(active.get("trigger_type") or "").lower() == "manual"
-                        ),
-                        continuation_request=None,
-                        last_outcome=request,
-                        successor_task_id=successor_id,
-                    )
-                    current.update(
-                        status="DONE",
-                        kanban_column="DONE",
-                        terminal_state="DONE",
-                        active_role=None,
-                        active_hop_id=None,
-                        active_action="completed",
-                        waiting=None,
-                        waiting_reason=None,
-                        waiting_code=None,
-                        completed_at=utc_now(),
-                    )
-                    response = str(hop.get("response") or "").strip()
-                    if response:
-                        current.setdefault("reports", []).append(
-                            {
-                                "report_id": f"{current['task_id']}-independent",
-                                "role": INDEPENDENT_ROLE,
-                                "hop_id": hop["hop_id"],
-                                "created_at": current["completed_at"],
-                                "content": response,
-                                "sha256": hop.get("response_sha256"),
-                                "outcome": request["outcome"],
-                                "summary": request["summary"],
-                            }
-                        )
-                    current = self._save_unlocked(target, current)
-                    catalog["entries"][self._catalog_key(target)] = (
-                        self._catalog_entry(current)
-                    )
-            successor = next(
-                (
-                    item
-                    for item in tasks
-                    if str(item.get("task_id") or "") == successor_id
-                ),
-                None,
+            independent["last_outcome"] = finalized_request
+            self._record_external_command(state, external_command_id)
+            return self._release_independent_job(
+                state,
+                disposition="COMPLETED",
+                now=now,
+                completion=finalized_request,
             )
-            if successor is None:
-                title = f"Independent agent: {independent['agent_name']}"
-                successor_path = (
-                    self.root
-                    / current["team"]
-                    / successor_id
-                    / f"{slugify(title)}.json"
-                ).resolve()
-                successor = self._initial_independent_state(
-                    agent_name=independent["agent_name"],
-                    agent_key=independent["agent_key"],
-                    team=current["team"],
-                    system_prompt=independent["system_prompt"],
-                    trigger_settings=independent["trigger_settings"],
-                    task_id=successor_id,
-                    generation=generation + 1,
-                    previous_task_id=current["task_id"],
-                    repository_path=Path(current["repository"]),
-                    target=successor_path,
-                    enabled=bool(independent["enabled"]),
-                    max_cycles=int(independent["max_cycles"]),
-                    inherited_role=current["roles"][INDEPENDENT_ROLE],
-                    watermarks=independent.get("watermarks"),
-                    occurrence_counts=independent.get("occurrence_counts"),
-                    last_outcome=request,
-                    new_chat_next_job=bool(
-                        independent.get("new_chat_next_job")
-                    ),
-                    new_chat_deferred_task_id=independent.get(
-                        "new_chat_deferred_task_id"
-                    ),
-                    close_tab_when_idle=bool(
-                        independent.get("close_tab_when_idle")
-                    ),
-                )
-                successor = self._save_unlocked(successor_path, successor)
-                catalog["entries"][self._catalog_key(successor_path)] = (
-                    self._catalog_entry(successor)
-                )
-            elif (
-                not is_independent_task(successor)
-                or successor["independent"].get("agent_key")
-                != independent.get("agent_key")
-                or successor["independent"].get("previous_task_id")
-                != current["task_id"]
-            ):
-                raise ValueError("independent successor conflicts with predecessor")
-            self._write_catalog_unlocked(catalog)
-            return current, successor
+
+        return self.update(path, mutate)
+
+    def reset_independent_task(
+        self,
+        path: str | Path,
+        *,
+        reason: str,
+        external_command_id: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_reason = sanitize_text(reason, max_chars=1200).strip()
+        if not normalized_reason:
+            raise ValueError("reset reason must not be empty")
+
+        def mutate(state: dict[str, Any]) -> dict[str, Any]:
+            if not is_independent_task(state):
+                raise ValueError("task is not independent")
+            if external_command_id in state.get("applied_command_ids", []):
+                return state
+            independent = state["independent"]
+            event = independent.get("active_event")
+            if not isinstance(event, Mapping):
+                self._record_external_command(state, external_command_id)
+                return state
+            hop = self._active_independent_hop(state)
+            if hop.get("state") not in {"responded", "routed", "abandoned"}:
+                hop["state"] = "abandoned"
+                hop.setdefault("timestamps", {})["abandoned_at"] = utc_now()
+            self._record_external_command(state, external_command_id)
+            return self._release_independent_job(
+                state,
+                disposition="RESET",
+                now=utc_now(),
+                reason=normalized_reason,
+                preserve_enabled=True,
+            )
+
+        return self.update(path, mutate)
 
     def continue_independent_task(
         self,
@@ -2930,7 +3282,12 @@ class TaskStore:
                 raise ValueError("task is not independent")
             independent = state["independent"]
             cycle = int(independent.get("cycle") or 0)
-            if cycle >= int(independent.get("max_cycles") or 1):
+            if independent_cycle_limit_reached(
+                cycle=cycle,
+                max_cycles=normalize_max_cycles(
+                    independent.get("max_cycles"), default=0
+                ),
+            ):
                 raise ValueError("independent maximum cycles reached")
             active_hop = next(
                 item
@@ -3064,6 +3421,66 @@ class TaskStore:
 
         return self.update(path, mutate)
 
+    def _reset_independent_cycle_by_settings(
+        self,
+        state: dict[str, Any],
+        *,
+        now: str,
+    ) -> dict[str, Any]:
+        independent = state["independent"]
+        event = independent.get("active_event")
+        if not isinstance(event, Mapping):
+            independent["cycle"] = 0
+            independent["settings_reset_request"] = None
+            return state
+        hop = self._active_independent_hop(state)
+        if hop.get("state") not in {"responded", "routed", "abandoned"}:
+            hop["state"] = "abandoned"
+            hop.setdefault("timestamps", {})["abandoned_at"] = now
+        self._append_independent_job_history(
+            independent,
+            event,
+            disposition="RESET_BY_SETTINGS",
+            released_at=now,
+            cycle=int(independent.get("cycle") or 0),
+            reason="Max turns per job changed",
+        )
+        next_hop = self._append_independent_waiting_hop(state, now=now)
+        next_hop["state"] = "pre_send"
+        next_hop["handoff"] = json.dumps(event, ensure_ascii=False, sort_keys=True)
+        independent.update(
+            cycle=1,
+            completion_request=None,
+            continuation_request=None,
+            settings_reset_request=None,
+            idle_since=None,
+            tab_keep_open_until=None,
+        )
+        state.update(
+            status="RUNNING",
+            kanban_column=INDEPENDENT_COLUMN,
+            active_action="queued",
+            waiting=None,
+            waiting_reason=None,
+            waiting_code=None,
+            pause_reason=None,
+        )
+        return state
+
+    def finalize_independent_settings_reset(self, path: str | Path) -> dict[str, Any]:
+        def mutate(state: dict[str, Any]) -> dict[str, Any]:
+            if not is_independent_task(state):
+                raise ValueError("task is not independent")
+            independent = state["independent"]
+            if not isinstance(independent.get("settings_reset_request"), Mapping):
+                return state
+            hop = self._active_independent_hop(state)
+            if hop.get("state") != "responded":
+                raise ValueError("settings reset requires a durable response boundary")
+            return self._reset_independent_cycle_by_settings(state, now=utc_now())
+
+        return self.update(path, mutate)
+
     def update_independent_agent(
         self,
         path: str | Path,
@@ -3071,6 +3488,7 @@ class TaskStore:
         enabled: bool | None = None,
         system_prompt: str | None = None,
         trigger_settings: Mapping[str, Any] | None = None,
+        max_cycles: int | None = None,
         new_chat_next_job: bool | None = None,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
@@ -3081,6 +3499,9 @@ class TaskStore:
             validate_trigger_settings(trigger_settings)
             if trigger_settings is not None
             else None
+        )
+        normalized_max_cycles = (
+            normalize_max_cycles(max_cycles) if max_cycles is not None else None
         )
         target = Path(path).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
@@ -3118,16 +3539,29 @@ class TaskStore:
                         )
 
                 independent = current["independent"]
+                if external_command_id in current.get("applied_command_ids", []):
+                    return current
+                if independent.get("deleted_at"):
+                    raise ValueError("independent agent is deleted")
                 if normalized_prompt is not None:
                     independent["system_prompt"] = normalized_prompt
                     current["roles"][INDEPENDENT_ROLE][
                         "constructor_sent_generation"
                     ] = None
                 if normalized_settings is not None:
-                    previous_interval = validate_trigger_settings(
+                    previous_settings = validate_trigger_settings(
                         independent.get("trigger_settings")
-                    )["interval_minutes"]
+                    )
+                    previous_interval = previous_settings["interval_minutes"]
                     independent["trigger_settings"] = normalized_settings
+                    if (
+                        prospective_enabled
+                        and normalized_settings["recovery"]
+                        and not previous_settings["recovery"]
+                    ):
+                        independent.setdefault("watermarks", {})[
+                            "recovery_enabled_at"
+                        ] = utc_now()
                     next_interval = normalized_settings["interval_minutes"]
                     if next_interval is None:
                         independent.setdefault("watermarks", {}).pop(
@@ -3140,6 +3574,33 @@ class TaskStore:
                             datetime.now(timezone.utc).timestamp()
                             // (int(next_interval) * 60)
                         )
+                if normalized_max_cycles is not None:
+                    previous_max_cycles = normalize_max_cycles(
+                        independent.get("max_cycles"), default=0
+                    )
+                    independent["max_cycles"] = normalized_max_cycles
+                    independent["max_cycles_explicit"] = True
+                    if normalized_max_cycles != previous_max_cycles:
+                        active_event = independent.get("active_event")
+                        if isinstance(active_event, Mapping):
+                            hop = self._active_independent_hop(current)
+                            accepted = hop.get("receipt") is not None or str(
+                                hop.get("state") or ""
+                            ) in {"sending", "sent", "waiting"}
+                            if accepted and hop.get("state") != "responded":
+                                independent["settings_reset_request"] = {
+                                    "event_key": active_event.get("event_key"),
+                                    "requested_at": utc_now(),
+                                    "max_cycles": normalized_max_cycles,
+                                    "source_hop_id": hop.get("hop_id"),
+                                }
+                            else:
+                                self._reset_independent_cycle_by_settings(
+                                    current, now=utc_now()
+                                )
+                        else:
+                            independent["cycle"] = 0
+                            independent["settings_reset_request"] = None
                 if new_chat_next_job is not None:
                     independent["new_chat_next_job"] = bool(new_chat_next_job)
                 if enabled is not None:
@@ -3164,6 +3625,11 @@ class TaskStore:
                             current["waiting_reason"] = "waiting for trigger"
                             current["waiting_code"] = "trigger"
                             independent["idle_since"] = now
+                            independent["tab_keep_open_until"] = None
+                            if prospective_settings["recovery"]:
+                                independent.setdefault("watermarks", {})[
+                                    "recovery_enabled_at"
+                                ] = now
                     else:
                         current["status"] = "PAUSED"
                         current["kanban_column"] = "PAUSED"
@@ -5755,7 +6221,7 @@ class TaskStore:
         confirmed: bool = False,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
-        allowed = {"pause", "resume", "retry", "stop", "restart_role", "open_tab", "close_tab", "new_chat", "route_plan", "clear_team"}
+        allowed = {"pause", "resume", "retry", "stop", "reset", "restart_role", "open_tab", "close_tab", "new_chat", "route_plan", "clear_team"}
         action = str(action).strip().lower()
         if action not in allowed:
             raise ValueError(f"unsupported control action {action!r}")
@@ -5771,6 +6237,18 @@ class TaskStore:
             )
 
         def mutate(state: dict[str, Any]) -> dict[str, Any]:
+            if is_independent_task(state) and action == "stop":
+                raise ValueError("independent agents use Reset; Stop is not supported")
+            if not is_independent_task(state) and action == "reset":
+                raise ValueError("Reset is available only for independent agents")
+            if role is not None:
+                expected_roles = (
+                    {INDEPENDENT_ROLE}
+                    if is_independent_task(state)
+                    else set(state.get("roles", {}))
+                )
+                if role not in expected_roles:
+                    raise ValueError(f"unsupported control role {role!r}")
             if external_command_id in state.get("applied_command_ids", []):
                 return state
             self._queue_control(

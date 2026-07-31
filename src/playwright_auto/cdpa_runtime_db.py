@@ -11,7 +11,7 @@ from typing import Any, Iterator, Mapping, Sequence
 from .cdpa_projection import TaskProjection
 
 SNAPSHOT_NAMES = frozenset(
-    {"catalog", "board", "worker", "browser", "dashboard_actions"}
+    {"catalog", "board", "worker", "browser", "dashboard_actions", "agents"}
 )
 COMMAND_KINDS = frozenset(
     {
@@ -21,6 +21,7 @@ COMMAND_KINDS = frozenset(
         "independent_complete",
         "independent_continue",
         "independent_run_now",
+        "independent_reset",
         "independent_settings",
         "independent_activate_agent",
         "independent_create_repair",

@@ -21,6 +21,7 @@ from .cdpa_independent import (
     normalize_agent_name,
     normalize_completion_request,
     normalize_manual_instruction,
+    normalize_max_cycles,
     normalize_system_prompt,
     validate_trigger_settings,
 )
@@ -233,7 +234,7 @@ class DashboardAPI:
         return normalized
 
     def normalize_independent_create(self, raw: Mapping[str, Any]) -> dict[str, Any]:
-        allowed = {"name", "system_prompt", "mode", "trigger_settings"}
+        allowed = {"name", "system_prompt", "mode", "trigger_settings", "max_cycles"}
         unknown = set(raw) - allowed
         if unknown:
             raise APIError(400, "invalid_request", f"unknown fields: {sorted(unknown)!r}")
@@ -248,11 +249,18 @@ class DashboardAPI:
                 if "trigger_settings" in raw
                 else None
             )
+            max_cycles = (
+                normalize_max_cycles(raw.get("max_cycles"))
+                if "max_cycles" in raw
+                else None
+            )
         except ValueError as exc:
             raise APIError(400, "invalid_request", str(exc)) from exc
         payload = {"name": name, "system_prompt": prompt, "mode": "Independent"}
         if settings is not None:
             payload["trigger_settings"] = settings
+        if max_cycles is not None:
+            payload["max_cycles"] = max_cycles
         return payload
 
     def normalize_independent_completion(
@@ -387,6 +395,7 @@ class DashboardAPI:
             "system_prompt",
             "trigger_settings",
             "new_chat_next_job",
+            "max_cycles",
         }
         unknown = set(raw) - allowed
         if unknown:
@@ -408,6 +417,11 @@ class DashboardAPI:
                 payload["trigger_settings"] = validate_trigger_settings(
                     raw["trigger_settings"]
                 )
+            except ValueError as exc:
+                raise APIError(400, "invalid_request", str(exc)) from exc
+        if "max_cycles" in raw:
+            try:
+                payload["max_cycles"] = normalize_max_cycles(raw["max_cycles"])
             except ValueError as exc:
                 raise APIError(400, "invalid_request", str(exc)) from exc
         if "new_chat_next_job" in raw:
@@ -638,6 +652,20 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
             )
             self._json(200, payload, headers={"ETag": etag})
             return
+        if path == "/api/agents":
+            snapshot = db.get_snapshot("agents")
+            version = int((snapshot or {}).get("version") or 0)
+            etag = f'"agents-{version}"'
+            if self.headers.get("If-None-Match") == etag:
+                self._send(304, headers={"ETag": etag})
+                return
+            payload = (
+                dict(snapshot["payload"])
+                if snapshot is not None
+                else {"degraded": True, "independent": []}
+            )
+            self._json(200, payload, headers={"ETag": etag})
+            return
         if path == "/api/tasks":
             version = db.get_snapshot_version("board") or 0
             etag = f'"board-{version}"'
@@ -799,6 +827,18 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                 elif operation == "run":
                     payload = app.normalize_independent_run(raw)
                     kind = "independent_run_now"
+                elif operation == "reset":
+                    if set(raw) - {"reason"}:
+                        raise APIError(400, "invalid_request", "reset accepts only reason")
+                    reason = str(raw.get("reason") or "Operator reset").strip()
+                    if not reason or len(reason) > 1200:
+                        raise APIError(
+                            400,
+                            "invalid_request",
+                            "reason must contain 1 to 1200 characters",
+                        )
+                    payload = {"reason": reason}
+                    kind = "independent_reset"
                 elif operation == "activate":
                     payload = app.normalize_independent_activation(raw)
                     kind = "independent_activate_agent"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -193,29 +194,39 @@ def test_renew_rejects_accepted_inflight_without_mutation(tmp_path: Path):
     assert actions.closed_teams == 0
 
 
-def test_manual_completion_requests_immediate_existing_idle_close_and_retains_url(
+def test_completion_waits_until_keep_open_boundary_and_reopens_saved_url(
     tmp_path: Path,
 ):
     _config, store, state, worker = setup_agent(tmp_path)
     responded = mark_responded(store, state, trigger_type="manual")
-    _completed, successor = store.complete_independent_task(
+    completed = store.complete_independent_task(
         responded["manifest_path"],
         outcome="SUCCESS",
         summary="Manual job completed.",
     )
 
-    assert successor["independent"]["close_tab_when_idle"] is True
-    saved_page_id = successor["roles"]["AGENT"]["page_id"]
-    saved_page_url = successor["roles"]["AGENT"]["page_url"]
+    assert completed["task_id"] == responded["task_id"]
+    assert completed["status"] == "PAUSED"
+    assert completed["independent"]["enabled"] is False
+    saved_page_id = completed["roles"]["AGENT"]["page_id"]
+    saved_page_url = completed["roles"]["AGENT"]["page_url"]
+    keep_open_epoch = datetime.fromisoformat(
+        completed["independent"]["tab_keep_open_until"]
+    ).timestamp()
 
     worker.hydrate_runtime(startup=False)
     actions = FakeActions()
-    changed = asyncio.run(worker._close_idle_independent_tabs(actions))
-    persisted = store.load(successor["manifest_path"])
+    assert not asyncio.run(
+        worker._close_idle_independent_tabs(actions, now_epoch=keep_open_epoch - 1)
+    )
+    assert actions.closed_teams == 0
 
-    assert successor["task_id"] in changed
+    changed = asyncio.run(
+        worker._close_idle_independent_tabs(actions, now_epoch=keep_open_epoch)
+    )
+    persisted = store.load(completed["manifest_path"])
+    assert completed["task_id"] in changed
     assert actions.closed_teams == 1
-    assert persisted["independent"]["close_tab_when_idle"] is False
     assert persisted["roles"]["AGENT"]["page_id"] == saved_page_id
     assert persisted["roles"]["AGENT"]["page_url"] == saved_page_url
     assert persisted["roles"]["AGENT"]["online"] is False
@@ -258,21 +269,32 @@ def test_manual_completion_requests_immediate_existing_idle_close_and_retains_ur
     }
     assert reopen_actions.reopened_url == saved_page_url
 
-    nonmanual_root = tmp_path / "nonmanual"
-    nonmanual_root.mkdir()
-    _config2, store2, state2, worker2 = setup_agent(nonmanual_root)
+    recurring_root = tmp_path / "recurring"
+    recurring_root.mkdir()
+    _config2, store2, state2, worker2 = setup_agent(recurring_root)
     responded2 = mark_responded(store2, state2, trigger_type="check_all")
-    _completed2, successor2 = store2.complete_independent_task(
+    completed2 = store2.complete_independent_task(
         responded2["manifest_path"],
         outcome="SUCCESS",
         summary="CHECK_ALL completed.",
     )
-    assert successor2["independent"].get("close_tab_when_idle") is False
+    assert completed2["task_id"] == responded2["task_id"]
+    assert completed2["status"] == "WAITING"
+    assert completed2["independent"]["enabled"] is True
+    keep_open_epoch2 = datetime.fromisoformat(
+        completed2["independent"]["tab_keep_open_until"]
+    ).timestamp()
     worker2.hydrate_runtime(startup=False)
     actions2 = FakeActions()
-    changed2 = asyncio.run(worker2._close_idle_independent_tabs(actions2))
-    assert successor2["task_id"] not in changed2
-    assert actions2.closed_teams == 0
+    assert not asyncio.run(
+        worker2._close_idle_independent_tabs(actions2, now_epoch=keep_open_epoch2 - 1)
+    )
+    changed2 = asyncio.run(
+        worker2._close_idle_independent_tabs(actions2, now_epoch=keep_open_epoch2)
+    )
+    assert completed2["task_id"] in changed2
+    assert actions2.closed_teams == 1
+
 
 def test_board_uses_operator_labels_run_task_and_restored_settings():
     html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")

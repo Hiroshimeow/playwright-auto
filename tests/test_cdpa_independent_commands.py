@@ -100,7 +100,7 @@ def test_create_independent_agent_command_is_idempotent(tmp_path: Path):
 
 
 
-def test_custom_agent_create_configure_run_complete_respawns_once(tmp_path: Path):
+def test_custom_agent_create_configure_run_complete_reuses_identity(tmp_path: Path):
     config, store, worker = setup_worker(tmp_path)
     api = DashboardAPI(config, db=worker.runtime_db)
     created_command = api.enqueue(
@@ -179,17 +179,20 @@ def test_custom_agent_create_configure_run_complete_respawns_once(tmp_path: Path
 
     tasks = store.discover()
     completed = next(item for item in tasks if item["task_id"] == agent["task_id"])
-    successors = [
+    identities = [
         item
         for item in tasks
         if item.get("task_mode") == "independent"
-        and item["independent"].get("previous_task_id") == agent["task_id"]
+        and item["independent"].get("agent_key")
+        == completed["independent"].get("agent_key")
     ]
-    assert completed["status"] == "DONE"
+    assert completed["status"] == "WAITING"
+    assert completed["independent"]["enabled"] is True
+    assert completed["independent"]["active_event"] is None
+    assert completed["independent"]["job_history"][-1]["disposition"] == "COMPLETED"
     assert complete_command["command_id"] in completed["applied_command_ids"]
-    assert len(successors) == 1
-    assert successors[0]["status"] == "WAITING"
-    assert successors[0]["independent"]["trigger_settings"] == configured["independent"][
+    assert len(identities) == 1
+    assert completed["independent"]["trigger_settings"] == configured["independent"][
         "trigger_settings"
     ]
 
@@ -222,6 +225,26 @@ def test_independent_target_control_is_bound_to_active_event(tmp_path: Path):
         return current
 
     target = store.update(target["manifest_path"], block)
+    target = store.update(
+        target["manifest_path"],
+        lambda current: {
+            **current,
+            "blocked_at": "2026-07-26T00:00:00+00:00",
+        },
+    )
+    agent = store.update(
+        agent["manifest_path"],
+        lambda current: {
+            **current,
+            "independent": {
+                **current["independent"],
+                "watermarks": {
+                    **current["independent"]["watermarks"],
+                    "recovery_enabled_at": "2026-07-26T00:00:00+00:00",
+                },
+            },
+        },
+    )
     worker.hydrate_runtime(startup=False)
     worker._activate_independent_agents()
     agent = store.load(agent["manifest_path"])

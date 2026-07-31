@@ -31,9 +31,10 @@ from .cdpa_independent import (
     INDEPENDENT_ROLE,
     canonical_independent_events,
     claim_oldest_event,
+    independent_tags,
     is_independent_task,
     normalize_agent_name,
-    record_consumed_event,
+    validate_trigger_settings,
 )
 from .cdpa_projection import (
     build_dashboard_actions,
@@ -1506,30 +1507,35 @@ class CDPAWorker:
             record["online"] = False
             record["last_activity_at"] = utc_now()
             return {"closed_tabs": closed}
-        if action == "stop":
+        if action == "reset":
             acquired = await actions.locate_owned(state, role)
             stopped_response = (
                 await actions.stop_if_active(acquired) if acquired is not None else False
             )
             event = independent.get("active_event")
-            event_key = (
-                str(event.get("event_key") or "")
-                if isinstance(event, Mapping)
-                else ""
+            if not isinstance(event, Mapping):
+                return {"reset": False, "reason": "no active job"}
+            if hop is not None and hop.get("state") not in {
+                "responded",
+                "routed",
+                "abandoned",
+            }:
+                hop["state"] = "abandoned"
+                hop.setdefault("timestamps", {})["abandoned_at"] = utc_now()
+            self.store._release_independent_job(
+                state,
+                disposition="RESET",
+                now=utc_now(),
+                reason=str(control.get("reason") or "independent job reset"),
+                preserve_enabled=True,
             )
-            if event_key:
-                record_consumed_event(independent, event)
-            independent["enabled"] = False
-            independent["active_event"] = None
-            state["status"] = "STOPPED"
-            state["terminal_state"] = "STOPPED"
-            state["kanban_column"] = "STOPPED"
-            state["stopped_at"] = utc_now()
-            state["stop_reason"] = control.get("reason") or "independent job stopped"
-            state["active_role"] = None
-            state["active_hop_id"] = None
-            state["active_action"] = "stopped"
-            return {"stopped_response": stopped_response, "enabled": False}
+            return {
+                "reset": True,
+                "stopped_response": stopped_response,
+                "enabled": bool(independent.get("enabled")),
+            }
+        if action == "stop":
+            raise RuntimeError("independent agents use Reset; Stop is not supported")
         raise RuntimeError(f"unsupported independent control action {action!r}")
 
     async def _apply_control(
@@ -2186,7 +2192,7 @@ class CDPAWorker:
                 workspace=str(state["repository"]),
                 event=active_event,
                 cycle=int(independent.get("cycle") or 1),
-                max_cycles=int(independent.get("max_cycles") or 1),
+                max_cycles=int(independent.get("max_cycles") or 0),
                 constructor_sent_generation=role_record.get(
                     "constructor_sent_generation"
                 ),
@@ -4056,10 +4062,15 @@ class CDPAWorker:
                         self._responded(state, hop)
                         if is_independent_task(state):
                             pending = state["independent"]
+                            settings_reset = pending.get("settings_reset_request")
                             completion = pending.get("completion_request")
                             continuation = pending.get("continuation_request")
+                            if settings_reset is not None:
+                                reset = self.store.finalize_independent_settings_reset(path)
+                                self._publish_command_state(reset)
+                                return reset
                             if completion is not None:
-                                completed, successor = self.store.complete_independent_task(
+                                completed = self.store.complete_independent_task(
                                     path,
                                     outcome=str(completion.get("outcome") or ""),
                                     summary=str(completion.get("summary") or ""),
@@ -4067,7 +4078,6 @@ class CDPAWorker:
                                     repair_task_id=completion.get("repair_task_id"),
                                 )
                                 self._publish_command_state(completed)
-                                self._publish_command_state(successor)
                                 return completed
                             if continuation is not None:
                                 continued = self.store.continue_independent_task(
@@ -4330,13 +4340,13 @@ class CDPAWorker:
             "Maintainers",
             system_prompt=BUILTIN_MAINTAINERS_PROMPT,
             trigger_settings={"recovery": True},
-            max_cycles=5,
+            max_cycles=0,
         )
         self.store.seed_independent_agent(
             "Monitor",
             system_prompt=BUILTIN_MONITOR_PROMPT,
             trigger_settings={"interval_minutes": 30, "check_all": True},
-            max_cycles=1,
+            max_cycles=0,
         )
 
     def _activate_independent_agents(self) -> set[str]:
@@ -4387,7 +4397,7 @@ class CDPAWorker:
         for snapshot in list(self.registry.tasks_by_id.values()):
             if not is_independent_task(snapshot):
                 continue
-            if str(snapshot.get("status") or "").upper() != "WAITING":
+            if str(snapshot.get("status") or "").upper() not in {"WAITING", "PAUSED"}:
                 continue
             independent = snapshot.get("independent")
             if not isinstance(independent, Mapping):
@@ -4400,7 +4410,11 @@ class CDPAWorker:
             if idle_since is None:
                 continue
             immediate_close = independent.get("close_tab_when_idle") is True
-            if (
+            keep_open_until = parse_time(independent.get("tab_keep_open_until"))
+            if keep_open_until is not None:
+                if not immediate_close and current_epoch < keep_open_until.timestamp():
+                    continue
+            elif (
                 not immediate_close
                 and current_epoch - idle_since.timestamp()
                 < self.config.independent_idle_close_seconds
@@ -4429,13 +4443,14 @@ class CDPAWorker:
                 if not isinstance(current, dict):
                     return state
                 if (
-                    str(state.get("status") or "").upper() != "WAITING"
+                    str(state.get("status") or "").upper() not in {"WAITING", "PAUSED"}
                     or current.get("active_event") is not None
                     or current.get("idle_since") != independent.get("idle_since")
                 ):
                     return state
                 current["idle_tab_closed_at"] = utc_now()
                 current["close_tab_when_idle"] = False
+                current["tab_keep_open_until"] = None
                 current["idle_tab_closed_count"] = int(
                     current.get("idle_tab_closed_count") or 0
                 ) + int(closed)
@@ -4460,8 +4475,46 @@ class CDPAWorker:
             self.runtime_db.requeue_running_commands()
             self.store.recover_phase4_replacement()
         if not read_only:
+            self.store.normalize_legacy_independent_agents()
             self._ensure_builtin_independent_agents()
         tasks, errors = self.store.discover_with_errors()
+        identity_groups: dict[str, list[Mapping[str, Any]]] = {}
+        recovery_owners: list[Mapping[str, Any]] = []
+        for task in tasks:
+            if not is_independent_task(task):
+                continue
+            independent = task.get("independent")
+            if not isinstance(independent, Mapping) or independent.get("deleted_at"):
+                continue
+            agent_key = str(independent.get("agent_key") or "")
+            if str(task.get("status") or "").upper() not in TERMINAL:
+                identity_groups.setdefault(agent_key, []).append(task)
+            if (
+                independent.get("enabled") is True
+                and str(task.get("status") or "").upper() not in TERMINAL
+                and validate_trigger_settings(independent.get("trigger_settings"))[
+                    "recovery"
+                ]
+            ):
+                recovery_owners.append(task)
+        for agent_key, owners in identity_groups.items():
+            if len(owners) > 1:
+                errors.append(
+                    {
+                        "manifest_path": owners[-1].get("manifest_path"),
+                        "error": (
+                            "multiple nonterminal Independent Agent identities for "
+                            f"{agent_key!r}"
+                        ),
+                    }
+                )
+        if len(recovery_owners) > 1:
+            errors.append(
+                {
+                    "manifest_path": recovery_owners[-1].get("manifest_path"),
+                    "error": "multiple enabled Independent Agents own the Recovery trigger",
+                }
+            )
         catalog = {
             "discovered_at": utc_now(),
             "complete": not errors,
@@ -4502,25 +4555,120 @@ class CDPAWorker:
             for task in tasks
         ]
         self.store.validate_repository_integrity(records)
+        latest_independent: dict[str, Mapping[str, Any]] = {}
+        runtime_tasks: list[Mapping[str, Any]] = []
+        for task in tasks:
+            if not is_independent_task(task):
+                runtime_tasks.append(task)
+                continue
+            independent = task.get("independent")
+            if not isinstance(independent, Mapping) or independent.get("deleted_at"):
+                continue
+            agent_key = str(independent.get("agent_key") or "")
+            previous = latest_independent.get(agent_key)
+            candidate_rank = (
+                str(task.get("status") or "").upper() not in TERMINAL,
+                int(independent.get("agent_generation") or 0),
+            )
+            previous_rank = (
+                (
+                    str(previous.get("status") or "").upper() not in TERMINAL,
+                    int(
+                        (previous.get("independent") or {}).get(
+                            "agent_generation"
+                        )
+                        or 0
+                    ),
+                )
+                if previous is not None
+                else None
+            )
+            if previous_rank is None or candidate_rank > previous_rank:
+                latest_independent[agent_key] = task
+        runtime_tasks.extend(latest_independent.values())
         self._manifest_cache.clear()
-        for path, task in records:
+        runtime_records = [
+            (Path(str(task["manifest_path"])).expanduser().resolve(), task)
+            for task in runtime_tasks
+        ]
+        for path, task in runtime_records:
             self._remember_manifest(path, task)
         self.registry = CDPARuntimeRegistry.hydrate(
-            tasks,
+            runtime_tasks,
             now=time.time(),
             cleanup_idle_seconds=self.config.cleanup_terminal_idle_seconds,
         )
-        waiting_order = build_waiting_order(tasks)
+        waiting_order = build_waiting_order(runtime_tasks)
         projections = [
             build_task_projection(task, tasks=tasks, waiting_order=waiting_order)
-            for task in tasks
+            for task in runtime_tasks
         ]
         self.runtime_db.replace_task_projections(projections, catalog=catalog)
         self.runtime_degraded = False
+        self._publish_agents(runtime_tasks)
         self._publish_dashboard_actions()
         self._publish_heartbeat(force=True)
         return catalog
 
+    def _publish_agents(
+        self, tasks: Sequence[Mapping[str, Any]] | None = None
+    ) -> None:
+        current_tasks = list(
+            tasks
+            if tasks is not None
+            else self.registry.tasks_by_id.values()
+            if self.registry is not None
+            else ()
+        )
+        latest: dict[str, Mapping[str, Any]] = {}
+        for state in current_tasks:
+            if not is_independent_task(state):
+                continue
+            independent = state.get("independent")
+            if not isinstance(independent, Mapping) or independent.get("deleted_at"):
+                continue
+            agent_key = str(independent.get("agent_key") or "")
+            generation = int(independent.get("agent_generation") or 0)
+            previous = latest.get(agent_key)
+            if previous is None or generation > int(
+                previous["independent"].get("agent_generation") or 0
+            ):
+                latest[agent_key] = state
+        independent_agents = []
+        for agent_key, state in sorted(latest.items()):
+            independent = state["independent"]
+            independent_agents.append(
+                {
+                    "task_id": str(state.get("task_id") or ""),
+                    "agent_key": agent_key,
+                    "name": str(
+                        independent.get("display_name")
+                        or independent.get("agent_name")
+                        or ""
+                    ),
+                    "identity_name": str(independent.get("agent_name") or ""),
+                    "system_prompt": str(independent.get("system_prompt") or ""),
+                    "trigger_settings": dict(
+                        independent.get("trigger_settings") or {}
+                    ),
+                    "enabled": bool(independent.get("enabled")),
+                    "status": str(state.get("status") or ""),
+                    "generation": int(independent.get("agent_generation") or 0),
+                    "tags": independent_tags(independent.get("trigger_settings")),
+                    "max_cycles": int(independent.get("max_cycles") or 0),
+                    "cycle": int(independent.get("cycle") or 0),
+                    "tab_open": bool(
+                        isinstance((state.get("roles") or {}).get(INDEPENDENT_ROLE), Mapping)
+                        and (state.get("roles") or {})[INDEPENDENT_ROLE].get("online")
+                    ),
+                    "tab_keep_open_until": independent.get("tab_keep_open_until"),
+                    "is_builtin": agent_key.casefold() in {"maintainers", "monitor"},
+                }
+            )
+        self.runtime_db.put_snapshot(
+            "agents",
+            {"independent": independent_agents},
+        )
     def _publish_dashboard_actions(self) -> None:
         if self.registry is None:
             return
@@ -4625,6 +4773,7 @@ class CDPAWorker:
             "independent_complete",
             "independent_continue",
             "independent_run_now",
+            "independent_reset",
             "independent_settings",
             "independent_activate_agent",
             "independent_create_repair",
@@ -4821,7 +4970,7 @@ class CDPAWorker:
                 )
                 hop = _active_hop(requested)
                 if hop.get("state") == "responded":
-                    completed, successor = self.store.complete_independent_task(
+                    completed = self.store.complete_independent_task(
                         requested["manifest_path"],
                         outcome=str(payload.get("outcome") or ""),
                         summary=str(payload.get("summary") or ""),
@@ -4829,12 +4978,10 @@ class CDPAWorker:
                         repair_task_id=payload.get("repair_task_id"),
                     )
                     self._publish_command_state(completed)
-                    self._publish_command_state(successor)
                     state = completed
                     result = {
                         "task_id": completed["task_id"],
                         "status": completed["status"],
-                        "successor_task_id": successor["task_id"],
                     }
                 else:
                     self._publish_command_state(requested)
@@ -4887,6 +5034,25 @@ class CDPAWorker:
                 )
                 self._publish_command_state(state)
                 result = {"task_id": state["task_id"], "status": state["status"]}
+            elif kind == "independent_reset":
+                if task_id is None:
+                    raise ValueError("independent_reset requires task_id")
+                current = self._command_task_state(task_id)
+                if current is None:
+                    raise ValueError(f"task does not exist: {task_id}")
+                state = self.store.request_control(
+                    current["manifest_path"],
+                    "reset",
+                    role=INDEPENDENT_ROLE,
+                    reason=str(payload.get("reason") or "Operator reset"),
+                    external_command_id=command_id,
+                )
+                self._publish_command_state(state)
+                result = {
+                    "task_id": state["task_id"],
+                    "status": state["status"],
+                    "queued": True,
+                }
             elif kind == "independent_activate_agent":
                 if task_id is None:
                     raise ValueError("independent_activate_agent requires source task_id")
@@ -4957,6 +5123,11 @@ class CDPAWorker:
                     trigger_settings=(
                         payload.get("trigger_settings")
                         if "trigger_settings" in payload
+                        else None
+                    ),
+                    max_cycles=(
+                        int(payload["max_cycles"])
+                        if "max_cycles" in payload
                         else None
                     ),
                     new_chat_next_job=(
@@ -5032,6 +5203,7 @@ class CDPAWorker:
                     "independent_complete",
                     "independent_continue",
                     "independent_run_now",
+                    "independent_reset",
                     "independent_settings",
                     "independent_activate_agent",
                     "independent_create_repair",
@@ -5057,6 +5229,7 @@ class CDPAWorker:
             "independent_complete",
             "independent_continue",
             "independent_run_now",
+            "independent_reset",
             "independent_settings",
             "independent_activate_agent",
             "independent_create_repair",

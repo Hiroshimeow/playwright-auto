@@ -32,12 +32,32 @@ def setup_agent(tmp_path: Path):
             "updated_at": "2026-07-26T00:00:00+00:00",
         },
     )
+    blocked = store.update(
+        blocked["manifest_path"],
+        lambda state: {
+            **state,
+            "blocked_at": "2026-07-26T00:00:00+00:00",
+        },
+    )
     standby = store.create_independent_agent(
         "Maintainers",
         system_prompt="Use @mcp-g8 and recover the affected task directly.",
         task_id="agent-maintainers-g1",
         trigger_settings={"recovery": True},
         max_cycles=5,
+    )
+    standby = store.update(
+        standby["manifest_path"],
+        lambda state: {
+            **state,
+            "independent": {
+                **state["independent"],
+                "watermarks": {
+                    **state["independent"]["watermarks"],
+                    "recovery_enabled_at": "2026-07-26T00:00:00+00:00",
+                },
+            },
+        },
     )
     claimed = claim_oldest_event(
         standby,
@@ -109,18 +129,20 @@ def test_independent_pause_and_resume_preserve_active_event(tmp_path: Path):
 
 
 
-def test_operator_stop_disables_independent_agent_without_respawn(tmp_path: Path):
+def test_operator_reset_releases_independent_job_without_respawn(tmp_path: Path):
     _config, store, _blocked, state, worker = setup_agent(tmp_path)
-    state = store.request_control(state["manifest_path"], "stop", role="AGENT")
+    state = store.request_control(state["manifest_path"], "reset", role="AGENT")
 
     assert asyncio.run(worker._apply_control(state, FakeActions())) is True
     state = store.save(state["manifest_path"], state)
     worker.hydrate_runtime(startup=False)
     worker._activate_independent_agents()
 
-    assert state["status"] == "STOPPED"
-    assert state["independent"]["enabled"] is False
+    assert state["status"] == "WAITING"
+    assert state["terminal_state"] is None
+    assert state["independent"]["enabled"] is True
     assert state["independent"]["active_event"] is None
+    assert state["independent"]["job_history"][-1]["disposition"] == "RESET"
     assert state["independent"].get("successor_task_id") is None
     assert not [
         item
@@ -128,15 +150,6 @@ def test_operator_stop_disables_independent_agent_without_respawn(tmp_path: Path
         if item.get("task_mode") == "independent"
         and item["independent"].get("previous_task_id") == state["task_id"]
     ]
-
-
-
-
-
-
-
-
-
 
 def test_interval_agent_stays_waiting_until_first_interval_is_due(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
@@ -177,12 +190,29 @@ def test_worker_activates_oldest_independent_event_and_persists_claim(tmp_path: 
                 "updated_at": at,
             },
         )
+        store.update(
+            state["manifest_path"],
+            lambda current, at=at: {**current, "blocked_at": at},
+        )
     standby = store.create_independent_agent(
         "Maintainers",
         system_prompt="Recover tasks directly.",
         task_id="agent-maintainers-g1",
         trigger_settings={"recovery": True},
         max_cycles=5,
+    )
+    standby = store.update(
+        standby["manifest_path"],
+        lambda current: {
+            **current,
+            "independent": {
+                **current["independent"],
+                "watermarks": {
+                    **current["independent"]["watermarks"],
+                    "recovery_enabled_at": "2026-07-26T00:00:00+00:00",
+                },
+            },
+        },
     )
     worker = CDPAWorker(config, store=store)
     worker.hydrate_runtime()

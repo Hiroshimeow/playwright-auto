@@ -101,7 +101,7 @@ def test_two_blocked_teams_claim_oldest_first_and_do_not_duplicate_active_event(
     assert second["independent"]["active_event"]["target_task_id"] == "task-b"
 
 
-def test_waiting_operational_failure_creates_recovery_event():
+def test_recovery_requires_continuous_blocked_state():
     current_agent = agent()
     target = workflow(
         "task-queue",
@@ -117,16 +117,26 @@ def test_waiting_operational_failure_creates_recovery_event():
             "since": "2026-07-26T00:00:00+00:00",
         },
     )
+    assert not [
+        item
+        for item in canonical_independent_events(current_agent, [target, current_agent])
+        if item["trigger_type"] == "recovery"
+    ]
 
-    events = canonical_independent_events(current_agent, [target, current_agent])
-
-    recovery = [item for item in events if item["trigger_type"] == "recovery"]
+    target.update(
+        status="BLOCKED",
+        blocked_at="2026-07-26T00:00:00+00:00",
+        block_code="queue_release_failed",
+        block_reason="exact team owner is unreadable",
+    )
+    recovery = [
+        item
+        for item in canonical_independent_events(current_agent, [target, current_agent])
+        if item["trigger_type"] == "recovery"
+    ]
     assert len(recovery) == 1
     assert recovery[0]["target_task_id"] == "task-queue"
     assert recovery[0]["failure_signature"].startswith("queue_release_failed:")
-
-
-
 
 def test_operator_stop_and_self_failure_do_not_create_recovery_events():
     current_agent = agent()

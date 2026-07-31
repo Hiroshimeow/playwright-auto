@@ -11,11 +11,21 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Sequence, TextIO
 
+from .cdpa_independent import MAX_TRIGGER_LEARNING_BYTES, trigger_learning_path
 from .cdpa_safety import sanitize_text
 from .file_lock import exclusive_file_lock, fsync_parent_directory
 
 _DISPOSITIONS = frozenset({"ADDED", "REVISED", "SUPERSEDED"})
 _REQUEST_KEYS = frozenset({"disposition", "old_text", "new_text"})
+_TRIGGER_REQUEST_KEYS = _REQUEST_KEYS | {"trigger"}
+_TRIGGER_TITLES = {
+    "learning_recovery.md": "# Recovery trigger learning",
+    "learning_interval.md": "# Interval trigger learning",
+    "learning_task_done.md": "# Task-done trigger learning",
+    "learning_role_completed.md": "# Role-completed trigger learning",
+    "learning_task_state.md": "# Task-state trigger learning",
+    "learning_manual.md": "# Manual trigger learning",
+}
 _MAX_EDIT_BYTES = 8_000
 _UUID = re.compile(
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
@@ -251,14 +261,137 @@ def update_learning(
             temporary.unlink(missing_ok=True)
 
 
-def _request(value: Any) -> tuple[str, str, str]:
-    if not isinstance(value, dict) or set(value) != _REQUEST_KEYS:
+
+def _validate_trigger_markdown(text: str, *, title: str) -> None:
+    if "\r" in text or "\0" in text:
+        raise LearningEditError("trigger learning must remain UTF-8 Markdown")
+    lines = text.splitlines()
+    if not lines or lines[0] != title:
+        raise LearningEditError(f"trigger learning must retain title {title!r}")
+    if sum(line == title for line in lines) != 1:
+        raise LearningEditError("trigger learning must contain one canonical title")
+    for line in lines:
+        if line.startswith("#") and not re.fullmatch(r"#{1,6} .+", line):
+            raise LearningEditError("trigger learning contains a malformed heading")
+
+
+def update_trigger_learning(
+    repository: str | Path,
+    *,
+    trigger: str,
+    disposition: str,
+    old_text: str,
+    new_text: str,
+) -> LearningEditEvidence:
+    normalized_disposition = str(disposition).strip().upper()
+    if normalized_disposition not in _DISPOSITIONS:
         raise LearningEditError(
-            f"request must contain exactly {sorted(_REQUEST_KEYS)!r}"
+            f"unsupported learning disposition {normalized_disposition!r}"
         )
-    if not all(isinstance(value[key], str) for key in _REQUEST_KEYS):
+    _validate_sanitized_lesson(new_text)
+    root = Path(repository).expanduser().resolve()
+    if not root.is_dir():
+        raise LearningEditError("repository root must be an existing directory")
+    try:
+        target = trigger_learning_path(root, trigger)
+    except ValueError as exc:
+        raise LearningEditError(str(exc)) from exc
+    learning_root = target.parent
+    if learning_root.exists() and (learning_root.is_symlink() or not learning_root.is_dir()):
+        raise LearningEditError("trigger learning directory is invalid")
+    learning_root.mkdir(parents=True, exist_ok=True)
+    if learning_root.resolve().parent != root:
+        raise LearningEditError("trigger learning directory escapes repository")
+    title = _TRIGGER_TITLES[target.name]
+    lock_root = root / ".plan"
+    lock_root.mkdir(parents=True, exist_ok=True)
+    if lock_root.is_symlink() or lock_root.resolve().parent != root:
+        raise LearningEditError("repository learning lock directory is invalid")
+    lock = lock_root / f"{target.name}.lock"
+    temporary: Path | None = None
+    try:
+        with exclusive_file_lock(lock):
+            if target.exists():
+                _validate_span(normalized_disposition, old_text, new_text)
+                if target.is_symlink() or not target.is_file() or target.resolve().parent != learning_root.resolve():
+                    raise LearningEditError("trigger learning file must be a contained regular file")
+                try:
+                    current = target.read_bytes().decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise LearningEditError("trigger learning is not valid UTF-8") from exc
+                positions = _exact_span_positions(current, old_text)
+                if len(positions) != 1:
+                    raise LearningEditError(
+                        "exact target must occur once as a complete Markdown span in current "
+                        f"trigger learning; found {len(positions)}"
+                    )
+                start = positions[0]
+                prefix = current[:start]
+                suffix = current[start + len(old_text) :]
+                proposed = prefix + new_text + suffix
+                target_mode = target.stat().st_mode & 0o777
+            else:
+                if normalized_disposition != "ADDED":
+                    raise LearningEditError("first trigger learning edit must be ADDED")
+                if old_text != title or not new_text.startswith(title):
+                    raise LearningEditError(
+                        "first trigger learning edit must preserve the canonical title anchor"
+                    )
+                proposed = new_text + ("\n" if not new_text.endswith("\n") else "")
+                prefix = ""
+                suffix = ""
+                target_mode = 0o644
+            _validate_trigger_markdown(proposed, title=title)
+            _validate_no_duplicate_lessons(proposed)
+            data = proposed.encode("utf-8")
+            if len(data) > MAX_TRIGGER_LEARNING_BYTES:
+                raise LearningEditError("trigger learning exceeds bounded size")
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=learning_root,
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, target_mode)
+            os.replace(temporary, target)
+            temporary = None
+            fsync_parent_directory(target)
+            read_back = target.read_bytes()
+            if read_back != data:
+                raise LearningEditError("trigger learning read-back did not match atomic write")
+            verified = read_back.decode("utf-8")
+            _validate_trigger_markdown(verified, title=title)
+            _validate_no_duplicate_lessons(verified)
+            if prefix and (not verified.startswith(prefix) or not verified.endswith(suffix)):
+                raise LearningEditError("unrelated trigger learning content changed")
+            return LearningEditEvidence(
+                disposition=normalized_disposition,
+                path=target.relative_to(root).as_posix(),
+                sha256=hashlib.sha256(read_back).hexdigest(),
+                size=len(read_back),
+            )
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+def _request(value: Any) -> tuple[str | None, str, str, str]:
+    if not isinstance(value, dict) or set(value) not in {
+        _REQUEST_KEYS,
+        _TRIGGER_REQUEST_KEYS,
+    }:
+        raise LearningEditError(
+            "request must contain disposition, old_text and new_text, with an "
+            "optional trigger"
+        )
+    if not all(isinstance(value[key], str) for key in value):
         raise LearningEditError("all learning request fields must be strings")
-    return value["disposition"], value["old_text"], value["new_text"]
+    trigger = str(value.get("trigger") or "").strip().lower() or None
+    return trigger, value["disposition"], value["old_text"], value["new_text"]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -282,13 +415,22 @@ def main(
     source = sys.stdin.read() if input_text is None else input_text
     try:
         request = json.loads(source)
-        disposition, old_text, new_text = _request(request)
-        evidence = update_learning(
-            args.repository,
-            disposition=disposition,
-            old_text=old_text,
-            new_text=new_text,
-        )
+        trigger, disposition, old_text, new_text = _request(request)
+        if trigger is None:
+            evidence = update_learning(
+                args.repository,
+                disposition=disposition,
+                old_text=old_text,
+                new_text=new_text,
+            )
+        else:
+            evidence = update_trigger_learning(
+                args.repository,
+                trigger=trigger,
+                disposition=disposition,
+                old_text=old_text,
+                new_text=new_text,
+            )
     except (json.JSONDecodeError, LearningEditError, OSError) as exc:
         print(
             json.dumps(

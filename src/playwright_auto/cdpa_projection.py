@@ -9,7 +9,7 @@ from typing import Any, Mapping, Sequence
 
 from .cdpa_config import CDPA_ROLES
 from .cdpa_dependencies import dependency_parent_ids
-from .cdpa_independent import is_independent_task
+from .cdpa_independent import independent_tags, is_independent_task
 from .cdpa_safety import sanitize_text, sanitize_value
 from .cdpa_team import (
     exact_team_ready_waiters,
@@ -927,6 +927,14 @@ def build_task_projection(
             "check_count": _int_or_zero(active_event.get("check_count")),
             "cycle": _int_or_zero(independent.get("cycle")),
             "max_cycles": _int_or_zero(independent.get("max_cycles")),
+            "tags": independent_tags(independent.get("trigger_settings")),
+            "tab_open": bool(
+                isinstance((raw.get("roles") or {}).get("AGENT"), Mapping)
+                and (raw.get("roles") or {})["AGENT"].get("online")
+            ),
+            "tab_keep_open_until": str(
+                independent.get("tab_keep_open_until") or ""
+            ) or None,
             "trigger_settings": _public_value(
                 independent.get("trigger_settings") or {}
             ),
@@ -991,6 +999,13 @@ def build_task_projection(
         detail["agent"] = dict(detail["agent"])
         detail["agent"]["system_prompt"] = str(
             independent.get("system_prompt") or ""
+        )
+        detail["agent"]["job_history"] = _public_value(
+            [
+                item
+                for item in independent.get("job_history") or []
+                if isinstance(item, Mapping)
+            ][-200:]
         )
     # Stable content fingerprints drive no-op DB writes and client detail caching.
     summary["projection_sha256"] = hashlib.sha256(

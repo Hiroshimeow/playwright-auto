@@ -184,13 +184,13 @@ This file is not a chronological incident log. Track one entry per stable root c
 
 ### P-017 — Canonical recovery activation must survive restart without duplicate or lost claims
 
-- **Status:** `IN_PROGRESS`
-- **Root cause:** recovery triggers are derived from canonical task state and claimed onto the one WAITING independent task. A claim must be durable before send, completion, or successor creation, and operator transitions must not be reclassified as recovery.
-- **Current architecture:** one enabled agent may own the exclusive recovery trigger. The worker selects the oldest eligible event, persists `active_event` plus watermarks on the independent task, and reuses the durable request ledger after restart. No second incident store or supervisor exists.
-- **Current regression evidence:** focused tests cover oldest-first claim, exclusive ownership, operator/self exclusions, restart-safe claim, queued completion, deterministic successor creation, and Monitor-to-Maintainers deduplication.
-- **Impact if regressed:** an eligible block may be skipped, duplicated, or acted on after it becomes stale.
-- **Owner:** `independent-agent-runtime`.
-- **Next verification:** controlled live A/B blocked ordering with a worker restart between claim/send/completion must prove one claim, zero duplicate send, one successor, and then activation of B.
+- **Status:** `IN_PROGRESS — deterministic runtime contract implemented`
+- **Root cause:** recovery triggers are derived from canonical task state and claimed onto one long-lived WAITING independent identity. A claim must be durable before send or completion, and operator transitions must not be reclassified as recovery.
+- **Current architecture:** at most one enabled agent may own the Recovery trigger. New or newly enabled ownership has a one-minute warm-up; targets become eligible only after three continuous BLOCKED minutes; the worker claims oldest first, one target at a time, with a one-minute inter-target delay and three-minute same-target cooldown. Claim/release state remains in existing event watermarks and the durable request ledger; no second scheduler, queue, incident store, or supervisor exists.
+- **Current regression evidence:** focused tests cover warm-up, continuous-block eligibility, FIFO order, same-target cooldown, inter-target spacing, exclusive ownership fail-closed at hydration, operator/self exclusions, exact active-event target controls, same-manifest completion, and accepted-send-preserving Reset.
+- **Impact if regressed:** an eligible block may be skipped, duplicated, reclaimed in a loop, or acted on after it becomes stale.
+- **Owner:** `independent-recovery-learning`.
+- **Next verification:** controlled live A/B blocked ordering with a worker restart between claim/send/completion must prove one claim, zero duplicate send, release of A on the same agent identity, cooldown enforcement, and then activation of B.
 
 ### P-018 — Runtime benchmark can stop the production worker and leave stale RUNNING projections
 
@@ -212,16 +212,22 @@ This file is not a chronological incident log. Track one entry per stable root c
 - **Required correction:** separate mailbox delivery from task-control completion, or keep the mailbox command nonterminal until the worker observes the action-specific postcondition. Requested controls must make their task immediately due regardless of dependency/queue waiting. Preserve optimistic task version, idempotency, operator provenance, and one mutation owner.
 - **Next verification:** a WAITING dependency task receives Stop through API, mailbox remains queued/running until the task becomes `STOPPED`, control becomes applied with result, and no browser tab/send is created; repeat for Pause where valid and for stale-version/idempotent replay.
 
-### P-020 — Queued `independent_complete` is not finalized after the assistant response arrives
+### P-020 — Queued `independent_complete` was not finalized after the assistant response arrived
 
-- **Status:** `OPEN`
-- **Root cause:** when `independent_complete` is submitted before the current independent-agent assistant response has been durably observed, the worker records `completion_request` and returns `queued_until_response`. After that same hop later becomes `responded`, the normal advance path does not re-evaluate the pending completion request, call `complete_independent_task()`, or create the deterministic WAITING successor. The task remains `RUNNING` with `active_action: await_completion` indefinitely.
-- **Architecture applicability:** specific to the independent-agent mailbox/response reconciliation boundary. The API correctly queues completion before response ownership is proven, but completion must be finalized by the worker immediately after the exact response is accepted.
-- **Evidence:** monitor task `agent-9c247954cbd59ff60e4132b5-g1` submitted command `cmd-aaf0fabb-a0a3-41ea-bbce-44e646fcb006` for DEV event `role-complete:cdpa-idem-bce9fa8eaeeef92b369d749d:2:DEV`. The command was accepted while hop 1 was still waiting; the hop later became `responded` at `2026-07-29T22:36:24Z`, but the task stayed `RUNNING / await_completion` with the original `completion_request`, no `completed_at`, and no `successor_task_id`. Consequently the REVIEW event at `2026-07-29T22:37:15Z` and task-DONE event at `2026-07-29T22:40:13Z` were never claimed. Their Telegram reports had to be sent manually, then the stuck monitor was explicitly stopped.
-- **Impact:** one valid early completion request can permanently consume the independent agent's sole nonterminal task, preventing successor creation and silently losing all later eligible events. For scoped reporters this means missing operational notifications; for recovery agents it could suppress later incidents while the UI still shows a RUNNING agent.
-- **Required correction:** after an independent hop transitions to `responded`, atomically check for a pending `completion_request`; validate it against the same task, active event, hop, and accepted response identity; complete exactly once; publish the completed task; create exactly one deterministic WAITING successor; and advance event watermarks without replaying the accepted send. Reprocessing the same mailbox command or restarting the worker must be idempotent.
-- **Owner:** none; belongs to `independent-agent-runtime` worker completion reconciliation.
-- **Next verification:** submit `independent_complete` while the hop is still `waiting`, then allow the exact assistant response to arrive. Prove the original task becomes terminal, one successor becomes WAITING, no duplicate send or successor is created across worker restart/idempotent command replay, and subsequent REVIEW plus task-DONE events are each claimed once in order.
+- **Status:** `RESOLVED IN SOURCE — live acceptance pending`
+- **Root cause:** when `independent_complete` was submitted before the current independent-agent response became durable, the worker stored `completion_request` but did not re-evaluate it after the same hop transitioned to `responded`.
+- **Concrete evidence:** monitor task `agent-9c247954cbd59ff60e4132b5-g1` accepted command `cmd-aaf0fabb-a0a3-41ea-bbce-44e646fcb006` before hop 1 responded, then remained `RUNNING / await_completion`; later REVIEW and task-DONE events were not claimed.
+- **Correction:** the responded boundary now finalizes queued completion before any continuation path. Completion records the report and job History, consumes/releases the exact event, preserves the accepted receipt and conversation URL, and returns the same long-lived identity to WAITING for recurring triggers or PAUSED for one-shot triggers. It creates no terminal agent card or successor generation, and idempotent replay returns the same manifest state.
+- **Regression evidence:** focused store, worker, and mailbox tests cover early queued completion, same-identity recurring completion, one-shot auto-pause, no successor, preserved conversation generation, and idempotent command replay.
+- **Next verification:** submit completion while a live hop is still waiting, allow the exact assistant response to arrive, restart the worker, and prove one History record, zero resend, the same agent task ID, and later eligible events claimed in order.
+
+### P-021 — Independent jobs leaked lifecycle counters and terminal generations
+
+- **Status:** `RESOLVED IN SOURCE — migration/live acceptance pending`
+- **Root cause:** `cycle` and `max_cycles` were modeled on the generated task rather than the exact active event, completion created terminal generations, and Stop removed the only runnable identity. This made a turn limit look like a total job limit and made recurring agents depend on successor creation.
+- **Correction:** `max_cycles` defaults to `0` for unlimited turns per job; each new event starts at cycle 1; continuation increments only on the same event; changing the limit resets that same event at a durable response boundary and records `RESET_BY_SETTINGS`. Completion and Reset release jobs on the same manifest. Runtime hydration collapses legacy generations to the newest identity, migrates a latest orphan terminal identity to WAITING/PAUSED, and fails closed on multiple nonterminal identities.
+- **Regression evidence:** deterministic tests cover unlimited validation/projection, counter isolation, settings reset without accepted-send replay, recurring versus one-shot completion, Reset idempotency, legacy terminal migration, and collapsed runtime projections with preserved legacy History.
+- **Next verification:** run one recurring agent across multiple distinct trigger events and one multi-turn continuation; prove every new event starts at cycle 1, no counter leaks to another agent, no terminal card appears, and no successor manifest is created.
 
 ## Audited incidents and terminal tasks
 

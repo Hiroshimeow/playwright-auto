@@ -5,7 +5,8 @@ import json
 import re
 import unicodedata
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from .cdpa_safety import sanitize_text
@@ -22,92 +23,41 @@ MAX_MANUAL_INSTRUCTION_CHARS = 4_000
 MAX_TRIGGER_TEAMS = 100
 MAX_TRIGGER_ROLES = 5
 MAX_SEEN_EVENT_KEYS = 500
+RECOVERY_WARMUP_SECONDS = 60
+RECOVERY_BLOCKED_SECONDS = 180
+RECOVERY_TARGET_COOLDOWN_SECONDS = 180
+RECOVERY_INTER_TARGET_SECONDS = 60
+MAX_TRIGGER_LEARNING_BYTES = 8_192
+_TRIGGER_LEARNING_FILES = {
+    "recovery": "learning_recovery.md",
+    "interval": "learning_interval.md",
+    "check_all": "learning_interval.md",
+    "task_done": "learning_task_done.md",
+    "role_completed": "learning_role_completed.md",
+    "team_state": "learning_task_state.md",
+    "task_state": "learning_task_state.md",
+    "manual": "learning_manual.md",
+    "direct": "learning_manual.md",
+}
 BUILTIN_MAINTAINERS_PROMPT = """# Maintainers
 
-You are the built-in Maintainers independent agent. You are a normal one-agent CDPA task using the shared independent-agent engine, not a workflow role, coordinator, or sidecar.
+You are the built-in Recovery independent agent. Use the shared independent-agent runtime and `@mcp-g8`; do not behave as a workflow role, coordinator, scheduler, or sidecar.
 
-Use the appropriate Superpower skill before acting. Use `@mcp-g8` for every repository inspection, command, runtime check, browser action, test, file operation, and CDPA control.
+For the exact blocked target in the trigger context:
 
-## Recovery responsibility
+1. inspect the task, active hop, durable receipt, conversation ownership, runtime evidence, and root cause;
+2. apply the smallest safe immediate release so the current task resumes without replaying an accepted send or drifting ownership;
+3. when a durable source correction is required, create or reuse one normal PLAN/DEV/REVIEW repair task through `independent_create_repair`, deduplicated by root cause;
+4. record the concrete defect and evidence in repository-root `PROBLEM.md`;
+5. update the applicable `.learning/learning_recovery.md` only after evidence supports a concise reusable principle, rationale, and preferred invariant. Never put task IDs, timestamps, stack traces, or incident chronology in trigger learning.
 
-This is the CDPA single-operator local runtime system. Restore and verify stable operation: investigate the exact canonical recovery event, recover the affected task safely, preserve accepted-send and conversation identity, restore exact ownership, release queues or dependencies, and prevent recurrence of demonstrated operational defects. Do not broaden the job into general product improvement.
+Use `independent_task_control` only for the exact active target, `independent_continue` only for another turn on that same event, and `independent_complete` only after the release and required recording are verified. Recovery remains enabled after completion and processes one eligible blocked target at a time. Never emit route JSON for the worker to parse from prose.
 
-Use these worker-owned commands directly as needed:
+Preserve explicit operator Pause, Clear Team, Restart, New Chat, and Delete decisions. Reset is the independent-agent force-release control; Stop is not an independent-agent lifecycle state. Preserve exact task/hop/request/conversation identity and never resend across an accepted-send boundary.
 
-- `independent_task_control` for the current event's exact target task only;
-- `independent_create_repair` for a bounded normal repair task;
-- `independent_continue` for another investigation/check cycle;
-- `independent_complete` only after the operational and learning work below is finished.
+`PROBLEM.md` is the concrete defect ledger. Trigger learning is shared by trigger type, not by agent identity, and contains only reusable operating/code philosophy. Use `uv run python -m playwright_auto.cdpa_learning --repository <repository-root>` with JSON fields `trigger`, `disposition`, `old_text`, and `new_text` for trigger-learning edits.
+""".strip()
 
-Never emit route JSON, maintenance decision JSON, recovery arrays, action lists, route/action JSON, or instructions for the worker to parse from prose. Perform actions through the command mailbox and report the evidence and verified result in Markdown.
-
-Preserve the exact task, team, hop, request, accepted-send receipt, conversation URL, dependencies, reports, and operator provenance. Never resend an accepted request. Never automatically reverse an explicit operator Pause, Stop, Clear Team, Restart role, or New Chat. If the canonical event is no longer eligible, do not act on stale evidence.
-
-Use no more than five investigation/recovery/check cycles for one job. In that bound:
-
-1. inspect the exact failure and retained evidence;
-2. apply the smallest safe recovery through existing controls;
-3. verify the task is stable or correctly waiting on a repair;
-4. create or reuse a normal repair task when required;
-5. perform one bounded post-incident learning pass, then complete the job.
-
-A control is successful only after its action-specific postcondition is true. Use `independent_continue` when another bounded operational verification cycle is required.
-
-## Repair decision
-
-Create or reuse a normal repair task only when a demonstrated runtime/system defect recurs, recovery treats only a symptom, or the same defect can destabilize other current local tasks. Use `HOLD_FOR_REPAIR` only when continuation threatens ownership, accepted-send, durable-state, dependency, or idempotency integrity; otherwise use `CONTINUE_IN_PARALLEL`. One-off environmental incidents do not require repair work when direct recovery is safe and stable.
-
-Repair creation and learning are separate decisions. A lesson never substitutes for source repair, and a pending repair is not proof that the defect is fixed.
-
-Do not create repair work for cosmetic UI issues, trusted-local metadata visibility, product policy, compliance, generic privacy/security hardening, packaging breadth, or hypothetical future deployments unless explicitly requested or tied to a concrete current operational failure.
-
-## Bounded learning pass
-
-Run the learning pass only after the operational outcome is verified. This is one bounded learning pass, not recursive self-editing or automatic prompt evolution.
-
-Inspect the incident evidence, actions, verified result, prior occurrences, current repository-root `LEARNING.md`, and related retained repair/report evidence. In the completion report, separate **Facts, Inference, and Proposed reusable rule**.
-
-Add or revise a lesson only when all of these are true:
-
-- observed failure, action, and verified postcondition support the rule;
-- causal evidence supports why the failure occurred or why the rule works;
-- transferability is shown by the same root cause in retained evidence or by a deterministic invariant or regression that applies across tasks;
-- the rule states an applicability condition and a concrete action or check;
-- the rule is consistent with operator intent, exact ownership, accepted-send non-replay, idempotency, dependency integrity, and current repository rules.
-
-A plausible explanation, similar symptom, one machine occurrence, or transient outage is insufficient. Record `SKIPPED — insufficient reusable evidence` and leave `LEARNING.md` unchanged when the gate is not met.
-
-Before mutation, search for equivalent or conflicting guidance; prefer revising the matching lesson over adding a duplicate. If evidence proves a matching lesson incomplete, stale, ineffective, or wrong, update that exact lesson and record `REVISED`; use a narrowly adjacent `SUPERSEDED` note only when retaining the old wording is necessary to prevent ambiguity. Never layer conflicting advice or edit unrelated lessons.
-
-Keep lesson text concise, operational, and generalized. Remove secrets, credentials, raw paths, transient IDs, or timestamps, including task, team, page, request, and incident identifiers. `LEARNING.md` is not an incident log: do not add chronology, speculation, task-specific steps, stale facts, unsupported consequences, or generic warnings.
-
-## `LEARNING.md` write boundary
-
-The learning path may mutate only repository-root `LEARNING.md` through the shared repository operation. Invoke `uv run python -m playwright_auto.cdpa_learning --repository <repository-root>` with `@mcp-g8 shell_execute` and exactly one JSON object on stdin containing `disposition`, `old_text`, and `new_text`. Never mutate `LEARNING.md` through generic file tools.
-
-The shared operation must:
-
-1. resolve the repository root and confirm containment;
-2. acquire the repository learning lock, then read repository-root `LEARNING.md` immediately before mutation as UTF-8;
-3. require one byte-exact complete Markdown span and apply one bounded exact-content section or bullet edit without whitespace-fuzzy matching;
-4. reject stale or conflicting target content instead of overwriting it;
-5. validate Markdown structure, sanitization, and duplicate lessons while serialized writers preserve unrelated concurrent edits;
-6. atomically replace and fsync the file, then read back and validate UTF-8, Markdown structure, repository containment, unchanged unrelated content, and absence of duplicate or conflicting lessons before releasing the lock.
-
-Do not claim success until the operation returns validated JSON. Record exactly one learning disposition in the Maintainers report: `ADDED`, `REVISED`, `SUPERSEDED`, or `SKIPPED`, with supporting evidence outside `LEARNING.md`.
-
-Through this learning path, never edit task manifests, SQLite, request ledgers, source code, tests, configuration, role reports, or task deliverables. Do not create another agent lifecycle, memory system, approval flow, scheduler, queue, store, or worker prose parser.
-
-## Completion
-
-Complete with one durable outcome:
-
-- `SUCCESS` when recovery is verified stable;
-- `NO_ACTION` when the event is already resolved and no mutation is needed;
-- `REPAIR_REQUIRED` when a repair task owns the permanent operational correction;
-- `OPERATOR_REQUIRED` when recovery is unsafe or impossible and exact evidence is recorded.
-
-Call `independent_complete` only after stability/correct-waiting verification, the separate repair decision, and the single bounded learning disposition are recorded. Do not edit task manifests directly, impersonate PLAN/DEV/TEST/REVIEW/AUDIT, or mark workflow tasks DONE."""
 BUILTIN_MONITOR_PROMPT = """You are the built-in Monitor independent agent using the shared one-agent task engine inside the CDPA single-operator local runtime system. Monitor operational flow only: stalled work, unexpected blocking, offline ownership, queue/dependency drift, repeated recovery, and failure to reach the next expected state. Review the exact interval, task-DONE, role-completion, team-state, CHECK_ALL, or Run-now trigger context. Report evidence-backed progress and blockers. Do not invent product-policy, compliance, generic privacy/security, packaging, or hypothetical deployment release gates. Use independent_activate_agent to activate Maintainers by immutable name only for a genuine unexpected recovery incident, and use independent_continue or independent_complete explicitly. Do not create a second scheduler, queue, event store, coordinator, or routing path, and never emit action JSON for the worker to parse."""
 
 INDEPENDENT_OUTCOMES = frozenset(
@@ -268,6 +218,62 @@ def validate_trigger_settings(value: Any) -> dict[str, Any]:
     }
 
 
+def normalize_max_cycles(value: Any, *, default: int = 0) -> int:
+    candidate = default if value is None else value
+    if isinstance(candidate, bool) or not isinstance(candidate, int) or candidate < 0:
+        raise ValueError("max_cycles must be a non-negative integer")
+    return candidate
+
+
+def independent_cycle_limit_reached(*, cycle: int, max_cycles: int) -> bool:
+    normalized_cycle = int(cycle)
+    normalized_limit = normalize_max_cycles(max_cycles)
+    return normalized_limit > 0 and normalized_cycle >= normalized_limit
+
+
+def independent_tags(settings: Mapping[str, Any] | None) -> list[str]:
+    return ["Recovery"] if validate_trigger_settings(settings)["recovery"] else []
+
+
+def trigger_learning_path(repository: str | Path, trigger_type: str) -> Path:
+    normalized = str(trigger_type or "").strip().lower()
+    filename = _TRIGGER_LEARNING_FILES.get(normalized)
+    if filename is None:
+        raise ValueError(f"unsupported trigger learning type {normalized!r}")
+    root = Path(repository).expanduser().resolve()
+    target = root / ".learning" / filename
+    if target.parent.resolve() != (root / ".learning").resolve():
+        raise ValueError("trigger learning path escapes repository")
+    return target
+
+
+def load_trigger_learning(
+    repository: str | Path,
+    trigger_type: str,
+    *,
+    max_bytes: int = MAX_TRIGGER_LEARNING_BYTES,
+) -> tuple[Path, str] | None:
+    root = Path(repository).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError("trigger learning repository must be an existing directory")
+    target = trigger_learning_path(root, trigger_type)
+    learning_root = target.parent
+    if learning_root.exists() and (learning_root.is_symlink() or not learning_root.is_dir()):
+        raise ValueError("trigger learning directory is invalid")
+    if not target.exists():
+        return None
+    if target.is_symlink() or not target.is_file() or target.resolve().parent != learning_root.resolve():
+        raise ValueError("trigger learning file must be a contained regular file")
+    data = target.read_bytes()
+    if len(data) > int(max_bytes):
+        raise ValueError("trigger learning file exceeds bounded size")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("trigger learning file is not valid UTF-8") from exc
+    return target, text.strip()
+
+
 def validate_independent_object(value: Any) -> str | None:
     if not isinstance(value, Mapping):
         return "independent must be an object"
@@ -307,13 +313,15 @@ def validate_independent_object(value: Any) -> str | None:
     cycle = value.get("cycle")
     for field, item, minimum in (
         ("agent_generation", generation, 1),
-        ("max_cycles", max_cycles, 1),
+        ("max_cycles", max_cycles, 0),
         ("cycle", cycle, 0),
     ):
         if isinstance(item, bool) or not isinstance(item, int) or item < minimum:
             return f"independent {field} is invalid"
     if not isinstance(value.get("enabled"), bool):
         return "independent enabled must be a boolean"
+    if not isinstance(value.get("max_cycles_explicit", False), bool):
+        return "independent max_cycles_explicit must be a boolean"
     if not isinstance(value.get("new_chat_next_job"), bool):
         return "independent new_chat_next_job must be a boolean"
     if not isinstance(value.get("close_tab_when_idle", False), bool):
@@ -364,6 +372,12 @@ def validate_independent_object(value: Any) -> str | None:
     continuation = value.get("continuation_request")
     if continuation is not None and not isinstance(continuation, Mapping):
         return "independent continuation_request must be null or an object"
+    settings_reset = value.get("settings_reset_request")
+    if settings_reset is not None and not isinstance(settings_reset, Mapping):
+        return "independent settings_reset_request must be null or an object"
+    history = value.get("job_history", [])
+    if not isinstance(history, list) or any(not isinstance(item, Mapping) for item in history):
+        return "independent job_history must be an array of objects"
     for field in ("previous_task_id", "idle_since", "successor_task_id"):
         item = value.get(field)
         if item is not None and (not isinstance(item, str) or not item.strip()):
@@ -514,6 +528,38 @@ def _event_time(state: Mapping[str, Any]) -> str:
     )
 
 
+def _parse_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def record_recovery_release(
+    independent: dict[str, Any],
+    event: Mapping[str, Any],
+    *,
+    now: datetime | None = None,
+) -> None:
+    normalized = normalize_event(event)
+    if normalized["trigger_type"] != "recovery":
+        return
+    released = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+    watermarks = independent.setdefault("watermarks", {})
+    target_task_id = normalized.get("target_task_id")
+    if target_task_id:
+        watermarks.setdefault("recovery_target_released_at", {})[
+            str(target_task_id)
+        ] = released
+    watermarks["recovery_last_released_at"] = released
+
+
 def _active_hop(state: Mapping[str, Any]) -> Mapping[str, Any] | None:
     active = state.get("active_hop_id")
     for hop in state.get("hops") or ():
@@ -549,13 +595,18 @@ def _operator_caused_terminal_or_pause(state: Mapping[str, Any]) -> bool:
 
 
 def _recovery_event(
-    source: Mapping[str, Any], occurrence_counts: Mapping[str, Any]
+    source: Mapping[str, Any],
+    occurrence_counts: Mapping[str, Any],
+    *,
+    now: datetime,
 ) -> dict[str, Any] | None:
     status = str(source.get("status") or "").upper()
-    waiting_code = str(source.get("waiting_code") or "").lower()
-    if status not in {"BLOCKED", "STOPPED"} and not (
-        status == "WAITING" and waiting_code in _RECOVERY_WAITING_CODES
-    ):
+    if status != "BLOCKED":
+        return None
+    blocked_at = _parse_datetime(
+        source.get("blocked_at") or source.get("updated_at")
+    )
+    if blocked_at is None or (now - blocked_at).total_seconds() < RECOVERY_BLOCKED_SECONDS:
         return None
     if _operator_caused_terminal_or_pause(source):
         return None
@@ -567,17 +618,8 @@ def _recovery_event(
     hop = _active_hop(source)
     task_id = str(source.get("task_id") or "")
     hop_id = hop.get("hop_id") if isinstance(hop, Mapping) else None
-    event_at = _event_time(source)
-    waiting = source.get("waiting")
-    waiting_since = (
-        waiting.get("since") if isinstance(waiting, Mapping) else None
-    )
-    episode = str(
-        source.get("blocked_at")
-        or waiting_since
-        or source.get("stopped_at")
-        or event_at
-    )
+    event_at = blocked_at.isoformat()
+    episode = event_at
     event_key = (
         f"recovery:{task_id}:{episode}:{hop_id or 0}:"
         f"{code or 'unexpected_stopped'}:{signature.rsplit(':', 1)[-1]}"
@@ -655,6 +697,17 @@ def canonical_independent_events(
     own_team = str(agent_state.get("team") or "")
     counts = independent.get("occurrence_counts")
     occurrence_counts = counts if isinstance(counts, Mapping) else {}
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    watermarks = independent.get("watermarks") or {}
+    recovery_enabled_at = _parse_datetime(watermarks.get("recovery_enabled_at"))
+    recovery_warmed = (
+        recovery_enabled_at is None
+        or (current - recovery_enabled_at).total_seconds() >= RECOVERY_WARMUP_SECONDS
+    )
+    last_recovery_release = _parse_datetime(watermarks.get("recovery_last_released_at"))
+    target_releases = watermarks.get("recovery_target_released_at")
+    if not isinstance(target_releases, Mapping):
+        target_releases = {}
     events: list[dict[str, Any]] = []
     for source in tasks:
         if source is agent_state or str(source.get("team") or "") == own_team:
@@ -670,10 +723,24 @@ def canonical_independent_events(
             if source_key == own_key or str(source.get("team") or "") == own_team:
                 continue
             continue
-        if settings["recovery"]:
-            event = _recovery_event(source, occurrence_counts)
+        if settings["recovery"] and recovery_warmed:
+            event = _recovery_event(source, occurrence_counts, now=current)
             if event is not None:
-                events.append(event)
+                target_release = _parse_datetime(
+                    target_releases.get(str(event.get("target_task_id") or ""))
+                )
+                same_target_ready = (
+                    target_release is None
+                    or (current - target_release).total_seconds()
+                    >= RECOVERY_TARGET_COOLDOWN_SECONDS
+                )
+                another_target_ready = (
+                    last_recovery_release is None
+                    or (current - last_recovery_release).total_seconds()
+                    >= RECOVERY_INTER_TARGET_SECONDS
+                )
+                if same_target_ready and another_target_ready:
+                    events.append(event)
         if settings["task_done"]:
             event = _task_done_event(source)
             if event is not None:
@@ -700,7 +767,6 @@ def canonical_independent_events(
             )
     interval = settings["interval_minutes"]
     if interval is not None:
-        current = now or datetime.now(timezone.utc)
         slot = int(current.timestamp() // (interval * 60))
         last_slot = int(
             ((independent.get("watermarks") or {}).get("last_interval_slot") or -1)
@@ -720,7 +786,6 @@ def canonical_independent_events(
                     }
                 )
             )
-    watermarks = independent.get("watermarks") or {}
     seen = set(
         item
         for item in (watermarks.get("seen_event_keys") or [])

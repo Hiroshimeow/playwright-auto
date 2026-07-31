@@ -68,6 +68,33 @@ def test_independent_prompt_constructor_rule_once_and_context_every_cycle(tmp_pa
     assert ".plan/" not in first.text
 
 
+def test_independent_prompt_loads_shared_trigger_learning_every_cycle(tmp_path: Path):
+    config = load_cdpa_config(None, repository_root=tmp_path)
+    learning = tmp_path / ".learning" / "learning_recovery.md"
+    learning.parent.mkdir()
+    learning.write_text(
+        "# Recovery trigger learning\n\n- Preserve accepted-send identity.\n",
+        encoding="utf-8",
+    )
+    built = PromptBuilder(config).build_independent(
+        agent_name="Maintainers",
+        system_prompt="Recover tasks.",
+        task_id="agent-maintainers-g1",
+        team="agent-maintainers",
+        physical_role="agent-maintainers-agent",
+        workspace=str(tmp_path),
+        event=event(),
+        cycle=2,
+        max_cycles=0,
+        constructor_sent_generation=0,
+        conversation_generation=0,
+    )
+    assert built.constructor_included is False
+    assert "TRIGGER_LEARNING (learning_recovery.md)" in built.text
+    assert "Preserve accepted-send identity" in built.text
+    assert '"max_cycles": 0' in built.text
+
+
 def test_independent_prompt_resends_constructor_after_generation_change(tmp_path: Path):
     config = load_cdpa_config(None, repository_root=tmp_path)
     built = PromptBuilder(config).build_independent(

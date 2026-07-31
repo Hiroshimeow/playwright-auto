@@ -101,7 +101,7 @@ def test_recovery_trigger_has_one_enabled_owner_but_nonexclusive_triggers_are_sh
 
 
 
-def test_complete_and_respawn_is_deterministic_and_copies_conversation(tmp_path: Path):
+def test_completion_reuses_long_lived_identity_and_conversation(tmp_path: Path):
     config = load_cdpa_config(None, repository_root=tmp_path)
     store = TaskStore(config)
     state = store.create_independent_agent(
@@ -125,6 +125,7 @@ def test_complete_and_respawn_is_deterministic_and_copies_conversation(tmp_path:
             "target_team": "alpha",
             "occurrence_count": 1,
         }
+        current["independent"]["cycle"] = 1
         current["roles"]["AGENT"]["page_url"] = "https://chatgpt.com/c/exact-conversation"
         current["roles"]["AGENT"]["conversation_generation"] = 4
         current["roles"]["AGENT"]["constructor_sent_generation"] = 4
@@ -134,34 +135,30 @@ def test_complete_and_respawn_is_deterministic_and_copies_conversation(tmp_path:
         return current
 
     active = store.update(state["manifest_path"], ready)
-    completed, successor = store.complete_independent_task(
+    completed = store.complete_independent_task(
         active["manifest_path"],
         outcome="SUCCESS",
         summary="Target recovered and stable.",
     )
-    replay_completed, replay_successor = store.complete_independent_task(
+    replay = store.complete_independent_task(
         active["manifest_path"],
         outcome="SUCCESS",
         summary="Target recovered and stable.",
     )
 
-    assert completed["status"] == "DONE"
-    assert successor["status"] == "WAITING"
-    assert successor["team"] == completed["team"]
-    assert successor["independent"]["agent_generation"] == 2
-    assert successor["independent"]["previous_task_id"] == completed["task_id"]
-    assert completed["independent"]["successor_task_id"] == successor["task_id"]
-    assert successor["roles"]["AGENT"]["page_url"] == "https://chatgpt.com/c/exact-conversation"
-    assert successor["roles"]["AGENT"]["conversation_generation"] == 4
-    assert successor["roles"]["AGENT"]["constructor_sent_generation"] == 4
-    assert replay_completed["task_id"] == completed["task_id"]
-    assert replay_successor["task_id"] == successor["task_id"]
-    assert len(
-        [
-            item
-            for item in store.discover()
-            if item.get("task_mode") == "independent"
-            and item.get("team") == "agent-maintainers"
-            and item.get("status") != "DONE"
-        ]
-    ) == 1
+    assert completed["task_id"] == active["task_id"]
+    assert completed["status"] == "WAITING"
+    assert completed["independent"]["agent_generation"] == 1
+    assert completed["independent"]["successor_task_id"] is None
+    assert completed["roles"]["AGENT"]["page_url"] == "https://chatgpt.com/c/exact-conversation"
+    assert completed["roles"]["AGENT"]["conversation_generation"] == 4
+    assert completed["roles"]["AGENT"]["constructor_sent_generation"] == 4
+    assert replay["task_id"] == completed["task_id"]
+    assert replay["independent"]["job_history"] == completed["independent"]["job_history"]
+    identities = [
+        item
+        for item in store.discover()
+        if item.get("task_mode") == "independent"
+        and item.get("team") == "agent-maintainers"
+    ]
+    assert len(identities) == 1

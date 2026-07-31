@@ -257,7 +257,7 @@ def load_cdpa_config(
         ),
         independent_idle_close_seconds=float(
             _positive(
-                independent_agents.get("idle_close_seconds", 1800),
+                independent_agents.get("idle_close_seconds", 60),
                 "independent_agents.idle_close_seconds",
             )
         ),

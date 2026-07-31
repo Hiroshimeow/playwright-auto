@@ -1691,12 +1691,32 @@ def test_independent_activation_refreshes_registry_and_projection(tmp_path: Path
             "updated_at": "2026-07-26T00:00:00+00:00",
         },
     )
+    store.update(
+        state["manifest_path"],
+        lambda current: {
+            **current,
+            "blocked_at": "2026-07-26T00:00:00+00:00",
+        },
+    )
     standby = store.create_independent_agent(
         "Maintainers",
         system_prompt="Recover tasks directly.",
         task_id="agent-maintainers-g1",
         trigger_settings={"recovery": True},
         max_cycles=5,
+    )
+    standby = store.update(
+        standby["manifest_path"],
+        lambda current: {
+            **current,
+            "independent": {
+                **current["independent"],
+                "watermarks": {
+                    **current["independent"]["watermarks"],
+                    "recovery_enabled_at": "2026-07-26T00:00:00+00:00",
+                },
+            },
+        },
     )
     worker.hydrate_runtime()
 

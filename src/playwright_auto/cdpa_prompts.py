@@ -5,7 +5,12 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from .cdpa_config import CDPAConfig
-from .cdpa_independent import event_context, normalize_agent_name, normalize_system_prompt
+from .cdpa_independent import (
+    event_context,
+    load_trigger_learning,
+    normalize_agent_name,
+    normalize_system_prompt,
+)
 
 
 @dataclass(frozen=True)
@@ -151,6 +156,11 @@ class PromptBuilder:
                     prompt,
                     self.config.independent_rule_path.read_text(encoding="utf-8").strip(),
                 )
+            )
+        learning = load_trigger_learning(workspace, str(event.get("trigger_type") or ""))
+        if learning is not None and learning[1]:
+            sections.append(
+                f"TRIGGER_LEARNING ({learning[0].name})\n{learning[1]}"
             )
         sections.append(
             "INDEPENDENT_AGENT_TRIGGER_CONTEXT\n"
