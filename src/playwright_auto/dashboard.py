@@ -1,20 +1,27 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import http.client
 import json
 import mimetypes
 import os
+import secrets
 import time
+from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .cdpa_config import CDPAConfig, load_cdpa_config
 
 DASHBOARD_HTML_PATH = Path(__file__).with_name("dashboard.html")
+DASHBOARD_LOGIN_HTML_PATH = Path(__file__).with_name("dashboard_login.html")
 ASSET_ROOT = Path(__file__).with_name("dashboard_assets")
+_AUTH_ENV_NAME = "CDPA_DASHBOARD_PASSWORD"
+_SESSION_COOKIE = "cdpa_session"
+_PUBLIC_HOST = "cdpa.hcu-lab.me"
 _HOP_BY_HOP = frozenset(
     {
         "connection",
@@ -29,9 +36,25 @@ _HOP_BY_HOP = frozenset(
 )
 
 
+def _load_dashboard_password(repository_root: Path) -> str | None:
+    try:
+        lines = (repository_root / ".env").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    prefix = f"{_AUTH_ENV_NAME}="
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            value = stripped[len(prefix) :].strip()
+            return value or None
+    return None
+
+
 class FrontendApplication:
-    def __init__(self, config: CDPAConfig) -> None:
+    def __init__(self, config: CDPAConfig, *, auth_password: str | None = None) -> None:
         self.config = config
+        self.auth_password = auth_password or None
+        self.session_token = secrets.token_urlsafe(32) if self.auth_password else None
         self.started_at = time.monotonic()
 
 
@@ -75,6 +98,62 @@ class DashboardHandler(BaseHTTPRequestHandler):
             content_type="application/json; charset=utf-8",
         )
 
+    def _is_public_request(self) -> bool:
+        host = self.headers.get("Host", "").strip().casefold()
+        public_host = host == _PUBLIC_HOST or host.startswith(f"{_PUBLIC_HOST}:")
+        return public_host or bool(self.headers.get("Cf-Ray", "").strip())
+
+    def _session_is_valid(self) -> bool:
+        expected = self.application.session_token
+        if not expected:
+            return False
+        parsed = cookies.SimpleCookie()
+        try:
+            parsed.load(self.headers.get("Cookie", ""))
+        except cookies.CookieError:
+            return False
+        morsel = parsed.get(_SESSION_COOKIE)
+        return bool(morsel and hmac.compare_digest(morsel.value, expected))
+
+    def _serve_login(self, *, status: int = 200, error: bool = False) -> None:
+        marker = b"<!--AUTH_ERROR-->"
+        error_html = "<p class=\"auth-error\">パスワードが違います。</p>".encode() if error else b""
+        self._send(
+            status,
+            DASHBOARD_LOGIN_HTML_PATH.read_bytes().replace(marker, error_html),
+            content_type="text/html; charset=utf-8",
+        )
+
+    def _login(self) -> None:
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send(400)
+            return
+        if size < 0 or size > 4096:
+            self._send(413)
+            return
+        if "application/x-www-form-urlencoded" not in self.headers.get("Content-Type", ""):
+            self._send(400)
+            return
+        body = self.rfile.read(size).decode("utf-8", errors="replace") if size else ""
+        submitted = parse_qs(body, keep_blank_values=True).get("password", [""])[0]
+        configured = self.application.auth_password
+        if not configured or not hmac.compare_digest(submitted, configured):
+            self._serve_login(status=401, error=True)
+            return
+        token = self.application.session_token
+        if not token:
+            self._send(503)
+            return
+        self._send(
+            303,
+            headers={
+                "Location": "/",
+                "Set-Cookie": f"{_SESSION_COOKIE}={token}; Path=/; HttpOnly; Secure; SameSite=Strict",
+            },
+        )
+
     def _serve_file(self, path: Path, *, root: Path) -> None:
         root = root.resolve()
         lexical = Path(os.path.abspath(path))
@@ -110,11 +189,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(413, {"error": {"code": "request_too_large", "message": "request body exceeds 10 MiB"}})
             return
         body = self.rfile.read(size) if size else None
-        forwarded = {
-            name: value
-            for name, value in self.headers.items()
-            if name.casefold() not in _HOP_BY_HOP | {"host", "content-length"}
-        }
+        forwarded: dict[str, str] = {}
+        for name, value in self.headers.items():
+            folded = name.casefold()
+            if folded in _HOP_BY_HOP | {"host", "content-length"}:
+                continue
+            if folded == "cookie":
+                value = "; ".join(
+                    part.strip()
+                    for part in value.split(";")
+                    if part.strip().partition("=")[0].strip() != _SESSION_COOKIE
+                )
+                if not value:
+                    continue
+            forwarded[name] = value
         connection = http.client.HTTPConnection(
             config.dashboard_api_host,
             config.dashboard_api_port,
@@ -153,6 +241,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _handle(self) -> None:
         path = urlsplit(self.path).path
+        if self._is_public_request():
+            if not self.application.auth_password:
+                if path.startswith("/api/"):
+                    self._json(
+                        503,
+                        {"error": {"code": "authentication_unavailable", "message": "authentication unavailable"}},
+                    )
+                else:
+                    self._send(503, b"Service unavailable", content_type="text/plain; charset=utf-8")
+                return
+            if path == "/auth/login" and self.command == "POST":
+                self._login()
+                return
+            if not self._session_is_valid():
+                if path.startswith("/api/"):
+                    self._json(
+                        401,
+                        {"error": {"code": "authentication_required", "message": "authentication required"}},
+                    )
+                else:
+                    self._serve_login(status=200 if self.command in {"GET", "HEAD"} else 401)
+                return
         if path == "/health":
             self._json(
                 200,
@@ -202,9 +312,10 @@ def create_server(
     *,
     host: str = "0.0.0.0",
     port: int | None = None,
+    auth_password: str | None = None,
 ) -> DashboardServer:
     server = DashboardServer((host, config.dashboard_port if port is None else port), DashboardHandler)
-    server.application = FrontendApplication(config)
+    server.application = FrontendApplication(config, auth_password=auth_password)
     return server
 
 
@@ -215,11 +326,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=None)
     args = parser.parse_args(argv)
-    config = load_cdpa_config(
-        args.config,
-        repository_root=Path(args.repository).expanduser().resolve(),
+    repository_root = Path(args.repository).expanduser().resolve()
+    config = load_cdpa_config(args.config, repository_root=repository_root)
+    server = create_server(
+        config,
+        host=args.host,
+        port=args.port,
+        auth_password=_load_dashboard_password(repository_root),
     )
-    server = create_server(config, host=args.host, port=args.port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

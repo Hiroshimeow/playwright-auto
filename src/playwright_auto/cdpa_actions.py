@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
@@ -68,6 +69,23 @@ class CDPATabActions:
     def __init__(self, browser_context: Any, config: CDPAConfig) -> None:
         self.browser_context = browser_context
         self.config = config
+        self._lifecycle_warning_emitted = False
+
+    async def _set_page_active(self, page: Any) -> None:
+        try:
+            session = await self.browser_context.new_cdp_session(page)
+            try:
+                await session.send("Page.setWebLifecycleState", {"state": "active"})
+            finally:
+                await session.detach()
+        except Exception as exc:
+            if not self._lifecycle_warning_emitted:
+                self._lifecycle_warning_emitted = True
+                warnings.warn(
+                    f"CDPA page lifecycle activation failed: {type(exc).__name__}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
     @staticmethod
     def _supported(page: Any) -> bool:
@@ -213,6 +231,7 @@ class CDPATabActions:
         if not matches:
             return None
         client, snapshot = matches[0]
+        await self._set_page_active(client.page)
         return AcquiredRole(
             client=client,
             page_id=str(snapshot.page_id),
@@ -275,6 +294,7 @@ class CDPATabActions:
         if snapshot.page_team != team or snapshot.page_task_id != task_id:
             raise RoleOwnershipError("task/team ownership did not persist on acquired role tab")
         assert client.binding is not None
+        await self._set_page_active(client.page)
         return AcquiredRole(
             client=client,
             page_id=client.binding.page_id,
@@ -398,6 +418,7 @@ class CDPATabActions:
                 raise RoleOwnershipError(
                     "conversation reopen did not restore exact role/task ownership"
                 )
+            await self._set_page_active(page)
             await page.bring_to_front()
             return AcquiredRole(
                 client=client,

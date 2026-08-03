@@ -107,22 +107,22 @@ def submit_task(
     new_roles: Sequence[str],
     new_all: bool,
     reuse_team: str | None = None,
-    report_mode: str = "file",
     depends_on_task_ids: Sequence[str] = (),
     upload_paths: Sequence[str | Path] = (),
     idempotency_key: str | None = None,
 ) -> Mapping[str, Any]:
+    repository_path = repository.expanduser().resolve()
     return _post(
         config,
         "/api/tasks",
         {
             "task": task,
-            "repository": str(repository),
+            "repository": str(repository_path),
             "requested_team": team,
             "reuse_team": reuse_team,
             "new_roles": list(new_roles),
             "new_all": bool(new_all),
-            "report_mode": str(report_mode),
+            "report_mode": "file",
             "depends_on_task_ids": list(depends_on_task_ids),
             "upload_paths": [str(Path(path).expanduser().resolve()) for path in upload_paths],
         },
@@ -309,11 +309,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="queue new work for one exact existing team without allocating a suffix",
     )
     parser.add_argument(
-        "--inline-report",
-        action="store_true",
-        help="write role reports from response Markdown instead of agent-created files",
-    )
-    parser.add_argument(
         "--depends-on",
         action="append",
         default=[],
@@ -383,7 +378,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 reuse_team=args.reuse_team,
                 new_roles=new_roles,
                 new_all=bool(args.new_all),
-                report_mode="inline" if args.inline_report else "file",
                 depends_on_task_ids=dependencies,
                 upload_paths=tuple(
                     str(Path(path).expanduser().resolve()) for path in args.upload
@@ -395,9 +389,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise ValueError("--reuse-team is invalid in taskless resume mode")
             if not args.team:
                 raise ValueError("taskless resume requires --team <exact-existing-team>")
-            if new_roles or args.new_all or args.inline_report or dependencies or args.upload:
+            if new_roles or args.new_all or dependencies or args.upload:
                 raise ValueError(
-                    "--new, --new-all, --inline-report, --depends-on, and --upload are invalid in taskless resume mode"
+                    "--new, --new-all, --depends-on, and --upload are invalid in taskless resume mode"
                 )
             state = resume_task(config, repository=repository, team=str(args.team))
             mode = "resumed"

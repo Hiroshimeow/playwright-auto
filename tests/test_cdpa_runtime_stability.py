@@ -103,11 +103,40 @@ def _setup(tmp_path: Path):
         "Repair shared runtime boundaries",
         requested_team="alpha",
         task_id="task-rate-a",
-        report_mode="inline",
     )
     worker = CDPAWorker(config, store=store)
     worker.runtime_db.ensure_schema()
     return config, store, state, worker
+
+
+def test_reload_catalog_command_fails_when_hydration_is_still_incomplete(
+    tmp_path: Path, monkeypatch
+):
+    _config, _store, _state, worker = _setup(tmp_path)
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-reload-incomplete",
+        idempotency_key="idem-reload-incomplete",
+        kind="reload_catalog",
+        task_id=None,
+        expected_task_version=None,
+        payload={},
+    )
+    worker.runtime_degraded = True
+    worker.registry = None
+    monkeypatch.setattr(
+        worker,
+        "hydrate_runtime",
+        lambda **_kwargs: {
+            "complete": False,
+            "discovered_at": "now",
+            "errors": [{"error": "broken manifest"}],
+        },
+    )
+
+    result = worker.dispatch_command_once()
+
+    assert result["status"] == "failed"
+    assert "reload catalog is incomplete" in result["error"]
 
 
 def test_shared_rate_limit_cooldown_coalesces_dismiss_and_pauses_agent_claims(
@@ -356,6 +385,6 @@ def _independent_task(
         "attachments": [],
         "cleanup": {"state": "ACTIVE"},
         "controls": [],
-        "options": {"report_mode": "inline"},
+        "options": {"report_mode": "file"},
         "depends_on_task_ids": [],
     }

@@ -5,7 +5,9 @@ import http.client
 import json
 import threading
 from pathlib import Path
+from urllib.parse import urlencode
 
+from playwright_auto import dashboard as dashboard_module
 from playwright_auto.cdpa_config import load_cdpa_config
 from playwright_auto.dashboard import ASSET_ROOT, DASHBOARD_HTML_PATH, create_server
 
@@ -17,6 +19,9 @@ class UpstreamHandler(__import__("http.server").server.BaseHTTPRequestHandler):
     def _handle(self):
         size = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(size) if size else b""
+        self.server.requests.append(  # type: ignore[attr-defined]
+            {"method": self.command, "path": self.path, "body": body, "headers": dict(self.headers.items())}
+        )
         payload = json.dumps(
             {
                 "method": self.command,
@@ -40,15 +45,16 @@ def start_upstream():
     server = __import__("http.server").server.ThreadingHTTPServer(
         ("127.0.0.1", 0), UpstreamHandler
     )
+    server.requests = []
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, thread
 
 
-def start_frontend(tmp_path: Path, *, api_port: int):
+def start_frontend(tmp_path: Path, *, api_port: int, auth_password: str | None = None):
     config = load_cdpa_config(None, repository_root=tmp_path)
     config = __import__("dataclasses").replace(config, dashboard_api_port=api_port)
-    server = create_server(config, host="127.0.0.1", port=0)
+    server = create_server(config, host="127.0.0.1", port=0, auth_password=auth_password)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, thread
@@ -157,8 +163,160 @@ def test_proxy_returns_structured_503_when_api_is_unavailable(tmp_path: Path):
         thread.join(timeout=5)
 
 
+def test_public_auth_rejects_anonymous_before_proxy_even_with_alternate_host(tmp_path: Path):
+    upstream, upstream_thread = start_upstream()
+    server, thread = start_frontend(tmp_path, api_port=upstream.server_address[1], auth_password="correct")
+    try:
+        status, _headers, body = request(
+            server, "GET", "/api/state", headers={"Host": "cdpa.hcu-lab.me"}
+        )
+        assert status == 401
+        assert json.loads(body)["error"]["code"] == "authentication_required"
+
+        status, _headers, _body = request(
+            server,
+            "GET",
+            "/api/state",
+            headers={"Host": "alternate.invalid", "Cf-Ray": "test-edge-request"},
+        )
+        assert status == 401
+        assert upstream.requests == []
+    finally:
+        server.shutdown()
+        upstream.shutdown()
+        thread.join(timeout=5)
+        upstream_thread.join(timeout=5)
 
 
+def test_public_login_rejects_wrong_password_and_accepts_opaque_secure_session(tmp_path: Path):
+    upstream, upstream_thread = start_upstream()
+    server, thread = start_frontend(tmp_path, api_port=upstream.server_address[1], auth_password="correct")
+    public = {"Host": "cdpa.hcu-lab.me", "Content-Type": "application/x-www-form-urlencoded"}
+    try:
+        wrong = urlencode({"password": "wrong"}).encode()
+        status, headers, body = request(server, "POST", "/auth/login", body=wrong, headers=public)
+        assert status == 401
+        assert "Set-Cookie" not in headers
+        login_html = body.decode()
+        assert "あなたは誰？<br>ここで何をしているの？" in login_html
+        assert "https://" not in login_html
+        assert "<script" not in login_html
+        assert "@media (max-width: 480px)" in login_html
+        assert upstream.requests == []
+
+        correct = urlencode({"password": "correct"}).encode()
+        status, headers, _body = request(server, "POST", "/auth/login", body=correct, headers=public)
+        assert status == 303
+        assert headers["Location"] == "/"
+        cookie = headers["Set-Cookie"]
+        assert "HttpOnly" in cookie
+        assert "Secure" in cookie
+        assert "SameSite=Strict" in cookie
+        assert "Path=/" in cookie
+        assert "correct" not in cookie
+        session_cookie = cookie.split(";", 1)[0]
+
+        status, _headers, body = request(
+            server,
+            "GET",
+            "/",
+            headers={"Host": "cdpa.hcu-lab.me", "Cookie": session_cookie},
+        )
+        assert status == 200
+        assert body == DASHBOARD_HTML_PATH.read_bytes()
+    finally:
+        server.shutdown()
+        upstream.shutdown()
+        thread.join(timeout=5)
+        upstream_thread.join(timeout=5)
+
+
+def test_authenticated_public_proxy_preserves_semantics_and_strips_only_auth_cookie(tmp_path: Path):
+    upstream, upstream_thread = start_upstream()
+    server, thread = start_frontend(tmp_path, api_port=upstream.server_address[1], auth_password="correct")
+    try:
+        login_body = urlencode({"password": "correct"}).encode()
+        status, headers, _body = request(
+            server,
+            "POST",
+            "/auth/login",
+            body=login_body,
+            headers={"Host": "cdpa.hcu-lab.me", "Content-Type": "application/x-www-form-urlencoded"},
+        )
+        assert status == 303
+        session_cookie = headers["Set-Cookie"].split(";", 1)[0]
+
+        status, headers, body = request(
+            server,
+            "POST",
+            "/api/tasks?view=compact",
+            body=b'{"task":"x"}',
+            headers={
+                "Host": "cdpa.hcu-lab.me",
+                "Content-Type": "application/json",
+                "Content-Length": "12",
+                "Idempotency-Key": "same-key",
+                "Cookie": f"other=keep; {session_cookie}",
+            },
+        )
+        payload = json.loads(body)
+        assert status == 207
+        assert headers["Content-Type"] == "application/json"
+        assert headers["ETag"] == '"upstream-1"'
+        assert payload == {
+            "method": "POST",
+            "path": "/api/tasks?view=compact",
+            "body": '{"task":"x"}',
+            "idempotency": "same-key",
+        }
+        upstream_headers = upstream.requests[-1]["headers"]
+        assert upstream_headers.get("Cookie") == "other=keep"
+        assert "correct" not in json.dumps(upstream.requests[-1], default=str)
+    finally:
+        server.shutdown()
+        upstream.shutdown()
+        thread.join(timeout=5)
+        upstream_thread.join(timeout=5)
+
+
+def test_public_auth_missing_configuration_fails_closed_without_upstream(tmp_path: Path):
+    upstream, upstream_thread = start_upstream()
+    server, thread = start_frontend(tmp_path, api_port=upstream.server_address[1])
+    try:
+        status, _headers, body = request(
+            server, "GET", "/api/state", headers={"Host": "cdpa.hcu-lab.me"}
+        )
+        assert status == 503
+        assert json.loads(body)["error"]["code"] == "authentication_unavailable"
+
+        status, _headers, body = request(
+            server, "GET", "/", headers={"Host": "cdpa.hcu-lab.me"}
+        )
+        assert status == 503
+        assert body != DASHBOARD_HTML_PATH.read_bytes()
+        assert upstream.requests == []
+    finally:
+        server.shutdown()
+        upstream.shutdown()
+        thread.join(timeout=5)
+        upstream_thread.join(timeout=5)
+
+
+def test_dashboard_password_loader_reads_only_named_repository_env_value(tmp_path: Path, monkeypatch):
+    env_path = tmp_path / ".env"
+    assert dashboard_module._load_dashboard_password(tmp_path) is None
+
+    env_path.write_text("OTHER=value\nCDPA_DASHBOARD_PASSWORD=correct\n", encoding="utf-8")
+    assert dashboard_module._load_dashboard_password(tmp_path) == "correct"
+
+    env_path.write_text("OTHER=value\n", encoding="utf-8")
+    assert dashboard_module._load_dashboard_password(tmp_path) is None
+
+    def unreadable(*_args, **_kwargs):
+        raise OSError("unreadable")
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    assert dashboard_module._load_dashboard_password(tmp_path) is None
 
 
 def test_frontend_assets_are_local_modular_and_suspend_hidden_polling():
@@ -230,6 +388,9 @@ def test_independent_agents_have_one_lane_and_operator_facing_controls():
     assert 'body: {trigger_type: "manual", instruction}' in app
     assert 'action: control.dataset.control' in app
     assert 'control.dataset.control === "reset"' in app
+    assert '/api/independent-agents/${encodeURIComponent(taskId)}/reset' in app
+    assert 'body: isReset ? {reason: "Operator reset"}' in app
+    assert '.filter(item => !item.agent?.deleted_at)' in app
     assert '/api/independent-agents/${encodeURIComponent(taskId)}/delete' in app
 
     assert '<h2>Run task</h2>' in html

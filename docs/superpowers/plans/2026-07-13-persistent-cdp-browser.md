@@ -15,7 +15,7 @@
 - KasmVNC is an interactive viewer only; Playwright automation never depends on port 9223.
 - Persistent Chrome profile is `.runtime/main-profile/`.
 - GUI and headless modes never use the profile simultaneously.
-- Streaming is replaceable by Selkies/WebRTC without changing browser or CDP interfaces.
+- The viewer transport is replaceable without changing browser or CDP interfaces.
 - Do not modify `tampermonkey-auto` or `agent-mcp-gateway`.
 
 ---

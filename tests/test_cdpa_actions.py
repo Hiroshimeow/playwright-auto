@@ -127,16 +127,45 @@ class FakeClient:
         return "fake"
 
 
+class FakeCDPSession:
+    def __init__(self, context, page):
+        self.context = context
+        self.page = page
+
+    async def send(self, method, params):
+        self.context.lifecycle_calls.append(
+            (
+                self.page,
+                method,
+                dict(params),
+                self.page.snapshot_value.page_task_id,
+                self.page.snapshot_value.page_team,
+            )
+        )
+        if self.context.cdp_error is not None:
+            raise self.context.cdp_error
+        return {}
+
+    async def detach(self):
+        self.context.detached_sessions += 1
+
+
 class FakeContext:
-    def __init__(self, pages=None, *, draft_on_new=""):
+    def __init__(self, pages=None, *, draft_on_new="", cdp_error=None):
         self.pages = list(pages or [])
         self.draft_on_new = draft_on_new
+        self.cdp_error = cdp_error
+        self.lifecycle_calls = []
+        self.detached_sessions = 0
 
     async def new_page(self):
         page = FakePage(page_id=None, role=None, team=None)
         page.snapshot_value.composer_text = self.draft_on_new
         self.pages.append(page)
         return page
+
+    async def new_cdp_session(self, page):
+        return FakeCDPSession(self, page)
 
 
 class FakeWorkspace:
@@ -231,13 +260,52 @@ def test_matching_clients_skips_free_tabs_and_prefers_latest_terminal_team(tmp_p
         FakePage(page_id="newest", role="PLAN", team="old-newest"),
     ]
     monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
-    actions = CDPATabActions(SimpleNamespace(pages=pages), config)
+    actions = CDPATabActions(FakeContext(pages), config)
 
     matches = asyncio.run(actions._matching_clients(manifest(), "PLAN"))
 
     assert len(matches) == 1
     assert matches[0][1].page_id == "newest"
     assert matches[0][0].binding.page_id == "newest"
+
+
+def test_locate_owned_sets_active_lifecycle_on_only_the_selected_page(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    other = FakePage(page_id="other", role="PLAN", team="other-team", task_id="task-1")
+    owned = FakePage(page_id="owned", role="PLAN", team="new-team", task_id="task-1")
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    context = FakeContext([other, owned])
+    actions = CDPATabActions(context, config)
+
+    acquired = asyncio.run(actions.locate_owned(manifest(page_id="owned"), "PLAN"))
+
+    assert acquired is not None
+    assert acquired.page_id == "owned"
+    assert owned.front is False
+    assert other.front is False
+    assert context.lifecycle_calls == [
+        (owned, "Page.setWebLifecycleState", {"state": "active"}, "task-1", "new-team")
+    ]
+    assert context.detached_sessions == 1
+
+
+def test_lifecycle_command_failure_is_soft_and_warns_once(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    owned = FakePage(page_id="owned", role="PLAN", team="new-team", task_id="task-1")
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    context = FakeContext([owned], cdp_error=RuntimeError("unsupported command"))
+    actions = CDPATabActions(context, config)
+
+    with pytest.warns(RuntimeWarning, match="lifecycle") as warnings:
+        first = asyncio.run(actions.locate_owned(manifest(page_id="owned"), "PLAN"))
+        second = asyncio.run(actions.locate_owned(manifest(page_id="owned"), "PLAN"))
+
+    assert first is not None and second is not None
+    assert first.page_id == second.page_id == "owned"
+    assert len(warnings) == 1
+    assert len(context.lifecycle_calls) == 2
+    assert context.detached_sessions == 2
+    assert owned.front is False
 
 
 def test_terminal_team_reuse_rebinds_without_new_chat(tmp_path, monkeypatch):
@@ -250,7 +318,8 @@ def test_terminal_team_reuse_rebinds_without_new_chat(tmp_path, monkeypatch):
     )
     original_url = page.url
     monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
-    actions = CDPATabActions(SimpleNamespace(pages=[page]), config)
+    context = FakeContext([page])
+    actions = CDPATabActions(context, config)
 
     acquired = asyncio.run(actions.acquire(manifest(), "PLAN"))
 
@@ -263,6 +332,11 @@ def test_terminal_team_reuse_rebinds_without_new_chat(tmp_path, monkeypatch):
     assert acquired.client.bind_calls == [("task-1", "new-team")]
     assert page.snapshot_value.page_task_id == "task-1"
     assert page.snapshot_value.page_team == "new-team"
+    assert page.front is False
+    assert context.lifecycle_calls == [
+        (page, "Page.setWebLifecycleState", {"state": "active"}, "task-1", "new-team")
+    ]
+    assert context.detached_sessions == 1
 
 
 
@@ -278,7 +352,7 @@ def test_exact_role_team_task_reconciles_despite_stale_recorded_page_id(tmp_path
         FakePage(page_id="current", role="PLAN", team="new-team", task_id="task-1"),
     ]
     monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
-    actions = CDPATabActions(SimpleNamespace(pages=pages), config)
+    actions = CDPATabActions(FakeContext(pages), config)
 
     matches = asyncio.run(actions._matching_clients(manifest(page_id="stale-page"), "PLAN"))
 
@@ -319,6 +393,16 @@ def test_recorded_offline_role_requires_controlled_reopen(tmp_path, monkeypatch)
     assert reopened.client.page.snapshot_value.page_task_id == "task-1"
     assert reopened.client.page.snapshot_value.page_team == "new-team"
     assert reopened.client.page.front is True
+    assert actions.browser_context.lifecycle_calls == [
+        (
+            reopened.client.page,
+            "Page.setWebLifecycleState",
+            {"state": "active"},
+            "task-1",
+            "new-team",
+        )
+    ]
+    assert actions.browser_context.detached_sessions == 1
 
 
 def test_explicit_restart_discards_only_exact_known_automated_draft(tmp_path, monkeypatch):
@@ -365,7 +449,7 @@ def test_close_team_uses_role_team_task_and_ignores_stale_page_id(tmp_path, monk
     other = FakePage(page_id="other", role="PLAN", team="other-team", task_id="task-1")
     monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
     monkeypatch.setattr(actions_module, "action_delay", lambda *_args, **_kwargs: asyncio.sleep(0))
-    actions = CDPATabActions(SimpleNamespace(pages=[owned, free, other]), config)
+    actions = CDPATabActions(FakeContext([owned, free, other]), config)
     state = manifest(page_id="stale-page")
 
     assert asyncio.run(actions.close_team(state)) == 1

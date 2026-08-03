@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -99,6 +100,233 @@ def test_recovery_trigger_has_one_enabled_owner_but_nonexclusive_triggers_are_sh
     assert shared["independent"]["trigger_settings"]["task_done"] is True
 
 
+
+
+@pytest.mark.parametrize(
+    ("old_interval", "new_interval", "release"),
+    [
+        (30, 60, "complete"),
+        (30, 60, "reset"),
+        (60, 30, "complete"),
+        (60, 30, "reset"),
+    ],
+)
+def test_cadence_change_release_keeps_new_interval_watermark(
+    tmp_path: Path,
+    old_interval: int,
+    new_interval: int,
+    release: str,
+):
+    config = load_cdpa_config(None, repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_independent_agent(
+        "Cadence Watcher",
+        system_prompt="Check all workflow tasks.",
+        task_id="agent-cadence-watcher-g1",
+        trigger_settings={"interval_minutes": old_interval, "check_all": True},
+    )
+    current = datetime.now(timezone.utc)
+    old_slot = int(current.timestamp() // (old_interval * 60))
+    old_event = {
+        "event_key": f"check-all:cadence watcher:{old_slot}",
+        "trigger_type": "check_all",
+        "occurred_at": datetime.fromtimestamp(
+            old_slot * old_interval * 60, timezone.utc
+        ).isoformat(),
+        "check_count": old_slot,
+    }
+
+    def activate(value: dict) -> dict:
+        value["status"] = "RUNNING"
+        value["waiting"] = None
+        value["waiting_reason"] = None
+        value["waiting_code"] = None
+        value["independent"]["active_event"] = old_event
+        value["independent"]["cycle"] = 1
+        value["hops"][0]["state"] = "responded" if release == "complete" else "waiting"
+        if release == "complete":
+            value["hops"][0]["response"] = "Checked."
+            value["hops"][0]["response_sha256"] = "a" * 64
+        return value
+
+    active = store.update(state["manifest_path"], activate)
+    changed = store.update_independent_agent(
+        active["manifest_path"],
+        trigger_settings={"interval_minutes": new_interval, "check_all": True},
+    )
+    rebased_slot = changed["independent"]["watermarks"]["last_interval_slot"]
+    assert rebased_slot == int(datetime.now(timezone.utc).timestamp() // (new_interval * 60))
+
+    if release == "complete":
+        released = store.complete_independent_task(
+            changed["manifest_path"], outcome="SUCCESS", summary="Checked."
+        )
+    else:
+        released = store.reset_independent_task(
+            changed["manifest_path"], reason="Release old cadence event."
+        )
+
+    assert released["independent"]["watermarks"]["last_interval_slot"] == rebased_slot
+    next_boundary = datetime.fromtimestamp(
+        (rebased_slot + 1) * new_interval * 60, timezone.utc
+    )
+    events = canonical_independent_events(released, [released], now=next_boundary)
+    assert [event["check_count"] for event in events] == [rebased_slot + 1]
+
+    deleted = store.delete_independent_agent(released["manifest_path"])
+    regenerated = store.create_independent_agent(
+        "Cadence Watcher",
+        system_prompt="Check all workflow tasks.",
+        trigger_settings={"interval_minutes": new_interval, "check_all": True},
+    )
+    assert deleted["status"] == "STOPPED"
+    assert regenerated["independent"]["agent_generation"] == 2
+    assert regenerated["independent"]["watermarks"]["last_interval_slot"] == rebased_slot
+    regenerated_events = canonical_independent_events(
+        regenerated, [deleted, regenerated], now=next_boundary
+    )
+    assert [event["check_count"] for event in regenerated_events] == [rebased_slot + 1]
+
+
+@pytest.mark.parametrize(("old_interval", "new_interval"), [(30, 60), (60, 30)])
+def test_generation_recreation_rebases_changed_interval_watermark(
+    tmp_path: Path,
+    old_interval: int,
+    new_interval: int,
+):
+    config = load_cdpa_config(None, repository_root=tmp_path)
+    store = TaskStore(config)
+    first = store.create_independent_agent(
+        "Generation Cadence Watcher",
+        system_prompt="Check all workflow tasks.",
+        task_id="agent-generation-cadence-watcher-g1",
+        trigger_settings={"interval_minutes": old_interval, "check_all": True},
+    )
+    old_slot = first["independent"]["watermarks"]["last_interval_slot"]
+
+    def preserve_history(value: dict) -> dict:
+        value["independent"]["watermarks"]["seen_event_keys"] = ["task_done:history:1"]
+        value["independent"]["watermarks"]["event_cursors"] = {
+            "task_done": {
+                "occurred_at": "2026-07-31T00:00:00+00:00",
+                "event_key": "task_done:history:1",
+            }
+        }
+        return value
+
+    first = store.update(first["manifest_path"], preserve_history)
+    deleted = store.delete_independent_agent(first["manifest_path"])
+    recreated = store.create_independent_agent(
+        "Generation Cadence Watcher",
+        system_prompt="Check all workflow tasks.",
+        trigger_settings={"interval_minutes": new_interval, "check_all": True},
+    )
+
+    expected_slot = int(datetime.now(timezone.utc).timestamp() // (new_interval * 60))
+    watermarks = recreated["independent"]["watermarks"]
+    assert deleted["status"] == "STOPPED"
+    assert recreated["independent"]["agent_generation"] == 2
+    assert watermarks["last_interval_slot"] == expected_slot
+    assert watermarks["last_interval_slot"] != old_slot
+    assert watermarks["seen_event_keys"] == ["task_done:history:1"]
+    assert watermarks["event_cursors"]["task_done"]["event_key"] == "task_done:history:1"
+
+    next_boundary = datetime.fromtimestamp(
+        (expected_slot + 1) * new_interval * 60, timezone.utc
+    )
+    events = canonical_independent_events(recreated, [deleted, recreated], now=next_boundary)
+    assert [event["check_count"] for event in events] == [expected_slot + 1]
+
+
+def test_same_cadence_generation_recreation_preserves_watermark_and_history(
+    tmp_path: Path,
+):
+    config = load_cdpa_config(None, repository_root=tmp_path)
+    store = TaskStore(config)
+    interval = 30
+    first = store.create_independent_agent(
+        "Generation Same Cadence Watcher",
+        system_prompt="Check all workflow tasks.",
+        task_id="agent-generation-same-cadence-watcher-g1",
+        trigger_settings={"interval_minutes": interval, "check_all": True},
+    )
+    slot = first["independent"]["watermarks"]["last_interval_slot"]
+
+    def preserve_history(value: dict) -> dict:
+        value["independent"]["watermarks"]["seen_event_keys"] = ["task_done:history:2"]
+        value["independent"]["watermarks"]["event_cursors"] = {
+            "task_done": {
+                "occurred_at": "2026-07-31T01:00:00+00:00",
+                "event_key": "task_done:history:2",
+            }
+        }
+        return value
+
+    first = store.update(first["manifest_path"], preserve_history)
+    deleted = store.delete_independent_agent(first["manifest_path"])
+    recreated = store.create_independent_agent(
+        "Generation Same Cadence Watcher",
+        system_prompt="Check all workflow tasks.",
+        trigger_settings={"interval_minutes": interval, "check_all": True},
+    )
+
+    watermarks = recreated["independent"]["watermarks"]
+    assert watermarks["last_interval_slot"] == slot
+    assert watermarks["seen_event_keys"] == ["task_done:history:2"]
+    assert watermarks["event_cursors"]["task_done"]["event_key"] == "task_done:history:2"
+    same_boundary = datetime.fromtimestamp(slot * interval * 60, timezone.utc)
+    assert canonical_independent_events(recreated, [deleted, recreated], now=same_boundary) == []
+    next_boundary = datetime.fromtimestamp((slot + 1) * interval * 60, timezone.utc)
+    events = canonical_independent_events(recreated, [deleted, recreated], now=next_boundary)
+    assert [event["check_count"] for event in events] == [slot + 1]
+
+
+def test_same_cadence_completion_consumes_current_interval_without_duplicate(
+    tmp_path: Path,
+):
+    config = load_cdpa_config(None, repository_root=tmp_path)
+    store = TaskStore(config)
+    interval = 30
+    state = store.create_independent_agent(
+        "Interval Watcher",
+        system_prompt="Check on the interval.",
+        task_id="agent-interval-watcher-g1",
+        trigger_settings={"interval_minutes": interval},
+    )
+    current_slot = state["independent"]["watermarks"]["last_interval_slot"]
+    event = {
+        "event_key": f"interval:interval watcher:{current_slot}",
+        "trigger_type": "interval",
+        "occurred_at": datetime.fromtimestamp(
+            current_slot * interval * 60, timezone.utc
+        ).isoformat(),
+        "check_count": current_slot,
+    }
+
+    def activate(value: dict) -> dict:
+        value["status"] = "RUNNING"
+        value["waiting"] = None
+        value["waiting_reason"] = None
+        value["waiting_code"] = None
+        value["independent"]["active_event"] = event
+        value["independent"]["cycle"] = 1
+        value["hops"][0]["state"] = "responded"
+        value["hops"][0]["response"] = "Checked."
+        value["hops"][0]["response_sha256"] = "b" * 64
+        return value
+
+    active = store.update(state["manifest_path"], activate)
+    released = store.complete_independent_task(
+        active["manifest_path"], outcome="SUCCESS", summary="Checked."
+    )
+    same_boundary = datetime.fromtimestamp(current_slot * interval * 60, timezone.utc)
+    assert canonical_independent_events(released, [released], now=same_boundary) == []
+
+    next_boundary = datetime.fromtimestamp(
+        (current_slot + 1) * interval * 60, timezone.utc
+    )
+    events = canonical_independent_events(released, [released], now=next_boundary)
+    assert [event["check_count"] for event in events] == [current_slot + 1]
 
 
 def test_completion_reuses_long_lived_identity_and_conversation(tmp_path: Path):

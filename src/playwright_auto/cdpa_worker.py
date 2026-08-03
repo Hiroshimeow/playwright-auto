@@ -73,6 +73,7 @@ from .cdpa_store import (
     utc_now,
 )
 from .cdpa_team import cleanup_eligible, has_other_nonterminal_team_work
+from .cdpa_workflow_agents import task_workflow_definitions
 from .chatgpt import (
     ChoicePromptBlockedError,
     ComposerConflictError,
@@ -252,6 +253,19 @@ def _report_mode(state: Mapping[str, Any]) -> str:
     if not isinstance(options, Mapping):
         raise ValueError("task options must be a mapping")
     return report_mode_from_options(options)
+
+
+def _workflow_report_roots(
+    config: CDPAConfig, state: Mapping[str, Any]
+) -> tuple[Path, Path]:
+    repository = Path(str(state.get("repository") or "")).expanduser().resolve()
+    try:
+        plans_relative = config.plans_root.relative_to(config.repository_root)
+    except ValueError as exc:
+        raise ValueError(
+            "workflow plans_root must be inside the control repository"
+        ) from exc
+    return repository, (repository / plans_relative).resolve()
 
 
 class CDPAWorker:
@@ -2132,12 +2146,69 @@ class CDPAWorker:
         role_record["status"] = "pending"
         return hop
 
+    def _pre_send_request_identity_is_safe(
+        self,
+        state: dict[str, Any],
+        hop: Mapping[str, Any],
+    ) -> bool:
+        if str(hop.get("state") or "") != "pre_send":
+            return True
+        if hop.get("receipt") is not None:
+            self._block(
+                state,
+                "pre_send hop already contains accepted receipt evidence; exact request recovery is required before any send",
+                code="pre_send_request_recovery_required",
+                retryable=False,
+            )
+            return False
+        ledger_path = str(hop.get("ledger_path") or "").strip()
+        request_id = str(hop.get("request_id") or "").strip()
+        if not ledger_path or not request_id or not Path(ledger_path).exists():
+            return True
+        try:
+            record = RequestLedger(ledger_path).get(request_id)
+        except Exception as exc:
+            self._block(
+                state,
+                f"pre_send durable request identity cannot be reconciled: {sanitize_exception(exc)}",
+                code="pre_send_request_recovery_required",
+                retryable=False,
+            )
+            return False
+        if record is None:
+            return True
+        self._block(
+            state,
+            f"pre_send hop already has durable request identity in status {record.status.value}; exact request recovery is required before any send",
+            code="pre_send_request_recovery_required",
+            retryable=False,
+        )
+        return False
+
+    def _normalize_legacy_pre_send_report_mode(
+        self,
+        state: dict[str, Any],
+        hop: Mapping[str, Any],
+    ) -> bool:
+        if is_independent_task(state) or str(hop.get("state") or "") != "pre_send":
+            return False
+        if _report_mode(state) != "inline":
+            return False
+        options = state.get("options")
+        if not isinstance(options, dict):
+            raise ValueError("task options must be mutable before report-mode normalization")
+        options["report_mode"] = "file"
+        return True
+
     async def _pre_send(
         self,
         state: dict[str, Any],
         hop: dict[str, Any],
         actions: CDPATabActions,
     ) -> None:
+        if not self._pre_send_request_identity_is_safe(state, hop):
+            return
+        self._normalize_legacy_pre_send_report_mode(state, hop)
         role = str(hop["target_role"])
         if self._attachment_files_for_generation(state, role) is None:
             return
@@ -2200,7 +2271,10 @@ class CDPAWorker:
             if not isinstance(active_event, Mapping):
                 raise ValueError("independent job has no active trigger event")
             built = self.prompts.build_independent(
-                agent_name=str(independent["agent_name"]),
+                agent_name=str(
+                    independent.get("display_name")
+                    or independent["agent_name"]
+                ),
                 system_prompt=str(independent["system_prompt"]),
                 task_id=str(state["task_id"]),
                 team=str(state["team"]),
@@ -2229,9 +2303,10 @@ class CDPAWorker:
             state["kanban_column"] = INDEPENDENT_COLUMN
             state["active_action"] = "send"
             return
+        report_repository, report_plans_root = _workflow_report_roots(self.config, state)
         expected = expected_report_relative(
-            plans_root=self.config.plans_root,
-            repository_root=self.config.repository_root,
+            plans_root=report_plans_root,
+            repository_root=report_repository,
             team=str(state["team"]),
             physical_role=str(hop["physical_role"]),
             turn=int(hop["turn"]),
@@ -2243,6 +2318,8 @@ class CDPAWorker:
             if source_logical in state["roles"]
             else None
         )
+        workflow_definitions = task_workflow_definitions(state, self.config)
+        allowed_routes = tuple(workflow_definitions) + ("DONE",)
         if hop.get("kind") == "route_repair":
             prompt = self.prompts.repair(
                 task_id=str(state["task_id"]),
@@ -2251,6 +2328,7 @@ class CDPAWorker:
                 turn=int(hop["turn"]),
                 validation_error=str(hop["validation_error"]),
                 report_mode=_report_mode(state),
+                allowed_routes=allowed_routes,
             )
             included = False
         else:
@@ -2261,12 +2339,7 @@ class CDPAWorker:
                 logical_role=role,
                 physical_role=str(hop["physical_role"]),
                 turn=int(hop["turn"]),
-                allowed_routes=tuple(
-                    configured
-                    for configured in ("PLAN", "DEV", "TEST", "REVIEW", "AUDIT")
-                    if configured in state["roles"]
-                )
-                + ("DONE",),
+                allowed_routes=allowed_routes,
                 workspace=str(state["repository"]),
                 source_physical_role=source_physical,
                 handoff=str(hop["handoff"]),
@@ -2276,6 +2349,7 @@ class CDPAWorker:
                 ),
                 conversation_generation=generation,
                 report_mode=_report_mode(state),
+                constructor_text=str(workflow_definitions[role]["system_prompt"]),
             )
             prompt = built.text
             included = built.constructor_included
@@ -2329,7 +2403,9 @@ class CDPAWorker:
                 )
             )
         else:
-            constructor = self.config.constructor_paths[role].read_text(encoding="utf-8")
+            constructor = str(
+                task_workflow_definitions(state, self.config)[role]["system_prompt"]
+            )
         block = DurableSendBlock(
             str(hop["prompt"]),
             ledger_path=hop["ledger_path"],
@@ -2491,12 +2567,17 @@ class CDPAWorker:
             response.text,
             source_role=role,
             report_mode=_report_mode(state),
+            allowed_routes=tuple(task_workflow_definitions(state, self.config))
+            + ("DONE",),
         )
         if parsed.inline_report is None:
+            report_repository, report_plans_root = _workflow_report_roots(
+                self.config, state
+            )
             validate_report(
                 parsed.decision.handoff,
-                repository_root=self.config.repository_root,
-                plans_root=self.config.plans_root,
+                repository_root=report_repository,
+                plans_root=report_plans_root,
                 team=str(state["team"]),
                 physical_role=str(hop["physical_role"]),
                 turn=int(hop["turn"]),
@@ -3049,12 +3130,17 @@ class CDPAWorker:
             state["block_reason"] = None
             return
         role = str(hop["target_role"])
+        response_mode = _report_mode(state)
+        legacy_inline = response_mode == "inline"
+        report_repository, report_plans_root = _workflow_report_roots(self.config, state)
         decision = None
         try:
             parsed = parse_role_response(
                 str(hop.get("response") or ""),
                 source_role=role,
-                report_mode=_report_mode(state),
+                report_mode=response_mode,
+                allowed_routes=tuple(task_workflow_definitions(state, self.config))
+                + ("DONE",),
             )
             decision = parsed.decision
             if decision.route != "DONE" and decision.route not in state["roles"]:
@@ -3064,8 +3150,8 @@ class CDPAWorker:
             if parsed.inline_report is None:
                 evidence = validate_report(
                     decision.handoff,
-                    repository_root=self.config.repository_root,
-                    plans_root=self.config.plans_root,
+                    repository_root=report_repository,
+                    plans_root=report_plans_root,
                     team=str(state["team"]),
                     physical_role=str(hop["physical_role"]),
                     turn=int(hop["turn"]),
@@ -3077,8 +3163,8 @@ class CDPAWorker:
                     evidence = materialize_inline_report(
                         parsed.inline_report,
                         expected_report_path=str(hop.get("expected_report_path") or ""),
-                        repository_root=self.config.repository_root,
-                        plans_root=self.config.plans_root,
+                        repository_root=report_repository,
+                        plans_root=report_plans_root,
                         team=str(state["team"]),
                         physical_role=str(hop["physical_role"]),
                         turn=int(hop["turn"]),
@@ -3086,20 +3172,29 @@ class CDPAWorker:
                     )
                 except (RouteContractError, OSError) as exc:
                     raise InlineReportMaterializationError(
-                        "inline report materialization failed"
+                        "legacy inline report materialization failed"
                     ) from exc
                 routed_handoff = str(hop["expected_report_path"])
         except InlineReportMaterializationError:
             self._block(
                 state,
-                "inline report materialization failed",
+                "legacy inline report materialization failed",
                 code="inline_report_materialization_failed",
                 retryable=False,
             )
             return
         except (RouteContractError, ValueError, OSError) as exc:
+            if legacy_inline:
+                options = state.get("options")
+                if isinstance(options, dict):
+                    options["report_mode"] = "file"
             self._repair_route(state, hop, exc, decision=decision)
             return
+        if legacy_inline:
+            options = state.get("options")
+            if not isinstance(options, dict):
+                raise ValueError("task options must be mutable during legacy report migration")
+            options["report_mode"] = "file"
         self._complete_request_response(hop)
         hop.update(
             {
@@ -3366,6 +3461,7 @@ class CDPAWorker:
             return
 
         response: MessageSnapshot | None = None
+        response_validation_error: str | None = None
         try:
             response = await acquired.client.wait_for_response(
                 receipt,
@@ -3384,11 +3480,19 @@ class CDPAWorker:
                 minimum_samples=2,
                 invalid_grace_ms=max(1_000, self.config.response_stable_ms),
             )
+        except StableMalformedResponseError as exc:
+            response = exc.candidate
+            response_validation_error = str(exc.validation_error)
         except (TimeoutError, IncompleteResponseTimeoutError):
             response = None
         if response is not None:
             old_hop_id = state.get("active_hop_id")
-            self._record_response(state, hop, response)
+            self._record_response(
+                state,
+                hop,
+                response,
+                validation_error=response_validation_error,
+            )
             self._responded(state, hop)
             self._finish_resume_control(
                 state,
@@ -3488,7 +3592,23 @@ class CDPAWorker:
         actions: CDPATabActions,
     ) -> None:
         ledger = RequestLedger(str(hop.get("ledger_path") or ""))
-        record = ledger.get(str(hop.get("request_id") or ""))
+        ledger_exists = ledger.path.exists()
+        record = ledger.get(str(hop.get("request_id") or "")) if ledger_exists else None
+        if record is None and ledger_exists:
+            state["active_action"] = "send"
+            self._finish_resume_control(
+                state,
+                control,
+                outcome="continued",
+                action="await_durable_send",
+                reason_code=None,
+                reason=(
+                    "Resume arrived after pre-send preparation but before this hop "
+                    "created its durable request record; the send boundary has not started."
+                ),
+                postcondition="send_not_started",
+            )
+            return
         if record is None or record.status is not RequestStatus.SENDING:
             self._require_resume_recovery(
                 state,
@@ -4555,6 +4675,7 @@ class CDPAWorker:
                     "reuse_teams": [],
                 },
             )
+            self._publish_agents(tasks)
             self.runtime_db.put_snapshot(
                 "worker",
                 {
@@ -4683,8 +4804,12 @@ class CDPAWorker:
             )
         self.runtime_db.put_snapshot(
             "agents",
-            {"independent": independent_agents},
+            {
+                "workflow": self.store.list_workflow_agents(),
+                "independent": independent_agents,
+            },
         )
+
     def _publish_dashboard_actions(self) -> None:
         if self.registry is None:
             return
@@ -4747,6 +4872,7 @@ class CDPAWorker:
             return
         affected = self.registry.update_task(state, now=time.time())
         self._publish_affected(affected)
+        self._publish_agents()
 
     def _command_replay_state(
         self, command: Mapping[str, Any]
@@ -4786,6 +4912,7 @@ class CDPAWorker:
         state = proven[0]
         if kind in {
             "create_independent_agent",
+            "delete_independent_agent",
             "independent_complete",
             "independent_continue",
             "independent_run_now",
@@ -4817,15 +4944,10 @@ class CDPAWorker:
             ):
                 raise RuntimeError("create command provenance does not match its payload")
             if "roles" in payload:
-                selected_roles = {
+                expected_roles = {
                     str(role).strip().upper() for role in payload["roles"]
                 }
-                expected_roles = tuple(
-                    role for role in self.config.roles if role in selected_roles
-                )
-                actual_roles = tuple(
-                    role for role in self.config.roles if role in state.get("roles", {})
-                )
+                actual_roles = set(state.get("roles", {}))
                 if actual_roles != expected_roles:
                     raise RuntimeError(
                         "create command role provenance does not match its payload"
@@ -4924,6 +5046,11 @@ class CDPAWorker:
             state: dict[str, Any] | None = None
             if kind == "reload_catalog":
                 catalog = self.hydrate_runtime(startup=False)
+                if catalog.get("complete") is not True:
+                    raise RuntimeError(
+                        "reload catalog is incomplete: "
+                        f"{len(catalog.get('errors') or [])} discovery errors"
+                    )
                 result = {"catalog": catalog}
             elif kind == "create_task":
                 if task_id is None:
@@ -4954,6 +5081,39 @@ class CDPAWorker:
                     )
                 self._publish_command_state(state)
                 result = {"task_id": task_id, "status": state.get("status")}
+            elif kind == "create_workflow_agent":
+                definition = self.store.create_workflow_agent(
+                    display_name=payload.get("name"),
+                    system_prompt=payload.get("system_prompt"),
+                    external_command_id=command_id,
+                )
+                self._publish_agents()
+                result = {
+                    "route_key": definition["route_key"],
+                    "display_name": definition["display_name"],
+                }
+            elif kind == "update_workflow_agent":
+                definition = self.store.update_workflow_agent(
+                    str(payload.get("route_key") or ""),
+                    display_name=payload.get("name"),
+                    system_prompt=payload.get("system_prompt"),
+                    external_command_id=command_id,
+                )
+                self._publish_agents()
+                result = {
+                    "route_key": definition["route_key"],
+                    "display_name": definition["display_name"],
+                }
+            elif kind == "delete_workflow_agent":
+                definition = self.store.delete_workflow_agent(
+                    str(payload.get("route_key") or ""),
+                    external_command_id=command_id,
+                )
+                self._publish_agents()
+                result = {
+                    "route_key": definition["route_key"],
+                    "deleted": True,
+                }
             elif kind == "create_independent_agent":
                 state = self.store.create_independent_agent(
                     str(payload.get("name") or ""),
@@ -4970,6 +5130,18 @@ class CDPAWorker:
                 )
                 self._publish_command_state(state)
                 result = {"task_id": state["task_id"], "status": state["status"]}
+            elif kind == "delete_independent_agent":
+                if task_id is None:
+                    raise ValueError("delete_independent_agent requires task_id")
+                current = self._command_task_state(task_id)
+                if current is None:
+                    raise ValueError(f"task does not exist: {task_id}")
+                state = self.store.delete_independent_agent(
+                    current["manifest_path"],
+                    external_command_id=command_id,
+                )
+                self._publish_command_state(state)
+                result = {"task_id": task_id, "deleted": True}
             elif kind == "independent_complete":
                 if task_id is None:
                     raise ValueError("independent_complete requires task_id")
@@ -5135,6 +5307,7 @@ class CDPAWorker:
                 state = self.store.update_independent_agent(
                     current["manifest_path"],
                     enabled=payload.get("enabled") if "enabled" in payload else None,
+                    display_name=payload.get("display_name"),
                     system_prompt=payload.get("system_prompt"),
                     trigger_settings=(
                         payload.get("trigger_settings")
@@ -5215,7 +5388,11 @@ class CDPAWorker:
                 kinds=(
                     "create_task",
                     "change_goal",
+                    "create_workflow_agent",
+                    "update_workflow_agent",
+                    "delete_workflow_agent",
                     "create_independent_agent",
+                    "delete_independent_agent",
                     "independent_complete",
                     "independent_continue",
                     "independent_run_now",
@@ -5241,7 +5418,11 @@ class CDPAWorker:
         browser_safe_commands = (
             "create_task",
             "change_goal",
+            "create_workflow_agent",
+            "update_workflow_agent",
+            "delete_workflow_agent",
             "create_independent_agent",
+            "delete_independent_agent",
             "independent_complete",
             "independent_continue",
             "independent_run_now",

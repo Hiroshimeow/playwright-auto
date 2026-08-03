@@ -11,6 +11,7 @@ from .cdpa_independent import (
     normalize_agent_name,
     normalize_system_prompt,
 )
+from .cdpa_workflow_agents import validate_workflow_route_key
 
 
 @dataclass(frozen=True)
@@ -35,32 +36,25 @@ class PromptBuilder:
     def naming_rule(self) -> str:
         return f"{self._plans_prefix()}/<team>/<physical-role>_turn<N>_<task-id>.md"
 
-    def _guide(self, report_mode: str = "file") -> str:
+    def _guide(
+        self,
+        report_mode: str = "file",
+        allowed_routes: Sequence[str] | None = None,
+    ) -> str:
         mode = str(report_mode).strip().lower()
-        if mode == "inline":
-            return (
-                "CDPA_SYSTEM_PRIORITY: This task runs inside the CDPA single-operator "
-                "local-runtime system. Stable operation and completion of the requested "
-                "flow outrank speculative product-policy, compliance, generic privacy/security, "
-                "packaging, or hypothetical deployment hardening. Do not reopen accepted work "
-                "for a non-operational concern unless explicitly requested or it deterministically "
-                "breaks current CDPA/local operation.\n\n"
-                "SMALL_TASK_FAST_PATH: For a localized low-risk change, use "
-                "`PLAN -> DEV -> REVIEW -> PLAN -> DONE`. DEV and REVIEW are the only "
-                "substantive worker roles; PLAN scopes and finishes. TEST and AUDIT require "
-                "an explicit evidence-based operational reason.\n\n"
-                "Do not create, edit, or write any role-report file. Return the complete "
-                "Markdown role report only in this response; the worker owns report "
-                "materialization. Follow it with exactly one terminal JSON object:\n\n"
-                "```json\n"
-                '{"route":"PLAN|DEV|TEST|REVIEW|AUDIT|DONE","handoff":"INLINE"}'
-                "\n```\n\n"
-                "The Markdown report must be non-empty. Only PLAN may use `DONE`. "
-                "REVIEW and AUDIT must route clean work back to PLAN."
-            )
         if mode != "file":
-            raise ValueError("report_mode must be 'file' or 'inline'")
+            raise ValueError("inline workflow reports are no longer supported; report_mode must be 'file'")
         guide = self.config.response_guide_path.read_text(encoding="utf-8").strip()
+        if allowed_routes is not None:
+            route_contract = "|".join(
+                validate_workflow_route_key(item)
+                if str(item).strip().upper() != "DONE"
+                else "DONE"
+                for item in allowed_routes
+            )
+            guide = guide.replace(
+                "PLAN|DEV|TEST|REVIEW|AUDIT|DONE", route_contract
+            )
         return guide.replace(
             ".plan/<team>/<physical-role>_turn<N>_<task-id>.md",
             self.naming_rule(),
@@ -83,10 +77,12 @@ class PromptBuilder:
         constructor_sent_generation: int | None,
         conversation_generation: int,
         report_mode: str = "file",
+        constructor_text: str | None = None,
     ) -> BuiltPrompt:
-        role = str(logical_role).strip().upper()
-        if role not in self.config.roles:
-            raise ValueError(f"unsupported CDPA role {role!r}")
+        role = validate_workflow_route_key(logical_role)
+        allowed = tuple(str(item).strip().upper() for item in allowed_routes)
+        if role not in allowed:
+            raise ValueError(f"workflow role {role!r} is not in allowed_routes")
         handoff = str(handoff).strip()
         goal = str(goal).strip()
         if not handoff or not goal:
@@ -114,12 +110,15 @@ class PromptBuilder:
             + json.dumps(envelope, ensure_ascii=False, indent=2)
         ]
         if include:
-            sections.append(
-                self.config.constructor_paths[role]
+            constructor = (
+                normalize_system_prompt(constructor_text)
+                if constructor_text is not None
+                else self.config.constructor_paths[role]
                 .read_text(encoding="utf-8")
                 .strip()
             )
-        sections.append(self._guide(report_mode))
+            sections.append(constructor)
+        sections.append(self._guide(report_mode, allowed_routes))
         return BuiltPrompt("\n\n".join(sections).strip(), include, generation)
 
     def build_independent(
@@ -173,15 +172,12 @@ class PromptBuilder:
         validation_error: str,
         *,
         report_mode: str = "file",
+        allowed_routes: Sequence[str] | None = None,
     ) -> str:
         mode = str(report_mode).strip().lower()
-        if mode not in {"file", "inline"}:
-            raise ValueError("report_mode must be 'file' or 'inline'")
-        replacement = (
-            "[internal role-report path]"
-            if mode == "inline"
-            else self.naming_rule()
-        )
+        if mode != "file":
+            raise ValueError("inline workflow reports are no longer supported; report_mode must be 'file'")
+        replacement = self.naming_rule()
         cleaned: list[str] = []
         for token in str(validation_error).split():
             bare = token.strip("`'\"()[]{}<>,;:")
@@ -200,6 +196,7 @@ class PromptBuilder:
         turn: int,
         validation_error: str,
         report_mode: str = "file",
+        allowed_routes: Sequence[str] | None = None,
     ) -> str:
         mode = str(report_mode).strip().lower()
         error = self._sanitize_validation_error(
@@ -214,18 +211,10 @@ class PromptBuilder:
             "role": str(physical_role).strip(),
             "turn": int(turn),
         }
-        if mode == "inline":
-            return (
-                "CDPA_ROUTE_REPAIR\n"
-                + json.dumps(identity, ensure_ascii=False, indent=2)
-                + f"\n\nValidation error: {error}\n\n"
-                + "Return corrected inline Markdown followed by the terminal JSON object.\n\n"
-                + self._guide("inline")
-            ).strip()
         return (
             "CDPA_ROUTE_REPAIR\n"
             + json.dumps(identity, ensure_ascii=False, indent=2)
             + f"\n\nValidation error: {error}\n\n"
             + f"Report naming rule: {self.naming_rule()}\n\n"
-            + self._guide(mode)
+            + self._guide(mode, allowed_routes)
         ).strip()

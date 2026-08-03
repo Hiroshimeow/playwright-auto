@@ -40,10 +40,11 @@ def validate_cdp_url(url: str) -> str:
 async def connect(url: str) -> tuple[Playwright, Browser]:
     playwright = await async_playwright().start()
     try:
-        browser = await playwright.chromium.connect_over_cdp(validate_cdp_url(url))
-        for context in browser.contexts:
-            for page in context.pages:
-                await page.emulate_media(color_scheme="null")
+        browser = await playwright.chromium.connect_over_cdp(
+            validate_cdp_url(url),
+            is_local=True,
+            no_defaults=True,
+        )
     except Exception:
         await playwright.stop()
         raise

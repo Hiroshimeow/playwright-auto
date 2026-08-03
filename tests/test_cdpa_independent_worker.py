@@ -313,6 +313,10 @@ def test_active_recovery_resume_preserves_job_and_gates_next_target(
     monkeypatch.setattr(
         "playwright_auto.cdpa_store.utc_now", lambda: enabled_at.isoformat()
     )
+    monkeypatch.setattr(
+        "playwright_auto.cdpa_store_independent.utc_now",
+        lambda: enabled_at.isoformat(),
+    )
     _config, store, _blocked, state, worker = setup_agent(tmp_path)
     event_key = state["independent"]["active_event"]["event_key"]
     state = store.request_control(state["manifest_path"], "pause", role="AGENT")

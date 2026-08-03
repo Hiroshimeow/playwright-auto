@@ -7,11 +7,13 @@ import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
+from .cdpa_workflow_agents import validate_workflow_route_key
 from .file_lock import exclusive_file_lock, fsync_parent_directory
 
 ROUTES = frozenset({"PLAN", "DEV", "REVIEW", "TEST", "AUDIT", "DONE"})
+_REPORT_MODES = frozenset({"file", "inline"})
 _KEYS = frozenset({"route", "handoff"})
 _FENCE = re.compile(r"^```json\s*(\{.*\})\s*```$", re.DOTALL | re.IGNORECASE)
 
@@ -22,6 +24,28 @@ class RouteContractError(ValueError):
 
 class InlineReportMaterializationError(RouteContractError):
     pass
+
+
+def normalize_report_mode(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("report_mode must be 'file' or 'inline'")
+    mode = value.strip().lower()
+    if mode not in _REPORT_MODES:
+        raise ValueError("report_mode must be 'file' or 'inline'")
+    return mode
+
+
+def effective_report_mode(
+    value: Any,
+    *,
+    control_repository: str | Path,
+    execution_repository: str | Path,
+) -> str:
+    del control_repository, execution_repository
+    mode = normalize_report_mode(value)
+    if mode != "file":
+        raise ValueError("report_mode='inline' is no longer supported; workflow reports are file-only")
+    return "file"
 
 
 @dataclass(frozen=True)
@@ -61,7 +85,12 @@ def _decode(source: str) -> dict[str, Any]:
     return value
 
 
-def parse_route_response(text: str, *, source_role: str | None = None) -> RouteDecision:
+def parse_route_response(
+    text: str,
+    *,
+    source_role: str | None = None,
+    allowed_routes: Sequence[str] | None = None,
+) -> RouteDecision:
     source = str(text).strip()
     match = _FENCE.fullmatch(source)
     if match:
@@ -75,7 +104,23 @@ def parse_route_response(text: str, *, source_role: str | None = None) -> RouteD
         raise RouteContractError("route and handoff must be strings")
     route = value["route"].strip().upper()
     handoff = value["handoff"].strip()
-    if route not in ROUTES:
+    if allowed_routes is None:
+        allowed = ROUTES
+    else:
+        try:
+            allowed = frozenset(
+                "DONE"
+                if str(item).strip().upper() == "DONE"
+                else validate_workflow_route_key(item)
+                for item in allowed_routes
+            )
+        except ValueError as exc:
+            raise RouteContractError(str(exc)) from exc
+    if route not in allowed:
+        if allowed_routes is not None:
+            raise RouteContractError(
+                f"route {route!r} is not selected or unavailable"
+            )
         raise RouteContractError(f"unsupported route {route!r}")
     if not handoff:
         raise RouteContractError("handoff must not be empty")
@@ -145,6 +190,7 @@ def parse_role_response(
     *,
     source_role: str,
     report_mode: str = "file",
+    allowed_routes: Sequence[str] | None = None,
 ) -> ParsedRoleResponse:
     mode = str(report_mode).strip().lower()
     if mode not in {"file", "inline"}:
@@ -155,11 +201,19 @@ def parse_role_response(
                 "file report mode requires a file report handoff and no inline body"
             )
         return ParsedRoleResponse(
-            parse_route_response(text, source_role=source_role),
+            parse_route_response(
+                text,
+                source_role=source_role,
+                allowed_routes=allowed_routes,
+            ),
             None,
         )
     report, route_source = _split_inline_response(text)
-    decision = parse_route_response(route_source, source_role=source_role)
+    decision = parse_route_response(
+        route_source,
+        source_role=source_role,
+        allowed_routes=allowed_routes,
+    )
     if decision.handoff != "INLINE":
         raise RouteContractError('inline report mode requires handoff "INLINE"')
     return ParsedRoleResponse(decision, report)

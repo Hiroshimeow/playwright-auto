@@ -1,9 +1,53 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 import playwright_auto.cdpa_cli as cdpa_cli_module
 from playwright_auto.cdpa_cli import main as cdpa_main
+
+
+def test_submit_task_keeps_file_mode_across_workspaces(tmp_path: Path, monkeypatch):
+    control_repository = tmp_path / "control"
+    execution_repository = tmp_path / "execution"
+    control_repository.mkdir()
+    execution_repository.mkdir()
+    payloads = []
+
+    def fake_post(_config, path, payload, **_kwargs):
+        payloads.append((path, payload))
+        return {"status": "queued"}
+
+    monkeypatch.setattr(cdpa_cli_module, "_post", fake_post)
+    config = SimpleNamespace(repository_root=control_repository.resolve())
+
+    cdpa_cli_module.submit_task(
+        config,
+        task="cross workspace",
+        repository=execution_repository,
+        team="cross",
+        new_roles=(),
+        new_all=False,
+    )
+    cdpa_cli_module.submit_task(
+        config,
+        task="same workspace",
+        repository=control_repository,
+        team="same",
+        new_roles=(),
+        new_all=False,
+    )
+
+    assert payloads[0][0] == "/api/tasks"
+    assert payloads[0][1]["report_mode"] == "file"
+    assert payloads[1][1]["report_mode"] == "file"
+
+
+def test_cli_no_longer_accepts_inline_report_flag():
+    with pytest.raises(SystemExit):
+        cdpa_cli_module.build_parser().parse_args(["task", "--inline-report"])
 
 
 def test_cdpa_without_arguments_starts_three_service_runtime_for_current_repository(

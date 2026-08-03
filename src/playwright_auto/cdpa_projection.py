@@ -916,10 +916,15 @@ def build_task_projection(
         )
         summary["task_mode"] = "independent"
         summary["agent"] = {
-            "name": _public_text(independent.get("agent_name"), max_chars=80),
+            "name": _public_text(
+                independent.get("display_name")
+                or independent.get("agent_name"),
+                max_chars=80,
+            ),
             "is_builtin": str(independent.get("agent_key") or "").casefold() in {"maintainers", "monitor"},
             "generation": _int_or_zero(independent.get("agent_generation")),
             "enabled": bool(independent.get("enabled")),
+            "deleted_at": str(independent.get("deleted_at") or "") or None,
             "trigger_type": str(active_event.get("trigger_type") or "") or None,
             "target_team": str(active_event.get("target_team") or "") or None,
             "target_task_id": str(active_event.get("target_task_id") or "") or None,

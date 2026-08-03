@@ -147,6 +147,7 @@ def setup_task(
     task_id="task-a",
     report_mode="file",
     roles=None,
+    repository=None,
 ):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
@@ -156,6 +157,7 @@ def setup_task(
         task_id=task_id,
         report_mode=report_mode,
         roles=roles,
+        repository=repository,
     )
     return config, store, state, CDPAWorker(config, store=store)
 
@@ -462,16 +464,17 @@ def test_valid_report_routes_to_lazy_dev_child_and_records_sha(tmp_path: Path):
 
 
 
-def test_unselected_route_enters_safe_repair_without_materializing_report(tmp_path: Path):
+def test_unselected_route_enters_safe_repair_without_recording_report(tmp_path: Path):
     _, _, state, worker = setup_task(
         tmp_path,
         task_id="task-unselected-route",
-        report_mode="inline",
         roles=("PLAN", "REVIEW"),
     )
     hop = _active_hop(state)
     asyncio.run(worker._pre_send(state, hop, FakeActions()))
-    hop["response"] = _inline_response(route="DEV")
+    hop["response"] = (
+        '{"route":"DEV","handoff":"' + str(hop["expected_report_path"]) + '"}'
+    )
     hop["state"] = "responded"
 
     worker._responded(state, hop)
@@ -936,9 +939,13 @@ def _prepare_sent_waiting_task(
     *,
     task_id: str,
     report_mode: str = "file",
+    repository=None,
 ):
     _, store, state, worker = setup_task(
-        tmp_path, task_id=task_id, report_mode=report_mode
+        tmp_path,
+        task_id=task_id,
+        report_mode=report_mode,
+        repository=repository,
     )
     path = Path(state["manifest_path"])
     hop = _active_hop(state)
@@ -999,6 +1006,138 @@ def _prepare_sent_waiting_task(
 
 
 
+
+
+def test_normal_wait_missing_file_response_enters_route_repair(tmp_path: Path):
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-normal-wait-missing-file"
+    )
+    response = MessageSnapshot(
+        "assistant",
+        "a-normal-missing-file",
+        "ta-normal-missing-file",
+        json.dumps(
+            {
+                "route": "TEST",
+                "handoff": str(hop["expected_report_path"]),
+            }
+        ),
+        (),
+    )
+    snapshot = SimpleNamespace(
+        state=ChatGPTState.WAITING_PROMPT,
+        stop_visible=False,
+        composer_empty=True,
+        manual_input_pending=False,
+        error_texts=(),
+        blocking_dialogs=(),
+        messages=(MessageSnapshot("user", "u1", "t1", receipt.prompt, ()),),
+    )
+
+    class Client:
+        async def wait_snapshot(self, _receipt, **_kwargs):
+            return snapshot
+
+        async def wait_for_response(self, _receipt, **kwargs):
+            try:
+                kwargs["candidate_validator"](response)
+            except Exception as exc:
+                raise StableMalformedResponseError(response, exc) from exc
+            raise AssertionError("missing report must fail candidate validation")
+
+    acquired = AcquiredRole(
+        Client(), receipt.binding.page_id, "https://chatgpt.com/c/normal-missing", False, False
+    )
+
+    class Actions:
+        async def locate_owned(self, _state, _role):
+            return acquired
+
+    asyncio.run(worker._waiting(state, hop, Actions(), path))
+
+    assert hop["state"] == "responded"
+    assert hop["response"] == response.text
+    assert hop["validation_error"] == "report file does not exist"
+
+    worker._responded(state, hop)
+
+    repair = _active_hop(state)
+    record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
+    assert hop["state"] == "routed"
+    assert repair["kind"] == "route_repair"
+    assert repair["target_role"] == "PLAN"
+    assert repair["validation_error"] == "report file does not exist"
+    assert record is not None
+    assert record.status is RequestStatus.COMPLETED
+    assert record.attempts == 1
+
+
+@pytest.mark.parametrize(
+    ("retained_report", "expected_kind", "expected_block"),
+    [
+        (True, "missing_file_fallback", None),
+        (False, None, "report_materialization_unavailable"),
+    ],
+)
+def test_repeated_missing_file_repair_keeps_bounded_fallback_behavior(
+    tmp_path: Path, retained_report: bool, expected_kind: str | None, expected_block: str | None
+):
+    _store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id=f"task-repeat-missing-{int(retained_report)}"
+    )
+    response = MessageSnapshot(
+        "assistant",
+        "a-repeat-missing",
+        "ta-repeat-missing",
+        json.dumps(
+            {
+                "route": "TEST",
+                "handoff": str(hop["expected_report_path"]),
+            }
+        ),
+        (),
+    )
+    worker._record_response(
+        state, hop, response, validation_error="report file does not exist"
+    )
+    worker._responded(state, hop)
+    parent = hop
+    repair = _active_hop(state)
+    asyncio.run(worker._pre_send(state, repair, FakeActions()))
+    repeated = MessageSnapshot(
+        "assistant",
+        "a-repeat-missing-repair",
+        "ta-repeat-missing-repair",
+        response.text,
+        (),
+    )
+    worker._record_response(
+        state, repair, repeated, validation_error="report file does not exist"
+    )
+    if retained_report:
+        state["reports"].append(
+            {
+                "path": ".plan/alpha/retained.md",
+                "sha256": "retained",
+                "size": 1,
+            }
+        )
+
+    worker._responded(state, repair)
+
+    assert parent["validation_error"] == "report file does not exist"
+    assert repair["validation_error"] == "report file does not exist"
+    if expected_block is not None:
+        assert state["status"] == "BLOCKED"
+        assert state["block_code"] == expected_block
+        assert state["active_hop_id"] == repair["hop_id"]
+    else:
+        fallback = _active_hop(state)
+        assert state["status"] == "RUNNING"
+        assert state["block_code"] is None
+        assert fallback["kind"] == expected_kind
+        assert fallback["target_role"] == "PLAN"
+        assert fallback["handoff"] == ".plan/alpha/retained.md"
 
 
 def test_waiting_requires_valid_route_report_and_two_samples_before_hop_response(tmp_path: Path):
@@ -1123,12 +1262,11 @@ def _inline_response(route="DONE", body="# Inline report\n\nEvidence."):
 
 
 
-def test_inline_response_materializes_exact_report_and_routes(tmp_path: Path):
-    _, _, state, worker = setup_task(
-        tmp_path, task_id="task-inline-materialize", report_mode="inline"
-    )
+def test_legacy_inline_response_materializes_once_then_switches_to_file(tmp_path: Path):
+    _, _, state, worker = setup_task(tmp_path, task_id="task-inline-materialize")
+    state["options"]["report_mode"] = "inline"
     hop = _active_hop(state)
-    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    hop["expected_report_path"] = ".plan/alpha/alpha-plan_turn1_task-inline-materialize.md"
     hop["response"] = _inline_response(route="DEV")
     hop["state"] = "responded"
 
@@ -1141,6 +1279,7 @@ def test_inline_response_materializes_exact_report_and_routes(tmp_path: Path):
     assert hop["report_sha256"] == worker_module.hashlib.sha256(expected.read_bytes()).hexdigest()
     assert len(state["reports"]) == 1
     assert state["reports"][0]["path"] == str(expected)
+    assert state["options"]["report_mode"] == "file"
     next_hop = _active_hop(state)
     assert next_hop["target_role"] == "DEV"
     assert next_hop["handoff"] == hop["expected_report_path"]
@@ -1163,6 +1302,513 @@ def test_inline_response_materializes_exact_report_and_routes(tmp_path: Path):
 
 
 
+
+
+def test_legacy_inline_invalid_route_repairs_in_file_mode(tmp_path: Path):
+    _, _, state, worker = setup_task(
+        tmp_path,
+        task_id="task-legacy-inline-repair",
+        roles=("PLAN", "REVIEW"),
+    )
+    state["options"]["report_mode"] = "inline"
+    hop = _active_hop(state)
+    hop["expected_report_path"] = (
+        ".plan/alpha/alpha-plan_turn1_task-legacy-inline-repair.md"
+    )
+    hop["response"] = _inline_response(route="DEV")
+    hop["state"] = "responded"
+
+    worker._responded(state, hop)
+
+    assert state["options"]["report_mode"] == "file"
+    assert state["reports"] == []
+    repair = _active_hop(state)
+    assert repair["kind"] == "route_repair"
+    assert repair["target_role"] == "PLAN"
+    asyncio.run(worker._pre_send(state, repair, FakeActions()))
+    assert '"handoff":"INLINE"' not in repair["prompt"]
+    assert repair["expected_report_path"] == hop["expected_report_path"]
+
+
+def test_pre_send_with_legacy_receipt_fails_closed_without_rebuilding_prompt(
+    tmp_path: Path,
+):
+    execution_repository = tmp_path.parent / f"{tmp_path.name}-legacy-receipt"
+    execution_repository.mkdir()
+    _config, store, state, worker = setup_task(
+        tmp_path,
+        task_id="task-pre-send-legacy-receipt",
+        repository=execution_repository,
+    )
+    path = Path(state["manifest_path"])
+    hop = _active_hop(state)
+    original_prompt = "legacy accepted file prompt"
+    receipt = SendReceipt(
+        prompt=original_prompt,
+        prompt_sha256=prompt_digest(original_prompt),
+        binding=PageBinding("page-alpha-plan", "alpha-plan"),
+        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+        attempts=1,
+        accepted_via="legacy_receipt",
+        session_id_before=None,
+        user_message_id=None,
+        user_turn_id=None,
+    )
+    hop["prompt"] = original_prompt
+    hop["prompt_sha256"] = prompt_digest(original_prompt)
+    hop["receipt"] = receipt.to_dict()
+    state = store.save(path, state)
+    hop = _active_hop(state)
+
+    class NoActions:
+        async def acquire(self, _state, _role):
+            raise AssertionError("pre_send receipt conflict must not acquire a tab")
+
+    asyncio.run(worker._pre_send(state, hop, NoActions()))
+
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "pre_send_request_recovery_required"
+    assert state["options"]["report_mode"] == "file"
+    assert hop["state"] == "pre_send"
+    assert hop["prompt"] == original_prompt
+    assert hop["receipt"] == receipt.to_dict()
+    assert hop["receipt"]["attempts"] == 1
+    assert not Path(hop["ledger_path"]).exists()
+
+
+def test_pre_send_with_durable_record_fails_closed_without_rebuilding_prompt(
+    tmp_path: Path,
+):
+    execution_repository = tmp_path.parent / f"{tmp_path.name}-durable-record"
+    execution_repository.mkdir()
+    _config, store, state, worker = setup_task(
+        tmp_path,
+        task_id="task-pre-send-durable-record",
+        repository=execution_repository,
+    )
+    path = Path(state["manifest_path"])
+    hop = _active_hop(state)
+    original_prompt = "durable accepted file prompt"
+    baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
+    binding = PageBinding("page-alpha-plan", "alpha-plan")
+    ledger = RequestLedger(hop["ledger_path"])
+    record = ledger.begin(
+        role="alpha-plan",
+        prompt=original_prompt,
+        request_id=hop["request_id"],
+        render_request_marker=False,
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=binding,
+        baseline=baseline,
+    )
+    hop["prompt"] = original_prompt
+    hop["prompt_sha256"] = prompt_digest(original_prompt)
+    state = store.save(path, state)
+    hop = _active_hop(state)
+
+    class NoActions:
+        async def acquire(self, _state, _role):
+            raise AssertionError("pre_send ledger conflict must not acquire a tab")
+
+    asyncio.run(worker._pre_send(state, hop, NoActions()))
+
+    current = ledger.get(record.request_id)
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "pre_send_request_recovery_required"
+    assert state["options"]["report_mode"] == "file"
+    assert hop["state"] == "pre_send"
+    assert hop["prompt"] == original_prompt
+    assert hop.get("receipt") is None
+    assert current is not None
+    assert current.rendered_prompt == original_prompt
+    assert current.status is RequestStatus.SENDING
+    assert current.attempts == 1
+
+
+def test_legacy_inline_pre_send_switches_to_file_before_prompt(
+    tmp_path: Path,
+):
+    execution_repository = tmp_path.parent / f"{tmp_path.name}-legacy-pre-send"
+    execution_repository.mkdir()
+    _config, store, state, worker = setup_task(
+        tmp_path,
+        task_id="task-legacy-pre-send",
+        repository=execution_repository,
+    )
+    path = Path(state["manifest_path"])
+    state["options"]["report_mode"] = "inline"
+    state = store.save(path, state)
+    baseline = json.loads(json.dumps(state))
+    hop = _active_hop(state)
+
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+
+    assert state["options"]["report_mode"] == "file"
+    assert "Report: .plan/<team>/<physical-role>_turn<N>_<task-id>.md" in hop["prompt"]
+    assert '"handoff":"INLINE"' not in hop["prompt"]
+    assert hop["expected_report_path"] == ".plan/alpha/alpha-plan_turn1_task-legacy-pre-send.md"
+    persisted = worker._persist_transport_result(path, baseline, state)
+    assert persisted["options"]["report_mode"] == "file"
+    assert _active_hop(persisted)["prompt"] == hop["prompt"]
+
+
+def test_accepted_legacy_inline_hop_drains_once_to_execution_repo_then_file(
+    tmp_path: Path,
+):
+    execution_repository = tmp_path.parent / f"{tmp_path.name}-legacy-accepted"
+    execution_repository.mkdir()
+    _config, store, state, worker = setup_task(
+        tmp_path,
+        task_id="task-legacy-accepted-inline",
+        repository=execution_repository,
+    )
+    path = Path(state["manifest_path"])
+    state["options"]["report_mode"] = "inline"
+    hop = _active_hop(state)
+    hop["expected_report_path"] = (
+        ".plan/alpha/alpha-plan_turn1_task-legacy-accepted-inline.md"
+    )
+    original_request_id = hop["request_id"]
+    original_prompt = "legacy accepted inline prompt with handoff INLINE"
+    hop["prompt"] = original_prompt
+    hop["prompt_sha256"] = prompt_digest(original_prompt)
+    baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
+    receipt = SendReceipt(
+        prompt=original_prompt,
+        prompt_sha256=prompt_digest(original_prompt),
+        binding=PageBinding("page-alpha-plan", "alpha-plan"),
+        baseline=baseline,
+        attempts=1,
+        accepted_via="user_message_identity",
+        session_id_before=None,
+        user_message_id="u1",
+        user_turn_id="t1",
+    )
+    ledger = RequestLedger(hop["ledger_path"])
+    record = ledger.begin(
+        role="alpha-plan",
+        prompt=original_prompt,
+        request_id=original_request_id,
+        render_request_marker=False,
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=receipt.binding,
+        baseline=baseline,
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENT,
+        accepted_at=1.0,
+        receipt=receipt.to_dict(),
+    )
+    hop["receipt"] = receipt.to_dict()
+    hop["state"] = "waiting"
+    hop["timestamps"]["sent_at"] = datetime.now(timezone.utc).isoformat()
+    worker._start_wait_budget_from_sent(hop)
+    state["roles"]["PLAN"]["page_id"] = "page-alpha-plan"
+    state = store.save(path, state)
+    hop = _active_hop(state)
+
+    body = "# Legacy accepted inline\n\nMaterialize exactly once."
+    response = MessageSnapshot(
+        "assistant",
+        "a-legacy-inline",
+        "ta-legacy-inline",
+        _inline_response(route="DEV", body=body),
+        (),
+    )
+    snapshot = SimpleNamespace(
+        state=ChatGPTState.WAITING_PROMPT,
+        stop_visible=False,
+        composer_empty=True,
+        manual_input_pending=False,
+        error_texts=(),
+        blocking_dialogs=(),
+        messages=(MessageSnapshot("user", "u1", "t1", original_prompt, ()),),
+    )
+
+    class Client:
+        async def assert_ownership(self):
+            return snapshot
+
+        async def wait_for_response(self, _receipt, **kwargs):
+            kwargs["candidate_validator"](response)
+            return response
+
+    acquired = AcquiredRole(
+        client=Client(),
+        page_id="page-alpha-plan",
+        url="https://chatgpt.com/c/legacy-inline",
+        created=False,
+        new_chat=False,
+    )
+
+    class Actions:
+        async def locate_owned(self, _state, _role):
+            return acquired
+
+    waiting_baseline = json.loads(json.dumps(state))
+    asyncio.run(worker._waiting(state, hop, Actions(), path))
+    state = worker._persist_transport_result(path, waiting_baseline, state)
+    hop = _active_hop(state)
+    assert hop["state"] == "responded"
+    assert state["options"]["report_mode"] == "inline"
+
+    responded_baseline = json.loads(json.dumps(state))
+    worker._responded(state, hop)
+    state = worker._persist_transport_result(path, responded_baseline, state)
+    completed_hop = state["hops"][0]
+    report_path = Path(completed_hop["report_path"])
+
+    assert report_path == (
+        execution_repository
+        / ".plan"
+        / "alpha"
+        / "alpha-plan_turn1_task-legacy-accepted-inline.md"
+    ).resolve()
+    assert report_path.read_text(encoding="utf-8") == body
+    assert not (
+        tmp_path / ".plan" / "alpha" / "alpha-plan_turn1_task-legacy-accepted-inline.md"
+    ).exists()
+    assert completed_hop["prompt"] == original_prompt
+    assert completed_hop["request_id"] == original_request_id
+    assert completed_hop["receipt"] == receipt.to_dict()
+    original_record = RequestLedger(completed_hop["ledger_path"]).get(original_request_id)
+    assert original_record is not None
+    assert original_record.attempts == 1
+    assert original_record.status is RequestStatus.COMPLETED
+    assert state["options"]["report_mode"] == "file"
+
+    next_hop = _active_hop(state)
+    assert next_hop["target_role"] == "DEV"
+    asyncio.run(worker._pre_send(state, next_hop, FakeActions()))
+    assert state["options"]["report_mode"] == "file"
+    assert '"handoff":"INLINE"' not in next_hop["prompt"]
+    assert next_hop["expected_report_path"] == (
+        ".plan/alpha/alpha-dev_turn1_task-legacy-accepted-inline.md"
+    )
+    final_record = RequestLedger(completed_hop["ledger_path"]).get(original_request_id)
+    assert final_record is not None
+    assert final_record.attempts == 1
+    assert final_record.status is RequestStatus.COMPLETED
+
+
+def test_accepted_legacy_inline_conflict_recovers_same_response_without_replay(
+    tmp_path: Path,
+):
+    execution_repository = tmp_path.parent / f"{tmp_path.name}-legacy-conflict"
+    execution_repository.mkdir()
+    _config, store, state, worker = setup_task(
+        tmp_path,
+        task_id="task-legacy-inline-conflict",
+        repository=execution_repository,
+    )
+    path = Path(state["manifest_path"])
+    state["options"]["report_mode"] = "inline"
+    hop = _active_hop(state)
+    hop["expected_report_path"] = (
+        ".plan/alpha/alpha-plan_turn1_task-legacy-inline-conflict.md"
+    )
+    original_request_id = hop["request_id"]
+    original_prompt = "legacy accepted inline conflict prompt with handoff INLINE"
+    hop["prompt"] = original_prompt
+    hop["prompt_sha256"] = prompt_digest(original_prompt)
+    receipt = SendReceipt(
+        prompt=original_prompt,
+        prompt_sha256=prompt_digest(original_prompt),
+        binding=PageBinding("page-alpha-plan", "alpha-plan"),
+        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+        attempts=1,
+        accepted_via="user_message_identity",
+        session_id_before=None,
+        user_message_id="u-conflict",
+        user_turn_id="t-conflict",
+    )
+    ledger = RequestLedger(hop["ledger_path"])
+    record = ledger.begin(
+        role="alpha-plan",
+        prompt=original_prompt,
+        request_id=original_request_id,
+        render_request_marker=False,
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=receipt.binding,
+        baseline=receipt.baseline,
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENT,
+        accepted_at=1.0,
+        receipt=receipt.to_dict(),
+    )
+    body = "# Legacy accepted inline conflict\n\nAccepted report body."
+    response_text = _inline_response(route="DEV", body=body)
+    response = MessageSnapshot(
+        "assistant",
+        "a-conflict",
+        "ta-conflict",
+        response_text,
+        (),
+    )
+    hop["receipt"] = receipt.to_dict()
+    hop["response"] = response_text
+    hop["response_sha256"] = worker_module.hashlib.sha256(
+        response_text.encode("utf-8")
+    ).hexdigest()
+    hop["response_record"] = response.to_dict()
+    hop["message_identity"] = {
+        "message_id": response.message_id,
+        "turn_id": response.turn_id,
+    }
+    hop["state"] = "responded"
+    state = store.save(path, state)
+    hop = _active_hop(state)
+
+    report_path = (execution_repository / hop["expected_report_path"]).resolve()
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    orphan_bytes = b"# Orphan steering artifact\n\nDifferent unowned bytes.\n"
+    report_path.write_bytes(orphan_bytes)
+
+    worker._responded(state, hop)
+    state = store.save(path, state)
+    blocked_hop = _active_hop(state)
+    original_record = RequestLedger(blocked_hop["ledger_path"]).get(original_request_id)
+
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "inline_report_materialization_failed"
+    assert report_path.read_bytes() == orphan_bytes
+    assert len(state["hops"]) == 1
+    assert blocked_hop["state"] == "responded"
+    assert blocked_hop["request_id"] == original_request_id
+    assert blocked_hop["prompt"] == original_prompt
+    assert blocked_hop["receipt"] == receipt.to_dict()
+    assert original_record is not None
+    assert original_record.attempts == 1
+    assert original_record.status is RequestStatus.SENT
+    mode_after_conflict = state["options"]["report_mode"]
+
+    archive_path = execution_repository / ".recovery-orphans" / "legacy-inline-conflict.md"
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.replace(archive_path)
+    report_path.write_text(body, encoding="utf-8")
+
+    recovered = store.load(path)
+    recovered_hop = _active_hop(recovered)
+    worker._responded(recovered, recovered_hop)
+    recovered = store.save(path, recovered)
+    completed_hop = recovered["hops"][0]
+    completed_record = RequestLedger(completed_hop["ledger_path"]).get(original_request_id)
+
+    assert mode_after_conflict == "inline"
+    assert archive_path.read_bytes() == orphan_bytes
+    assert Path(completed_hop["report_path"]) == report_path
+    assert report_path.read_text(encoding="utf-8") == body
+    assert completed_hop["state"] == "routed"
+    assert completed_hop["route"] == "DEV"
+    assert completed_hop["request_id"] == original_request_id
+    assert completed_hop["prompt"] == original_prompt
+    assert completed_hop["receipt"] == receipt.to_dict()
+    assert completed_record is not None
+    assert completed_record.attempts == 1
+    assert completed_record.status is RequestStatus.COMPLETED
+    assert recovered["options"]["report_mode"] == "file"
+    assert len(recovered["hops"]) == 2
+    next_hop = _active_hop(recovered)
+    assert next_hop["kind"] == "handoff"
+    assert next_hop["target_role"] == "DEV"
+
+
+def test_cross_workspace_file_report_is_consumed_from_execution_repository(
+    tmp_path: Path,
+):
+    execution_repository = tmp_path.parent / f"{tmp_path.name}-worker-execution"
+    execution_repository.mkdir()
+    store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path,
+        task_id="task-cross-workspace-file",
+        repository=execution_repository,
+    )
+    original_request_id = hop["request_id"]
+    report_path = (execution_repository / hop["expected_report_path"]).resolve()
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("# Cross-workspace file report\n\nExecution evidence.", encoding="utf-8")
+    response = MessageSnapshot(
+        "assistant",
+        "a-cross-workspace",
+        "ta-cross-workspace",
+        (
+            '{"route":"DEV","handoff":"'
+            + str(hop["expected_report_path"])
+            + '"}'
+        ),
+        (),
+    )
+    snapshot = SimpleNamespace(
+        state=ChatGPTState.WAITING_PROMPT,
+        stop_visible=False,
+        composer_empty=True,
+        manual_input_pending=False,
+        error_texts=(),
+        blocking_dialogs=(),
+        messages=(MessageSnapshot("user", "u1", "t1", receipt.prompt, ()),),
+    )
+
+    class Client:
+        async def assert_ownership(self):
+            return snapshot
+
+        async def wait_for_response(self, _receipt, **kwargs):
+            kwargs["candidate_validator"](response)
+            return response
+
+    acquired = AcquiredRole(
+        client=Client(),
+        page_id="page-alpha-plan",
+        url="https://chatgpt.com/c/cross-workspace",
+        created=False,
+        new_chat=False,
+    )
+
+    class Actions:
+        async def locate_owned(self, _state, _role):
+            return acquired
+
+    assert state["options"]["report_mode"] == "file"
+    assert '"handoff":"INLINE"' not in hop["prompt"]
+    assert RequestLedger(hop["ledger_path"]).get(original_request_id).attempts == 1
+
+    asyncio.run(worker._waiting(state, hop, Actions(), Path(state["manifest_path"])))
+    assert hop["state"] == "responded"
+    worker._responded(state, hop)
+
+    assert Path(hop["report_path"]) == report_path
+    report_bytes = report_path.read_bytes()
+    assert hop["report_size"] == len(report_bytes)
+    assert hop["report_sha256"] == worker_module.hashlib.sha256(report_bytes).hexdigest()
+    control_copy = tmp_path / hop["expected_report_path"]
+    assert not control_copy.exists()
+    assert hop["request_id"] == original_request_id
+    record = RequestLedger(hop["ledger_path"]).get(original_request_id)
+    assert record.attempts == 1
+    assert record.status is RequestStatus.COMPLETED
+    assert all(item.get("kind") != "route_repair" for item in state["hops"])
+    assert _active_hop(state)["target_role"] == "DEV"
+
+    persisted = store.save(state["manifest_path"], state)
+    assert persisted["active_role"] == "DEV"
+    assert len(persisted["hops"]) == 2
+    assert persisted["hops"][0]["request_id"] == original_request_id
+    assert persisted["hops"][0]["report_path"] == str(report_path)
 
 
 class ExplodingBrowserContext:

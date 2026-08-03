@@ -15,6 +15,8 @@ Reusable lessons for CDPA teams. Read before starting a task. Add only evidence-
 
 ## Browser and tab ownership
 
+- For CDPA-owned ChatGPT pages whose wait path depends on renderer timers, reassert Chrome web lifecycle `active` through CDP at the existing ownership/wait boundary; never use foreground focus as a liveness mechanism, and fail soft if the experimental command is unavailable.
+
 - Use the unique physical-role + team + task tuple as durable operating ownership. Treat `page_id` as replaceable runtime metadata during pre-send reconciliation, but never transfer an accepted in-flight receipt to another page. Fail closed when more than one exact owner exists.
 - A deployment-wide coordination path must be CWD-independent before it protects ownership. Validate every path source—including explicit configuration and environment fallbacks—as absolute before resolution or directory creation; resolving a relative value against each repository CWD can split the ownership plane and permit duplicate sends.
 - Tabs with no role are user-owned free tabs. Never allocate or clean them.
@@ -77,4 +79,8 @@ Reusable lessons for CDPA teams. Read before starting a task. Add only evidence-
 - Keep prompts and persisted context compact. Send stable system rules once per conversation generation; send only the current trigger context for each job. Do not repeatedly serialize state the worker already owns.
 - Treat names as configuration and behavior as reusable machinery. Maintainers is an agent identity, not a special architecture; another agent may use the same trigger only if it owns that trigger under the same shared rules.
 - Prefer evidence-backed learning over automatic accumulation. Add or revise reusable lessons only when they are general, actionable, and likely to prevent recurrence; do not turn shared learning into a chronological incident log.
+
+- Planning is implementation design, not a catalog of possible architecture. Before proposing new code, inventory the existing call path, helpers, classes, native platform features, and installed dependencies that already cover the requirement; choose the smallest root-cause change, name the exact files/tests that need to move, state what must not be built, and define a concrete stop condition. Do not widen a plan merely to make it look comprehensive.
+- Reuse before extraction. Do not create a helper, wrapper, adapter, function, or class merely because a block can be named; keep direct code when it is clearer, reuse an existing primitive when one already fits, and extract only when demonstrated repetition, shared state, a shared invariant, or an independently testable responsibility makes the code simpler overall.
+- When several operations genuinely share the same state, lifecycle, invariant, or responsibility, consolidate them into the existing cohesive class or one small cohesive class rather than scattering near-duplicate functions. Similar syntax alone is not a reason for a class, and one implementation does not justify an interface, factory, registry, plugin system, or generalized framework.
 - Evaluate design by total effectiveness: correctness, operating cost, latency, failure surface, debuggability, and ease of change. Fewer lines or abstractions are not automatically better; the best solution is the smallest one that remains complete and robust.

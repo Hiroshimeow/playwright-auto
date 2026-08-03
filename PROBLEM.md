@@ -1,5 +1,7 @@
 # PROBLEM.md
 
+nếu có task nào được chạy từ problem thì xóa dòng đấy đi.
+
 Persistent root-cause backlog for small operational defects discovered while CDPA tasks run.
 
 This file is not a chronological incident log. Track one entry per stable root cause, update the existing entry when evidence or ownership changes, and keep resolved operational rules in `LEARNING.md` instead.
@@ -15,27 +17,6 @@ This file is not a chronological incident log. Track one entry per stable root c
 
 ## Active problems
 
-### P-001 — Operator-originated controls can be mistaken for recovery events
-
-- **Status:** `IN_PROGRESS`
-- **Root cause:** recovery selection must use durable control provenance rather than status labels alone. Legacy controls may have incomplete origin metadata.
-- **Current architecture:** canonical recovery extraction excludes operator Pause, Stop, Clear Team, Restart role, and New Chat. Independent-agent controls use the distinct `independent_agent` origin plus immutable source task/event identity.
-- **Current regression evidence:** trigger tests prove operator actions create no recovery event; direct-control tests prove an independent agent cannot target work outside its active canonical event.
-- **Impact if regressed:** a recovery agent could reverse operator intent or create duplicate work.
-- **Owner:** `independent-agent-runtime`.
-- **Next verification:** controlled live operator Pause/Stop/Clear/Restart/New Chat must produce no Maintainers activation, report, or recovery control before this item is marked resolved.
-
-### P-002 — Recovery actions have historically left a hidden manual Resume step
-
-- **Status:** `IN_PROGRESS`
-- **Root cause:** a recovery primitive could be recorded as applied after opening/resetting a role without atomically proving that the same task/hop/request left the matching block and resumed at the safe boundary.
-- **Architecture applicability:** still valid with the new API. Exact-tab recovery is worker/browser behavior; frontend and API separation does not close this invariant.
-- **Evidence:** historical controls reopened roles with `recovered: true` but still required a separate manual Resume. Current source contains stricter `OPEN_ROLE_TAB` postconditions and same-hop recovery for `pre_send` and accepted `waiting`, but the responsible task stopped before final independent acceptance.
-- **Impact:** the user can remain the hidden final recovery mechanism while Maintainers reports success too early.
-- **Owner:** replacement `cdpa-idem-003d1dfeb644f2673f7f7adc` / `maintainer-update` now owns final acceptance. Source recovery preserves the same hop/request, accepted receipt, exact conversation URL, and recorded page identity without a separate Resume control.
-- **Current regression evidence:** pre-send and accepted-waiting automatic recovery tests pass, including exact-URL recovery that restores a drifted accepted `page_id` without changing the hop/request/receipt or creating an incident. The Maintainers `OPEN_ROLE_TAB` fallback now reuses the same recovery contract: `pre_send` retains clean readiness, accepted `waiting` skips it, exact-tab page-ID drift is restored, wrong-conversation outcomes remain explicitly `ineffective`, and the full worker suite passes 264 tests.
-- **Next verification:** controlled live pre-send and accepted-waiting recovery must preserve hop/request/receipt, perform zero resend, create no incident for recovered transients, and require no later operator Resume.
-
 ### P-003 — Failed attachment upload is treated as an irreversible in-flight send
 
 - **Status:** `OPEN`
@@ -44,44 +25,6 @@ This file is not a chronological incident log. Track one entry per stable root c
 - **Impact:** a recoverable durable upload request cannot use New Chat/restart recovery and must be manually stopped or repaired outside the normal recovery contract.
 - **Owner:** no dedicated repair task or waiting repair dependency was found. `cdpa-20260724-170528-d68a7cc3` is `DONE` and proves the final upload happy path, but it does not cover recovery from a failed pre-acceptance upload.
 - **Next verification:** distinguish pre-acceptance upload/sending from accepted send using receipt/ledger/message evidence; safely replay the same immutable attachment snapshot and request without a new hop or duplicate send; add focused regression and controlled live failure/recovery acceptance.
-
-### P-004 — Suspended MCP/tooling incidents still need a complete automatic restoration path
-
-- **Status:** `IN_PROGRESS`
-- **Root cause:** fail-closed tooling suspension needs a narrow worker-owned capability probe and deterministic restoration of the exact suspended task/hop/request.
-- **Architecture applicability:** still valid with the new API because tooling readiness and durable recovery are worker/Maintainers concerns, not dashboard read-path behavior.
-- **Evidence:** earlier TEST reproduced an available capability endpoint while the incident remained `SUSPENDED`. Later `maintainer-update` turns added allowlisted MCP preflight work, but final TEST turn 15 was interrupted and the task was operator-stopped.
-- **Impact:** after bounded tooling failures, a task can remain suspended indefinitely and require external intervention.
-- **Owner:** replacement `cdpa-idem-003d1dfeb644f2673f7f7adc` / `maintainer-update` retains the existing bounded suspension/restoration implementation without architectural changes.
-- **Current regression evidence:** the complete Maintainers/action/prompt contract suite passes 393 tests, including bounded capability preflight and preserved incident identity.
-- **Next verification:** TEST must run the controlled unavailable→available loopback MCP restoration acceptance and prove the exact suspended task/hop/request resumes automatically.
-
-### P-005 — Legacy worker-parsed PROBLEM.md update contract
-
-- **Status:** `RESOLVED`
-- **Resolution:** the special maintenance decision parser and worker-owned model-to-file translation were retired. Independent agents act through explicit MCP/API controls and return plain Markdown; the worker no longer parses a structured PROBLEM.md mutation from model output.
-- **Evidence:** active source contains no maintenance decision parser, recovery array dispatcher, or `create_repair_task` control action. Repository problem updates remain ordinary evidence-backed file work rather than hidden worker translation.
-- **Do not reintroduce:** no model response schema, automatic lesson/problem append path, or coordinator-specific persistence layer.
-
-### P-006 — Dashboard read path repeatedly rebuilds global task state
-
-- **Status:** `IN_PROGRESS`
-- **Root cause:** this was the legacy dashboard architecture: every `/api/tasks` poll discovered and revalidated manifests, rebuilt dependency/index state, and amplified filesystem work at one-second cadence.
-- **Architecture applicability:** the root cause is no longer present in the current dirty lightweight branch. Frontend is static, API reads SQLite projections/mailbox only, and the worker is the sole `.plan`/TaskStore owner. Keep this entry open until the replacement architecture is accepted and committed.
-- **Current evidence:** live `/api/tasks` is approximately `34,056 B` and returned in roughly `1–3 ms` during the 23-task dataset. Current API source has no TaskStore/CDP discovery path.
-- **Impact if regressed:** overlapping request threads, filesystem lock contention, high CPU, and multi-client amplification.
-- **Owner:** `cdpa-20260725-205201-efc11447` / `dashboard-mobile-runtime-fix`, currently `RUNNING`; functional/API gates pass but current TEST retains a memory-stability blocker.
-- **Next verification:** after task `DONE`, confirm production 9224/9225 uses only the lightweight FE/API boundary, unchanged polls cause no `.plan` scan/write, and 8/30/100-task API latency/payload remain bounded.
-
-### P-007 — Runtime state has no single internal API/snapshot ownership boundary
-
-- **Status:** `IN_PROGRESS`
-- **Root cause:** the legacy implementation coupled dashboard serving, filesystem discovery, task projection, CDP inspection, and controls without one revisioned runtime owner.
-- **Architecture applicability:** current source implements the intended split: worker owns `.plan`, TaskStore, dependency graph, CDP and mutations; API owns SQLite reads plus command mailbox; frontend is a static consumer. The issue is now deployment/final-acceptance risk rather than missing design.
-- **Current evidence:** `/api/tasks`, task detail, `/api/state`, and command polling are served from `.runtime/cdpa-control.sqlite3`; browser/task projections are published by the worker. Frontend/API no longer import direct TaskStore/CDP ownership.
-- **Impact if regressed:** inconsistent snapshots, duplicate writers, difficult caching, and unsafe alternate frontends.
-- **Owner:** `cdpa-20260725-205201-efc11447` / `dashboard-mobile-runtime-fix` plus the parent lightweight refactor on `feat/cdpa-independent-runtime`.
-- **Next verification:** final full regression, production process identity, crash/restart behavior, optimistic command/version checks, and proof that two read clients still leave exactly one manifest/CDP mutation owner.
 
 ### P-008 — Worker state transitions and invariants are distributed across large mutable-dict branches
 
@@ -101,96 +44,14 @@ This file is not a chronological incident log. Track one entry per stable root c
 - **Owner:** none. This is lower priority than P-006/P-007 and should not be attempted during active runtime feature stabilization.
 - **Next verification:** extract shared scripts without changing call semantics, retain exact argument/result contracts, add fixture-based browser-script characterization tests, and prove upload ownership, composer conflict handling, accepted-send detection, and duplicate-send guards remain unchanged.
 
-### P-010 — `/api/tasks` duplicates complete task objects across response sections
-
-- **Status:** `IN_PROGRESS`
-- **Root cause:** legacy `/api/tasks` returned full task objects repeatedly across `tasks`, `active`, `offline_recoverable`, and `history`, including large timeline/report fields.
-- **Architecture applicability:** current lightweight API uses compact summaries and lazy task detail, so the old duplication is no longer observed. Keep open until the active migration task reaches `DONE`.
-- **Current evidence:** live board response is about `34 KB`; full task text/prompt/input/report details are absent from summaries; detail is fetched separately and ETag/304 is supported.
-- **Impact if regressed:** repeated JSON allocation, browser parsing, bandwidth, and board rerender cost.
-- **Owner:** `cdpa-20260725-205201-efc11447` / `dashboard-mobile-runtime-fix`, currently `RUNNING`.
-- **Next verification:** board remains `<100 KiB`, task detail remains bounded/lazy, multiple clients do not trigger full-object duplication, and history pagination does not grow the board payload.
-
-### P-011 — Long-running CDPA worker has abnormal resident-memory growth
-
-- **Status:** `IN_PROGRESS`
-- **Root cause:** not yet isolated. The former production worker once retained extreme RSS, and the current lightweight real-response acceptance still shows monotonic PSS growth despite the CPU hot loop being fixed.
-- **Architecture applicability:** the old `~14.8 GB RSS` observation belongs to the legacy/hot runtime and must not be treated as the current steady-state baseline. The current issue is narrower: retained memory during authenticated active ChatGPT response observation.
-- **Current evidence:** `dashboard-mobile-runtime-fix` TEST turn 3 measured worker PSS `+20.39 MiB` and current-source role-UI service PSS `+7.07 MiB` over 300 seconds, exceeding the warmed `<5 MiB per-process` gate. CPU passed (`0.403%` mean, `3.000%` p95). Current worker after restart is about `240 MiB RSS`, which proves the old 14.8 GB state is gone but does not close the five-minute slope.
-- **Impact:** continued growth across long responses can accumulate, cause swapping, and invalidate the lightweight-runtime claim.
-- **Owner:** `cdpa-20260725-205201-efc11447` / `dashboard-mobile-runtime-fix`, active DEV after the TEST memory blocker.
-- **Next verification:** isolate Python versus Playwright-driver retention, warm before measurement, hold exact active response identity, require `<5 MiB` PSS growth per process over 300 seconds, stable FDs/threads/files, and repeat once after GC/task transition.
-
 ### P-012 — Task creation conflates the CDPA control-plane repository with the execution workspace
 
 - **Status:** `OPEN`
 - **Root cause:** the single task field `repository` currently represents both the local repository that owns the CDPA task store/configuration and the workspace in which an agent is expected to execute code. The dashboard is bound to one `CDPATaskStore`, resolves the submitted value as a local filesystem path, and rejects task creation unless it exactly equals `task_store.config.repository_root`. Worker prompts, route/repair validation, commands, maintenance, and workspace metadata also assume that the same value is a locally available `Path`.
-- **Evidence:** `dashboard.py` rejects `/api/tasks` and `/api/tasks/resume` with `task repository must match the dashboard CDPA repository` when the submitted path differs from the dashboard root. The create dialog labels the field `Repository / workspace`, while `CDPATaskStore.create_task()` stores the resolved path as the task repository. Worker code later uses `state["repository"]` both as the agent workspace and as a local `repository_root` for repository-bound operations.
+- **Evidence:** `dashboard.py` rejects `/api/tasks` and `/api/tasks/resume` with `task repository must match the dashboard CDPA repository` when the submitted path differs from the dashboard root. The create dialog labels the field `Repository / workspace`, while `CDPATaskStore.create_task()` stores the resolved path as the task repository. Worker code later uses `state["repository"]` both as the agent workspace and as a local `repository_root` for repository-bound operations. On 2026-07-31, a file-report workflow executed in a different allowed local workspace wrote the exact PLAN report under that execution workspace, while the worker validated the same relative handoff under the control-plane root. One route-repair response repeated the valid handoff, then the task blocked with `report_materialization_unavailable`; both accepted requests remained at one attempt. Materializing the already-authored bytes at the worker-owned path and resuming the preserved responded hop advanced the task to DEV without replay. On 2026-08-01, the same long-running legacy-inline task reached accepted PLAN hop 67 / turn 53 with a complete `DONE` response and one ledger attempt, but the canonical turn-53 report path already contained a different 5,980-byte orphan artifact from earlier operator steering and no manifest report record owned that artifact. The inline materializer correctly refused destructive overwrite and blocked with `inline_report_materialization_failed`. Recovery archived the orphan bytes, materialized the exact accepted response body (5,488 bytes, SHA-256 `3e54b416b4e59eda2bf4a3e8bd4cd2246266371dfab2a644e3f35ffedbaae95a`) at the canonical path, and resumed the same responded hop to `DONE` with ledger attempts still `1`.
 - **Impact:** a central/cloud CDPA control plane cannot create and manage a task whose code workspace lives on another machine and is accessible through a published MCP server. Absolute paths are host-specific, so even identical Git repositories may legitimately have different paths. Simply removing the equality check would be unsafe: it would permit arbitrary server-local paths while downstream code would still incorrectly attempt local filesystem operations against a remote workspace.
-- **Owner:** none. This is related to the single-runtime-owner/API boundary in P-007, but requires a separate execution-target data model and migration.
-- **Next verification:** split the current field into (1) a local control-plane/task-store root owned exclusively by CDPA and (2) an explicit registered execution target such as `{executor_id, mcp_alias, workspace, repository_identity, capabilities}`. Task creation must select an allowlisted target rather than submit an arbitrary server path. Preserve manifests, queue, dependencies, reports, and controls centrally; route code/file/shell operations through the selected MCP target; keep control-plane files local; use stable executor/repository identity instead of absolute-path equality; add target health/capability checks, backward-compatible migration for existing local tasks, and live acceptance proving one CDPA server can run separate tasks against at least two machines without cross-target writes or path confusion.
-
-### P-013 — Manual user turns can disconnect an active role from routing
-
-- **Status:** `FIXED IN CURRENT SOURCE — retain until independent acceptance`
-- **Severity:** `CRITICAL`; a normal operator message must never deadlock a running task.
-- **Root cause:** `assistant_turns_for_receipt()` stopped at the first later user turn. The tab and role were still online, but the worker ignored the assistant response following the operator message and kept polling the obsolete response segment.
-- **Required recovery loop:**
-  1. Check the exact role tab and ownership.
-  2. If the tab is offline, reopen the last known exact conversation URL, restore the same role binding, then repeat step 1.
-  3. If online, read the current DOM/API transcript.
-  4. If the latest assistant response is still streaming, keep waiting.
-  5. If the latest transcript item is a user turn, wait for the assistant response after that turn; never reuse an older assistant response.
-  6. If the latest assistant response is complete, parse and apply its route.
-  7. If the response is complete but does not satisfy the route contract, send the existing route-repair instruction in the same role tab and repeat from step 3.
-- **Block boundary:** block only when the exact conversation cannot be restored, login/manual authentication is required, or task/role/page ownership is ambiguous. A later user turn by itself is not an error and does not invalidate the active hop.
-- **Implementation:** response selection now continues across later user turns and uses only assistant responses after the latest user turn. Exact previously persisted assistant identity recovery remains supported. No new task, hop, or duplicate Send is created merely because the operator intervened.
-- **Live evidence:** `dashboard-mobile-runtime-fix` REVIEW hop `17` had a manual operator turn followed by a valid `DEV` route and existing report, while the manifest remained `waiting`. After the fix and worker restart, the worker consumed the visible response, materialized REVIEW report turn 3, routed hop `17` to `DEV`, and created DEV hop `18` without JSON intervention or duplicate Send.
-- **Regression evidence:** operator user turn followed by assistant routes correctly; a later user turn with no assistant does not reuse the previous assistant; exact expected assistant identity before a later turn remains recoverable.
-- **Owner:** replacement `maintainer-update` task `cdpa-idem-003d1dfeb644f2673f7f7adc` for final independent acceptance and the offline exact-URL reopen path shared with P-015.
-- **Next verification:** live online steer, multiple user turns, streaming response, malformed route repair, worker restart, exact URL reopen, and proof of no duplicate Send or false timeout.
-
-### P-014 — Dashboard can remain RUNNING after a complete visible response
-
-- **Status:** `FIXED FOR THE USER-TURN FAILURE CLASS — retain until independent acceptance`
-- **Root cause:** the worker treated process/tab liveness as progress even when its response selector could no longer reach the latest visible assistant response.
-- **Impact:** completed work and a valid route remained visible in the owned tab while the task stayed `RUNNING / wait_response`, blocking dependencies and exact-team ownership.
-- **Correction:** every waiting cycle must execute the P-013 recovery loop. `RUNNING / wait_response` is valid only while the exact owned tab is responding or awaiting the assistant after the latest user turn. A complete response must proceed immediately to route validation; an invalid complete response must enter route repair rather than wait for the generic timeout.
-- **Live evidence:** hop `17` advanced from `wait_response` to `validate_route`, then routed to DEV hop `18`; worker remained online and browser ownership remained intact.
-- **Next verification:** no complete visible response may remain in `wait_response` for more than one bounded polling cycle, including after operator messages, F5, worker restart, or exact-tab reopen.
-
-
-### P-015 — Active-role F5/network loss blocks before deterministic exact-tab recovery
-
-- **Status:** `IN_PROGRESS`
-- **Root cause:** `_owned_or_block()` previously moved the current active role directly to `BLOCKED` when its exact tab was absent or on the wrong conversation URL. DEV now invokes one bounded exact-URL reopen before blocking, limited to the active hop in `pre_send`, `sending`, `sent`, or `waiting`.
-- **Architecture applicability:** valid under both legacy and current API designs. This is worker/CDP ownership behavior; API transport does not fix it.
-- **Required narrow scope:** apply only to a nonterminal task's `active_role` whose active hop is `pre_send`, `sending`, `sent`, or `waiting`. Ignore uncalled/idle roles.
-- **Required sequence:** recheck exact role/team/task/page identity with a short bounded grace; if online verify exact recorded conversation URL; if URL is wrong or tab is absent, reopen the saved `/c/<conversation-id>`, restore the same `page_id`/role/team/task, and continue the same hop/request without resend.
-- **Block boundary:** enter `BLOCKED` only when the exact URL cannot be restored, redirects away, authentication/manual intervention is required, ownership is duplicated/ambiguous, or the accepted-send `page_id` cannot be re-established.
-- **Current source evidence:** automatic recovery verifies the saved `/c/...` identity, repairs URL drift on the existing exact-owned tab or reopens a missing tab, restores role/task/team/page identity even when an already-correct surviving tab has a drifted `page_id`, skips clean-composer readiness for accepted waiting, and leaves unused roles untouched. The verified `OPEN_ROLE_TAB` fallback now invokes that same worker recovery path rather than duplicating locate/open logic. The full worker suite passes 264 tests; action/offline-recovery suites pass 32 tests.
-- **Next verification:** TEST must perform controlled F5, tab close, brief CDP/network unavailability, and URL drift against the active role only; prove no new hop/request, duplicate send, operator control, or Maintainers incident for recovered transients.
-
-### P-016 — Choice-prompt detector can classify the injected CDPA role badge as a ChatGPT choice
-
-- **Status:** `IN_PROGRESS`
-- **Root cause:** the detector scanned every visible button and used broad substring markers including `run`. DEV now excludes the complete current/legacy CDPA badge and role-control subtrees, requires a ChatGPT main/dialog/modal owner, and uses bounded word/phrase semantics.
-- **Architecture applicability:** valid under both legacy and current API designs. It is shared browser automation code.
-- **Evidence:** `dashboard-mobile-runtime-fix` blocked with `choice_prompt_blocked`; the captured label was the CDPA badge ending in `Automation role indicator and control`, not a ChatGPT choice prompt.
-- **Impact:** a healthy active response can be marked non-retryable `BLOCKED` after F5/transient composer disappearance.
-- **Required correction:** exclude the complete CDPA overlay/control subtree by stable IDs/data attributes before choice classification; require ChatGPT-owned prompt/dialog context and bounded whole-label semantics rather than generic substring `run`.
-- **Current regression evidence:** full and sparse snapshot classifiers plus safe-choice click use the same text/ARIA candidate rule, ignore metadata-only `data-testid="run-action"`, `runtime`, nested `runner-start-approve`, and overlay `Allow` labels, detect and click one genuine dialog `Continue`, and fail closed without clicking when both `Continue` and `Allow` are eligible; the full browser-safety suite passes 110 tests.
-- **Next verification:** TEST must confirm the production role overlay cannot create `choice_prompt_blocked` after F5 while a genuine ChatGPT `Continue/Allow/Proceed` prompt remains fail-closed and resolvable.
-
-### P-017 — Canonical recovery activation must survive restart without duplicate or lost claims
-
-- **Status:** `IN_PROGRESS — deterministic runtime contract implemented`
-- **Root cause:** recovery triggers are derived from canonical task state and claimed onto one long-lived WAITING independent identity. A claim must be durable before send or completion, and operator transitions must not be reclassified as recovery.
-- **Current architecture:** at most one enabled agent may own the Recovery trigger. New or newly enabled ownership has a one-minute warm-up; targets become eligible only after three continuous BLOCKED minutes; the worker claims oldest first, one target at a time, with a one-minute inter-target delay and three-minute same-target cooldown. Claim/release state remains in existing event watermarks and the durable request ledger; no second scheduler, queue, incident store, or supervisor exists.
-- **Current regression evidence:** focused tests cover warm-up, continuous-block eligibility, FIFO order, same-target cooldown, inter-target spacing, exclusive ownership fail-closed at hydration, operator/self exclusions, exact active-event target controls, same-manifest completion, and accepted-send-preserving Reset.
-- **Impact if regressed:** an eligible block may be skipped, duplicated, reclaimed in a loop, or acted on after it becomes stale.
-- **Owner:** `independent-recovery-learning`.
-- **Next verification:** controlled live A/B blocked ordering with a worker restart between claim/send/completion must prove one claim, zero duplicate send, release of A on the same agent identity, cooldown enforcement, and then activation of B.
+- **Owner:** the current file-only report-contract and legacy-inline migration correction is tracked by `cdpa-idem-9c180b662c0cf70a8e5fed8c` (`cdpa-runtime-contract-root-fix`); the earlier `cross-workspace-report-materialization` task is historical. The broader execution-target data model and migration remain open and are related to the single-runtime-owner/API boundary in P-007.
+- **Next verification:** prove the bounded file-only report contract: same-root and cross-workspace new tasks stay file-mode; a legacy nonterminal inline accepted send drains exactly once without replay; and a pre-existing different canonical artifact with no owning manifest report cannot strand that accepted send or be destructively overwritten. Keep the separate Resume/accepted-user-provenance redesign out of this correction. The broader follow-up is to split the current field into (1) a local control-plane/task-store root owned exclusively by CDPA and (2) an explicit registered execution target such as `{executor_id, mcp_alias, workspace, repository_identity, capabilities}`. Task creation must select an allowlisted target rather than submit an arbitrary server path. Preserve manifests, queue, dependencies, reports, and controls centrally; route code/file/shell operations through the selected MCP target; keep control-plane files local; use stable executor/repository identity instead of absolute-path equality; add target health/capability checks, backward-compatible migration for existing local tasks, and live acceptance proving one CDPA server can run separate tasks against at least two machines without cross-target writes or path confusion.
 
 ### P-018 — Runtime benchmark can stop the production worker and leave stale RUNNING projections
 
@@ -207,37 +68,36 @@ This file is not a chronological incident log. Track one entry per stable root c
 - **Status:** `OPEN`
 - **Root cause:** the API command loop marks a `task_control` mailbox command `applied` after `TaskStore.request_control()` durably appends a requested control. Actual task transition occurs later in `advance()`. A task held in `WAITING` on a non-ready dependency is not scheduled through the control-application path, so the requested operator action can remain pending indefinitely while the public command is already terminal `applied`.
 - **Architecture applicability:** specific to the new API/mailbox split. The API correctly avoids direct manifest mutation, but the command/result contract currently conflates command delivery with control postcondition.
-- **Evidence:** Stop commands for the six superseded legacy WAITING tasks returned mailbox status `applied`, while each task remained `WAITING`, each control remained `status: requested`, and no stop result/applied timestamp existed. The first task remained unchanged for more than 60 seconds and across normal worker cycles. Replacement tasks could still reuse the exact teams because WAITING is not an active-team ownership barrier, but the old tasks remain visible as nonterminal history.
+- **Evidence:** Stop commands for the six superseded legacy WAITING tasks returned mailbox status `applied`, while each task remained `WAITING`, each control remained `status: requested`, and no stop result/applied timestamp existed. The first task remained unchanged for more than 60 seconds and across normal worker cycles. Replacement tasks could still reuse the exact teams because WAITING is not an active-team ownership barrier, but the old tasks remain visible as nonterminal history. Recurrences on 2026-08-02: operator Stop for `cdpa-idem-740bf77d1fe726160549ce87` remained requested while old Phase 10 was dependency-held on Phase 9; Resumer applied that already-confirmed control through the canonical worker path at 14:02:54 UTC, producing `STOPPED` with no tab/send. Old Phase 11 `cdpa-idem-b63c907f77091d0ef192668c` likewise remained dependency-held with three operator Stop controls requested and no conversation/receipt; Resumer applied the earliest confirmed Stop through the same worker path at 15:01:46 UTC, producing `STOPPED` without creating a tab or send. Old animation task `cdpa-idem-3fb83c46c8be6bb863a29905` then showed the same failure with two operator Stops requested while dependency-held, still `pre_send` with no conversation/receipt/tab; Resumer applied the earliest confirmed Stop at 16:01:45 UTC, producing `STOPPED` without any send.
 - **Impact:** dashboard/API can claim success when nothing operational happened; Stop/Pause/other controls on dependency-held tasks may never apply; automation cannot safely wait on command completion; stale nonterminal tasks remain visible and can complicate eligibility or operator reasoning.
 - **Required correction:** separate mailbox delivery from task-control completion, or keep the mailbox command nonterminal until the worker observes the action-specific postcondition. Requested controls must make their task immediately due regardless of dependency/queue waiting. Preserve optimistic task version, idempotency, operator provenance, and one mutation owner.
 - **Next verification:** a WAITING dependency task receives Stop through API, mailbox remains queued/running until the task becomes `STOPPED`, control becomes applied with result, and no browser tab/send is created; repeat for Pause where valid and for stale-version/idempotent replay.
 
-### P-020 — Queued `independent_complete` was not finalized after the assistant response arrived
+### P-022 — CHECK_ALL independent jobs cannot bind the single incident they select
 
-- **Status:** `RESOLVED IN SOURCE — live acceptance pending`
-- **Root cause:** when `independent_complete` was submitted before the current independent-agent response became durable, the worker stored `completion_request` but did not re-evaluate it after the same hop transitioned to `responded`.
-- **Concrete evidence:** monitor task `agent-9c247954cbd59ff60e4132b5-g1` accepted command `cmd-aaf0fabb-a0a3-41ea-bbce-44e646fcb006` before hop 1 responded, then remained `RUNNING / await_completion`; later REVIEW and task-DONE events were not claimed.
-- **Correction:** the responded boundary now finalizes queued completion before any continuation path. Completion records the report and job History, consumes/releases the exact event, preserves the accepted receipt and conversation URL, and returns the same long-lived identity to WAITING for recurring triggers or PAUSED for one-shot triggers. It creates no terminal agent card or successor generation, and idempotent replay returns the same manifest state.
-- **Regression evidence:** focused store, worker, and mailbox tests cover early queued completion, same-identity recurring completion, one-shot auto-pause, no successor, preserved conversation generation, and idempotent command replay.
-- **Next verification:** submit completion while a live hop is still waiting, allow the exact assistant response to arrive, restart the worker, and prove one History record, zero resend, the same agent task ID, and later eligible events claimed in order.
+- **Status:** `OPEN`
+- **Root cause:** a canonical `check_all` event is activated with `target_task_id: null`, but `_queue_independent_task_control()` requires the requested target to equal the active event target and `_create_independent_repair_command()` rejects an active event without a target. The Resumer contract requires scanning all tasks, selecting exactly one incident, then using those two commands; the runtime provides no durable one-time claim/bind transition for that selection.
+- **Concrete evidence:** Resumer event `check-all:resumer:991949` started at `2026-07-31T14:30:00Z` with no target. It selected task `cdpa-idem-593e2ebe2e10a6f96d24d9a0`, which is `BLOCKED` on PLAN hop 60 with `accepted_user_provenance_ambiguous`. The owned conversation contains a newer explicit operator steering turn and a complete assistant route to DEV, while the accepted hop-60 user turn is absent from the current branch. Resume/retry would re-enter the obsolete receipt boundary, and the only independent control/repair APIs reject the selected task before any action because the active CHECK_ALL event remains targetless.
+- **Impact:** a periodic whole-runtime watchdog can detect and diagnose the highest-priority incident but cannot safely recover it or create the required deduplicated repair task. The job must escalate to the operator even when the evidence and desired target are unambiguous.
+- **Required correction:** add one idempotent, durable, same-event operation that binds an active targetless `check_all`/interval job to exactly one currently eligible non-independent task before control or repair. Preserve event identity, record the selected task/hop, reject rebinding, revalidate canonical eligibility, and reuse the existing command mailbox/TaskStore—no second queue or recovery path.
+- **Next verification:** activate a targetless CHECK_ALL job, select one blocked task, bind it once, apply an exact-target safe control or create/reuse one repair, reject a second target and stale/replayed commands, restart the worker between claim and action, and prove zero accepted-send replay or ownership drift.
 
-### P-021 — Independent jobs leaked lifecycle counters and terminal generations
+### P-023 — Manual Run completion disables a recurring Recovery agent
 
-- **Status:** `RESOLVED IN SOURCE — migration/live acceptance pending`
-- **Root cause:** `cycle` and `max_cycles` were modeled on the generated task rather than the exact active event, completion created terminal generations, and Stop removed the only runnable identity. This made a turn limit look like a total job limit and made recurring agents depend on successor creation.
-- **Correction:** `max_cycles` defaults to `0` for unlimited turns per job; each new event starts at cycle 1; continuation increments only on the same event; changing the limit resets that same event at a durable response boundary and records `RESET_BY_SETTINGS`. Completion and Reset release jobs on the same manifest. Runtime hydration collapses legacy generations to the newest identity, migrates a latest orphan terminal identity to WAITING/PAUSED, and fails closed on multiple nonterminal identities.
-- **Regression evidence:** deterministic tests cover unlimited validation/projection, counter isolation, settings reset without accepted-send replay, recurring versus one-shot completion, Reset idempotency, legacy terminal migration, and collapsed runtime projections with preserved legacy History.
-- **Next verification:** run one recurring agent across multiple distinct trigger events and one multi-turn continuation; prove every new event starts at cycle 1, no counter leaks to another agent, no terminal card appears, and no successor manifest is created.
+- **Status:** `OPEN`
+- **Root cause:** `_release_independent_job()` decides whether to preserve `independent.enabled` from the active event `trigger_type` only. Completing a `manual` Run-now event therefore sets `enabled=false` even when the same long-lived identity is configured as the global recurring Recovery owner. The trigger settings remain `recovery=true`, but status becomes `PAUSED` and canonical Recovery events can no longer be claimed.
+- **Concrete evidence:** Maintainers `agent-7fa62f0a9c22c1b921092493-g4` remained `RUNNING / await_completion` with hop 2 already `responded` and a durable `REPAIR_REQUIRED` completion request from 2026-07-31. On 2026-08-01 Resumer replayed only that identical completion control; the job released, but source changed the agent to `PAUSED`, `enabled=false`, `pause_reason=independent agent disabled`. Resumer restored the exact pre-incident setting with `enabled=true`, after which API and manifest both showed `WAITING / waiting_trigger` with `recovery=true`. No work prompt or accepted send was replayed.
+- **Contract mismatch:** the independent runtime specification says direct/manual one-shot agents auto-pause, while recurring Interval/Recovery agents remain enabled and return to waiting. A manual Run-now operation on an already recurring agent must not silently destroy its recurrence.
+- **Required correction:** completion should preserve enabled state when the identity has a recurring trigger configured (`recovery` or interval/check-all recurrence), regardless of a one-off manual Run-now event. A truly manual-only identity should still auto-pause. Keep the same manifest, event history, exactly-once receipt and no successor generation.
+- **Next verification:** configure a Recovery agent, invoke one manual Run-now job, complete it, and prove it returns to enabled `WAITING`; then prove a manual-only agent still pauses. Repeat for interval/check-all agents and verify no duplicate event claim after worker restart.
 
-## Audited incidents and terminal tasks
+### P-028 — Online role tabs cannot be observed live from the CDPA dashboard
 
-| Evidence | Current assessment |
-|---|---|
-| Historical role-offline incidents on `unstopable3` | Operationally recovered and parent task is `DONE`; systemic atomic-recovery work remains tracked by P-002. |
-| STOPPED parent `cdpa-20260724-162023-b059f49a` | Resolved by replacement `cdpa-20260724-162136-431a15c7`, which is `DONE`; no active problem. |
-| STOPPED replacement fixtures `cdpa-20260724-160701-d8d8f160` and `cdpa-20260724-161638-558e7806` | Intentional disposable history with no active children found; do not create recovery work solely because they remain `STOPPED`. |
-| Upload fixture `cdpa-20260724-163442-3527f3ba` | Resume succeeded before later manual Stop; operator history is not a Maintainers problem. |
-| Upload fixtures `cdpa-20260724-162733-73d86cc1` and `cdpa-20260724-164821-73f7419c` | Manual Stop is authoritative; underlying failed-upload recovery defect remains P-003. |
-| Final upload fixture `cdpa-20260724-170528-d68a7cc3` | `DONE`; proves normal upload/inline-report flow only, not failed-upload recovery. |
-| Composer conflict on `maintainer-update` REVIEW hop 6 | Operationally recovered historically, but the task is now operator-`STOPPED`; hidden follow-up Resume remains part of P-002 acceptance for the replacement task. |
-| Current API-v2 `WAITING` task chain | Replacement root `cdpa-idem-003d1dfeb644f2673f7f7adc` reuses exact team `maintainer-update` and waits for `dashboard-mobile-runtime-fix`; six API-v2 replacements follow it through `cdpa-idem-259c176a13b4bcb877b91398`. Legacy waiters have operator Stop requested but remain `WAITING` because of P-019. |
+- **Status:** `OPEN`
+- **Problem:** when a workflow role is online, CDPA exposes role/tab availability and durable workflow state but not the live ChatGPT content currently visible in that owned tab. The operator must open the real browser tab to see the current user turn, streaming assistant text, tool/progress state, choice/error UI, or other immediate context.
+- **Current capability:** the worker already owns the exact ChatGPT tab through CDP and the response-wait path already reads bounded response activity, turn identity, transport state, and full snapshots when required. The lightweight dashboard projection intentionally publishes only role metadata such as online/offline state.
+- **Desired future feature:** add a read-only `Live ChatGPT` view for an online selected role. Prefer an on-demand semantic transcript/state stream (current user/assistant content, streaming/tool/error/choice state) at a bounded cadence, plus a one-shot screenshot button for visual diagnosis. Do not build continuous video/CDP screencast or remote browser control by default.
+- **Architecture boundary:** the CDPA worker remains the only CDP/browser owner. Live observation must not Send, Stop, click, type, change page ownership, create a second automation path, or bypass the existing command mailbox. Live content should be ephemeral/on-demand rather than added to manifests, reports, timelines, or the normal `/api/tasks` projection. No viewer means zero additional high-frequency browser work.
+- **Trade-off:** semantic live observation gives most of the operational value with materially lower CPU/bandwidth/ownership risk than pixel-perfect browser streaming. A manual screenshot covers popup/layout cases without permanently paying screenshot/video cost.
+- **Owner:** none; intentionally deferred for implementation after the current runtime backlog is stabilized.
+- **Next verification:** when implemented, select an online role and prove the dashboard follows a real streaming ChatGPT turn with bounded latency while exact task/role/page ownership is unchanged, closing the viewer stops extra observation work, one-shot screenshot works without persistent storage, and worker/browser CPU plus no-duplicate-send invariants remain within the accepted lightweight-runtime gates.

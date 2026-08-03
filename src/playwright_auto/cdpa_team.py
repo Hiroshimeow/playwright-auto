@@ -217,13 +217,17 @@ def queued_team_tasks(
 
 def physical_role(logical_role: str, team_base: str, team_suffix: int) -> str:
     role = str(logical_role).strip().upper()
-    if role not in {"PLAN", "DEV", "REVIEW", "TEST", "AUDIT", "AGENT"}:
+    builtins = {"PLAN", "DEV", "REVIEW", "TEST", "AUDIT", "AGENT"}
+    if role not in builtins and re.fullmatch(r"WF_[A-Z0-9]{12}", role) is None:
         raise ValueError(f"unsupported CDPA role {role!r}")
     suffix = int(team_suffix)
     if suffix <= 0:
         raise ValueError("team suffix must be positive")
     ending = "" if suffix == 1 else str(suffix)
-    return f"{normalize_team_base(team_base)}-{role.lower()}{ending}"
+    value = f"{normalize_team_base(team_base)}-{role.lower()}{ending}"
+    if len(value) > 64:
+        raise ValueError("physical role exceeds the supported 64-character identity")
+    return value
 
 
 def cleanup_eligible(

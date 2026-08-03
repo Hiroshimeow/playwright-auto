@@ -16,6 +16,7 @@ from playwright_auto.chatgpt import (
     SendRecoveryError,
     looks_incomplete_response,
     prompt_digest,
+    response_transport_ui_active,
 )
 
 
@@ -116,6 +117,20 @@ def test_incomplete_response_detector_covers_code_fence_and_json():
     assert looks_incomplete_response('{"route": "DEV"') is True
     assert looks_incomplete_response('{"route": "DEV"}') is False
     assert looks_incomplete_response("normal final response") is False
+
+
+def test_transient_marker_inside_completed_report_is_not_transport_activity():
+    final_report = (
+        "DEV report\n\n"
+        "ThinkBook returned 400: We couldn't connect your account. Please try again.\n\n"
+        "Implementation and verification are complete.\n"
+        '{"route":"PLAN","handoff":"INLINE"}'
+    )
+    snapshot = conversation(final_report)
+
+    assert looks_incomplete_response(final_report) is False
+    assert response_transport_ui_active(snapshot) is False
+    assert looks_incomplete_response("We couldn't connect. Please try again.") is True
 
 
 def test_wait_response_resets_stability_when_text_changes(monkeypatch):

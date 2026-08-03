@@ -318,6 +318,16 @@ def validate_independent_object(value: Any) -> str | None:
         display, key, _team = normalize_agent_name(value.get("agent_name"))
         if value.get("agent_key") != key:
             return "independent agent_key is not canonical"
+        display_name = value.get("display_name", display)
+        if not isinstance(display_name, str) or not display_name.strip():
+            return "independent display_name must be a non-empty string"
+        if len(display_name.strip()) > 80:
+            return "independent display_name must be at most 80 characters"
+        deleted_at = value.get("deleted_at")
+        if deleted_at is not None and (
+            not isinstance(deleted_at, str) or not deleted_at.strip()
+        ):
+            return "independent deleted_at must be null or a non-empty string"
         normalize_system_prompt(value.get("system_prompt"))
         validate_trigger_settings(value.get("trigger_settings"))
     except ValueError as exc:
@@ -482,11 +492,6 @@ def record_consumed_event(
     previous = cursors.get(normalized["trigger_type"])
     if not isinstance(previous, Mapping) or _cursor_position(previous) < _cursor_position(cursor):
         cursors[normalized["trigger_type"]] = cursor
-    if normalized["trigger_type"] in {"interval", "check_all"}:
-        watermarks["last_interval_slot"] = max(
-            int(watermarks.get("last_interval_slot") or -1),
-            int(normalized["check_count"]),
-        )
     return cursor
 
 

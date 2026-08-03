@@ -114,6 +114,82 @@ def test_api_module_has_no_taskstore_worker_or_browser_imports():
     )
 
 
+def test_agents_api_etag_and_workflow_catalog_commands(tmp_path: Path):
+    _config, db, server, thread = start_api(tmp_path)
+    workflow = [
+        {
+            "route_key": "PLAN",
+            "display_name": "Planner",
+            "system_prompt": "PLAN_PROMPT",
+            "is_system": True,
+            "deleted_at": None,
+        },
+        {
+            "route_key": "WF_123456789ABC",
+            "display_name": "Researcher",
+            "system_prompt": "CUSTOM_PROMPT",
+            "is_system": False,
+            "deleted_at": None,
+        },
+    ]
+    db.put_snapshot("agents", {"workflow": workflow, "independent": []})
+    try:
+        status, headers, body = request(server, "GET", "/api/agents")
+        assert status == 200
+        assert json.loads(body) == {"workflow": workflow, "independent": []}
+        etag = headers["ETag"]
+        status, _headers, body = request(
+            server,
+            "GET",
+            "/api/agents",
+            headers={"If-None-Match": etag},
+        )
+        assert status == 304
+        assert body == b""
+
+        status, _headers, body = request(
+            server,
+            "POST",
+            "/api/workflow-agents",
+            body={"name": "Writer", "system_prompt": "WRITER_PROMPT"},
+            headers={"Idempotency-Key": "create-writer"},
+        )
+        assert status == 202
+        command = db.get_command(json.loads(body)["command_id"])
+        assert command["kind"] == "create_workflow_agent"
+        assert command["payload"] == {
+            "name": "Writer",
+            "system_prompt": "WRITER_PROMPT",
+        }
+
+        status, _headers, body = request(
+            server,
+            "POST",
+            "/api/workflow-agents/WF_123456789ABC/settings",
+            body={"name": "Researcher v2", "system_prompt": "CUSTOM_PROMPT_V2"},
+            headers={"Idempotency-Key": "update-researcher"},
+        )
+        assert status == 202
+        command = db.get_command(json.loads(body)["command_id"])
+        assert command["kind"] == "update_workflow_agent"
+        assert command["payload"]["route_key"] == "WF_123456789ABC"
+
+        status, _headers, body = request(
+            server,
+            "POST",
+            "/api/workflow-agents/WF_123456789ABC/delete",
+            body={},
+            headers={"Idempotency-Key": "delete-researcher"},
+        )
+        assert status == 202
+        command = db.get_command(json.loads(body)["command_id"])
+        assert command["kind"] == "delete_workflow_agent"
+        assert command["payload"] == {"route_key": "WF_123456789ABC"}
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
 def test_board_etag_304_and_worker_offline_last_known_good(tmp_path: Path):
     _config, _db, server, thread = start_api(tmp_path)
     try:
@@ -253,6 +329,49 @@ def test_mutations_require_idempotency_and_reuse_identical_command(tmp_path: Pat
 
 
 
+
+
+def test_tasks_api_is_file_only_for_same_and_cross_workspace(tmp_path: Path):
+    _config, db, server, thread = start_api(tmp_path)
+    execution_repository = tmp_path.parent / f"{tmp_path.name}-api-execution"
+    execution_repository.mkdir()
+    try:
+        cases = (
+            ("same-root-file", tmp_path, "file"),
+            ("cross-root-default", execution_repository, None),
+            ("cross-root-file", execution_repository, "file"),
+        )
+        for key, repository, requested_mode in cases:
+            body = {"task": key, "repository": str(repository)}
+            if requested_mode is not None:
+                body["report_mode"] = requested_mode
+            status, _headers, data = request(
+                server,
+                "POST",
+                "/api/tasks",
+                body=body,
+                headers={"Idempotency-Key": key},
+            )
+            assert status == 202
+            command = db.get_command(json.loads(data)["command_id"])
+            assert command["payload"]["report_mode"] == "file"
+
+        for mode in ("inline", "remote"):
+            status, _headers, _data = request(
+                server,
+                "POST",
+                "/api/tasks",
+                body={
+                    "task": f"invalid-report-mode-{mode}",
+                    "repository": str(execution_repository),
+                    "report_mode": mode,
+                },
+                headers={"Idempotency-Key": f"invalid-report-mode-{mode}"},
+            )
+            assert status == 400
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
 
 
 def test_independent_create_accepts_initial_triggers_and_preserves_idempotency(

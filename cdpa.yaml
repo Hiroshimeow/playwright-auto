@@ -43,10 +43,10 @@
   },
   "independent_agents": {
     "seed_builtins": true,
-    "idle_close_seconds": 1800
+    "idle_close_seconds": 60
   },
   "cleanup": {
-    "terminal_idle_seconds": 3600
+    "terminal_idle_seconds": 1800
   },
   "delays": {
     "minimum_seconds": 1.0,

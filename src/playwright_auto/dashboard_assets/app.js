@@ -618,7 +618,7 @@ export async function loadBoard() {
   try {
     const response = await client.request("board", "/api/tasks");
     if (response.notModified) return;
-    const items = response.data.items || [];
+    const items = (response.data.items || []).filter(item => !item.agent?.deleted_at);
     commit(current => {
       current.board = new Map(items.map(item => [item.task_id, item]));
       current.counts = response.data.counts;
@@ -1018,12 +1018,14 @@ roots.detail.addEventListener("click", event => {
     queueCommand({
       kind: control.dataset.control,
       taskId,
-      endpoint: `/api/tasks/${encodeURIComponent(taskId)}/controls`,
-      body: {
+      endpoint: isReset
+        ? `/api/independent-agents/${encodeURIComponent(taskId)}/reset`
+        : `/api/tasks/${encodeURIComponent(taskId)}/controls`,
+      body: isReset ? {reason: "Operator reset"} : {
         action: control.dataset.control,
         role: selectedRole(state),
         expected_task_version: Number(control.dataset.version),
-        confirmed: !isReset && ["stop", "clear_team"].includes(control.dataset.control),
+        confirmed: ["stop", "clear_team"].includes(control.dataset.control),
       },
       label: `${control.textContent} · ${detail?.team || taskId}`,
     });

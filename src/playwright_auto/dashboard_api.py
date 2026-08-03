@@ -25,7 +25,13 @@ from .cdpa_independent import (
     normalize_system_prompt,
     validate_trigger_settings,
 )
+from .cdpa_routes import effective_report_mode
 from .cdpa_runtime_db import IdempotencyConflict, RuntimeDB, RuntimeDBError
+from .cdpa_workflow_agents import (
+    normalize_workflow_display_name,
+    ordered_system_routes,
+    validate_workflow_route_key,
+)
 
 STATUSES = ("RUNNING", "WAITING", "BLOCKED", "PAUSED", "DONE", "STOPPED")
 LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -166,6 +172,19 @@ class DashboardAPI:
             raise APIError(400, "invalid_request", f"{field} must be an array")
         return value
 
+    def _active_workflow_routes(self) -> tuple[str, ...]:
+        snapshot = self.db.get_snapshot("agents")
+        payload = snapshot.get("payload") if snapshot is not None else None
+        workflow = payload.get("workflow") if isinstance(payload, Mapping) else None
+        if not isinstance(workflow, list):
+            return ordered_system_routes(self.config)
+        routes = []
+        for item in workflow:
+            if not isinstance(item, Mapping) or item.get("deleted_at") is not None:
+                continue
+            routes.append(validate_workflow_route_key(item.get("route_key")))
+        return tuple(routes) or ordered_system_routes(self.config)
+
     def _workflow_roles(self, value: object) -> list[str]:
         raw_roles = self._list(value, "roles")
         roles: list[str] = []
@@ -185,7 +204,8 @@ class DashboardAPI:
                 "invalid_request",
                 "roles must not contain duplicates",
             )
-        unknown = set(roles) - set(self.config.roles)
+        available = self._active_workflow_routes()
+        unknown = set(roles) - set(available)
         if unknown:
             raise APIError(
                 400,
@@ -195,7 +215,7 @@ class DashboardAPI:
         if "PLAN" not in roles:
             raise APIError(400, "invalid_request", "roles must include PLAN")
         selected = set(roles)
-        return [role for role in self.config.roles if role in selected]
+        return [role for role in available if role in selected]
 
     def normalize_create(self, raw: Mapping[str, Any]) -> dict[str, Any]:
         allowed = {
@@ -216,14 +236,23 @@ class DashboardAPI:
         task = str(raw.get("task") or "").strip()
         if not task:
             raise APIError(400, "invalid_request", "task must not be empty")
+        repository = self._repository(raw.get("repository"))
+        try:
+            report_mode = effective_report_mode(
+                raw.get("report_mode") or "file",
+                control_repository=self.config.repository_root,
+                execution_repository=repository,
+            )
+        except ValueError as exc:
+            raise APIError(400, "invalid_request", str(exc)) from exc
         normalized = {
             "task": task,
             "requested_team": raw.get("requested_team"),
             "reuse_team": raw.get("reuse_team") or None,
             "new_roles": self._list(raw.get("new_roles"), "new_roles"),
             "new_all": bool(raw.get("new_all")),
-            "repository": self._repository(raw.get("repository")),
-            "report_mode": str(raw.get("report_mode") or "file"),
+            "repository": repository,
+            "report_mode": report_mode,
             "depends_on_task_ids": self._list(
                 raw.get("depends_on_task_ids"), "depends_on_task_ids"
             ),
@@ -232,6 +261,35 @@ class DashboardAPI:
         if "roles" in raw:
             normalized["roles"] = self._workflow_roles(raw.get("roles"))
         return normalized
+
+    def normalize_workflow_agent_create(
+        self, raw: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        if set(raw) - {"name", "system_prompt"}:
+            raise APIError(
+                400,
+                "invalid_request",
+                "workflow agent accepts only name and system_prompt",
+            )
+        try:
+            name = normalize_workflow_display_name(raw.get("name"))
+            prompt = normalize_system_prompt(raw.get("system_prompt"))
+        except ValueError as exc:
+            raise APIError(400, "invalid_request", str(exc)) from exc
+        return {"name": name, "system_prompt": prompt}
+
+    def normalize_workflow_agent_update(
+        self, route_key: str, raw: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        payload = self.normalize_workflow_agent_create(raw)
+        payload["route_key"] = validate_workflow_route_key(route_key)
+        return payload
+
+    @staticmethod
+    def normalize_empty(raw: Mapping[str, Any]) -> dict[str, Any]:
+        if raw:
+            raise APIError(400, "invalid_request", "request body must be empty")
+        return {}
 
     def normalize_independent_create(self, raw: Mapping[str, Any]) -> dict[str, Any]:
         allowed = {"name", "system_prompt", "mode", "trigger_settings", "max_cycles"}
@@ -337,8 +395,11 @@ class DashboardAPI:
             raise APIError(400, "invalid_request", "unsupported independent task control")
         role_value = raw.get("role")
         role = str(role_value or "").strip().upper() or None
-        if role is not None and role not in self.config.roles:
-            raise APIError(400, "invalid_request", "unsupported control role")
+        if role is not None:
+            try:
+                role = validate_workflow_route_key(role)
+            except ValueError as exc:
+                raise APIError(400, "invalid_request", str(exc)) from exc
         reason = str(raw.get("reason") or "").strip()
         if not reason or len(reason) > 1200:
             raise APIError(
@@ -392,6 +453,7 @@ class DashboardAPI:
     ) -> dict[str, Any]:
         allowed = {
             "enabled",
+            "display_name",
             "system_prompt",
             "trigger_settings",
             "new_chat_next_job",
@@ -403,6 +465,13 @@ class DashboardAPI:
         if not raw:
             raise APIError(400, "invalid_request", "at least one setting is required")
         payload: dict[str, Any] = {}
+        if "display_name" in raw:
+            try:
+                payload["display_name"] = normalize_workflow_display_name(
+                    raw["display_name"]
+                )
+            except ValueError as exc:
+                raise APIError(400, "invalid_request", str(exc)) from exc
         if "enabled" in raw:
             if not isinstance(raw["enabled"], bool):
                 raise APIError(400, "invalid_request", "enabled must be a boolean")
@@ -662,7 +731,7 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
             payload = (
                 dict(snapshot["payload"])
                 if snapshot is not None
-                else {"degraded": True, "independent": []}
+                else {"degraded": True, "workflow": [], "independent": []}
             )
             self._json(200, payload, headers={"ETag": etag})
             return
@@ -781,6 +850,14 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                 task_id=None,
                 payload=payload,
             )
+        elif path == "/api/workflow-agents":
+            payload = app.normalize_workflow_agent_create(raw)
+            command = app.enqueue(
+                idempotency_key=key,
+                kind="create_workflow_agent",
+                task_id=None,
+                payload=payload,
+            )
         elif path == "/api/independent-agents":
             payload = app.normalize_independent_create(raw)
             command = app.enqueue(
@@ -810,10 +887,30 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
             )
         else:
             parts = [unquote(part) for part in path.strip("/").split("/") if part]
-            if len(parts) == 4 and parts[:2] == ["api", "independent-agents"]:
+            if len(parts) == 4 and parts[:2] == ["api", "workflow-agents"]:
+                route_key = validate_workflow_route_key(parts[2])
+                operation = parts[3]
+                if operation == "settings":
+                    payload = app.normalize_workflow_agent_update(route_key, raw)
+                    kind = "update_workflow_agent"
+                elif operation == "delete":
+                    payload = {**app.normalize_empty(raw), "route_key": route_key}
+                    kind = "delete_workflow_agent"
+                else:
+                    raise APIError(404, "not_found", "endpoint does not exist")
+                command = app.enqueue(
+                    idempotency_key=key,
+                    kind=kind,
+                    task_id=None,
+                    payload=payload,
+                )
+            elif len(parts) == 4 and parts[:2] == ["api", "independent-agents"]:
                 task_id = validate_task_id(parts[2])
                 operation = parts[3]
-                if operation == "complete":
+                if operation == "delete":
+                    payload = app.normalize_empty(raw)
+                    kind = "delete_independent_agent"
+                elif operation == "complete":
                     payload = app.normalize_independent_completion(raw)
                     kind = "independent_complete"
                 elif operation == "continue":

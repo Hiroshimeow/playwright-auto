@@ -19,6 +19,7 @@ from playwright_auto.chatgpt import (
     MessageSnapshot,
     PageBinding,
     SendReceipt,
+    StableMalformedResponseError,
     capture_message_baseline,
 )
 from playwright_auto.cdpa_runtime_db import RuntimeDB
@@ -160,6 +161,107 @@ def test_resume_consumes_existing_stable_response_without_another_send(
 
 
 
+def test_resume_missing_file_response_enters_route_repair_without_replay(
+    tmp_path: Path, monkeypatch
+):
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-resume-missing-file"
+    )
+    hop["conversation_url"] = "https://chatgpt.com/c/exact"
+    state["roles"]["PLAN"]["page_url"] = hop["conversation_url"]
+    state = store.save(path, state)
+    hop = _active_hop(state)
+    response = MessageSnapshot(
+        "assistant",
+        "a-missing-file",
+        "ta-missing-file",
+        json.dumps(
+            {
+                "route": "TEST",
+                "handoff": str(hop["expected_report_path"]),
+            }
+        ),
+        (),
+    )
+    snapshot = _accepted_snapshot(receipt, response=response)
+    original = {
+        "task_id": state["task_id"],
+        "team": state["team"],
+        "request_id": hop["request_id"],
+        "receipt": json.loads(json.dumps(hop["receipt"])),
+        "conversation_url": hop["conversation_url"],
+        "page_id": receipt.binding.page_id,
+        "physical_role": hop["physical_role"],
+        "user_message_id": receipt.user_message_id,
+        "user_turn_id": receipt.user_turn_id,
+    }
+
+    class Client:
+        def __init__(self):
+            self.send_calls = 0
+            self.retry_calls = 0
+
+        async def assert_ownership(self):
+            return snapshot
+
+        async def wait_for_response(self, _receipt, **kwargs):
+            try:
+                kwargs["candidate_validator"](response)
+            except Exception as exc:
+                raise StableMalformedResponseError(response, exc) from exc
+            raise AssertionError("missing report must fail candidate validation")
+
+        async def send(self, *_args, **_kwargs):
+            self.send_calls += 1
+            raise AssertionError("accepted request must not be sent again")
+
+        async def retry_generation(self, *_args, **_kwargs):
+            self.retry_calls += 1
+            raise AssertionError("stable malformed response must not trigger Retry")
+
+    client = Client()
+    acquired = AcquiredRole(client, receipt.binding.page_id, snapshot.url, False, False)
+
+    class Actions:
+        async def locate_owned(self, _state, _role):
+            return acquired
+
+    _queue_blocked_resume(store, state)
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
+
+    recovered = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    control = recovered["controls"][-1]
+    completed = recovered["hops"][0]
+    repair = _active_hop(recovered)
+    record = RequestLedger(completed["ledger_path"]).get(original["request_id"])
+
+    assert control["status"] == "applied"
+    assert control["result"]["outcome"] == "continued"
+    assert control["result"]["action"] == "consume_response"
+    assert control["result"]["postcondition"] == "hop_advanced"
+    assert completed["response"] == response.text
+    assert completed["validation_error"] == "report file does not exist"
+    assert completed["state"] == "routed"
+    assert repair["kind"] == "route_repair"
+    assert repair["target_role"] == "PLAN"
+    assert repair["parent_hop_id"] == completed["hop_id"]
+    assert client.send_calls == 0
+    assert client.retry_calls == 0
+    assert record is not None
+    assert record.status is RequestStatus.COMPLETED
+    assert record.attempts == 1
+    assert completed["request_id"] == original["request_id"]
+    assert completed["receipt"] == original["receipt"]
+    assert completed["conversation_url"] == original["conversation_url"]
+    assert completed["receipt"]["binding"]["page_id"] == original["page_id"]
+    assert completed["physical_role"] == original["physical_role"]
+    assert completed["receipt"]["user_message_id"] == original["user_message_id"]
+    assert completed["receipt"]["user_turn_id"] == original["user_turn_id"]
+    assert recovered["task_id"] == original["task_id"]
+    assert recovered["team"] == original["team"]
+
+
 def test_manual_composer_conflict_returns_recovery_required_and_is_untouched(
     tmp_path: Path, monkeypatch
 ):
@@ -201,6 +303,39 @@ def test_manual_composer_conflict_returns_recovery_required_and_is_untouched(
 
 
 
+
+
+def test_resume_does_not_block_send_preparation_before_durable_boundary(tmp_path: Path):
+    _config, store, state, worker = setup_task(
+        tmp_path, task_id="task-resume-pre-durable-send"
+    )
+    path = Path(state["manifest_path"])
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    assert hop["state"] == "sending"
+    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]) is None
+
+    state = store.save(path, state)
+    state = _queue_blocked_resume(
+        store,
+        state,
+        code="operator_recovery",
+        reason="resume arrived between pre_send and durable send",
+    )
+
+    applied = asyncio.run(worker._apply_control(state, FakeActions(), path))
+    assert applied is True
+    control = state["controls"][-1]
+    asyncio.run(worker._recover_resume_control(state, control, FakeActions()))
+
+    assert state["status"] == "RUNNING"
+    assert state["block_code"] is None
+    assert _active_hop(state)["state"] == "sending"
+    assert control["status"] == "applied"
+    assert control["result"]["outcome"] == "continued"
+    assert control["result"]["action"] == "await_durable_send"
+    assert control["result"]["postcondition"] == "send_not_started"
+    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]) is None
 
 
 def _prepare_sending_record(tmp_path: Path, *, task_id: str):

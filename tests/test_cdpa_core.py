@@ -43,7 +43,7 @@ def write_config(root: Path) -> Path:
                 "response": {"timeout_seconds": 7200, "refresh_after_seconds": 1200, "stable_ms": 1000, "poll_ms": 100},
                 "independent_agents": {
                     "seed_builtins": False,
-                    "idle_close_seconds": 1800,
+                    "idle_close_seconds": 60,
                 },
                 "cleanup": {"terminal_idle_seconds": 3600},
                 "worker": {"poll_seconds": 1},
@@ -616,7 +616,7 @@ def test_independent_agent_config_is_shared_and_not_a_normal_route(tmp_path: Pat
 
     assert config.independent_rule_path.name == "INDEPENDENT_RULE.md"
     assert config.independent_rule_path.is_file()
-    assert config.independent_idle_close_seconds == 1800
+    assert config.independent_idle_close_seconds == 60
     assert "MAINTAINERS" not in config.roles
     assert "MONITOR" not in config.roles
 
@@ -627,30 +627,48 @@ def test_independent_agent_config_is_shared_and_not_a_normal_route(tmp_path: Pat
 
 
 
-def test_task_report_mode_defaults_file_and_validates_inline(tmp_path: Path):
+def test_new_workflow_tasks_are_file_report_only_across_repositories(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
+    execution_repository = tmp_path.parent / f"{tmp_path.name}-execution"
+    execution_repository.mkdir()
 
-    file_task = store.create_task(
+    same_root_default = store.create_task(
         "File report", requested_team="alpha", task_id="task-file"
     )
-    inline_task = store.create_task(
-        "Inline report",
+    same_root_explicit = store.create_task(
+        "Explicit file report",
         requested_team="beta",
-        task_id="task-inline",
-        report_mode="inline",
+        task_id="task-explicit-file",
+        report_mode="file",
+    )
+    cross_root_default = store.create_task(
+        "Cross-root default report",
+        requested_team="delta",
+        task_id="task-cross-default",
+        repository=execution_repository,
+    )
+    cross_root_explicit = store.create_task(
+        "Cross-root explicit file report",
+        requested_team="epsilon",
+        task_id="task-cross-explicit",
+        repository=execution_repository,
+        report_mode="file",
     )
 
-    assert file_task["options"]["report_mode"] == "file"
-    assert inline_task["options"]["report_mode"] == "inline"
-    assert store.load(inline_task["manifest_path"])["options"]["report_mode"] == "inline"
-    with pytest.raises(ValueError, match="report_mode"):
-        store.create_task(
-            "Bad report mode",
-            requested_team="gamma",
-            task_id="task-bad-report-mode",
-            report_mode="remote",
-        )
+    assert same_root_default["options"]["report_mode"] == "file"
+    assert same_root_explicit["options"]["report_mode"] == "file"
+    assert cross_root_default["options"]["report_mode"] == "file"
+    assert cross_root_explicit["options"]["report_mode"] == "file"
+    assert store.load(cross_root_explicit["manifest_path"])["options"]["report_mode"] == "file"
+    for mode in ("inline", "remote"):
+        with pytest.raises(ValueError, match="report_mode"):
+            store.create_task(
+                f"Bad report mode {mode}",
+                requested_team=f"bad-{mode}",
+                task_id=f"task-bad-report-mode-{mode}",
+                report_mode=mode,
+            )
 
 
 
@@ -662,41 +680,28 @@ def test_task_report_mode_defaults_file_and_validates_inline(tmp_path: Path):
 
 
 
-def test_inline_first_generation_payload_is_authoritative_for_all_roles():
+def test_workflow_prompt_builder_rejects_inline_report_mode():
     repository = Path(__file__).resolve().parents[1]
     config = load_cdpa_config(repository / "cdpa.yaml", repository_root=repository)
     builder = PromptBuilder(config)
-    forbidden = (
-        "write the PLAN report at the expected path",
-        "Write evidence and remaining risks into your own role-turn report",
-        "Record exact commands and results in your own report",
-    )
 
-    for role in config.roles:
-        prompt = builder.build(
-            task_title="Inline contract",
+    with pytest.raises(ValueError, match="inline"):
+        builder.build(
+            task_title="Removed inline contract",
             task_id="task-inline-contract",
             team="alpha",
-            logical_role=role,
-            physical_role=f"alpha-{role.lower()}",
+            logical_role="PLAN",
+            physical_role="alpha-plan",
             turn=1,
-            allowed_routes=("PLAN", "DEV", "TEST", "REVIEW", "AUDIT", "DONE"),
+            allowed_routes=("PLAN", "DEV", "REVIEW", "DONE"),
             workspace=str(repository),
             source_physical_role=None,
-            handoff="inline contract",
-            goal="inline contract",
+            handoff="legacy inline must not be selectable",
+            goal="file-only contract",
             constructor_sent_generation=None,
             conversation_generation=0,
             report_mode="inline",
-        ).text
-        assert "CDPA_SYSTEM_PRIORITY" in prompt
-        assert "single-operator local runtime" in prompt
-        assert "Do not create, edit, or write any role-report file" in prompt
-        assert "the worker owns report materialization" in prompt
-        assert '"handoff":"INLINE"' in prompt
-        assert ".plan/alpha/alpha-" not in prompt
-        for phrase in forbidden:
-            assert phrase not in prompt
+        )
 
 
 
@@ -918,6 +923,66 @@ def test_replace_task_and_rewire_preserves_old_parent_and_child_order(tmp_path: 
 
 
 
+
+
+def test_historical_terminal_inline_manifest_remains_readable_without_rewrite(
+    tmp_path: Path,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_task(
+        "Historical inline task",
+        requested_team="history-inline",
+        task_id="task-history-inline",
+    )
+    state = store.update(
+        state["manifest_path"],
+        lambda current: {
+            **current,
+            "options": {**current["options"], "report_mode": "inline"},
+        },
+    )
+    terminal = _stop_task(store, state, reason="historical record")
+    path = Path(terminal["manifest_path"])
+    before = path.read_bytes()
+
+    loaded = store.load(path)
+
+    assert loaded["status"] == "STOPPED"
+    assert loaded["options"]["report_mode"] == "inline"
+    assert path.read_bytes() == before
+
+
+def test_replacement_of_legacy_inline_task_is_file_mode(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    execution_repository = tmp_path.parent / f"{tmp_path.name}-replacement-execution"
+    execution_repository.mkdir()
+    original = store.create_task(
+        "Legacy cross-workspace task",
+        requested_team="legacy-cross",
+        task_id="task-legacy-cross",
+        repository=execution_repository,
+    )
+    original = store.update(
+        original["manifest_path"],
+        lambda state: {
+            **state,
+            "options": {**state["options"], "report_mode": "inline"},
+        },
+    )
+    original = _stop_task(store, original)
+
+    result = store.replace_task_and_rewire(
+        original["task_id"],
+        "Continue without the obsolete report contract",
+        reuse_team=True,
+        rewire_children=False,
+        incident_id="legacy-cross-report",
+    )
+
+    assert result["replacement"]["repository"] == str(execution_repository.resolve())
+    assert result["replacement"]["options"]["report_mode"] == "file"
 
 
 def _block_task_for_replacement(store: TaskStore, state: dict) -> dict:

@@ -922,6 +922,20 @@ _TRANSIENT_RESPONSE_MARKERS = (
 )
 
 
+def _looks_like_transient_response_notice(text: str) -> bool:
+    value = normalize_visible_text(text).casefold()
+    if not value or len(value) > 240:
+        return False
+    return any(
+        value == marker
+        or value.startswith(f"{marker} ")
+        or value.startswith(f"{marker}.")
+        or value.endswith(f" {marker}")
+        or value.endswith(f" {marker}.")
+        for marker in _TRANSIENT_RESPONSE_MARKERS
+    )
+
+
 def response_transport_ui_active(snapshot: ChatGPTSnapshot) -> bool:
     state = getattr(snapshot, "state", ChatGPTState.UNKNOWN)
     error_texts = tuple(getattr(snapshot, "error_texts", ()) or ())
@@ -932,12 +946,11 @@ def response_transport_ui_active(snapshot: ChatGPTSnapshot) -> bool:
         for message in tuple(getattr(snapshot, "messages", ()) or ())
         if message.role == "assistant"
     )
-    latest = assistants[-1].text.casefold() if assistants else ""
-    activity = str(getattr(snapshot, "response_activity_text", "") or "").casefold()
-    return any(
-        marker in latest or marker in activity
-        for marker in _TRANSIENT_RESPONSE_MARKERS
-    )
+    latest = assistants[-1].text if assistants else ""
+    activity = str(getattr(snapshot, "response_activity_text", "") or "")
+    return _looks_like_transient_response_notice(
+        latest
+    ) or _looks_like_transient_response_notice(activity)
 
 
 def response_activity_signature(
@@ -982,8 +995,7 @@ def looks_incomplete_response(text: str) -> bool:
         return True
     if re.fullmatch(r"(?is)(?:thinking|analyzing|working)(?:\.{3}|…)?", value):
         return True
-    lowered = value.casefold()
-    if any(marker in lowered for marker in _TRANSIENT_RESPONSE_MARKERS):
+    if _looks_like_transient_response_notice(value):
         return True
     if value.count("```") % 2 == 1:
         return True

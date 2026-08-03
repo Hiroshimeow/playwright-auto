@@ -124,6 +124,17 @@ class CDPARuntimeRegistry:
             hop_state = _active_hop_state(state)
             if hop_state in {"pre_send", "sending", "sent", "waiting"}:
                 return now + MINIMUM_DEADLINE_SECONDS
+            if hop_state == "responded":
+                independent = state.get("independent")
+                if isinstance(independent, Mapping) and any(
+                    independent.get(key) is not None
+                    for key in (
+                        "completion_request",
+                        "continuation_request",
+                        "settings_reset_request",
+                    )
+                ):
+                    return now + MINIMUM_DEADLINE_SECONDS
             return None
         if (
             status not in TERMINAL | {"PAUSED", "BLOCKED", "WAITING"}

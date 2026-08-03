@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from playwright_auto.cdpa_actions import AcquiredRole
+from playwright_auto.cdpa_actions import AcquiredRole, RoleOwnershipError
 from playwright_auto.cdpa_config import load_cdpa_config
 from playwright_auto.cdpa_projection import build_task_projection
 from playwright_auto.cdpa_runtime_db import RuntimeDB
@@ -57,6 +57,63 @@ def mark_responded(store: TaskStore, state: dict, *, trigger_type: str = "manual
         return current
 
     return store.update(state["manifest_path"], mutate)
+
+
+def test_new_triggered_agent_ignores_history_and_opens_only_for_a_new_event(
+    tmp_path: Path,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    old = store.create_task("Old done", requested_team="old", task_id="old-done")
+    old = store.update(
+        old["manifest_path"],
+        lambda current: {
+            **current,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "completed_at": "2026-07-01T00:00:00+00:00",
+            "updated_at": "2026-07-01T00:00:00+00:00",
+            "active_role": None,
+            "active_hop_id": None,
+        },
+    )
+    agent = store.create_independent_agent(
+        "Future DONE watcher",
+        system_prompt="Report newly completed tasks.",
+        trigger_settings={"task_done": True},
+    )
+
+    assert agent["status"] == "WAITING"
+    assert agent["independent"]["active_event"] is None
+    assert agent["roles"]["AGENT"]["page_id"] is None
+    assert agent["roles"]["AGENT"]["page_url"] is None
+    assert agent["roles"]["AGENT"]["online"] is False
+
+    worker = CDPAWorker(config, store=store)
+    worker.hydrate_runtime(startup=False)
+    assert agent["task_id"] not in worker._activate_independent_agents()
+    persisted = store.load(agent["manifest_path"])
+    assert persisted["status"] == "WAITING"
+    assert persisted["independent"]["active_event"] is None
+
+    new = store.create_task("New done", requested_team="new", task_id="new-done")
+    store.update(
+        new["manifest_path"],
+        lambda current: {
+            **current,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "completed_at": "2099-07-01T00:00:00+00:00",
+            "updated_at": "2099-07-01T00:00:00+00:00",
+            "active_role": None,
+            "active_hop_id": None,
+        },
+    )
+    worker.hydrate_runtime(startup=False)
+    assert agent["task_id"] in worker._activate_independent_agents()
+    persisted = store.load(agent["manifest_path"])
+    assert persisted["status"] == "RUNNING"
+    assert persisted["independent"]["active_event"]["target_task_id"] == "new-done"
 
 
 def test_command_dispatch_is_idempotent_and_persists_instruction(tmp_path: Path):
@@ -194,35 +251,37 @@ def test_renew_rejects_accepted_inflight_without_mutation(tmp_path: Path):
     assert actions.closed_teams == 0
 
 
-def test_completion_waits_until_keep_open_boundary_and_reopens_saved_url(
+@pytest.mark.parametrize("trigger_type", ["manual", "check_all"])
+def test_completed_job_closes_after_one_minute_and_next_trigger_reopens_saved_url(
     tmp_path: Path,
+    trigger_type: str,
 ):
     _config, store, state, worker = setup_agent(tmp_path)
-    responded = mark_responded(store, state, trigger_type="manual")
+    responded = mark_responded(store, state, trigger_type=trigger_type)
     completed = store.complete_independent_task(
         responded["manifest_path"],
         outcome="SUCCESS",
-        summary="Manual job completed.",
+        summary=f"{trigger_type} job completed.",
     )
 
     assert completed["task_id"] == responded["task_id"]
-    assert completed["status"] == "PAUSED"
-    assert completed["independent"]["enabled"] is False
+    assert completed["independent"]["close_tab_when_idle"] is False
+    assert completed["status"] == ("PAUSED" if trigger_type == "manual" else "WAITING")
     saved_page_id = completed["roles"]["AGENT"]["page_id"]
     saved_page_url = completed["roles"]["AGENT"]["page_url"]
-    keep_open_epoch = datetime.fromisoformat(
-        completed["independent"]["tab_keep_open_until"]
+    idle_epoch = datetime.fromisoformat(
+        completed["independent"]["idle_since"]
     ).timestamp()
 
     worker.hydrate_runtime(startup=False)
     actions = FakeActions()
     assert not asyncio.run(
-        worker._close_idle_independent_tabs(actions, now_epoch=keep_open_epoch - 1)
+        worker._close_idle_independent_tabs(actions, now_epoch=idle_epoch + 59)
     )
     assert actions.closed_teams == 0
 
     changed = asyncio.run(
-        worker._close_idle_independent_tabs(actions, now_epoch=keep_open_epoch)
+        worker._close_idle_independent_tabs(actions, now_epoch=idle_epoch + 60)
     )
     persisted = store.load(completed["manifest_path"])
     assert completed["task_id"] in changed
@@ -236,14 +295,15 @@ def test_completion_waits_until_keep_open_boundary_and_reopens_saved_url(
         def __init__(self):
             super().__init__()
             self.reopened_url = None
+            self.required_clean_ready = None
 
-        async def locate_owned(self, _state, _role):
-            return None
+        async def acquire(self, _state, _role):
+            raise RoleOwnershipError("saved agent tab is offline", code="role_offline")
 
         async def reopen(self, current, logical_role, *, require_clean_ready=True):
-            assert require_clean_ready is True
             record = current["roles"][logical_role]
             self.reopened_url = record["page_url"]
+            self.required_clean_ready = require_clean_ready
             return AcquiredRole(
                 client=SimpleNamespace(),
                 page_id=record["page_id"],
@@ -252,49 +312,18 @@ def test_completion_waits_until_keep_open_boundary_and_reopens_saved_url(
                 new_chat=False,
             )
 
-    reopen_actions = ReopenActions()
-    result = asyncio.run(
-        worker._apply_independent_control(
-            persisted,
-            {"action": "open_tab"},
-            reopen_actions,
-            role="AGENT",
-            hop=_active_hop(persisted),
+    if trigger_type == "manual":
+        persisted = store.update_independent_agent(
+            persisted["manifest_path"], enabled=True
         )
+    running = store.run_independent_now(
+        persisted["manifest_path"], trigger_type="manual"
     )
-    assert result == {
-        "page_id": saved_page_id,
-        "created": False,
-        "reopened": True,
-    }
+    reopen_actions = ReopenActions()
+    asyncio.run(worker._pre_send(running, _active_hop(running), reopen_actions))
     assert reopen_actions.reopened_url == saved_page_url
-
-    recurring_root = tmp_path / "recurring"
-    recurring_root.mkdir()
-    _config2, store2, state2, worker2 = setup_agent(recurring_root)
-    responded2 = mark_responded(store2, state2, trigger_type="check_all")
-    completed2 = store2.complete_independent_task(
-        responded2["manifest_path"],
-        outcome="SUCCESS",
-        summary="CHECK_ALL completed.",
-    )
-    assert completed2["task_id"] == responded2["task_id"]
-    assert completed2["status"] == "WAITING"
-    assert completed2["independent"]["enabled"] is True
-    keep_open_epoch2 = datetime.fromisoformat(
-        completed2["independent"]["tab_keep_open_until"]
-    ).timestamp()
-    worker2.hydrate_runtime(startup=False)
-    actions2 = FakeActions()
-    assert not asyncio.run(
-        worker2._close_idle_independent_tabs(actions2, now_epoch=keep_open_epoch2 - 1)
-    )
-    changed2 = asyncio.run(
-        worker2._close_idle_independent_tabs(actions2, now_epoch=keep_open_epoch2)
-    )
-    assert completed2["task_id"] in changed2
-    assert actions2.closed_teams == 1
-
+    assert reopen_actions.required_clean_ready is True
+    assert _active_hop(running)["state"] == "sending"
 
 def test_board_uses_operator_labels_run_task_and_restored_settings():
     html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
@@ -353,4 +382,7 @@ def test_board_uses_operator_labels_run_task_and_restored_settings():
     assert "No reports for this agent." in detail
     assert "this independent agent" not in app
     assert 'body: {trigger_type: "manual", instruction}' in app
+    assert '/api/independent-agents/${encodeURIComponent(taskId)}/reset' in app
+    assert '.filter(item => !item.agent?.deleted_at)' in app
+    assert 'app.js?v=20260731-agent-ux-v3' in html
     assert "new_chat_next_job" not in html[html.index('id="agent-settings-dialog"') :]

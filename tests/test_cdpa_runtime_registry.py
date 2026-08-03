@@ -149,6 +149,22 @@ def test_independent_standby_waits_for_trigger_and_responded_job_waits_for_comma
     registry.update_task(responded, now=1002.0)
     assert registry.next_due_at() is None
 
+    pending_completion = dict(responded)
+    pending_completion["independent"] = {
+        "active_event": {"event_key": "recovery:a"},
+        "completion_request": {"outcome": "SUCCESS"},
+    }
+    registry.update_task(pending_completion, now=1003.0)
+    assert registry.due_task_ids(1003.5) == ("agent-g1",)
+
+    pending_continuation = dict(responded)
+    pending_continuation["independent"] = {
+        "active_event": {"event_key": "recovery:a"},
+        "continuation_request": {"cycle": 2, "reason": "recheck"},
+    }
+    registry.update_task(pending_continuation, now=1004.0)
+    assert registry.due_task_ids(1004.5) == ("agent-g1",)
+
 
 def test_new_replacement_unschedules_existing_parent_immediately():
     old = task("old", status="STOPPED", updated_at="1970-01-01T00:00:00+00:00")
