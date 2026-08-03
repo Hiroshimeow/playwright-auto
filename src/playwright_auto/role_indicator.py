@@ -13,6 +13,7 @@ ROLE_INDICATOR_SCRIPT = r"""
   const ROLE_KEY = "playwright-auto:role";
   const PAGE_ID_KEY = "playwright-auto:page-id";
   const TASK_ID_KEY = "playwright-auto:task-id";
+  const TEAM_KEY = "playwright-auto:team";
   const ROLE_CHANGE_KEY = "playwright-auto:last-role-change";
   const BADGE_ID = "playwright-auto-role-badge-v3";
   const CONTROL_ID = "playwright-auto-role-control-v1";
@@ -42,12 +43,13 @@ ROLE_INDICATOR_SCRIPT = r"""
     }
   };
 
-  const writeWindowBinding = (role, pageId, taskId) => {
+  const writeWindowBinding = (role, pageId, taskId, team) => {
     if (!pageId) return;
     window.name = WINDOW_NAME_PREFIX + JSON.stringify({
       role: role || null,
       pageId,
       taskId: taskId || null,
+      team: team || null,
     });
   };
 
@@ -56,16 +58,19 @@ ROLE_INDICATOR_SCRIPT = r"""
     let role = null;
     let pageId = null;
     let taskId = null;
+    let team = null;
     try {
       role = sessionStorage.getItem(ROLE_KEY);
       pageId = sessionStorage.getItem(PAGE_ID_KEY);
       taskId = sessionStorage.getItem(TASK_ID_KEY);
+      team = sessionStorage.getItem(TEAM_KEY);
     } catch (_) {
       // Cross-origin auth pages have a separate storage namespace.
     }
     role = role || fallback.role || null;
     pageId = pageId || fallback.pageId || null;
     taskId = taskId || fallback.taskId || null;
+    team = team || fallback.team || null;
     if (!pageId && createPageId && isChatGPT()) pageId = crypto.randomUUID();
     if (isChatGPT()) {
       try {
@@ -73,12 +78,13 @@ ROLE_INDICATOR_SCRIPT = r"""
         else sessionStorage.removeItem(ROLE_KEY);
         if (pageId) sessionStorage.setItem(PAGE_ID_KEY, pageId);
         if (taskId) sessionStorage.setItem(TASK_ID_KEY, taskId);
+        if (team) sessionStorage.setItem(TEAM_KEY, team);
       } catch (_) {
         // Storage can be unavailable during early navigation.
       }
     }
-    if (pageId) writeWindowBinding(role, pageId, taskId);
-    return {role, pageId, taskId};
+    if (pageId) writeWindowBinding(role, pageId, taskId, team);
+    return {role, pageId, taskId, team};
   };
 
   const currentPageState = () => {
@@ -134,6 +140,7 @@ ROLE_INDICATOR_SCRIPT = r"""
       role: role || null,
       pageId: binding.pageId,
       taskId: binding.taskId || null,
+      team: binding.team || null,
       source,
       state: currentPageState(),
       changedAt: new Date().toISOString(),
@@ -154,7 +161,7 @@ ROLE_INDICATOR_SCRIPT = r"""
     const before = readBinding();
     if (!before.pageId) throw new Error("Page identity is not available");
     if (isChatGPT()) sessionStorage.setItem(ROLE_KEY, role);
-    writeWindowBinding(role, before.pageId, before.taskId);
+    writeWindowBinding(role, before.pageId, before.taskId, before.team);
     const detail = emitRoleChange(before.role, role, before, source);
     apply();
     return detail;
@@ -164,7 +171,7 @@ ROLE_INDICATOR_SCRIPT = r"""
     const before = readBinding();
     if (!before.pageId) throw new Error("Page identity is not available");
     if (isChatGPT()) sessionStorage.removeItem(ROLE_KEY);
-    writeWindowBinding(null, before.pageId, before.taskId);
+    writeWindowBinding(null, before.pageId, before.taskId, before.team);
     const detail = emitRoleChange(before.role, null, before, source);
     apply();
     return detail;
@@ -333,7 +340,7 @@ ROLE_INDICATOR_SCRIPT = r"""
     document.documentElement.dataset.playwrightAutoRole = role || "";
     document.documentElement.dataset.playwrightAutoPageId = pageId;
     document.documentElement.dataset.playwrightAutoTaskId = taskId;
-    return {role, pageId, taskId, title: document.title, badge: badge?.textContent || null};
+    return {role, pageId, taskId, team: binding.team || null, title: document.title, badge: badge?.textContent || null};
   };
 
   const setConflict = (message = null) => {
@@ -373,7 +380,10 @@ ROLE_INDICATOR_SCRIPT = r"""
           {subtree: true, childList: true, characterData: true}
         );
       }
-      window.setInterval(apply, 500);
+      // Role changes call apply synchronously. This slow safety repair only
+      // restores the badge after an unusual document replacement; it must not
+      // wake every ChatGPT renderer twice per second while responses stream.
+      window.setInterval(apply, 5000);
     };
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", start, {once: true});
@@ -394,12 +404,14 @@ async def ensure_role_indicator(
     expected_role: str | None = None,
     expected_page_id: str | None = None,
     expected_task_id: str | None = None,
+    expected_team: str | None = None,
 ) -> dict[str, str | None]:
     if not hasattr(page, "add_init_script") or not hasattr(page, "evaluate"):
         return {
             "role": expected_role,
             "pageId": expected_page_id,
             "taskId": expected_task_id or "idle",
+            "team": expected_team,
             "title": f"⟦{expected_role}⟧ test" if expected_role else "test",
             "badge": (
                 f"{expected_role} · {expected_task_id or 'idle'} · "
@@ -433,5 +445,10 @@ async def ensure_role_indicator(
         raise RuntimeError(
             f"visible task id mismatch: expected {expected_task_id!r}, "
             f"got {result.get('taskId')!r}"
+        )
+    if expected_team is not None and result.get("team") != expected_team:
+        raise RuntimeError(
+            f"visible team mismatch: expected {expected_team!r}, "
+            f"got {result.get('team')!r}"
         )
     return result

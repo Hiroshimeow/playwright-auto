@@ -10,7 +10,7 @@ A browser lifecycle CLI starts Chromium with a persistent profile and fixed loca
 
 Headless mode reuses the same profile only after the GUI instance and its display stream have stopped. Automation clients attach with Playwright over CDP rather than owning the browser process.
 
-The streaming boundary is independent of the browser and automation layers: a future Selkies/WebRTC service may consume the same virtual display without changing the CDP endpoint, persistent profile, or Playwright clients.
+The streaming boundary is independent of the browser and automation layers: a future browser-viewer service may consume the same virtual display without changing the CDP endpoint, persistent profile, or Playwright clients.
 
 ## Safety and lifecycle constraints
 

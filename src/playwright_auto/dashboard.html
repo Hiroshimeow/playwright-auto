@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>CDPA Control Center</title>
+  <link rel="stylesheet" href="/assets/dashboard.css?v=20260731-agent-ux-v2">
+</head>
+<body>
+  <header class="app-header">
+    <a class="brand" href="/" aria-label="CDPA Control Center home">
+      <span class="brand-mark" aria-hidden="true">C</span>
+      <span class="brand-copy"><strong>CDPA</strong><small>Control Center</small></span>
+    </a>
+
+    <div id="service-status" class="service-strip" aria-live="polite"></div>
+
+    <nav class="header-actions" aria-label="Dashboard actions">
+      <button type="button" class="button primary" data-open-create>Create task</button>
+      <button type="button" class="button" aria-expanded="false" aria-controls="agents-panel" data-open-agent>Add Agents</button>
+      <button type="button" class="button" data-action="reload_catalog">Reload catalog</button>
+      <button type="button" class="button" data-view="resume">Resume teams</button>
+      <button type="button" class="button" data-view="history">History</button>
+    </nav>
+  </header>
+
+  <main class="app-main">
+    <section class="board-section" aria-labelledby="board-title">
+      <header class="section-header">
+        <div>
+          <p class="eyebrow">Operational queue</p>
+          <h1 id="board-title">Task board</h1>
+        </div>
+        <div id="catalog-health" class="catalog-health" aria-live="polite"></div>
+      </header>
+      <div id="board" class="board-grid" aria-live="polite"></div>
+    </section>
+
+    <section class="task-workspace" aria-label="Selected task workspace">
+      <article id="task-detail" class="surface task-detail empty-state">
+        <p class="eyebrow">Task detail</p>
+        <h2>Select a task</h2>
+        <p>Task detail is loaded only after selection and remains stable while the dashboard polls.</p>
+      </article>
+      <aside id="commands" class="surface command-panel" aria-live="polite"></aside>
+    </section>
+  </main>
+
+  <dialog id="secondary-dialog" class="secondary-dialog" aria-labelledby="secondary-title">
+    <section class="secondary-shell">
+      <header class="secondary-header">
+        <div>
+          <p class="eyebrow">Secondary view</p>
+          <h2 id="secondary-title">History</h2>
+        </div>
+        <button type="button" class="button icon-button" data-close-secondary aria-label="Close secondary view">Close</button>
+      </header>
+      <div id="secondary-content" class="secondary-content" aria-live="polite"></div>
+    </section>
+  </dialog>
+
+  <dialog id="create-dialog" class="create-dialog create-task-dialog">
+    <form id="create-form" method="dialog" class="create-form create-task-form">
+      <header class="secondary-header create-dialog-header">
+        <div>
+          <p class="eyebrow">Queue work</p>
+          <h2>Create task</h2>
+          <p class="detail-subtitle">Define the work, assign its workflow agents, then queue it once.</p>
+        </div>
+        <button type="button" class="button icon-button" data-close-create aria-label="Close create task form">Close</button>
+      </header>
+
+      <div class="create-dialog-body">
+        <section class="create-section" data-create-section="task-details" aria-labelledby="create-task-details-title">
+          <div class="create-section-heading">
+            <span class="create-section-index">01</span>
+            <div><p class="eyebrow">Task details</p><h3 id="create-task-details-title">What should the team deliver?</h3></div>
+          </div>
+          <label>Task<textarea name="task" rows="7" required placeholder="Describe the required result, constraints, and acceptance evidence."></textarea></label>
+        </section>
+
+        <section class="create-section" data-create-section="team-repository" aria-labelledby="create-team-title">
+          <div class="create-section-heading">
+            <span class="create-section-index">02</span>
+            <div><p class="eyebrow">Team / repository</p><h3 id="create-team-title">Choose identity and workspace</h3></div>
+          </div>
+          <div class="form-grid">
+            <label>New team<input name="requested_team" autocomplete="off" placeholder="dashboard-agent-ux"></label>
+            <label>Reuse exact team<select name="reuse_team"><option value="">Do not reuse</option></select></label>
+          </div>
+          <label>Repository<input name="repository" autocomplete="off" placeholder="Uses dashboard repository when blank"></label>
+          <p class="form-help">Choose one team path. Exact-team reuse inherits and locks its workflow-agent composition.</p>
+        </section>
+
+        <section class="create-section" data-create-section="workflow-agents" aria-labelledby="create-agents-title">
+          <div class="create-section-heading">
+            <span class="create-section-index">03</span>
+            <div><p class="eyebrow">Workflow agents</p><h3 id="create-agents-title">Select the execution path</h3></div>
+          </div>
+          <div id="workflow-agent-options" class="workflow-agent-grid" aria-live="polite"></div>
+          <p class="form-help">PLAN is required. PLAN, DEV, and REVIEW are selected by default. Custom workflow agents start unchecked.</p>
+        </section>
+
+        <section class="create-section" data-create-section="dependencies-output" aria-labelledby="dependency-title">
+          <div class="create-section-heading">
+            <span class="create-section-index">04</span>
+            <div><p class="eyebrow">Dependencies / output</p><h3 id="dependency-title">Gate the start and preserve reports</h3></div>
+          </div>
+          <p class="form-help">Select canonical dependencies. Role reports continue to use the existing task output contract.</p>
+          <div id="dependency-options" class="action-options" aria-live="polite"></div>
+          <details data-advanced-dependencies>
+            <summary>Advanced: exact task IDs</summary>
+            <label>Dependency task IDs<input name="depends_on_task_ids" placeholder="task-a, task-b" autocomplete="off"></label>
+          </details>
+        </section>
+      </div>
+
+      <footer class="dialog-actions create-dialog-footer">
+        <div class="create-footer-copy">
+          <p id="create-selection-summary" class="create-selection-summary" aria-live="polite">PLAN · DEV · REVIEW</p>
+          <p id="create-validation" class="create-validation" aria-live="assertive" hidden></p>
+        </div>
+        <div class="create-footer-actions">
+          <button type="button" class="button" data-close-create>Cancel</button>
+          <button type="submit" class="button primary">Queue task</button>
+        </div>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="change-goal-dialog" class="create-dialog">
+    <form id="change-goal-form" method="dialog" class="create-form">
+      <header class="secondary-header">
+        <div><p class="eyebrow">Running workflow</p><h2>Change goal</h2></div>
+        <button type="button" class="button icon-button" data-close-change-goal aria-label="Close change goal form">Close</button>
+      </header>
+      <input type="hidden" name="task_id">
+      <input type="hidden" name="expected_task_version">
+      <label>Full replacement goal<textarea name="goal" rows="12" required></textarea></label>
+      <p class="form-help">Applies from the next route/hop. The current hop is not changed or resent.</p>
+      <footer class="dialog-actions">
+        <button type="button" class="button" data-close-change-goal>Cancel</button>
+        <button type="submit" class="button primary">Save goal</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <section id="agents-panel" class="agents-panel surface" hidden aria-labelledby="agents-panel-title">
+    <header class="secondary-header agents-panel-header">
+      <div><p class="eyebrow">Agent catalog</p><h2 id="agents-panel-title">Add Agents</h2></div>
+      <button type="button" class="button icon-button" data-close-agent aria-label="Close Add Agents panel">Close</button>
+    </header>
+    <div class="agents-picker">
+      <label>Agent<select name="agent_select"><option value="">Select an agent</option></select></label>
+      <button type="button" class="button" data-new-agent>New agent</button>
+    </div>
+    <form id="agent-form" class="agents-editor">
+      <input type="hidden" name="agent_kind" value="new">
+      <input type="hidden" name="agent_id">
+      <input type="hidden" name="is_system" value="false">
+      <label>Name<input name="name" maxlength="80" autocomplete="off" required></label>
+      <label>System prompt<textarea name="system_prompt" rows="7" required></textarea></label>
+      <label class="check-row agents-independent-toggle">
+        <input type="checkbox" name="independent"> Independent agent
+      </label>
+      <details id="independent-settings" class="action-fieldset" hidden>
+        <summary>Independent settings</summary>
+        <label>Trigger
+          <select name="trigger_type">
+            <option value="manual">Manual only</option>
+            <option value="interval">Interval</option>
+            <option value="task_done">Workflow task completed</option>
+            <option value="role_completed">Workflow agent completed</option>
+            <option value="task_state">Workflow task state</option>
+            <option value="check_all">Review all active workflow tasks</option>
+            <option value="recovery">Recovery</option>
+          </select>
+        </label>
+        <label>Max turns per job<input type="number" name="max_cycles" min="0" step="1" value="0" inputmode="numeric"><span class="form-help">0 means Unlimited.</span></label>
+        <label data-trigger-field="interval">Interval minutes<input type="number" name="interval_minutes" min="20" step="1"></label>
+        <label data-trigger-field="task_team role_team state_team">Workflow task / team<input name="trigger_team" list="workflow-task-team-options" autocomplete="off"></label>
+        <label data-trigger-field="role">Workflow agent<select name="trigger_role" data-workflow-agent-select></select></label>
+        <label data-trigger-field="state">Workflow task state<input name="trigger_state" placeholder="BLOCKED" autocomplete="off"></label>
+        <p class="form-help">Uses current workflow tasks and the existing Agent Catalog. New agents default to manual-only.</p>
+      </details>
+      <p id="agent-editor-help" class="form-help">New agents are Custom Workflow Agents unless Independent agent is enabled.</p>
+      <footer class="dialog-actions agents-editor-actions">
+        <button type="button" class="button danger" data-delete-agent hidden>Delete</button>
+        <button type="submit" class="button primary">Save</button>
+      </footer>
+    </form>
+  </section>
+
+  <dialog id="agent-command-dialog" class="create-dialog">
+    <form id="agent-command-form" method="dialog" class="create-form">
+      <header class="secondary-header">
+        <div>
+          <p class="eyebrow">Agent</p>
+          <h2>Run task</h2>
+        </div>
+        <button type="button" class="button icon-button" data-close-agent-command aria-label="Close Run task dialog">Close</button>
+      </header>
+      <input type="hidden" name="task_id">
+      <label>Instruction<textarea name="instruction" rows="5" maxlength="4000" required placeholder="Describe the one job this agent should perform."></textarea></label>
+      <footer class="dialog-actions">
+        <button type="button" class="button" data-close-agent-command>Cancel</button>
+        <button type="submit" class="button primary">Run task</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="agent-settings-dialog" class="create-dialog agent-settings-dialog">
+    <form id="agent-settings-form" method="dialog" class="agent-settings-form">
+      <header class="secondary-header agent-settings-header">
+        <div>
+          <p class="eyebrow">Independent agent</p>
+          <h2>Settings</h2>
+          <p id="agent-settings-caption" class="detail-subtitle"></p>
+        </div>
+        <div class="agent-settings-header-actions">
+          <label class="switch-control">
+            <input type="checkbox" name="enabled">
+            <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+            <span class="switch-label">Enabled</span>
+          </label>
+          <button type="button" class="button icon-button agent-settings-close" data-close-agent-settings aria-label="Close agent settings">×</button>
+        </div>
+      </header>
+
+      <div class="agent-settings-body">
+        <input type="hidden" name="task_id">
+        <label>Name<input name="display_name" maxlength="80" required></label>
+        <label>System prompt<textarea class="agent-settings-prompt" name="system_prompt" rows="6" required></textarea></label>
+        <label>Max turns per job<input type="number" name="max_cycles" min="0" step="1" value="0" inputmode="numeric"><span class="form-help">0 means Unlimited.</span></label>
+
+        <section class="agent-trigger-card" aria-labelledby="agent-trigger-title">
+          <div class="agent-trigger-heading">
+            <div>
+              <p class="eyebrow">Trigger</p>
+              <h3 id="agent-trigger-title">When should this agent run?</h3>
+            </div>
+            <label class="agent-trigger-select">Trigger
+              <select name="trigger_type">
+                <option value="manual">Manual only</option>
+                <option value="interval">Interval</option>
+                <option value="task_done">Workflow task completed</option>
+                <option value="role_completed">Workflow agent completed</option>
+                <option value="task_state">Workflow task state</option>
+                <option value="check_all">Review all active workflow tasks</option>
+                <option value="recovery">Recovery</option>
+              </select>
+            </label>
+          </div>
+          <p id="independent-settings-trigger-help" class="form-help">Runs only when started manually.</p>
+          <div class="agent-settings-trigger-fields">
+            <label data-trigger-field="interval" hidden>Interval minutes
+              <input type="number" name="interval_minutes" min="20" step="1" inputmode="numeric">
+            </label>
+            <label data-trigger-field="task_team role_team state_team" hidden>Workflow task / team
+              <input name="trigger_team" list="workflow-task-team-options" placeholder="dashboard-team" autocomplete="off">
+            </label>
+            <label data-trigger-field="role" hidden>Workflow agent
+              <select name="trigger_role" data-workflow-agent-select></select>
+            </label>
+            <label data-trigger-field="state" hidden>Workflow task state
+              <select name="trigger_state">
+                <option value="RUNNING">RUNNING</option>
+                <option value="WAITING">WAITING</option>
+                <option value="BLOCKED">BLOCKED</option>
+                <option value="PAUSED">PAUSED</option>
+                <option value="DONE">DONE</option>
+                <option value="STOPPED">STOPPED</option>
+              </select>
+            </label>
+          </div>
+        </section>
+      </div>
+
+      <footer class="dialog-actions agent-settings-actions">
+        <button type="button" class="button" data-close-agent-settings>Cancel</button>
+        <button type="submit" class="button primary">Save settings</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <datalist id="workflow-task-team-options"></datalist>
+
+  <div id="toast" class="toast" hidden role="status"></div>
+  <script type="module" src="/assets/app.js?v=20260731-agent-ux-v3"></script>
+</body>
+</html>

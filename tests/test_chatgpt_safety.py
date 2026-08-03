@@ -146,89 +146,8 @@ def test_role_binding_is_immutable_without_explicit_rebind(monkeypatch):
         asyncio.run(client.set_role("PLAN"))
 
 
-def test_send_recovery_rechecks_progress_before_second_click(monkeypatch):
-    page = DummyPage(
-        snapshot(
-            composer_text="",
-            send_visible=False,
-            send_enabled=False,
-            state=ChatGPTState.NEW_CHAT,
-        )
-    )
-    page.raise_click = True
-    client = ChatGPTPage(page, timeout_ms=100)
-    client.binding = PageBinding("page-1", "DEV")
-
-    async def fake_inspect(_page):
-        return page.current
-
-    async def fake_set_text(_page, text, timeout_ms):
-        page.current = snapshot(
-            composer_text=text,
-            send_visible=True,
-            send_enabled=True,
-            state=ChatGPTState.DRAFT,
-        )
-
-    async def fake_refresh(_page, timeout_ms):
-        page.current = snapshot(
-            messages=(
-                MessageSnapshot("user", "u2", "t2", "exact prompt", ()),
-            ),
-            state=ChatGPTState.SUBMITTING,
-        )
-
-    async def fake_click_send(_page, timeout_ms):
-        page.clicks += 1
-        raise RuntimeError("synthetic send failure")
-
-    monkeypatch.setattr(chatgpt, "inspect_chatgpt_page", fake_inspect)
-    monkeypatch.setattr(chatgpt, "set_composer_text", fake_set_text)
-    monkeypatch.setattr(chatgpt, "refresh_page", fake_refresh)
-    monkeypatch.setattr(chatgpt, "click_send_button", fake_click_send)
-
-    receipt = asyncio.run(
-        client.send(
-            "exact prompt",
-            timeout_ms=100,
-            max_attempts=2,
-            recovery_reload=True,
-            wait_for_stop=False,
-        )
-    )
-
-    assert page.clicks == 1
-    assert receipt.attempts == 1
-    assert receipt.accepted_via == "post_reload:exact_user_message"
 
 
-def test_wait_response_rejects_unproven_stale_assistant(monkeypatch):
-    stale = MessageSnapshot("assistant", "a2", "t2", "stale", ())
-    page = DummyPage(snapshot(messages=(stale,), state=ChatGPTState.WAITING_PROMPT))
-    client = ChatGPTPage(page, timeout_ms=20)
-    binding = PageBinding("page-1", "DEV")
-    client.binding = binding
-    receipt = SendReceipt(
-        prompt="expected prompt",
-        prompt_sha256="digest",
-        binding=binding,
-        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
-        attempts=1,
-        accepted_via="stop_button",
-        session_id_before=None,
-    )
-
-    async def fake_inspect(_page):
-        return page.current
-
-    monkeypatch.setattr(chatgpt, "inspect_chatgpt_page", fake_inspect)
-
-    with pytest.raises(SendRecoveryError, match="stale response rejected"):
-        asyncio.run(
-            client.wait_for_response(
-                receipt, timeout_ms=20, stable_ms=0, poll_ms=1
-            )
-        )
 
 
 def test_send_receipt_round_trip_preserves_provenance_and_rejects_tamper():

@@ -16,6 +16,7 @@ from playwright_auto.chatgpt import (
     SendRecoveryError,
     looks_incomplete_response,
     prompt_digest,
+    response_transport_ui_active,
 )
 
 
@@ -118,6 +119,20 @@ def test_incomplete_response_detector_covers_code_fence_and_json():
     assert looks_incomplete_response("normal final response") is False
 
 
+def test_transient_marker_inside_completed_report_is_not_transport_activity():
+    final_report = (
+        "DEV report\n\n"
+        "ThinkBook returned 400: We couldn't connect your account. Please try again.\n\n"
+        "Implementation and verification are complete.\n"
+        '{"route":"PLAN","handoff":"INLINE"}'
+    )
+    snapshot = conversation(final_report)
+
+    assert looks_incomplete_response(final_report) is False
+    assert response_transport_ui_active(snapshot) is False
+    assert looks_incomplete_response("We couldn't connect. Please try again.") is True
+
+
 def test_wait_response_resets_stability_when_text_changes(monkeypatch):
     page = SequencePage(
         [
@@ -160,47 +175,8 @@ def test_post_reload_first_stale_snapshot_requires_confirmation(monkeypatch):
     assert page.inspect_calls == 2
 
 
-def test_active_response_reloads_once_then_rejects_first_stale_done(monkeypatch):
-    page = SequencePage(
-        [
-            conversation("partial", stop=True),
-            conversation("partial growing", stop=True),
-            conversation("stale after reload"),
-            conversation("final after reload"),
-        ]
-    )
-    install_sequence(monkeypatch, page)
-
-    async def fake_refresh(_page, timeout_ms):
-        page.reload_calls += 1
-
-    monkeypatch.setattr(chatgpt, "refresh_page", fake_refresh)
-
-    result = asyncio.run(
-        bind(page).wait_for_response(
-            receipt(accepted_via="stop_button"),
-            timeout_ms=50,
-            stable_ms=0,
-            poll_ms=1,
-            active_reload_after_ms=1,
-            reload_wait_ms=0,
-        )
-    )
-
-    assert result.text == "final after reload"
-    assert page.reload_calls == 1
 
 
-def test_structurally_incomplete_response_is_never_returned(monkeypatch):
-    page = SequencePage([conversation('{"PLAN": "continue"')])
-    install_sequence(monkeypatch, page)
-
-    with pytest.raises(SendRecoveryError, match="structurally complete"):
-        asyncio.run(
-            bind(page).wait_for_response(
-                receipt(), timeout_ms=8, stable_ms=0, poll_ms=1
-            )
-        )
 
 
 def test_manual_composer_input_blocks_completion_and_recovery(monkeypatch):

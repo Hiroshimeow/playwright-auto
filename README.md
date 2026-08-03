@@ -1,258 +1,280 @@
 # playwright-auto
 
-Persistent Chromium automation through local CDP, with a low-latency interactive Selkies/WebRTC view.
+Persistent Chromium automation over local CDP, with a durable CDPA workflow runtime and an optional interactive noVNC browser viewer.
 
-## Endpoints
+## Runtime layout
 
-- CDP: `http://127.0.0.1:9222` (loopback only)
-- Viewer: `http://<tailscale-ip>:9223/` (interactive browser screen)
-- Profile: `.runtime/main-profile/` (inside this repository, ignored by Git)
-- Display: `:100`
+| Surface | Default | Purpose |
+|---|---|---|
+| Chromium CDP | `127.0.0.1:9222` | Automation transport; loopback only |
+| noVNC viewer | `0.0.0.0:9223` | Interactive view of the Xvfb desktop |
+| noVNC WebSocket | `127.0.0.1:9226` | Internal websockify bridge |
+| VNC backend | `127.0.0.1:5901` | Internal x11vnc endpoint |
+| CDPA dashboard | `0.0.0.0:9224` | Kanban, task controls, reports, runtime state |
+| CDPA API | `127.0.0.1:9225` | Projection reads and durable command mailbox |
+| Virtual display | `:100` | Chromium GUI display |
 
-Port 9223 is only the visual keyboard/mouse view. Automation connects only to CDP 9222.
+The browser viewer and automation path are independent. CDPA/Playwright connects to CDP `9222`; noVNC only exposes the pixels, keyboard, and mouse of the Xvfb display.
 
-CDP clients must disconnect with `playwright.stop()` or `connected_browser(...)`. Do not call `browser.close()` after `connect_over_cdp`; it closes the persistent Chromium process and PM2 will restart it.
+Do not call `browser.close()` on a browser obtained through `connect_over_cdp`; it closes the persistent Chromium process. Disconnect the Playwright client instead.
 
-## Prerequisites
+## Linux prerequisites
 
-- Linux with Bash and Python 3.11 or newer.
-- `uv`, Node.js, and PM2.
-- Xvfb and a Chromium-family browser.
-- Tailscale for private remote viewer access.
-- Selkies GStreamer unpacked under `~/.local/opt/selkies-gstreamer`, or set `SELKIES_ROOT`.
+Required commands:
 
-Runtime executables are discovered automatically. On nonstandard installations, set:
+- Python 3.11+
+- `uv`
+- Node.js + PM2
+- Chromium/Chrome
+- Xvfb + `xdpyinfo`
+- `x11vnc`
+- `nginx`
+- `curl` and `tar`
+
+Optional overrides:
 
 ```bash
-export CHROMIUM_BIN=/path/to/chromium-or-chrome
+export CHROMIUM_BIN=/path/to/chromium
 export XVFB_BIN=/path/to/Xvfb
-export SELKIES_ROOT=/path/to/selkies-gstreamer
-# Only needed when Selkies has a nonstandard Python package layout:
-export SELKIES_PYTHON_PACKAGE=/path/to/site-packages/selkies_gstreamer
+export X11VNC_BIN=/path/to/x11vnc
+export NGINX_BIN=/path/to/nginx
+export PLAYWRIGHT_PROFILE_DIR=/path/to/persistent-profile
+export PLAYWRIGHT_DISPLAY=:100
+export PLAYWRIGHT_VIEWER_PORT=9223
 ```
 
-## Start
+The default Chromium profile is `$HOME/Workspace/playwright-profile`. It is intentionally outside the repository so repository cleanup does not remove the logged-in browser profile.
+
+## Linux setup and start
+
+Install Python dependencies and the pinned noVNC runtime:
 
 ```bash
 uv sync
+./scripts/install-novnc.sh
+```
+
+`install-novnc.sh` installs noVNC `v1.7.0` and websockify `0.13.0` under `.runtime/`; nothing is installed system-wide by that script.
+
+Start the services:
+
+```bash
 pm2 start ecosystem.config.cjs
 pm2 save
 ```
 
+Expected services:
+
+```text
+playwright-display
+playwright-vnc
+playwright-novnc
+playwright-browser
+playwright-role-ui
+playwright-dashboard-api
+playwright-dashboard
+playwright-cdpa-worker
+```
+
+Check them with:
+
 ```bash
-pm2 status playwright-display playwright-selkies playwright-browser playwright-role-ui
+pm2 status
 curl http://127.0.0.1:9222/json/version
 curl -I http://127.0.0.1:9223/
+curl http://127.0.0.1:9224/health
 uv run python scripts/smoke.py
 ```
 
-Stop or restart with `pm2 stop|restart playwright-browser playwright-selkies playwright-display playwright-role-ui`.
+The viewer path is:
 
-Selkies v1.6.2 is unpacked user-locally at `~/.local/opt/selkies-gstreamer`. The viewer has no application password and must stay inside the private Tailscale network. Do not expose port 9223 through Funnel or a public tunnel.
+```text
+Xvfb :100
+   ↓
+x11vnc 127.0.0.1:5901
+   ↓
+websockify 127.0.0.1:9226
+   ↓
+nginx/noVNC :9223
+   ↓
+browser viewer
+```
 
-The virtual display is a separate PM2 service, so restarting Selkies does not restart Chrome or affect its profile.
+The VNC and WebSocket backends stay on loopback. Port `9223` is the network-facing viewer. Keep it on a trusted network or put an appropriate access layer in front of it.
 
-### Windows with an existing CDP browser
+## Persistent Chromium behavior
 
-The PM2/Xvfb/Selkies stack above is Linux-only. On Windows, point the tools at a Chrome
-instance already running with loopback CDP on port 9222:
+`scripts/browser-gui.sh` starts Chromium on the Xvfb display with CDP bound to loopback. Chromium starts at `about:blank`; after CDP becomes ready the launcher opens the configured default URL through the DevTools HTTP endpoint. This avoids a native X11/VNC keyboard-input issue seen when ChatGPT is passed directly as Chromium's startup URL.
 
-```powershell
-uv sync --frozen
-Invoke-RestMethod http://127.0.0.1:9222/json/version
+Default URL:
+
+```bash
+export PLAYWRIGHT_DEFAULT_URL=https://chatgpt.com/
+```
+
+The persistent profile survives PM2/browser restarts. Restarting the viewer does not restart Chromium.
+
+## CDPA architecture
+
+CDPA is a single-operator durable workflow runtime around real ChatGPT browser tabs.
+
+```text
+Dashboard :9224
+    ↓ /api
+Loopback API :9225
+    ↓ durable command mailbox / SQLite projections
+CDPA worker
+    ↓
+TaskStore + .plan manifests/reports
+    ↓
+Persistent Chromium via CDP :9222
+```
+
+Important ownership rule: **the worker is the only process that mutates TaskStore workflow state or controls ChatGPT tabs.** The frontend/API only read projections and enqueue commands.
+
+Normal workflow roles are `PLAN`, `DEV`, `REVIEW`, `TEST`, and `AUDIT`. PLAN is the only normal role allowed to route a task to `DONE`.
+
+A task preserves:
+
+- task/team identity;
+- active hop and role;
+- exact request ID;
+- accepted-send receipt and user-message identity;
+- exact conversation URL and physical page binding;
+- reports and route history;
+- dependency/queue state;
+- operator-control provenance.
+
+Accepted sends are never intentionally replayed during recovery.
+
+## Start CDPA directly
+
+```bash
+uv run playwright-dashboard-api --repository . --host 127.0.0.1 --port 9225 --config cdpa.yaml
+uv run playwright-dashboard --host 0.0.0.0 --port 9224 --config cdpa.yaml
+uv run cdpa-worker --repository . --config cdpa.yaml
+```
+
+The PM2 configuration starts the same three services for the repository runtime.
+
+Submit a task:
+
+```bash
+cdpa "Implement and verify the requested behavior"
+```
+
+Examples:
+
+```bash
+cdpa "Build parent" --team alpha
+cdpa "Build child" --team beta --depends-on <parent-task-id>
+cdpa "Continue with the same team context" --reuse-team alpha
+cdpa "Analyze these sources" --upload design.md
+cdpa --team <exact-existing-team>
+```
+
+The dashboard provides durable controls such as Pause, Resume, Retry hop, Stop, Restart role, Open tab, New Chat, Route PLAN, Clear Team, and Change Goal. Controls are applied through the worker state machine rather than by direct frontend browser actions.
+
+## Independent agents
+
+Independent agents use the same manifest/task runtime but have one `AGENT` role instead of PLAN/DEV/REVIEW routing.
+
+Built-in agents include Maintainers and Monitor. The runtime supports trigger-driven jobs, run-now jobs, bounded continuation cycles, repair creation, and exact-target controls. Recovery controls carry source task/event provenance and are rejected when the canonical event is stale.
+
+A recurring independent agent returns to `WAITING / waiting_trigger` after its job. Operator Pause/Stop/Restart/New Chat/Clear Team remains authoritative.
+
+## Workflow agents
+
+Workflow-role definitions are configurable through the workflow-agent catalog. System routes remain stable route keys; custom workflow agents receive stable custom route keys and may be created, renamed, updated, or deleted through the supported control surface.
+
+## Reports and recovery
+
+Role responses use a file-backed report contract under `.plan/<team>/...`. Recovery distinguishes:
+
+- pre-acceptance preparation from an accepted Send boundary;
+- transport activity from a stable final assistant response;
+- response validation from report materialization;
+- operator intent from automatic recovery;
+- immediate release from durable root-cause repair.
+
+`PROBLEM.md` is the unresolved root-cause backlog. Once a repair/task is created from a problem and completed, remove that problem entry; durable operational rules belong in `LEARNING.md` or `.learning/`.
+
+## Dashboard authentication
+
+The public host guard reads the dashboard password from repository `.env`:
+
+```dotenv
+CDPA_DASHBOARD_PASSWORD=change-me
+```
+
+The loopback API remains on `127.0.0.1:9225`. Public requests to the dashboard require the password session; the dashboard frontend proxies `/api` to the loopback API after authentication.
+
+## Browser roles
+
+List currently open ChatGPT role tabs:
+
+```bash
 uv run playwright-roles --list
 ```
 
-Do not run `uv pip install fcntl`; `fcntl` is a Unix standard-library module, not a PyPI
-package. The durable ledger uses `msvcrt` locks on Windows and `fcntl` locks on Unix.
-
-To keep the visible `SET ROLE` control injected across reloads, leave this running in a
-separate PowerShell window:
-
-```powershell
-uv run playwright-role-ui
-```
-
-Use `uv run playwright-role-ui --once` when one-time injection is sufficient.
-
-## Run a multi-role task
-
-Open the private viewer and log in to ChatGPT once:
-
-```text
-http://<tailscale-ip>:9223/
-```
-
-Start a task with the default team `PLAN=1, DEV=2, REVIEW=1, TEST=1`:
+Assign roles:
 
 ```bash
-uv run playwright-team "Implement and verify the requested feature"
+uv run playwright-roles DEV REVIEW --tabs 1,2
 ```
 
-Override role counts without editing Python:
+`playwright-role-ui` also provides the in-page role badge/control. Role ownership includes task/team/page identity so a runner fails closed if the physical tab or conversation no longer matches its lease.
+
+## Windows usage
+
+The Linux Xvfb/noVNC/PM2 viewer stack is not required on Windows. If Chrome/Chromium is already running with loopback CDP `9222`, install the CLI globally:
+
+```powershell
+uv tool install --force "git+https://github.com/Hiroshimeow/playwright-auto.git@develop"
+uv tool update-shell
+```
+
+Then, from the target repository:
+
+```powershell
+cd E:\python_project\target-repository
+cdpa
+```
+
+Submit work from another terminal:
+
+```powershell
+cdpa "Implement and verify the requested behavior"
+```
+
+Useful commands:
+
+```powershell
+cdpa start
+cdpa ui
+cdpa --team <exact-team-name>
+cdpa start --repository E:\python_project\target-repository
+```
+
+`Ctrl+C` stops the local CDPA frontend/API/worker started by the CLI; it does not close the existing browser on `9222`.
+
+## Headless mode
+
+Do not run GUI and headless Chromium simultaneously with the same profile.
 
 ```bash
-uv run playwright-team \
-  "Implement and verify the requested feature" \
-  --team DEV=3,REVIEW=2,TEST=2
-```
-
-Preview allocation without sending anything:
-
-```bash
-uv run playwright-team "Implement the requested feature" --dry-run
-```
-
-If login or a recoverable runtime interruption blocks the task, the CLI persists its
-manifest and prints the exact resume command:
-
-```bash
-uv run playwright-team --resume <task-id>
-```
-
-Each physical tab displays `⟦ROLE⟧` in its browser title and
-`ROLE · TASK-ID · page-id` in a fixed in-page badge. The same task resumes its
-existing role conversations. A new task uses New Chat after the whole participating
-team passes draft/attachment/dialog/stream preflight.
-
-### Change roles on tabs that are already open
-
-No agent, Tampermonkey installation, or `chatgpt_probe.py` rerun is required. List only the
-open ChatGPT tabs:
-
-```powershell
-uv run playwright-roles --list
-```
-
-Assign roles directly. When the browser has more tabs than roles, an interactive terminal
-prompts for the correct tab for each role:
-
-```powershell
-uv run playwright-roles REVIEW REVIEW1
-```
-
-For scripts or CI, pass the tab indices printed by `--list`:
-
-```powershell
-uv run playwright-roles REVIEW REVIEW1 --tabs 3,4
-```
-
-Alternatively, run `uv run playwright-role-ui` and use the page itself:
-
-1. Click the `SET ROLE` or current-role badge at the top center of the ChatGPT tab.
-2. Enter any valid role such as `DEV`, `REVIEW`, `SECURITY`, or `REVIEW1`.
-3. Click **Apply**. Use **Release** to leave the tab unassigned.
-
-Changing a role preserves the current conversation URL, task ID, page ID, draft, and
-streaming response. A workflow that already leased the old role fails its next ownership
-check instead of continuing on the wrong tab. The next runner attaches the tab using its
-new role. Duplicate role names across physical tabs turn both badges red; rename one role,
-for example `REVIEW` → `REVIEW1`.
-
-`playwright-role-ui` records changes in `.runtime/role-ui-events.jsonl` and reinjects the
-control after reload/navigation while it is running. `chatgpt_probe.py` remains only an
-emergency low-level fallback.
-
-New task manifests default to workflow version 2. PLAN returns distinct assignments for
-all DEV instances, REVIEW/TEST verify independently, DEV revises, REVIEW/TEST reverify,
-and PLAN closes out from a deterministic accepted/blocked gate. Existing version-1 task
-manifests continue to resume with their original round graph.
-
-Requests are paced across the team. The known ChatGPT `Too many requests` dialog triggers
-a bounded cooldown, safe `Got it` dismissal, and durable retry without resending an
-already accepted prompt. Unknown dialogs still require manual intervention.
-
-Normal runs require an authenticated profile and fail closed with
-`waiting_for_login`. `--allow-guest` exists only for controlled testing because
-anonymous ChatGPT sessions are not reliable for sustained multi-round work.
-
-### Run a two-role review exchange
-
-The short form defaults to `REVIEW` and `REVIEW1`:
-
-```powershell
-uv run python scripts/two_role_review_flow.py `
-  "Review the repository for concrete correctness and operational defects" `
-  --repo E:\git-project\qmh
-```
-
-Use arbitrary roles when the common flow is implementation followed by review:
-
-```powershell
-uv run python scripts/two_role_review_flow.py `
-  "Implement the task, then independently review it" `
-  --repo E:\git-project\target-repo `
-  --roles DEV REVIEW
-```
-
-Bash uses the same arguments with `\` line continuations. The original `--task` form remains
-supported for backward compatibility. `--repo` defaults to the current directory, and
-`--roles` defaults to `REVIEW REVIEW1`. The MCP defaults to `mcp-thinkbook` on Windows and
-`mcp-g8` on Unix; override it explicitly with `--mcp <tool-name>`.
-
-The fixed round order is `ROLE_A → ROLE_B → ROLE_A`. The second role receives the first
-report; the final role receives both earlier reports and returns one consolidated verdict.
-The flow is durable, keeps one request ledger per role/round, and resumes completed turns
-without resending them. It reads and tests the target repository but its standard review
-prompt forbids editing, staging, resetting, committing, or deploying. Use `--task-id` to
-provide a stable identity for an explicit resume or audit trail.
-
-## Viewer implementation
-
-Port 9223 uses this path:
-
-```text
-Xvfb :100 → Selkies GStreamer/WebRTC → x264 H.264 → browser viewer
-```
-
-It is not VNC/noVNC. The private Tailscale profile is video-only, uses UDP ICE only
-for loopback/Tailscale/LAN addresses, and keeps port 9223 fixed. Current settings are
-1280×720, 15 FPS, and 1.2 Mbps. The Selkies web and Python runtime patches are
-generated under `.runtime/`; the installed Selkies package is not modified.
-
-## ChatGPT workflows
-
-`ChatGPTPage` wraps one tab. Reusable blocks are composed by `Workflow`:
-
-```python
-workflow = Workflow(
-    "dev-task",
-    [
-        SetRoleBlock("DEV"),
-        NewChatBlock(),
-        SendPromptBlock(lambda ctx: ctx.require("prompt")),
-        WaitStateBlock(ChatGPTState.RESPONDING),
-        StopResponseBlock(),
-    ],
-)
-
-run = await workflow.run(
-    ChatGPTPage(page),
-    variables={"prompt": "Implement phase 1"},
-)
-```
-
-Blocks have stable IDs and can be changed without rewriting the runner:
-
-```python
-workflow.replace("set_role", SetRoleBlock("REVIEW"))
-workflow.insert_after("set_role", CaptureSnapshotBlock("before_prompt"))
-workflow.remove("stop_response")
-```
-
-For restart-safe Send/upload flows, start from `workflows/chatgpt_durable_loop.py`.
-See `docs/chatgpt-workflows.md`, `docs/tampermonkey-edge-cases.md`, and
-`scripts/chatgpt_workflow_example.py`.
-
-## Headless
-
-Stop both PM2 apps before reusing the profile headlessly:
-
-```bash
-pm2 stop playwright-browser playwright-selkies playwright-display
+pm2 stop playwright-browser playwright-vnc playwright-novnc playwright-display
 uv run playwright-auto start --headless
 uv run playwright-auto status
 uv run playwright-auto stop
 ```
 
-GUI and headless must never run simultaneously with the same profile.
+## Development verification
+
+```bash
+uv run python -m compileall -q src tests
+uv run pytest -q
+git diff --check
+```
+
+For browser/runtime changes, also verify the real persistent CDP instance and exact task/hop/page ownership before claiming acceptance.

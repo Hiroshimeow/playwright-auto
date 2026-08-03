@@ -1,0 +1,75 @@
+{
+  "paths": {
+    "plans_root": ".plan",
+    "constructors": {
+      "PLAN": "prompts/cdpa/PLAN.md",
+      "DEV": "prompts/cdpa/DEV.md",
+      "REVIEW": "prompts/cdpa/REVIEW.md",
+      "TEST": "prompts/cdpa/TEST.md",
+      "AUDIT": "prompts/cdpa/AUDIT.md"
+    },
+    "response_guide": "prompts/cdpa/RESPONSE_GUIDE.md",
+    "independent_rule": "prompts/cdpa/INDEPENDENT_RULE.md"
+  },
+  "roles": [
+    "PLAN",
+    "DEV",
+    "REVIEW",
+    "TEST",
+    "AUDIT"
+  ],
+  "browser": {
+    "cdp_url": "http://127.0.0.1:9222",
+    "workspace_timeout_seconds": 15
+  },
+  "dashboard": {
+    "url": "http://127.0.0.1:9224",
+    "port": 9224,
+    "poll_seconds": 1,
+    "api_host": "127.0.0.1",
+    "api_port": 9225
+  },
+  "worker": {
+    "poll_seconds": 1
+  },
+  "route_repair": {
+    "max_attempts": 3
+  },
+  "response": {
+    "timeout_seconds": 7200,
+    "refresh_after_seconds": 1200,
+    "stable_ms": 1000,
+    "poll_ms": 1000
+  },
+  "independent_agents": {
+    "seed_builtins": true,
+    "idle_close_seconds": 60
+  },
+  "cleanup": {
+    "terminal_idle_seconds": 1800
+  },
+  "delays": {
+    "minimum_seconds": 1.0,
+    "maximum_seconds": 1.5,
+    "multipliers": {
+      "composer_fill": 1,
+      "send": 3,
+      "new_chat": 4,
+      "refresh": 4,
+      "open_tab": 4,
+      "close_tab": 4
+    }
+  },
+  "runtime": {
+    "database": ".runtime/cdpa-control.sqlite3",
+    "worker_stale_seconds": 15,
+    "command_poll_seconds": 1,
+    "heartbeat_seconds": 5,
+    "browser_inventory_seconds": 5
+  },
+  "repositories": {
+    "allowed_roots": [
+      "/home/ayumi/Workspace/git_project"
+    ]
+  }
+}

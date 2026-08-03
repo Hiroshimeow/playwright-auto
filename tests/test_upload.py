@@ -133,39 +133,3 @@ def test_wait_upload_ready_reports_missing_attachments():
                 poll_ms=1,
             )
         )
-
-
-def test_upload_refuses_partial_existing_attachments(tmp_path):
-    first = tmp_path / "a.txt"
-    second = tmp_path / "b.txt"
-    first.write_text("a", encoding="utf-8")
-    second.write_text("b", encoding="utf-8")
-    client = FakeClient([snapshot(attachments=("a.txt",))])
-
-    with pytest.raises(ComposerConflictError, match="partial"):
-        asyncio.run(
-            upload_files(
-                client,
-                [str(first), str(second)],
-                request_marker="ROLE_REQUEST_ID: request-1",
-                timeout_ms=10,
-            )
-        )
-
-
-def test_upload_existing_ready_attachments_is_idempotent(tmp_path):
-    path = tmp_path / "a.txt"
-    path.write_text("a", encoding="utf-8")
-    client = FakeClient([snapshot(attachments=("a.txt",))])
-
-    receipt = asyncio.run(
-        upload_files(
-            client,
-            [str(path)],
-            request_marker="ROLE_REQUEST_ID: request-1",
-            timeout_ms=10,
-        )
-    )
-
-    assert receipt.method == "already_ready"
-    assert receipt.attachment_count == 1

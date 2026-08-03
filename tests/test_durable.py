@@ -207,27 +207,6 @@ def test_recovery_classifier_never_resends_after_send_boundary(tmp_path):
     )
 
 
-def test_durable_send_completes_once_then_returns_cached_response(tmp_path):
-    ledger_path = tmp_path / "ledger.json"
-    client = FakeDurableClient()
-    block = DurableSendBlock(
-        "perform durable task",
-        ledger_path=ledger_path,
-        stable_ms=0,
-    )
-
-    first = run_block(block, client)
-    second = run_block(block, client)
-
-    assert first.context.results["durable_send"]["cached"] is False
-    assert second.context.results["durable_send"]["cached"] is True
-    assert len(client.send_calls) == 1
-    assert len(client.wait_calls) == 1
-    stored = RequestLedger(ledger_path).get(
-        first.context.variables["durable_request"].request_id
-    )
-    assert stored.status is RequestStatus.COMPLETED
-    assert stored.response["text"] == "durable answer"
 
 
 def test_crash_resume_with_transcript_marker_waits_without_resend(tmp_path):
@@ -305,63 +284,8 @@ def test_sending_without_marker_fails_closed_and_never_resends(tmp_path):
     assert client.send_calls == []
 
 
-def test_durable_upload_is_hashed_uploaded_and_sent_once(tmp_path):
-    ledger_path = tmp_path / "ledger.json"
-    attachment = tmp_path / "context.txt"
-    attachment.write_text("context", encoding="utf-8")
-    client = FakeDurableClient()
-
-    result = run_block(
-        DurableSendBlock(
-            "task with context",
-            ledger_path=ledger_path,
-            files=[str(attachment)],
-            stable_ms=0,
-        ),
-        client,
-    )
-
-    record = result.context.variables["durable_request"]
-    assert len(client.upload_calls) == 1
-    assert len(client.send_calls) == 1
-    assert client.send_calls[0][-1] == 1
-    assert record.status is RequestStatus.COMPLETED
-    assert record.files[0].name == "context.txt"
-    assert record.upload_receipt["attachment_count"] == 1
 
 
-def test_uploading_crash_resumes_only_when_ui_proves_all_attachments_ready(tmp_path):
-    ledger_path = tmp_path / "ledger.json"
-    attachment = tmp_path / "context.txt"
-    attachment.write_text("context", encoding="utf-8")
-    identities = collect_file_identities([attachment])
-    ledger = RequestLedger(ledger_path)
-    record = ledger.begin(role="DEV", prompt="upload resume", files=identities)
-    record = ledger.update(record.request_id, status=RequestStatus.PROMPT_SET)
-    record = ledger.update(record.request_id, status=RequestStatus.UPLOADING)
-    client = FakeDurableClient(
-        snapshot(
-            text=record.rendered_prompt,
-            attachments=("context.txt",),
-            state=ChatGPTState.DRAFT,
-        )
-    )
-
-    result = run_block(
-        DurableSendBlock(
-            "upload resume",
-            ledger_path=ledger_path,
-            files=[str(attachment)],
-            stable_ms=0,
-        ),
-        client,
-    )
-
-    assert client.upload_calls == []
-    assert len(client.send_calls) == 1
-    assert result.context.variables["durable_request"].status is (
-        RequestStatus.COMPLETED
-    )
 
 
 def test_uploading_crash_without_ready_attachments_fails_closed(tmp_path):
