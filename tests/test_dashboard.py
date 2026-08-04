@@ -363,9 +363,12 @@ def test_independent_agents_have_one_lane_and_operator_facing_controls():
     assert 'text("span", "Independent Agent", "task-agent-context")' in board
     assert 'agent.tags' in board
     assert '"Custom Agent"' not in board
-    assert 'task.task_mode !== "independent" && task.status === "RUNNING"' in board
-    assert 'task.status === "DONE"' in board
-    assert 'completed_at' in board
+    assert 'agent.run_count' in board
+    assert 'agent.run_count_truncated' in board
+    assert 'agent.last_run_at' in board
+    assert 'task.status === "RUNNING"' in board
+    assert 'task.elapsed_end_at' in board
+    assert 'fixedDuration' in board
     assert 'data-elapsed-at' not in board.split('if (agent)', 1)[-1].split('function ensureLane', 1)[0]
 
     for label in [

@@ -187,6 +187,57 @@ def test_independent_projection_identifies_only_canonical_builtins(tmp_path: Pat
     assert custom.detail["agent"]["is_builtin"] is False
 
 
+def test_independent_projection_exposes_run_count_and_last_run(tmp_path: Path):
+    raw = raw_task(tmp_path)
+    raw["independent"] = {
+        "agent_key": "monitor",
+        "agent_name": "Monitor",
+        "agent_generation": 1,
+        "enabled": True,
+        "active_event": {
+            "event_key": "interval:monitor:3",
+            "trigger_type": "interval",
+            "occurred_at": "2026-07-25T03:00:00+00:00",
+        },
+        "job_history": [
+            {"event_key": "interval:monitor:1", "released_at": "2026-07-25T01:05:00+00:00"},
+            {"event_key": "interval:monitor:2", "released_at": "2026-07-25T02:05:00+00:00"},
+            {"event_key": "interval:monitor:2", "released_at": "2026-07-25T02:06:00+00:00"},
+        ],
+    }
+
+    projection = build_task_projection(raw, tasks=[raw])
+
+    assert projection.summary["agent"]["run_count"] == 3
+    assert projection.summary["agent"]["run_count_truncated"] is False
+    assert projection.summary["agent"]["last_run_at"] == "2026-07-25T03:00:00+00:00"
+
+    raw["independent"]["active_event"] = None
+    raw["independent"]["job_history"] = [
+        {"event_key": f"interval:monitor:{index}", "released_at": f"2026-07-25T02:05:{index % 60:02d}+00:00"}
+        for index in range(200)
+    ]
+    capped = build_task_projection(raw, tasks=[raw])
+    assert capped.summary["agent"]["run_count"] == 200
+    assert capped.summary["agent"]["run_count_truncated"] is True
+
+
+def test_projection_exposes_fixed_elapsed_end_for_non_running_tasks(tmp_path: Path):
+    cases = {
+        "DONE": ("completed_at", "2026-07-25T04:00:00+00:00"),
+        "BLOCKED": ("blocked_at", "2026-07-25T03:00:00+00:00"),
+        "STOPPED": ("stopped_at", "2026-07-25T02:00:00+00:00"),
+    }
+    for status, (field, end_at) in cases.items():
+        raw = raw_task(tmp_path)
+        raw.update(status=status, started_at="2026-07-25T01:00:00+00:00")
+        raw[field] = end_at
+
+        projection = build_task_projection(raw, tasks=[raw])
+
+        assert projection.summary["elapsed_end_at"] == end_at
+
+
 def test_disconnected_browser_marks_role_availability_unknown(tmp_path: Path):
     raw = raw_task(tmp_path)
 
@@ -269,7 +320,7 @@ def test_projection_summary_is_compact_and_deterministic(tmp_path: Path):
     assert set(first.summary) <= {
         "task_id", "team", "status", "column", "surface", "active_role",
         "active_hop_id", "active_action", "created_at", "started_at", "updated_at",
-        "effective_activity_at",
+        "effective_activity_at", "elapsed_end_at",
         "availability", "primary_problem", "waiting_reason", "block_code",
         "queue_position", "queue_length", "waiting_order", "roles", "has_reports", "task_title",
         "version", "projection_sha256",

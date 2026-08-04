@@ -224,20 +224,22 @@ function card(task, selected, board) {
   meta.className = "task-meta";
   if (agent) {
     meta.append(field("Status", task.status));
+    meta.append(field("Runs", `${agent.run_count ?? 0}${agent.run_count_truncated ? "+" : ""}`));
+    meta.append(field("Last", agent.last_run_at ? new Date(agent.last_run_at).toLocaleString() : "—"));
     meta.append(field("Action", task.active_action));
     meta.append(field("Tab", agent.tab_open ? "Open" : "Closed"));
   } else {
     const normalWaiting = task.status === "WAITING";
     meta.append(normalWaiting ? waitingOrderField(task) : field("Status", task.status));
     meta.append(field("Action", task.active_action));
-    if (task.task_mode !== "independent" && task.status === "RUNNING") {
-      const timestamp = task.started_at || task.created_at;
+    const timestamp = task.started_at || task.created_at;
+    if (task.status === "RUNNING") {
       const running = field("Total", elapsed(timestamp), "task-field task-elapsed");
       running.dataset.elapsedAt = timestamp || "";
       meta.append(running);
-    } else if (task.status === "DONE") {
-      const duration = fixedDuration(task.started_at || task.created_at, task.completed_at);
-      if (duration) meta.append(field("Duration", duration, "task-field task-elapsed"));
+    } else {
+      const duration = fixedDuration(timestamp, task.elapsed_end_at);
+      if (duration) meta.append(field("Total", duration, "task-field task-elapsed"));
     }
   }
   node.append(meta);

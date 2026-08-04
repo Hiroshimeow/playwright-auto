@@ -853,6 +853,19 @@ def build_task_projection(
         if active_input is not None:
             active_input = {**active_input, "input": None, "handoff": None}
     queue = raw.get("queue") if isinstance(raw.get("queue"), Mapping) else {}
+    waiting = raw.get("waiting") if isinstance(raw.get("waiting"), Mapping) else {}
+    elapsed_end_at = None
+    if status != "RUNNING":
+        elapsed_end_at = str(
+            (
+                raw.get("completed_at") if status == "DONE"
+                else raw.get("stopped_at") if status == "STOPPED"
+                else raw.get("blocked_at") if status == "BLOCKED"
+                else waiting.get("since") if status == "WAITING"
+                else raw.get("updated_at")
+            )
+            or updated_at
+        ) or None
     title = _public_text(
         str(raw.get("task_text") or raw.get("task_title") or "").splitlines()[0],
         max_chars=240,
@@ -883,6 +896,7 @@ def build_task_projection(
         "started_at": str(raw.get("started_at") or "") or None,
         "updated_at": updated_at,
         "effective_activity_at": str(raw.get("last_role_activity_at") or updated_at),
+        "elapsed_end_at": elapsed_end_at,
         "availability": availability,
         "primary_problem": problem,
         "waiting_reason": _public_text(raw.get("waiting_reason"), max_chars=500) or None,
@@ -914,6 +928,24 @@ def build_task_projection(
             if isinstance(independent.get("active_event"), Mapping)
             else {}
         )
+        job_history = [
+            item
+            for item in independent.get("job_history") or []
+            if isinstance(item, Mapping)
+        ]
+        run_event_keys = {
+            str(item.get("event_key") or "")
+            for item in job_history
+            if str(item.get("event_key") or "")
+        }
+        active_event_key = str(active_event.get("event_key") or "")
+        if active_event_key:
+            run_event_keys.add(active_event_key)
+        last_run_at = str(
+            active_event.get("occurred_at")
+            or (job_history[-1].get("released_at") if job_history else "")
+            or ""
+        ) or None
         summary["task_mode"] = "independent"
         summary["agent"] = {
             "name": _public_text(
@@ -950,6 +982,9 @@ def build_task_projection(
                 independent.get("idle_tab_closed_at") or ""
             ) or None,
             "last_outcome": _public_value(independent.get("last_outcome")),
+            "run_count": len(run_event_keys),
+            "run_count_truncated": len(job_history) >= 200,
+            "last_run_at": last_run_at,
         }
     goal_revisions = []
     for revision in raw.get("goal_revisions") or []:
