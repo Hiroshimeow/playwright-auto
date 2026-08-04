@@ -14,6 +14,8 @@ from .chatgpt import (
     PageBinding,
     action_delay,
     action_delay_multiplier,
+    backend_conversation as read_backend_conversation,
+    backend_stream_status as read_backend_stream_status,
     random_delay,
     refresh_page,
 )
@@ -70,6 +72,12 @@ class CDPATabActions:
         self.browser_context = browser_context
         self.config = config
         self._lifecycle_warning_emitted = False
+
+    async def backend_stream_status(self, conversation_id: str) -> dict[str, Any]:
+        return await read_backend_stream_status(self.browser_context, conversation_id)
+
+    async def backend_conversation(self, conversation_id: str) -> dict[str, Any]:
+        return await read_backend_conversation(self.browser_context, conversation_id)
 
     async def _set_page_active(self, page: Any) -> None:
         try:
@@ -219,6 +227,49 @@ class CDPATabActions:
             page_id=client.binding.page_id,
             url=str(snapshot.url),
             created=True,
+            new_chat=False,
+        )
+
+    async def locate_owned_metadata(
+        self,
+        manifest: Mapping[str, Any],
+        logical_role: str,
+    ) -> AcquiredRole | None:
+        """Locate the exact owned tab without falling back to a DOM snapshot."""
+        role_record = manifest["roles"][logical_role]
+        physical = str(role_record["physical_role"])
+        team = str(manifest["team"])
+        task_id = str(manifest["task_id"])
+        matches: list[tuple[ChatGPTPage, Mapping[str, Any]]] = []
+        for page in self.browser_context.pages:
+            if page.is_closed() or not self._supported(page):
+                continue
+            metadata = await inspect_page_metadata(page)
+            if (
+                metadata.get("role") != physical
+                or metadata.get("team") != team
+                or metadata.get("task_id") != task_id
+                or not metadata.get("page_id")
+            ):
+                continue
+            client = ChatGPTPage(
+                page,
+                timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
+            )
+            client.binding = PageBinding(str(metadata["page_id"]), physical)
+            matches.append((client, metadata))
+        if len(matches) > 1:
+            raise RoleOwnershipError(
+                f"multiple exact tabs match {physical!r} for team {team!r} task {task_id!r}"
+            )
+        if not matches:
+            return None
+        client, metadata = matches[0]
+        return AcquiredRole(
+            client=client,
+            page_id=str(metadata["page_id"]),
+            url=str(metadata.get("url") or client.page.url),
+            created=False,
             new_chat=False,
         )
 

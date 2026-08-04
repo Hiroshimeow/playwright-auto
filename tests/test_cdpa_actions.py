@@ -269,6 +269,37 @@ def test_matching_clients_skips_free_tabs_and_prefers_latest_terminal_team(tmp_p
     assert matches[0][0].binding.page_id == "newest"
 
 
+def test_locate_owned_metadata_never_falls_back_to_dom_snapshot(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    owned = FakePage(page_id="owned", role="PLAN", team="new-team", task_id="task-1")
+
+    class NoSnapshotClient(FakeClient):
+        async def snapshot(self):
+            raise AssertionError("metadata-only locator must not take a DOM snapshot")
+
+    async def fake_metadata(page):
+        snap = page.snapshot_value
+        return {
+            "page_id": snap.page_id,
+            "role": snap.page_role,
+            "team": snap.page_team,
+            "task_id": snap.page_task_id,
+            "url": snap.url,
+        }
+
+    monkeypatch.setattr(actions_module, "ChatGPTPage", NoSnapshotClient)
+    monkeypatch.setattr(actions_module, "inspect_page_metadata", fake_metadata)
+    context = FakeContext([owned])
+    actions = CDPATabActions(context, config)
+
+    acquired = asyncio.run(actions.locate_owned_metadata(manifest(page_id="owned"), "PLAN"))
+
+    assert acquired is not None
+    assert acquired.page_id == "owned"
+    assert acquired.url == owned.url
+    assert context.lifecycle_calls == []
+
+
 def test_locate_owned_sets_active_lifecycle_on_only_the_selected_page(tmp_path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     other = FakePage(page_id="other", role="PLAN", team="other-team", task_id="task-1")

@@ -154,7 +154,22 @@ def test_config_loads_root_json_compatible_yaml_and_validates_defaults(tmp_path:
     assert config.route_repair_attempts == 3
     assert config.response_timeout_seconds == 7200
     assert config.response_refresh_after_seconds == 1200
+    assert config.response_stream_status_poll_seconds == 3.0
     assert config.dashboard_url == "http://127.0.0.1:9224"
+
+
+def test_stream_status_poll_interval_is_configurable_and_bounded(tmp_path: Path):
+    path = write_config(tmp_path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["response"]["stream_status_poll_seconds"] = 0.5
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    assert load_cdpa_config(path, repository_root=tmp_path).response_stream_status_poll_seconds == 0.5
+
+    for invalid in (0, -1, 0.19, 60.01, float("nan"), float("inf"), "nope"):
+        raw["response"]["stream_status_poll_seconds"] = invalid
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        with pytest.raises(CDPAConfigError, match="stream_status_poll_seconds"):
+            load_cdpa_config(path, repository_root=tmp_path)
 
 
 

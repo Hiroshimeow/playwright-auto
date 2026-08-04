@@ -8,6 +8,7 @@ from typing import Any
 from .chatgpt import (
     ChatGPTPage,
     MessageSnapshot,
+    SendReceipt,
     attachment_names_match,
     capture_message_baseline,
     unique_new_user_message,
@@ -66,6 +67,65 @@ def _validate_upload_receipt(
     ):
         raise DurableRequestError("persisted upload receipt does not match durable files")
     return receipt
+
+
+def _attach_frontend_identity_enrichment(
+    client: Any,
+    ledger: RequestLedger,
+    request_id: str,
+    accepted_receipt: SendReceipt,
+) -> None:
+    take_task = getattr(client, "take_frontend_identity_task", None)
+    if not callable(take_task):
+        return
+    try:
+        task = take_task()
+    except Exception:
+        return
+    if task is None:
+        return
+
+    def complete(done: Any) -> None:
+        try:
+            evidence = done.result()
+            if not isinstance(evidence, Mapping):
+                return
+            observed_user = evidence.get("observed_user_message_id")
+            conversation_id = evidence.get("conversation_id")
+            if observed_user != accepted_receipt.user_message_id:
+                return
+            if not isinstance(conversation_id, str) or not conversation_id:
+                return
+            record = ledger.get(request_id)
+            if (
+                record is None
+                or record.status is not RequestStatus.SENT
+                or not isinstance(record.receipt, Mapping)
+            ):
+                return
+            current = SendReceipt.from_dict(record.receipt)
+            accepted_base = accepted_receipt.to_dict()
+            current_base = current.to_dict()
+            accepted_base["conversation_id"] = None
+            current_base["conversation_id"] = None
+            if current_base != accepted_base:
+                return
+            if current.conversation_id not in {None, conversation_id}:
+                return
+            if current.conversation_id is None:
+                enriched = current.to_dict()
+                enriched["conversation_id"] = conversation_id
+                # Re-validate the exact allowlisted receipt before persistence.
+                validated = SendReceipt.from_dict(enriched)
+                ledger.update(request_id, receipt=validated.to_dict())
+        except Exception:
+            # Enrichment is shadow evidence: never authorize retry/replay or fail Send.
+            return
+
+    try:
+        task.add_done_callback(complete)
+    except Exception:
+        return
 
 
 class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
@@ -563,6 +623,9 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
             baseline=receipt.baseline,
             session_id_before=receipt.session_id_before,
             error=None,
+        )
+        _attach_frontend_identity_enrichment(
+            context.client, ledger, record.request_id, receipt
         )
         context.variables[self.receipt_key] = receipt
         return await self._complete_from_receipt(

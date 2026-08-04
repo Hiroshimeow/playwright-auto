@@ -359,3 +359,133 @@ def test_durable_composer_whitespace_collapse_keeps_exact_semantic_prompt(tmp_pa
         collapsed.replace("body", "changed"),
         record.rendered_prompt,
     ) is False
+
+
+def test_async_frontend_identity_enriches_only_exact_sent_ledger_without_resend(tmp_path):
+    class AsyncIdentityClient(FakeDurableClient):
+        def __init__(self, evidence):
+            super().__init__()
+            self.evidence = evidence
+            self.identity_task = None
+            self.gate = asyncio.Event()
+
+        async def send(self, text, **kwargs):
+            self.send_calls.append(text)
+            baseline = capture_message_baseline(self.current.messages)
+            user = MessageSnapshot("user", "u1", "t1", text, ())
+            self.current = snapshot(messages=(*self.current.messages, user), state=ChatGPTState.SUBMITTING)
+
+            async def identity():
+                await self.gate.wait()
+                return self.evidence
+
+            self.identity_task = asyncio.create_task(identity())
+            return SendReceipt(
+                prompt=text,
+                prompt_sha256=prompt_digest(text),
+                binding=self.binding,
+                baseline=baseline,
+                attempts=1,
+                accepted_via="exact_user_message",
+                session_id_before="session-1",
+                user_message_id="u1",
+                user_turn_id="t1",
+            )
+
+        def take_frontend_identity_task(self):
+            task = self.identity_task
+            self.identity_task = None
+            return task
+
+    async def run(evidence):
+        ledger_path = tmp_path / f"ledger-{evidence['observed_user_message_id']}.json"
+        client = AsyncIdentityClient(evidence)
+        await Workflow(
+            "durable",
+            [DurableSendBlock(
+                "async identity",
+                ledger_path=ledger_path,
+                render_request_marker=False,
+                wait_for_response=False,
+            )],
+        ).run(client)
+        request_id = build_idempotency_key(role="DEV", prompt="async identity")[:24]
+        before = RequestLedger(ledger_path).get(request_id)
+        assert before is not None and before.status is RequestStatus.SENT
+        assert before.receipt["conversation_id"] is None
+        client.gate.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        after = RequestLedger(ledger_path).get(request_id)
+        assert after is not None
+        return client, after
+
+    matching_client, matching = asyncio.run(run({
+        "observed_user_message_id": "u1", "conversation_id": "conversation-1"
+    }))
+    assert matching.receipt["conversation_id"] == "conversation-1"
+    assert matching.attempts == 1
+    assert len(matching_client.send_calls) == 1
+
+    mismatching_client, mismatching = asyncio.run(run({
+        "observed_user_message_id": "other-user", "conversation_id": "conversation-wrong"
+    }))
+    assert mismatching.receipt["conversation_id"] is None
+    assert mismatching.attempts == 1
+    assert len(mismatching_client.send_calls) == 1
+
+
+def test_frontend_identity_callback_does_not_mutate_completed_record(tmp_path):
+    class LateIdentityClient(FakeDurableClient):
+        def __init__(self):
+            super().__init__()
+            self.identity_task = None
+            self.gate = asyncio.Event()
+
+        async def send(self, text, **kwargs):
+            baseline = capture_message_baseline(self.current.messages)
+            user = MessageSnapshot("user", "u1", "t1", text, ())
+            self.current = snapshot(messages=(*self.current.messages, user), state=ChatGPTState.SUBMITTING)
+
+            async def identity():
+                await self.gate.wait()
+                return {"observed_user_message_id": "u1", "conversation_id": "too-late"}
+
+            self.identity_task = asyncio.create_task(identity())
+            return SendReceipt(
+                prompt=text,
+                prompt_sha256=prompt_digest(text),
+                binding=self.binding,
+                baseline=baseline,
+                attempts=1,
+                accepted_via="exact_user_message",
+                session_id_before="session-1",
+                user_message_id="u1",
+                user_turn_id="t1",
+            )
+
+        def take_frontend_identity_task(self):
+            task = self.identity_task
+            self.identity_task = None
+            return task
+
+    async def run():
+        ledger_path = tmp_path / "late-ledger.json"
+        client = LateIdentityClient()
+        result = await Workflow(
+            "durable",
+            [DurableSendBlock("late identity", ledger_path=ledger_path, render_request_marker=False)],
+        ).run(client)
+        request_id = build_idempotency_key(role="DEV", prompt="late identity")[:24]
+        record = RequestLedger(ledger_path).get(request_id)
+        assert record is not None and record.status is RequestStatus.COMPLETED
+        client.gate.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        after = RequestLedger(ledger_path).get(request_id)
+        assert after is not None
+        assert after.status is RequestStatus.COMPLETED
+        assert after.receipt["conversation_id"] is None
+        return result
+
+    asyncio.run(run())

@@ -131,6 +131,12 @@ def test_resume_consumes_existing_stable_response_without_another_send(
             kwargs["candidate_validator"](response)
             return response
 
+        async def backend_stream_status(self, *_args, **_kwargs):
+            raise AssertionError("Resume completion must remain DOM-only")
+
+        async def backend_conversation(self, *_args, **_kwargs):
+            raise AssertionError("Resume completion must remain DOM-only")
+
         async def send(self, *_args, **_kwargs):
             self.send_calls += 1
             raise AssertionError("accepted request must not be sent again")

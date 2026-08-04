@@ -374,3 +374,292 @@ def test_bound_tab_reports_auth_redirect_explicitly(monkeypatch):
 
     with pytest.raises(AuthenticationRequiredError, match="requires authentication"):
         asyncio.run(client.assert_ownership())
+
+
+def test_send_receipt_conversation_id_is_strict_and_allowlisted():
+    receipt = SendReceipt(
+        prompt="exact prompt",
+        prompt_sha256=chatgpt.prompt_digest("exact prompt"),
+        binding=PageBinding("page-1", "DEV"),
+        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+        attempts=1,
+        accepted_via="exact_user_message",
+        session_id_before=None,
+        user_message_id="user-1",
+        user_turn_id="turn-1",
+        conversation_id="conversation-1",
+    )
+    payload = receipt.to_dict()
+    assert SendReceipt.from_dict(payload) == receipt
+    assert set(payload) == {
+        "prompt", "prompt_sha256", "binding", "baseline", "attempts",
+        "accepted_via", "session_id_before", "user_message_id", "user_turn_id",
+        "conversation_id",
+    }
+    legacy = dict(payload)
+    legacy.pop("conversation_id")
+    assert SendReceipt.from_dict(legacy).conversation_id is None
+    for invalid in ("", "bad\nvalue", 123, {"id": "conversation-1"}):
+        bad = dict(payload)
+        bad["conversation_id"] = invalid
+        with pytest.raises(ValueError, match="conversation ID"):
+            SendReceipt.from_dict(bad)
+
+
+def test_send_arms_nonblocking_frontend_identity_observer_before_single_click(monkeypatch):
+    import types
+
+    accepted = MessageSnapshot("user", "u1", "t1", "prompt", ())
+    before = snapshot(send_visible=True, send_enabled=True)
+
+    class Request:
+        method = "POST"
+        post_data_json = {"messages": [{"id": "u1", "author": {"role": "user"}}]}
+
+    class Response:
+        url = "https://chatgpt.com/backend-api/f/conversation"
+        request = Request()
+        def __init__(self, gate): self.gate = gate
+        async def body(self):
+            await self.gate.wait()
+            return b'data: {"conversation_id":"c1"}\n'
+
+    class EventPage(DummyPage):
+        def __init__(self, current):
+            super().__init__(current)
+            self.listeners = {}
+        def on(self, event, callback):
+            self.listeners.setdefault(event, []).append(callback)
+        def remove_listener(self, event, callback):
+            if callback in self.listeners.get(event, []):
+                self.listeners[event].remove(callback)
+        def emit(self, event, value):
+            for callback in tuple(self.listeners.get(event, [])):
+                callback(value)
+
+    async def run():
+        gate = asyncio.Event()
+        page = EventPage(before)
+        client = ChatGPTPage(page)
+        client.binding = PageBinding("page-1", "DEV")
+
+        async def fake_assert(self): return before
+        async def fake_prepare(self, *_args, **_kwargs): return None
+        async def fake_accept(self, *_args, **_kwargs): return ("exact_user_message", accepted)
+        client.assert_ownership = types.MethodType(fake_assert, client)
+        client._prepare_prompt_locked = types.MethodType(fake_prepare, client)
+        client._wait_send_acceptance = types.MethodType(fake_accept, client)
+
+        async def fake_click(target, **_kwargs):
+            target.clicks += 1
+            assert target.listeners.get("response")
+            target.emit("response", Response(gate))
+        monkeypatch.setattr(chatgpt, "click_send_button", fake_click)
+
+        receipt = await client.send("prompt", wait_for_stop=False, max_attempts=1)
+        task = client.take_frontend_identity_task()
+        assert receipt.user_message_id == "u1"
+        assert receipt.conversation_id is None
+        assert page.clicks == 1
+        assert task is not None and not task.done()
+        gate.set()
+        assert await task == {"observed_user_message_id": "u1", "conversation_id": "c1"}
+
+    asyncio.run(run())
+
+
+def test_sequential_send_clears_previous_frontend_identity_task(monkeypatch):
+    import types
+
+    before = snapshot(send_visible=True, send_enabled=True)
+    accepted = [
+        MessageSnapshot("user", "u1", "t1", "first", ()),
+        MessageSnapshot("user", "u2", "t2", "second", ()),
+    ]
+
+    class Request:
+        method = "POST"
+        post_data_json = {"messages": [{"id": "u1", "author": {"role": "user"}}]}
+
+    class Response:
+        url = "https://chatgpt.com/backend-api/f/conversation"
+        request = Request()
+        async def body(self):
+            return b'data: {"conversation_id":"conversation-1"}\n'
+
+    class EventPage(DummyPage):
+        def __init__(self, current):
+            super().__init__(current)
+            self.listeners = {}
+        def on(self, event, callback):
+            self.listeners.setdefault(event, []).append(callback)
+        def remove_listener(self, event, callback):
+            if callback in self.listeners.get(event, []):
+                self.listeners[event].remove(callback)
+        def emit(self, event, value):
+            for callback in tuple(self.listeners.get(event, [])):
+                callback(value)
+
+    async def run():
+        page = EventPage(before)
+        client = ChatGPTPage(page)
+        client.binding = PageBinding("page-1", "DEV")
+        acceptance_index = 0
+
+        async def fake_assert(self): return before
+        async def fake_prepare(self, *_args, **_kwargs): return None
+        async def fake_accept(self, *_args, **_kwargs):
+            nonlocal acceptance_index
+            await asyncio.sleep(0)
+            value = accepted[acceptance_index]
+            acceptance_index += 1
+            return ("exact_user_message", value)
+        client.assert_ownership = types.MethodType(fake_assert, client)
+        client._prepare_prompt_locked = types.MethodType(fake_prepare, client)
+        client._wait_send_acceptance = types.MethodType(fake_accept, client)
+
+        async def fake_click(target, **_kwargs):
+            target.clicks += 1
+            if target.clicks == 1:
+                target.emit("response", Response())
+        monkeypatch.setattr(chatgpt, "click_send_button", fake_click)
+
+        first = await client.send("first", wait_for_stop=False, max_attempts=1)
+        assert first.conversation_id == "conversation-1"
+        first_task = client._frontend_identity_task
+        assert first_task is not None and first_task.done()
+
+        second = await client.send("second", wait_for_stop=False, max_attempts=1)
+        assert second.user_message_id == "u2"
+        assert second.conversation_id is None
+        second_task = client.take_frontend_identity_task()
+        assert second_task is not None and not second_task.done()
+        assert page.clicks == 2
+        assert first_task.done()
+
+    asyncio.run(run())
+
+
+def test_post_reload_acceptance_reuses_same_frontend_identity_without_second_click(monkeypatch):
+    import types
+
+    before = snapshot(send_visible=True, send_enabled=True)
+    accepted = MessageSnapshot("user", "u1", "t1", "prompt", ())
+
+    class Request:
+        method = "POST"
+        post_data_json = {"messages": [{"id": "u1", "author": {"role": "user"}}]}
+
+    class Response:
+        url = "https://chatgpt.com/backend-api/f/conversation"
+        request = Request()
+        async def body(self):
+            return b'data: {"conversation_id":"conversation-reload"}\n'
+
+    class EventPage(DummyPage):
+        def __init__(self, current):
+            super().__init__(current)
+            self.listeners = {}
+        def on(self, event, callback):
+            self.listeners.setdefault(event, []).append(callback)
+        def remove_listener(self, event, callback):
+            if callback in self.listeners.get(event, []):
+                self.listeners[event].remove(callback)
+        def emit(self, event, value):
+            for callback in tuple(self.listeners.get(event, [])):
+                callback(value)
+
+    async def run():
+        page = EventPage(before)
+        client = ChatGPTPage(page)
+        client.binding = PageBinding("page-1", "DEV")
+        acceptance_calls = 0
+
+        async def fake_assert(self): return before
+        async def fake_prepare(self, *_args, **_kwargs): return None
+        async def fake_accept(self, *_args, **_kwargs):
+            nonlocal acceptance_calls
+            acceptance_calls += 1
+            await asyncio.sleep(0)
+            if acceptance_calls == 1:
+                raise RuntimeError("synthetic acceptance timeout after click")
+            return ("exact_user_message", accepted)
+        client.assert_ownership = types.MethodType(fake_assert, client)
+        client._prepare_prompt_locked = types.MethodType(fake_prepare, client)
+        client._wait_send_acceptance = types.MethodType(fake_accept, client)
+
+        async def fake_click(target, **_kwargs):
+            target.clicks += 1
+            target.emit("response", Response())
+        async def fake_refresh(_page, **_kwargs):
+            await asyncio.sleep(0)
+        monkeypatch.setattr(chatgpt, "click_send_button", fake_click)
+        monkeypatch.setattr(chatgpt, "refresh_page", fake_refresh)
+
+        receipt = await client.send("prompt", wait_for_stop=False, max_attempts=2)
+        assert receipt.accepted_via == "post_reload:exact_user_message"
+        assert receipt.conversation_id == "conversation-reload"
+        assert receipt.attempts == 1
+        assert page.clicks == 1
+        assert acceptance_calls == 2
+
+    asyncio.run(run())
+
+
+def test_frontend_identity_parser_failure_cannot_retry_accepted_dom_send(monkeypatch):
+    import types
+
+    before = snapshot(send_visible=True, send_enabled=True)
+    accepted = MessageSnapshot("user", "u1", "t1", "prompt", ())
+
+    class Request:
+        method = "POST"
+        post_data_json = {"messages": [{"id": "u1", "author": {"role": "user"}}]}
+
+    class Response:
+        url = "https://chatgpt.com/backend-api/f/conversation"
+        request = Request()
+        async def body(self):
+            raise RuntimeError("synthetic raw body failure")
+
+    class EventPage(DummyPage):
+        def __init__(self, current):
+            super().__init__(current)
+            self.listeners = {}
+        def on(self, event, callback):
+            self.listeners.setdefault(event, []).append(callback)
+        def remove_listener(self, event, callback):
+            if callback in self.listeners.get(event, []):
+                self.listeners[event].remove(callback)
+        def emit(self, event, value):
+            for callback in tuple(self.listeners.get(event, [])):
+                callback(value)
+
+    async def run():
+        page = EventPage(before)
+        client = ChatGPTPage(page)
+        client.binding = PageBinding("page-1", "DEV")
+
+        async def fake_assert(self): return before
+        async def fake_prepare(self, *_args, **_kwargs): return None
+        async def fake_accept(self, *_args, **_kwargs):
+            await asyncio.sleep(0)
+            return ("exact_user_message", accepted)
+        client.assert_ownership = types.MethodType(fake_assert, client)
+        client._prepare_prompt_locked = types.MethodType(fake_prepare, client)
+        client._wait_send_acceptance = types.MethodType(fake_accept, client)
+
+        async def fake_click(target, **_kwargs):
+            target.clicks += 1
+            target.emit("response", Response())
+        monkeypatch.setattr(chatgpt, "click_send_button", fake_click)
+
+        receipt = await client.send("prompt", wait_for_stop=False, max_attempts=2)
+        task = client.take_frontend_identity_task()
+        assert receipt.user_message_id == "u1"
+        assert receipt.conversation_id is None
+        assert receipt.attempts == 1
+        assert page.clicks == 1
+        assert task is not None and await task is None
+
+    asyncio.run(run())

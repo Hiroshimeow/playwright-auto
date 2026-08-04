@@ -13,6 +13,12 @@ from enum import Enum
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlparse
 
+from .chatgpt_graph import (
+    BackendAuthError,
+    BackendNotReadyError,
+    BackendSchemaError,
+    BackendUnavailableError,
+)
 from .observability import record_page_action
 from .role_indicator import WINDOW_NAME_PREFIX, ensure_role_indicator
 
@@ -276,6 +282,7 @@ class TaskBindingError(ChatGPTAutomationError):
 _PAGE_WORKFLOW_LOCKS: weakref.WeakKeyDictionary[Any, asyncio.Lock] = weakref.WeakKeyDictionary()
 _PAGE_MUTATION_LOCKS: weakref.WeakKeyDictionary[Any, asyncio.Lock] = weakref.WeakKeyDictionary()
 _PAGE_WAIT_STATES: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
+_BACKEND_CONTEXT_STATES: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
 _RATE_LIMIT_MARKERS = (
     "too many requests",
     "making requests too quickly",
@@ -307,6 +314,116 @@ def _page_wait_state(page: Any) -> dict[str, Any]:
         # Tiny fake page objects in unit tests may not support weak references.
         pass
     return state
+
+
+def _backend_context_state(context: Any) -> dict[str, Any]:
+    state = {"token": None}
+    try:
+        existing = _BACKEND_CONTEXT_STATES.get(context)
+        if existing is not None:
+            return existing
+        _BACKEND_CONTEXT_STATES[context] = state
+        return state
+    except TypeError:
+        existing = getattr(context, "_playwright_auto_backend_state", None)
+        if isinstance(existing, dict):
+            return existing
+        try:
+            setattr(context, "_playwright_auto_backend_state", state)
+        except Exception:
+            pass
+        return state
+
+
+async def _backend_session_token(context: Any) -> str:
+    state = _backend_context_state(context)
+    token = state.get("token")
+    if isinstance(token, str) and token:
+        return token
+    try:
+        response = await context.request.get("https://chatgpt.com/api/auth/session")
+    except Exception:
+        raise BackendUnavailableError(0, "session") from None
+    status = int(getattr(response, "status", 0) or 0)
+    if status == 401:
+        raise BackendAuthError("backend session is unauthorized")
+    if status == 429 or status >= 500 or status < 200 or status >= 300:
+        raise BackendUnavailableError(status, "session")
+    try:
+        payload = await response.json()
+    except Exception:
+        raise BackendSchemaError("session response is not valid JSON") from None
+    if not isinstance(payload, Mapping):
+        raise BackendSchemaError("session response must be an object")
+    token = _safe_identity_string(payload.get("accessToken"), max_length=16_384)
+    if token is None:
+        raise BackendAuthError("backend session has no access token")
+    state["token"] = token
+    return token
+
+
+async def _backend_get_object(context: Any, path: str, *, category: str) -> dict[str, Any]:
+    state = _backend_context_state(context)
+    token = await _backend_session_token(context)
+    for attempt in range(2):
+        try:
+            response = await context.request.get(
+                f"https://chatgpt.com{path}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        except Exception:
+            raise BackendUnavailableError(0, category) from None
+        status = int(getattr(response, "status", 0) or 0)
+        if status == 401:
+            state["token"] = None
+            if attempt == 0:
+                token = await _backend_session_token(context)
+                continue
+            raise BackendAuthError(f"{category} remained unauthorized after one refresh")
+        if status == 404:
+            raise BackendNotReadyError(f"{category} is not ready")
+        if status == 429 or status >= 500:
+            raise BackendUnavailableError(status, category)
+        if status < 200 or status >= 300:
+            raise BackendUnavailableError(status, category)
+        try:
+            payload = await response.json()
+        except Exception:
+            raise BackendSchemaError(f"{category} response is not valid JSON") from None
+        if not isinstance(payload, Mapping):
+            raise BackendSchemaError(f"{category} response must be an object")
+        return dict(payload)
+    raise BackendAuthError(f"{category} authentication failed")
+
+
+async def backend_stream_status(context: Any, conversation_id: str) -> dict[str, Any]:
+    exact_id = _safe_identity_string(conversation_id)
+    if exact_id is None:
+        raise ValueError("conversation ID must be a bounded printable string")
+    payload = await _backend_get_object(
+        context,
+        f"/backend-api/conversation/{exact_id}/stream_status",
+        category="stream_status",
+    )
+    if payload.get("status") not in {"IS_STREAMING", "COMPLETE"}:
+        raise BackendSchemaError("stream_status response has unknown status")
+    return payload
+
+
+async def backend_conversation(context: Any, conversation_id: str) -> dict[str, Any]:
+    exact_id = _safe_identity_string(conversation_id)
+    if exact_id is None:
+        raise ValueError("conversation ID must be a bounded printable string")
+    payload = await _backend_get_object(
+        context,
+        f"/backend-api/conversation/{exact_id}",
+        category="conversation",
+    )
+    if not isinstance(payload.get("mapping"), Mapping) or not isinstance(
+        payload.get("current_node"), str
+    ):
+        raise BackendSchemaError("conversation response is missing graph shape")
+    return payload
 
 
 class ChatGPTState(str, Enum):
@@ -398,6 +515,114 @@ class MessageBaseline:
         )
 
 
+def _safe_identity_string(value: Any, *, max_length: int = 512) -> str | None:
+    if not isinstance(value, str) or not value or len(value) > max_length:
+        return None
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        return None
+    return value
+
+
+def _matches_frontend_conversation_response(response: Any) -> bool:
+    try:
+        request = response.request
+        parsed = urlparse(str(response.url))
+        return (
+            str(request.method).upper() == "POST"
+            and parsed.scheme == "https"
+            and parsed.hostname in {"chatgpt.com", "www.chatgpt.com"}
+            and parsed.path == "/backend-api/f/conversation"
+        )
+    except Exception:
+        return False
+
+
+def _frontend_user_message_id(request: Any) -> str | None:
+    try:
+        payload = request.post_data_json
+    except Exception:
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return None
+    matches: list[str] = []
+    for message in messages:
+        if not isinstance(message, Mapping):
+            continue
+        author = message.get("author")
+        if not isinstance(author, Mapping) or author.get("role") != "user":
+            continue
+        message_id = _safe_identity_string(message.get("id"))
+        if message_id is not None:
+            matches.append(message_id)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _conversation_ids(value: Any) -> set[str]:
+    found: set[str] = set()
+    if isinstance(value, Mapping):
+        raw = value.get("conversation_id")
+        conversation_id = _safe_identity_string(raw)
+        if conversation_id is not None:
+            found.add(conversation_id)
+        for nested in value.values():
+            found.update(_conversation_ids(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            found.update(_conversation_ids(nested))
+    return found
+
+
+def _reduce_frontend_conversation_body(
+    body: bytes | str, observed_user_message_id: str
+) -> dict[str, str] | None:
+    user_message_id = _safe_identity_string(observed_user_message_id)
+    if user_message_id is None:
+        return None
+    if isinstance(body, bytes):
+        try:
+            text = body.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    elif isinstance(body, str):
+        text = body
+    else:
+        return None
+    conversation_ids: set[str] = set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("data:"):
+            continue
+        payload = stripped[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            decoded = json.loads(payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        conversation_ids.update(_conversation_ids(decoded))
+        if len(conversation_ids) > 1:
+            return None
+    if len(conversation_ids) != 1:
+        return None
+    return {
+        "observed_user_message_id": user_message_id,
+        "conversation_id": next(iter(conversation_ids)),
+    }
+
+
+async def _reduce_frontend_conversation_response(
+    response: Any, observed_user_message_id: str
+) -> dict[str, str] | None:
+    try:
+        body = await response.body()
+        return _reduce_frontend_conversation_body(body, observed_user_message_id)
+    except Exception:
+        return None
+
+
 @dataclass(frozen=True)
 class SendReceipt:
     prompt: str
@@ -409,6 +634,7 @@ class SendReceipt:
     session_id_before: str | None
     user_message_id: str | None = None
     user_turn_id: str | None = None
+    conversation_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -421,6 +647,7 @@ class SendReceipt:
             "session_id_before": self.session_id_before,
             "user_message_id": self.user_message_id,
             "user_turn_id": self.user_turn_id,
+            "conversation_id": self.conversation_id,
         }
 
     @classmethod
@@ -444,6 +671,15 @@ class SendReceipt:
                 raise ValueError("send receipt has an unsupported recovery acceptance signal")
         elif accepted_via not in allowed_acceptance:
             raise ValueError("send receipt has an unsupported acceptance signal")
+        conversation_id = value.get("conversation_id")
+        if conversation_id is not None:
+            if (
+                not isinstance(conversation_id, str)
+                or not conversation_id
+                or len(conversation_id) > 512
+                or any(ord(char) < 32 or ord(char) == 127 for char in conversation_id)
+            ):
+                raise ValueError("send receipt conversation ID must be a bounded printable string")
         return cls(
             prompt=prompt,
             prompt_sha256=digest,
@@ -466,6 +702,7 @@ class SendReceipt:
                 if value.get("user_turn_id") is not None
                 else None
             ),
+            conversation_id=conversation_id,
         )
 
 
@@ -2489,6 +2726,8 @@ class ChatGPTPage:
         self.timeout_ms = timeout_ms
         self.binding: PageBinding | None = None
         self._owned_composer_text: str | None = None
+        self._frontend_identity_task: asyncio.Future[dict[str, str] | None] | None = None
+        self._frontend_identity_listener: Callable[[Any], None] | None = None
         self._wait_state = _page_wait_state(page)
         self._wait_metrics: dict[str, Any] = {
             "sparse_probes": 0,
@@ -2497,6 +2736,104 @@ class ChatGPTPage:
             "sparse_errors": 0,
             "full_snapshot_reasons": {},
         }
+
+    def _remove_frontend_identity_listener(self) -> None:
+        listener = self._frontend_identity_listener
+        self._frontend_identity_listener = None
+        if listener is None:
+            return
+        try:
+            self.page.remove_listener("response", listener)
+        except Exception:
+            try:
+                self.page.off("response", listener)
+            except Exception:
+                pass
+
+    def _reset_frontend_identity_observer(self) -> None:
+        self._remove_frontend_identity_listener()
+        future = self._frontend_identity_task
+        self._frontend_identity_task = None
+        if future is not None and not future.done():
+            future.set_result(None)
+
+    def _arm_frontend_identity_observer(self) -> None:
+        self._reset_frontend_identity_observer()
+        future: asyncio.Future[dict[str, str] | None] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._frontend_identity_task = future
+
+        def finish(value: dict[str, str] | None) -> None:
+            if not future.done():
+                future.set_result(value)
+
+        def on_response(response: Any) -> None:
+            try:
+                if not _matches_frontend_conversation_response(response):
+                    return
+                observed_user_message_id = _frontend_user_message_id(response.request)
+                self._remove_frontend_identity_listener()
+                if observed_user_message_id is None:
+                    finish(None)
+                    return
+
+                async def reduce_response() -> None:
+                    finish(
+                        await _reduce_frontend_conversation_response(
+                            response, observed_user_message_id
+                        )
+                    )
+
+                asyncio.create_task(reduce_response())
+            except Exception:
+                self._remove_frontend_identity_listener()
+                finish(None)
+
+        try:
+            self._frontend_identity_listener = on_response
+            self.page.on("response", on_response)
+        except Exception:
+            self._frontend_identity_listener = None
+            finish(None)
+
+    def take_frontend_identity_task(
+        self,
+    ) -> asyncio.Future[dict[str, str] | None] | None:
+        task = self._frontend_identity_task
+        self._frontend_identity_task = None
+        return task
+
+    def _captured_conversation_id(self, accepted_user_message_id: str | None) -> str | None:
+        task = self._frontend_identity_task
+        if task is None or not task.done() or accepted_user_message_id is None:
+            return None
+        try:
+            evidence = task.result()
+        except Exception:
+            return None
+        if not isinstance(evidence, Mapping):
+            return None
+        if evidence.get("observed_user_message_id") != accepted_user_message_id:
+            return None
+        return _safe_identity_string(evidence.get("conversation_id"))
+
+    @property
+    def _backend_token(self) -> str | None:
+        value = _backend_context_state(self.page.context).get("token")
+        return str(value) if isinstance(value, str) and value else None
+
+    async def _backend_session_token(self) -> str:
+        return await _backend_session_token(self.page.context)
+
+    async def _backend_get_object(self, path: str, *, category: str) -> dict[str, Any]:
+        return await _backend_get_object(self.page.context, path, category=category)
+
+    async def backend_stream_status(self, conversation_id: str) -> dict[str, Any]:
+        return await backend_stream_status(self.page.context, conversation_id)
+
+    async def backend_conversation(self, conversation_id: str) -> dict[str, Any]:
+        return await backend_conversation(self.page.context, conversation_id)
 
     @property
     def _wait_probe(self) -> WaitProbe | None:
@@ -3732,6 +4069,8 @@ class ChatGPTPage:
                         expected_attachment_count=expected_count,
                         expected_attachment_names=expected_names,
                     )
+                    # Passive network identity observation is armed around this same click.
+                    self._arm_frontend_identity_observer()
                     # Ownership, safe page state, prompt, attachments, and click share one callback.
                     await click_send_button(
                         self.page,
@@ -3774,6 +4113,9 @@ class ChatGPTPage:
                         session_id_before=before.session_id,
                         user_message_id=(accepted_user.message_id if accepted_user else None),
                         user_turn_id=(accepted_user.turn_id if accepted_user else None),
+                        conversation_id=self._captured_conversation_id(
+                            accepted_user.message_id if accepted_user else None
+                        ),
                     )
                 except (ComposerConflictError, PageOwnershipError, UnsafePageStateError):
                     raise
@@ -3800,6 +4142,9 @@ class ChatGPTPage:
                             session_id_before=before.session_id,
                             user_message_id=(accepted_user.message_id if accepted_user else None),
                             user_turn_id=(accepted_user.turn_id if accepted_user else None),
+                            conversation_id=self._captured_conversation_id(
+                                accepted_user.message_id if accepted_user else None
+                            ),
                         )
                     recovered_text = normalize_visible_text(recovered.composer_text)
                     if recovered_text not in {"", normalize_visible_text(prompt)}:

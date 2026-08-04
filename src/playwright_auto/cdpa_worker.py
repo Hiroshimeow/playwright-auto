@@ -98,6 +98,15 @@ from .chatgpt import (
     unique_new_user_message,
     visible_text_matches,
 )
+from .chatgpt_graph import (
+    BackendAuthError,
+    BackendError,
+    BackendNotReadyError,
+    BackendSchemaError,
+    BackendUnavailableError,
+    GraphIdentityError,
+    resolve_terminal_assistant,
+)
 from .connection import connected_browser, is_cdp_disconnect
 from .durable import RequestLedger, RequestStatus
 from .durable_blocks import DurableSendBlock
@@ -2584,6 +2593,39 @@ class CDPAWorker:
                 task_id=str(state["task_id"]),
             )
 
+    def _reconcile_hop_conversation_identity(self, hop: dict[str, Any]) -> None:
+        ledger_path = hop.get("ledger_path")
+        request_id = hop.get("request_id")
+        hop_payload = hop.get("receipt")
+        if not ledger_path or not request_id or not isinstance(hop_payload, Mapping):
+            return
+        record = RequestLedger(str(ledger_path)).get(str(request_id))
+        if record is None or not isinstance(record.receipt, Mapping):
+            return
+        try:
+            hop_receipt = SendReceipt.from_dict(hop_payload)
+            ledger_receipt = SendReceipt.from_dict(record.receipt)
+        except Exception as exc:
+            raise RuntimeError("durable conversation identity receipt is invalid") from exc
+        hop_base = hop_receipt.to_dict()
+        ledger_base = ledger_receipt.to_dict()
+        hop_base["conversation_id"] = None
+        ledger_base["conversation_id"] = None
+        if hop_base != ledger_base:
+            raise RuntimeError("durable conversation identity immutable receipt diverged")
+        if hop_receipt.conversation_id is not None:
+            if ledger_receipt.conversation_id != hop_receipt.conversation_id:
+                raise RuntimeError("durable conversation identity changed or disappeared")
+            return
+        if ledger_receipt.conversation_id is not None:
+            hop["receipt"] = ledger_receipt.to_dict()
+
+    async def _flush_hop_conversation_identity(self, hop: dict[str, Any]) -> None:
+        # Let an already-completed frontend response-body task publish its exact
+        # ledger enrichment; never await the body task itself or any backend read.
+        await asyncio.sleep(0)
+        self._reconcile_hop_conversation_identity(hop)
+
     def _record_response(
         self,
         state: dict[str, Any],
@@ -2592,6 +2634,7 @@ class CDPAWorker:
         *,
         validation_error: str | None = None,
     ) -> None:
+        self._reconcile_hop_conversation_identity(hop)
         hop["response"] = response.text
         hop["response_sha256"] = _sha(response.text)
         hop["response_record"] = response.to_dict()
@@ -2668,6 +2711,7 @@ class CDPAWorker:
             )
         except StableMalformedResponseError as exc:
             wait["recovery_baseline"] = None
+            await self._flush_hop_conversation_identity(hop)
             self._record_response(
                 state,
                 hop,
@@ -2691,6 +2735,7 @@ class CDPAWorker:
             )
             return True
         wait["recovery_baseline"] = None
+        await self._flush_hop_conversation_identity(hop)
         self._record_response(state, hop, response)
         return True
 
@@ -2716,7 +2761,236 @@ class CDPAWorker:
             return await wait_snapshot(receipt, **kwargs)
         return await client.assert_ownership()
 
+    @staticmethod
+    def _backend_failure_category(error: BaseException, *, prefix: str) -> str:
+        if isinstance(error, BackendUnavailableError):
+            return f"{prefix}_unavailable"
+        if isinstance(error, BackendAuthError):
+            return f"{prefix}_auth"
+        if isinstance(error, BackendNotReadyError):
+            return f"{prefix}_not_ready"
+        if isinstance(error, GraphIdentityError):
+            return f"{prefix}_identity"
+        if isinstance(error, BackendSchemaError):
+            return f"{prefix}_schema"
+        return f"{prefix}_error"
+
+    async def _ensure_backend_wait_source(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        actions: CDPATabActions,
+        receipt: SendReceipt,
+    ) -> AcquiredRole | None:
+        role = str(hop["target_role"])
+        conversation_id = str(receipt.conversation_id or "").strip()
+        expected_url = f"https://chatgpt.com/c/{conversation_id}"
+        expected_conversation = _recoverable_conversation_identity(expected_url)
+        hop["conversation_url"] = expected_url
+        state["roles"][role]["page_url"] = expected_url
+        try:
+            metadata_locator = getattr(actions, "locate_owned_metadata", None)
+            acquired = await (
+                metadata_locator(state, role)
+                if callable(metadata_locator)
+                else actions.locate_owned(state, role)
+            )
+            live_conversation = (
+                _recoverable_conversation_identity(acquired.url)
+                if acquired is not None
+                else None
+            )
+            if (
+                acquired is None
+                or live_conversation != expected_conversation
+                or str(acquired.page_id) != str(receipt.binding.page_id)
+            ):
+                acquired = await actions.reopen(
+                    state,
+                    role,
+                    require_clean_ready=False,
+                )
+            if _recoverable_conversation_identity(acquired.url) != expected_conversation:
+                raise RoleOwnershipError(
+                    "backend completion fallback reopened a different conversation"
+                )
+            if str(acquired.page_id) != str(receipt.binding.page_id):
+                raise RoleOwnershipError(
+                    "backend completion fallback changed the in-flight page identity"
+                )
+        except Exception as exc:
+            self._block(
+                state,
+                exc,
+                code=_role_ownership_block_code(exc) or "role_ownership_ambiguous",
+                retryable=False,
+            )
+            return None
+        self._record_acquired(state, role, acquired)
+        return acquired
+
     async def _waiting(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        actions: CDPATabActions,
+        manifest_path: Path,
+        transport_baseline: dict[str, Any] | None = None,
+    ) -> None:
+        self._start_wait_budget_from_sent(hop)
+        self._reconcile_hop_conversation_identity(hop)
+        receipt = SendReceipt.from_dict(hop["receipt"])
+        if not receipt.conversation_id or not receipt.user_message_id:
+            await self._waiting_dom(
+                state,
+                hop,
+                actions,
+                manifest_path,
+                transport_baseline,
+            )
+            return
+
+        wait = hop["wait"]
+        backend_before = copy.deepcopy(state)
+        persistence_baseline = (
+            transport_baseline if transport_baseline is not None else backend_before
+        )
+        now = datetime.now(timezone.utc)
+        mode = str(wait.get("completion_mode") or "")
+        request_id = str(hop["request_id"])
+
+        if mode == "dom_fallback":
+            ready_at = parse_time(wait.get("dom_fallback_ready_at"))
+            if ready_at is not None and now < ready_at:
+                return
+            await self._waiting_dom(
+                state,
+                hop,
+                actions,
+                manifest_path,
+                transport_baseline,
+            )
+            return
+
+        if wait.get("terminal_graph_request_id") == request_id:
+            wait["completion_mode"] = "dom_fallback"
+            wait["backend_fallback_category"] = "graph_attempt_interrupted"
+            acquired = await self._ensure_backend_wait_source(
+                state, hop, actions, receipt
+            )
+            if acquired is not None and parse_time(wait.get("dom_fallback_ready_at")) is None:
+                wait["dom_fallback_ready_at"] = (now + timedelta(seconds=30)).isoformat()
+            return
+
+        if remaining_timeout_ms(wait, now=now) <= 0:
+            wait["completion_mode"] = "dom_fallback"
+            wait["backend_fallback_category"] = "response_deadline"
+            wait["dom_fallback_ready_at"] = None
+            await self._waiting_dom(
+                state,
+                hop,
+                actions,
+                manifest_path,
+                transport_baseline,
+            )
+            return
+
+        wait["completion_mode"] = "stream_status"
+        terminal_graph_ready_at = parse_time(wait.get("terminal_graph_ready_at"))
+        if terminal_graph_ready_at is not None:
+            if now < terminal_graph_ready_at:
+                return
+        else:
+            sent_at = parse_time((hop.get("timestamps") or {}).get("sent_at")) or now
+            interval = float(self.config.response_stream_status_poll_seconds)
+            next_poll = parse_time(wait.get("stream_status_next_poll_at"))
+            if next_poll is None:
+                next_poll = sent_at + timedelta(seconds=interval)
+                wait["stream_status_next_poll_at"] = next_poll.isoformat()
+            if now < next_poll:
+                return
+
+            wait["stream_status_last_poll_at"] = now.isoformat()
+            wait["stream_status_next_poll_at"] = (now + timedelta(seconds=interval)).isoformat()
+            wait["stream_status_poll_count"] = int(wait.get("stream_status_poll_count") or 0) + 1
+            try:
+                status_payload = await actions.backend_stream_status(receipt.conversation_id)
+                status = status_payload.get("status")
+                if status not in {"IS_STREAMING", "COMPLETE"}:
+                    raise BackendSchemaError("stream_status response has unknown status")
+            except BackendError as exc:
+                wait["completion_mode"] = "dom_fallback"
+                wait["backend_fallback_category"] = self._backend_failure_category(
+                    exc, prefix="status"
+                )
+                wait["dom_fallback_ready_at"] = None
+                self._persist_transport_result(manifest_path, persistence_baseline, state)
+                await self._waiting_dom(
+                    state,
+                    hop,
+                    actions,
+                    manifest_path,
+                    transport_baseline,
+                )
+                return
+
+            if status == "IS_STREAMING":
+                await self._ensure_backend_wait_source(state, hop, actions, receipt)
+                return
+
+            wait["terminal_complete_seen_at"] = now.isoformat()
+            settle_seconds = float(
+                self.config.response_stream_status_terminal_settle_seconds
+            )
+            if settle_seconds > 0:
+                wait["terminal_graph_ready_at"] = (
+                    now + timedelta(seconds=settle_seconds)
+                ).isoformat()
+                self._persist_transport_result(
+                    manifest_path, persistence_baseline, state
+                )
+                return
+
+        wait["terminal_graph_request_id"] = request_id
+        wait["terminal_graph_attempted_at"] = now.isoformat()
+        self._persist_transport_result(manifest_path, persistence_baseline, state)
+        try:
+            graph = await actions.backend_conversation(receipt.conversation_id)
+            resolved = resolve_terminal_assistant(graph, receipt.user_message_id)
+        except BackendError as exc:
+            wait["completion_mode"] = "dom_fallback"
+            wait["backend_fallback_category"] = self._backend_failure_category(
+                exc, prefix="graph"
+            )
+            acquired = await self._ensure_backend_wait_source(
+                state, hop, actions, receipt
+            )
+            if acquired is not None:
+                wait["dom_fallback_ready_at"] = (
+                    datetime.now(timezone.utc) + timedelta(seconds=30)
+                ).isoformat()
+            return
+
+        response = MessageSnapshot(
+            role="assistant",
+            message_id=resolved.message_id,
+            turn_id=None,
+            text=resolved.text,
+            actions=(),
+        )
+        validation_error: str | None = None
+        try:
+            self._validate_response_candidate(state, hop, response)
+        except Exception as exc:
+            validation_error = sanitize_exception(exc)
+        self._record_response(
+            state,
+            hop,
+            response,
+            validation_error=validation_error,
+        )
+
+    async def _waiting_dom(
         self,
         state: dict[str, Any],
         hop: dict[str, Any],
@@ -2731,6 +3005,7 @@ class CDPAWorker:
         wait = hop["wait"]
         recover_incomplete_refresh(wait)
         self._start_wait_budget_from_sent(hop)
+        self._reconcile_hop_conversation_identity(hop)
         receipt = SendReceipt.from_dict(hop["receipt"])
         snapshot = await self._waiting_snapshot(
             acquired.client,
@@ -2873,6 +3148,7 @@ class CDPAWorker:
             )
         except StableMalformedResponseError as exc:
             wait["recovery_baseline"] = None
+            await self._flush_hop_conversation_identity(hop)
             self._record_response(
                 state,
                 hop,
@@ -2910,6 +3186,7 @@ class CDPAWorker:
             )
             return
         wait["recovery_baseline"] = None
+        await self._flush_hop_conversation_identity(hop)
         self._record_response(state, hop, response)
 
     def _route_to_plan(
@@ -3487,6 +3764,7 @@ class CDPAWorker:
             response = None
         if response is not None:
             old_hop_id = state.get("active_hop_id")
+            await self._flush_hop_conversation_identity(hop)
             self._record_response(
                 state,
                 hop,
