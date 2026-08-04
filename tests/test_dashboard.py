@@ -370,6 +370,12 @@ def test_independent_agents_have_one_lane_and_operator_facing_controls():
     assert 'task.elapsed_end_at' in board
     assert 'fixedDuration' in board
     assert 'data-elapsed-at' not in board.split('if (agent)', 1)[-1].split('function ensureLane', 1)[0]
+    agent_meta = board.split('meta.className = "task-meta";', 1)[1].split('} else {', 1)[0]
+    assert 'field("Status", task.status)' in agent_meta
+    assert 'field("Runs",' in agent_meta
+    assert 'elapsed(agent.last_run_at)' in agent_meta
+    assert 'field("Action", task.active_action)' not in agent_meta
+    assert 'field("Tab",' not in agent_meta
 
     for label in [
         '"Run task"', '"Pause"', '"Enable"', '"Reset"', '"Settings"',
@@ -386,7 +392,9 @@ def test_independent_agents_have_one_lane_and_operator_facing_controls():
     assert 'agent.tab_keep_open_until' in detail
     assert 'selectedIndependentTabByTask' in store
     assert 'dataset.renderDisabled' in detail
+    assert 'disabled: active || !enabled' in detail
     assert 'button.dataset.renderDisabled === "true"' in app
+    assert 'if (state.selectedDetail?.task_id === taskId) return;' in app
     assert '/api/independent-agents/${encodeURIComponent(taskId)}/run' in app
     assert 'body: {trigger_type: "manual", instruction}' in app
     assert 'action: control.dataset.control' in app

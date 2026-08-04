@@ -157,7 +157,7 @@ function independentControls(detail) {
   const inFlight = ["sending", "sent", "waiting"].includes(detail.active_hop?.state);
   const tabOpen = Boolean(agent.tab_open);
 
-  controls.append(independentButton("run-task", "Run task", detail, {disabled: active}));
+  controls.append(independentButton("run-task", "Run task", detail, {disabled: active || !enabled}));
   controls.append(button(enabled ? "pause" : "resume", enabled ? "Pause" : "Enable", detail));
   controls.append(button("reset", "Reset", detail, {disabled: !active}));
   controls.append(independentButton("settings", "Settings", detail));

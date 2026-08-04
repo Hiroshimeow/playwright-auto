@@ -572,6 +572,7 @@ function selectTask(taskId, cached = null) {
 
 function beginDetailLoad(taskId) {
   if (state.selectedTaskId !== taskId) return;
+  if (state.selectedDetail?.task_id === taskId) return;
   commit(current => {
     if (current.selectedTaskId !== taskId) return;
     current.selectedDetail = null;
