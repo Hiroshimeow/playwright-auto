@@ -261,6 +261,64 @@ class RecordingCDPASendActions:
         )
 
 
+def test_waiting_stop_control_applies_before_waiting_short_circuit(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    dependency = store.create_task(
+        "dependency",
+        requested_team="dependency",
+        task_id="task-waiting-stop-dependency",
+    )
+    state = store.create_task(
+        "waiting child",
+        requested_team="waiting-stop",
+        task_id="task-waiting-stop",
+        depends_on_task_ids=(dependency["task_id"],),
+    )
+    path = Path(state["manifest_path"])
+    assert state["status"] == "WAITING"
+
+    requested = store.request_control(path, "stop", reason="operator force stop")
+    assert requested["controls"][-1]["status"] == "requested"
+
+    actions = FakeActions()
+    worker = CDPAWorker(config, store=store)
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    stopped = asyncio.run(
+        worker.advance(
+            path,
+            SimpleNamespace(pages=[]),
+            scheduling_tasks=store.discover(),
+        )
+    )
+
+    assert stopped == store.load(path)
+    assert stopped["status"] == "STOPPED"
+    assert stopped["terminal_state"] == "STOPPED"
+    assert stopped["controls"][-1]["status"] == "applied"
+
+
+def test_stop_terminalizes_even_when_owned_tab_lookup_fails(tmp_path: Path):
+    config, store, state, worker = setup_task(tmp_path, task_id="task-force-stop")
+    path = Path(state["manifest_path"])
+    requested = store.request_control(path, "stop", reason="operator force stop")
+
+    class MissingOwnedTabActions(FakeActions):
+        async def locate_owned(self, _state, _role):
+            raise RoleOwnershipError("owned tab is unavailable")
+
+    stopped = asyncio.run(worker._apply_control(requested, MissingOwnedTabActions(), path))
+
+    assert stopped is True
+    assert requested["status"] == "STOPPED"
+    assert requested["terminal_state"] == "STOPPED"
+    assert requested["controls"][-1]["status"] == "applied"
+
+
 def test_pause_requested_during_role_acquisition_survives_and_applies_before_send(
     tmp_path: Path,
     monkeypatch,

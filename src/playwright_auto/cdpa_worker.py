@@ -1682,9 +1682,17 @@ class CDPAWorker:
                 if state.get("status") in TERMINAL:
                     raise RuntimeError("Stop is invalid for a terminal task")
                 stop_role = str(state.get("active_role") or role).upper()
-                acquired = await actions.locate_owned(state, stop_role)
-                if acquired is not None:
-                    result = {"stopped_response": await actions.stop_if_active(acquired)}
+                stopped_response = False
+                browser_stop_error = None
+                try:
+                    acquired = await actions.locate_owned(state, stop_role)
+                    if acquired is not None:
+                        stopped_response = await actions.stop_if_active(acquired)
+                except Exception as exc:
+                    browser_stop_error = sanitize_exception(exc)
+                result = {"stopped_response": stopped_response}
+                if browser_stop_error:
+                    result["browser_stop_error"] = browser_stop_error
                 state["status"] = "STOPPED"
                 state["terminal_state"] = "STOPPED"
                 state["kanban_column"] = "DONE_STOPPED"
@@ -1697,6 +1705,9 @@ class CDPAWorker:
                 state["block_retryable"] = False
                 state["block_reason"] = None
                 state["pause_reason"] = None
+                state["waiting"] = None
+                state["waiting_reason"] = None
+                state["waiting_code"] = None
             elif action == "restart_role":
                 if state.get("status") in TERMINAL:
                     raise RuntimeError("cannot restart a role for a terminal task")
@@ -4315,9 +4326,15 @@ class CDPAWorker:
                     state.clear()
                     state.update(saved)
                     return saved
-                if scheduling_changed:
+                force_stop_requested = any(
+                    isinstance(item, Mapping)
+                    and item.get("status") == "requested"
+                    and item.get("action") == "stop"
+                    for item in state.get("controls") or []
+                )
+                if scheduling_changed and not force_stop_requested:
                     return state
-                if state.get("status") == "WAITING":
+                if state.get("status") == "WAITING" and not force_stop_requested:
                     return state
                 transport_baseline = state
                 active_hop_id = state.get("active_hop_id")

@@ -352,6 +352,41 @@ def test_frontend_assets_are_local_modular_and_suspend_hidden_polling():
 
 
 
+def test_commands_fill_board_gap_without_moving_task_workspace():
+    html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+    css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
+
+    board_section_at = html.index('<section class="board-section"')
+    board_at = html.index('<div id="board" class="board-grid"')
+    commands_at = html.index('<aside id="commands"')
+    board_section_end = html.index("</section>", board_section_at)
+    workspace_at = html.index('<section class="task-workspace"')
+
+    assert board_section_at < board_at < commands_at < board_section_end < workspace_at
+    assert ".board-section {\n  display: grid;" in css
+    assert ".board-grid {\n  display: contents;" in css
+    assert ".board-section > .command-panel { grid-column: 1 / -1;" in css
+    assert "@media (min-width: 1600px)" in css
+    assert ".board-section > .command-panel { grid-column: span 3; }" in css
+    assert "@media (max-width: 1199px)" in css
+    assert ".board-section > .command-panel { grid-column: span 2;" in css
+    assert "@media (max-width: 920px) and (min-width: 721px)" in css
+    assert ".board-section > .command-panel { grid-column: 1 / -1; }" in css
+    assert ".task-workspace {\n  display: grid;\n  grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr);" in css
+    mobile = css.split("@media (max-width: 720px)", 1)[1]
+    assert ".board-section { display: block; }" in mobile
+    assert ".board-grid {\n    display: grid;" in mobile
+
+
+def test_task_controls_render_before_task_prompt():
+    detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
+    workflow = detail.split("function workflowContent", 1)[1].split("function build", 1)[0]
+    independent = detail.split("function independentOverview", 1)[1].split("function independentHistory", 1)[0]
+
+    assert workflow.index("fragment.append(controls);") < workflow.index("fragment.append(taskSection);")
+    assert independent.index("fragment.append(independentControls(detail));") < independent.index("fragment.append(section);")
+
+
 def test_independent_agents_have_one_lane_and_operator_facing_controls():
     html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
     board = (ASSET_ROOT / "views" / "board.js").read_text(encoding="utf-8")

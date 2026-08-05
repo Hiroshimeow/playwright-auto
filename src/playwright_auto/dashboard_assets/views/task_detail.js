@@ -172,6 +172,7 @@ function independentControls(detail) {
 function independentOverview(detail, timeline, selectedRole) {
   const fragment = document.createDocumentFragment();
   const agent = detail.agent || {};
+  fragment.append(independentControls(detail));
   const section = el("section", null, "detail-section independent-overview");
   section.append(el("h3", "Independent Agent"));
   const prompt = agent.system_prompt || detail.task_text || "No system prompt projected.";
@@ -198,7 +199,6 @@ function independentOverview(detail, timeline, selectedRole) {
     fragment.append(problem);
   }
 
-  fragment.append(independentControls(detail));
   const tabState = el("p", null, "tab-state-help");
   if (agent.tab_open) {
     const keepOpen = agent.tab_keep_open_until
@@ -289,6 +289,16 @@ function independentTabs(detail, selectedTab) {
 
 function workflowContent(detail, timeline, selectedRole) {
   const fragment = document.createDocumentFragment();
+  const controls = el("div", null, "control-grid");
+  if (detail.status === "RUNNING") controls.append(changeGoalButton(detail));
+  for (const [action, label] of [
+    ["pause", "Pause"], ["resume", "Resume"], ["retry", "Retry hop"],
+    ["restart_role", "Restart role"], ["new_chat", "New chat"],
+    ["open_tab", "Open tab"], ["route_plan", "Route PLAN"],
+    ["stop", "Stop"], ["clear_team", "Clear team"],
+  ]) controls.append(button(action, label, detail));
+  fragment.append(controls);
+
   const taskSection = el("section", null, "detail-section");
   taskSection.append(el("h3", "Task"));
   taskSection.append(el("pre", detail.task_text || detail.task_title || detail.task_id, "task-text"));
@@ -316,15 +326,7 @@ function workflowContent(detail, timeline, selectedRole) {
     fragment.append(problem);
   }
 
-  const controls = el("div", null, "control-grid");
-  if (detail.status === "RUNNING") controls.append(changeGoalButton(detail));
-  for (const [action, label] of [
-    ["pause", "Pause"], ["resume", "Resume"], ["retry", "Retry hop"],
-    ["restart_role", "Restart role"], ["new_chat", "New chat"],
-    ["open_tab", "Open tab"], ["route_plan", "Route PLAN"],
-    ["stop", "Stop"], ["clear_team", "Clear team"],
-  ]) controls.append(button(action, label, detail));
-  fragment.append(controls, rolesSection(detail, selectedRole), timelineSection(detail, timeline));
+  fragment.append(rolesSection(detail, selectedRole), timelineSection(detail, timeline));
   return fragment;
 }
 
