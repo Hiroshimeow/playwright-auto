@@ -776,8 +776,16 @@ def test_open_tab_recovers_presend_role_offline_and_sends_original_once(
         async def locate_owned(self, _state, _role):
             return acquired if self.recovered else None
 
-        async def reopen(self, _state, _role, *, require_clean_ready=True):
+        async def reopen(
+            self,
+            _state,
+            _role,
+            *,
+            require_clean_ready=True,
+            foreground=True,
+        ):
             assert require_clean_ready is True
+            assert foreground is True
             self.recovered = True
             return acquired
 
@@ -1101,17 +1109,7 @@ def test_backend_primary_is_streaming_uses_status_cadence_without_dom_or_graph(t
         tmp_path, task_id="task-stream-primary"
     )
     state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
-    calls = {"status": 0, "graph": 0, "dom": 0, "locate": 0}
-
-    class Client:
-        async def wait_snapshot(self, *_args, **_kwargs):
-            calls["dom"] += 1
-            raise AssertionError("stream-status primary must not scan DOM messages")
-        async def wait_for_response(self, *_args, **_kwargs):
-            calls["dom"] += 1
-            raise AssertionError("stream-status primary must not wait on DOM response")
-
-    acquired = AcquiredRole(Client(), receipt.binding.page_id, hop["conversation_url"], False, False)
+    calls = {"status": 0, "graph": 0, "dom": 0, "source": 0}
 
     class Actions:
         async def backend_stream_status(self, conversation_id):
@@ -1121,32 +1119,32 @@ def test_backend_primary_is_streaming_uses_status_cadence_without_dom_or_graph(t
         async def backend_conversation(self, _conversation_id):
             calls["graph"] += 1
             raise AssertionError("IS_STREAMING must not fetch full conversation")
-        async def locate_owned_metadata(self, _state, _role):
-            calls["locate"] += 1
-            return acquired
+        async def locate_owned_metadata(self, *_args, **_kwargs):
+            calls["source"] += 1
+            raise AssertionError("healthy stream-status polling must not depend on source tab")
         async def locate_owned(self, *_args, **_kwargs):
-            raise AssertionError("steady stream-status polling must not use DOM-capable locator")
+            calls["source"] += 1
+            raise AssertionError("healthy stream-status polling must not inspect source DOM")
         async def reopen(self, *_args, **_kwargs):
-            raise AssertionError("present source tab must not reopen")
+            calls["source"] += 1
+            raise AssertionError("healthy stream-status polling must not reopen source")
 
     actions = Actions()
     asyncio.run(worker._waiting(state, hop, actions, path))
     asyncio.run(worker._waiting(state, hop, actions, path))
-    assert calls == {"status": 1, "graph": 0, "dom": 0, "locate": 1}
+
+    assert calls == {"status": 1, "graph": 0, "dom": 0, "source": 0}
     assert hop["state"] == "waiting"
     assert hop["wait"]["completion_mode"] == "stream_status"
     assert hop["wait"]["stream_status_poll_count"] == 1
 
 
-def test_is_streaming_reopens_missing_exact_source_without_dom_scan(tmp_path: Path):
+def test_is_streaming_does_not_reopen_missing_source_while_backend_is_healthy(tmp_path: Path):
     store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-stream-source-reopen"
     )
     state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
-    calls = {"status": 0, "metadata": 0, "reopen": 0}
-    acquired = AcquiredRole(
-        SimpleNamespace(), receipt.binding.page_id, hop["conversation_url"], False, False
-    )
+    calls = {"status": 0, "source": 0}
 
     class Actions:
         async def backend_stream_status(self, _conversation_id):
@@ -1155,17 +1153,18 @@ def test_is_streaming_reopens_missing_exact_source_without_dom_scan(tmp_path: Pa
         async def backend_conversation(self, *_args, **_kwargs):
             raise AssertionError("IS_STREAMING must not fetch graph")
         async def locate_owned_metadata(self, *_args, **_kwargs):
-            calls["metadata"] += 1
-            return None
+            calls["source"] += 1
+            raise AssertionError("healthy backend wait must tolerate a closed source tab")
         async def locate_owned(self, *_args, **_kwargs):
-            raise AssertionError("missing-source detection must stay metadata-only")
-        async def reopen(self, _state, _role, *, require_clean_ready=True):
-            calls["reopen"] += 1
-            assert require_clean_ready is False
-            return acquired
+            calls["source"] += 1
+            raise AssertionError("healthy backend wait must tolerate a closed source tab")
+        async def reopen(self, *_args, **_kwargs):
+            calls["source"] += 1
+            raise AssertionError("healthy backend wait must not reopen source")
 
     asyncio.run(worker._waiting(state, hop, Actions(), path))
-    assert calls == {"status": 1, "metadata": 1, "reopen": 1}
+
+    assert calls == {"status": 1, "source": 0}
     assert hop["state"] == "waiting"
     assert state["status"] != "BLOCKED"
 
@@ -1296,21 +1295,14 @@ def test_advance_complete_backend_result_survives_pregraph_guard_outer_persisten
     assert saved_hop["wait"]["terminal_graph_request_id"] == saved_hop["request_id"]
 
 
-def test_stale_complete_graph_not_ready_falls_back_once_after_nonblocking_30s_gate(tmp_path: Path):
+def test_complete_graph_not_ready_retries_after_two_minutes_without_source_wake(tmp_path: Path):
     from playwright_auto.chatgpt_graph import BackendNotReadyError
 
     store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-stale-complete"
     )
     state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
-    calls = {"status": 0, "graph": 0, "dom": 0, "locate": 0}
-
-    class Client:
-        async def wait_snapshot(self, *_args, **_kwargs):
-            calls["dom"] += 1
-            raise AssertionError("DOM must wait for the 30 second stabilization gate")
-
-    acquired = AcquiredRole(Client(), receipt.binding.page_id, hop["conversation_url"], False, False)
+    calls = {"status": 0, "graph": 0, "source": 0}
 
     class Actions:
         async def backend_stream_status(self, _conversation_id):
@@ -1319,23 +1311,33 @@ def test_stale_complete_graph_not_ready_falls_back_once_after_nonblocking_30s_ga
         async def backend_conversation(self, _conversation_id):
             calls["graph"] += 1
             raise BackendNotReadyError("terminal assistant response is not materialized yet")
+        async def locate_owned_metadata(self, *_args, **_kwargs):
+            calls["source"] += 1
+            raise AssertionError("terminal graph retry must not inspect source")
         async def locate_owned(self, *_args, **_kwargs):
-            calls["locate"] += 1
-            return acquired
+            calls["source"] += 1
+            raise AssertionError("terminal graph retry must not wake source")
         async def reopen(self, *_args, **_kwargs):
-            raise AssertionError("existing exact source should be reused")
+            calls["source"] += 1
+            raise AssertionError("terminal graph retry must not reopen source")
+        async def wake(self, *_args, **_kwargs):
+            calls["source"] += 1
+            raise AssertionError("terminal graph retry must not wake source")
 
     actions = Actions()
     asyncio.run(worker._waiting(state, hop, actions, path))
-    assert calls == {"status": 1, "graph": 1, "dom": 0, "locate": 1}
-    assert hop["wait"]["completion_mode"] == "dom_fallback"
-    assert hop["wait"]["backend_fallback_category"] == "graph_not_ready"
-    assert worker_module.parse_time(hop["wait"]["dom_fallback_ready_at"]) > datetime.now(timezone.utc)
+
+    wait = hop["wait"]
+    assert calls == {"status": 1, "graph": 1, "source": 0}
+    assert wait["completion_mode"] == "terminal_graph_retry"
+    assert wait["backend_fallback_category"] == "graph_not_ready"
+    assert wait["terminal_graph_attempts"] == 1
+    retry_at = worker_module.parse_time(wait["terminal_graph_ready_at"])
+    assert retry_at is not None
+    assert 119 <= (retry_at - datetime.now(timezone.utc)).total_seconds() <= 121
 
     asyncio.run(worker._waiting(state, hop, actions, path))
-    assert calls["status"] == 1
-    assert calls["graph"] == 1
-    assert calls["dom"] == 0
+    assert calls == {"status": 1, "graph": 1, "source": 0}
 
 
 @pytest.mark.parametrize(
@@ -1348,19 +1350,16 @@ def test_stale_complete_graph_not_ready_falls_back_once_after_nonblocking_30s_ga
         (lambda: worker_module.GraphIdentityError("identity ambiguous"), "graph_identity"),
     ],
 )
-def test_complete_graph_failure_classes_degrade_once_to_30s_dom_fallback(
+def test_complete_graph_failure_classes_use_bounded_retry_without_source(
     tmp_path: Path,
     error_factory,
     expected_category: str,
 ):
     store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id=f"task-graph-fallback-{expected_category}"
+        tmp_path, task_id=f"task-graph-retry-{expected_category}"
     )
     state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
-    calls = {"status": 0, "graph": 0, "locate": 0}
-    acquired = AcquiredRole(
-        SimpleNamespace(), receipt.binding.page_id, hop["conversation_url"], False, False
-    )
+    calls = {"status": 0, "graph": 0, "source": 0}
 
     class Actions:
         async def backend_stream_status(self, _conversation_id):
@@ -1370,119 +1369,226 @@ def test_complete_graph_failure_classes_degrade_once_to_30s_dom_fallback(
             calls["graph"] += 1
             raise error_factory()
         async def locate_owned_metadata(self, *_args, **_kwargs):
-            calls["locate"] += 1
-            return acquired
+            calls["source"] += 1
+            raise AssertionError("graph retry must not inspect source")
         async def locate_owned(self, *_args, **_kwargs):
-            raise AssertionError("fallback source presence should stay metadata-only")
+            calls["source"] += 1
+            raise AssertionError("graph retry must not inspect source DOM")
         async def reopen(self, *_args, **_kwargs):
-            raise AssertionError("existing exact source should be reused")
+            calls["source"] += 1
+            raise AssertionError("graph retry must not reopen source")
+        async def wake(self, *_args, **_kwargs):
+            calls["source"] += 1
+            raise AssertionError("graph retry must not wake source")
 
     asyncio.run(worker._waiting(state, hop, Actions(), path))
-    assert calls == {"status": 1, "graph": 1, "locate": 1}
+    assert calls == {"status": 1, "graph": 1, "source": 0}
     assert state["status"] != "BLOCKED"
     assert hop["wait"]["backend_fallback_category"] == expected_category
-    assert hop["wait"]["completion_mode"] == "dom_fallback"
-    assert worker_module.parse_time(hop["wait"]["dom_fallback_ready_at"]) > datetime.now(timezone.utc)
+    assert hop["wait"]["completion_mode"] == "terminal_graph_retry"
+    assert hop["wait"]["terminal_graph_attempts"] == 1
 
 
-def test_existing_graph_attempt_marker_never_repeats_full_graph_after_restart(tmp_path: Path):
+def test_interrupted_terminal_graph_attempt_resumes_bounded_retry(tmp_path: Path):
     store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-graph-marker-restart"
     )
     state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
-    hop["wait"]["completion_mode"] = "stream_status"
-    hop["wait"]["terminal_graph_request_id"] = hop["request_id"]
-    hop["wait"]["terminal_graph_attempted_at"] = utc_now()
+    hop["wait"].update(
+        completion_mode="terminal_graph_retry",
+        terminal_graph_request_id=hop["request_id"],
+        terminal_graph_attempted_at=utc_now(),
+        terminal_graph_attempts=1,
+        terminal_graph_ready_at=(datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat(),
+    )
     state = store.save(path, state)
     hop = _active_hop(state)
-    calls = {"status": 0, "graph": 0, "locate": 0}
-    acquired = AcquiredRole(SimpleNamespace(), receipt.binding.page_id, hop["conversation_url"], False, False)
+    calls = {"status": 0, "graph": 0, "source": 0}
 
     class Actions:
         async def backend_stream_status(self, *_args, **_kwargs):
             calls["status"] += 1
-            raise AssertionError("guarded terminal attempt must degrade, not repoll status")
+            raise AssertionError("interrupted graph retry must not repoll status")
         async def backend_conversation(self, *_args, **_kwargs):
             calls["graph"] += 1
-            raise AssertionError("full graph must be exactly once")
+            raise AssertionError("interrupted graph retry must wait for its next deadline")
         async def locate_owned(self, *_args, **_kwargs):
-            calls["locate"] += 1
-            return acquired
-        async def reopen(self, *_args, **_kwargs):
-            raise AssertionError("existing exact source should be reused")
+            calls["source"] += 1
+            raise AssertionError("interrupted graph retry must not inspect source")
 
     asyncio.run(worker._waiting(state, hop, Actions(), path))
-    assert calls == {"status": 0, "graph": 0, "locate": 1}
-    assert hop["wait"]["completion_mode"] == "dom_fallback"
-    assert hop["wait"]["backend_fallback_category"] == "graph_attempt_interrupted"
+    assert calls == {"status": 0, "graph": 0, "source": 0}
+    assert hop["wait"]["completion_mode"] == "terminal_graph_retry"
+    assert "terminal_graph_request_id" not in hop["wait"]
+    assert hop["wait"]["terminal_graph_attempts"] == 1
 
 
-def test_stream_status_failure_degrades_once_to_existing_dom_wait_without_backend_block(tmp_path: Path):
+def test_stream_status_failure_enters_recovery_without_dom_or_source(tmp_path: Path):
     from playwright_auto.chatgpt_graph import BackendUnavailableError
 
     store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-status-fallback"
+        tmp_path, task_id="task-status-recovery"
     )
     state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
-    calls = {"status": 0, "dom": 0}
-    snapshot = SimpleNamespace(
-        state=ChatGPTState.WAITING_PROMPT,
-        stop_visible=True,
-        composer_empty=True,
-        manual_input_pending=False,
-        error_texts=(),
-        blocking_dialogs=(),
-        messages=(MessageSnapshot("user", "u1", "t1", receipt.prompt, ()),),
-        response_activity_turn_id="active",
-        response_activity_text="",
-        response_activity_structure="",
-        response_activity_length=0,
-    )
-
-    class Client:
-        async def wait_snapshot(self, *_args, **_kwargs):
-            calls["dom"] += 1
-            return snapshot
-        async def wait_for_response(self, *_args, **_kwargs):
-            raise AssertionError("active DOM transport should remain waiting")
-
-    acquired = AcquiredRole(Client(), receipt.binding.page_id, hop["conversation_url"], False, False)
+    calls = {"status": 0, "graph": 0, "source": 0}
 
     class Actions:
         async def backend_stream_status(self, *_args, **_kwargs):
             calls["status"] += 1
             raise BackendUnavailableError(429, "stream_status")
         async def backend_conversation(self, *_args, **_kwargs):
-            raise AssertionError("status failure must not fetch graph")
+            calls["graph"] += 1
+            raise AssertionError("first status failure must wait five minutes before graph probe")
         async def locate_owned(self, *_args, **_kwargs):
-            return acquired
+            calls["source"] += 1
+            raise AssertionError("status recovery must not inspect source")
         async def reopen(self, *_args, **_kwargs):
-            raise AssertionError("existing source should be reused")
+            calls["source"] += 1
+            raise AssertionError("status recovery must not reopen source")
+        async def wake(self, *_args, **_kwargs):
+            calls["source"] += 1
+            raise AssertionError("status recovery must not wake source")
 
     actions = Actions()
     asyncio.run(worker._waiting(state, hop, actions, path))
-    assert calls == {"status": 1, "dom": 1}
-    assert state["status"] != "BLOCKED"
-    assert hop["wait"]["completion_mode"] == "dom_fallback"
-    assert hop["wait"]["backend_fallback_category"] == "status_unavailable"
+
+    wait = hop["wait"]
+    assert calls == {"status": 1, "graph": 0, "source": 0}
+    assert wait["completion_mode"] == "status_recovery"
+    assert wait["backend_fallback_category"] == "status_unavailable"
+    next_status = worker_module.parse_time(wait["stream_status_next_poll_at"])
+    next_graph = worker_module.parse_time(wait["status_recovery_graph_next_at"])
+    now = datetime.now(timezone.utc)
+    assert next_status is not None and 29 <= (next_status - now).total_seconds() <= 31
+    assert next_graph is not None and 299 <= (next_graph - now).total_seconds() <= 301
 
     asyncio.run(worker._waiting(state, hop, actions, path))
-    assert calls["status"] == 1
-    assert calls["dom"] == 2
+    assert calls == {"status": 1, "graph": 0, "source": 0}
 
 
+def test_status_recovery_returns_to_normal_ten_second_poll_when_status_recovers(tmp_path: Path):
+    from playwright_auto.chatgpt_graph import BackendUnavailableError
+
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-status-recovers"
+    )
+    state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
+    replies = [BackendUnavailableError(429, "stream_status"), {"status": "IS_STREAMING"}]
+    calls = {"status": 0, "graph": 0}
+
+    class Actions:
+        async def backend_stream_status(self, *_args, **_kwargs):
+            calls["status"] += 1
+            reply = replies.pop(0)
+            if isinstance(reply, BaseException):
+                raise reply
+            return reply
+        async def backend_conversation(self, *_args, **_kwargs):
+            calls["graph"] += 1
+            raise AssertionError("recovered IS_STREAMING must not fetch graph")
+
+    actions = Actions()
+    asyncio.run(worker._waiting(state, hop, actions, path))
+    hop["wait"]["stream_status_next_poll_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    asyncio.run(worker._waiting(state, hop, actions, path))
+
+    wait = hop["wait"]
+    assert calls == {"status": 2, "graph": 0}
+    assert wait["completion_mode"] == "stream_status"
+    assert "status_recovery_graph_next_at" not in wait
+    next_status = worker_module.parse_time(wait["stream_status_next_poll_at"])
+    assert next_status is not None
+    assert 9 <= (next_status - datetime.now(timezone.utc)).total_seconds() <= 11
 
 
+def test_status_recovery_graph_probe_routes_after_five_minutes(tmp_path: Path):
+    from playwright_auto.chatgpt_graph import BackendUnavailableError
+
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-status-graph-route"
+    )
+    state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
+    report_relative = hop["expected_report_path"]
+    report = tmp_path / report_relative
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("status recovery graph response", encoding="utf-8")
+    response_text = json.dumps({"route": "REVIEW", "handoff": report_relative})
+    calls = {"status": 0, "graph": 0, "source": 0}
+
+    class Actions:
+        async def backend_stream_status(self, *_args, **_kwargs):
+            calls["status"] += 1
+            raise BackendUnavailableError(429, "stream_status")
+        async def backend_conversation(self, *_args, **_kwargs):
+            calls["graph"] += 1
+            return _backend_graph(receipt.user_message_id, "assistant-recovery", response_text)
+        async def locate_owned(self, *_args, **_kwargs):
+            calls["source"] += 1
+            raise AssertionError("successful recovery graph must not inspect source")
+        async def reopen(self, *_args, **_kwargs):
+            calls["source"] += 1
+            raise AssertionError("successful recovery graph must not reopen source")
+        async def wake(self, *_args, **_kwargs):
+            calls["source"] += 1
+            raise AssertionError("successful recovery graph must not wake source")
+
+    actions = Actions()
+    asyncio.run(worker._waiting(state, hop, actions, path))
+    hop["wait"]["status_recovery_graph_next_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    state = store.save(path, state)
+    hop = _active_hop(state)
+    asyncio.run(worker._waiting(state, hop, actions, path))
+
+    assert calls == {"status": 1, "graph": 1, "source": 0}
+    assert hop["state"] == "responded"
+    assert hop["response"] == response_text
 
 
+def test_terminal_graph_third_failure_enters_dom_fallback_and_wakes_source(tmp_path: Path):
+    from playwright_auto.chatgpt_graph import BackendUnavailableError
 
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-terminal-graph-max"
+    )
+    state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
+    calls = {"status": 0, "graph": 0, "locate": 0, "wake": 0}
+    acquired = AcquiredRole(
+        SimpleNamespace(), receipt.binding.page_id, hop["conversation_url"], False, False
+    )
 
+    class Actions:
+        async def backend_stream_status(self, *_args, **_kwargs):
+            calls["status"] += 1
+            return {"status": "COMPLETE"}
+        async def backend_conversation(self, *_args, **_kwargs):
+            calls["graph"] += 1
+            raise BackendUnavailableError(0, "conversation")
+        async def locate_owned_metadata(self, *_args, **_kwargs):
+            calls["locate"] += 1
+            return acquired
+        async def reopen(self, *_args, **kwargs):
+            raise AssertionError(f"existing source should be reused: {kwargs}")
+        async def wake(self, exact):
+            assert exact is acquired
+            calls["wake"] += 1
 
+    actions = Actions()
+    for attempt in range(3):
+        if attempt:
+            hop["wait"]["terminal_graph_ready_at"] = (
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat()
+        state = store.save(path, state)
+        hop = _active_hop(state)
+        asyncio.run(worker._waiting(state, hop, actions, path))
 
-
-
-
-
+    assert calls == {"status": 1, "graph": 3, "locate": 1, "wake": 1}
+    assert hop["wait"]["terminal_graph_attempts"] == 3
+    assert hop["wait"]["completion_mode"] == "dom_fallback"
+    assert hop["wait"]["backend_fallback_category"] == "graph_unavailable"
+    assert worker_module.parse_time(hop["wait"]["dom_fallback_ready_at"]) > datetime.now(timezone.utc)
 
 
 def test_normal_wait_missing_file_response_enters_route_repair(tmp_path: Path):
@@ -2896,20 +3002,31 @@ def test_active_accepted_waiting_offline_reopens_without_resend_or_clean_compose
 
     class Actions:
         def __init__(self):
-            self.reopen_clean = []
+            self.reopen_calls = []
+            self.wake_calls = []
 
         async def locate_owned(self, *_args, **_kwargs):
             return None
 
-        async def reopen(self, *_args, require_clean_ready=True, **_kwargs):
-            self.reopen_clean.append(require_clean_ready)
+        async def reopen(
+            self,
+            *_args,
+            require_clean_ready=True,
+            foreground=True,
+            **_kwargs,
+        ):
+            self.reopen_calls.append((require_clean_ready, foreground))
             return acquired
+
+        async def wake(self, exact):
+            self.wake_calls.append(exact)
 
     actions = Actions()
     result = asyncio.run(worker._owned_or_block(state, "PLAN", actions))
 
     assert result == acquired
-    assert actions.reopen_clean == [False]
+    assert actions.reopen_calls == [(False, False)]
+    assert actions.wake_calls == [acquired]
     assert hop["state"] == "waiting"
     assert hop["request_id"] == original_request_id
     assert hop["receipt"] == receipt

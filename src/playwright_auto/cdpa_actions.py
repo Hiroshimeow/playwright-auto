@@ -84,6 +84,7 @@ class CDPATabActions:
             session = await self.browser_context.new_cdp_session(page)
             try:
                 await session.send("Page.setWebLifecycleState", {"state": "active"})
+                await session.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
             finally:
                 await session.detach()
         except Exception as exc:
@@ -94,6 +95,9 @@ class CDPATabActions:
                     RuntimeWarning,
                     stacklevel=2,
                 )
+
+    async def wake(self, acquired: AcquiredRole) -> None:
+        await self._set_page_active(acquired.client.page)
 
     @staticmethod
     def _supported(page: Any) -> bool:
@@ -360,6 +364,7 @@ class CDPATabActions:
         logical_role: str,
         *,
         require_clean_ready: bool = True,
+        foreground: bool = True,
     ) -> AcquiredRole:
         logical_role = str(logical_role).upper()
         role_record = manifest["roles"][logical_role]
@@ -469,8 +474,9 @@ class CDPATabActions:
                 raise RoleOwnershipError(
                     "conversation reopen did not restore exact role/task ownership"
                 )
-            await self._set_page_active(page)
-            await page.bring_to_front()
+            if foreground:
+                await self._set_page_active(page)
+                await page.bring_to_front()
             return AcquiredRole(
                 client=client,
                 page_id=page_id,

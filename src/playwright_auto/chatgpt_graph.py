@@ -46,12 +46,17 @@ def _exact_string(value: Any, label: str) -> str:
     return value
 
 
-def _node(mapping: Mapping[str, Any], node_id: str) -> Mapping[str, Any]:
+def _graph_node(mapping: Mapping[str, Any], node_id: str) -> Mapping[str, Any]:
     raw = mapping.get(node_id)
     if not isinstance(raw, Mapping):
         raise BackendSchemaError("graph current branch references a missing node")
     if _exact_string(raw.get("id"), "node id") != node_id:
         raise BackendSchemaError("graph mapping key and node id differ")
+    return raw
+
+
+def _node(mapping: Mapping[str, Any], node_id: str) -> Mapping[str, Any]:
+    raw = _graph_node(mapping, node_id)
     message = raw.get("message")
     if not isinstance(message, Mapping):
         raise BackendSchemaError("graph node is missing message object")
@@ -124,18 +129,16 @@ def resolve_terminal_assistant(
         if node_id in seen:
             raise BackendSchemaError("conversation graph current branch contains a cycle")
         seen.add(node_id)
-        node = _node(mapping, node_id)
+        node = _graph_node(mapping, node_id)
         reverse_chain.append(node)
+        if node_id == accepted_user_message_id:
+            parent = node.get("parent")
+            if parent is not None and str(parent) in seen:
+                raise BackendSchemaError("conversation graph current branch contains a cycle")
+            break
         parent = node.get("parent")
         node_id = str(parent) if parent is not None else None
-    chain = list(reversed(reverse_chain))
-
-    branch_matches = [
-        index
-        for index, node in enumerate(chain)
-        if node["message"]["id"] == accepted_user_message_id
-    ]
-    if not branch_matches:
+    else:
         if any(
             isinstance(raw, Mapping)
             and isinstance(raw.get("message"), Mapping)
@@ -144,17 +147,18 @@ def resolve_terminal_assistant(
         ):
             raise GraphIdentityError("accepted user message is not on the current branch")
         raise BackendNotReadyError("accepted user message is not materialized yet")
-    if len(branch_matches) != 1:
-        raise GraphIdentityError("accepted user message identity is ambiguous")
-    accepted_index = branch_matches[0]
-    if _message_role(chain[accepted_index]) != "user":
+
+    chain = list(reversed(reverse_chain))
+    for node in chain:
+        _node(mapping, str(node["id"]))
+    if _message_role(chain[0]) != "user":
         raise GraphIdentityError("accepted user message id does not identify a user node")
 
     terminal: ResolvedAssistant | None = None
     unresolved_tool_chain = False
     tool_result_seen = False
     previous_role = "user"
-    for node in chain[accepted_index + 1 :]:
+    for node in chain[1:]:
         role = _message_role(node)
         if role == "user":
             if previous_role != "tool":

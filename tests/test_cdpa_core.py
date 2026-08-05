@@ -154,7 +154,7 @@ def test_config_loads_root_json_compatible_yaml_and_validates_defaults(tmp_path:
     assert config.route_repair_attempts == 3
     assert config.response_timeout_seconds == 7200
     assert config.response_refresh_after_seconds == 1200
-    assert config.response_stream_status_poll_seconds == 3.0
+    assert config.response_stream_status_poll_seconds == 10.0
     assert config.dashboard_url == "http://127.0.0.1:9224"
 
 

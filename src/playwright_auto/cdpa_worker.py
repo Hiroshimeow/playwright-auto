@@ -116,6 +116,11 @@ from .workflow import WorkflowContext
 TERMINAL = frozenset({"DONE", "STOPPED"})
 IN_FLIGHT = frozenset({"sending", "sent", "waiting"})
 _RATE_LIMIT_COOLDOWN_SECONDS = 60.0
+_STREAM_STATUS_RECOVERY_SECONDS = 30.0
+_STATUS_RECOVERY_GRAPH_SECONDS = 300.0
+_TERMINAL_GRAPH_RETRY_SECONDS = 120.0
+_TERMINAL_GRAPH_MAX_ATTEMPTS = 3
+_DOM_FALLBACK_SETTLE_SECONDS = 30.0
 _RATE_LIMIT_BLOCK_MESSAGE = (
     "Too many requests; shared browser-profile cooldown is active"
 )
@@ -788,6 +793,8 @@ class CDPAWorker:
         state: dict[str, Any],
         role: str,
         actions: CDPATabActions,
+        *,
+        foreground: bool = False,
     ) -> AcquiredRole:
         _, expected_conversation, expected_page_id, require_clean_ready = (
             self._active_recovery_context(state, role)
@@ -798,7 +805,10 @@ class CDPAWorker:
                 code="role_offline",
             )
         acquired = await actions.reopen(
-            state, role, require_clean_ready=require_clean_ready
+            state,
+            role,
+            require_clean_ready=require_clean_ready and foreground,
+            foreground=foreground,
         )
         if _recoverable_conversation_identity(acquired.url) != expected_conversation:
             raise RoleOwnershipError(
@@ -808,6 +818,12 @@ class CDPAWorker:
             raise RoleOwnershipError(
                 "automatic role recovery did not restore the recorded page identity"
             )
+        if not foreground:
+            await actions.wake(acquired)
+            if require_clean_ready:
+                await acquired.client.wait_until_clean_ready(
+                    timeout_ms=round(self.config.workspace_timeout_seconds * 1000)
+                )
         self._record_acquired(state, role, acquired)
         return acquired
 
@@ -1837,7 +1853,9 @@ class CDPAWorker:
                     expected_binding_page_id = str(binding.get("page_id") or "").strip() or None
                 if blocked_role_recovery:
                     try:
-                        acquired = await self._recover_active_role(state, role, actions)
+                        acquired = await self._recover_active_role(
+                            state, role, actions, foreground=True
+                        )
                     except RoleOwnershipError as exc:
                         raise IneffectiveControlError(str(exc)) from exc
                     recovered = True
@@ -2820,6 +2838,7 @@ class CDPAWorker:
                     state,
                     role,
                     require_clean_ready=False,
+                    foreground=False,
                 )
             if _recoverable_conversation_identity(acquired.url) != expected_conversation:
                 raise RoleOwnershipError(
@@ -2839,6 +2858,27 @@ class CDPAWorker:
             return None
         self._record_acquired(state, role, acquired)
         return acquired
+
+    async def _begin_backend_dom_fallback(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        actions: CDPATabActions,
+        receipt: SendReceipt,
+        *,
+        category: str,
+        now: datetime,
+    ) -> None:
+        wait = hop["wait"]
+        wait["completion_mode"] = "dom_fallback"
+        wait["backend_fallback_category"] = category
+        acquired = await self._ensure_backend_wait_source(state, hop, actions, receipt)
+        if acquired is None:
+            return
+        await actions.wake(acquired)
+        wait["dom_fallback_ready_at"] = (
+            now + timedelta(seconds=_DOM_FALLBACK_SETTLE_SECONDS)
+        ).isoformat()
 
     async def _waiting(
         self,
@@ -2866,8 +2906,17 @@ class CDPAWorker:
         persistence_baseline = (
             transport_baseline if transport_baseline is not None else backend_before
         )
+
+        def persist_transport_state() -> None:
+            nonlocal persistence_baseline
+            saved = self._persist_transport_result(
+                manifest_path, persistence_baseline, state
+            )
+            state["updated_at"] = saved["updated_at"]
+            persistence_baseline = copy.deepcopy(state)
+
         now = datetime.now(timezone.utc)
-        mode = str(wait.get("completion_mode") or "")
+        mode = str(wait.get("completion_mode") or "stream_status")
         request_id = str(hop["request_id"])
 
         if mode == "dom_fallback":
@@ -2884,102 +2933,172 @@ class CDPAWorker:
             return
 
         if wait.get("terminal_graph_request_id") == request_id:
-            wait["completion_mode"] = "dom_fallback"
-            wait["backend_fallback_category"] = "graph_attempt_interrupted"
-            acquired = await self._ensure_backend_wait_source(
-                state, hop, actions, receipt
-            )
-            if acquired is not None and parse_time(wait.get("dom_fallback_ready_at")) is None:
-                wait["dom_fallback_ready_at"] = (now + timedelta(seconds=30)).isoformat()
-            return
-
-        if remaining_timeout_ms(wait, now=now) <= 0:
-            wait["completion_mode"] = "dom_fallback"
-            wait["backend_fallback_category"] = "response_deadline"
-            wait["dom_fallback_ready_at"] = None
-            await self._waiting_dom(
-                state,
-                hop,
-                actions,
-                manifest_path,
-                transport_baseline,
-            )
-            return
-
-        wait["completion_mode"] = "stream_status"
-        terminal_graph_ready_at = parse_time(wait.get("terminal_graph_ready_at"))
-        if terminal_graph_ready_at is not None:
-            if now < terminal_graph_ready_at:
-                return
-        else:
-            sent_at = parse_time((hop.get("timestamps") or {}).get("sent_at")) or now
-            interval = float(self.config.response_stream_status_poll_seconds)
-            next_poll = parse_time(wait.get("stream_status_next_poll_at"))
-            if next_poll is None:
-                next_poll = sent_at + timedelta(seconds=interval)
-                wait["stream_status_next_poll_at"] = next_poll.isoformat()
-            if now < next_poll:
-                return
-
-            wait["stream_status_last_poll_at"] = now.isoformat()
-            wait["stream_status_next_poll_at"] = (now + timedelta(seconds=interval)).isoformat()
-            wait["stream_status_poll_count"] = int(wait.get("stream_status_poll_count") or 0) + 1
-            try:
-                status_payload = await actions.backend_stream_status(receipt.conversation_id)
-                status = status_payload.get("status")
-                if status not in {"IS_STREAMING", "COMPLETE"}:
-                    raise BackendSchemaError("stream_status response has unknown status")
-            except BackendError as exc:
-                wait["completion_mode"] = "dom_fallback"
-                wait["backend_fallback_category"] = self._backend_failure_category(
-                    exc, prefix="status"
-                )
-                wait["dom_fallback_ready_at"] = None
-                self._persist_transport_result(manifest_path, persistence_baseline, state)
-                await self._waiting_dom(
+            wait.pop("terminal_graph_request_id", None)
+            attempts = max(1, int(wait.get("terminal_graph_attempts") or 0))
+            wait["terminal_graph_attempts"] = attempts
+            wait["completion_mode"] = "terminal_graph_retry"
+            if parse_time(wait.get("terminal_graph_ready_at")) is None:
+                wait["terminal_graph_ready_at"] = (
+                    now + timedelta(seconds=_TERMINAL_GRAPH_RETRY_SECONDS)
+                ).isoformat()
+            if attempts >= _TERMINAL_GRAPH_MAX_ATTEMPTS:
+                await self._begin_backend_dom_fallback(
                     state,
                     hop,
                     actions,
-                    manifest_path,
-                    transport_baseline,
+                    receipt,
+                    category="graph_attempt_interrupted",
+                    now=now,
                 )
-                return
+            return
 
-            if status == "IS_STREAMING":
-                await self._ensure_backend_wait_source(state, hop, actions, receipt)
-                return
-
-            wait["terminal_complete_seen_at"] = now.isoformat()
-            settle_seconds = float(
-                self.config.response_stream_status_terminal_settle_seconds
+        if remaining_timeout_ms(wait, now=now) <= 0:
+            await self._begin_backend_dom_fallback(
+                state,
+                hop,
+                actions,
+                receipt,
+                category="response_deadline",
+                now=now,
             )
-            if settle_seconds > 0:
-                wait["terminal_graph_ready_at"] = (
-                    now + timedelta(seconds=settle_seconds)
-                ).isoformat()
-                self._persist_transport_result(
-                    manifest_path, persistence_baseline, state
+            return
+
+        graph_mode: str | None = None
+        if mode == "terminal_graph_retry":
+            graph_ready_at = parse_time(wait.get("terminal_graph_ready_at"))
+            if graph_ready_at is not None and now < graph_ready_at:
+                return
+            graph_mode = "terminal"
+        else:
+            if mode not in {"stream_status", "status_recovery"}:
+                mode = "stream_status"
+            wait["completion_mode"] = mode
+            normal_interval = float(self.config.response_stream_status_poll_seconds)
+            next_poll = parse_time(wait.get("stream_status_next_poll_at"))
+            if next_poll is None:
+                if mode == "status_recovery":
+                    next_poll = now
+                else:
+                    sent_at = (
+                        parse_time((hop.get("timestamps") or {}).get("sent_at"))
+                        or now
+                    )
+                    next_poll = sent_at + timedelta(seconds=normal_interval)
+                wait["stream_status_next_poll_at"] = next_poll.isoformat()
+
+            if now >= next_poll:
+                wait["stream_status_last_poll_at"] = now.isoformat()
+                wait["stream_status_poll_count"] = (
+                    int(wait.get("stream_status_poll_count") or 0) + 1
                 )
+                try:
+                    status_payload = await actions.backend_stream_status(
+                        receipt.conversation_id
+                    )
+                    status = status_payload.get("status")
+                    if status not in {"IS_STREAMING", "COMPLETE"}:
+                        raise BackendSchemaError(
+                            "stream_status response has unknown status"
+                        )
+                except BackendError as exc:
+                    mode = "status_recovery"
+                    wait["completion_mode"] = mode
+                    wait["backend_fallback_category"] = (
+                        self._backend_failure_category(exc, prefix="status")
+                    )
+                    wait["stream_status_next_poll_at"] = (
+                        now + timedelta(seconds=_STREAM_STATUS_RECOVERY_SECONDS)
+                    ).isoformat()
+                    if parse_time(wait.get("status_recovery_graph_next_at")) is None:
+                        wait["status_recovery_graph_next_at"] = (
+                            now + timedelta(seconds=_STATUS_RECOVERY_GRAPH_SECONDS)
+                        ).isoformat()
+                    persist_transport_state()
+                else:
+                    if status == "IS_STREAMING":
+                        wait["completion_mode"] = "stream_status"
+                        wait["stream_status_next_poll_at"] = (
+                            now + timedelta(seconds=normal_interval)
+                        ).isoformat()
+                        for key in (
+                            "backend_fallback_category",
+                            "status_recovery_graph_next_at",
+                            "terminal_complete_seen_at",
+                            "terminal_graph_ready_at",
+                            "terminal_graph_attempts",
+                            "terminal_graph_request_id",
+                            "terminal_graph_attempted_at",
+                        ):
+                            wait.pop(key, None)
+                        return
+
+                    wait["completion_mode"] = "terminal_graph_retry"
+                    wait["terminal_complete_seen_at"] = now.isoformat()
+                    wait["terminal_graph_attempts"] = 0
+                    wait.pop("terminal_graph_request_id", None)
+                    wait.pop("status_recovery_graph_next_at", None)
+                    settle_seconds = float(
+                        self.config.response_stream_status_terminal_settle_seconds
+                    )
+                    wait["terminal_graph_ready_at"] = (
+                        now + timedelta(seconds=settle_seconds)
+                    ).isoformat()
+                    persist_transport_state()
+                    if settle_seconds > 0:
+                        return
+                    graph_mode = "terminal"
+
+            if graph_mode is None and mode == "status_recovery":
+                graph_ready_at = parse_time(wait.get("status_recovery_graph_next_at"))
+                if graph_ready_at is None:
+                    wait["status_recovery_graph_next_at"] = (
+                        now + timedelta(seconds=_STATUS_RECOVERY_GRAPH_SECONDS)
+                    ).isoformat()
+                    return
+                if now < graph_ready_at:
+                    return
+                wait["status_recovery_graph_next_at"] = (
+                    now + timedelta(seconds=_STATUS_RECOVERY_GRAPH_SECONDS)
+                ).isoformat()
+                persist_transport_state()
+                graph_mode = "recovery"
+            elif graph_mode is None:
                 return
 
-        wait["terminal_graph_request_id"] = request_id
-        wait["terminal_graph_attempted_at"] = now.isoformat()
-        self._persist_transport_result(manifest_path, persistence_baseline, state)
+        if graph_mode == "terminal":
+            attempts = int(wait.get("terminal_graph_attempts") or 0) + 1
+            wait["terminal_graph_attempts"] = attempts
+            wait["terminal_graph_request_id"] = request_id
+            wait["terminal_graph_attempted_at"] = now.isoformat()
+            wait["terminal_graph_ready_at"] = (
+                now + timedelta(seconds=_TERMINAL_GRAPH_RETRY_SECONDS)
+            ).isoformat()
+            persist_transport_state()
+
         try:
             graph = await actions.backend_conversation(receipt.conversation_id)
             resolved = resolve_terminal_assistant(graph, receipt.user_message_id)
         except BackendError as exc:
-            wait["completion_mode"] = "dom_fallback"
             wait["backend_fallback_category"] = self._backend_failure_category(
                 exc, prefix="graph"
             )
-            acquired = await self._ensure_backend_wait_source(
-                state, hop, actions, receipt
-            )
-            if acquired is not None:
-                wait["dom_fallback_ready_at"] = (
-                    datetime.now(timezone.utc) + timedelta(seconds=30)
-                ).isoformat()
+            if graph_mode == "terminal":
+                wait.pop("terminal_graph_request_id", None)
+                attempts = int(wait.get("terminal_graph_attempts") or 0)
+                if attempts >= _TERMINAL_GRAPH_MAX_ATTEMPTS:
+                    await self._begin_backend_dom_fallback(
+                        state,
+                        hop,
+                        actions,
+                        receipt,
+                        category=str(wait["backend_fallback_category"]),
+                        now=datetime.now(timezone.utc),
+                    )
+                else:
+                    wait["completion_mode"] = "terminal_graph_retry"
+            else:
+                wait["completion_mode"] = "status_recovery"
+            persist_transport_state()
             return
 
         response = MessageSnapshot(

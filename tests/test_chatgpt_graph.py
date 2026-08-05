@@ -36,6 +36,26 @@ def test_resolve_terminal_assistant_on_exact_current_branch():
     assert resolved.content_type == "text"
 
 
+def test_resolver_stops_at_exact_user_before_structural_client_root():
+    graph = {
+        "current_node": "a1",
+        "mapping": {
+            "client-created-root": {
+                "id": "client-created-root",
+                "message": None,
+                "parent": None,
+                "children": ["u1"],
+            },
+            "u1": msg("u1", "user", parent="client-created-root", children=("a1",)),
+            "a1": msg("a1", "assistant", parent="u1", text="final"),
+        },
+    }
+
+    resolved = resolve_terminal_assistant(graph, "u1")
+
+    assert (resolved.message_id, resolved.text) == ("a1", "final")
+
+
 def test_resolve_terminal_assistant_handles_tool_chain_and_internal_user_continuation():
     graph = {
         "current_node": "a-final",

@@ -296,21 +296,43 @@ def test_completed_job_closes_after_one_minute_and_next_trigger_reopens_saved_ur
             super().__init__()
             self.reopened_url = None
             self.required_clean_ready = None
+            self.foreground = None
+            self.wake_calls = []
+            self.events = []
 
         async def acquire(self, _state, _role):
             raise RoleOwnershipError("saved agent tab is offline", code="role_offline")
 
-        async def reopen(self, current, logical_role, *, require_clean_ready=True):
+        async def reopen(
+            self,
+            current,
+            logical_role,
+            *,
+            require_clean_ready=True,
+            foreground=True,
+        ):
             record = current["roles"][logical_role]
             self.reopened_url = record["page_url"]
             self.required_clean_ready = require_clean_ready
+            self.foreground = foreground
+            self.events.append(("reopen", require_clean_ready, foreground))
             return AcquiredRole(
-                client=SimpleNamespace(),
+                client=SimpleNamespace(
+                    wait_until_clean_ready=self.wait_until_clean_ready
+                ),
                 page_id=record["page_id"],
                 url=record["page_url"],
                 created=True,
                 new_chat=False,
             )
+
+        async def wake(self, acquired):
+            self.wake_calls.append(acquired)
+            self.events.append(("wake", acquired.url))
+
+        async def wait_until_clean_ready(self, *, timeout_ms):
+            self.events.append(("clean_ready", timeout_ms))
+            return SimpleNamespace()
 
     if trigger_type == "manual":
         persisted = store.update_independent_agent(
@@ -322,7 +344,15 @@ def test_completed_job_closes_after_one_minute_and_next_trigger_reopens_saved_ur
     reopen_actions = ReopenActions()
     asyncio.run(worker._pre_send(running, _active_hop(running), reopen_actions))
     assert reopen_actions.reopened_url == saved_page_url
-    assert reopen_actions.required_clean_ready is True
+    assert reopen_actions.required_clean_ready is False
+    assert reopen_actions.foreground is False
+    assert len(reopen_actions.wake_calls) == 1
+    assert reopen_actions.wake_calls[0].url == saved_page_url
+    assert reopen_actions.events == [
+        ("reopen", False, False),
+        ("wake", saved_page_url),
+        ("clean_ready", round(worker.config.workspace_timeout_seconds * 1000)),
+    ]
     assert _active_hop(running)["state"] == "sending"
 
 def test_board_uses_operator_labels_run_task_and_restored_settings():

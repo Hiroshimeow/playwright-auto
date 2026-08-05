@@ -315,7 +315,8 @@ def test_locate_owned_sets_active_lifecycle_on_only_the_selected_page(tmp_path, 
     assert owned.front is False
     assert other.front is False
     assert context.lifecycle_calls == [
-        (owned, "Page.setWebLifecycleState", {"state": "active"}, "task-1", "new-team")
+        (owned, "Page.setWebLifecycleState", {"state": "active"}, "task-1", "new-team"),
+        (owned, "Emulation.setFocusEmulationEnabled", {"enabled": True}, "task-1", "new-team"),
     ]
     assert context.detached_sessions == 1
 
@@ -365,7 +366,8 @@ def test_terminal_team_reuse_rebinds_without_new_chat(tmp_path, monkeypatch):
     assert page.snapshot_value.page_team == "new-team"
     assert page.front is False
     assert context.lifecycle_calls == [
-        (page, "Page.setWebLifecycleState", {"state": "active"}, "task-1", "new-team")
+        (page, "Page.setWebLifecycleState", {"state": "active"}, "task-1", "new-team"),
+        (page, "Emulation.setFocusEmulationEnabled", {"enabled": True}, "task-1", "new-team"),
     ]
     assert context.detached_sessions == 1
 
@@ -431,7 +433,14 @@ def test_recorded_offline_role_requires_controlled_reopen(tmp_path, monkeypatch)
             {"state": "active"},
             "task-1",
             "new-team",
-        )
+        ),
+        (
+            reopened.client.page,
+            "Emulation.setFocusEmulationEnabled",
+            {"enabled": True},
+            "task-1",
+            "new-team",
+        ),
     ]
     assert actions.browser_context.detached_sessions == 1
 
@@ -526,3 +535,49 @@ def test_reopen_accepted_waiting_skips_clean_composer_requirement(tmp_path, monk
 
     assert reopened.url == "https://chatgpt.com/c/exact-conversation"
     assert reopened.client.clean_ready_calls == []
+
+
+def test_automatic_reopen_stays_background_until_explicit_wake(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    monkeypatch.setattr(
+        actions_module,
+        "random_delay",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+    actions = CDPATabActions(FakeContext(), config)
+    state = manifest(
+        page_id="closed-page",
+        page_url="https://chatgpt.com/c/exact-conversation",
+        conversation_url="https://chatgpt.com/c/exact-conversation",
+    )
+
+    reopened = asyncio.run(
+        actions.reopen(
+            state,
+            "PLAN",
+            require_clean_ready=False,
+            foreground=False,
+        )
+    )
+
+    assert reopened.client.page.front is False
+    assert actions.browser_context.lifecycle_calls == []
+
+    asyncio.run(actions.wake(reopened))
+    assert actions.browser_context.lifecycle_calls == [
+        (
+            reopened.client.page,
+            "Page.setWebLifecycleState",
+            {"state": "active"},
+            "task-1",
+            "new-team",
+        ),
+        (
+            reopened.client.page,
+            "Emulation.setFocusEmulationEnabled",
+            {"enabled": True},
+            "task-1",
+            "new-team",
+        ),
+    ]

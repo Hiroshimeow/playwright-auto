@@ -264,7 +264,7 @@ def load_cdpa_config(
         response_timeout_seconds=float(_positive(response.get("timeout_seconds", 7200), "response.timeout_seconds")),
         response_refresh_after_seconds=float(_positive(response.get("refresh_after_seconds", 1200), "response.refresh_after_seconds")),
         response_stream_status_poll_seconds=_bounded_float(
-            response.get("stream_status_poll_seconds", 3.0),
+            response.get("stream_status_poll_seconds", 10.0),
             "response.stream_status_poll_seconds",
             minimum=0.2,
             maximum=60.0,
