@@ -2531,6 +2531,7 @@ class CDPAWorker:
         )
         hop["conversation_url"] = post_send.conversation_url or str(post_send.url)
         hop["receipt"] = output["receipt"]
+        self._canonicalize_receipt_conversation_url(state, hop)
         hop["rendered_prompt_sha256"] = output["receipt"]["prompt_sha256"]
         hop["state"] = "sent"
         if files:
@@ -2622,7 +2623,26 @@ class CDPAWorker:
                 task_id=str(state["task_id"]),
             )
 
-    def _reconcile_hop_conversation_identity(self, hop: dict[str, Any]) -> None:
+    @staticmethod
+    def _canonicalize_receipt_conversation_url(
+        state: dict[str, Any], hop: dict[str, Any]
+    ) -> None:
+        payload = hop.get("receipt")
+        if not isinstance(payload, Mapping):
+            return
+        conversation_id = str(payload.get("conversation_id") or "").strip()
+        if not conversation_id:
+            return
+        exact_url = f"https://chatgpt.com/c/{conversation_id}"
+        hop["conversation_url"] = exact_url
+        role = str(hop.get("target_role") or "").upper()
+        role_record = state.get("roles", {}).get(role)
+        if isinstance(role_record, dict):
+            role_record["page_url"] = exact_url
+
+    def _reconcile_hop_conversation_identity(
+        self, state: dict[str, Any], hop: dict[str, Any]
+    ) -> None:
         ledger_path = hop.get("ledger_path")
         request_id = hop.get("request_id")
         hop_payload = hop.get("receipt")
@@ -2645,15 +2665,17 @@ class CDPAWorker:
         if hop_receipt.conversation_id is not None:
             if ledger_receipt.conversation_id != hop_receipt.conversation_id:
                 raise RuntimeError("durable conversation identity changed or disappeared")
-            return
-        if ledger_receipt.conversation_id is not None:
+        elif ledger_receipt.conversation_id is not None:
             hop["receipt"] = ledger_receipt.to_dict()
+        self._canonicalize_receipt_conversation_url(state, hop)
 
-    async def _flush_hop_conversation_identity(self, hop: dict[str, Any]) -> None:
+    async def _flush_hop_conversation_identity(
+        self, state: dict[str, Any], hop: dict[str, Any]
+    ) -> None:
         # Let an already-completed frontend response-body task publish its exact
         # ledger enrichment; never await the body task itself or any backend read.
         await asyncio.sleep(0)
-        self._reconcile_hop_conversation_identity(hop)
+        self._reconcile_hop_conversation_identity(state, hop)
 
     def _record_response(
         self,
@@ -2663,7 +2685,7 @@ class CDPAWorker:
         *,
         validation_error: str | None = None,
     ) -> None:
-        self._reconcile_hop_conversation_identity(hop)
+        self._reconcile_hop_conversation_identity(state, hop)
         hop["response"] = response.text
         hop["response_sha256"] = _sha(response.text)
         hop["response_record"] = response.to_dict()
@@ -2740,7 +2762,7 @@ class CDPAWorker:
             )
         except StableMalformedResponseError as exc:
             wait["recovery_baseline"] = None
-            await self._flush_hop_conversation_identity(hop)
+            await self._flush_hop_conversation_identity(state, hop)
             self._record_response(
                 state,
                 hop,
@@ -2764,7 +2786,7 @@ class CDPAWorker:
             )
             return True
         wait["recovery_baseline"] = None
-        await self._flush_hop_conversation_identity(hop)
+        await self._flush_hop_conversation_identity(state, hop)
         self._record_response(state, hop, response)
         return True
 
@@ -2889,7 +2911,7 @@ class CDPAWorker:
         transport_baseline: dict[str, Any] | None = None,
     ) -> None:
         self._start_wait_budget_from_sent(hop)
-        self._reconcile_hop_conversation_identity(hop)
+        self._reconcile_hop_conversation_identity(state, hop)
         receipt = SendReceipt.from_dict(hop["receipt"])
         if not receipt.conversation_id or not receipt.user_message_id:
             await self._waiting_dom(
@@ -3135,7 +3157,7 @@ class CDPAWorker:
         wait = hop["wait"]
         recover_incomplete_refresh(wait)
         self._start_wait_budget_from_sent(hop)
-        self._reconcile_hop_conversation_identity(hop)
+        self._reconcile_hop_conversation_identity(state, hop)
         receipt = SendReceipt.from_dict(hop["receipt"])
         snapshot = await self._waiting_snapshot(
             acquired.client,
@@ -3278,7 +3300,7 @@ class CDPAWorker:
             )
         except StableMalformedResponseError as exc:
             wait["recovery_baseline"] = None
-            await self._flush_hop_conversation_identity(hop)
+            await self._flush_hop_conversation_identity(state, hop)
             self._record_response(
                 state,
                 hop,
@@ -3316,7 +3338,7 @@ class CDPAWorker:
             )
             return
         wait["recovery_baseline"] = None
-        await self._flush_hop_conversation_identity(hop)
+        await self._flush_hop_conversation_identity(state, hop)
         self._record_response(state, hop, response)
 
     def _route_to_plan(
@@ -3894,7 +3916,7 @@ class CDPAWorker:
             response = None
         if response is not None:
             old_hop_id = state.get("active_hop_id")
-            await self._flush_hop_conversation_identity(hop)
+            await self._flush_hop_conversation_identity(state, hop)
             self._record_response(
                 state,
                 hop,
