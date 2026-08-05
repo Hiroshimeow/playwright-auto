@@ -169,7 +169,7 @@ textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; 
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  overscroll-behavior-y: contain;
+  overscroll-behavior-y: auto;
   overscroll-behavior-x: auto;
   scrollbar-gutter: stable;
   padding: .7rem;
