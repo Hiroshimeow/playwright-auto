@@ -329,6 +329,79 @@ def test_same_cadence_completion_consumes_current_interval_without_duplicate(
     assert [event["check_count"] for event in events] == [current_slot + 1]
 
 
+def test_manual_run_completion_keeps_interval_agent_enabled(tmp_path: Path):
+    config = load_cdpa_config(None, repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_independent_agent(
+        "Interval Manual Watcher",
+        system_prompt="Check periodically and on demand.",
+        task_id="agent-interval-manual-watcher-g1",
+        trigger_settings={"interval_minutes": 30, "check_all": True},
+    )
+    original_settings = dict(state["independent"]["trigger_settings"])
+    active = store.run_independent_now(
+        state["manifest_path"],
+        trigger_type="manual",
+        instruction="Run one explicit check now.",
+    )
+
+    def respond(current: dict) -> dict:
+        hop = next(
+            item
+            for item in current["hops"]
+            if item.get("hop_id") == current.get("active_hop_id")
+        )
+        hop["state"] = "responded"
+        hop["response"] = "Manual check complete."
+        hop["response_sha256"] = "c" * 64
+        return current
+
+    active = store.update(active["manifest_path"], respond)
+    completed = store.complete_independent_task(
+        active["manifest_path"], outcome="SUCCESS", summary="Manual check complete."
+    )
+
+    assert completed["independent"]["enabled"] is True
+    assert completed["status"] == "WAITING"
+    assert completed["waiting_code"] == "trigger"
+    assert completed["independent"]["trigger_settings"] == original_settings
+
+
+def test_manual_run_completion_pauses_nonrecurring_agent(tmp_path: Path):
+    config = load_cdpa_config(None, repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_independent_agent(
+        "One Shot Manual Agent",
+        system_prompt="Run only when explicitly requested.",
+        task_id="agent-one-shot-manual-g1",
+    )
+    active = store.run_independent_now(
+        state["manifest_path"],
+        trigger_type="manual",
+        instruction="Run once.",
+    )
+
+    def respond(current: dict) -> dict:
+        hop = next(
+            item
+            for item in current["hops"]
+            if item.get("hop_id") == current.get("active_hop_id")
+        )
+        hop["state"] = "responded"
+        hop["response"] = "One-shot check complete."
+        hop["response_sha256"] = "d" * 64
+        return current
+
+    active = store.update(active["manifest_path"], respond)
+    completed = store.complete_independent_task(
+        active["manifest_path"], outcome="SUCCESS", summary="One-shot check complete."
+    )
+
+    assert completed["independent"]["enabled"] is False
+    assert completed["status"] == "PAUSED"
+    assert completed["waiting"] is None
+
+
 def test_completion_reuses_long_lived_identity_and_conversation(tmp_path: Path):
     config = load_cdpa_config(None, repository_root=tmp_path)
     store = TaskStore(config)

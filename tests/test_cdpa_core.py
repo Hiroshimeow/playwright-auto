@@ -8,10 +8,11 @@ from pathlib import Path
 import pytest
 
 import playwright_auto.cdpa_store as store_module
+from playwright_auto.cdpa_bootstraps import normalize_bootstrap_record
 from playwright_auto.cdpa_config import CDPAConfigError, load_cdpa_config
 from playwright_auto.cdpa_projection import build_dashboard_actions
 from playwright_auto.cdpa_prompts import PromptBuilder
-from playwright_auto.cdpa_routes import RouteContractError, parse_route_response, validate_report
+from playwright_auto.cdpa_routes import RouteContractError, parse_route_response
 from playwright_auto.cdpa_store import TaskStore, effective_task_goal, task_goal_for_hop, utc_now
 from playwright_auto.cdpa_worker import CDPAWorker
 from playwright_auto.cdpa_team import (
@@ -59,6 +60,10 @@ def write_config(root: Path) -> Path:
         target.write_text(f"# {role}\nConstructor for {role}.\n", encoding="utf-8")
     (root / "prompts" / "cdpa" / "INDEPENDENT_RULE.md").write_text(
         "INDEPENDENT_AGENT_OPERATING_RULE\nAct directly and use explicit completion controls.\n",
+        encoding="utf-8",
+    )
+    (root / "prompts" / "cdpa" / "BASE_CONTEXT.md").write_text(
+        "TEST_BASE_CONTEXT\nRead AGENTS.md and LEARNING.md before fresh-context work.\n",
         encoding="utf-8",
     )
     (root / "prompts" / "cdpa" / "RESPONSE_GUIDE.md").write_text(
@@ -277,6 +282,62 @@ def test_workflow_role_subset_is_canonical_and_exact_team_reuse_inherits(tmp_pat
     assert set(store.load(legacy["manifest_path"])["roles"]) == set(config.roles)
 
 
+def test_task_bootstrap_snapshot_is_optional_immutable_and_validated(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    bootstrap = {
+        "bootstrap_id": "general-team-bootstrap",
+        "name": "General Team Bootstrap",
+        "description": "Reusable task-neutral context",
+        "conversation_id": "11111111-1111-4111-8111-111111111111",
+        "terminal_assistant_message_id": "22222222-2222-4222-8222-222222222222",
+        "enabled": True,
+        "tags": ["general"],
+        "created_at": "2026-08-06T00:00:00+00:00",
+        "updated_at": "2026-08-06T00:00:00+00:00",
+        "expires_at": None,
+        "last_verified_at": None,
+        "source_fingerprints": {},
+    }
+
+    fresh = store.create_task(
+        "fresh task", requested_team="fresh", task_id="task-bootstrap-fresh"
+    )
+    assert "bootstrap" not in fresh
+    assert all("context_source" not in role for role in fresh["roles"].values())
+
+    selected = store.create_task(
+        "bootstrapped task",
+        requested_team="bootstrapped",
+        task_id="task-bootstrap-selected",
+        bootstrap=bootstrap,
+    )
+    assert selected["bootstrap"] == normalize_bootstrap_record(bootstrap)
+    bootstrap["name"] = "Mutated caller value"
+    assert store.load(selected["manifest_path"])["bootstrap"]["name"] == "General Team Bootstrap"
+
+    with pytest.raises(ValueError, match="bootstrap"):
+        store.update(
+            selected["manifest_path"],
+            lambda current: {
+                **current,
+                "bootstrap": {**current["bootstrap"], "conversation_id": "WEB:invalid"},
+            },
+        )
+
+    with pytest.raises(ValueError, match="context_source"):
+        store.update(
+            fresh["manifest_path"],
+            lambda current: {
+                **current,
+                "roles": {
+                    **current["roles"],
+                    "PLAN": {**current["roles"]["PLAN"], "context_source": "bootstrap_native"},
+                },
+            },
+        )
+
+
 def _prompt_kwargs(config, tmp_path: Path, **overrides):
     value = {
         "task_title": "full task",
@@ -330,10 +391,8 @@ def test_constructor_is_once_per_generation_and_prompt_is_compact_allowlist(tmp_
     )
 
     assert first.text.startswith("alpha · role: plan\n{")
-    envelope_text = first.text.split("\n\n# PLAN", 1)[0].removeprefix(
-        "alpha · role: plan\n"
-    )
-    envelope = json.loads(envelope_text)
+    envelope_text = first.text.removeprefix("alpha · role: plan\n")
+    envelope, _ = json.JSONDecoder().raw_decode(envelope_text)
     assert envelope == {
         "title": "full task",
         "task-id": "task-a",
@@ -445,48 +504,30 @@ def test_exact_team_resume_preserves_identity_and_creation_still_allocates(tmp_p
 
 
 
-def test_route_contract_and_report_validation(tmp_path: Path):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    state = TaskStore(config).create_task("Task", requested_team="alpha", task_id="task-1")
-    report = tmp_path / ".plan" / "alpha" / "PLAN_turn1_task-1.md"
-    report.write_text("final report", encoding="utf-8")
-    decision = parse_route_response('{"route":"DEV","handoff":".plan/alpha/PLAN_turn1_task-1.md"}')
-    evidence = validate_report(
-        decision.handoff,
-        repository_root=tmp_path,
-        plans_root=config.plans_root,
-        team="alpha",
-        physical_role="PLAN",
-        turn=1,
-        task_id="task-1",
+def test_route_contract_validates_only_worker_owned_fields():
+    decision = parse_route_response(
+        '{"route":"DEV","handoff":".plan/remote-team/remote-plan_turn1_task-1.md"}',
+        source_role="PLAN",
+        allowed_routes=("PLAN", "DEV", "REVIEW", "DONE"),
     )
-    assert evidence.path == str(report.resolve())
-    assert evidence.size == len("final report")
-    assert len(evidence.sha256) == 64
-
-    real_report = report.with_name("real-report.md")
-    real_report.write_text("symlink target", encoding="utf-8")
-    report.unlink()
-    report.symlink_to(real_report)
-    with pytest.raises(RouteContractError, match="symlink"):
-        validate_report(
-            ".plan/alpha/PLAN_turn1_task-1.md",
-            repository_root=tmp_path,
-            plans_root=config.plans_root,
-            team="alpha",
-            physical_role="PLAN",
-            turn=1,
-            task_id="task-1",
-        )
+    assert decision.route == "DEV"
+    assert decision.handoff == ".plan/remote-team/remote-plan_turn1_task-1.md"
 
     for invalid in (
         '{"route":"DEV","handoff":"x","extra":true}',
         '{"route":"DEV","route":"PLAN","handoff":"x"}',
         'prose {"route":"DEV","handoff":"x"}',
+        '{"route":"DEV","handoff":"   "}',
     ):
         with pytest.raises(RouteContractError):
             parse_route_response(invalid)
 
+    with pytest.raises(RouteContractError, match="selected or unavailable"):
+        parse_route_response(
+            '{"route":"TEST","handoff":"x"}',
+            source_role="PLAN",
+            allowed_routes=("PLAN", "DEV", "DONE"),
+        )
     with pytest.raises(RouteContractError, match="PLAN"):
         parse_route_response('{"route":"DONE","handoff":"x"}', source_role="DEV")
 

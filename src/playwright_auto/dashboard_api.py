@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from .cdpa_bootstraps import BootstrapCatalog
 from .cdpa_commands import RepairRequest
 from .cdpa_config import CDPAConfig, load_cdpa_config
 from .cdpa_identity import generate_idempotent_task_id, validate_task_id
@@ -229,6 +230,7 @@ class DashboardAPI:
             "report_mode",
             "depends_on_task_ids",
             "upload_paths",
+            "bootstrap_id",
         }
         unknown = set(raw) - allowed
         if unknown:
@@ -260,6 +262,15 @@ class DashboardAPI:
         }
         if "roles" in raw:
             normalized["roles"] = self._workflow_roles(raw.get("roles"))
+        if "bootstrap_id" in raw and raw.get("bootstrap_id") is not None:
+            bootstrap_id = raw.get("bootstrap_id")
+            if not isinstance(bootstrap_id, str) or not bootstrap_id.strip():
+                raise APIError(
+                    400,
+                    "invalid_request",
+                    "bootstrap_id must be a non-empty string or null",
+                )
+            normalized["bootstrap_id"] = bootstrap_id
         return normalized
 
     def normalize_workflow_agent_create(
@@ -520,6 +531,29 @@ class DashboardAPI:
                 raise APIError(400, "invalid_request", "expected_task_version must be non-negative")
         return {"goal": goal}, expected
 
+    @staticmethod
+    def normalize_parent_removal(raw: Mapping[str, Any]) -> int:
+        if set(raw) != {"expected_task_version"}:
+            raise APIError(
+                400,
+                "invalid_request",
+                "parent removal requires only expected_task_version",
+            )
+        expected = raw.get("expected_task_version")
+        if isinstance(expected, bool) or not isinstance(expected, int):
+            raise APIError(
+                400,
+                "invalid_request",
+                "expected_task_version must be an integer",
+            )
+        if expected < 0:
+            raise APIError(
+                400,
+                "invalid_request",
+                "expected_task_version must be non-negative",
+            )
+        return expected
+
     def enqueue(
         self,
         *,
@@ -720,6 +754,35 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                 }
             )
             self._json(200, payload, headers={"ETag": etag})
+            return
+        if path == "/api/bootstraps":
+            entries = [
+                entry
+                for entry in BootstrapCatalog(app.config.repository_root).list()
+                if entry.get("enabled") is True
+            ]
+            items = [
+                {
+                    "bootstrap_id": entry["bootstrap_id"],
+                    "name": entry["name"],
+                    "description": entry["description"],
+                    "tags": list(entry.get("tags") or ()),
+                }
+                for entry in entries
+            ]
+            default_id = next(
+                (
+                    item["bootstrap_id"]
+                    for item in items
+                    if item["bootstrap_id"] == "general-team-bootstrap"
+                ),
+                None,
+            )
+            self._json(
+                200,
+                {"items": items, "default_id": default_id},
+                headers={"Cache-Control": "no-store"},
+            )
             return
         if path == "/api/agents":
             snapshot = db.get_snapshot("agents")
@@ -957,7 +1020,23 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                     payload=payload,
                 )
             else:
-                if len(parts) == 4 and parts[:2] == ["api", "tasks"] and parts[3] == "goal":
+                if (
+                    len(parts) == 6
+                    and parts[:2] == ["api", "tasks"]
+                    and parts[3] == "parents"
+                    and parts[5] == "remove"
+                ):
+                    task_id = validate_task_id(parts[2])
+                    parent_task_id = validate_task_id(parts[4])
+                    expected = app.normalize_parent_removal(raw)
+                    command = app.enqueue(
+                        idempotency_key=key,
+                        kind="remove_parent_dependency",
+                        task_id=task_id,
+                        expected_task_version=expected,
+                        payload={"parent_task_id": parent_task_id},
+                    )
+                elif len(parts) == 4 and parts[:2] == ["api", "tasks"] and parts[3] == "goal":
                     task_id = validate_task_id(parts[2])
                     payload, expected = app.normalize_goal_change(raw)
                     command = app.enqueue(

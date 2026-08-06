@@ -7,13 +7,19 @@ import pytest
 from pathlib import Path
 from types import SimpleNamespace
 
+import playwright_auto.cdpa_worker as worker_module
 from playwright_auto.cdpa_commands import RepairRequest, WorkerCommand
 from playwright_auto.cdpa_config import load_cdpa_config
 from playwright_auto.cdpa_store import TaskStore
 from playwright_auto.cdpa_worker import _active_hop
+from playwright_auto.durable import RequestLedger
 
 from test_cdpa_core import write_config
-from test_cdpa_worker import setup_task
+from test_cdpa_worker import (
+    _enable_backend_wait_identity,
+    _prepare_sent_waiting_task,
+    setup_task,
+)
 
 
 def block_task(store: TaskStore, state: dict, *, hop_state: str = "pre_send") -> dict:
@@ -97,6 +103,118 @@ def test_hold_for_repair_atomically_gates_same_existing_task(tmp_path: Path):
 
 
 
+
+
+def test_repair_gate_preserves_accepted_send_and_prevents_browser_actions(
+    tmp_path: Path,
+    monkeypatch,
+):
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-held-accepted-send"
+    )
+    state, hop, receipt = _enable_backend_wait_identity(
+        store,
+        state,
+        path,
+        hop,
+        receipt,
+        conversation_id="conversation-held",
+    )
+    hop["wait"].update(
+        completion_mode="dom_fallback",
+        backend_fallback_category="graph_not_ready",
+        refresh_count=1,
+        activity_signature="semantic-signature",
+        activity_length=607,
+        terminal_continuation_unresolved={
+            "request_id": hop["request_id"],
+            "started_at": "2026-08-05T19:00:00+00:00",
+            "refresh_baseline": 0,
+            "block_ready_at": "2026-08-05T19:00:30+00:00",
+        },
+    )
+    state.update(
+        status="BLOCKED",
+        kanban_column="BLOCKED",
+        active_action="blocked",
+        block_code="terminal_continuation_unresolved",
+        block_reason="terminal continuation did not materialize",
+        block_retryable=False,
+    )
+    state = store.save(path, state)
+    before_hop = json.loads(json.dumps(_active_hop(state)))
+    before_record = RequestLedger(before_hop["ledger_path"]).get(
+        before_hop["request_id"]
+    )
+    assert before_record is not None
+    assert before_record.attempts == 1
+
+    result = store.create_or_gate_repair(
+        repair_request(state, "HOLD_FOR_REPAIR")
+    )
+    held = store.load(path)
+
+    assert held["status"] == "WAITING"
+    assert held["repair_wait"]["state"] == "WAITING"
+    assert _active_hop(held) == before_hop
+    assert held["active_hop_id"] == before_hop["hop_id"]
+    assert before_hop["request_id"] == held["repair_wait"]["preserved_request_id"]
+    assert before_hop["receipt"]["conversation_id"] == "conversation-held"
+    assert before_hop["receipt"]["user_message_id"] == receipt.user_message_id
+    assert before_hop["receipt"]["user_turn_id"] == receipt.user_turn_id
+    assert before_hop["wait"]["activity_length"] == 607
+    assert before_hop["wait"]["terminal_continuation_unresolved"][
+        "refresh_baseline"
+    ] == 0
+    held_record = RequestLedger(before_hop["ledger_path"]).get(before_hop["request_id"])
+    assert held_record is not None
+    assert held_record.attempts == 1
+    assert held_record.receipt == before_record.receipt
+    assert not any(
+        item.get("action") == "resume" for item in held.get("controls") or []
+    )
+
+    def browser_actions_forbidden(*_args, **_kwargs):
+        raise AssertionError("repair-held task must not construct browser actions")
+
+    monkeypatch.setattr(worker_module, "CDPATabActions", browser_actions_forbidden)
+    observed = asyncio.run(worker.advance(path, object()))
+    assert observed is not None
+    assert observed["status"] == "WAITING"
+    assert _active_hop(observed) == before_hop
+
+    repair_path = Path(result["repair"]["manifest_path"])
+
+    def finish(current: dict) -> dict:
+        current.update(
+            status="DONE",
+            terminal_state="DONE",
+            kanban_column="DONE_STOPPED",
+            active_action="done",
+            active_role=None,
+            active_hop_id=None,
+        )
+        return current
+
+    store.update(repair_path, finish)
+    released, changed = store.refresh_scheduling(
+        path,
+        tasks=store.discover_with_errors()[0],
+    )
+
+    assert changed is True
+    assert released["status"] == "RUNNING"
+    assert released["repair_wait"]["state"] == "RELEASED"
+    assert _active_hop(released) == before_hop
+    released_record = RequestLedger(before_hop["ledger_path"]).get(
+        before_hop["request_id"]
+    )
+    assert released_record is not None
+    assert released_record.attempts == 1
+    assert released_record.receipt == before_record.receipt
+    assert not any(
+        item.get("action") == "resume" for item in released.get("controls") or []
+    )
 
 
 def test_continue_in_parallel_creates_repair_without_dependency_gate(tmp_path: Path):

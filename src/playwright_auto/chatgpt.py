@@ -1196,9 +1196,8 @@ def response_activity_signature(
 ) -> tuple[str, int]:
     assistants = new_assistant_turns(snapshot.messages, baseline)
     latest = assistants[-1] if assistants else None
-    activity_text = str(getattr(snapshot, "response_activity_text", "") or "")
-    activity_structure = str(
-        getattr(snapshot, "response_activity_structure", "") or ""
+    activity_text = normalize_visible_text(
+        getattr(snapshot, "response_activity_text", "")
     )
     activity_turn_id = str(
         getattr(snapshot, "response_activity_turn_id", "") or ""
@@ -1208,19 +1207,12 @@ def response_activity_signature(
         int(getattr(snapshot, "response_activity_length", 0) or 0),
         len(activity_text),
     )
-    state = getattr(snapshot, "state", ChatGPTState.UNKNOWN)
-    state_value = state.value if isinstance(state, ChatGPTState) else str(state)
     payload = "\0".join(
         (
             message_fingerprint(latest),
-            str(length),
             activity_turn_id,
-            activity_text,
-            activity_structure,
-            state_value,
-            "1" if bool(getattr(snapshot, "stop_visible", False)) else "0",
-            "\n".join(tuple(getattr(snapshot, "error_texts", ()) or ())),
-            "\n".join(tuple(getattr(snapshot, "blocking_dialogs", ()) or ())),
+            str(length),
+            activity_text[-160:],
         )
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest(), length

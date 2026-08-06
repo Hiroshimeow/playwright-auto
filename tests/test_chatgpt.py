@@ -1,14 +1,179 @@
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
+from playwright_auto.cdpa_response import (
+    begin_refresh,
+    observe_response_activity,
+    refresh_due,
+    start_wait_budget,
+)
 from playwright_auto.chatgpt import (
+    ChatGPTSnapshot,
     ChatGPTState,
+    MessageBaseline,
     MessageSnapshot,
     classify_chatgpt_state,
     extract_session_id,
     recent_assistant_messages,
     recent_assistant_turns,
+    response_activity_signature,
     validate_page_role,
 )
+
+
+def _activity_snapshot(
+    *,
+    activity_text: str,
+    activity_length: int,
+    activity_turn_id: str = "turn-active",
+    activity_structure: str = "bounded",
+    messages=(),
+    state: ChatGPTState = ChatGPTState.RESPONDING,
+    stop_visible: bool = True,
+    error_texts=(),
+    blocking_dialogs=(),
+) -> ChatGPTSnapshot:
+    return ChatGPTSnapshot(
+        url="https://chatgpt.com/c/activity",
+        session_id="activity",
+        page_id="page-activity",
+        page_role="PLAN",
+        page_task_id="task-activity",
+        page_team="activity",
+        state=state,
+        requires_login=False,
+        composer_present=True,
+        composer_editable=True,
+        composer_text="",
+        send_visible=False,
+        send_enabled=False,
+        stop_visible=stop_visible,
+        blocking_dialogs=tuple(blocking_dialogs),
+        attachment_markers=(),
+        error_texts=tuple(error_texts),
+        messages=tuple(messages),
+        response_activity_text=activity_text,
+        response_activity_structure=activity_structure,
+        response_activity_turn_id=activity_turn_id,
+        response_activity_length=activity_length,
+    )
+
+
+def test_response_activity_signature_is_canonical_across_probe_representations():
+    full_text = "prefix-" + ("x" * 600)
+    baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
+    lightweight = _activity_snapshot(
+        activity_text=full_text[-160:],
+        activity_length=len(full_text),
+        activity_structure=f"bounded:{len(full_text)}",
+        state=ChatGPTState.RESPONDING,
+        stop_visible=True,
+        error_texts=("temporary transport notice",),
+    )
+    full = _activity_snapshot(
+        activity_text=full_text,
+        activity_length=len(full_text),
+        activity_structure="tool-call:finished>tool-result:finished",
+        state=ChatGPTState.ERROR,
+        stop_visible=False,
+        blocking_dialogs=("representation-only dialog",),
+    )
+
+    lightweight_signature, lightweight_length = response_activity_signature(
+        lightweight, baseline
+    )
+    full_signature, full_length = response_activity_signature(full, baseline)
+
+    assert lightweight_signature == full_signature
+    assert lightweight_length == full_length == len(full_text)
+
+
+def test_alternating_probe_representations_do_not_extend_no_progress_budget():
+    start = datetime(2026, 8, 5, 18, 0, tzinfo=timezone.utc)
+    full_text = "y" * 607
+    baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
+    signatures = [
+        response_activity_signature(
+            _activity_snapshot(
+                activity_text=full_text[-160:],
+                activity_length=len(full_text),
+                activity_structure=f"bounded:{len(full_text)}",
+            ),
+            baseline,
+        ),
+        response_activity_signature(
+            _activity_snapshot(
+                activity_text=full_text,
+                activity_length=len(full_text),
+                activity_structure="full DOM tool structure",
+                state=ChatGPTState.ERROR,
+                stop_visible=False,
+            ),
+            baseline,
+        ),
+    ]
+    wait = {}
+    start_wait_budget(wait, timeout_seconds=7200, now=start)
+
+    assert observe_response_activity(
+        wait,
+        signature=signatures[0][0],
+        length=signatures[0][1],
+        now=start + timedelta(minutes=1),
+    )
+    changed_at = wait["activity_changed_at"]
+    assert not observe_response_activity(
+        wait,
+        signature=signatures[1][0],
+        length=signatures[1][1],
+        now=start + timedelta(minutes=10),
+    )
+    assert wait["activity_changed_at"] == changed_at
+    assert refresh_due(
+        wait,
+        refresh_after_seconds=1200,
+        now=start + timedelta(minutes=21),
+    )
+    begin_refresh(wait, now=start + timedelta(minutes=21))
+    assert not refresh_due(
+        wait,
+        refresh_after_seconds=1200,
+        now=start + timedelta(minutes=21, seconds=1),
+    )
+
+
+@pytest.mark.parametrize(
+    "progressed",
+    [
+        _activity_snapshot(
+            activity_text="stable output plus one token",
+            activity_length=28,
+        ),
+        _activity_snapshot(
+            activity_text="stable output",
+            activity_length=13,
+            activity_turn_id="turn-next",
+        ),
+        _activity_snapshot(
+            activity_text="stable output",
+            activity_length=13,
+            messages=(
+                MessageSnapshot(
+                    "assistant", "assistant-1", "assistant-turn-1", "new assistant text", ()
+                ),
+            ),
+        ),
+    ],
+)
+def test_response_activity_signature_changes_only_for_semantic_progress(progressed):
+    baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
+    stable = _activity_snapshot(activity_text="stable output", activity_length=13)
+
+    stable_signature, _ = response_activity_signature(stable, baseline)
+    progressed_signature, _ = response_activity_signature(progressed, baseline)
+
+    assert progressed_signature != stable_signature
 
 
 def test_extract_session_id_from_supported_routes():

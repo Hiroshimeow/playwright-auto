@@ -14,7 +14,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from .cdpa_actions import AcquiredRole, CDPATabActions, RoleOwnershipError, TeamCloseError
+from .cdpa_actions import (
+    AcquiredRole,
+    BranchBootstrapError,
+    CDPATabActions,
+    RoleOwnershipError,
+    TeamCloseError,
+)
+from .cdpa_bootstraps import BootstrapCatalog
 from .cdpa_commands import (
     RepairRequest,
     WorkerCommand,
@@ -63,7 +70,6 @@ from .cdpa_routes import (
     expected_report_relative,
     materialize_inline_report,
     parse_role_response,
-    validate_report,
 )
 from .cdpa_store import (
     TaskStore,
@@ -112,6 +118,7 @@ from .durable import RequestLedger, RequestStatus
 from .durable_blocks import DurableSendBlock
 from .upload import UploadIdentityChangedError, UploadReceipt, collect_file_identities
 from .workflow import WorkflowContext
+from .workspace import ChatGPTWorkspace
 
 TERMINAL = frozenset({"DONE", "STOPPED"})
 IN_FLIGHT = frozenset({"sending", "sent", "waiting"})
@@ -134,6 +141,10 @@ _RATE_LIMIT_DEFERRED_COMMANDS = frozenset(
 
 class IneffectiveControlError(RuntimeError):
     """The primitive ran, but its required operational postcondition did not hold."""
+
+
+class BootstrapUIBranchError(RuntimeError):
+    """The bounded semantic UI bootstrap branch failed before Send."""
 
 
 def _active_hop(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -1677,6 +1688,25 @@ class CDPAWorker:
                     "before": command_snapshot(baseline, role=role),
                     "after": None,
                 }
+                if self.store.enforce_dependency_barrier(
+                    state,
+                    scheduling_tasks or (),
+                ):
+                    result = {
+                        "outcome": "applied",
+                        "action": "wait_dependency",
+                        "reason_code": "dependency_barrier",
+                        "reason": (
+                            "Resume cleared the operator recovery state, but unfinished "
+                            "dependencies keep this task waiting."
+                        ),
+                        "next_safe_action": (
+                            "Complete or remove the exact unfinished parent dependency."
+                        ),
+                        "postcondition": "waiting_dependency",
+                        "before": command_snapshot(baseline, role=role),
+                        "after": command_snapshot(state, role=role),
+                    }
             elif action == "retry":
                 if state.get("status") != "BLOCKED":
                     raise RuntimeError("Retry is valid only for a BLOCKED task")
@@ -1916,8 +1946,6 @@ class CDPAWorker:
                         or "manual route to PLAN"
                     ),
                     kind="control",
-                    allow_active_plan=False,
-                    require_retained_report=False,
                 )
             elif action == "clear_team":
                 cleanup = state.setdefault("cleanup", {})
@@ -2077,7 +2105,11 @@ class CDPAWorker:
                 if persisted_result is not None:
                     persisted_result.append(True)
             return True
-        if action == "resume" and not is_independent_task(state):
+        if (
+            action == "resume"
+            and not is_independent_task(state)
+            and str(state.get("status") or "").upper() != "WAITING"
+        ):
             control["status"] = "recovering"
             control["command_state"] = "RUNNING"
             control["result"] = result
@@ -2238,6 +2270,312 @@ class CDPAWorker:
         options["report_mode"] = "file"
         return True
 
+    async def _acquire_existing_role(
+        self,
+        state: dict[str, Any],
+        role: str,
+        actions: CDPATabActions,
+    ) -> AcquiredRole | None:
+        try:
+            return await actions.acquire(state, role)
+        except RoleOwnershipError as exc:
+            if _role_ownership_block_code(exc) != "role_offline":
+                raise
+            _, expected_conversation, _, _ = self._active_recovery_context(state, role)
+            if expected_conversation is None:
+                raise
+            return await self._recover_active_role(state, role, actions)
+        except UnsafePageStateError as exc:
+            if str(exc).strip().casefold() != "page is already responding":
+                raise
+            acquired = await actions.locate_owned(state, role)
+            if acquired is None:
+                raise RoleOwnershipError(
+                    "active response page disappeared during pre-send reconciliation"
+                ) from exc
+            state["active_action"] = "reconcile_page_response"
+            try:
+                await acquired.client.wait_until_clean_ready(
+                    timeout_ms=min(
+                        3_000,
+                        max(500, int(self.config.worker_poll_seconds * 1000)),
+                    ),
+                    poll_ms=100,
+                )
+            except TimeoutError:
+                return None
+            try:
+                return await actions.acquire(state, role)
+            except UnsafePageStateError as retry_exc:
+                if str(retry_exc).strip().casefold() == "page is already responding":
+                    state["active_action"] = "reconcile_page_response"
+                    return None
+                raise
+
+    async def _branch_from_bootstrap_ui(
+        self,
+        state: Mapping[str, Any],
+        role: str,
+        actions: CDPATabActions,
+        bootstrap: Mapping[str, Any],
+    ) -> AcquiredRole:
+        role_record = state["roles"][role]
+        physical = str(role_record["physical_role"])
+        task_id = str(state["task_id"])
+        team = str(state["team"])
+        conversation_id = str(bootstrap["conversation_id"])
+        message_id = str(bootstrap["terminal_assistant_message_id"])
+        source_url = f"https://chatgpt.com/c/{conversation_id}"
+        timeout_ms = round(self.config.workspace_timeout_seconds * 1000)
+        page = None
+        try:
+            page = await actions.browser_context.new_page()
+            await page.goto(source_url, wait_until="domcontentloaded", timeout=timeout_ms)
+            assistant = page.locator(
+                f'[data-message-author-role="assistant"][data-message-id="{message_id}"]'
+            ).first
+            await assistant.wait_for(state="visible", timeout=timeout_ms)
+            turn = assistant.locator(
+                "xpath=ancestor::section[starts-with(@data-testid, 'conversation-turn-')][1]"
+            )
+            await turn.hover()
+            await turn.get_by_role("button", name="More actions", exact=True).click()
+            await page.get_by_role(
+                "menuitem", name="Branch in new chat", exact=True
+            ).click()
+            await page.wait_for_url(
+                lambda url: str(url).split("?", 1)[0].rstrip("/") != source_url,
+                wait_until="domcontentloaded",
+                timeout=timeout_ms,
+            )
+            workspace = ChatGPTWorkspace()
+            client = await workspace.bind(
+                physical,
+                page,
+                timeout_ms=timeout_ms,
+                force_new_page_id=True,
+            )
+            await client.wait_until_clean_ready(timeout_ms=timeout_ms)
+            await client.bind_task_identity(task_id, team)
+            snapshot = await client.assert_ownership()
+            binding = client.binding
+            if (
+                binding is None
+                or str(snapshot.page_id or "") != binding.page_id
+                or str(snapshot.page_role or "") != physical
+                or str(snapshot.page_task_id or "") != task_id
+                or str(snapshot.page_team or "") != team
+            ):
+                raise BootstrapUIBranchError(
+                    "UI bootstrap branch target ownership did not persist"
+                )
+            return AcquiredRole(
+                client=client,
+                page_id=binding.page_id,
+                url=str(snapshot.url),
+                created=True,
+                new_chat=True,
+            )
+        except Exception as exc:
+            if page is not None and not page.is_closed():
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+            if isinstance(exc, BootstrapUIBranchError):
+                raise
+            raise BootstrapUIBranchError(
+                f"UI bootstrap branch failed: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    def _wait_for_bootstrap_repair(
+        self,
+        state: dict[str, Any],
+        bootstrap: Mapping[str, Any],
+    ) -> None:
+        bootstrap_id = str(bootstrap.get("bootstrap_id") or "")
+        waiting = {
+            "reason": "bootstrap",
+            "waiting_on": [],
+            "stopped": [],
+            "missing": [],
+            "since": utc_now(),
+            "bootstrap_id": bootstrap_id,
+            "bootstrap_repair_event_key": None,
+        }
+        state.update(
+            status="WAITING",
+            kanban_column="WAITING",
+            active_action="waiting_bootstrap_repair",
+            waiting_code="bootstrap_repair",
+            waiting_reason=(
+                f"Bootstrap {bootstrap_id!r} is unavailable; waiting for Bootstrap Keeper renewal"
+            ),
+            waiting=waiting,
+            block_code=None,
+            block_retryable=False,
+            block_reason=None,
+            pause_reason=None,
+        )
+        try:
+            discovered = self.store.discover()
+        except Exception as exc:
+            waiting["bootstrap_repair_error"] = sanitize_text(
+                f"Bootstrap Keeper discovery failed: {type(exc).__name__}: {exc}",
+                max_chars=500,
+            )
+            return
+        keepers = [
+            item
+            for item in discovered
+            if is_independent_task(item)
+            and str(item.get("team") or "") == "agent-bootstrap-keeper"
+            and item.get("independent", {}).get("deleted_at") is None
+        ]
+        if len(keepers) != 1:
+            waiting["bootstrap_repair_error"] = (
+                "Bootstrap Keeper is unavailable"
+                if not keepers
+                else "Bootstrap Keeper identity is ambiguous"
+            )
+            return
+        keeper = keepers[0]
+        independent = keeper.get("independent")
+        if not isinstance(independent, Mapping) or independent.get("enabled") is not True:
+            waiting["bootstrap_repair_error"] = "Bootstrap Keeper is disabled"
+            return
+        active_event = independent.get("active_event")
+        if isinstance(active_event, Mapping):
+            waiting["bootstrap_repair_error"] = "Bootstrap Keeper is already running"
+            return
+        if str(keeper.get("status") or "").upper() != "WAITING":
+            waiting["bootstrap_repair_error"] = "Bootstrap Keeper is not idle"
+            return
+        try:
+            activated = self.store.run_independent_now(
+                keeper["manifest_path"],
+                trigger_type="manual",
+                instruction=(
+                    f"Selected workflow {state['task_id']} exhausted native and semantic UI "
+                    f"branching before Send for {bootstrap_id}. Force one bounded renewal under "
+                    "the saved Keeper contract even if the old anchor later probes healthy; "
+                    "publish only after candidate branch-health verification and preserve the "
+                    "previous stable pointer on failure."
+                ),
+            )
+        except Exception as exc:
+            waiting["bootstrap_repair_error"] = sanitize_text(
+                f"{type(exc).__name__}: {exc}", max_chars=500
+            )
+            return
+        event = activated.get("independent", {}).get("active_event")
+        if isinstance(event, Mapping):
+            waiting["bootstrap_repair_event_key"] = event.get("event_key")
+        self._publish_command_state(activated)
+
+    def _release_bootstrap_repair_wait(
+        self,
+        path: Path,
+        state: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        if (
+            str(state.get("status") or "").upper() != "WAITING"
+            or state.get("waiting_code") != "bootstrap_repair"
+        ):
+            return dict(state), False
+        bootstrap = state.get("bootstrap")
+        if not isinstance(bootstrap, Mapping):
+            return dict(state), False
+        bootstrap_id = str(bootstrap.get("bootstrap_id") or "")
+        try:
+            renewed = BootstrapCatalog(self.config.repository_root).get(bootstrap_id)
+        except Exception:
+            return dict(state), False
+        if renewed is None or renewed.get("enabled") is not True or not renewed.get("last_verified_at"):
+            return dict(state), False
+        old_anchor = (
+            str(bootstrap.get("conversation_id") or ""),
+            str(bootstrap.get("terminal_assistant_message_id") or ""),
+        )
+        new_anchor = (
+            str(renewed.get("conversation_id") or ""),
+            str(renewed.get("terminal_assistant_message_id") or ""),
+        )
+        if old_anchor == new_anchor:
+            return dict(state), False
+
+        def release(current: dict[str, Any]) -> dict[str, Any]:
+            if (
+                str(current.get("status") or "").upper() != "WAITING"
+                or current.get("waiting_code") != "bootstrap_repair"
+            ):
+                return current
+            current_bootstrap = current.get("bootstrap")
+            if not isinstance(current_bootstrap, Mapping):
+                return current
+            if (
+                str(current_bootstrap.get("conversation_id") or ""),
+                str(current_bootstrap.get("terminal_assistant_message_id") or ""),
+            ) != old_anchor:
+                return current
+            hop = _active_hop(current)
+            if hop.get("receipt") is not None or str(hop.get("state") or "") != "pre_send":
+                return current
+            role = str(current.get("active_role") or "PLAN").upper()
+            current["bootstrap"] = dict(renewed)
+            current["status"] = "RUNNING"
+            current["kanban_column"] = _column_for(role)
+            current["active_action"] = "queued"
+            current["waiting_code"] = None
+            current["waiting_reason"] = None
+            current["waiting"] = None
+            return current
+
+        saved = self.store.update(path, release)
+        return saved, saved != state
+
+    async def _acquire_workflow_role(
+        self,
+        state: dict[str, Any],
+        role: str,
+        actions: CDPATabActions,
+    ) -> AcquiredRole | None:
+        bootstrap = state.get("bootstrap")
+        role_record = state["roles"][role]
+        first_allocation = (
+            isinstance(bootstrap, Mapping)
+            and not role_record.get("page_id")
+            and not role_record.get("page_url")
+            and int(role_record.get("conversation_generation") or 0) == 0
+            and role_record.get("context_source") is None
+        )
+        if not first_allocation:
+            return await self._acquire_existing_role(state, role, actions)
+
+        owned = await actions.locate_owned(state, role)
+        if owned is not None:
+            return owned
+        try:
+            acquired = await actions.branch_from_anchor(
+                state,
+                role,
+                source_conversation_id=str(bootstrap["conversation_id"]),
+                assistant_message_id=str(bootstrap["terminal_assistant_message_id"]),
+            )
+            role_record["context_source"] = "bootstrap_native"
+            return acquired
+        except BranchBootstrapError:
+            pass
+        try:
+            acquired = await self._branch_from_bootstrap_ui(
+                state, role, actions, bootstrap
+            )
+            role_record["context_source"] = "bootstrap_ui"
+            return acquired
+        except BootstrapUIBranchError:
+            self._wait_for_bootstrap_repair(state, bootstrap)
+            return None
+
     async def _pre_send(
         self,
         state: dict[str, Any],
@@ -2261,46 +2599,9 @@ class CDPAWorker:
             independent["new_chat_next_job"] = False
             independent["new_chat_deferred_task_id"] = None
         else:
-            try:
-                acquired = await actions.acquire(state, role)
-            except RoleOwnershipError as exc:
-                if _role_ownership_block_code(exc) != "role_offline":
-                    raise
-                _, expected_conversation, _, _ = self._active_recovery_context(
-                    state, role
-                )
-                if expected_conversation is None:
-                    raise
-                acquired = await self._recover_active_role(state, role, actions)
-            except UnsafePageStateError as exc:
-                if str(exc).strip().casefold() != "page is already responding":
-                    raise
-                acquired = await actions.locate_owned(state, role)
-                if acquired is None:
-                    raise RoleOwnershipError(
-                        "active response page disappeared during pre-send reconciliation"
-                    ) from exc
-                state["active_action"] = "reconcile_page_response"
-                try:
-                    await acquired.client.wait_until_clean_ready(
-                        timeout_ms=min(
-                            3_000,
-                            max(500, int(self.config.worker_poll_seconds * 1000)),
-                        ),
-                        poll_ms=100,
-                    )
-                except TimeoutError:
-                    return
-                try:
-                    acquired = await actions.acquire(state, role)
-                except UnsafePageStateError as retry_exc:
-                    if (
-                        str(retry_exc).strip().casefold()
-                        == "page is already responding"
-                    ):
-                        state["active_action"] = "reconcile_page_response"
-                        return
-                    raise
+            acquired = await self._acquire_workflow_role(state, role, actions)
+            if acquired is None:
+                return
         self._record_acquired(state, role, acquired)
         role_record = state["roles"][role]
         generation = int(role_record.get("conversation_generation") or 0)
@@ -2357,6 +2658,12 @@ class CDPAWorker:
             else None
         )
         workflow_definitions = task_workflow_definitions(state, self.config)
+        workflow_definition = workflow_definitions[role]
+        bootstrap_inherited = (
+            bool(workflow_definition["is_system"])
+            and role_record.get("context_source") in {"bootstrap_native", "bootstrap_ui"}
+            and generation == 1
+        )
         allowed_routes = tuple(workflow_definitions) + ("DONE",)
         if hop.get("kind") == "route_repair":
             prompt = self.prompts.repair(
@@ -2387,7 +2694,9 @@ class CDPAWorker:
                 ),
                 conversation_generation=generation,
                 report_mode=_report_mode(state),
-                constructor_text=str(workflow_definitions[role]["system_prompt"]),
+                constructor_text=str(workflow_definition["system_prompt"]),
+                is_system_role=bool(workflow_definition["is_system"]),
+                bootstrap_inherited=bootstrap_inherited,
             )
             prompt = built.text
             included = built.constructor_included
@@ -2602,26 +2911,13 @@ class CDPAWorker:
                 raise ValueError("independent response must not be empty")
             return
         role = str(hop["target_role"])
-        parsed = parse_role_response(
+        parse_role_response(
             response.text,
             source_role=role,
             report_mode=_report_mode(state),
             allowed_routes=tuple(task_workflow_definitions(state, self.config))
             + ("DONE",),
         )
-        if parsed.inline_report is None:
-            report_repository, report_plans_root = _workflow_report_roots(
-                self.config, state
-            )
-            validate_report(
-                parsed.decision.handoff,
-                repository_root=report_repository,
-                plans_root=report_plans_root,
-                team=str(state["team"]),
-                physical_role=str(hop["physical_role"]),
-                turn=int(hop["turn"]),
-                task_id=str(state["task_id"]),
-            )
 
     @staticmethod
     def _canonicalize_receipt_conversation_url(
@@ -2894,6 +3190,17 @@ class CDPAWorker:
         wait = hop["wait"]
         wait["completion_mode"] = "dom_fallback"
         wait["backend_fallback_category"] = category
+        if category == "graph_not_ready":
+            unresolved = wait.get("terminal_continuation_unresolved")
+            if not isinstance(unresolved, Mapping) or unresolved.get("request_id") != str(
+                hop["request_id"]
+            ):
+                wait["terminal_continuation_unresolved"] = {
+                    "request_id": str(hop["request_id"]),
+                    "started_at": now.isoformat(),
+                    "refresh_baseline": int(wait.get("refresh_count") or 0),
+                    "block_ready_at": None,
+                }
         acquired = await self._ensure_backend_wait_source(state, hop, actions, receipt)
         if acquired is None:
             return
@@ -3183,6 +3490,41 @@ class CDPAWorker:
             composer_empty=snapshot.composer_empty,
             manual_input_pending=snapshot.manual_input_pending,
         )
+        unresolved = wait.get("terminal_continuation_unresolved")
+        unresolved_complete = (
+            isinstance(unresolved, dict)
+            and wait.get("backend_fallback_category") == "graph_not_ready"
+            and unresolved.get("request_id") == str(hop["request_id"])
+        )
+        unresolved_refresh_used = bool(
+            unresolved_complete
+            and int(wait.get("refresh_count") or 0)
+            > int(unresolved.get("refresh_baseline") or 0)
+        )
+        unresolved_block_ready_at = (
+            parse_time(unresolved.get("block_ready_at"))
+            if unresolved_complete
+            else None
+        )
+        if (
+            unresolved_refresh_used
+            and unresolved_block_ready_at is not None
+            and datetime.now(timezone.utc) >= unresolved_block_ready_at
+        ):
+            if await self._final_response_reconciliation(
+                state, hop, acquired, receipt, wait
+            ):
+                return
+            self._block(
+                state,
+                (
+                    "backend reported COMPLETE, but no terminal assistant continuation "
+                    "materialized after one bounded refresh"
+                ),
+                code="terminal_continuation_unresolved",
+                retryable=False,
+            )
+            return
         remaining = remaining_timeout_ms(wait)
         refreshed_this_cycle = False
         should_refresh = refresh_due(
@@ -3191,6 +3533,12 @@ class CDPAWorker:
             composer_empty=snapshot.composer_empty,
             manual_input_pending=snapshot.manual_input_pending,
         )
+        if unresolved_complete:
+            should_refresh = bool(
+                not unresolved_refresh_used
+                and snapshot.composer_empty
+                and not snapshot.manual_input_pending
+            )
         if remaining <= 0 or should_refresh:
             if await self._final_response_reconciliation(
                 state, hop, acquired, receipt, wait
@@ -3218,6 +3566,12 @@ class CDPAWorker:
                 composer_empty=snapshot.composer_empty,
                 manual_input_pending=snapshot.manual_input_pending,
             )
+            if unresolved_complete:
+                should_refresh = bool(
+                    not unresolved_refresh_used
+                    and snapshot.composer_empty
+                    and not snapshot.manual_input_pending
+                )
             if remaining <= 0:
                 self._block(
                     state,
@@ -3237,6 +3591,11 @@ class CDPAWorker:
                     receipt.baseline,
                 ),
             )
+            if unresolved_complete:
+                unresolved["block_ready_at"] = (
+                    datetime.now(timezone.utc)
+                    + timedelta(seconds=_DOM_FALLBACK_SETTLE_SECONDS)
+                ).isoformat()
             begin_refresh(wait)
             self._persist_transport_result(manifest_path, refresh_baseline, state)
             refresh_baseline = json.loads(
@@ -3348,23 +3707,19 @@ class CDPAWorker:
         *,
         reason: str,
         kind: str,
-        allow_active_plan: bool,
-        require_retained_report: bool,
     ) -> dict[str, int]:
         if state.get("status") in TERMINAL:
             raise RuntimeError("cannot route a terminal task to PLAN")
         if str(hop.get("state") or "") in IN_FLIGHT:
             raise RuntimeError("cannot route to PLAN across an in-flight send boundary")
         source_role = str(state.get("active_role") or hop.get("target_role") or "PLAN")
-        if source_role == "PLAN" and not allow_active_plan:
+        if source_role == "PLAN":
             raise RuntimeError("PLAN is already the active role")
         retained_reports = [
             item
             for item in state.get("reports") or []
             if isinstance(item, Mapping) and str(item.get("path") or "").strip()
         ]
-        if require_retained_report and not retained_reports:
-            raise RuntimeError("no retained report is available for PLAN continuation")
         next_handoff = (
             str(retained_reports[-1]["path"])
             if retained_reports
@@ -3394,59 +3749,6 @@ class CDPAWorker:
         )
         return {"old_hop_id": old_hop_id, "new_hop_id": int(new_hop["hop_id"])}
 
-    @staticmethod
-    def _operator_lifecycle_recovery_pending(state: Mapping[str, Any]) -> bool:
-        if str(state.get("status") or "").upper() != "RUNNING":
-            return True
-        if str((state.get("cleanup") or {}).get("state") or "ACTIVE") != "ACTIVE":
-            return True
-        return any(
-            isinstance(item, Mapping)
-            and item.get("origin") == "operator"
-            and item.get("status") == "requested"
-            and item.get("action")
-            in {"pause", "stop", "clear_team", "restart_role", "new_chat"}
-            for item in state.get("controls") or []
-        )
-
-    def _is_identical_missing_file_repair(
-        self,
-        state: Mapping[str, Any],
-        hop: Mapping[str, Any],
-        error: Exception,
-        decision: Any,
-    ) -> bool:
-        if (
-            _report_mode(state) != "file"
-            or str(error) != "report file does not exist"
-            or decision is None
-            or hop.get("kind") != "route_repair"
-            or str(decision.handoff) != str(hop.get("expected_report_path") or "")
-        ):
-            return False
-        parent_id = hop.get("parent_hop_id")
-        parent = next(
-            (
-                item
-                for item in state.get("hops") or []
-                if isinstance(item, Mapping) and item.get("hop_id") == parent_id
-            ),
-            None,
-        )
-        return bool(
-            isinstance(parent, Mapping)
-            and parent.get("target_role") == hop.get("target_role")
-            and parent.get("physical_role") == hop.get("physical_role")
-            and parent.get("turn") == hop.get("turn")
-            and parent.get("expected_report_path") == hop.get("expected_report_path")
-            and conversation_identity(parent.get("conversation_url"))
-            == conversation_identity(hop.get("conversation_url"))
-            and parent.get("response_sha256") == hop.get("response_sha256")
-            and parent.get("validation_error") == "report file does not exist"
-            and parent.get("validation_route") == decision.route
-            and parent.get("validation_handoff") == decision.handoff
-        )
-
     def _repair_route(
         self,
         state: dict[str, Any],
@@ -3461,51 +3763,6 @@ class CDPAWorker:
         if decision is not None:
             hop["validation_route"] = decision.route
             hop["validation_handoff"] = decision.handoff
-        if self._is_identical_missing_file_repair(state, hop, error, decision):
-            if self._operator_lifecycle_recovery_pending(state):
-                return
-            hops_by_id = {
-                item.get("hop_id"): item
-                for item in state.get("hops") or []
-                if isinstance(item, Mapping) and isinstance(item.get("hop_id"), int)
-            }
-            ancestor_id = hop.get("parent_hop_id")
-            visited: set[int] = set()
-            fallback_exhausted = False
-            while isinstance(ancestor_id, int) and ancestor_id not in visited:
-                visited.add(ancestor_id)
-                ancestor = hops_by_id.get(ancestor_id)
-                if not isinstance(ancestor, Mapping):
-                    break
-                if ancestor.get("kind") == "missing_file_fallback":
-                    fallback_exhausted = True
-                    break
-                ancestor_id = ancestor.get("parent_hop_id")
-            retained_report = any(
-                isinstance(item, Mapping) and str(item.get("path") or "").strip()
-                for item in state.get("reports") or []
-            )
-            if fallback_exhausted or not retained_report:
-                self._block(
-                    state,
-                    (
-                        "valid route report could not be materialized after bounded PLAN recovery"
-                        if fallback_exhausted
-                        else "valid route report could not be materialized and no retained report exists"
-                    ),
-                    code="report_materialization_unavailable",
-                    retryable=False,
-                )
-                return
-            self._route_to_plan(
-                state,
-                hop,
-                reason="identical missing file report repeated after one route repair",
-                kind="missing_file_fallback",
-                allow_active_plan=True,
-                require_retained_report=True,
-            )
-            return
         attempt = int(hop.get("repair_attempt") or 0) + 1
         if attempt > self.config.route_repair_attempts:
             self._block(
@@ -3561,7 +3818,6 @@ class CDPAWorker:
         role = str(hop["target_role"])
         response_mode = _report_mode(state)
         legacy_inline = response_mode == "inline"
-        report_repository, report_plans_root = _workflow_report_roots(self.config, state)
         decision = None
         try:
             parsed = parse_role_response(
@@ -3577,17 +3833,14 @@ class CDPAWorker:
                     f"route {decision.route!r} is not selected for this task"
                 )
             if parsed.inline_report is None:
-                evidence = validate_report(
-                    decision.handoff,
-                    repository_root=report_repository,
-                    plans_root=report_plans_root,
-                    team=str(state["team"]),
-                    physical_role=str(hop["physical_role"]),
-                    turn=int(hop["turn"]),
-                    task_id=str(state["task_id"]),
-                )
                 routed_handoff = decision.handoff
+                report_path = decision.handoff
+                report_sha256 = None
+                report_size = None
             else:
+                report_repository, report_plans_root = _workflow_report_roots(
+                    self.config, state
+                )
                 try:
                     evidence = materialize_inline_report(
                         parsed.inline_report,
@@ -3604,6 +3857,9 @@ class CDPAWorker:
                         "legacy inline report materialization failed"
                     ) from exc
                 routed_handoff = str(hop["expected_report_path"])
+                report_path = evidence.path
+                report_sha256 = evidence.sha256
+                report_size = evidence.size
         except InlineReportMaterializationError:
             self._block(
                 state,
@@ -3627,16 +3883,19 @@ class CDPAWorker:
         self._complete_request_response(hop)
         hop.update(
             {
-                "report_path": evidence.path,
-                "report_sha256": evidence.sha256,
-                "report_size": evidence.size,
+                "report_path": report_path,
+                "report_sha256": report_sha256,
+                "report_size": report_size,
                 "route": decision.route,
                 "state": "routed",
             }
         )
         hop["timestamps"]["routed_at"] = utc_now()
         if not any(
-            item.get("path") == evidence.path and item.get("sha256") == evidence.sha256
+            item.get("path") == report_path
+            and item.get("role") == role
+            and item.get("physical_role") == hop["physical_role"]
+            and item.get("turn") == hop["turn"]
             for item in state.get("reports") or []
             if isinstance(item, Mapping)
         ):
@@ -3646,9 +3905,9 @@ class CDPAWorker:
                     "role": role,
                     "physical_role": hop["physical_role"],
                     "turn": hop["turn"],
-                    "path": evidence.path,
-                    "sha256": evidence.sha256,
-                    "size": evidence.size,
+                    "path": report_path,
+                    "sha256": report_sha256,
+                    "size": report_size,
                     "created_at": utc_now(),
                 }
             )
@@ -3658,7 +3917,7 @@ class CDPAWorker:
                 "hop_id": hop["hop_id"],
                 "source_role": role,
                 "route": decision.route,
-                "report_path": evidence.path,
+                "report_path": report_path,
             }
         )
         state["roles"][role]["status"] = "idle"
@@ -4427,7 +4686,10 @@ class CDPAWorker:
                         tasks=scheduling_tasks,
                         state=loaded_state,
                     )
-                    if scheduling_changed:
+                    state, bootstrap_released = self._release_bootstrap_repair_wait(
+                        path, state
+                    )
+                    if scheduling_changed or bootstrap_released:
                         self._remember_manifest(path, state)
                 except Exception as exc:
                     failure_baseline = self._load_manifest_cached(path, force=True)
@@ -5128,6 +5390,17 @@ class CDPAWorker:
             for task in tasks
         ]
         self.store.validate_repository_integrity(records)
+        if not read_only:
+            reconciled_tasks: list[dict[str, Any]] = []
+            scheduling_snapshot = list(tasks)
+            for task in tasks:
+                reconciled, _changed = self.store.refresh_scheduling(
+                    task["manifest_path"],
+                    tasks=scheduling_snapshot,
+                    state=dict(task),
+                )
+                reconciled_tasks.append(reconciled)
+            tasks = reconciled_tasks
         latest_independent: dict[str, Mapping[str, Any]] = {}
         runtime_tasks: list[Mapping[str, Any]] = []
         for task in tasks:
@@ -5370,6 +5643,23 @@ class CDPAWorker:
             if len(revisions) != 1 or revisions[0].get("goal") != payload.get("goal"):
                 raise RuntimeError("change-goal command provenance does not match its payload")
             return state
+        if kind == "remove_parent_dependency":
+            events = [
+                item
+                for item in state.get("dependency_events") or []
+                if isinstance(item, Mapping)
+                and item.get("status") == "PARENT_REMOVED"
+                and item.get("external_command_id") == command_id
+            ]
+            if (
+                len(events) != 1
+                or events[0].get("parent_task_id")
+                != payload.get("parent_task_id")
+            ):
+                raise RuntimeError(
+                    "parent-removal command provenance does not match its payload"
+                )
+            return state
         if kind == "create_task":
             if (
                 str(state.get("task_id") or "") != task_id
@@ -5388,6 +5678,19 @@ class CDPAWorker:
                     raise RuntimeError(
                         "create command role provenance does not match its payload"
                     )
+            requested_bootstrap_id = (
+                str(payload.get("bootstrap_id") or "") or None
+            )
+            snapshot = state.get("bootstrap")
+            snapshot_bootstrap_id = (
+                str(snapshot.get("bootstrap_id") or "")
+                if isinstance(snapshot, Mapping)
+                else None
+            )
+            if requested_bootstrap_id != snapshot_bootstrap_id:
+                raise RuntimeError(
+                    "create command bootstrap provenance does not match its payload"
+                )
             return state
         if kind not in {"task_control", "resume_team"}:
             return None
@@ -5497,6 +5800,20 @@ class CDPAWorker:
                         raise ValueError(f"task_id already exists without command provenance: {task_id}")
                     state = existing
                 else:
+                    bootstrap = None
+                    if "bootstrap_id" in payload:
+                        bootstrap_id = str(payload.get("bootstrap_id") or "")
+                        bootstrap = BootstrapCatalog(self.config.repository_root).get(
+                            bootstrap_id
+                        )
+                        if bootstrap is None:
+                            raise ValueError(
+                                f"requested bootstrap does not exist: {bootstrap_id}"
+                            )
+                        if bootstrap.get("enabled") is not True:
+                            raise ValueError(
+                                f"requested bootstrap is disabled: {bootstrap_id}"
+                            )
                     state = self.store.create_task(
                         str(payload.get("task") or ""),
                         requested_team=payload.get("requested_team"),
@@ -5513,6 +5830,7 @@ class CDPAWorker:
                         report_mode=str(payload.get("report_mode") or "file"),
                         depends_on_task_ids=tuple(payload.get("depends_on_task_ids") or ()),
                         upload_paths=tuple(payload.get("upload_paths") or ()),
+                        bootstrap=bootstrap,
                         external_command_id=command_id,
                     )
                 self._publish_command_state(state)
@@ -5781,6 +6099,25 @@ class CDPAWorker:
                     "status": state.get("status"),
                     "goal_revision": len(state.get("goal_revisions") or []),
                 }
+            elif kind == "remove_parent_dependency":
+                if task_id is None:
+                    raise ValueError("remove_parent_dependency requires task_id")
+                current = self._command_task_state(task_id)
+                if current is None:
+                    raise ValueError(f"task does not exist: {task_id}")
+                state = self.store.remove_parent_dependency(
+                    current["manifest_path"],
+                    str(payload.get("parent_task_id") or ""),
+                    external_command_id=command_id,
+                )
+                self._publish_command_state(state)
+                result = {
+                    "task_id": task_id,
+                    "status": state.get("status"),
+                    "depends_on_task_ids": list(
+                        state.get("depends_on_task_ids") or []
+                    ),
+                }
             elif kind == "resume_team":
                 state = self.store.resume_team(
                     str(payload.get("team") or ""),
@@ -5824,6 +6161,7 @@ class CDPAWorker:
                 kinds=(
                     "create_task",
                     "change_goal",
+                    "remove_parent_dependency",
                     "create_workflow_agent",
                     "update_workflow_agent",
                     "delete_workflow_agent",
@@ -5854,6 +6192,7 @@ class CDPAWorker:
         browser_safe_commands = (
             "create_task",
             "change_goal",
+            "remove_parent_dependency",
             "create_workflow_agent",
             "update_workflow_agent",
             "delete_workflow_agent",

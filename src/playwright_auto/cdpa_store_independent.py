@@ -880,13 +880,10 @@ class IndependentAgentStoreMixin:
             result=completion,
             reason=reason,
         )
-        trigger_type = str(event.get("trigger_type") or "").strip().lower()
         if not preserve_enabled and disposition == "COMPLETED":
-            independent["enabled"] = bool(independent.get("enabled")) and trigger_type in {
-                "recovery",
-                "interval",
-                "check_all",
-            }
+            settings = validate_trigger_settings(independent.get("trigger_settings"))
+            recurring = settings["recovery"] or settings["interval_minutes"] is not None
+            independent["enabled"] = bool(independent.get("enabled")) and recurring
         independent.update(
             active_event=None,
             cycle=0,

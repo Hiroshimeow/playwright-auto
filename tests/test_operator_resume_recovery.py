@@ -167,26 +167,20 @@ def test_resume_consumes_existing_stable_response_without_another_send(
 
 
 
-def test_resume_missing_file_response_enters_route_repair_without_replay(
-    tmp_path: Path, monkeypatch
-):
+def test_resume_routes_path_only_response_without_replay(tmp_path: Path, monkeypatch):
     store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-resume-missing-file"
+        tmp_path, task_id="task-resume-path-only"
     )
     hop["conversation_url"] = "https://chatgpt.com/c/exact"
     state["roles"]["PLAN"]["page_url"] = hop["conversation_url"]
     state = store.save(path, state)
     hop = _active_hop(state)
+    handoff = ".plan/windows-team/windows-plan_turn1_task-resume-path-only.md"
     response = MessageSnapshot(
         "assistant",
-        "a-missing-file",
-        "ta-missing-file",
-        json.dumps(
-            {
-                "route": "TEST",
-                "handoff": str(hop["expected_report_path"]),
-            }
-        ),
+        "a-path-only",
+        "ta-path-only",
+        json.dumps({"route": "TEST", "handoff": handoff}),
         (),
     )
     snapshot = _accepted_snapshot(receipt, response=response)
@@ -211,11 +205,8 @@ def test_resume_missing_file_response_enters_route_repair_without_replay(
             return snapshot
 
         async def wait_for_response(self, _receipt, **kwargs):
-            try:
-                kwargs["candidate_validator"](response)
-            except Exception as exc:
-                raise StableMalformedResponseError(response, exc) from exc
-            raise AssertionError("missing report must fail candidate validation")
+            kwargs["candidate_validator"](response)
+            return response
 
         async def send(self, *_args, **_kwargs):
             self.send_calls += 1
@@ -223,7 +214,7 @@ def test_resume_missing_file_response_enters_route_repair_without_replay(
 
         async def retry_generation(self, *_args, **_kwargs):
             self.retry_calls += 1
-            raise AssertionError("stable malformed response must not trigger Retry")
+            raise AssertionError("accepted response must not trigger Retry or Regenerate")
 
     client = Client()
     acquired = AcquiredRole(client, receipt.binding.page_id, snapshot.url, False, False)
@@ -239,7 +230,7 @@ def test_resume_missing_file_response_enters_route_repair_without_replay(
 
     control = recovered["controls"][-1]
     completed = recovered["hops"][0]
-    repair = _active_hop(recovered)
+    child = _active_hop(recovered)
     record = RequestLedger(completed["ledger_path"]).get(original["request_id"])
 
     assert control["status"] == "applied"
@@ -247,11 +238,15 @@ def test_resume_missing_file_response_enters_route_repair_without_replay(
     assert control["result"]["action"] == "consume_response"
     assert control["result"]["postcondition"] == "hop_advanced"
     assert completed["response"] == response.text
-    assert completed["validation_error"] == "report file does not exist"
+    assert completed.get("validation_error") is None
     assert completed["state"] == "routed"
-    assert repair["kind"] == "route_repair"
-    assert repair["target_role"] == "PLAN"
-    assert repair["parent_hop_id"] == completed["hop_id"]
+    assert completed["report_path"] == handoff
+    assert completed["report_sha256"] is None
+    assert completed["report_size"] is None
+    assert child["kind"] == "handoff"
+    assert child["target_role"] == "TEST"
+    assert child["parent_hop_id"] == completed["hop_id"]
+    assert child["handoff"] == handoff
     assert client.send_calls == 0
     assert client.retry_calls == 0
     assert record is not None

@@ -493,6 +493,22 @@ def test_create_task_sections_summary_validation_and_agent_panel_dismissal_are_e
     assert 'data-workflow-agent-select' in html
     assert 'renderTriggerChoices' in app
 
+def test_create_task_bootstrap_select_load_submit_and_detail_are_explicit():
+    html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+    app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
+
+    assert html.count('select name="bootstrap_id"') == 1
+    assert "None / Fresh context" in html
+    assert '"/api/bootstraps"' in app
+    assert "loadBootstrapOptions" in app
+    assert "data.default_id" in app
+    assert "body.bootstrap_id" in app
+    assert "renderBootstrapContext" in app
+    assert "bootstrap_context" in app
+    assert "conversation_id" not in app
+    assert "terminal_assistant_message_id" not in app
+
+
 def test_create_task_role_selection_defaults_and_reuse_lock_are_explicit():
     html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
     app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
@@ -509,6 +525,18 @@ def test_create_task_role_selection_defaults_and_reuse_lock_are_explicit():
     assert "applyReuseRoleSelection" in actions
     assert "item.roles" in actions
     assert 'input.disabled = locked || input.value === "PLAN"' in actions
+
+
+def test_parent_dependencies_render_exact_remove_actions_through_shared_command_path():
+    app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
+    detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
+    assert 'detail.depends_on_task_ids' in detail
+    assert '"Remove parent"' in detail
+    assert 'dataset.removeParent' in detail
+    assert '[data-remove-parent]' in app
+    assert '/parents/${encodeURIComponent(parentTaskId)}/remove' in app
+    assert 'kind: "remove_parent_dependency"' in app
+    assert 'expected_task_version' in app
 
 
 def test_change_goal_ui_contract_is_running_only_and_uses_shared_command_path():

@@ -8,6 +8,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from playwright_auto.cdpa_bootstraps import BootstrapCatalog
 from playwright_auto.cdpa_config import load_cdpa_config
 from playwright_auto.cdpa_projection import TaskProjection
 from playwright_auto.cdpa_runtime_db import RuntimeDB
@@ -114,6 +115,87 @@ def test_api_module_has_no_taskstore_worker_or_browser_imports():
     )
 
 
+def test_bootstrap_api_filters_anchor_ids_and_create_payload_is_optional(tmp_path: Path):
+    _config, db, server, thread = start_api(tmp_path)
+    catalog = BootstrapCatalog(tmp_path)
+    base = {
+        "name": "General Team Bootstrap",
+        "description": "Reusable task-neutral context",
+        "conversation_id": "11111111-1111-4111-8111-111111111111",
+        "terminal_assistant_message_id": "22222222-2222-4222-8222-222222222222",
+        "tags": ["general"],
+        "created_at": "2026-08-06T00:00:00+00:00",
+        "updated_at": "2026-08-06T00:00:00+00:00",
+        "expires_at": None,
+        "last_verified_at": None,
+        "source_fingerprints": {},
+    }
+    catalog.upsert({**base, "bootstrap_id": "general-team-bootstrap", "enabled": True})
+    catalog.upsert(
+        {
+            **base,
+            "bootstrap_id": "disabled-bootstrap",
+            "name": "Disabled",
+            "conversation_id": "33333333-3333-4333-8333-333333333333",
+            "terminal_assistant_message_id": "44444444-4444-4444-8444-444444444444",
+            "enabled": False,
+        }
+    )
+    try:
+        status, _headers, body = request(server, "GET", "/api/bootstraps")
+        assert status == 200
+        payload = json.loads(body)
+        assert payload == {
+            "items": [
+                {
+                    "bootstrap_id": "general-team-bootstrap",
+                    "name": "General Team Bootstrap",
+                    "description": "Reusable task-neutral context",
+                    "tags": ["general"],
+                }
+            ],
+            "default_id": "general-team-bootstrap",
+        }
+        serialized = body.decode()
+        assert base["conversation_id"] not in serialized
+        assert base["terminal_assistant_message_id"] not in serialized
+
+        common = {"task": "bootstrap payload", "repository": str(tmp_path)}
+        status, _headers, data = request(
+            server,
+            "POST",
+            "/api/tasks",
+            body={**common, "bootstrap_id": "general-team-bootstrap"},
+            headers={"Idempotency-Key": "bootstrap-payload"},
+        )
+        assert status == 202
+        command = db.get_command(json.loads(data)["command_id"])
+        assert command["payload"]["bootstrap_id"] == "general-team-bootstrap"
+
+        status, _headers, data = request(
+            server,
+            "POST",
+            "/api/tasks",
+            body={**common, "task": "fresh payload", "bootstrap_id": None},
+            headers={"Idempotency-Key": "fresh-payload"},
+        )
+        assert status == 202
+        assert "bootstrap_id" not in db.get_command(json.loads(data)["command_id"])["payload"]
+
+        for index, invalid in enumerate(("", "   ", 7, [], {})):
+            status, _headers, _data = request(
+                server,
+                "POST",
+                "/api/tasks",
+                body={**common, "task": f"invalid bootstrap {index}", "bootstrap_id": invalid},
+                headers={"Idempotency-Key": f"invalid-bootstrap-{index}"},
+            )
+            assert status == 400
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
 def test_agents_api_etag_and_workflow_catalog_commands(tmp_path: Path):
     _config, db, server, thread = start_api(tmp_path)
     workflow = [
@@ -185,6 +267,44 @@ def test_agents_api_etag_and_workflow_catalog_commands(tmp_path: Path):
         command = db.get_command(json.loads(body)["command_id"])
         assert command["kind"] == "delete_workflow_agent"
         assert command["payload"] == {"route_key": "WF_123456789ABC"}
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_remove_parent_api_requires_version_and_queues_exact_relationship(tmp_path: Path):
+    _config, db, server, thread = start_api(tmp_path)
+    try:
+        status, _headers, body = request(
+            server,
+            "POST",
+            "/api/tasks/task-a/parents/parent-b/remove",
+            body={"expected_task_version": 0},
+            headers={"Idempotency-Key": "remove-parent-b"},
+        )
+        assert status == 202
+        command = db.get_command(json.loads(body)["command_id"])
+        assert command["kind"] == "remove_parent_dependency"
+        assert command["task_id"] == "task-a"
+        assert command["expected_task_version"] == 0
+        assert command["payload"] == {"parent_task_id": "parent-b"}
+
+        invalid_versions = (
+            {},
+            {"expected_task_version": "0"},
+            {"expected_task_version": True},
+            {"expected_task_version": -1},
+        )
+        for index, invalid in enumerate(invalid_versions):
+            status, _headers, body = request(
+                server,
+                "POST",
+                "/api/tasks/task-a/parents/parent-c/remove",
+                body=invalid,
+                headers={"Idempotency-Key": f"remove-parent-invalid-{index}"},
+            )
+            assert status == 400
+            assert json.loads(body)["error"]["code"] == "invalid_request"
     finally:
         server.shutdown()
         thread.join(timeout=5)

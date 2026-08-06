@@ -11,9 +11,14 @@ from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
+from .cdpa_bootstraps import normalize_bootstrap_record
 from .cdpa_commands import RepairRequest, WorkerCommand, command_snapshot
 from .cdpa_config import CDPAConfig
-from .cdpa_dependencies import dependency_readiness, validate_new_dependencies
+from .cdpa_dependencies import (
+    DependencyReadiness,
+    dependency_readiness,
+    validate_new_dependencies,
+)
 from .cdpa_identity import generate_task_id
 from .cdpa_independent import (
     INDEPENDENT_COLUMN,
@@ -67,6 +72,7 @@ _TASK_STATUSES = frozenset({"INBOX", "WAITING", "RUNNING", "PAUSED", "BLOCKED", 
 _HOP_STATES = frozenset({"waiting_trigger", "pre_send", "sending", "sent", "waiting", "responded", "routed", "abandoned"})
 _CLEANUP_STATES = frozenset({"ACTIVE", "CLEARING", "CLEARED"})
 _MAINTENANCE_STATES = frozenset({"OPEN", "RUNNING", "SUSPENDED", "RESOLVED", "ESCALATED"})
+_BOOTSTRAP_CONTEXT_SOURCES = frozenset({"bootstrap_native", "bootstrap_ui", "fresh_fallback"})
 
 
 class TeamWorkExistsError(RuntimeError):
@@ -704,6 +710,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 "team_busy",
                 "dependency_team_busy",
                 "trigger",
+                "bootstrap",
             }:
                 return "waiting reason is invalid"
             for field in ("waiting_on", "stopped", "missing"):
@@ -831,6 +838,17 @@ class TaskStore(IndependentAgentStoreMixin):
                 if str(active_incident.get("state") or "").upper() not in {"OPEN", "RUNNING"}:
                     return "maintenance active incident must be OPEN or RUNNING"
 
+        bootstrap = state.get("bootstrap")
+        if bootstrap is not None:
+            if mode != TASK_MODE_WORKFLOW:
+                return "bootstrap snapshot is only valid for workflow tasks"
+            try:
+                normalized_bootstrap = normalize_bootstrap_record(bootstrap)
+            except ValueError as exc:
+                return f"bootstrap snapshot is invalid: {exc}"
+            if dict(bootstrap) != normalized_bootstrap:
+                return "bootstrap snapshot must be canonical"
+
         roles = state["roles"]
         if mode == TASK_MODE_INDEPENDENT:
             independent_error = validate_independent_object(state.get("independent"))
@@ -877,6 +895,12 @@ class TaskStore(IndependentAgentStoreMixin):
                 return f"role record {logical!r} has invalid status"
             if not isinstance(record.get("online"), bool):
                 return f"role record {logical!r} has invalid online flag"
+            context_source = record.get("context_source")
+            if context_source is not None:
+                if bootstrap is None:
+                    return f"role record {logical!r} context_source requires bootstrap snapshot"
+                if context_source not in _BOOTSTRAP_CONTEXT_SOURCES:
+                    return f"role record {logical!r} has invalid context_source"
             uploaded_generation = record.get("attachments_uploaded_generation")
             conversation_generation = record.get("conversation_generation")
             if uploaded_generation is not None and (
@@ -1718,6 +1742,124 @@ class TaskStore(IndependentAgentStoreMixin):
             self._write_catalog_unlocked(catalog)
             return saved, True
 
+    @staticmethod
+    def _is_dependency_waiting_state(state: Mapping[str, Any]) -> bool:
+        waiting = state.get("waiting")
+        waiting_reason = (
+            str(waiting.get("reason") or "")
+            if isinstance(waiting, Mapping)
+            else ""
+        )
+        return (
+            waiting_reason in {"dependency", "dependency_team_busy"}
+            or str(state.get("waiting_code") or "").startswith("dependency")
+            or str(state.get("active_action") or "").startswith("waiting_dependency")
+        )
+
+    @staticmethod
+    def _apply_dependency_barrier_state(
+        state: dict[str, Any],
+        readiness: DependencyReadiness,
+        *,
+        blocked_by_task_id: str | None = None,
+    ) -> bool:
+        if readiness.ready:
+            return False
+        waiting = (
+            state.get("waiting")
+            if isinstance(state.get("waiting"), Mapping)
+            else {}
+        )
+        team_waiting = blocked_by_task_id is not None
+        waiting_kind = "dependency_team_busy" if team_waiting else "dependency"
+        code = (
+            "dependency_team_busy"
+            if team_waiting
+            else "dependency_missing"
+            if readiness.missing
+            else "dependency_stopped"
+            if readiness.stopped
+            else "dependency"
+        )
+        blocked_ids = [*readiness.waiting_on, *readiness.missing]
+        reason = (
+            "Waiting for dependencies and exact-team ownership"
+            if team_waiting
+            else "Waiting for dependencies"
+        )
+        details = [*blocked_ids, *([blocked_by_task_id] if blocked_by_task_id else [])]
+        if details:
+            reason += ": " + ", ".join(details)
+        desired = {
+            "reason": waiting_kind,
+            "waiting_on": list(readiness.waiting_on),
+            "stopped": list(readiness.stopped),
+            "missing": list(readiness.missing),
+            "since": waiting.get("since") or utc_now(),
+        }
+        if team_waiting:
+            desired["blocked_by_task_id"] = blocked_by_task_id
+        unchanged = (
+            str(state.get("status") or "").upper() == "WAITING"
+            and state.get("kanban_column") == "WAITING"
+            and state.get("active_action")
+            == ("waiting_dependency_team" if team_waiting else "waiting_dependency")
+            and state.get("waiting_code") == code
+            and state.get("waiting_reason") == reason
+            and dict(waiting) == desired
+            and state.get("block_code") is None
+            and state.get("block_retryable") is False
+            and state.get("block_reason") is None
+            and state.get("pause_reason") is None
+        )
+        if unchanged:
+            return False
+        state.update(
+            status="WAITING",
+            kanban_column="WAITING",
+            active_action=(
+                "waiting_dependency_team" if team_waiting else "waiting_dependency"
+            ),
+            waiting_reason=reason,
+            waiting_code=code,
+            waiting=desired,
+            block_code=None,
+            block_retryable=False,
+            block_reason=None,
+            pause_reason=None,
+        )
+        state.pop("blocked_at", None)
+        state.pop("resume_column", None)
+        state.setdefault("dependency_events", []).append(
+            {
+                "at": utc_now(),
+                "status": "WAITING",
+                "message": reason,
+                "waiting_on": list(readiness.waiting_on),
+                "stopped": list(readiness.stopped),
+                "missing": list(readiness.missing),
+            }
+        )
+        return True
+
+    def enforce_dependency_barrier(
+        self,
+        state: dict[str, Any],
+        tasks: Sequence[Mapping[str, Any]],
+    ) -> bool:
+        if is_independent_task(state):
+            return False
+        status = str(state.get("status") or "").upper()
+        if status in TERMINAL or status == "PAUSED":
+            return False
+        dependencies = normalize_dependency_ids(state.get("depends_on_task_ids"))
+        if not dependencies:
+            return False
+        return self._apply_dependency_barrier_state(
+            state,
+            dependency_readiness(state, tasks),
+        )
+
     def refresh_scheduling(
         self,
         path: str | Path,
@@ -1738,28 +1880,47 @@ class TaskStore(IndependentAgentStoreMixin):
             status = str(current.get("status") or "").upper()
             if is_independent_task(current):
                 return current, False
-            if status in TERMINAL:
-                return current, False
-            if status != "WAITING":
+            if status in TERMINAL or status == "PAUSED":
                 return current, False
             dependencies = normalize_dependency_ids(current.get("depends_on_task_ids"))
+            dependency_waiting_origin = self._is_dependency_waiting_state(current)
             queue = current.get("queue")
             queue_pending = (
                 isinstance(queue, Mapping)
                 and queue.get("reuse_team") is True
                 and queue.get("released_at") is None
             )
-            if not queue_pending and not dependencies:
+            if (
+                not queue_pending
+                and not dependencies
+                and not (status == "WAITING" and dependency_waiting_origin)
+            ):
                 return current, False
             readiness = dependency_readiness(current, scheduling_tasks)
             next_state = json.loads(json.dumps(current, ensure_ascii=False))
             changed = False
+            if status != "WAITING":
+                changed = self.enforce_dependency_barrier(
+                    next_state,
+                    scheduling_tasks,
+                )
+                if not changed:
+                    return current, False
+                with exclusive_file_lock(self._lock_path(target)):
+                    latest = self._load_current_manifest_unlocked(target)
+                    if latest.get("updated_at") != current.get("updated_at"):
+                        raise ValueError("task changed while refreshing scheduling state")
+                    saved = self._save_unlocked(target, next_state)
+                self._catalog_saved_manifest_unlocked(saved)
+                return saved, True
             team = str(current.get("team") or "")
             current_id = str(current.get("task_id") or "")
             blocked_by: str | None = None
             selected_id: str | None = None
 
-            if status == "WAITING" and (queue_pending or dependencies):
+            if status == "WAITING" and (
+                queue_pending or dependencies or dependency_waiting_origin
+            ):
                 catalog = self._load_catalog_unlocked(reconcile=False)
                 exact_tasks = [
                     item
@@ -1797,6 +1958,8 @@ class TaskStore(IndependentAgentStoreMixin):
                 selected_id = (
                     str(ready_waiters[0].get("task_id") or "")
                     if ready_waiters
+                    else current_id
+                    if dependency_waiting_origin and readiness.ready
                     else None
                 )
                 blocked_by = barrier_id or (
@@ -1901,7 +2064,7 @@ class TaskStore(IndependentAgentStoreMixin):
                             }
                         )
                         changed = True
-            elif dependencies:
+            elif dependencies or dependency_waiting_origin:
                 waiting = (
                     current.get("waiting")
                     if isinstance(current.get("waiting"), Mapping)
@@ -2039,6 +2202,7 @@ class TaskStore(IndependentAgentStoreMixin):
         queue_blocked_by: str | None,
         now: str,
         workflow_agents: Mapping[str, Mapping[str, Any]] | None = None,
+        normalized_bootstrap: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         roles = {}
         for logical in workflow_roles:
@@ -2124,6 +2288,15 @@ class TaskStore(IndependentAgentStoreMixin):
         return {
             "schema_version": SCHEMA_VERSION,
             "task_mode": TASK_MODE_WORKFLOW,
+            **(
+                {
+                    "bootstrap": json.loads(
+                        json.dumps(dict(normalized_bootstrap), ensure_ascii=False)
+                    )
+                }
+                if normalized_bootstrap is not None
+                else {}
+            ),
             "manifest_path": str(target),
             "task_id": task_id,
             "task_title": text.splitlines()[0],
@@ -2339,6 +2512,7 @@ class TaskStore(IndependentAgentStoreMixin):
         replaces_task_id: str | None = None,
         replacement_incident_id: str | None = None,
         upload_paths: Sequence[str | Path] = (),
+        bootstrap: Mapping[str, Any] | None = None,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
         text = str(task).strip()
@@ -2360,6 +2534,9 @@ class TaskStore(IndependentAgentStoreMixin):
         normalized_replaces = _optional_nonempty_string(replaces_task_id, "replaces_task_id")
         normalized_incident = _optional_nonempty_string(
             replacement_incident_id, "replacement_incident_id"
+        )
+        normalized_bootstrap = (
+            normalize_bootstrap_record(bootstrap) if bootstrap is not None else None
         )
         if requested_team is not None and reuse_team is not None:
             raise ValueError("requested_team and reuse_team are mutually exclusive")
@@ -2582,6 +2759,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 queue_blocked_by=queue_blocked_by,
                 now=now,
                 workflow_agents=workflow_agent_snapshot,
+                normalized_bootstrap=normalized_bootstrap,
             )
             self._record_external_command(state, external_command_id)
             saved = self._save_unlocked(target, state)
@@ -4364,7 +4542,7 @@ class TaskStore(IndependentAgentStoreMixin):
         reason: str,
     ) -> dict[str, Any]:
         dependencies = list(normalize_dependency_ids(state.get("depends_on_task_ids")))
-        if not dependencies:
+        if not dependencies and not TaskStore._is_dependency_waiting_state(state):
             raise ValueError("task is not dependency-waiting")
         repair_wait = state.get("repair_wait")
         if (
@@ -4439,9 +4617,37 @@ class TaskStore(IndependentAgentStoreMixin):
                 }
             )
             return state
-        state["status"] = "INBOX"
-        state["kanban_column"] = "INBOX"
-        state["active_action"] = "queued"
+        active_hop = next(
+            (
+                item
+                for item in state.get("hops") or []
+                if isinstance(item, Mapping)
+                and item.get("hop_id") == state.get("active_hop_id")
+            ),
+            None,
+        )
+        hop_state = str(active_hop.get("state") or "") if active_hop else ""
+        if hop_state == "pre_send":
+            state["status"] = "INBOX"
+            state["kanban_column"] = "INBOX"
+            state["active_action"] = "queued"
+        else:
+            role = str(state.get("active_role") or "PLAN").upper()
+            state["status"] = "RUNNING"
+            state["kanban_column"] = (
+                "PLANNING"
+                if role == "PLAN"
+                else "WORKING"
+                if role == "DEV"
+                else "VERIFYING"
+            )
+            state["active_action"] = (
+                "observe_response"
+                if hop_state in {"sent", "waiting"}
+                else "process_response"
+                if hop_state == "responded"
+                else "resume_preserved_hop"
+            )
         state["waiting_reason"] = None
         state["waiting_code"] = None
         state["waiting"] = {
@@ -4459,6 +4665,11 @@ class TaskStore(IndependentAgentStoreMixin):
                 "waiting_on": [],
                 "stopped": [],
                 "missing": [],
+                "preserved_hop_id": state.get("active_hop_id"),
+                "preserved_request_id": (
+                    active_hop.get("request_id") if active_hop else None
+                ),
+                "preserved_hop_state": hop_state or None,
             }
         )
         return state
@@ -4502,6 +4713,67 @@ class TaskStore(IndependentAgentStoreMixin):
             }
         )
         return state
+
+    def remove_parent_dependency(
+        self,
+        path: str | Path,
+        parent_task_id: str,
+        *,
+        external_command_id: str | None = None,
+    ) -> dict[str, Any]:
+        target = Path(path).expanduser().resolve()
+        parent_id = _validate_task_id(parent_task_id)
+        command_id = str(external_command_id or "").strip() or None
+        self.root.mkdir(parents=True, exist_ok=True)
+        with exclusive_file_lock(self.allocation_lock):
+            self._recover_phase4_replacement_unlocked()
+            catalog = self._load_catalog_unlocked(reconcile=False)
+            with exclusive_file_lock(self._lock_path(target)):
+                current = self._load_current_manifest_unlocked(target)
+                self._assert_manifest_mutable_unlocked(target, current)
+                if command_id in current.get("applied_command_ids", []):
+                    return current
+                if is_independent_task(current):
+                    raise ValueError("independent tasks do not have workflow parents")
+                if str(current.get("status") or "").upper() in TERMINAL:
+                    raise ValueError("cannot remove a parent from a terminal task")
+                parents = list(
+                    normalize_dependency_ids(current.get("depends_on_task_ids"))
+                )
+                if parent_id not in parents:
+                    raise ValueError(
+                        f"task {current.get('task_id')!r} does not depend on {parent_id!r}"
+                    )
+                remaining = [item for item in parents if item != parent_id]
+                now = utc_now()
+                next_state = json.loads(
+                    json.dumps(current, ensure_ascii=False, default=str)
+                )
+                next_state["depends_on_task_ids"] = remaining
+                event = {
+                    "at": now,
+                    "status": "PARENT_REMOVED",
+                    "message": f"Operator removed parent dependency {parent_id}",
+                    "parent_task_id": parent_id,
+                    "remaining_parent_task_ids": remaining,
+                    "external_command_id": command_id,
+                }
+                next_state.setdefault("dependency_events", []).append(event)
+                next_state.setdefault("route_timeline", []).append(
+                    {"kind": "parent_removed", **event}
+                )
+                self._record_external_command(next_state, command_id)
+                saved = self._save_unlocked(target, next_state)
+            catalog["entries"][self._catalog_key(target)] = self._catalog_entry(saved)
+            self._write_catalog_unlocked(catalog)
+
+        tasks, _errors = self.discover_with_errors()
+        reconciled, _changed = self.refresh_scheduling(
+            target,
+            tasks=tasks,
+            state=saved,
+        )
+        return reconciled
 
     def request_resume(
         self,

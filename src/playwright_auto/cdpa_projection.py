@@ -65,6 +65,7 @@ _PRIVATE_IDENTITY_KEYS = frozenset(
         "page_id",
         "page_url",
         "request_id",
+        "terminal_assistant_message_id",
         "user_message_id",
         "user_turn_id",
     }
@@ -93,6 +94,7 @@ _PRIVATE_PUBLIC_KEYS = frozenset(
         "response_sha256",
         "root",
         "system_prompt",
+        "terminal_assistant_message_id",
         "user_message_id",
         "user_turn_id",
         "workspace",
@@ -986,6 +988,39 @@ def build_task_projection(
             "run_count_truncated": len(job_history) >= 200,
             "last_run_at": last_run_at,
         }
+    bootstrap_context = None
+    bootstrap = raw.get("bootstrap") if isinstance(raw.get("bootstrap"), Mapping) else None
+    if independent is None and bootstrap is not None:
+        role_records = raw.get("roles") if isinstance(raw.get("roles"), Mapping) else {}
+        labels = {
+            "bootstrap_native": {
+                "source": "Bootstrap / native branch",
+                "fallback": "none",
+            },
+            "bootstrap_ui": {
+                "source": "Bootstrap / UI branch",
+                "fallback": "native branch failed",
+            },
+            "fresh_fallback": {
+                "source": "Fresh context",
+                "fallback": "bootstrap fallback exhausted",
+            },
+        }
+        bootstrap_context = {
+            "bootstrap_id": str(bootstrap.get("bootstrap_id") or "") or None,
+            "name": _public_text(bootstrap.get("name"), max_chars=200),
+            "roles": {
+                str(role): dict(
+                    labels.get(
+                        record.get("context_source"),
+                        {"source": "pending", "fallback": "pending"},
+                    )
+                )
+                for role, record in role_records.items()
+                if isinstance(record, Mapping)
+            },
+        }
+
     goal_revisions = []
     for revision in raw.get("goal_revisions") or []:
         if not isinstance(revision, Mapping):
@@ -1005,6 +1040,11 @@ def build_task_projection(
             raw.get("effective_goal") or raw.get("task_text"), max_chars=None
         ),
         "goal_revisions": goal_revisions,
+        **(
+            {"bootstrap_context": bootstrap_context}
+            if bootstrap_context is not None
+            else {}
+        ),
         "roles": roles,
         "active_hop": active_input,
         "active_input": active_input,

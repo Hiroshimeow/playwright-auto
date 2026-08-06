@@ -29,6 +29,7 @@ const roots = {
   dependencyOptions: document.querySelector("#dependency-options"),
   reuseTeam: document.querySelector('#create-form select[name="reuse_team"]'),
   requestedTeam: document.querySelector('#create-form input[name="requested_team"]'),
+  bootstrapSelect: document.querySelector('#create-form select[name="bootstrap_id"]'),
   workflowAgentOptions: document.querySelector("#workflow-agent-options"),
   createSummary: document.querySelector("#create-selection-summary"),
   createValidation: document.querySelector("#create-validation"),
@@ -53,6 +54,7 @@ const activeStatuses = new Set(["submitting", "unknown", "queued", "running"]);
 const OVERLAY_STATE = "cdpaOverlay";
 let viewSaveTimer = null;
 let closingOverlay = null;
+let bootstrapDefaultId = "";
 const agentReportBodies = new Map();
 
 function idempotencyKey() {
@@ -214,6 +216,37 @@ function updateAgentSettingsTriggerFields() {
 function showCreateValidation(message = "") {
   roots.createValidation.textContent = message;
   roots.createValidation.hidden = !message;
+}
+
+async function loadBootstrapOptions() {
+  try {
+    const response = await client.request("bootstraps", "/api/bootstraps");
+    if (response.notModified) return;
+    const data = response.data || {};
+    const items = Array.isArray(data.items) ? data.items : [];
+    const options = [new Option("None / Fresh context", "")];
+    for (const item of items) {
+      const option = new Option(item.name || item.bootstrap_id, item.bootstrap_id);
+      option.title = item.description || "";
+      options.push(option);
+    }
+    roots.bootstrapSelect.replaceChildren(...options);
+    bootstrapDefaultId = String(data.default_id || "");
+    roots.bootstrapSelect.value = [...roots.bootstrapSelect.options].some(
+      option => option.value === bootstrapDefaultId,
+    ) ? bootstrapDefaultId : "";
+    updateCreateSummary();
+  } catch (error) {
+    bootstrapDefaultId = "";
+    roots.bootstrapSelect.replaceChildren(new Option("None / Fresh context", ""));
+    toast(error.message);
+  }
+}
+
+function resetBootstrapSelection() {
+  roots.bootstrapSelect.value = [...roots.bootstrapSelect.options].some(
+    option => option.value === bootstrapDefaultId,
+  ) ? bootstrapDefaultId : "";
 }
 
 function updateCreateSummary() {
@@ -503,6 +536,32 @@ function renderCommands(current) {
   if (reload) reload.disabled = Boolean(pendingReload && activeStatuses.has(pendingReload.status));
 }
 
+function renderBootstrapContext(detail) {
+  const context = detail?.bootstrap_context;
+  const existing = roots.detail.querySelector("[data-bootstrap-context]");
+  if (!context) {
+    existing?.remove();
+    return;
+  }
+  const signature = JSON.stringify(context);
+  if (existing?.dataset.signature === signature) return;
+  const section = existing || document.createElement("section");
+  section.dataset.bootstrapContext = "";
+  section.dataset.signature = signature;
+  section.className = "detail-section";
+  const title = document.createElement("strong");
+  title.textContent = `Context · ${context.name || "Fresh context"}`;
+  const meta = document.createElement("p");
+  meta.textContent = context.bootstrap_id ? `Bootstrap ${context.bootstrap_id}` : "Fresh context";
+  const roles = document.createElement("p");
+  roles.textContent = Object.entries(context.roles || {}).map(([role, value]) => {
+    const fallback = value?.fallback && value.fallback !== "none" ? ` · ${value.fallback}` : "";
+    return `${role}: ${value?.source || "pending"}${fallback}`;
+  }).join(" · ");
+  section.replaceChildren(title, meta, roles);
+  if (!existing) roots.detail.append(section);
+}
+
 function render(current) {
   renderBoard(roots.board, current);
   renderTaskDetail(
@@ -517,6 +576,7 @@ function render(current) {
     agentReportBodies,
     current.agentReportsRevision,
   );
+  renderBootstrapContext(current.selectedDetail);
   renderCommands(current);
   renderRuntime(roots.services, current);
   renderAgents(current);
@@ -900,6 +960,7 @@ function openCreate() {
   showCreateValidation();
   updateCreateSummary();
   loadDashboardActions();
+  loadBootstrapOptions();
 }
 
 function closeCreate() {
@@ -971,6 +1032,21 @@ roots.detail.addEventListener("scroll", () => {
 }, {passive: true});
 
 roots.detail.addEventListener("click", event => {
+  const removeParent = event.target.closest("[data-remove-parent]");
+  if (removeParent) {
+    const taskId = removeParent.dataset.taskId;
+    const parentTaskId = removeParent.dataset.removeParent;
+    if (window.confirm(`Remove parent ${parentTaskId} from ${taskId}?`)) {
+      queueCommand({
+        kind: "remove_parent_dependency",
+        taskId,
+        endpoint: `/api/tasks/${encodeURIComponent(taskId)}/parents/${encodeURIComponent(parentTaskId)}/remove`,
+        body: {expected_task_version: Number(removeParent.dataset.version)},
+        label: `Remove parent · ${parentTaskId}`,
+      });
+    }
+    return;
+  }
   const changeGoal = event.target.closest("[data-change-goal]");
   if (changeGoal) {
     openChangeGoal(state.selectedDetail);
@@ -1160,6 +1236,8 @@ roots.form.addEventListener("submit", event => {
     depends_on_task_ids: dependencies,
   };
   body.roles = selectedWorkflowRoles();
+  const bootstrapId = String(values.get("bootstrap_id") || "");
+  if (bootstrapId) body.bootstrap_id = bootstrapId;
   if (reuseTeam) body.reuse_team = reuseTeam;
   else if (requestedTeam) body.requested_team = requestedTeam;
   queueCommand({
@@ -1170,6 +1248,7 @@ roots.form.addEventListener("submit", event => {
     label: task.split("\n")[0],
   });
   roots.form.reset();
+  resetBootstrapSelection();
   roots.requestedTeam.disabled = false;
   applyReuseRoleSelection(roots.roleInputs, null, {reset: true});
   updateCreateSummary();

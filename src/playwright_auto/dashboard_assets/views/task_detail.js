@@ -287,6 +287,25 @@ function independentTabs(detail, selectedTab) {
   return tabs;
 }
 
+function dependencySection(detail) {
+  const section = el("section", null, "detail-section");
+  section.append(el("h3", "Parents"));
+  const list = el("div", null, "history-list");
+  for (const parentTaskId of detail.depends_on_task_ids || []) {
+    const row = el("article", null, "history-card");
+    row.append(el("strong", parentTaskId));
+    const remove = el("button", "Remove parent");
+    remove.type = "button";
+    remove.dataset.removeParent = parentTaskId;
+    remove.dataset.taskId = detail.task_id;
+    remove.dataset.version = String(detail.version || 0);
+    row.append(remove);
+    list.append(row);
+  }
+  section.append(list);
+  return section;
+}
+
 function workflowContent(detail, timeline, selectedRole) {
   const fragment = document.createDocumentFragment();
   const controls = el("div", null, "control-grid");
@@ -298,6 +317,9 @@ function workflowContent(detail, timeline, selectedRole) {
     ["stop", "Stop"], ["clear_team", "Clear team"],
   ]) controls.append(button(action, label, detail));
   fragment.append(controls);
+  if ((detail.depends_on_task_ids || []).length) {
+    fragment.append(dependencySection(detail));
+  }
 
   const taskSection = el("section", null, "detail-section");
   taskSection.append(el("h3", "Task"));

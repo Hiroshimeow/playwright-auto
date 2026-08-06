@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
+from uuid import UUID
 
 from .cdpa_browser_projection import inspect_page_metadata
 from .cdpa_config import CDPAConfig
@@ -41,6 +42,10 @@ def _reopenable_conversation_identity(value: Any) -> str | None:
     return path
 
 
+class BranchBootstrapError(RuntimeError):
+    pass
+
+
 class RoleOwnershipError(RuntimeError):
     def __init__(
         self,
@@ -65,6 +70,18 @@ class AcquiredRole:
     url: str
     created: bool
     new_chat: bool
+
+
+def _canonical_uuid_text(value: str, *, field: str) -> str:
+    if not isinstance(value, str):
+        raise BranchBootstrapError(f"{field} must be canonical UUID text")
+    try:
+        parsed = UUID(value)
+    except (ValueError, AttributeError) as exc:
+        raise BranchBootstrapError(f"{field} must be canonical UUID text") from exc
+    if str(parsed) != value:
+        raise BranchBootstrapError(f"{field} must be canonical UUID text")
+    return value
 
 
 class CDPATabActions:
@@ -294,6 +311,77 @@ class CDPATabActions:
             created=False,
             new_chat=False,
         )
+
+    async def branch_from_anchor(
+        self,
+        manifest: Mapping[str, Any],
+        logical_role: str,
+        *,
+        source_conversation_id: str,
+        assistant_message_id: str,
+    ) -> AcquiredRole:
+        try:
+            logical_role = str(logical_role).upper()
+            role_record = manifest["roles"][logical_role]
+            physical = str(role_record["physical_role"])
+            task_id = str(manifest["task_id"])
+            team = str(manifest["team"])
+        except Exception as exc:
+            raise BranchBootstrapError("branch bootstrap target ownership is invalid") from exc
+
+        source_id = _canonical_uuid_text(
+            source_conversation_id,
+            field="source conversation id",
+        )
+        message_id = _canonical_uuid_text(
+            assistant_message_id,
+            field="assistant message id",
+        )
+        branch_url = f"https://chatgpt.com/branch/{source_id}/{message_id}"
+        timeout = round(self.config.workspace_timeout_seconds * 1000)
+        client: ChatGPTPage | None = None
+        try:
+            await random_delay(action_delay_multiplier("open_tab"))
+            workspace = ChatGPTWorkspace()
+            client = await workspace.open_role(
+                self.browser_context,
+                physical,
+                url=branch_url,
+                timeout_ms=timeout,
+                force_new_page_id=True,
+            )
+            await client.wait_until_clean_ready(timeout_ms=timeout)
+            await client.bind_task_identity(task_id, team)
+            snapshot = await client.assert_ownership()
+            binding = client.binding
+            if (
+                binding is None
+                or str(snapshot.page_id or "") != binding.page_id
+                or str(snapshot.page_role or "") != physical
+                or str(snapshot.page_task_id or "") != task_id
+                or str(snapshot.page_team or "") != team
+            ):
+                raise BranchBootstrapError(
+                    "branch bootstrap target ownership did not persist"
+                )
+            return AcquiredRole(
+                client=client,
+                page_id=binding.page_id,
+                url=str(snapshot.url),
+                created=True,
+                new_chat=True,
+            )
+        except Exception as exc:
+            if client is not None and not client.page.is_closed():
+                try:
+                    await client.page.close()
+                except Exception:
+                    pass
+            if isinstance(exc, BranchBootstrapError):
+                raise
+            raise BranchBootstrapError(
+                f"branch bootstrap failed: {type(exc).__name__}: {exc}"
+            ) from exc
 
     async def acquire(
         self,

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 import playwright_auto.cdpa_actions as actions_module
+import playwright_auto.workspace as workspace_module
 from playwright_auto.cdpa_actions import (
     AcquiredRole,
     CDPATabActions,
@@ -31,6 +32,7 @@ class FakePage:
         self.url = "https://chatgpt.com/c/test"
         self.closed = False
         self.front = False
+        self.goto_calls = []
         self.snapshot_value = SimpleNamespace(
             page_id=page_id,
             page_role=role,
@@ -44,6 +46,10 @@ class FakePage:
         return self.closed
 
     async def goto(self, url, **_kwargs):
+        self.goto_calls.append(url)
+        error = getattr(self, "goto_error", None)
+        if error is not None:
+            raise error
         self.url = url
         self.snapshot_value.url = url
 
@@ -66,6 +72,9 @@ class FakeClient:
         self.prepare_calls = []
         self.bind_calls = []
         self.clean_ready_calls = []
+        self.set_role_calls = []
+        self.events = []
+        self.send_calls = []
 
     async def snapshot(self):
         error = getattr(self.page, "snapshot_error", None)
@@ -85,7 +94,12 @@ class FakeClient:
         return self.page.snapshot_value
 
     async def set_role(self, role, *, allow_rebind=False, force_new_page_id=False):
-        page_id = "reopened-page" if force_new_page_id else (self.page.snapshot_value.page_id or "assigned-page")
+        self.set_role_calls.append((role, allow_rebind, force_new_page_id))
+        page_id = (
+            f"fresh-page-{getattr(self.page, 'generated_index', 0)}"
+            if force_new_page_id
+            else (self.page.snapshot_value.page_id or "assigned-page")
+        )
         self.binding = SimpleNamespace(page_id=page_id, role=role)
         self.page.snapshot_value.page_id = page_id
         self.page.snapshot_value.page_role = role
@@ -104,10 +118,18 @@ class FakeClient:
 
     async def wait_until_clean_ready(self, *, timeout_ms=None, **_kwargs):
         self.clean_ready_calls.append(timeout_ms)
+        self.events.append("ready")
+        error = getattr(self.page, "clean_ready_error", None)
+        if error is not None:
+            raise error
         return self.page.snapshot_value
 
     async def bind_task_identity(self, task_id, team):
         self.bind_calls.append((task_id, team))
+        self.events.append("bind")
+        error = getattr(self.page, "bind_error", None)
+        if error is not None:
+            raise error
         self.page.snapshot_value.page_task_id = task_id
         self.page.snapshot_value.page_team = team
         return {"task_id": task_id, "team": team}
@@ -125,6 +147,10 @@ class FakeClient:
             raise RuntimeError("draft provenance mismatch")
         self.page.snapshot_value.composer_text = ""
         return "fake"
+
+    async def send(self, *_args, **_kwargs):
+        self.send_calls.append((_args, _kwargs))
+        raise AssertionError("branch primitive must not Send")
 
 
 class FakeCDPSession:
@@ -151,16 +177,34 @@ class FakeCDPSession:
 
 
 class FakeContext:
-    def __init__(self, pages=None, *, draft_on_new="", cdp_error=None):
+    def __init__(
+        self,
+        pages=None,
+        *,
+        draft_on_new="",
+        cdp_error=None,
+        goto_error=None,
+        clean_ready_error=None,
+        bind_error=None,
+    ):
         self.pages = list(pages or [])
         self.draft_on_new = draft_on_new
         self.cdp_error = cdp_error
+        self.goto_error = goto_error
+        self.clean_ready_error = clean_ready_error
+        self.bind_error = bind_error
         self.lifecycle_calls = []
         self.detached_sessions = 0
+        self.new_page_calls = 0
 
     async def new_page(self):
+        self.new_page_calls += 1
         page = FakePage(page_id=None, role=None, team=None)
+        page.generated_index = self.new_page_calls
         page.snapshot_value.composer_text = self.draft_on_new
+        page.goto_error = self.goto_error
+        page.clean_ready_error = self.clean_ready_error
+        page.bind_error = self.bind_error
         self.pages.append(page)
         return page
 
@@ -169,18 +213,34 @@ class FakeContext:
 
 
 class FakeWorkspace:
-    async def open_role(self, context, role, *, timeout_ms=0):
+    async def open_role(
+        self,
+        context,
+        role,
+        *,
+        url="https://chatgpt.com/",
+        timeout_ms=0,
+        force_new_page_id=False,
+    ):
         page = await context.new_page()
-        page.snapshot_value.page_id = "fresh-page"
+        await page.goto(url)
+        page_id = (
+            f"fresh-page-{page.generated_index}"
+            if force_new_page_id
+            else "fresh-page"
+        )
+        page.snapshot_value.page_id = page_id
         page.snapshot_value.page_role = role
         client = FakeClient(page, timeout_ms=timeout_ms)
-        client.binding = SimpleNamespace(page_id="fresh-page", role=role)
+        client.binding = SimpleNamespace(page_id=page_id, role=role)
         return client
 
 
 def manifest(
     *,
     team="new-team",
+    task_id="task-1",
+    physical_role="PLAN",
     page_id=None,
     page_url="https://chatgpt.com/c/test",
     conversation_url=None,
@@ -197,19 +257,249 @@ def manifest(
             }
         ]
     return {
-        "task_id": "task-1",
+        "task_id": task_id,
         "active_hop_id": active_hop_id,
         "hops": hops,
         "team": team,
         "reusable_teams": ["old-newest", "old-older"],
         "roles": {
             "PLAN": {
-                "physical_role": "PLAN",
+                "physical_role": physical_role,
                 "page_id": page_id,
                 "page_url": page_url,
             }
         },
     }
+
+
+SOURCE_CONVERSATION_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+ASSISTANT_MESSAGE_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+BRANCH_URL = (
+    "https://chatgpt.com/branch/"
+    f"{SOURCE_CONVERSATION_ID}/{ASSISTANT_MESSAGE_ID}"
+)
+
+
+def test_workspace_open_role_can_force_fresh_page_identity(monkeypatch):
+    monkeypatch.setattr(workspace_module, "ChatGPTPage", FakeClient)
+    context = FakeContext()
+    workspace = workspace_module.ChatGPTWorkspace()
+
+    client = asyncio.run(
+        workspace.open_role(
+            context,
+            "PLAN",
+            url=BRANCH_URL,
+            timeout_ms=1234,
+            force_new_page_id=True,
+        )
+    )
+
+    assert context.new_page_calls == 1
+    assert client.page.goto_calls == [BRANCH_URL]
+    assert client.set_role_calls == [("PLAN", False, True)]
+    assert client.binding.page_id == "fresh-page-1"
+
+
+def test_branch_from_anchor_opens_native_route_and_binds_clean_fresh_target(
+    tmp_path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    monkeypatch.setattr(actions_module, "ChatGPTWorkspace", FakeWorkspace)
+    monkeypatch.setattr(
+        actions_module,
+        "random_delay",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+    context = FakeContext()
+    actions = CDPATabActions(context, config)
+
+    acquired = asyncio.run(
+        actions.branch_from_anchor(
+            manifest(physical_role="multi-bootstrap-branch-core-dev"),
+            "PLAN",
+            source_conversation_id=SOURCE_CONVERSATION_ID,
+            assistant_message_id=ASSISTANT_MESSAGE_ID,
+        )
+    )
+
+    assert context.new_page_calls == 1
+    assert acquired.client.page.goto_calls == [BRANCH_URL]
+    assert acquired.page_id == "fresh-page-1"
+    assert acquired.created is True
+    assert acquired.new_chat is True
+    assert acquired.client.events == ["ready", "bind"]
+    assert acquired.client.clean_ready_calls == [
+        round(config.workspace_timeout_seconds * 1000)
+    ]
+    assert acquired.client.bind_calls == [("task-1", "new-team")]
+    assert acquired.client.page.snapshot_value.page_role == "multi-bootstrap-branch-core-dev"
+    assert acquired.client.page.snapshot_value.page_task_id == "task-1"
+    assert acquired.client.page.snapshot_value.page_team == "new-team"
+    assert acquired.client.send_calls == []
+
+
+def test_branch_from_same_anchor_is_independent_of_closed_source_and_repeats_fresh(
+    tmp_path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    monkeypatch.setattr(actions_module, "ChatGPTWorkspace", FakeWorkspace)
+    monkeypatch.setattr(
+        actions_module,
+        "random_delay",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+    source = FakePage(
+        page_id="source-page",
+        role="bootstrap",
+        team="bootstrap-team",
+        task_id="bootstrap-task",
+    )
+    source.closed = True
+    source_before = vars(source.snapshot_value).copy()
+    context = FakeContext([source])
+    actions = CDPATabActions(context, config)
+
+    first = asyncio.run(
+        actions.branch_from_anchor(
+            manifest(team="team-a", task_id="task-a", physical_role="team-a-dev"),
+            "PLAN",
+            source_conversation_id=SOURCE_CONVERSATION_ID,
+            assistant_message_id=ASSISTANT_MESSAGE_ID,
+        )
+    )
+    second = asyncio.run(
+        actions.branch_from_anchor(
+            manifest(team="team-b", task_id="task-b", physical_role="team-b-review"),
+            "PLAN",
+            source_conversation_id=SOURCE_CONVERSATION_ID,
+            assistant_message_id=ASSISTANT_MESSAGE_ID,
+        )
+    )
+
+    assert source.closed is True
+    assert vars(source.snapshot_value) == source_before
+    assert context.new_page_calls == 2
+    assert first.client.page is not second.client.page
+    assert first.page_id != second.page_id
+    assert first.client.page.goto_calls == second.client.page.goto_calls == [BRANCH_URL]
+    assert first.client.page.snapshot_value.page_team == "team-a"
+    assert second.client.page.snapshot_value.page_team == "team-b"
+
+
+@pytest.mark.parametrize(
+    ("source_conversation_id", "assistant_message_id"),
+    [
+        ("", ASSISTANT_MESSAGE_ID),
+        ("WEB:temporary", ASSISTANT_MESSAGE_ID),
+        (SOURCE_CONVERSATION_ID.upper(), ASSISTANT_MESSAGE_ID),
+        (SOURCE_CONVERSATION_ID, "not-a-uuid"),
+    ],
+)
+def test_branch_from_anchor_rejects_noncanonical_ids_before_new_page(
+    tmp_path,
+    monkeypatch,
+    source_conversation_id,
+    assistant_message_id,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    monkeypatch.setattr(actions_module, "ChatGPTWorkspace", FakeWorkspace)
+    monkeypatch.setattr(
+        actions_module,
+        "random_delay",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+    context = FakeContext()
+    actions = CDPATabActions(context, config)
+
+    with pytest.raises(actions_module.BranchBootstrapError, match="canonical UUID"):
+        asyncio.run(
+            actions.branch_from_anchor(
+                manifest(),
+                "PLAN",
+                source_conversation_id=source_conversation_id,
+                assistant_message_id=assistant_message_id,
+            )
+        )
+
+    assert context.new_page_calls == 0
+
+
+@pytest.mark.parametrize(
+    "context_kwargs",
+    [
+        {"clean_ready_error": RuntimeError("not ready")},
+        {"bind_error": RuntimeError("bind failed")},
+    ],
+)
+def test_branch_from_anchor_wraps_post_navigation_failure_and_closes_only_new_branch(
+    tmp_path, monkeypatch, context_kwargs
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    monkeypatch.setattr(actions_module, "ChatGPTWorkspace", FakeWorkspace)
+    monkeypatch.setattr(
+        actions_module,
+        "random_delay",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+    source = FakePage(
+        page_id="source-page",
+        role="bootstrap",
+        team="bootstrap-team",
+        task_id="bootstrap-task",
+    )
+    context = FakeContext([source], **context_kwargs)
+    actions = CDPATabActions(context, config)
+
+    with pytest.raises(actions_module.BranchBootstrapError, match="branch bootstrap"):
+        asyncio.run(
+            actions.branch_from_anchor(
+                manifest(),
+                "PLAN",
+                source_conversation_id=SOURCE_CONVERSATION_ID,
+                assistant_message_id=ASSISTANT_MESSAGE_ID,
+            )
+        )
+
+    assert source.closed is False
+    assert context.new_page_calls == 1
+    assert context.pages[-1].closed is True
+
+
+def test_branch_from_anchor_wraps_navigation_failure_after_workspace_closes_page(
+    tmp_path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    monkeypatch.setattr(workspace_module, "ChatGPTPage", FakeClient)
+    monkeypatch.setattr(
+        actions_module,
+        "random_delay",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+    context = FakeContext(goto_error=RuntimeError("navigation failed"))
+    actions = CDPATabActions(context, config)
+
+    with pytest.raises(actions_module.BranchBootstrapError, match="navigation failed"):
+        asyncio.run(
+            actions.branch_from_anchor(
+                manifest(),
+                "PLAN",
+                source_conversation_id=SOURCE_CONVERSATION_ID,
+                assistant_message_id=ASSISTANT_MESSAGE_ID,
+            )
+        )
+
+    assert context.new_page_calls == 1
+    assert context.pages[-1].closed is True
+
+
+def test_temporary_web_conversation_remains_non_reopenable():
+    assert (
+        actions_module._reopenable_conversation_identity(
+            "https://chatgpt.com/c/WEB:12345678-1234-4234-8234-123456789abc"
+        )
+        is None
+    )
 
 
 def test_automatic_refresh_uses_reload_only_and_never_retry_control(tmp_path, monkeypatch):
