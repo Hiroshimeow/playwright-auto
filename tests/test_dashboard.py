@@ -503,9 +503,18 @@ def test_create_task_bootstrap_select_load_submit_and_detail_are_explicit():
     assert "loadBootstrapOptions" in app
     assert "data.default_id" in app
     assert "body.bootstrap_id" in app
+    assert 'data-bootstrap-inline' in html
+    assert 'name="bootstrap_new_id"' in html
+    assert 'name="bootstrap_new_name"' in html
+    assert 'name="bootstrap_new_source"' in html
+    assert 'name="bootstrap_new_prewarm_prompt"' in html
+    assert 'name="bootstrap_new_max_backups"' in html
+    assert "body.bootstrap_definition" in app
+    assert "source: bootstrapSource" in app
+    assert 'name="bootstrap_kind"' not in html
+    assert 'name="bootstrap_import_generated"' not in html
     assert "renderBootstrapContext" in app
     assert "bootstrap_context" in app
-    assert "conversation_id" not in app
     assert "terminal_assistant_message_id" not in app
 
 

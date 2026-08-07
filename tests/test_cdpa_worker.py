@@ -486,6 +486,10 @@ def test_pre_send_first_role_uses_bootstrap_once_and_keeps_full_prompt(tmp_path:
         async def locate_owned(self, _state, _role):
             return None
 
+        async def backend_conversation(self, conversation_id):
+            assert conversation_id == anchor["conversation_id"]
+            return _bootstrap_graph(anchor["terminal_assistant_message_id"])
+
         async def branch_from_anchor(
             self, _state, role, *, source_conversation_id, assistant_message_id
         ):
@@ -505,7 +509,7 @@ def test_pre_send_first_role_uses_bootstrap_once_and_keeps_full_prompt(tmp_path:
     assert actions.branch_calls == [
         ("PLAN", anchor["conversation_id"], anchor["terminal_assistant_message_id"])
     ]
-    assert state["roles"]["PLAN"]["context_source"] == "bootstrap_native"
+    assert state["roles"]["PLAN"]["context_source"] == "bootstrap_donor"
     assert state["roles"]["PLAN"]["conversation_generation"] == 1
     assert "Constructor for PLAN" in first["prompt"]
     assert "Return only the strict route JSON." in first["prompt"]
@@ -546,6 +550,10 @@ def test_pre_send_bootstrap_fallback_chain_is_pre_send_only(tmp_path: Path, monk
         async def locate_owned(self, _state, _role):
             return None
 
+        async def backend_conversation(self, conversation_id):
+            assert conversation_id == bootstrap_record()["conversation_id"]
+            return _bootstrap_graph(bootstrap_record()["terminal_assistant_message_id"])
+
         async def branch_from_anchor(self, *_args, **_kwargs):
             self.branch_calls += 1
             raise BranchBootstrapError("native unavailable")
@@ -557,8 +565,8 @@ def test_pre_send_bootstrap_fallback_chain_is_pre_send_only(tmp_path: Path, monk
     actions = Actions()
     ui_calls = []
 
-    async def ui_success(_state, role, _actions, bootstrap):
-        ui_calls.append((role, bootstrap["bootstrap_id"]))
+    async def ui_success(_state, role, _actions, donor):
+        ui_calls.append((role, donor["conversation_id"], donor["assistant_message_id"]))
         return AcquiredRole(
             client=SimpleNamespace(),
             page_id="ui-branch-plan",
@@ -571,134 +579,15 @@ def test_pre_send_bootstrap_fallback_chain_is_pre_send_only(tmp_path: Path, monk
     hop = _active_hop(state)
     asyncio.run(worker._pre_send(state, hop, actions))
     assert actions.branch_calls == 1
-    assert ui_calls == [("PLAN", "general-team-bootstrap")]
+    assert ui_calls == [
+        (
+            "PLAN",
+            bootstrap_record()["conversation_id"],
+            bootstrap_record()["terminal_assistant_message_id"],
+        )
+    ]
     assert actions.acquire_calls == 0
-    assert state["roles"]["PLAN"]["context_source"] == "bootstrap_ui"
-
-    keeper = store.create_independent_agent(
-        "Bootstrap Keeper",
-        system_prompt="Maintain general-team-bootstrap.",
-        task_id="agent-bootstrap-keeper-g1",
-        trigger_settings={"interval_minutes": 360, "check_all": True},
-    )
-    state2 = store.create_task(
-        "fallback repair",
-        requested_team="fallback-repair",
-        task_id="task-bootstrap-repair-wait",
-        bootstrap=bootstrap_record(),
-    )
-    worker2 = CDPAWorker(config, store=store)
-    actions2 = Actions()
-
-    async def ui_failure(*_args, **_kwargs):
-        raise worker_module.BootstrapUIBranchError("ui unavailable")
-
-    monkeypatch.setattr(worker2, "_branch_from_bootstrap_ui", ui_failure, raising=False)
-    hop2 = _active_hop(state2)
-    asyncio.run(worker2._pre_send(state2, hop2, actions2))
-    assert actions2.branch_calls == 1
-    assert actions2.acquire_calls == 0
-    assert hop2["state"] == "pre_send"
-    assert state2["status"] == "WAITING"
-    assert state2["waiting_code"] == "bootstrap_repair"
-    assert state2["roles"]["PLAN"].get("context_source") is None
-    activated_keeper = store.load(keeper["manifest_path"])
-    assert activated_keeper["status"] == "RUNNING"
-    repair_event = activated_keeper["independent"]["active_event"]
-    assert repair_event["trigger_type"] == "manual"
-    assert repair_event["event_key"] == state2["waiting"]["bootstrap_repair_event_key"]
-
-    repair_path = Path(state2["manifest_path"])
-    store.update(repair_path, lambda _current: state2)
-    still_waiting = asyncio.run(
-        worker2.advance(
-            repair_path,
-            SimpleNamespace(pages=[]),
-            scheduling_tasks=store.discover(),
-        )
-    )
-    assert still_waiting["status"] == "WAITING"
-    assert still_waiting["waiting_code"] == "bootstrap_repair"
-    assert _active_hop(still_waiting)["state"] == "pre_send"
-    assert still_waiting["bootstrap"]["conversation_id"] == bootstrap_record()[
-        "conversation_id"
-    ]
-
-    renewed = {
-        **bootstrap_record(),
-        "conversation_id": "33333333-3333-4333-8333-333333333333",
-        "terminal_assistant_message_id": "44444444-4444-4444-8444-444444444444",
-        "created_at": "2026-08-06T01:00:00+00:00",
-        "updated_at": "2026-08-06T01:00:00+00:00",
-        "last_verified_at": "2026-08-06T01:00:00+00:00",
-    }
-    BootstrapCatalog(tmp_path).upsert(renewed)
-
-    class RecoveredActions(Actions):
-        def __init__(self):
-            super().__init__()
-            self.branch_anchors = []
-
-        async def branch_from_anchor(
-            self, _state, role, *, source_conversation_id, assistant_message_id
-        ):
-            self.branch_calls += 1
-            self.branch_anchors.append((source_conversation_id, assistant_message_id))
-            return AcquiredRole(
-                client=SimpleNamespace(),
-                page_id=f"renewed-{role.lower()}",
-                url=f"https://chatgpt.com/c/renewed-{role.lower()}",
-                created=True,
-                new_chat=True,
-            )
-
-    recovered_actions = RecoveredActions()
-    monkeypatch.setattr(
-        worker_module,
-        "CDPATabActions",
-        lambda *_args, **_kwargs: recovered_actions,
-    )
-    released = asyncio.run(
-        worker2.advance(
-            repair_path,
-            SimpleNamespace(pages=[]),
-            scheduling_tasks=store.discover(),
-        )
-    )
-    assert released["status"] == "RUNNING"
-    assert released["active_action"] == "send"
-    assert released["waiting"] is None
-    assert released["bootstrap"]["conversation_id"] == renewed["conversation_id"]
-    assert released["bootstrap"]["terminal_assistant_message_id"] == renewed[
-        "terminal_assistant_message_id"
-    ]
-    assert recovered_actions.branch_anchors == [
-        (renewed["conversation_id"], renewed["terminal_assistant_message_id"])
-    ]
-    assert released["roles"]["PLAN"]["context_source"] == "bootstrap_native"
-    assert _active_hop(released)["state"] == "sending"
-
-    def complete_keeper_job(current: dict) -> dict:
-        keeper_hop = next(
-            item
-            for item in current["hops"]
-            if item.get("hop_id") == current.get("active_hop_id")
-        )
-        keeper_hop["state"] = "responded"
-        keeper_hop["response"] = "Bootstrap renewal complete."
-        keeper_hop["response_sha256"] = "e" * 64
-        return current
-
-    activated_keeper = store.update(keeper["manifest_path"], complete_keeper_job)
-    completed_keeper = store.complete_independent_task(
-        activated_keeper["manifest_path"],
-        outcome="SUCCESS",
-        summary="Bootstrap renewal complete.",
-    )
-    assert completed_keeper["independent"]["enabled"] is True
-    assert completed_keeper["status"] == "WAITING"
-    assert completed_keeper["independent"]["trigger_settings"]["interval_minutes"] == 360
-    assert completed_keeper["independent"]["trigger_settings"]["check_all"] is True
+    assert state["roles"]["PLAN"]["context_source"] == "bootstrap_donor"
 
     protected = store.create_task(
         "protected send",
@@ -820,12 +709,16 @@ def test_ui_bootstrap_fallback_uses_exact_semantic_source_message(tmp_path: Path
             return Client()
 
     monkeypatch.setattr(worker_module, "ChatGPTWorkspace", Workspace)
+    donor = {
+        "conversation_id": anchor["conversation_id"],
+        "assistant_message_id": anchor["terminal_assistant_message_id"],
+    }
     acquired = asyncio.run(
         worker._branch_from_bootstrap_ui(
             state,
             "PLAN",
             SimpleNamespace(browser_context=Context()),
-            anchor,
+            donor,
         )
     )
 
@@ -833,7 +726,7 @@ def test_ui_bootstrap_fallback_uses_exact_semantic_source_message(tmp_path: Path
     assert acquired.new_chat is True
     assert (
         "assistant-selector",
-        f'[data-message-author-role="assistant"][data-message-id="{anchor["terminal_assistant_message_id"]}"]',
+        f'[data-message-author-role="assistant"][data-message-id="{donor["assistant_message_id"]}"]',
     ) in calls
     assert ("turn-role", "button", "More actions", True) in calls
     assert ("page-role", "menuitem", "Branch in new chat", True) in calls
@@ -1500,6 +1393,9 @@ def _enable_backend_wait_identity(store, state, path, hop, receipt, *, conversat
     hop["conversation_url"] = f"https://chatgpt.com/c/{conversation_id}"
     state["roles"]["PLAN"]["page_url"] = hop["conversation_url"]
     hop["timestamps"]["sent_at"] = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
+    hop["wait"]["stream_status_next_poll_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
     state = store.save(path, state)
     return state, _active_hop(state), enriched
 
@@ -1893,7 +1789,7 @@ def test_stream_status_failure_enters_recovery_without_dom_or_source(tmp_path: P
     assert calls == {"status": 1, "graph": 0, "source": 0}
 
 
-def test_status_recovery_returns_to_normal_ten_second_poll_when_status_recovers(tmp_path: Path):
+def test_status_recovery_returns_to_normal_randomized_poll_when_status_recovers(tmp_path: Path):
     from playwright_auto.chatgpt_graph import BackendUnavailableError
 
     store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
@@ -1925,7 +1821,7 @@ def test_status_recovery_returns_to_normal_ten_second_poll_when_status_recovers(
     assert "status_recovery_graph_next_at" not in wait
     next_status = worker_module.parse_time(wait["stream_status_next_poll_at"])
     assert next_status is not None
-    assert 9 <= (next_status - datetime.now(timezone.utc)).total_seconds() <= 11
+    assert 9 <= (next_status - datetime.now(timezone.utc)).total_seconds() <= 15
 
 
 def test_status_recovery_graph_probe_routes_after_five_minutes(tmp_path: Path):
@@ -3570,6 +3466,56 @@ def test_runtime_create_snapshots_bootstrap_and_replay_ignores_catalog_drift(tmp
     assert failed["status"] == "failed"
     assert store.load_task_id("task-disabled-bootstrap") is None
 
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-create-explicit-fresh",
+        idempotency_key="create-explicit-fresh",
+        kind="create_task",
+        task_id="task-explicit-fresh",
+        expected_task_version=None,
+        payload={
+            "task": "Explicit Fresh remains supported",
+            "requested_team": "explicit-fresh",
+            "repository": str(tmp_path),
+            "report_mode": "file",
+            "bootstrap_id": None,
+        },
+    )
+    fresh_result = worker._apply_next_command()
+    assert fresh_result["status"] == "applied"
+    fresh = store.load_task_id("task-explicit-fresh")
+    assert fresh is not None
+    assert fresh.get("bootstrap") is None
+
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-create-inline-bootstrap",
+        idempotency_key="create-inline-bootstrap",
+        kind="create_task",
+        task_id="task-inline-bootstrap",
+        expected_task_version=None,
+        payload={
+            "task": "Create bootstrap inline",
+            "requested_team": "inline-bootstrap-team",
+            "repository": str(tmp_path),
+            "report_mode": "file",
+            "bootstrap_id": "inline-bootstrap",
+            "bootstrap_definition": {
+                "bootstrap_id": "inline-bootstrap",
+                "name": "Inline Bootstrap",
+                "source_conversation_id": None,
+                "prewarm_prompt": "Reusable inline prewarm.",
+                "max_backups": 5,
+            },
+        },
+    )
+    inline_result = worker._apply_next_command()
+    assert inline_result["status"] == "applied"
+    inline = store.load_task_id("task-inline-bootstrap")
+    assert inline is not None
+    assert inline["bootstrap"]["bootstrap_id"] == "inline-bootstrap"
+    assert inline["bootstrap"]["prewarm_prompt"] == "Reusable inline prewarm."
+    assert inline["bootstrap"]["max_backups"] == 5
+    assert BootstrapCatalog(tmp_path).get("inline-bootstrap") == inline["bootstrap"]
+
 
 def test_bootstrap_projection_is_sanitized_and_distinguishes_fallbacks(tmp_path: Path):
     from playwright_auto.cdpa_projection import build_task_projection
@@ -3583,13 +3529,11 @@ def test_bootstrap_projection_is_sanitized_and_distinguishes_fallbacks(tmp_path:
         roles=("PLAN", "DEV", "REVIEW"),
         bootstrap=bootstrap_record(),
     )
-    state["roles"]["PLAN"]["context_source"] = "bootstrap_native"
-    state["roles"]["DEV"]["context_source"] = "bootstrap_ui"
-    state["roles"]["REVIEW"]["context_source"] = "fresh_fallback"
+    state["roles"]["PLAN"]["context_source"] = "bootstrap_donor"
+    state["roles"]["DEV"]["context_source"] = "bootstrap_native"
+    state["roles"]["REVIEW"]["context_source"] = "bootstrap_ui"
     state["status"] = "BLOCKED"
-    state["block_reason"] = (
-        "locator timeout for " + bootstrap_record()["terminal_assistant_message_id"]
-    )
+    state["block_reason"] = "locator timeout for bootstrap donor"
 
     detail = build_task_projection(state, tasks=[state]).detail
     context = detail["bootstrap_context"]
@@ -3800,6 +3744,9 @@ def test_waiting_reconciles_conversation_id_from_exact_ledger_before_backend_wai
     hop["timestamps"]["sent_at"] = (
         datetime.now(timezone.utc) - timedelta(seconds=10)
     ).isoformat()
+    hop["wait"]["stream_status_next_poll_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
     state["roles"]["PLAN"]["page_url"] = "https://chatgpt.com/c/conversation-1"
     hop["conversation_url"] = "https://chatgpt.com/c/conversation-1"
     _store.save(path, state)
@@ -3942,3 +3889,430 @@ def test_final_reconciliation_completion_is_dom_only(tmp_path: Path):
     assert completed is True
     assert hop["state"] == "responded"
     assert hop["response"] == response.text
+
+
+def donor_pool_record(*, donors=None, prewarm_prompt=None, max_backups=7):
+    return {
+        "bootstrap_id": "general-team-bootstrap",
+        "name": "General Team Bootstrap",
+        "description": "Reusable task-neutral context",
+        "source_conversation_id": "11111111-1111-4111-8111-111111111111",
+        "prewarm_prompt": prewarm_prompt,
+        "max_backups": max_backups,
+        "donors": list(
+            donors
+            if donors is not None
+            else [
+                {
+                    "conversation_id": "11111111-1111-4111-8111-111111111111",
+                    "assistant_message_id": "22222222-2222-4222-8222-222222222222",
+                }
+            ]
+        ),
+        "enabled": True,
+        "tags": ["general"],
+        "created_at": "2026-08-06T00:00:00+00:00",
+        "updated_at": "2026-08-06T00:00:00+00:00",
+    }
+
+
+def _bootstrap_graph(assistant_id: str):
+    return {
+        "current_node": assistant_id,
+        "mapping": {
+            "bootstrap-user": {
+                "id": "bootstrap-user",
+                "message": {
+                    "id": "bootstrap-user",
+                    "author": {"role": "user"},
+                    "recipient": "all",
+                    "content": {"content_type": "text", "parts": ["seed"]},
+                },
+                "parent": None,
+                "children": [assistant_id],
+            },
+            assistant_id: {
+                "id": assistant_id,
+                "message": {
+                    "id": assistant_id,
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "content": {"content_type": "text", "parts": ["bootstrap"]},
+                },
+                "parent": "bootstrap-user",
+                "children": [],
+            },
+        },
+    }
+
+
+def test_stream_status_poll_delay_is_randomized_within_10_to_15_seconds(tmp_path: Path):
+    _, _, _, worker = setup_task(tmp_path, task_id="task-stream-jitter")
+    samples = [worker._stream_status_poll_delay() for _ in range(100)]
+    assert all(10.0 <= value <= 15.0 for value in samples)
+    assert len({round(value, 4) for value in samples}) > 1
+
+
+def test_bootstrap_keeper_compatibility_is_retired_from_worker():
+    assert not hasattr(CDPAWorker, "_wait_for_bootstrap_repair")
+    assert not hasattr(CDPAWorker, "_release_bootstrap_repair_wait")
+
+
+def test_shared_automated_send_gate_enforces_remaining_spacing(tmp_path: Path, monkeypatch):
+    _, _, _, worker = setup_task(tmp_path, task_id="task-send-spacing")
+    worker._last_automated_send_at = worker_module.time.monotonic() - 5.0
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(worker_module.asyncio, "sleep", fake_sleep)
+    calls = []
+
+    async def send_once():
+        calls.append("send")
+        return "accepted"
+
+    before = worker_module.time.monotonic()
+    result = asyncio.run(worker._run_automated_send(send_once))
+
+    assert result == "accepted"
+    assert calls == ["send"]
+    assert len(sleeps) == 1 and 4.5 <= sleeps[0] <= 5.0
+    assert worker._last_automated_send_at is not None
+    assert worker._last_automated_send_at >= before
+
+
+def test_first_allocation_prefers_current_task_donor_before_catalog(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    catalog = BootstrapCatalog(tmp_path)
+    root_donor = donor_pool_record()["donors"][0]
+    record = catalog.upsert(donor_pool_record())
+    store = TaskStore(config)
+    state = store.create_task(
+        "prefer descendant donor",
+        requested_team="donor-preference",
+        task_id="task-donor-preference",
+        bootstrap=record,
+    )
+    child_donor = {
+        "conversation_id": "33333333-3333-4333-8333-333333333333",
+        "assistant_message_id": "44444444-4444-4444-8444-444444444444",
+    }
+    state["bootstrap_task_donors"] = [child_donor]
+    worker = CDPAWorker(config, store=store)
+
+    class Actions(FakeActions):
+        def __init__(self):
+            super().__init__()
+            self.branches = []
+
+        async def locate_owned(self, _state, _role):
+            return None
+
+        async def backend_conversation(self, conversation_id):
+            donor = child_donor if conversation_id == child_donor["conversation_id"] else root_donor
+            return _bootstrap_graph(donor["assistant_message_id"])
+
+        async def branch_from_anchor(
+            self, _state, role, *, source_conversation_id, assistant_message_id
+        ):
+            self.branches.append((source_conversation_id, assistant_message_id))
+            return AcquiredRole(
+                client=SimpleNamespace(),
+                page_id=f"branch-{role.lower()}",
+                url=f"https://chatgpt.com/c/{source_conversation_id}",
+                created=True,
+                new_chat=True,
+            )
+
+    actions = Actions()
+    acquired = asyncio.run(worker._acquire_workflow_role(state, "PLAN", actions))
+
+    assert acquired is not None
+    assert actions.branches == [
+        (child_donor["conversation_id"], child_donor["assistant_message_id"])
+    ]
+    assert state["roles"]["PLAN"]["context_source"] == "bootstrap_donor"
+
+
+def test_transient_donor_backend_failure_retries_without_removing_or_blocking(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    catalog = BootstrapCatalog(tmp_path)
+    record = catalog.upsert(donor_pool_record())
+    store = TaskStore(config)
+    state = store.create_task(
+        "transient donor read",
+        requested_team="donor-transient",
+        task_id="task-donor-transient",
+        bootstrap=record,
+    )
+    worker = CDPAWorker(config, store=store)
+
+    class Actions(FakeActions):
+        async def locate_owned(self, _state, _role):
+            return None
+
+        async def backend_conversation(self, _conversation_id):
+            raise worker_module.BackendUnavailableError(502, "conversation")
+
+    acquired = asyncio.run(worker._acquire_workflow_role(state, "PLAN", Actions()))
+
+    assert acquired is None
+    assert state.get("block_code") is None
+    assert state["active_action"] == "bootstrap_retry"
+    assert catalog.get(record["bootstrap_id"])["donors"] == record["donors"]
+
+
+def test_source_only_bootstrap_materializes_first_donor_without_fresh_fallback(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    catalog = BootstrapCatalog(tmp_path)
+    record = catalog.upsert(donor_pool_record(donors=[]))
+    store = TaskStore(config)
+    state = store.create_task(
+        "materialize source donor",
+        requested_team="donor-source",
+        task_id="task-donor-source",
+        bootstrap=record,
+    )
+    worker = CDPAWorker(config, store=store)
+    assistant_id = "22222222-2222-4222-8222-222222222222"
+
+    class Actions(FakeActions):
+        def __init__(self):
+            super().__init__()
+            self.branches = []
+
+        async def locate_owned(self, _state, _role):
+            return None
+
+        async def backend_conversation(self, conversation_id):
+            assert conversation_id == record["source_conversation_id"]
+            return _bootstrap_graph(assistant_id)
+
+        async def branch_from_anchor(
+            self, _state, role, *, source_conversation_id, assistant_message_id
+        ):
+            self.branches.append((source_conversation_id, assistant_message_id))
+            return AcquiredRole(
+                client=SimpleNamespace(),
+                page_id=f"branch-{role.lower()}",
+                url=f"https://chatgpt.com/c/{source_conversation_id}",
+                created=True,
+                new_chat=True,
+            )
+
+    actions = Actions()
+    acquired = asyncio.run(worker._acquire_workflow_role(state, "PLAN", actions))
+
+    assert acquired is not None
+    donor = {
+        "conversation_id": record["source_conversation_id"],
+        "assistant_message_id": assistant_id,
+    }
+    assert actions.branches == [(donor["conversation_id"], donor["assistant_message_id"])]
+    assert catalog.get(record["bootstrap_id"])["donors"] == [donor]
+    assert state["roles"]["PLAN"]["context_source"] == "bootstrap_donor"
+
+
+def test_prewarm_regenerates_donor_through_shared_send_gate(tmp_path: Path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    catalog = BootstrapCatalog(tmp_path)
+    record = catalog.upsert(
+        donor_pool_record(donors=[], prewarm_prompt="Load reusable bootstrap context only.")
+    )
+    store = TaskStore(config)
+    state = store.create_task(
+        "regenerate donor",
+        requested_team="donor-prewarm",
+        task_id="task-donor-prewarm",
+        bootstrap=record,
+    )
+    state["bootstrap_source_exhausted"] = True
+    worker = CDPAWorker(config, store=store)
+    calls = []
+
+    class Client:
+        binding = SimpleNamespace(role="BOOTSTRAP")
+        page = SimpleNamespace(url="https://chatgpt.com/c/33333333-3333-4333-8333-333333333333")
+
+        async def new_chat(self, **_kwargs):
+            calls.append("new_chat")
+            return "https://chatgpt.com/"
+
+        async def assert_ownership(self):
+            return SimpleNamespace(
+                page_role="BOOTSTRAP",
+                page_task_id=None,
+                page_team=None,
+                url="https://chatgpt.com/c/33333333-3333-4333-8333-333333333333",
+            )
+
+    class Actions(FakeActions):
+        async def acquire_global_role(self, physical_role):
+            calls.append(("acquire_global_role", physical_role))
+            return AcquiredRole(
+                client=Client(),
+                page_id="bootstrap-global",
+                url="https://chatgpt.com/",
+                created=True,
+                new_chat=False,
+            )
+
+    class FakeBlock:
+        def __init__(self, prompt, **kwargs):
+            source_context = kwargs["source_context"]
+            assert source_context["kind"] == "bootstrap_prewarm"
+            assert source_context["origin_task_id"] == state["task_id"]
+            assert "task_id" not in source_context
+            assert "team" not in source_context
+            calls.append(("block", prompt, kwargs))
+
+        async def run(self, context):
+            calls.append(("block.run", context.client.binding.role))
+            return {
+                "receipt": {
+                    "conversation_id": "33333333-3333-4333-8333-333333333333"
+                },
+                "response": {
+                    "message_id": "44444444-4444-4444-8444-444444444444",
+                    "role": "assistant",
+                    "turn_id": "55555555-5555-4555-8555-555555555555",
+                    "text": "bootstrap ready",
+                    "attachments": [],
+                },
+            }
+
+    monkeypatch.setattr(worker_module, "DurableSendBlock", FakeBlock)
+    original_gate = worker._run_automated_send
+
+    async def tracked_gate(operation):
+        calls.append("send_gate")
+        return await original_gate(operation)
+
+    monkeypatch.setattr(worker, "_run_automated_send", tracked_gate)
+
+    updated = asyncio.run(
+        worker._regenerate_bootstrap_donor(state, record, Actions())
+    )
+
+    donor = {
+        "conversation_id": "33333333-3333-4333-8333-333333333333",
+        "assistant_message_id": "44444444-4444-4444-8444-444444444444",
+    }
+    assert updated is not None
+    assert updated["donors"] == [donor]
+    assert catalog.get(record["bootstrap_id"])["donors"] == [donor]
+    assert state["bootstrap_prewarm_donor"] == donor
+    assert ("acquire_global_role", "BOOTSTRAP") in calls
+    assert "new_chat" in calls
+    assert "send_gate" in calls
+
+
+def test_exhausted_source_without_prewarm_blocks_without_fresh_fallback(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    catalog = BootstrapCatalog(tmp_path)
+    record = catalog.upsert(donor_pool_record(donors=[]))
+    store = TaskStore(config)
+    state = store.create_task(
+        "lost donors",
+        requested_team="donor-lost",
+        task_id="task-donor-lost",
+        bootstrap=record,
+    )
+    worker = CDPAWorker(config, store=store)
+
+    class Actions(FakeActions):
+        async def locate_owned(self, _state, _role):
+            return None
+
+        async def backend_conversation(self, _conversation_id):
+            raise worker_module.BackendUnavailableError(404, "conversation")
+
+    acquired = asyncio.run(worker._acquire_workflow_role(state, "PLAN", Actions()))
+
+    assert acquired is None
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "bootstrap_unavailable"
+    assert state["bootstrap_source_exhausted"] is True
+    assert "select another bootstrap" in state["block_reason"].lower()
+
+
+def test_accepted_first_role_self_clones_child_local_bootstrap_donor(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    catalog = BootstrapCatalog(tmp_path)
+    record = catalog.upsert(donor_pool_record(max_backups=2))
+    store = TaskStore(config)
+    state = store.create_task(
+        "capture descendant donor",
+        requested_team="donor-capture",
+        task_id="task-donor-capture",
+        bootstrap=record,
+    )
+    role = state["roles"]["PLAN"]
+    role["context_source"] = "bootstrap_donor"
+    role["conversation_generation"] = 1
+    hop = _active_hop(state)
+    child_conversation = "33333333-3333-4333-8333-333333333333"
+    inherited_assistant = "44444444-4444-4444-8444-444444444444"
+    accepted_user = "55555555-5555-4555-8555-555555555555"
+    role_response = "66666666-6666-4666-8666-666666666666"
+    hop["receipt"] = {
+        "conversation_id": child_conversation,
+        "user_message_id": accepted_user,
+    }
+    graph = {
+        "current_node": role_response,
+        "mapping": {
+            inherited_assistant: {
+                "id": inherited_assistant,
+                "message": {
+                    "id": inherited_assistant,
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "content": {"content_type": "text", "parts": ["bootstrap prefix"]},
+                },
+                "parent": None,
+                "children": [accepted_user],
+            },
+            accepted_user: {
+                "id": accepted_user,
+                "message": {
+                    "id": accepted_user,
+                    "author": {"role": "user"},
+                    "recipient": "all",
+                    "content": {"content_type": "text", "parts": ["PLAN prompt"]},
+                },
+                "parent": inherited_assistant,
+                "children": [role_response],
+            },
+            role_response: {
+                "id": role_response,
+                "message": {
+                    "id": role_response,
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "content": {"content_type": "text", "parts": ["PLAN response"]},
+                },
+                "parent": accepted_user,
+                "children": [],
+            },
+        },
+    }
+    worker = CDPAWorker(config, store=store)
+
+    class Actions:
+        async def backend_conversation(self, conversation_id):
+            assert conversation_id == child_conversation
+            return graph
+
+    captured = asyncio.run(worker._capture_bootstrap_role_donor(state, hop, Actions()))
+
+    donor = {
+        "conversation_id": child_conversation,
+        "assistant_message_id": inherited_assistant,
+    }
+    assert captured is True
+    assert state["bootstrap_task_donors"][0] == donor
+    assert role["bootstrap_donor"] == donor
+    assert catalog.get(record["bootstrap_id"])["donors"][0] == donor

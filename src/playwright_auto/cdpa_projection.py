@@ -993,9 +993,13 @@ def build_task_projection(
     if independent is None and bootstrap is not None:
         role_records = raw.get("roles") if isinstance(raw.get("roles"), Mapping) else {}
         labels = {
+            "bootstrap_donor": {
+                "source": "Bootstrap / donor branch",
+                "fallback": "lazy donor failover",
+            },
             "bootstrap_native": {
                 "source": "Bootstrap / native branch",
-                "fallback": "none",
+                "fallback": "legacy task",
             },
             "bootstrap_ui": {
                 "source": "Bootstrap / UI branch",

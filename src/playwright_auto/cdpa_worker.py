@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 import os
+import random
 import sys
 import time
 from dataclasses import replace
@@ -21,7 +22,7 @@ from .cdpa_actions import (
     RoleOwnershipError,
     TeamCloseError,
 )
-from .cdpa_bootstraps import BootstrapCatalog
+from .cdpa_bootstraps import BootstrapCatalog, normalize_bootstrap_donor, normalize_bootstrap_record
 from .cdpa_commands import (
     RepairRequest,
     WorkerCommand,
@@ -112,9 +113,12 @@ from .chatgpt_graph import (
     BackendUnavailableError,
     GraphIdentityError,
     resolve_terminal_assistant,
+    resolve_bootstrap_donor,
+    resolve_inherited_assistant,
+    resolve_latest_terminal_assistant,
 )
 from .connection import connected_browser, is_cdp_disconnect
-from .durable import RequestLedger, RequestStatus
+from .durable import DurableRequestError, RequestLedger, RequestStatus
 from .durable_blocks import DurableSendBlock
 from .upload import UploadIdentityChangedError, UploadReceipt, collect_file_identities
 from .workflow import WorkflowContext
@@ -128,6 +132,10 @@ _STATUS_RECOVERY_GRAPH_SECONDS = 300.0
 _TERMINAL_GRAPH_RETRY_SECONDS = 120.0
 _TERMINAL_GRAPH_MAX_ATTEMPTS = 3
 _DOM_FALLBACK_SETTLE_SECONDS = 30.0
+_STREAM_STATUS_POLL_MIN_SECONDS = 10.0
+_STREAM_STATUS_POLL_MAX_SECONDS = 15.0
+_AUTOMATED_SEND_SPACING_SECONDS = 10.0
+_AUTOMATED_SEND_SKIPPED = object()
 _RATE_LIMIT_BLOCK_MESSAGE = (
     "Too many requests; shared browser-profile cooldown is active"
 )
@@ -316,6 +324,8 @@ class CDPAWorker:
         self._rate_limit_cooldown: dict[str, Any] | None = None
         self._rate_limit_lock = asyncio.Lock()
         self._send_gate_lock = asyncio.Lock()
+        self._last_automated_send_at: float | None = None
+        self._bootstrap_prepare_lock = asyncio.Lock()
         self.rate_limit_cooldown_seconds = _RATE_LIMIT_COOLDOWN_SECONDS
         self._manifest_cache: dict[
             Path, tuple[tuple[int, int, int, int], dict[str, Any]]
@@ -2312,19 +2322,258 @@ class CDPAWorker:
                     return None
                 raise
 
+    @staticmethod
+    def _stream_status_poll_delay() -> float:
+        return random.uniform(
+            _STREAM_STATUS_POLL_MIN_SECONDS, _STREAM_STATUS_POLL_MAX_SECONDS
+        )
+
+    async def _run_automated_send(self, operation: Callable[[], Any]) -> Any:
+        async with self._send_gate_lock:
+            last = self._last_automated_send_at
+            if last is not None:
+                remaining = _AUTOMATED_SEND_SPACING_SECONDS - (time.monotonic() - last)
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+            attempted = False
+            try:
+                result = await operation()
+                if result is _AUTOMATED_SEND_SKIPPED:
+                    return result
+                attempted = True
+                return result
+            except Exception:
+                attempted = True
+                raise
+            finally:
+                if attempted:
+                    self._last_automated_send_at = time.monotonic()
+
+    def _bootstrap_for_state(self, state: Mapping[str, Any]) -> dict[str, Any] | None:
+        snapshot = state.get("bootstrap")
+        if not isinstance(snapshot, Mapping):
+            return None
+        bootstrap_id = str(snapshot.get("bootstrap_id") or "").strip()
+        if not bootstrap_id:
+            return None
+        current = BootstrapCatalog(self.config.repository_root).get(bootstrap_id)
+        if current is not None and current.get("enabled") is True:
+            return current
+        try:
+            normalized = normalize_bootstrap_record(snapshot)
+        except ValueError:
+            return None
+        return normalized if normalized.get("enabled") is True else None
+
+    @staticmethod
+    def _bootstrap_donor_candidates(
+        state: Mapping[str, Any], bootstrap: Mapping[str, Any]
+    ) -> list[dict[str, str]]:
+        candidates: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for raw in [
+            *(state.get("bootstrap_task_donors") or []),
+            *(bootstrap.get("donors") or []),
+        ]:
+            if not isinstance(raw, Mapping):
+                continue
+            try:
+                donor = normalize_bootstrap_donor(raw)
+            except ValueError:
+                continue
+            identity = (donor["conversation_id"], donor["assistant_message_id"])
+            if identity in seen:
+                continue
+            seen.add(identity)
+            candidates.append(donor)
+        return candidates
+
+    @staticmethod
+    def _remove_task_donor(state: dict[str, Any], donor: Mapping[str, Any]) -> None:
+        existing = state.get("bootstrap_task_donors")
+        if not isinstance(existing, list):
+            return
+        state["bootstrap_task_donors"] = [item for item in existing if item != donor]
+
+    def _mark_bootstrap_unavailable(
+        self, state: dict[str, Any], bootstrap: Mapping[str, Any]
+    ) -> None:
+        self._block(
+            state,
+            (
+                f"Bootstrap {bootstrap.get('bootstrap_id')!r} has no usable donors and no "
+                "prewarm_prompt; select another bootstrap or replace/add a source before Send."
+            ),
+            code="bootstrap_unavailable",
+            retryable=False,
+        )
+
+    async def _materialize_bootstrap_source_donor(
+        self,
+        state: dict[str, Any],
+        bootstrap: Mapping[str, Any],
+        actions: CDPATabActions,
+    ) -> tuple[dict[str, Any], bool]:
+        source_id = str(bootstrap.get("source_conversation_id") or "").strip()
+        if not source_id or state.get("bootstrap_source_exhausted") is True:
+            return dict(bootstrap), False
+        try:
+            graph = await actions.backend_conversation(source_id)
+            assistant = resolve_latest_terminal_assistant(graph)
+        except BackendUnavailableError as exc:
+            if exc.status_code in {404, 410}:
+                state["bootstrap_source_exhausted"] = True
+                return dict(bootstrap), False
+            state["active_action"] = "bootstrap_retry"
+            return dict(bootstrap), True
+        except BackendNotReadyError:
+            state["active_action"] = "bootstrap_retry"
+            return dict(bootstrap), True
+        except BackendError:
+            state["active_action"] = "bootstrap_retry"
+            return dict(bootstrap), True
+
+        donor = normalize_bootstrap_donor(
+            {
+                "conversation_id": source_id,
+                "assistant_message_id": assistant.message_id,
+            }
+        )
+        updated = BootstrapCatalog(self.config.repository_root).add_donor(
+            str(bootstrap["bootstrap_id"]), donor
+        )
+        state["bootstrap"] = updated
+        state["bootstrap_source_materialized"] = donor
+        return updated, False
+
+    async def _regenerate_bootstrap_donor(
+        self,
+        state: dict[str, Any],
+        bootstrap: Mapping[str, Any],
+        actions: CDPATabActions,
+    ) -> dict[str, Any] | None:
+        prewarm_prompt = str(bootstrap.get("prewarm_prompt") or "").strip()
+        if not prewarm_prompt:
+            return None
+        async with self._bootstrap_prepare_lock:
+            current = self._bootstrap_for_state(state) or dict(bootstrap)
+            if current.get("donors"):
+                return current
+            generation = int(state.get("bootstrap_prewarm_generation") or 0) + 1
+            bootstrap_id = str(current["bootstrap_id"])
+            request_id = "bootstrap-prewarm-" + _sha(
+                f"{bootstrap_id}:{state.get('task_id')}:{generation}"
+            )[:24]
+            ledger_path = (
+                self.config.repository_root
+                / ".runtime"
+                / "cdpa-bootstrap-prewarm-ledger.json"
+            )
+            ledger = RequestLedger(ledger_path)
+            existing = ledger.get(request_id) if ledger.path.exists() else None
+            acquired = await actions.acquire_global_role("BOOTSTRAP")
+            if existing is None:
+                await acquired.client.new_chat(
+                    discard_draft=False,
+                    discard_attachments=False,
+                    stop_first=False,
+                    timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
+                )
+                ownership = await acquired.client.assert_ownership()
+                if (
+                    str(getattr(ownership, "page_role", "") or "") != "BOOTSTRAP"
+                    or getattr(ownership, "page_task_id", None)
+                    or getattr(ownership, "page_team", None)
+                ):
+                    raise RoleOwnershipError(
+                        "bootstrap prewarm tab must remain global and task-neutral"
+                    )
+            block = DurableSendBlock(
+                prewarm_prompt,
+                ledger_path=ledger_path,
+                source_context={
+                    "kind": "bootstrap_prewarm",
+                    "bootstrap_id": bootstrap_id,
+                    "origin_task_id": state.get("task_id"),
+                    "generation": generation,
+                },
+                role_prompt_hash=_sha("bootstrap-prewarm"),
+                request_id=request_id,
+                wait_for_response=True,
+                response_timeout_ms=round(self.config.response_timeout_seconds * 1000),
+                block_id="bootstrap_prewarm",
+            )
+
+            crossed_send_boundary = bool(
+                existing is not None
+                and existing.status
+                in {RequestStatus.SENDING, RequestStatus.SENT, RequestStatus.COMPLETED}
+            )
+
+            async def perform_send() -> Any:
+                if self._rate_limit_gate_active() and not crossed_send_boundary:
+                    state["active_action"] = "bootstrap_regenerate"
+                    return _AUTOMATED_SEND_SKIPPED
+                try:
+                    return await block.run(WorkflowContext(acquired.client))
+                except RateLimitBlockedError as exc:
+                    await self._enter_rate_limit_cooldown(state, actions, exc)
+                    state["active_action"] = "bootstrap_regenerate"
+                    return _AUTOMATED_SEND_SKIPPED
+
+            try:
+                output = await self._run_automated_send(perform_send)
+            except DurableRequestError as exc:
+                self._block(
+                    state,
+                    sanitize_text(exc, max_chars=1000),
+                    code="bootstrap_prewarm_recovery_required",
+                    retryable=False,
+                )
+                return None
+            if output is _AUTOMATED_SEND_SKIPPED:
+                return None
+            if not isinstance(output, Mapping):
+                raise RuntimeError("bootstrap prewarm durable send returned invalid output")
+            receipt = output.get("receipt")
+            response = output.get("response")
+            if not isinstance(receipt, Mapping) or not isinstance(response, Mapping):
+                raise RuntimeError("bootstrap prewarm completed without receipt and response")
+            conversation_id = str(receipt.get("conversation_id") or "").strip()
+            if not conversation_id:
+                ownership = await acquired.client.assert_ownership()
+                identity = conversation_identity(getattr(ownership, "url", None))
+                conversation_id = (
+                    identity.rsplit("/", 1)[-1] if identity is not None else ""
+                )
+            donor = normalize_bootstrap_donor(
+                {
+                    "conversation_id": conversation_id,
+                    "assistant_message_id": str(response.get("message_id") or ""),
+                }
+            )
+            updated = BootstrapCatalog(self.config.repository_root).add_donor(
+                bootstrap_id, donor
+            )
+            state["bootstrap"] = updated
+            state["bootstrap_prewarm_generation"] = generation
+            state["bootstrap_prewarm_donor"] = donor
+            state["active_action"] = "bootstrap_retry"
+            return updated
+
     async def _branch_from_bootstrap_ui(
         self,
         state: Mapping[str, Any],
         role: str,
         actions: CDPATabActions,
-        bootstrap: Mapping[str, Any],
+        donor: Mapping[str, Any],
     ) -> AcquiredRole:
         role_record = state["roles"][role]
         physical = str(role_record["physical_role"])
         task_id = str(state["task_id"])
         team = str(state["team"])
-        conversation_id = str(bootstrap["conversation_id"])
-        message_id = str(bootstrap["terminal_assistant_message_id"])
+        conversation_id = str(donor["conversation_id"])
+        message_id = str(donor["assistant_message_id"])
         source_url = f"https://chatgpt.com/c/{conversation_id}"
         timeout_ms = round(self.config.workspace_timeout_seconds * 1000)
         page = None
@@ -2388,162 +2637,16 @@ class CDPAWorker:
                 f"UI bootstrap branch failed: {type(exc).__name__}: {exc}"
             ) from exc
 
-    def _wait_for_bootstrap_repair(
-        self,
-        state: dict[str, Any],
-        bootstrap: Mapping[str, Any],
-    ) -> None:
-        bootstrap_id = str(bootstrap.get("bootstrap_id") or "")
-        waiting = {
-            "reason": "bootstrap",
-            "waiting_on": [],
-            "stopped": [],
-            "missing": [],
-            "since": utc_now(),
-            "bootstrap_id": bootstrap_id,
-            "bootstrap_repair_event_key": None,
-        }
-        state.update(
-            status="WAITING",
-            kanban_column="WAITING",
-            active_action="waiting_bootstrap_repair",
-            waiting_code="bootstrap_repair",
-            waiting_reason=(
-                f"Bootstrap {bootstrap_id!r} is unavailable; waiting for Bootstrap Keeper renewal"
-            ),
-            waiting=waiting,
-            block_code=None,
-            block_retryable=False,
-            block_reason=None,
-            pause_reason=None,
-        )
-        try:
-            discovered = self.store.discover()
-        except Exception as exc:
-            waiting["bootstrap_repair_error"] = sanitize_text(
-                f"Bootstrap Keeper discovery failed: {type(exc).__name__}: {exc}",
-                max_chars=500,
-            )
-            return
-        keepers = [
-            item
-            for item in discovered
-            if is_independent_task(item)
-            and str(item.get("team") or "") == "agent-bootstrap-keeper"
-            and item.get("independent", {}).get("deleted_at") is None
-        ]
-        if len(keepers) != 1:
-            waiting["bootstrap_repair_error"] = (
-                "Bootstrap Keeper is unavailable"
-                if not keepers
-                else "Bootstrap Keeper identity is ambiguous"
-            )
-            return
-        keeper = keepers[0]
-        independent = keeper.get("independent")
-        if not isinstance(independent, Mapping) or independent.get("enabled") is not True:
-            waiting["bootstrap_repair_error"] = "Bootstrap Keeper is disabled"
-            return
-        active_event = independent.get("active_event")
-        if isinstance(active_event, Mapping):
-            waiting["bootstrap_repair_error"] = "Bootstrap Keeper is already running"
-            return
-        if str(keeper.get("status") or "").upper() != "WAITING":
-            waiting["bootstrap_repair_error"] = "Bootstrap Keeper is not idle"
-            return
-        try:
-            activated = self.store.run_independent_now(
-                keeper["manifest_path"],
-                trigger_type="manual",
-                instruction=(
-                    f"Selected workflow {state['task_id']} exhausted native and semantic UI "
-                    f"branching before Send for {bootstrap_id}. Force one bounded renewal under "
-                    "the saved Keeper contract even if the old anchor later probes healthy; "
-                    "publish only after candidate branch-health verification and preserve the "
-                    "previous stable pointer on failure."
-                ),
-            )
-        except Exception as exc:
-            waiting["bootstrap_repair_error"] = sanitize_text(
-                f"{type(exc).__name__}: {exc}", max_chars=500
-            )
-            return
-        event = activated.get("independent", {}).get("active_event")
-        if isinstance(event, Mapping):
-            waiting["bootstrap_repair_event_key"] = event.get("event_key")
-        self._publish_command_state(activated)
-
-    def _release_bootstrap_repair_wait(
-        self,
-        path: Path,
-        state: Mapping[str, Any],
-    ) -> tuple[dict[str, Any], bool]:
-        if (
-            str(state.get("status") or "").upper() != "WAITING"
-            or state.get("waiting_code") != "bootstrap_repair"
-        ):
-            return dict(state), False
-        bootstrap = state.get("bootstrap")
-        if not isinstance(bootstrap, Mapping):
-            return dict(state), False
-        bootstrap_id = str(bootstrap.get("bootstrap_id") or "")
-        try:
-            renewed = BootstrapCatalog(self.config.repository_root).get(bootstrap_id)
-        except Exception:
-            return dict(state), False
-        if renewed is None or renewed.get("enabled") is not True or not renewed.get("last_verified_at"):
-            return dict(state), False
-        old_anchor = (
-            str(bootstrap.get("conversation_id") or ""),
-            str(bootstrap.get("terminal_assistant_message_id") or ""),
-        )
-        new_anchor = (
-            str(renewed.get("conversation_id") or ""),
-            str(renewed.get("terminal_assistant_message_id") or ""),
-        )
-        if old_anchor == new_anchor:
-            return dict(state), False
-
-        def release(current: dict[str, Any]) -> dict[str, Any]:
-            if (
-                str(current.get("status") or "").upper() != "WAITING"
-                or current.get("waiting_code") != "bootstrap_repair"
-            ):
-                return current
-            current_bootstrap = current.get("bootstrap")
-            if not isinstance(current_bootstrap, Mapping):
-                return current
-            if (
-                str(current_bootstrap.get("conversation_id") or ""),
-                str(current_bootstrap.get("terminal_assistant_message_id") or ""),
-            ) != old_anchor:
-                return current
-            hop = _active_hop(current)
-            if hop.get("receipt") is not None or str(hop.get("state") or "") != "pre_send":
-                return current
-            role = str(current.get("active_role") or "PLAN").upper()
-            current["bootstrap"] = dict(renewed)
-            current["status"] = "RUNNING"
-            current["kanban_column"] = _column_for(role)
-            current["active_action"] = "queued"
-            current["waiting_code"] = None
-            current["waiting_reason"] = None
-            current["waiting"] = None
-            return current
-
-        saved = self.store.update(path, release)
-        return saved, saved != state
-
     async def _acquire_workflow_role(
         self,
         state: dict[str, Any],
         role: str,
         actions: CDPATabActions,
     ) -> AcquiredRole | None:
-        bootstrap = state.get("bootstrap")
+        bootstrap = self._bootstrap_for_state(state)
         role_record = state["roles"][role]
         first_allocation = (
-            isinstance(bootstrap, Mapping)
+            isinstance(state.get("bootstrap"), Mapping)
             and not role_record.get("page_id")
             and not role_record.get("page_url")
             and int(role_record.get("conversation_generation") or 0) == 0
@@ -2551,30 +2654,92 @@ class CDPAWorker:
         )
         if not first_allocation:
             return await self._acquire_existing_role(state, role, actions)
+        if bootstrap is None:
+            self._block(
+                state,
+                "Selected bootstrap record is unavailable; select another bootstrap before Send.",
+                code="bootstrap_unavailable",
+                retryable=False,
+            )
+            return None
 
         owned = await actions.locate_owned(state, role)
         if owned is not None:
             return owned
-        try:
-            acquired = await actions.branch_from_anchor(
-                state,
-                role,
-                source_conversation_id=str(bootstrap["conversation_id"]),
-                assistant_message_id=str(bootstrap["terminal_assistant_message_id"]),
-            )
-            role_record["context_source"] = "bootstrap_native"
+
+        catalog = BootstrapCatalog(self.config.repository_root)
+        saw_transient = False
+        for donor in self._bootstrap_donor_candidates(state, bootstrap):
+            try:
+                graph = await actions.backend_conversation(donor["conversation_id"])
+                resolve_bootstrap_donor(graph, donor["assistant_message_id"])
+            except BackendUnavailableError as exc:
+                if exc.status_code in {404, 410}:
+                    updated = catalog.remove_donor(str(bootstrap["bootstrap_id"]), donor)
+                    state["bootstrap"] = updated
+                    bootstrap = updated
+                    self._remove_task_donor(state, donor)
+                    if donor["conversation_id"] == str(
+                        bootstrap.get("source_conversation_id") or ""
+                    ):
+                        state["bootstrap_source_exhausted"] = True
+                    continue
+                saw_transient = True
+                continue
+            except GraphIdentityError:
+                updated = catalog.remove_donor(str(bootstrap["bootstrap_id"]), donor)
+                state["bootstrap"] = updated
+                bootstrap = updated
+                self._remove_task_donor(state, donor)
+                if donor["conversation_id"] == str(
+                    bootstrap.get("source_conversation_id") or ""
+                ):
+                    state["bootstrap_source_exhausted"] = True
+                continue
+            except BackendError:
+                saw_transient = True
+                continue
+
+            try:
+                acquired = await actions.branch_from_anchor(
+                    state,
+                    role,
+                    source_conversation_id=donor["conversation_id"],
+                    assistant_message_id=donor["assistant_message_id"],
+                )
+            except BranchBootstrapError:
+                try:
+                    acquired = await self._branch_from_bootstrap_ui(
+                        state, role, actions, donor
+                    )
+                except BootstrapUIBranchError:
+                    saw_transient = True
+                    continue
+            role_record["context_source"] = "bootstrap_donor"
+            role_record["bootstrap_source_donor"] = dict(donor)
             return acquired
-        except BranchBootstrapError:
-            pass
-        try:
-            acquired = await self._branch_from_bootstrap_ui(
-                state, role, actions, bootstrap
-            )
-            role_record["context_source"] = "bootstrap_ui"
-            return acquired
-        except BootstrapUIBranchError:
-            self._wait_for_bootstrap_repair(state, bootstrap)
+
+        current = self._bootstrap_for_state(state) or bootstrap
+        if current.get("donors") or saw_transient:
+            state["active_action"] = "bootstrap_retry"
             return None
+        current, source_transient = await self._materialize_bootstrap_source_donor(
+            state, current, actions
+        )
+        if current.get("donors"):
+            return await self._acquire_workflow_role(state, role, actions)
+        if source_transient:
+            return None
+        if str(current.get("prewarm_prompt") or "").strip():
+            state["active_action"] = "bootstrap_regenerate"
+            regenerated = await self._regenerate_bootstrap_donor(
+                state, current, actions
+            )
+            if regenerated is not None and regenerated.get("donors"):
+                return await self._acquire_workflow_role(state, role, actions)
+            return None
+        self._mark_bootstrap_unavailable(state, current)
+        return None
 
     async def _pre_send(
         self,
@@ -2661,7 +2826,8 @@ class CDPAWorker:
         workflow_definition = workflow_definitions[role]
         bootstrap_inherited = (
             bool(workflow_definition["is_system"])
-            and role_record.get("context_source") in {"bootstrap_native", "bootstrap_ui"}
+            and role_record.get("context_source")
+            in {"bootstrap_donor", "bootstrap_native", "bootstrap_ui"}
             and generation == 1
         )
         allowed_routes = tuple(workflow_definitions) + ("DONE",)
@@ -2771,7 +2937,7 @@ class CDPAWorker:
             response_timeout_ms=None,
         )
         try:
-            async with self._send_gate_lock:
+            async def perform_send() -> Any:
                 current_record = (
                     ledger.get(str(hop["request_id"]))
                     if ledger.path.exists()
@@ -2788,13 +2954,17 @@ class CDPAWorker:
                 )
                 if self._rate_limit_gate_active() and not crossed_send_boundary:
                     self._apply_rate_limit_to_state(state, hop)
-                    return
+                    return _AUTOMATED_SEND_SKIPPED
                 try:
-                    output = await block.run(WorkflowContext(acquired.client))
+                    return await block.run(WorkflowContext(acquired.client))
                 except RateLimitBlockedError as exc:
                     await self._enter_rate_limit_cooldown(state, actions, exc)
                     self._apply_rate_limit_to_state(state, hop)
-                    return
+                    return _AUTOMATED_SEND_SKIPPED
+
+            output = await self._run_automated_send(perform_send)
+            if output is _AUTOMATED_SEND_SKIPPED:
+                return
         except UploadIdentityChangedError:
             attachment = next(
                 (
@@ -3209,6 +3379,54 @@ class CDPAWorker:
             now + timedelta(seconds=_DOM_FALLBACK_SETTLE_SECONDS)
         ).isoformat()
 
+    async def _capture_bootstrap_role_donor(
+        self,
+        state: dict[str, Any],
+        hop: Mapping[str, Any],
+        actions: CDPATabActions,
+    ) -> bool:
+        bootstrap = self._bootstrap_for_state(state)
+        if bootstrap is None:
+            return False
+        role = str(hop.get("target_role") or "").upper()
+        role_record = state.get("roles", {}).get(role)
+        if not isinstance(role_record, dict):
+            return False
+        if (
+            role_record.get("context_source") != "bootstrap_donor"
+            or int(role_record.get("conversation_generation") or 0) != 1
+            or isinstance(role_record.get("bootstrap_donor"), Mapping)
+        ):
+            return False
+        receipt = hop.get("receipt")
+        if not isinstance(receipt, Mapping):
+            return False
+        conversation_id = str(receipt.get("conversation_id") or "").strip()
+        user_message_id = str(receipt.get("user_message_id") or "").strip()
+        if not conversation_id or not user_message_id:
+            return False
+        try:
+            graph = await actions.backend_conversation(conversation_id)
+            inherited = resolve_inherited_assistant(graph, user_message_id)
+            donor = normalize_bootstrap_donor(
+                {
+                    "conversation_id": conversation_id,
+                    "assistant_message_id": inherited.message_id,
+                }
+            )
+        except BackendError:
+            return False
+        updated = BootstrapCatalog(self.config.repository_root).add_donor(
+            str(bootstrap["bootstrap_id"]), donor
+        )
+        state["bootstrap"] = updated
+        task_donors = state.setdefault("bootstrap_task_donors", [])
+        task_donors[:] = [donor, *[item for item in task_donors if item != donor]][
+            : int(updated["max_backups"])
+        ]
+        role_record["bootstrap_donor"] = donor
+        return True
+
     async def _waiting(
         self,
         state: dict[str, Any],
@@ -3230,6 +3448,7 @@ class CDPAWorker:
             )
             return
 
+        await self._capture_bootstrap_role_donor(state, hop, actions)
         wait = hop["wait"]
         backend_before = copy.deepcopy(state)
         persistence_baseline = (
@@ -3302,7 +3521,6 @@ class CDPAWorker:
             if mode not in {"stream_status", "status_recovery"}:
                 mode = "stream_status"
             wait["completion_mode"] = mode
-            normal_interval = float(self.config.response_stream_status_poll_seconds)
             next_poll = parse_time(wait.get("stream_status_next_poll_at"))
             if next_poll is None:
                 if mode == "status_recovery":
@@ -3312,7 +3530,9 @@ class CDPAWorker:
                         parse_time((hop.get("timestamps") or {}).get("sent_at"))
                         or now
                     )
-                    next_poll = sent_at + timedelta(seconds=normal_interval)
+                    next_poll = sent_at + timedelta(
+                        seconds=self._stream_status_poll_delay()
+                    )
                 wait["stream_status_next_poll_at"] = next_poll.isoformat()
 
             if now >= next_poll:
@@ -3347,7 +3567,8 @@ class CDPAWorker:
                     if status == "IS_STREAMING":
                         wait["completion_mode"] = "stream_status"
                         wait["stream_status_next_poll_at"] = (
-                            now + timedelta(seconds=normal_interval)
+                            now
+                            + timedelta(seconds=self._stream_status_poll_delay())
                         ).isoformat()
                         for key in (
                             "backend_fallback_category",
@@ -4466,17 +4687,20 @@ class CDPAWorker:
                 return
             ownership_token = upload_receipt.ownership_token
         try:
-            receipt = await acquired.client.send(
-                record.rendered_prompt,
-                wait_for_stop=False,
-                max_attempts=1,
-                recovery_reload=False,
-                expected_task_id=str(state["task_id"]),
-                expected_team=str(state["team"]),
-                expected_attachment_ownership_token=ownership_token,
-                expected_attachment_count=len(record.files),
-                expected_attachment_names=expected_names,
-            )
+            async def resume_send() -> Any:
+                return await acquired.client.send(
+                    record.rendered_prompt,
+                    wait_for_stop=False,
+                    max_attempts=1,
+                    recovery_reload=False,
+                    expected_task_id=str(state["task_id"]),
+                    expected_team=str(state["team"]),
+                    expected_attachment_ownership_token=ownership_token,
+                    expected_attachment_count=len(record.files),
+                    expected_attachment_names=expected_names,
+                )
+
+            receipt = await self._run_automated_send(resume_send)
         except (ComposerConflictError, PageOwnershipError, TaskBindingError) as exc:
             self._require_resume_recovery(
                 state,
@@ -4686,10 +4910,7 @@ class CDPAWorker:
                         tasks=scheduling_tasks,
                         state=loaded_state,
                     )
-                    state, bootstrap_released = self._release_bootstrap_repair_wait(
-                        path, state
-                    )
-                    if scheduling_changed or bootstrap_released:
+                    if scheduling_changed:
                         self._remember_manifest(path, state)
                 except Exception as exc:
                     failure_baseline = self._load_manifest_cached(path, force=True)
@@ -5691,6 +5912,26 @@ class CDPAWorker:
                 raise RuntimeError(
                     "create command bootstrap provenance does not match its payload"
                 )
+            definition = payload.get("bootstrap_definition")
+            if definition is not None:
+                if not isinstance(definition, Mapping) or not isinstance(snapshot, Mapping):
+                    raise RuntimeError(
+                        "create command bootstrap definition provenance is missing"
+                    )
+                expected_definition = {
+                    "bootstrap_id": definition.get("bootstrap_id"),
+                    "name": definition.get("name"),
+                    "source_conversation_id": definition.get("source_conversation_id"),
+                    "prewarm_prompt": definition.get("prewarm_prompt"),
+                    "max_backups": definition.get("max_backups"),
+                }
+                actual_definition = {
+                    key: snapshot.get(key) for key in expected_definition
+                }
+                if actual_definition != expected_definition:
+                    raise RuntimeError(
+                        "create command bootstrap definition provenance does not match its payload"
+                    )
             return state
         if kind not in {"task_control", "resume_team"}:
             return None
@@ -5801,7 +6042,60 @@ class CDPAWorker:
                     state = existing
                 else:
                     bootstrap = None
-                    if "bootstrap_id" in payload:
+                    definition = payload.get("bootstrap_definition")
+                    if definition is not None:
+                        if not isinstance(definition, Mapping):
+                            raise ValueError("bootstrap_definition must be an object")
+                        bootstrap_id = str(payload.get("bootstrap_id") or "")
+                        if bootstrap_id != str(definition.get("bootstrap_id") or ""):
+                            raise ValueError(
+                                "bootstrap_definition must match requested bootstrap_id"
+                            )
+                        catalog = BootstrapCatalog(self.config.repository_root)
+                        existing_bootstrap = catalog.get(bootstrap_id)
+                        if existing_bootstrap is None:
+                            now = utc_now()
+                            bootstrap = catalog.upsert(
+                                {
+                                    "bootstrap_id": bootstrap_id,
+                                    "name": definition.get("name"),
+                                    "description": "",
+                                    "source_conversation_id": definition.get(
+                                        "source_conversation_id"
+                                    ),
+                                    "prewarm_prompt": definition.get("prewarm_prompt"),
+                                    "max_backups": definition.get("max_backups", 7),
+                                    "donors": [],
+                                    "enabled": True,
+                                    "tags": [],
+                                    "created_at": now,
+                                    "updated_at": now,
+                                }
+                            )
+                        else:
+                            expected_definition = {
+                                "bootstrap_id": bootstrap_id,
+                                "name": definition.get("name"),
+                                "source_conversation_id": definition.get(
+                                    "source_conversation_id"
+                                ),
+                                "prewarm_prompt": definition.get("prewarm_prompt"),
+                                "max_backups": definition.get("max_backups"),
+                            }
+                            actual_definition = {
+                                key: existing_bootstrap.get(key)
+                                for key in expected_definition
+                            }
+                            if actual_definition != expected_definition:
+                                raise ValueError(
+                                    f"bootstrap already exists with different definition: {bootstrap_id}"
+                                )
+                            if existing_bootstrap.get("enabled") is not True:
+                                raise ValueError(
+                                    f"requested bootstrap is disabled: {bootstrap_id}"
+                                )
+                            bootstrap = existing_bootstrap
+                    elif "bootstrap_id" in payload and payload.get("bootstrap_id") is not None:
                         bootstrap_id = str(payload.get("bootstrap_id") or "")
                         bootstrap = BootstrapCatalog(self.config.repository_root).get(
                             bootstrap_id

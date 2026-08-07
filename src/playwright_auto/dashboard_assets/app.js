@@ -30,6 +30,7 @@ const roots = {
   reuseTeam: document.querySelector('#create-form select[name="reuse_team"]'),
   requestedTeam: document.querySelector('#create-form input[name="requested_team"]'),
   bootstrapSelect: document.querySelector('#create-form select[name="bootstrap_id"]'),
+  bootstrapInline: document.querySelector("#create-form [data-bootstrap-inline]"),
   workflowAgentOptions: document.querySelector("#workflow-agent-options"),
   createSummary: document.querySelector("#create-selection-summary"),
   createValidation: document.querySelector("#create-validation"),
@@ -52,6 +53,7 @@ const roots = {
 const client = new APIClient(state.etags, state.inflight);
 const activeStatuses = new Set(["submitting", "unknown", "queued", "running"]);
 const OVERLAY_STATE = "cdpaOverlay";
+const INLINE_BOOTSTRAP_VALUE = "__create_inline__";
 let viewSaveTimer = null;
 let closingOverlay = null;
 let bootstrapDefaultId = "";
@@ -230,23 +232,34 @@ async function loadBootstrapOptions() {
       option.title = item.description || "";
       options.push(option);
     }
+    options.push(new Option("Create bootstrap inline…", INLINE_BOOTSTRAP_VALUE));
     roots.bootstrapSelect.replaceChildren(...options);
     bootstrapDefaultId = String(data.default_id || "");
     roots.bootstrapSelect.value = [...roots.bootstrapSelect.options].some(
       option => option.value === bootstrapDefaultId,
     ) ? bootstrapDefaultId : "";
+    syncBootstrapInlineFields();
     updateCreateSummary();
   } catch (error) {
     bootstrapDefaultId = "";
-    roots.bootstrapSelect.replaceChildren(new Option("None / Fresh context", ""));
+    roots.bootstrapSelect.replaceChildren(
+      new Option("None / Fresh context", ""),
+      new Option("Create bootstrap inline…", INLINE_BOOTSTRAP_VALUE),
+    );
+    syncBootstrapInlineFields();
     toast(error.message);
   }
+}
+
+function syncBootstrapInlineFields() {
+  roots.bootstrapInline.hidden = roots.bootstrapSelect.value !== INLINE_BOOTSTRAP_VALUE;
 }
 
 function resetBootstrapSelection() {
   roots.bootstrapSelect.value = [...roots.bootstrapSelect.options].some(
     option => option.value === bootstrapDefaultId,
   ) ? bootstrapDefaultId : "";
+  syncBootstrapInlineFields();
 }
 
 function updateCreateSummary() {
@@ -1237,7 +1250,30 @@ roots.form.addEventListener("submit", event => {
   };
   body.roles = selectedWorkflowRoles();
   const bootstrapId = String(values.get("bootstrap_id") || "");
-  if (bootstrapId) body.bootstrap_id = bootstrapId;
+  if (bootstrapId === INLINE_BOOTSTRAP_VALUE) {
+    const bootstrapNewId = String(values.get("bootstrap_new_id") || "").trim();
+    const bootstrapName = String(values.get("bootstrap_new_name") || "").trim();
+    const bootstrapSource = String(values.get("bootstrap_new_source") || "").trim() || null;
+    const bootstrapPrewarm = String(values.get("bootstrap_new_prewarm_prompt") || "").trim() || null;
+    const bootstrapMaxBackups = Number(values.get("bootstrap_new_max_backups") || 7);
+    if (!bootstrapNewId || !bootstrapName) {
+      showCreateValidation("Inline bootstrap ID and name are required.");
+      return;
+    }
+    if (!bootstrapSource && !bootstrapPrewarm) {
+      showCreateValidation("Inline bootstrap requires a source or prewarm prompt.");
+      return;
+    }
+    body.bootstrap_definition = {
+      bootstrap_id: bootstrapNewId,
+      name: bootstrapName,
+      source: bootstrapSource,
+      prewarm_prompt: bootstrapPrewarm,
+      max_backups: bootstrapMaxBackups,
+    };
+  } else {
+    body.bootstrap_id = bootstrapId || null;
+  }
   if (reuseTeam) body.reuse_team = reuseTeam;
   else if (requestedTeam) body.requested_team = requestedTeam;
   queueCommand({
@@ -1260,6 +1296,11 @@ roots.form.addEventListener("input", event => {
     showCreateValidation();
     updateCreateSummary();
   }
+});
+roots.bootstrapSelect.addEventListener("change", () => {
+  syncBootstrapInlineFields();
+  showCreateValidation();
+  updateCreateSummary();
 });
 roots.dependencyOptions.addEventListener("change", updateCreateSummary);
 roots.workflowAgentOptions.addEventListener("change", updateCreateSummary);

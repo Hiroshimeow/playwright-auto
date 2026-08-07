@@ -165,7 +165,18 @@ def test_bootstrap_api_filters_anchor_ids_and_create_payload_is_optional(tmp_pat
             server,
             "POST",
             "/api/tasks",
-            body={**common, "bootstrap_id": "general-team-bootstrap"},
+            body=common,
+            headers={"Idempotency-Key": "default-bootstrap-payload"},
+        )
+        assert status == 202
+        command = db.get_command(json.loads(data)["command_id"])
+        assert command["payload"]["bootstrap_id"] == "general-team-bootstrap"
+
+        status, _headers, data = request(
+            server,
+            "POST",
+            "/api/tasks",
+            body={**common, "task": "named payload", "bootstrap_id": "general-team-bootstrap"},
             headers={"Idempotency-Key": "bootstrap-payload"},
         )
         assert status == 202
@@ -180,7 +191,35 @@ def test_bootstrap_api_filters_anchor_ids_and_create_payload_is_optional(tmp_pat
             headers={"Idempotency-Key": "fresh-payload"},
         )
         assert status == 202
-        assert "bootstrap_id" not in db.get_command(json.loads(data)["command_id"])["payload"]
+        assert db.get_command(json.loads(data)["command_id"])["payload"]["bootstrap_id"] is None
+
+        status, _headers, data = request(
+            server,
+            "POST",
+            "/api/tasks",
+            body={
+                **common,
+                "task": "inline bootstrap payload",
+                "bootstrap_definition": {
+                    "bootstrap_id": "inline-bootstrap",
+                    "name": "Inline Bootstrap",
+                    "source": "https://chatgpt.com/c/55555555-5555-4555-8555-555555555555",
+                    "prewarm_prompt": "Keep this context reusable.",
+                    "max_backups": 5,
+                },
+            },
+            headers={"Idempotency-Key": "inline-bootstrap-payload"},
+        )
+        assert status == 202
+        inline = db.get_command(json.loads(data)["command_id"])["payload"]
+        assert inline["bootstrap_id"] == "inline-bootstrap"
+        assert inline["bootstrap_definition"] == {
+            "bootstrap_id": "inline-bootstrap",
+            "name": "Inline Bootstrap",
+            "source_conversation_id": "55555555-5555-4555-8555-555555555555",
+            "prewarm_prompt": "Keep this context reusable.",
+            "max_backups": 5,
+        }
 
         for index, invalid in enumerate(("", "   ", 7, [], {})):
             status, _headers, _data = request(

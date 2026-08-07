@@ -11,7 +11,11 @@ from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
-from .cdpa_bootstraps import normalize_bootstrap_record
+from .cdpa_bootstraps import (
+    is_legacy_bootstrap_record,
+    normalize_bootstrap_record,
+    normalize_legacy_bootstrap_record,
+)
 from .cdpa_commands import RepairRequest, WorkerCommand, command_snapshot
 from .cdpa_config import CDPAConfig
 from .cdpa_dependencies import (
@@ -72,7 +76,9 @@ _TASK_STATUSES = frozenset({"INBOX", "WAITING", "RUNNING", "PAUSED", "BLOCKED", 
 _HOP_STATES = frozenset({"waiting_trigger", "pre_send", "sending", "sent", "waiting", "responded", "routed", "abandoned"})
 _CLEANUP_STATES = frozenset({"ACTIVE", "CLEARING", "CLEARED"})
 _MAINTENANCE_STATES = frozenset({"OPEN", "RUNNING", "SUSPENDED", "RESOLVED", "ESCALATED"})
-_BOOTSTRAP_CONTEXT_SOURCES = frozenset({"bootstrap_native", "bootstrap_ui", "fresh_fallback"})
+_BOOTSTRAP_CONTEXT_SOURCES = frozenset(
+    {"bootstrap_donor", "bootstrap_native", "bootstrap_ui", "fresh_fallback"}
+)
 
 
 class TeamWorkExistsError(RuntimeError):
@@ -843,7 +849,11 @@ class TaskStore(IndependentAgentStoreMixin):
             if mode != TASK_MODE_WORKFLOW:
                 return "bootstrap snapshot is only valid for workflow tasks"
             try:
-                normalized_bootstrap = normalize_bootstrap_record(bootstrap)
+                normalized_bootstrap = (
+                    normalize_legacy_bootstrap_record(bootstrap)
+                    if is_legacy_bootstrap_record(bootstrap)
+                    else normalize_bootstrap_record(bootstrap)
+                )
             except ValueError as exc:
                 return f"bootstrap snapshot is invalid: {exc}"
             if dict(bootstrap) != normalized_bootstrap:

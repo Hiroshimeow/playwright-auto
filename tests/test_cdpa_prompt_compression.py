@@ -29,6 +29,25 @@ class BootstrapActions(FakeActions):
     async def locate_owned(self, _state, _role):
         return None
 
+    async def backend_conversation(self, conversation_id):
+        anchor = bootstrap_record()
+        assert conversation_id == anchor["conversation_id"]
+        return {
+            "current_node": anchor["terminal_assistant_message_id"],
+            "mapping": {
+                anchor["terminal_assistant_message_id"]: {
+                    "id": anchor["terminal_assistant_message_id"],
+                    "parent": None,
+                    "message": {
+                        "id": anchor["terminal_assistant_message_id"],
+                        "author": {"role": "assistant"},
+                        "recipient": "all",
+                        "content": {"content_type": "text", "parts": ["bootstrap"]},
+                    },
+                }
+            },
+        }
+
     async def branch_from_anchor(
         self,
         _state,
@@ -79,7 +98,7 @@ def test_inherited_builtin_omits_base_and_exact_send_payload_stays_identical(tmp
     asyncio.run(worker._pre_send(state, hop, actions))
 
     assert actions.branch_calls == ["PLAN"]
-    assert state["roles"]["PLAN"]["context_source"] == "bootstrap_native"
+    assert state["roles"]["PLAN"]["context_source"] == "bootstrap_donor"
     assert state["roles"]["PLAN"]["conversation_generation"] == 1
     assert "TEST_BASE_CONTEXT" not in hop["prompt"]
     assert "Constructor for PLAN" in hop["prompt"]
@@ -97,13 +116,10 @@ def test_inherited_builtin_omits_base_and_exact_send_payload_stays_identical(tmp
     assert record.rendered_prompt == hop["prompt"]
 
 
-def test_selected_bootstrap_exhaustion_waits_without_fresh_base_context(tmp_path: Path, monkeypatch):
+def test_selected_bootstrap_transient_branch_failure_retries_without_fresh_base_context(tmp_path: Path, monkeypatch):
     _store, state, worker = _setup(tmp_path, bootstrap=bootstrap_record())
 
-    class FailedBootstrapActions(FakeActions):
-        async def locate_owned(self, _state, _role):
-            return None
-
+    class FailedBootstrapActions(BootstrapActions):
         async def branch_from_anchor(self, *_args, **_kwargs):
             raise BranchBootstrapError("native unavailable")
 
@@ -117,9 +133,9 @@ def test_selected_bootstrap_exhaustion_waits_without_fresh_base_context(tmp_path
     hop = _active_hop(state)
     asyncio.run(worker._pre_send(state, hop, FailedBootstrapActions()))
 
-    assert state["status"] == "WAITING"
-    assert state["waiting_code"] == "bootstrap_repair"
-    assert state["waiting"]["bootstrap_repair_error"] == "Bootstrap Keeper is unavailable"
+    assert state["status"] == "INBOX"
+    assert state["active_action"] == "bootstrap_retry"
+    assert state.get("waiting_code") is None
     assert state["roles"]["PLAN"].get("context_source") is None
     assert hop["state"] == "pre_send"
     assert hop.get("prompt") is None
@@ -131,7 +147,7 @@ def test_generation_two_after_inherited_new_chat_restores_base_context(tmp_path:
     actions = BootstrapActions()
     asyncio.run(worker._pre_send(state, first, actions))
     assert state["roles"]["PLAN"]["conversation_generation"] == 1
-    assert state["roles"]["PLAN"]["context_source"] == "bootstrap_native"
+    assert state["roles"]["PLAN"]["context_source"] == "bootstrap_donor"
 
     worker._record_acquired(
         state,
@@ -154,7 +170,7 @@ def test_generation_two_after_inherited_new_chat_restores_base_context(tmp_path:
     )
     asyncio.run(worker._pre_send(state, second, FakeActions()))
 
-    assert state["roles"]["PLAN"]["context_source"] == "bootstrap_native"
+    assert state["roles"]["PLAN"]["context_source"] == "bootstrap_donor"
     assert "TEST_BASE_CONTEXT" in second["prompt"]
     assert "Constructor for PLAN" in second["prompt"]
 
@@ -183,7 +199,7 @@ def test_custom_workflow_prompt_is_preserved_even_when_bootstrap_inherited(tmp_p
 
     asyncio.run(worker._pre_send(state, hop, BootstrapActions()))
 
-    assert state["roles"][route]["context_source"] == "bootstrap_native"
+    assert state["roles"][route]["context_source"] == "bootstrap_donor"
     assert state["roles"][route]["conversation_generation"] == 1
     assert "CUSTOM_BOOTSTRAP_PROMPT_EXACT" in hop["prompt"]
     assert "TEST_BASE_CONTEXT" not in hop["prompt"]

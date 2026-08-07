@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from .cdpa_bootstraps import BootstrapCatalog
+from .cdpa_bootstraps import BootstrapCatalog, normalize_bootstrap_record
 from .cdpa_commands import RepairRequest
 from .cdpa_config import CDPAConfig, load_cdpa_config
 from .cdpa_identity import generate_idempotent_task_id, validate_task_id
@@ -173,6 +173,10 @@ class DashboardAPI:
             raise APIError(400, "invalid_request", f"{field} must be an array")
         return value
 
+    def _default_bootstrap_id(self) -> str | None:
+        record = BootstrapCatalog(self.config.repository_root).get("general-team-bootstrap")
+        return "general-team-bootstrap" if record and record.get("enabled") is True else None
+
     def _active_workflow_routes(self) -> tuple[str, ...]:
         snapshot = self.db.get_snapshot("agents")
         payload = snapshot.get("payload") if snapshot is not None else None
@@ -218,6 +222,49 @@ class DashboardAPI:
         selected = set(roles)
         return [role for role in available if role in selected]
 
+    def _bootstrap_definition(self, value: Any) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise APIError(400, "invalid_request", "bootstrap_definition must be an object")
+        allowed = {"bootstrap_id", "name", "source", "prewarm_prompt", "max_backups"}
+        unknown = set(value) - allowed
+        if unknown:
+            raise APIError(
+                400,
+                "invalid_request",
+                f"unknown bootstrap_definition fields: {sorted(unknown)!r}",
+            )
+        source = value.get("source")
+        if isinstance(source, str) and not source.strip():
+            source = None
+        prewarm_prompt = value.get("prewarm_prompt")
+        if isinstance(prewarm_prompt, str) and not prewarm_prompt.strip():
+            prewarm_prompt = None
+        try:
+            normalized = normalize_bootstrap_record(
+                {
+                    "bootstrap_id": value.get("bootstrap_id"),
+                    "name": value.get("name"),
+                    "description": "",
+                    "source_conversation_id": source,
+                    "prewarm_prompt": prewarm_prompt,
+                    "max_backups": value.get("max_backups", 7),
+                    "donors": [],
+                    "enabled": True,
+                    "tags": [],
+                    "created_at": "2000-01-01T00:00:00+00:00",
+                    "updated_at": "2000-01-01T00:00:00+00:00",
+                }
+            )
+        except ValueError as exc:
+            raise APIError(400, "invalid_request", str(exc)) from exc
+        return {
+            "bootstrap_id": normalized["bootstrap_id"],
+            "name": normalized["name"],
+            "source_conversation_id": normalized["source_conversation_id"],
+            "prewarm_prompt": normalized["prewarm_prompt"],
+            "max_backups": normalized["max_backups"],
+        }
+
     def normalize_create(self, raw: Mapping[str, Any]) -> dict[str, Any]:
         allowed = {
             "task",
@@ -231,6 +278,7 @@ class DashboardAPI:
             "depends_on_task_ids",
             "upload_paths",
             "bootstrap_id",
+            "bootstrap_definition",
         }
         unknown = set(raw) - allowed
         if unknown:
@@ -262,7 +310,26 @@ class DashboardAPI:
         }
         if "roles" in raw:
             normalized["roles"] = self._workflow_roles(raw.get("roles"))
-        if "bootstrap_id" in raw and raw.get("bootstrap_id") is not None:
+        definition = (
+            self._bootstrap_definition(raw.get("bootstrap_definition"))
+            if "bootstrap_definition" in raw
+            else None
+        )
+        if definition is not None:
+            requested_id = raw.get("bootstrap_id")
+            if requested_id not in {None, definition["bootstrap_id"]}:
+                raise APIError(
+                    400,
+                    "invalid_request",
+                    "bootstrap_id must match bootstrap_definition.bootstrap_id",
+                )
+            normalized["bootstrap_id"] = definition["bootstrap_id"]
+            normalized["bootstrap_definition"] = definition
+        elif "bootstrap_id" not in raw:
+            normalized["bootstrap_id"] = self._default_bootstrap_id()
+        elif raw.get("bootstrap_id") is None:
+            normalized["bootstrap_id"] = None
+        else:
             bootstrap_id = raw.get("bootstrap_id")
             if not isinstance(bootstrap_id, str) or not bootstrap_id.strip():
                 raise APIError(
@@ -770,14 +837,7 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                 }
                 for entry in entries
             ]
-            default_id = next(
-                (
-                    item["bootstrap_id"]
-                    for item in items
-                    if item["bootstrap_id"] == "general-team-bootstrap"
-                ),
-                None,
-            )
+            default_id = app._default_bootstrap_id()
             self._json(
                 200,
                 {"items": items, "default_id": default_id},

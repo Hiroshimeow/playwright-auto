@@ -190,3 +190,94 @@ def resolve_terminal_assistant(
     if terminal is None or unresolved_tool_chain:
         raise BackendNotReadyError("terminal assistant response is not materialized yet")
     return terminal
+
+
+def _current_branch_node_ids(graph: Mapping[str, Any]) -> tuple[Mapping[str, Any], list[str]]:
+    if not isinstance(graph, Mapping):
+        raise BackendSchemaError("conversation graph must be an object")
+    mapping = graph.get("mapping")
+    current_node = graph.get("current_node")
+    if not isinstance(mapping, Mapping) or not isinstance(current_node, str) or not current_node:
+        raise BackendSchemaError("conversation graph requires mapping and current_node")
+    reverse: list[str] = []
+    seen: set[str] = set()
+    node_id: str | None = current_node
+    while node_id is not None:
+        if node_id in seen:
+            raise BackendSchemaError("conversation graph current branch contains a cycle")
+        seen.add(node_id)
+        raw = _graph_node(mapping, node_id)
+        reverse.append(node_id)
+        parent = raw.get("parent")
+        node_id = str(parent) if parent is not None else None
+    return mapping, list(reversed(reverse))
+
+
+def resolve_latest_terminal_assistant(graph: Mapping[str, Any]) -> ResolvedAssistant:
+    mapping, chain = _current_branch_node_ids(graph)
+    latest_user_id: str | None = None
+    for node_id in reversed(chain):
+        raw = _graph_node(mapping, node_id)
+        message = raw.get("message")
+        if not isinstance(message, Mapping):
+            continue
+        node = _node(mapping, node_id)
+        if _message_role(node) == "user":
+            latest_user_id = node_id
+            break
+    if latest_user_id is None:
+        raise BackendNotReadyError("conversation has no materialized user turn")
+    return resolve_terminal_assistant(graph, latest_user_id)
+
+
+def resolve_bootstrap_donor(
+    graph: Mapping[str, Any], assistant_message_id: str
+) -> ResolvedAssistant:
+    mapping, chain = _current_branch_node_ids(graph)
+    if not isinstance(assistant_message_id, str) or not assistant_message_id:
+        raise GraphIdentityError("bootstrap assistant message id is missing")
+    if assistant_message_id not in chain:
+        if assistant_message_id in mapping:
+            raise GraphIdentityError("bootstrap assistant message is not on the current branch")
+        raise GraphIdentityError("bootstrap assistant message is missing")
+    node = _node(mapping, assistant_message_id)
+    if _message_role(node) != "assistant" or _message_recipient(node) != "all":
+        raise GraphIdentityError("bootstrap donor must identify a public assistant message")
+    candidate = _assistant_text(node)
+    if candidate is None:
+        raise GraphIdentityError("bootstrap donor assistant has no branchable text content")
+    text, content_type = candidate
+    return ResolvedAssistant(
+        message_id=assistant_message_id,
+        text=text,
+        content_type=content_type,
+    )
+
+
+def resolve_inherited_assistant(
+    graph: Mapping[str, Any], accepted_user_message_id: str
+) -> ResolvedAssistant:
+    mapping, chain = _current_branch_node_ids(graph)
+    if not isinstance(accepted_user_message_id, str) or not accepted_user_message_id:
+        raise GraphIdentityError("accepted user message id is missing")
+    if accepted_user_message_id not in chain:
+        if accepted_user_message_id in mapping:
+            raise GraphIdentityError("accepted user message is not on the current branch")
+        raise BackendNotReadyError("accepted user message is not materialized yet")
+    accepted_index = chain.index(accepted_user_message_id)
+    accepted = _node(mapping, accepted_user_message_id)
+    if _message_role(accepted) != "user":
+        raise GraphIdentityError("accepted user message id does not identify a user node")
+    for node_id in reversed(chain[:accepted_index]):
+        raw = _graph_node(mapping, node_id)
+        if not isinstance(raw.get("message"), Mapping):
+            continue
+        node = _node(mapping, node_id)
+        if _message_role(node) != "assistant" or _message_recipient(node) != "all":
+            continue
+        candidate = _assistant_text(node)
+        if candidate is None:
+            continue
+        text, content_type = candidate
+        return ResolvedAssistant(message_id=node_id, text=text, content_type=content_type)
+    raise GraphIdentityError("accepted role turn has no inherited public bootstrap assistant")

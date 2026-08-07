@@ -5,6 +5,9 @@ from playwright_auto.chatgpt_graph import (
     BackendSchemaError,
     GraphIdentityError,
     resolve_terminal_assistant,
+    resolve_latest_terminal_assistant,
+    resolve_inherited_assistant,
+    resolve_bootstrap_donor,
 )
 
 
@@ -223,3 +226,49 @@ def test_resolver_requires_new_terminal_after_completed_tool_result():
     }
     with pytest.raises(BackendNotReadyError):
         resolve_terminal_assistant(graph, "u1")
+
+
+def test_latest_terminal_assistant_uses_latest_user_branch():
+    graph = {
+        "current_node": "a2",
+        "mapping": {
+            "u1": msg("u1", "user", children=("a1",)),
+            "a1": msg("a1", "assistant", parent="u1", text="old", children=("u2",)),
+            "u2": msg("u2", "user", parent="a1", text="next", children=("a2",)),
+            "a2": msg("a2", "assistant", parent="u2", text="latest"),
+        },
+    }
+    resolved = resolve_latest_terminal_assistant(graph)
+    assert (resolved.message_id, resolved.text) == ("a2", "latest")
+
+
+def test_inherited_assistant_is_child_local_fork_point_before_role_user():
+    graph = {
+        "current_node": "a-role",
+        "mapping": {
+            "u-bootstrap": msg("u-bootstrap", "user", children=("a-child-bootstrap",)),
+            "a-child-bootstrap": msg(
+                "a-child-bootstrap", "assistant", parent="u-bootstrap", text="bootstrap prefix", children=("u-role",)
+            ),
+            "u-role": msg("u-role", "user", parent="a-child-bootstrap", text="PLAN role prompt", children=("a-role",)),
+            "a-role": msg("a-role", "assistant", parent="u-role", text="PLAN response"),
+        },
+    }
+    inherited = resolve_inherited_assistant(graph, "u-role")
+    assert (inherited.message_id, inherited.text) == ("a-child-bootstrap", "bootstrap prefix")
+
+
+def test_bootstrap_donor_requires_exact_public_assistant_message():
+    graph = {
+        "current_node": "a1",
+        "mapping": {
+            "u1": msg("u1", "user", children=("a1",)),
+            "a1": msg("a1", "assistant", parent="u1", text="bootstrap"),
+        },
+    }
+    donor = resolve_bootstrap_donor(graph, "a1")
+    assert (donor.message_id, donor.text) == ("a1", "bootstrap")
+    with pytest.raises(GraphIdentityError):
+        resolve_bootstrap_donor(graph, "missing")
+    with pytest.raises(GraphIdentityError):
+        resolve_bootstrap_donor(graph, "u1")
