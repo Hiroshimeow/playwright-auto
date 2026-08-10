@@ -4848,12 +4848,18 @@ class CDPAWorker:
                 postcondition=None,
             )
 
-    def _sync_resume_commands(self, state: Mapping[str, Any]) -> None:
+    def _sync_control_commands(self, state: Mapping[str, Any]) -> None:
         for control in state.get("controls") or []:
-            if not isinstance(control, Mapping) or control.get("action") != "resume":
+            if not isinstance(control, Mapping):
                 continue
             status = str(control.get("status") or "")
-            if status not in {"applied", "recovery_required", "failed", "rejected"}:
+            if status not in {
+                "applied",
+                "recovery_required",
+                "failed",
+                "rejected",
+                "ineffective",
+            }:
                 continue
             command_ids: list[str] = []
             external = str(control.get("external_command_id") or "").strip()
@@ -4950,15 +4956,13 @@ class CDPAWorker:
                     state.clear()
                     state.update(saved)
                     return saved
-                force_stop_requested = any(
-                    isinstance(item, Mapping)
-                    and item.get("status") == "requested"
-                    and item.get("action") == "stop"
+                requested_control = any(
+                    isinstance(item, Mapping) and item.get("status") == "requested"
                     for item in state.get("controls") or []
                 )
-                if scheduling_changed and not force_stop_requested:
+                if scheduling_changed and not requested_control:
                     return state
-                if state.get("status") == "WAITING" and not force_stop_requested:
+                if state.get("status") == "WAITING" and not requested_control:
                     return state
                 transport_baseline = state
                 active_hop_id = state.get("active_hop_id")
@@ -4977,7 +4981,9 @@ class CDPAWorker:
                 actions = CDPATabActions(browser_context, self.config)
                 if state.get("cleanup", {}).get("state") == "CLEARING":
                     await self._continue_cleanup(state, actions, path)
-                    return self.store.load(path)
+                    saved = self.store.load(path)
+                    self._sync_control_commands(saved)
+                    return saved
                 pending_control = next(
                     (
                         item for item in state.get("controls") or []
@@ -5023,9 +5029,13 @@ class CDPAWorker:
                             json.dumps(state, ensure_ascii=False, default=str)
                         )
                     elif persisted_control:
-                        return self._load_manifest_cached(path)
+                        saved = self._load_manifest_cached(path)
+                        self._sync_control_commands(saved)
+                        return saved
                     else:
                         raise RuntimeError("control result was not persisted atomically")
+                if state.get("status") == "WAITING":
+                    return state
                 if state.get("status") in TERMINAL:
                     if is_independent_task(state):
                         return state
@@ -5079,7 +5089,7 @@ class CDPAWorker:
                     )
                     state.clear()
                     state.update(saved)
-                    self._sync_resume_commands(saved)
+                    self._sync_control_commands(saved)
                     return saved
                 if state.get("status") in {"PAUSED", "BLOCKED"}:
                     return state
@@ -6000,8 +6010,8 @@ class CDPAWorker:
                 return self.runtime_db.get_command(command_id)
             if replay_state is not None:
                 self._publish_command_state(replay_state)
-                if str(command.get("kind") or "") == "resume_team":
-                    self._sync_resume_commands(replay_state)
+                if str(command.get("kind") or "") in {"resume_team", "task_control"}:
+                    self._sync_control_commands(replay_state)
                     return self.runtime_db.get_command(command_id)
                 self.runtime_db.finish_command(
                     command_id,
@@ -6419,7 +6429,7 @@ class CDPAWorker:
                     external_command_id=command_id,
                 )
                 self._publish_command_state(state)
-                self._sync_resume_commands(state)
+                self._sync_control_commands(state)
                 return self.runtime_db.get_command(command_id)
             elif kind == "task_control":
                 if task_id is None:
@@ -6436,7 +6446,8 @@ class CDPAWorker:
                     external_command_id=command_id,
                 )
                 self._publish_command_state(state)
-                result = {"task_id": task_id, "status": state.get("status")}
+                self._sync_control_commands(state)
+                return self.runtime_db.get_command(command_id)
             else:
                 raise ValueError(f"unsupported command kind: {kind}")
             self.runtime_db.finish_command(command_id, result=result)
