@@ -89,6 +89,30 @@ def test_independent_pre_send_uses_shared_prompt_without_route_contract(tmp_path
     assert state["kanban_column"] == "INDEPENDENT_AGENTS"
 
 
+def test_post_release_inflight_lease_blocks_deferred_independent_new_chat(tmp_path: Path):
+    _config, _store, _blocked, state, worker = setup_agent(tmp_path)
+    worker._rate_limit_cooldown = {
+        "state": "released",
+        "detected_at": "2026-08-09T00:00:00+00:00",
+        "release_not_before": "2026-08-09T00:01:00+00:00",
+        "released_at": "2026-08-09T00:01:00+00:00",
+        "post_release_acquisition": "in_progress",
+    }
+    state["independent"]["new_chat_next_job"] = True
+    state["independent"]["new_chat_deferred_task_id"] = None
+    hop = _active_hop(state)
+
+    class NoNewChat(FakeActions):
+        async def new_chat(self, *_args, **_kwargs):
+            raise AssertionError("another post-release acquisition owns the profile lease")
+
+    asyncio.run(worker._pre_send(state, hop, NoNewChat()))
+
+    assert hop["state"] == "pre_send"
+    assert state["independent"]["new_chat_next_job"] is True
+    assert worker._rate_limit_cooldown["post_release_acquisition"] == "in_progress"
+
+
 def test_independent_responded_waits_for_explicit_completion_without_route_parse(
     tmp_path: Path,
 ):

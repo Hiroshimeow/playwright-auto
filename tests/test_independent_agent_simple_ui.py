@@ -266,7 +266,7 @@ def test_completed_job_closes_after_one_minute_and_next_trigger_reopens_saved_ur
 
     assert completed["task_id"] == responded["task_id"]
     assert completed["independent"]["close_tab_when_idle"] is False
-    assert completed["status"] == ("PAUSED" if trigger_type == "manual" else "WAITING")
+    assert completed["status"] == "WAITING"
     saved_page_id = completed["roles"]["AGENT"]["page_id"]
     saved_page_url = completed["roles"]["AGENT"]["page_url"]
     idle_epoch = datetime.fromisoformat(
@@ -414,5 +414,5 @@ def test_board_uses_operator_labels_run_task_and_restored_settings():
     assert 'body: {trigger_type: "manual", instruction}' in app
     assert '/api/independent-agents/${encodeURIComponent(taskId)}/reset' in app
     assert '.filter(item => !item.agent?.deleted_at)' in app
-    assert 'app.js?v=20260731-agent-ux-v3' in html
+    assert 'app.js?v=20260809-compact-ui-v2' in html
     assert "new_chat_next_job" not in html[html.index('id="agent-settings-dialog"') :]

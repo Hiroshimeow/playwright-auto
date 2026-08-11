@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from .cdpa_bootstraps import BootstrapCatalog, normalize_bootstrap_record
 from .cdpa_commands import RepairRequest
-from .cdpa_config import CDPAConfig, load_cdpa_config
+from .cdpa_config import CDPAConfig, declared_repository_from_task, load_cdpa_config
 from .cdpa_identity import generate_idempotent_task_id, validate_task_id
 from .cdpa_independent import (
     normalize_agent_name,
@@ -166,6 +166,13 @@ class DashboardAPI:
         return str(repository)
 
     @staticmethod
+    def _declared_repository(task: str) -> str | None:
+        try:
+            return declared_repository_from_task(task)
+        except ValueError as exc:
+            raise APIError(400, "invalid_request", str(exc)) from exc
+
+    @staticmethod
     def _list(value: object, field: str) -> list[Any]:
         if value is None:
             return []
@@ -286,7 +293,12 @@ class DashboardAPI:
         task = str(raw.get("task") or "").strip()
         if not task:
             raise APIError(400, "invalid_request", "task must not be empty")
-        repository = self._repository(raw.get("repository"))
+        requested_repository = raw.get("repository")
+        if requested_repository is None or (
+            isinstance(requested_repository, str) and not requested_repository.strip()
+        ):
+            requested_repository = self._declared_repository(task)
+        repository = self._repository(requested_repository)
         try:
             report_mode = effective_report_mode(
                 raw.get("report_mode") or "file",
@@ -682,24 +694,74 @@ class DashboardAPI:
             if expected_size != len(data) or hashlib.sha256(data).hexdigest() != expected_hash:
                 raise APIError(409, "report_changed", "report content changed after projection")
             return data
+        availability = str(locator.get("availability") or "")
+        if availability == "remote_unmirrored":
+            raise APIError(
+                409,
+                "report_remote_unmirrored",
+                "report is stored on a remote execution host and is not mirrored",
+            )
+        if availability == "unavailable":
+            raise APIError(404, "report_not_found", "report is not locally available")
+
         raw_path = Path(str(locator.get("path") or "")).expanduser()
-        plans_root = self.config.plans_root.resolve()
-        lexical_path = Path(os.path.abspath(raw_path))
+        control_repository = self.config.repository_root.resolve()
+        control_plans_root = self.config.plans_root.resolve()
+        plans_relative = control_plans_root.relative_to(control_repository)
+        execution_repository = Path(
+            str(locator.get("repository") or private.get("repository") or control_repository)
+        ).expanduser().resolve()
+        if not any(
+            execution_repository.is_relative_to(root.resolve())
+            for root in self.config.repository_allowed_roots
+        ):
+            raise APIError(403, "report_escape", "report repository is outside configured allowed roots")
+        execution_plans_root = execution_repository / plans_relative
+        team = str(locator.get("team") or "").strip()
+        if not team and not maintenance:
+            manifest_path = Path(str(private.get("manifest_path") or "")).expanduser()
+            try:
+                manifest_relative = Path(os.path.abspath(manifest_path)).relative_to(control_plans_root)
+            except ValueError:
+                manifest_relative = Path()
+            if len(manifest_relative.parts) >= 2:
+                team = manifest_relative.parts[0]
+        if maintenance:
+            containment_roots = (control_plans_root, execution_plans_root)
+        else:
+            if not team:
+                raise APIError(409, "report_locator_invalid", "report locator is missing team identity")
+            containment_roots = (execution_plans_root / team,)
+        lexical_path = Path(
+            os.path.abspath(raw_path if raw_path.is_absolute() else execution_repository / raw_path)
+        )
+        containment_root = next(
+            (root for root in containment_roots if lexical_path.is_relative_to(root)),
+            None,
+        )
+        if containment_root is None:
+            raise APIError(403, "report_escape", "report path escapes the report team root")
+        path_repository = (
+            control_repository
+            if maintenance and containment_root == control_plans_root
+            else execution_repository
+        )
         try:
-            lexical_relative = lexical_path.relative_to(plans_root)
+            repository_relative = lexical_path.relative_to(path_repository)
         except ValueError as exc:
-            raise APIError(403, "report_escape", "report path escapes the plans root") from exc
-        current = plans_root
-        for part in lexical_relative.parts:
+            raise APIError(403, "report_escape", "report path escapes the report repository") from exc
+        current = path_repository
+        for part in repository_relative.parts:
             current /= part
             if current.is_symlink():
                 raise APIError(403, "report_symlink", "report symlinks are forbidden")
         try:
             candidate = lexical_path.resolve(strict=True)
+            resolved_containment_root = containment_root.resolve(strict=True)
         except FileNotFoundError as exc:
             raise APIError(404, "report_not_found", "report does not exist") from exc
-        if not candidate.is_relative_to(plans_root):
-            raise APIError(403, "report_escape", "report path escapes the plans root")
+        if not candidate.is_relative_to(resolved_containment_root):
+            raise APIError(403, "report_escape", "report path escapes the report team root")
         if not candidate.is_file():
             raise APIError(404, "report_not_found", "report does not exist")
         body = candidate.read_bytes()

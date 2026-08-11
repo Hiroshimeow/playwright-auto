@@ -227,6 +227,6 @@ def test_production_prompt_split_keeps_common_context_out_of_role_files():
         else:
             assert "LEARNING.md" not in text
 
-    assert '"route":"PLAN|DEV|TEST|REVIEW|AUDIT|DONE"' in guide
+    assert '"route":"PLAN|DEV|TEST|REVIEW|AUDIT|PAUSE|DONE"' in guide
     assert "Only PLAN may use `DONE`" in guide
     assert "REVIEW and AUDIT must route clean work back to PLAN" in guide

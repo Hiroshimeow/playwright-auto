@@ -191,7 +191,11 @@ def test_public_auth_rejects_anonymous_before_proxy_even_with_alternate_host(tmp
 def test_public_login_rejects_wrong_password_and_accepts_opaque_secure_session(tmp_path: Path):
     upstream, upstream_thread = start_upstream()
     server, thread = start_frontend(tmp_path, api_port=upstream.server_address[1], auth_password="correct")
-    public = {"Host": "cdpa.hcu-lab.me", "Content-Type": "application/x-www-form-urlencoded"}
+    public = {
+        "Host": "cdpa.hcu-lab.me",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": "https://cdpa.hcu-lab.me",
+    }
     try:
         wrong = urlencode({"password": "wrong"}).encode()
         status, headers, body = request(server, "POST", "/auth/login", body=wrong, headers=public)
@@ -241,7 +245,11 @@ def test_authenticated_public_proxy_preserves_semantics_and_strips_only_auth_coo
             "POST",
             "/auth/login",
             body=login_body,
-            headers={"Host": "cdpa.hcu-lab.me", "Content-Type": "application/x-www-form-urlencoded"},
+            headers={
+                "Host": "cdpa.hcu-lab.me",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "https://cdpa.hcu-lab.me",
+            },
         )
         assert status == 303
         session_cookie = headers["Set-Cookie"].split(";", 1)[0]
@@ -255,6 +263,7 @@ def test_authenticated_public_proxy_preserves_semantics_and_strips_only_auth_coo
                 "Host": "cdpa.hcu-lab.me",
                 "Content-Type": "application/json",
                 "Content-Length": "12",
+                "Origin": "https://cdpa.hcu-lab.me",
                 "Idempotency-Key": "same-key",
                 "Cookie": f"other=keep; {session_cookie}",
             },
@@ -352,35 +361,179 @@ def test_frontend_assets_are_local_modular_and_suspend_hidden_polling():
 
 
 
-def test_commands_fill_board_gap_without_moving_task_workspace():
+def test_commands_are_a_full_height_board_lane_without_changing_command_semantics():
     html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+    app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
     css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
 
-    board_section_at = html.index('<section class="board-section"')
-    board_at = html.index('<div id="board" class="board-grid"')
+    board_open = html.index('<div id="board" class="board-grid"')
+    board_close = html.index("</div>", board_open)
     commands_at = html.index('<aside id="commands"')
-    board_section_end = html.index("</section>", board_section_at)
     workspace_at = html.index('<section class="task-workspace"')
+    command_lane = css.split(".lane.command-lane {", 1)[1].split("}", 1)[0]
 
-    assert board_section_at < board_at < commands_at < board_section_end < workspace_at
-    assert ".board-section {\n  display: grid;" in css
-    assert ".board-grid {\n  display: contents;" in css
-    assert ".board-section > .command-panel { grid-column: 1 / -1;" in css
-    assert "@media (min-width: 1600px)" in css
-    assert ".board-section > .command-panel { grid-column: span 3; }" in css
-    assert "@media (max-width: 1199px)" in css
-    assert ".board-section > .command-panel { grid-column: span 2;" in css
-    assert "@media (max-width: 920px) and (min-width: 721px)" in css
-    assert ".board-section > .command-panel { grid-column: 1 / -1; }" in css
-    assert ".task-workspace {\n  display: grid;\n  grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr);" in css
+    assert board_open < commands_at < board_close < workspace_at
+    assert 'class="lane command-lane"' in html
+    assert 'data-column="COMMANDS"' in html
+    assert 'count.className = "lane-count"' in app
+    assert 'className = "lane-list command-list"' in app
+    assert 'JSON.stringify([entries.length, entries.slice(0, 12)' in app
+    assert 'String(b.createdAt).localeCompare(String(a.createdAt))' in app
+    assert "commandPresentation(command)" in app
+    assert 'button.dataset.renderDisabled === "true"' in app
+    assert ".board-section > .command-panel" not in css
+    assert '.lane[data-column="COMMANDS"]' in css
+    assert ".command-list" in css
+    assert "order: 8;" in command_lane
+    assert "height:" not in command_lane
+    assert "min-height:" not in command_lane
+    assert "align-self:" not in command_lane
+    assert ".lane {\n  --lane-accent:" in css
+    assert "height: 388px;" in css
+    assert ".lane-list {" in css
+    assert "min-height: 0;" in css
+    assert "overflow-y: auto;" in css
     mobile = css.split("@media (max-width: 720px)", 1)[1]
-    assert ".board-section { display: block; }" in mobile
-    assert ".board-grid {\n    display: grid;" in mobile
+    assert "grid-template-columns: repeat(8, min(86vw, 340px));" in mobile
+    assert "height: 388px;" in mobile
+    assert "min-height: 388px;" in mobile
+
+
+def test_workflow_report_model_selects_latest_per_role_and_retains_older_reports():
+    module = (ASSET_ROOT / "views" / "task_detail.js").resolve().as_uri()
+    script = f"""
+      import {{ workflowReportModel }} from {json.dumps(module)};
+      const detail = {{
+        status: "RUNNING",
+        roles: [
+          {{logical_role: "PLAN", physical_role: "alpha-plan"}},
+          {{logical_role: "DEV", physical_role: "alpha-dev"}},
+          {{logical_role: "REVIEW", physical_role: "alpha-review"}},
+          {{logical_role: "AUDIT", physical_role: "alpha-audit"}},
+        ],
+        reports: [
+          {{role: "PLAN", turn: 1, url: "/p1"}},
+          {{role: "DEV", turn: 1, url: "/d1"}},
+          {{role: "PLAN", turn: 2, url: "/p2"}},
+          {{physical_role: "alpha-dev", turn: 2, url: "/d2"}},
+          {{physical_role: "alpha-review", turn: 2, url: "/r2"}},
+        ],
+      }};
+      const running = workflowReportModel(detail, "DEV");
+      const fallback = workflowReportModel(detail, "AUDIT");
+      const done = workflowReportModel({{...detail, status: "DONE"}}, "DEV");
+      const explicit = workflowReportModel(detail, "PLAN", "/p1");
+      console.log(JSON.stringify({{
+        latest: running.roles.map(item => [item.role, item.latest?.url || null]),
+        older: running.olderReports.map(item => item.url),
+        running: running.selectedReport?.url || null,
+        fallback: fallback.selectedReport?.url || null,
+        done: done.selectedReport?.url || null,
+        explicit: explicit.selectedReport?.url || null,
+        explicitRole: explicit.selectedReport?._logicalRole || null,
+        coverage: running.coverage,
+      }}));
+    """
+    result = __import__("subprocess").run(
+        ["node", "--input-type=module", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == {
+        "latest": [["PLAN", "/p2"], ["DEV", "/d2"], ["REVIEW", "/r2"], ["AUDIT", None]],
+        "older": ["/d1", "/p1"],
+        "running": "/d2",
+        "fallback": "/r2",
+        "done": "/p2",
+        "explicit": "/p1",
+        "explicitRole": "PLAN",
+        "coverage": "3/4",
+    }
+
+
+def test_workflow_report_availability_distinguishes_remote_without_fetchable_url():
+    module = (ASSET_ROOT / "views" / "task_detail.js").resolve().as_uri()
+    app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
+    script = f"""
+      import {{ reportBody }} from {json.dumps(module)};
+      const bodies = new Map();
+      console.log(JSON.stringify([
+        reportBody({{availability: "remote_unmirrored"}}, bodies),
+        reportBody({{availability: "unavailable"}}, bodies),
+      ]));
+    """
+    result = __import__("subprocess").run(
+        ["node", "--input-type=module", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == [
+        "Report stored on remote execution host / not mirrored.",
+        "Report is unavailable on this dashboard host.",
+    ]
+    assert "if (!report.url || reportBodies.has(report.url)) return;" in app
+
+
+def test_workflow_report_polish_uses_coverage_rail_and_responsive_selector():
+    detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
+    css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
+
+    assert '["reports", `Reports ${model.coverage}`]' in detail
+    assert 'tabs.classList.add("workflow-detail-tabs")' in detail
+    assert '"workflow-report-layout"' in detail
+    assert '"workflow-report-content"' in detail
+    assert '`report-role${item.role === model.selectedReport?._logicalRole ? " selected" : ""}`' in detail
+    assert "role.disabled = !item.latest;" in detail
+    assert 'item.latest ? `Turn ${item.latest.turn ?? "—"}` : "No report"' in detail
+    assert ".workflow-report-layout {" in css
+    assert "grid-template-columns: 175px minmax(0, 1fr);" in css
+    assert "box-shadow: inset 2px 0 0 var(--accent);" in css
+    tablet = css.split("@media (max-width: 900px)", 1)[1]
+    assert ".workflow-report-layout { grid-template-columns: minmax(0, 1fr); }" in tablet
+    assert ".report-role-nav {" in tablet
+    assert "overflow-x: auto;" in tablet
+    mobile = css.split("@media (max-width: 720px)", 1)[1]
+    assert ".workflow-detail-tabs.detail-tabs" in mobile
+    assert "grid-template-columns: repeat(2, minmax(0, 1fr));" in mobile
+
+
+def test_task_goal_blocks_dedupe_and_disclosure_state_contract_is_keyed():
+    module = (ASSET_ROOT / "views" / "task_detail.js").resolve().as_uri()
+    detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
+    script = f"""
+      import {{ taskGoalBlocks }} from {json.dumps(module)};
+      console.log(JSON.stringify([
+        taskGoalBlocks({{task_id: "x", task_text: "same", effective_goal: "same"}}),
+        taskGoalBlocks({{task_id: "x", task_text: "task", effective_goal: "goal"}}),
+      ]));
+    """
+    result = __import__("subprocess").run(
+        ["node", "--input-type=module", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == [
+        [{"key": "task-goal", "label": "Task / Effective goal", "text": "same"}],
+        [
+            {"key": "task", "label": "Task", "text": "task"},
+            {"key": "effective-goal", "label": "Effective goal", "text": "goal"},
+        ],
+    ]
+    assert 'details.dataset.disclosureKey = block.key' in detail
+    assert '"task-disclosure-preview"' in detail
+    assert '"Show more"' in detail
+    assert '"Show less"' in detail
+    assert 'sameTask ? new Set' in detail
+    assert 'querySelectorAll("details[data-disclosure-key][open]")' in detail
+    assert 'details.open = openDisclosureKeys.has(details.dataset.disclosureKey)' in detail
 
 
 def test_task_controls_render_before_task_prompt():
     detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
-    workflow = detail.split("function workflowContent", 1)[1].split("function build", 1)[0]
+    workflow = detail.split("function workflowOverview", 1)[1].split("function build", 1)[0]
     independent = detail.split("function independentOverview", 1)[1].split("function independentHistory", 1)[0]
 
     assert workflow.index("fragment.append(controls);") < workflow.index("fragment.append(taskSection);")

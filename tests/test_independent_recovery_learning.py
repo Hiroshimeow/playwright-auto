@@ -576,3 +576,30 @@ def test_independent_reset_command_kind_is_durable(tmp_path: Path):
     )
     assert command["status"] == "queued"
     assert command["kind"] == "independent_reset"
+
+
+def test_consecutive_self_route_guard_is_not_canonical_recovery_eligible(tmp_path: Path):
+    now = datetime(2026, 8, 10, 3, 30, tzinfo=UTC)
+    store = _store(tmp_path)
+    agent = store.create_independent_agent(
+        "Recovery guard exclusion",
+        system_prompt="Recover eligible operational blocks.",
+        task_id="agent-guard-exclusion-g1",
+        trigger_settings={"recovery": True},
+    )
+
+    def warmed(current: dict) -> dict:
+        current["independent"]["watermarks"]["recovery_enabled_at"] = (
+            now - timedelta(seconds=RECOVERY_WARMUP_SECONDS + 1)
+        ).isoformat()
+        return current
+
+    agent = store.update(agent["manifest_path"], warmed)
+    guarded = _blocked(
+        "guarded-self-route",
+        blocked_at=now - timedelta(seconds=RECOVERY_BLOCKED_SECONDS + 1),
+    )
+    guarded["block_code"] = "consecutive_self_route_limit"
+    guarded["block_reason"] = "PLAN self-route streak 3 requires explicit operator Resume"
+
+    assert canonical_independent_events(agent, [agent, guarded], now=now) == []

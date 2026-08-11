@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -45,6 +46,11 @@ class _RateActions:
     def __init__(self, client: _RateClient) -> None:
         self.client = client
         self.acquire_calls = 0
+        self.cleanup_calls = 0
+
+    async def cleanup_rate_limited_chatgpt_pages(self):
+        self.cleanup_calls += 1
+        return {"targeted": 3, "closed": 3, "cleared": 2, "errors": []}
 
     async def locate_owned(self, state, role):
         record = state["roles"][role]
@@ -139,7 +145,7 @@ def test_reload_catalog_command_fails_when_hydration_is_still_incomplete(
     assert "reload catalog is incomplete" in result["error"]
 
 
-def test_shared_rate_limit_cooldown_coalesces_dismiss_and_pauses_agent_claims(
+def test_shared_rate_limit_cooldown_coalesces_cleanup_and_enforces_60s_minimum(
     tmp_path: Path, monkeypatch
 ):
     _config, _store, state, worker = _setup(tmp_path)
@@ -148,6 +154,7 @@ def test_shared_rate_limit_cooldown_coalesces_dismiss_and_pauses_agent_claims(
     )
     client = _RateClient()
     actions = _RateActions(client)
+    worker.rate_limit_cooldown_seconds = 0.5
 
     async def enter_twice():
         await asyncio.gather(
@@ -161,16 +168,63 @@ def test_shared_rate_limit_cooldown_coalesces_dismiss_and_pauses_agent_claims(
 
     asyncio.run(enter_twice())
 
-    assert client.dismiss_calls == 1
+    assert actions.cleanup_calls == 1
+    assert client.dismiss_calls == 0
     assert worker._rate_limit_gate_active() is True
     snapshot = worker.runtime_db.get_snapshot("worker")
-    assert snapshot["payload"]["rate_limit_cooldown"]["state"] == "active"
+    cooldown = snapshot["payload"]["rate_limit_cooldown"]
+    assert cooldown["state"] == "active"
+    detected = datetime.fromisoformat(cooldown["detected_at"])
+    release = datetime.fromisoformat(cooldown["release_not_before"])
+    assert (release - detected).total_seconds() >= 60.0
+    assert cooldown["cleanup"]["closed"] == 3
     monkeypatch.setattr(
         "playwright_auto.cdpa_worker.canonical_independent_events",
         lambda *_args, **_kwargs: pytest.fail("agent triggers must not be inspected during cooldown"),
     )
     worker.registry = SimpleNamespace(tasks_by_id={}, paths_by_id={})
     assert worker._activate_independent_agents() == set()
+
+
+def test_restored_post_release_inflight_lease_returns_to_pending(tmp_path: Path):
+    config, store, _state, worker = _setup(tmp_path)
+    worker.runtime_db.put_snapshot(
+        "worker",
+        {
+            "rate_limit_cooldown": {
+                "state": "released",
+                "detected_at": "2026-08-09T00:00:00+00:00",
+                "release_not_before": "2026-08-09T00:01:00+00:00",
+                "released_at": "2026-08-09T00:01:00+00:00",
+                "post_release_acquisition": "in_progress",
+            }
+        },
+    )
+    restarted = CDPAWorker(config, store=store)
+
+    restarted._restore_rate_limit_cooldown()
+
+    assert restarted._rate_limit_cooldown is not None
+    assert restarted._rate_limit_cooldown["state"] == "released"
+    assert restarted._rate_limit_cooldown["post_release_acquisition"] == "pending"
+
+
+def test_rate_limit_release_uses_timestamp_without_browser_probe(tmp_path: Path):
+    _config, _store, _state, worker = _setup(tmp_path)
+    worker.registry = SimpleNamespace(tasks_by_id={}, paths_by_id={})
+    worker._rate_limit_cooldown = {
+        "state": "active",
+        "detected_at": "2000-01-01T00:00:00+00:00",
+        "release_not_before": "2000-01-01T00:01:00+00:00",
+        "cleanup": {"targeted": 0, "closed": 0, "cleared": 0, "errors": []},
+    }
+    browser_context = SimpleNamespace(pages=[])
+
+    released = asyncio.run(worker._refresh_rate_limit_cooldown(browser_context))
+
+    assert released is True
+    assert worker._rate_limit_cooldown["state"] == "released"
+    assert worker._rate_limit_cooldown["post_release_acquisition"] == "pending"
 
 
 def _prepare_sending(state: dict, *, page_id: str) -> dict:
@@ -216,7 +270,7 @@ def _begin_sent_record(state: dict, hop: dict) -> dict:
 
 
 
-def test_active_cooldown_reconciles_existing_sent_ledger_once(
+def test_active_cooldown_preserves_existing_sent_ledger_without_browser_send_path(
     tmp_path: Path, monkeypatch
 ):
     _config, _store, state, worker = _setup(tmp_path)
@@ -240,12 +294,17 @@ def test_active_cooldown_reconciles_existing_sent_ledger_once(
 
     monkeypatch.setattr(worker_module, "DurableSendBlock", CachedSendBlock)
 
-    asyncio.run(worker._sending(state, hop, _RateActions(_RateClient())))
+    actions = _RateActions(_RateClient())
+    asyncio.run(worker._sending(state, hop, actions))
 
-    assert calls == 1
-    assert hop["state"] == "sent"
-    assert state["active_action"] == "wait_response"
+    assert calls == 0
+    assert actions.acquire_calls == 0
+    assert hop["state"] == "sending"
+    assert state["active_action"] == "rate_limit_cooldown_reconcile"
     assert state.get("block_code") is None
+    persisted = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
+    assert persisted is not None and persisted.status is RequestStatus.SENT
+    assert persisted.attempts == cached["record"]["attempts"]
 
 
 

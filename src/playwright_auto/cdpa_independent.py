@@ -630,6 +630,8 @@ def _recovery_event(
     if _operator_caused_terminal_or_pause(source):
         return None
     code = str(source.get("block_code") or source.get("waiting_code") or "").lower()
+    if code == "consecutive_self_route_limit":
+        return None
     signature = normalized_failure_signature(source)
     team = str(source.get("team") or "")
     count_key = f"{team}:{signature}"

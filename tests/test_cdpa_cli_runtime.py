@@ -39,10 +39,58 @@ def test_submit_task_keeps_file_mode_across_workspaces(tmp_path: Path, monkeypat
         new_roles=(),
         new_all=False,
     )
+    cdpa_cli_module.submit_task(
+        config,
+        task="infer repository",
+        repository=None,
+        team="infer",
+        new_roles=(),
+        new_all=False,
+    )
 
     assert payloads[0][0] == "/api/tasks"
     assert payloads[0][1]["report_mode"] == "file"
     assert payloads[1][1]["report_mode"] == "file"
+    assert payloads[2][1]["report_mode"] == "file"
+    assert "repository" not in payloads[2][1]
+
+
+def test_task_cli_preserves_omitted_repository_for_api_inference(tmp_path: Path, monkeypatch):
+    captured = []
+    config = SimpleNamespace(
+        repository_root=tmp_path.resolve(),
+        dashboard_api_host="127.0.0.1",
+        dashboard_api_port=9225,
+        dashboard_url="http://127.0.0.1:9224",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cdpa_cli_module,
+        "load_cdpa_config",
+        lambda _path, *, repository_root: config,
+    )
+    monkeypatch.setattr(
+        cdpa_cli_module,
+        "submit_task",
+        lambda _config, **kwargs: captured.append(kwargs) or {"status": "queued"},
+    )
+
+    assert cdpa_main(["Title\nRepository /some/repo"]) == 0
+    assert captured[-1]["repository"] is None
+
+    explicit = tmp_path / "execution"
+    explicit.mkdir()
+    assert (
+        cdpa_main(
+            [
+                "Title\nRepository /ignored",
+                "--repository",
+                str(explicit),
+            ]
+        )
+        == 0
+    )
+    assert captured[-1]["repository"] == explicit.resolve()
 
 
 def test_cli_no_longer_accepts_inline_report_flag():

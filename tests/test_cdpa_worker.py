@@ -34,6 +34,7 @@ from playwright_auto.chatgpt import (
     MessageSnapshot,
     PageBinding,
     PageOwnershipError,
+    RateLimitBlockedError,
     SendReceipt,
     StableMalformedResponseError,
     UnsafePageStateError,
@@ -456,7 +457,7 @@ def test_pre_send_lazily_acquires_only_plan_and_persists_constructor(tmp_path: P
         "source-role": None,
         "turn": 1,
         "workspace": str(tmp_path),
-        "allowed-routes": ["PLAN", "DEV", "TEST", "REVIEW", "AUDIT", "DONE"],
+        "allowed-routes": ["PLAN", "DEV", "TEST", "REVIEW", "AUDIT", "PAUSE", "DONE"],
         "goal": "Implement exact production behavior",
         "handoff": "Implement exact production behavior",
     }
@@ -528,6 +529,162 @@ def test_pre_send_first_role_uses_bootstrap_once_and_keeps_full_prompt(tmp_path:
         asyncio.run(worker._pre_send(state, hop, actions))
     assert [call[0] for call in actions.branch_calls] == ["PLAN", "DEV", "REVIEW"]
     assert all(call[1:] == actions.branch_calls[0][1:] for call in actions.branch_calls)
+
+
+def test_bootstrap_branch_rejects_foreign_durable_writable_conversation(
+    tmp_path: Path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    anchor = bootstrap_record()
+    state = store.create_task(
+        "owner collision",
+        requested_team="owner-collision",
+        task_id="task-owner-collision",
+        bootstrap=anchor,
+    )
+    foreign = store.create_task(
+        "foreign owner",
+        requested_team="foreign-owner",
+        task_id="task-foreign-owner",
+    )
+    candidate_id = "88888888-8888-4888-8888-888888888888"
+    foreign_role = foreign["roles"]["PLAN"]
+    foreign_role["page_id"] = "foreign-owned-page"
+    foreign_role["page_url"] = f"https://chatgpt.com/c/{candidate_id}"
+    store.save(Path(foreign["manifest_path"]), foreign)
+    worker = CDPAWorker(config, store=store)
+
+    class BranchPage:
+        def __init__(self):
+            self.closed = False
+
+        def is_closed(self):
+            return self.closed
+
+        async def close(self):
+            self.closed = True
+
+    branch_page = BranchPage()
+
+    class Actions(FakeActions):
+        async def locate_owned(self, _state, _role):
+            return None
+
+        async def backend_conversation(self, conversation_id):
+            assert conversation_id == anchor["conversation_id"]
+            return _bootstrap_graph(anchor["terminal_assistant_message_id"])
+
+        async def branch_from_anchor(self, *_args, **_kwargs):
+            return AcquiredRole(
+                client=SimpleNamespace(page=branch_page),
+                page_id="new-branch-page",
+                url=f"https://chatgpt.com/c/{candidate_id}",
+                created=True,
+                new_chat=True,
+            )
+
+    async def no_ui_fallback(*_args, **_kwargs):
+        raise worker_module.BootstrapUIBranchError("no second branch")
+
+    monkeypatch.setattr(worker, "_branch_from_bootstrap_ui", no_ui_fallback)
+    acquired = asyncio.run(worker._acquire_workflow_role(state, "PLAN", Actions()))
+
+    assert acquired is None
+    assert branch_page.closed is True
+    assert state["roles"]["PLAN"].get("page_id") is None
+    assert state["active_action"] == "bootstrap_retry"
+
+
+def test_pre_send_unresolved_native_branch_blocks_without_ui_fallback(
+    tmp_path: Path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    anchor = bootstrap_record()
+    state = store.create_task(
+        "unresolved provisional branch",
+        requested_team="unresolved-branch",
+        task_id="task-unresolved-branch",
+        bootstrap=anchor,
+    )
+    worker = CDPAWorker(config, store=store)
+    unresolved_type = getattr(
+        worker_module, "BranchTargetUnresolvedError", BranchBootstrapError
+    )
+
+    class Actions(FakeActions):
+        async def locate_owned(self, _state, _role):
+            return None
+
+        async def backend_conversation(self, conversation_id):
+            assert conversation_id == anchor["conversation_id"]
+            return _bootstrap_graph(anchor["terminal_assistant_message_id"])
+
+        async def branch_from_anchor(self, *_args, **_kwargs):
+            raise unresolved_type("branch target remained provisional WEB identity")
+
+    ui_calls = []
+
+    async def forbidden_ui(_state, role, _actions, donor):
+        ui_calls.append((role, dict(donor)))
+        return AcquiredRole(
+            client=SimpleNamespace(),
+            page_id="unexpected-ui-page",
+            url="https://chatgpt.com/c/unexpected-ui",
+            created=True,
+            new_chat=True,
+        )
+
+    monkeypatch.setattr(worker, "_branch_from_bootstrap_ui", forbidden_ui)
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, Actions()))
+
+    assert ui_calls == []
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "branch_target_unresolved"
+    assert state["active_action"] == "blocked"
+    assert hop["state"] == "pre_send"
+    assert RequestLedger(hop["ledger_path"]).peek(hop["request_id"]) is None
+
+
+def test_bootstrap_alias_rejection_keeps_durable_attempts_at_zero(
+    tmp_path: Path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    anchor = bootstrap_record()
+    state = store.create_task(
+        "alias stays pre-send",
+        requested_team="alias-zero-send",
+        task_id="task-alias-zero-send",
+        bootstrap=anchor,
+    )
+    worker = CDPAWorker(config, store=store)
+
+    class Actions(FakeActions):
+        async def locate_owned(self, _state, _role):
+            return None
+
+        async def backend_conversation(self, conversation_id):
+            assert conversation_id == anchor["conversation_id"]
+            return _bootstrap_graph(anchor["terminal_assistant_message_id"])
+
+        async def branch_from_anchor(self, *_args, **_kwargs):
+            raise BranchBootstrapError("branch canonicalized back to donor")
+
+    async def ui_alias(*_args, **_kwargs):
+        raise worker_module.BootstrapUIBranchError(
+            "UI branch canonicalized back to donor"
+        )
+
+    monkeypatch.setattr(worker, "_branch_from_bootstrap_ui", ui_alias)
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, Actions()))
+
+    assert hop["state"] != "sending"
+    assert state["active_action"] == "bootstrap_retry"
+    assert RequestLedger(hop["ledger_path"]).peek(hop["request_id"]) is None
 
 
 def test_pre_send_bootstrap_fallback_chain_is_pre_send_only(tmp_path: Path, monkeypatch):
@@ -617,6 +774,17 @@ def test_ui_bootstrap_fallback_uses_exact_semantic_source_message(tmp_path: Path
     worker = CDPAWorker(config, store=store)
     calls = []
 
+    class BranchResponse:
+        url = "https://chatgpt.com/backend-api/conversation/new_branch"
+        status = 200
+
+        async def json(self):
+            return {
+                "conversation": {
+                    "conversation_id": "77777777-7777-4777-8777-777777777777"
+                }
+            }
+
     class Button:
         def __init__(self, page, label):
             self.page = page
@@ -625,7 +793,9 @@ def test_ui_bootstrap_fallback_uses_exact_semantic_source_message(tmp_path: Path
         async def click(self):
             calls.append(("click", self.label))
             if self.label == "Branch in new chat":
-                self.page.url = "https://chatgpt.com/c/ui-branched-conversation"
+                self.page.url = "https://chatgpt.com/c/WEB:ui-fallback"
+                for listener in tuple(self.page.listeners.get("response", ())):
+                    listener(BranchResponse())
 
     class Turn:
         def __init__(self, page):
@@ -654,6 +824,7 @@ def test_ui_bootstrap_fallback_uses_exact_semantic_source_message(tmp_path: Path
         def __init__(self):
             self.url = "about:blank"
             self.closed = False
+            self.listeners = {}
 
         async def goto(self, url, *, wait_until, timeout):
             self.url = url
@@ -666,6 +837,14 @@ def test_ui_bootstrap_fallback_uses_exact_semantic_source_message(tmp_path: Path
         def get_by_role(self, role, *, name, exact):
             calls.append(("page-role", role, name, exact))
             return Button(self, name)
+
+        def on(self, event, listener):
+            self.listeners.setdefault(event, []).append(listener)
+
+        def remove_listener(self, event, listener):
+            listeners = self.listeners.get(event, [])
+            if listener in listeners:
+                listeners.remove(listener)
 
         async def wait_for_url(self, predicate, *, wait_until, timeout):
             calls.append(("wait-url", wait_until, timeout))
@@ -680,12 +859,17 @@ def test_ui_bootstrap_fallback_uses_exact_semantic_source_message(tmp_path: Path
     page = Page()
 
     class Context:
+        def __init__(self):
+            self.pages = []
+
         async def new_page(self):
+            self.pages.append(page)
             return page
 
     class Client:
         def __init__(self):
             self.binding = PageBinding("ui-page", "alpha-plan")
+            self.page = page
 
         async def wait_until_clean_ready(self, *, timeout_ms):
             calls.append(("clean-ready", timeout_ms))
@@ -699,6 +883,14 @@ def test_ui_bootstrap_fallback_uses_exact_semantic_source_message(tmp_path: Path
                 page_role="alpha-plan",
                 page_task_id=state["task_id"],
                 page_team=state["team"],
+                composer_text="",
+                composer_present=True,
+                composer_editable=True,
+                stop_visible=False,
+                blocking_dialogs=(),
+                attachment_markers=(),
+                state=ChatGPTState.NEW_CHAT,
+                requires_login=False,
                 url=page.url,
             )
 
@@ -713,11 +905,12 @@ def test_ui_bootstrap_fallback_uses_exact_semantic_source_message(tmp_path: Path
         "conversation_id": anchor["conversation_id"],
         "assistant_message_id": anchor["terminal_assistant_message_id"],
     }
+    context = Context()
     acquired = asyncio.run(
         worker._branch_from_bootstrap_ui(
             state,
             "PLAN",
-            SimpleNamespace(browser_context=Context()),
+            worker_module.CDPATabActions(context, config),
             donor,
         )
     )
@@ -734,6 +927,157 @@ def test_ui_bootstrap_fallback_uses_exact_semantic_source_message(tmp_path: Path
     assert ("bind-task", state["task_id"], state["team"]) in calls
 
 
+def test_ui_bootstrap_branch_rejects_eventual_source_alias_before_task_bind(
+    tmp_path: Path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    anchor = bootstrap_record()
+    state = store.create_task(
+        "ui alias",
+        requested_team="ui-alias",
+        task_id="task-ui-alias",
+        bootstrap=anchor,
+    )
+    worker = CDPAWorker(config, store=store)
+    bind_calls = []
+
+    class BranchResponse:
+        url = "https://chatgpt.com/backend-api/conversation/new_branch"
+        status = 200
+
+        async def json(self):
+            return {"conversation": {"conversation_id": anchor["conversation_id"]}}
+
+    class ClickTarget:
+        def __init__(self, page, label):
+            self.page = page
+            self.label = label
+
+        async def click(self):
+            if self.label == "Branch in new chat":
+                self.page.url = "https://chatgpt.com/c/WEB:temporary-branch"
+                for listener in tuple(self.page.listeners.get("response", ())):
+                    listener(BranchResponse())
+
+    class Turn:
+        async def hover(self):
+            return None
+
+        def get_by_role(self, _role, *, name, exact):
+            assert exact is True
+            return ClickTarget(page, name)
+
+    class Assistant:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        async def wait_for(self, **_kwargs):
+            return None
+
+        def locator(self, _selector):
+            return Turn()
+
+    class Page:
+        def __init__(self):
+            self.url = "about:blank"
+            self.closed = False
+            self.wait_calls = 0
+            self.listeners = {}
+
+        async def goto(self, url, **_kwargs):
+            self.url = url
+
+        def locator(self, _selector):
+            return Assistant()
+
+        def get_by_role(self, _role, *, name, exact):
+            assert exact is True
+            return ClickTarget(self, name)
+
+        def on(self, event, listener):
+            self.listeners.setdefault(event, []).append(listener)
+
+        def remove_listener(self, event, listener):
+            listeners = self.listeners.get(event, [])
+            if listener in listeners:
+                listeners.remove(listener)
+
+        async def wait_for_url(self, predicate, **_kwargs):
+            self.wait_calls += 1
+            if self.wait_calls > 1:
+                self.url = f"https://chatgpt.com/c/{anchor['conversation_id']}"
+            if not predicate(self.url):
+                raise TimeoutError("URL predicate did not match")
+
+        def is_closed(self):
+            return self.closed
+
+        async def close(self):
+            self.closed = True
+
+    page = Page()
+
+    class Context:
+        def __init__(self):
+            self.pages = []
+
+        async def new_page(self):
+            self.pages.append(page)
+            return page
+
+    class Client:
+        def __init__(self):
+            self.binding = PageBinding("ui-alias-page", "ui-alias-plan")
+            self.bound = False
+            self.page = page
+
+        async def wait_until_clean_ready(self, **_kwargs):
+            return None
+
+        async def bind_task_identity(self, task_id, team):
+            bind_calls.append((task_id, team))
+            self.bound = True
+
+        async def assert_ownership(self):
+            return SimpleNamespace(
+                page_id="ui-alias-page",
+                page_role="ui-alias-plan",
+                page_task_id=state["task_id"] if self.bound else None,
+                page_team=state["team"] if self.bound else None,
+                composer_text="",
+                composer_present=True,
+                composer_editable=True,
+                stop_visible=False,
+                blocking_dialogs=(),
+                attachment_markers=(),
+                state=ChatGPTState.NEW_CHAT,
+                requires_login=False,
+                url=page.url,
+            )
+
+    class Workspace:
+        async def bind(self, _role, bound_page, **_kwargs):
+            assert bound_page is page
+            return Client()
+
+    monkeypatch.setattr(worker_module, "ChatGPTWorkspace", Workspace)
+    context = Context()
+    actions = worker_module.CDPATabActions(context, config)
+    donor = {
+        "conversation_id": anchor["conversation_id"],
+        "assistant_message_id": anchor["terminal_assistant_message_id"],
+    }
+
+    with pytest.raises(worker_module.BootstrapUIBranchError, match="source|donor|alias"):
+        asyncio.run(worker._branch_from_bootstrap_ui(state, "PLAN", actions, donor))
+
+    assert bind_calls == []
+    assert page.closed is True
+
+
 def test_pre_send_limits_allowed_routes_to_selected_workflow_roles(tmp_path: Path):
     _, _, state, worker = setup_task(tmp_path, roles=("PLAN", "REVIEW"))
     hop = _active_hop(state)
@@ -743,7 +1087,7 @@ def test_pre_send_limits_allowed_routes_to_selected_workflow_roles(tmp_path: Pat
     envelope, _ = json.JSONDecoder().raw_decode(
         hop["prompt"].removeprefix("alpha · role: plan\n")
     )
-    assert envelope["allowed-routes"] == ["PLAN", "REVIEW", "DONE"]
+    assert envelope["allowed-routes"] == ["PLAN", "REVIEW", "PAUSE", "DONE"]
     assert list(state["roles"]) == ["PLAN", "REVIEW"]
 
 
@@ -1034,6 +1378,37 @@ def test_resume_and_retry_controls_have_distinct_state_contracts(tmp_path: Path)
 
 
 
+@pytest.mark.parametrize("action", ["open_tab", "new_chat"])
+def test_active_rate_limit_gate_leaves_tab_opening_controls_queued(tmp_path: Path, action: str):
+    _, _, state, worker = setup_task(
+        tmp_path, task_id=f"task-rate-limit-control-{action}"
+    )
+    worker._rate_limit_cooldown = {
+        "state": "active",
+        "detected_at": "2026-08-09T00:00:00+00:00",
+        "release_not_before": "2999-01-01T00:00:00+00:00",
+    }
+    state["controls"] = [
+        {
+            "control_id": 1,
+            "action": action,
+            "role": "PLAN",
+            "reason": "must remain queued during cooldown",
+            "confirmed": False,
+            "status": "requested",
+            "requested_at": "2026-08-09T00:00:00+00:00",
+            "applied_at": None,
+            "result": None,
+        }
+    ]
+
+    applied = asyncio.run(worker._apply_control(state, SimpleNamespace()))
+
+    assert applied is False
+    assert state["controls"][0]["status"] == "requested"
+    assert state["controls"][0]["result"] is None
+
+
 def test_open_tab_recovers_presend_role_offline_and_sends_original_once(
     tmp_path: Path, monkeypatch
 ):
@@ -1292,6 +1667,128 @@ def test_open_tab_recovers_waiting_accepted_send_on_exact_conversation_without_r
 
 
 
+def test_open_tab_reconciles_stale_web_command_snapshot_from_exact_ledger(tmp_path: Path):
+    from dataclasses import replace
+    from playwright_auto.cdpa_commands import WorkerCommand
+
+    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-open-tab-stale-web"
+    )
+    provisional_url = "https://chatgpt.com/c/WEB:stale-open-tab"
+    canonical_id = "canonical-open-tab"
+    canonical_url = f"https://chatgpt.com/c/{canonical_id}"
+    hop["conversation_url"] = provisional_url
+    state["roles"]["PLAN"].update(page_url=provisional_url, online=False)
+    state.update(
+        status="BLOCKED",
+        kanban_column="BLOCKED",
+        block_code="role_offline",
+        block_retryable=False,
+        block_reason="owned alpha-plan tab is offline",
+    )
+    command = WorkerCommand.create(
+        origin="operator",
+        action="open_tab",
+        reason="recover stale provisional conversation",
+        state=state,
+        role="PLAN",
+    )
+    RequestLedger(hop["ledger_path"]).update(
+        hop["request_id"],
+        receipt=replace(receipt, conversation_id=canonical_id).to_dict(),
+    )
+    state["controls"] = [
+        {
+            "control_id": 1,
+            "action": "open_tab",
+            "role": "PLAN",
+            "reason": "recover stale provisional conversation",
+            "status": "requested",
+            "command": command.to_dict(),
+        }
+    ]
+    acquired = AcquiredRole(
+        client=SimpleNamespace(),
+        page_id=receipt.binding.page_id,
+        url=canonical_url,
+        created=True,
+        new_chat=False,
+    )
+
+    class Actions:
+        def __init__(self):
+            self.reopen_calls = []
+
+        async def reopen(self, _state, _role, **kwargs):
+            self.reopen_calls.append(kwargs)
+            return acquired
+
+    actions = Actions()
+    assert asyncio.run(worker._apply_control(state, actions)) is True
+
+    assert actions.reopen_calls == [{"require_clean_ready": False, "foreground": True}]
+    assert state["controls"][0]["status"] == "applied"
+    assert state["status"] == "RUNNING"
+    assert hop["receipt"]["conversation_id"] == canonical_id
+    assert hop["conversation_url"] == canonical_url
+    assert state["roles"]["PLAN"]["page_url"] == canonical_url
+    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
+
+
+def test_open_tab_rejects_conflicting_canonical_snapshot_after_ledger_reconcile(tmp_path: Path):
+    from dataclasses import replace
+    from playwright_auto.cdpa_commands import WorkerCommand
+
+    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-open-tab-canonical-conflict"
+    )
+    provisional_url = "https://chatgpt.com/c/WEB:stale-conflict"
+    hop["conversation_url"] = provisional_url
+    state["roles"]["PLAN"].update(page_url=provisional_url, online=False)
+    state.update(
+        status="BLOCKED",
+        kanban_column="BLOCKED",
+        block_code="role_offline",
+        block_retryable=False,
+        block_reason="owned alpha-plan tab is offline",
+    )
+    command_state = json.loads(json.dumps(state))
+    command_hop = _active_hop(command_state)
+    command_hop["conversation_url"] = "https://chatgpt.com/c/conflicting-canonical"
+    command_state["roles"]["PLAN"]["page_url"] = command_hop["conversation_url"]
+    command = WorkerCommand.create(
+        origin="operator",
+        action="open_tab",
+        reason="conflicting canonical snapshot",
+        state=command_state,
+        role="PLAN",
+    )
+    RequestLedger(hop["ledger_path"]).update(
+        hop["request_id"],
+        receipt=replace(receipt, conversation_id="durable-canonical").to_dict(),
+    )
+    state["controls"] = [
+        {
+            "control_id": 1,
+            "action": "open_tab",
+            "role": "PLAN",
+            "reason": "conflicting canonical snapshot",
+            "status": "requested",
+            "command": command.to_dict(),
+        }
+    ]
+
+    class Actions:
+        async def reopen(self, *_args, **_kwargs):
+            raise AssertionError("canonical command conflict must fail before reopening")
+
+    assert asyncio.run(worker._apply_control(state, Actions())) is True
+    assert state["controls"][0]["status"] == "ineffective"
+    assert "canonical" in str(state["controls"][0]["result"]).lower()
+    assert state["status"] == "BLOCKED"
+    assert _active_hop(state)["conversation_url"] == provisional_url
+
+
 def test_blocked_task_does_not_advance_without_explicit_control(tmp_path: Path):
     _, store, state, worker = setup_task(tmp_path)
     path = Path(state["manifest_path"])
@@ -1453,7 +1950,6 @@ def test_legacy_receipt_upgrade_advances_wait_persistence_baseline(tmp_path: Pat
     hop["wait"]["activity_length"] = 7
     saved = worker._persist_transport_result(path, persistence_baseline, state)
     assert _active_hop(saved)["wait"]["activity_length"] == 7
-
 
 
 def _backend_graph(user_id: str, assistant_id: str, text: str):
@@ -2292,6 +2788,125 @@ def test_normal_wait_routes_path_only_response_without_repair(tmp_path: Path):
     assert record is not None
     assert record.status is RequestStatus.COMPLETED
     assert record.attempts == 1
+
+
+def test_waiting_recovers_prior_terminal_only_from_proven_foreign_durable_request(
+    tmp_path: Path,
+):
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-historical-owner"
+    )
+    conversation_id = "99999999-9999-4999-8999-999999999999"
+    state, hop, receipt = _enable_backend_wait_identity(
+        store, state, path, hop, receipt, conversation_id=conversation_id
+    )
+    report_relative = ".plan/alpha/alpha-plan_turn1_task-historical-owner.md"
+    report_path = tmp_path / report_relative
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("historical response", encoding="utf-8")
+    accepted_text = json.dumps({"route": "DEV", "handoff": report_relative})
+
+    foreign = store.create_task(
+        "foreign durable request",
+        requested_team="foreign-durable",
+        task_id="task-foreign-durable",
+    )
+    foreign_hop = _active_hop(foreign)
+    foreign_source = {
+        "task_id": foreign["task_id"],
+        "team": foreign["team"],
+        "hop_id": foreign_hop["hop_id"],
+        "manifest": foreign["manifest_path"],
+    }
+    foreign_ledger = RequestLedger(foreign_hop["ledger_path"])
+    foreign_record = foreign_ledger.begin(
+        role=foreign_hop["physical_role"],
+        prompt="foreign prompt",
+        source_context=foreign_source,
+        request_id=foreign_hop["request_id"],
+        render_request_marker=False,
+    )
+    foreign_ledger.update(
+        foreign_record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+    )
+    foreign_receipt = {
+        "conversation_id": conversation_id,
+        "user_message_id": "u2",
+    }
+    foreign_ledger.update(
+        foreign_record.request_id,
+        status=RequestStatus.SENT,
+        accepted_at=2.0,
+        receipt=foreign_receipt,
+    )
+    foreign_hop["receipt"] = foreign_receipt
+    foreign_hop["state"] = "waiting"
+    store.save(Path(foreign["manifest_path"]), foreign)
+
+    graph = {
+        "current_node": "a2",
+        "mapping": {
+            "u1": {
+                "id": "u1",
+                "parent": None,
+                "message": {
+                    "id": "u1",
+                    "author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": [receipt.prompt]},
+                },
+            },
+            "a1": {
+                "id": "a1",
+                "parent": "u1",
+                "message": {
+                    "id": "a1",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "content": {"content_type": "text", "parts": [accepted_text]},
+                },
+            },
+            "u2": {
+                "id": "u2",
+                "parent": "a1",
+                "message": {
+                    "id": "u2",
+                    "author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": ["foreign prompt"]},
+                },
+            },
+            "a2": {
+                "id": "a2",
+                "parent": "u2",
+                "message": {
+                    "id": "a2",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "content": {"content_type": "text", "parts": ["foreign response"]},
+                },
+            },
+        },
+    }
+
+    class Actions:
+        async def backend_stream_status(self, observed_conversation_id):
+            assert observed_conversation_id == conversation_id
+            return {"status": "COMPLETE"}
+
+        async def backend_conversation(self, observed_conversation_id):
+            assert observed_conversation_id == conversation_id
+            return graph
+
+    asyncio.run(worker._waiting(state, hop, Actions(), path))
+
+    assert hop["state"] == "responded"
+    assert hop["response"] == accepted_text
+    assert hop["message_identity"]["message_id"] == "a1"
+    current = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
+    assert current is not None
+    assert current.attempts == 1
+    assert current.status is RequestStatus.SENT
 
 
 def test_waiting_requires_valid_route_report_and_two_samples_before_hop_response(tmp_path: Path):
@@ -3366,10 +3981,81 @@ def test_runtime_worker_discovers_once_and_idle_cycles_do_not_scan(tmp_path: Pat
     assert recover_calls == 1
 
 
+def test_heartbeat_ticker_keeps_long_advance_online_without_task_mutation(
+    tmp_path: Path, monkeypatch
+):
+    from dataclasses import replace
+
+    from playwright_auto.dashboard_api import DashboardAPI
+
+    config, store, state, worker = setup_task(tmp_path, task_id="task-heartbeat-live")
+    worker.config = replace(config, heartbeat_seconds=0.01, worker_stale_seconds=0.04)
+    worker.hydrate_runtime()
+    manifest_path = Path(state["manifest_path"])
+    manifest_before = manifest_path.read_bytes()
+    advance_started = asyncio.Event()
+
+    async def slow_advance(path, _browser_context, *, scheduling_tasks=None):
+        assert scheduling_tasks is not None
+        advance_started.set()
+        await asyncio.sleep(0.10)
+        return store.load(path)
+
+    monkeypatch.setattr(worker, "advance", slow_advance)
+    api = DashboardAPI(worker.config)
+
+    async def scenario():
+        heartbeat_task = asyncio.create_task(worker._heartbeat_loop())
+        advance_task = asyncio.create_task(
+            worker.advance(
+                manifest_path,
+                SimpleNamespace(pages=[]),
+                scheduling_tasks=[store.load(manifest_path)],
+            )
+        )
+        try:
+            await asyncio.wait_for(advance_started.wait(), timeout=1.0)
+            await asyncio.sleep(0.07)
+            health = api.worker_health()
+            assert health["worker_online"] is True
+            assert health["worker_stale"] is False
+            await advance_task
+        finally:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+
+    try:
+        asyncio.run(scenario())
+        assert manifest_path.read_bytes() == manifest_before
+    finally:
+        api.db.close()
+        worker.runtime_db.close()
 
 
+def test_stopped_heartbeat_ticker_becomes_stale(tmp_path: Path):
+    from dataclasses import replace
 
+    from playwright_auto.dashboard_api import DashboardAPI
 
+    config, _store, _state, worker = setup_task(tmp_path, task_id="task-heartbeat-stale")
+    worker.config = replace(config, heartbeat_seconds=0.01, worker_stale_seconds=0.04)
+    worker.hydrate_runtime()
+    api = DashboardAPI(worker.config)
+
+    async def scenario():
+        heartbeat_task = asyncio.create_task(worker._heartbeat_loop())
+        await asyncio.sleep(0.03)
+        assert api.worker_health()["worker_online"] is True
+        heartbeat_task.cancel()
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
+        await asyncio.sleep(0.06)
+        assert api.worker_health()["worker_stale"] is True
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        api.db.close()
+        worker.runtime_db.close()
 
 
 def test_dashboard_actions_snapshot_tracks_browser_and_command_changes(tmp_path: Path):
@@ -3801,6 +4487,56 @@ def test_change_goal_keeps_current_prompt_and_updates_first_later_hop(tmp_path: 
     assert later_envelope["goal"] == "Replacement for later roles"
 
 
+def test_resume_reconciles_canonical_ledger_before_exact_page_validation(tmp_path: Path):
+    from dataclasses import replace
+
+    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-resume-stale-web"
+    )
+    provisional_url = "https://chatgpt.com/c/WEB:stale-resume"
+    canonical_id = "canonical-resume"
+    canonical_url = f"https://chatgpt.com/c/{canonical_id}"
+    hop["conversation_url"] = provisional_url
+    state["roles"]["PLAN"]["page_url"] = provisional_url
+    RequestLedger(hop["ledger_path"]).update(
+        hop["request_id"],
+        receipt=replace(receipt, conversation_id=canonical_id).to_dict(),
+    )
+    control = {
+        "control_id": 1,
+        "action": "resume",
+        "role": "PLAN",
+        "status": "recovering",
+        "result": {"before": None},
+    }
+    seen = []
+
+    class Actions:
+        async def backend_stream_status(self, conversation_id):
+            seen.append(conversation_id)
+            return {"status": "IS_STREAMING"}
+
+        async def backend_conversation(self, *_args, **_kwargs):
+            raise AssertionError("IS_STREAMING must not fetch graph")
+
+        async def locate_owned(self, *_args, **_kwargs):
+            raise AssertionError("canonical backend Resume must not inspect source DOM")
+
+        async def reopen(self, *_args, **_kwargs):
+            raise AssertionError("canonical backend Resume must not reopen source")
+
+    asyncio.run(worker._recover_resume_waiting(state, hop, control, Actions()))
+
+    assert seen == [canonical_id]
+    assert control["status"] == "applied"
+    assert control["result"]["action"] == "rearm_backend_wait"
+    assert control["result"]["postcondition"] == "backend_wait_rearmed"
+    assert hop["receipt"]["conversation_id"] == canonical_id
+    assert hop["conversation_url"] == canonical_url
+    assert state["roles"]["PLAN"]["page_url"] == canonical_url
+    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
+
+
 def test_waiting_reconciles_conversation_id_from_exact_ledger_before_backend_wait(tmp_path: Path):
     from dataclasses import replace
     _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
@@ -3841,6 +4577,60 @@ def test_waiting_reconciles_conversation_id_from_exact_ledger_before_backend_wai
     assert hop["receipt"]["conversation_id"] == "conversation-1"
 
 
+def test_expired_waiting_with_canonical_ledger_checks_backend_before_dom_fallback(tmp_path: Path):
+    from dataclasses import replace
+
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-expired-backend-first"
+    )
+    report_relative = ".plan/alpha/alpha-plan_turn1_task-expired-backend-first.md"
+    report = tmp_path / report_relative
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("backend-first", encoding="utf-8")
+    canonical_id = "expired-backend"
+    enriched = replace(receipt, conversation_id=canonical_id)
+    RequestLedger(hop["ledger_path"]).update(
+        hop["request_id"], receipt=enriched.to_dict()
+    )
+    hop["wait"]["deadline_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    hop["wait"]["stream_status_next_poll_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    store.save(path, state)
+    calls = []
+
+    class Actions:
+        async def backend_stream_status(self, conversation_id):
+            calls.append(("status", conversation_id))
+            return {"status": "COMPLETE"}
+
+        async def backend_conversation(self, conversation_id):
+            calls.append(("graph", conversation_id))
+            return _backend_graph(
+                receipt.user_message_id,
+                "assistant-expired",
+                json.dumps({"route": "TEST", "handoff": report_relative}),
+            )
+
+        async def locate_owned(self, *_args, **_kwargs):
+            raise AssertionError("expired canonical backend path must run before DOM fallback")
+
+        async def reopen(self, *_args, **_kwargs):
+            raise AssertionError("expired canonical backend path must not reopen before backend check")
+
+        async def wake(self, *_args, **_kwargs):
+            raise AssertionError("expired canonical backend path must not wake before backend check")
+
+    asyncio.run(worker._waiting(state, hop, Actions(), path))
+
+    assert calls == [("status", canonical_id), ("graph", canonical_id)]
+    assert hop["state"] == "responded"
+    assert hop["receipt"]["conversation_id"] == canonical_id
+    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
+
+
 def test_record_response_reconciles_late_conversation_id_and_conflict_fails_closed(tmp_path: Path):
     from dataclasses import replace
     _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
@@ -3866,14 +4656,23 @@ def test_record_response_reconciles_late_conversation_id_and_conflict_fails_clos
 def test_worker_completion_is_stream_status_primary_with_dom_fallback_preserved():
     import inspect
 
+    backend_source = inspect.getsource(CDPAWorker._waiting_backend_step)
+    assert "backend_stream_status" in backend_source
+    assert "backend_conversation" in backend_source
+    assert "resolve_terminal_assistant" in backend_source
+    assert ".wait_for_response(" not in backend_source
+
     waiting_source = inspect.getsource(CDPAWorker._waiting)
-    assert "backend_stream_status" in waiting_source
-    assert "backend_conversation" in waiting_source
-    assert "resolve_terminal_assistant" in waiting_source
+    assert "_waiting_backend_step" in waiting_source
     assert "_waiting_dom" in waiting_source
     assert ".wait_for_response(" not in waiting_source
 
-    for name in ("_final_response_reconciliation", "_waiting_dom", "_recover_resume_waiting"):
+    resume_source = inspect.getsource(CDPAWorker._recover_resume_waiting)
+    assert "_waiting_backend_step" in resume_source
+    assert ".wait_for_response(" in resume_source
+    assert "retry_generation(" not in resume_source
+
+    for name in ("_final_response_reconciliation", "_waiting_dom"):
         method_source = inspect.getsource(getattr(CDPAWorker, name))
         assert ".wait_for_response(" in method_source
 
@@ -4053,14 +4852,14 @@ def test_shared_automated_send_gate_enforces_remaining_spacing(tmp_path: Path, m
     assert worker._last_automated_send_at >= before
 
 
-def test_first_allocation_prefers_current_task_donor_before_catalog(tmp_path: Path):
+def test_first_allocation_keeps_catalog_primary_before_task_backup(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     catalog = BootstrapCatalog(tmp_path)
     root_donor = donor_pool_record()["donors"][0]
     record = catalog.upsert(donor_pool_record())
     store = TaskStore(config)
     state = store.create_task(
-        "prefer descendant donor",
+        "prefer stable primary donor",
         requested_team="donor-preference",
         task_id="task-donor-preference",
         bootstrap=record,
@@ -4101,9 +4900,172 @@ def test_first_allocation_prefers_current_task_donor_before_catalog(tmp_path: Pa
 
     assert acquired is not None
     assert actions.branches == [
-        (child_donor["conversation_id"], child_donor["assistant_message_id"])
+        (root_donor["conversation_id"], root_donor["assistant_message_id"])
     ]
     assert state["roles"]["PLAN"]["context_source"] == "bootstrap_donor"
+
+
+def test_post_release_first_failed_branch_does_not_fan_out_to_ui_or_donor_two(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    donors = [
+        {
+            "conversation_id": "11111111-1111-4111-8111-111111111111",
+            "assistant_message_id": "22222222-2222-4222-8222-222222222222",
+        },
+        {
+            "conversation_id": "33333333-3333-4333-8333-333333333333",
+            "assistant_message_id": "44444444-4444-4444-8444-444444444444",
+        },
+    ]
+    catalog = BootstrapCatalog(tmp_path)
+    record = catalog.upsert(donor_pool_record(donors=donors))
+    store = TaskStore(config)
+    state = store.create_task(
+        "one acquisition after cooldown",
+        requested_team="post-release-one-shot",
+        task_id="task-post-release-one-shot",
+        bootstrap=record,
+    )
+    worker = CDPAWorker(config, store=store)
+    worker.runtime_db.ensure_schema()
+    worker._rate_limit_cooldown = {
+        "state": "released",
+        "detected_at": "2026-08-09T00:00:00+00:00",
+        "release_not_before": "2026-08-09T00:01:00+00:00",
+        "released_at": "2026-08-09T00:01:00+00:00",
+        "post_release_acquisition": "pending",
+    }
+
+    class Actions(FakeActions):
+        def __init__(self):
+            super().__init__()
+            self.branches = []
+
+        async def locate_owned(self, _state, _role):
+            return None
+
+        async def backend_conversation(self, conversation_id):
+            donor = next(item for item in donors if item["conversation_id"] == conversation_id)
+            return _bootstrap_graph(donor["assistant_message_id"])
+
+        async def branch_from_anchor(
+            self, _state, _role, *, source_conversation_id, assistant_message_id
+        ):
+            self.branches.append((source_conversation_id, assistant_message_id))
+            raise BranchBootstrapError("first post-release acquisition failed")
+
+    actions = Actions()
+    acquired = asyncio.run(worker._acquire_workflow_role(state, "PLAN", actions))
+
+    assert acquired is None
+    assert actions.branches == [
+        (donors[0]["conversation_id"], donors[0]["assistant_message_id"])
+    ]
+    assert worker._rate_limit_cooldown["post_release_acquisition"] == "consumed"
+    assert state["active_action"] == "bootstrap_retry"
+
+
+def test_post_release_acquisition_is_profile_wide_single_inflight_lease(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    catalog = BootstrapCatalog(tmp_path)
+    record = catalog.upsert(donor_pool_record())
+    store = TaskStore(config)
+    state_a = store.create_task(
+        "post release A",
+        requested_team="post-release-a",
+        task_id="task-post-release-a",
+        bootstrap=record,
+    )
+    state_b = store.create_task(
+        "post release B",
+        requested_team="post-release-b",
+        task_id="task-post-release-b",
+        bootstrap=record,
+    )
+    worker = CDPAWorker(config, store=store)
+    worker.runtime_db.ensure_schema()
+    worker._rate_limit_cooldown = {
+        "state": "released",
+        "detected_at": "2026-08-09T00:00:00+00:00",
+        "release_not_before": "2026-08-09T00:01:00+00:00",
+        "released_at": "2026-08-09T00:01:00+00:00",
+        "post_release_acquisition": "pending",
+    }
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class Actions(FakeActions):
+        def __init__(self):
+            super().__init__()
+            self.branch_calls = []
+
+        async def locate_owned(self, _state, _role):
+            return None
+
+        async def backend_conversation(self, _conversation_id):
+            return _bootstrap_graph(record["donors"][0]["assistant_message_id"])
+
+        async def branch_from_anchor(
+            self, state, role, *, source_conversation_id, assistant_message_id
+        ):
+            self.branch_calls.append(state["task_id"])
+            if len(self.branch_calls) == 1:
+                first_started.set()
+                await release_first.wait()
+            return AcquiredRole(
+                client=SimpleNamespace(),
+                page_id=f"branch-{state['task_id']}",
+                url=f"https://chatgpt.com/c/{state['task_id']}",
+                created=True,
+                new_chat=True,
+            )
+
+    actions = Actions()
+
+    async def scenario():
+        first = asyncio.create_task(
+            worker._acquire_workflow_role(state_a, "PLAN", actions)
+        )
+        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+        second = asyncio.create_task(
+            worker._acquire_workflow_role(state_b, "PLAN", actions)
+        )
+        await asyncio.sleep(0)
+        release_first.set()
+        return await asyncio.gather(first, second)
+
+    first_result, second_result = asyncio.run(scenario())
+
+    assert first_result is not None
+    assert second_result is None
+    assert actions.branch_calls == [state_a["task_id"]]
+    assert worker._rate_limit_cooldown["post_release_acquisition"] == "consumed"
+
+
+def test_active_rate_limit_gate_blocks_ui_bootstrap_before_new_page(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_task(
+        "block UI bootstrap during cooldown",
+        requested_team="ui-bootstrap-gated",
+        task_id="task-ui-bootstrap-gated",
+        bootstrap=donor_pool_record(),
+    )
+    worker = CDPAWorker(config, store=store)
+    worker._rate_limit_cooldown = {
+        "state": "active",
+        "detected_at": "2026-08-09T00:00:00+00:00",
+        "release_not_before": "2999-01-01T00:00:00+00:00",
+    }
+    donor = donor_pool_record()["donors"][0]
+
+    class Actions:
+        browser_context = SimpleNamespace(
+            new_page=lambda: pytest.fail("cooldown must block UI page creation")
+        )
+
+    with pytest.raises(RateLimitBlockedError, match="cooldown"):
+        asyncio.run(worker._branch_from_bootstrap_ui(state, "PLAN", Actions(), donor))
 
 
 def test_transient_donor_backend_failure_retries_without_removing_or_blocking(tmp_path: Path):
@@ -4183,6 +5145,37 @@ def test_source_only_bootstrap_materializes_first_donor_without_fresh_fallback(t
     assert actions.branches == [(donor["conversation_id"], donor["assistant_message_id"])]
     assert catalog.get(record["bootstrap_id"])["donors"] == [donor]
     assert state["roles"]["PLAN"]["context_source"] == "bootstrap_donor"
+
+
+def test_active_rate_limit_gate_blocks_prewarm_before_global_role_acquisition(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    catalog = BootstrapCatalog(tmp_path)
+    record = catalog.upsert(
+        donor_pool_record(donors=[], prewarm_prompt="Load reusable bootstrap context only.")
+    )
+    store = TaskStore(config)
+    state = store.create_task(
+        "do not prewarm during cooldown",
+        requested_team="donor-prewarm-gated",
+        task_id="task-donor-prewarm-gated",
+        bootstrap=record,
+    )
+    state["bootstrap_source_exhausted"] = True
+    worker = CDPAWorker(config, store=store)
+    worker._rate_limit_cooldown = {
+        "state": "active",
+        "detected_at": "2026-08-09T00:00:00+00:00",
+        "release_not_before": "2999-01-01T00:00:00+00:00",
+    }
+
+    class Actions(FakeActions):
+        async def acquire_global_role(self, _physical_role):
+            pytest.fail("cooldown must block global role acquisition before opening a tab")
+
+    updated = asyncio.run(worker._regenerate_bootstrap_donor(state, record, Actions()))
+
+    assert updated is None
+    assert state["active_action"] == "bootstrap_regenerate"
 
 
 def test_prewarm_regenerates_donor_through_shared_send_gate(tmp_path: Path, monkeypatch):
@@ -4322,6 +5315,7 @@ def test_accepted_first_role_self_clones_child_local_bootstrap_donor(tmp_path: P
     role = state["roles"]["PLAN"]
     role["context_source"] = "bootstrap_donor"
     role["conversation_generation"] = 1
+    role["bootstrap_source_donor"] = dict(record["donors"][0])
     hop = _active_hop(state)
     child_conversation = "33333333-3333-4333-8333-333333333333"
     inherited_assistant = "44444444-4444-4444-8444-444444444444"
@@ -4385,4 +5379,207 @@ def test_accepted_first_role_self_clones_child_local_bootstrap_donor(tmp_path: P
     assert captured is True
     assert state["bootstrap_task_donors"][0] == donor
     assert role["bootstrap_donor"] == donor
-    assert catalog.get(record["bootstrap_id"])["donors"][0] == donor
+    assert catalog.get(record["bootstrap_id"])["donors"] == [record["donors"][0], donor]
+
+
+def test_aliased_role_conversation_is_not_persisted_as_descendant_bootstrap_donor(
+    tmp_path: Path,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    catalog = BootstrapCatalog(tmp_path)
+    record = catalog.upsert(donor_pool_record(max_backups=2))
+    source_donor = dict(record["donors"][0])
+    store = TaskStore(config)
+    state = store.create_task(
+        "reject aliased descendant donor",
+        requested_team="donor-alias",
+        task_id="task-donor-alias",
+        bootstrap=record,
+    )
+    role = state["roles"]["PLAN"]
+    role["context_source"] = "bootstrap_donor"
+    role["conversation_generation"] = 1
+    role["bootstrap_source_donor"] = source_donor
+    hop = _active_hop(state)
+    hop["receipt"] = {
+        "conversation_id": source_donor["conversation_id"],
+        "user_message_id": "55555555-5555-4555-8555-555555555555",
+    }
+    worker = CDPAWorker(config, store=store)
+
+    class Actions:
+        async def backend_conversation(self, _conversation_id):
+            raise AssertionError("aliased donor must be rejected before backend capture")
+
+    captured = asyncio.run(worker._capture_bootstrap_role_donor(state, hop, Actions()))
+
+    assert captured is False
+    assert state.get("bootstrap_task_donors") in (None, [])
+    assert role.get("bootstrap_donor") is None
+    assert catalog.get(record["bootstrap_id"])["donors"] == record["donors"]
+
+
+def _accept_self_route_guard_decision(worker, state, route: str):
+    hop = _active_hop(state)
+    state["roles"][str(hop["target_role"])]["turn"] = int(hop["turn"])
+    handoff = (
+        f".plan/{state['team']}/{hop['physical_role']}_turn{hop['turn']}_"
+        f"{state['task_id']}.md"
+    )
+    hop["response"] = json.dumps({"route": route, "handoff": handoff})
+    hop["state"] = "responded"
+    worker._responded(state, hop)
+    return hop
+
+
+def test_consecutive_self_route_guard_blocks_third_without_child_or_send_after_reload(
+    tmp_path: Path, monkeypatch
+):
+    config, store, state, worker = setup_task(tmp_path, task_id="task-self-route-limit")
+
+    first = _accept_self_route_guard_decision(worker, state, "PLAN")
+    second = _accept_self_route_guard_decision(worker, state, "PLAN")
+    third = _accept_self_route_guard_decision(worker, state, "PLAN")
+
+    assert first["state"] == second["state"] == third["state"] == "routed"
+    assert len(state["hops"]) == 3
+    assert state["active_hop_id"] == third["hop_id"]
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "consecutive_self_route_limit"
+    assert state["block_retryable"] is False
+    assert "PLAN" in state["block_reason"]
+    assert "3" in state["block_reason"]
+    assert "operator Resume" in state["block_reason"]
+    assert [item.get("kind") for item in state["route_timeline"]] == [None, None, None]
+    assert len(state["reports"]) == 3
+    assert not any(hop["request_id"].endswith("-hop4") for hop in state["hops"])
+
+    path = Path(state["manifest_path"])
+    store.save(path, state)
+    restarted = CDPAWorker(config, store=store)
+
+    async def forbidden_pre_send(*_args, **_kwargs):
+        raise AssertionError("guarded reload must not reach _pre_send")
+
+    monkeypatch.setattr(restarted, "_pre_send", forbidden_pre_send)
+    reloaded = asyncio.run(restarted.advance(path, SimpleNamespace(pages=[])))
+
+    assert reloaded["status"] == "BLOCKED"
+    assert reloaded["block_code"] == "consecutive_self_route_limit"
+    assert len(reloaded["hops"]) == 3
+    assert len(reloaded["reports"]) == 3
+    assert len(reloaded["route_timeline"]) == 3
+    assert RequestLedger(third["ledger_path"]).peek("task-self-route-limit-hop4") is None
+
+
+def test_consecutive_self_route_guard_resets_on_normal_role_change(tmp_path: Path):
+    _, _, state, worker = setup_task(
+        tmp_path,
+        task_id="task-self-route-role-reset",
+        roles=("PLAN", "DEV"),
+    )
+
+    _accept_self_route_guard_decision(worker, state, "PLAN")
+    _accept_self_route_guard_decision(worker, state, "PLAN")
+    _accept_self_route_guard_decision(worker, state, "DEV")
+    assert state["active_role"] == "DEV"
+
+    _accept_self_route_guard_decision(worker, state, "DEV")
+    _accept_self_route_guard_decision(worker, state, "DEV")
+    third_dev = _accept_self_route_guard_decision(worker, state, "DEV")
+
+    assert state["status"] == "BLOCKED"
+    assert state["active_hop_id"] == third_dev["hop_id"]
+    assert len([item for item in state["route_timeline"] if item.get("source_role") == "DEV"]) == 3
+
+
+def test_consecutive_self_route_guard_applies_to_custom_workflow_role(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    custom = store.create_workflow_agent(
+        display_name="Custom loop role",
+        system_prompt="Perform the assigned custom workflow role.",
+        external_command_id="create-custom-loop-role",
+    )["route_key"]
+    state = store.create_task(
+        "Exercise custom self-route guard",
+        requested_team="custom-loop",
+        task_id="task-custom-self-route-limit",
+        roles=("PLAN", custom),
+    )
+    worker = CDPAWorker(config, store=store)
+
+    _accept_self_route_guard_decision(worker, state, custom)
+    _accept_self_route_guard_decision(worker, state, custom)
+    _accept_self_route_guard_decision(worker, state, custom)
+    third = _accept_self_route_guard_decision(worker, state, custom)
+
+    assert custom.startswith("WF_")
+    assert state["status"] == "BLOCKED"
+    assert state["active_hop_id"] == third["hop_id"]
+    assert custom in state["block_reason"]
+
+
+def test_route_repair_artifacts_neither_count_nor_reset_self_route_streak(tmp_path: Path):
+    _, _, state, worker = setup_task(tmp_path, task_id="task-self-route-repair")
+
+    _accept_self_route_guard_decision(worker, state, "PLAN")
+    _accept_self_route_guard_decision(worker, state, "PLAN")
+    malformed = _active_hop(state)
+    malformed["response"] = "not json"
+    malformed["state"] = "responded"
+    worker._responded(state, malformed)
+    repair = _active_hop(state)
+    assert repair["kind"] == "route_repair"
+
+    _accept_self_route_guard_decision(worker, state, "PLAN")
+    assert state["status"] == "RUNNING"
+    assert _active_hop(state)["kind"] == "handoff"
+
+    third_normal = _accept_self_route_guard_decision(worker, state, "PLAN")
+    assert state["status"] == "BLOCKED"
+    assert state["active_hop_id"] == third_normal["hop_id"]
+
+
+def test_goal_revision_resets_self_route_streak_at_applies_from_hop_boundary(tmp_path: Path):
+    _, _, state, worker = setup_task(tmp_path, task_id="task-self-route-goal-reset")
+
+    _accept_self_route_guard_decision(worker, state, "PLAN")
+    _accept_self_route_guard_decision(worker, state, "PLAN")
+    boundary = int(state["active_hop_id"])
+    state["goal_revisions"] = [
+        {
+            "revision": 1,
+            "changed_at": utc_now(),
+            "applies_from_hop_id": boundary,
+            "goal": "Revised goal",
+            "external_command_id": "goal-reset-self-route",
+        }
+    ]
+    state["effective_goal"] = "Revised goal"
+
+    _accept_self_route_guard_decision(worker, state, "PLAN")
+
+    assert state["status"] == "RUNNING"
+    assert state["active_hop_id"] == boundary + 1
+
+
+@pytest.mark.parametrize("operational_kind", ["role_restart", "control"])
+def test_operational_hop_decision_neither_counts_nor_resets_self_route_streak(
+    tmp_path: Path, operational_kind: str
+):
+    _, _, state, worker = setup_task(
+        tmp_path, task_id=f"task-self-route-{operational_kind}"
+    )
+    _accept_self_route_guard_decision(worker, state, "PLAN")
+    _accept_self_route_guard_decision(worker, state, "PLAN")
+
+    operational = _active_hop(state)
+    operational["kind"] = operational_kind
+    _accept_self_route_guard_decision(worker, state, "PLAN")
+    assert state["status"] == "RUNNING"
+
+    third_normal = _accept_self_route_guard_decision(worker, state, "PLAN")
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "consecutive_self_route_limit"
+    assert state["active_hop_id"] == third_normal["hop_id"]

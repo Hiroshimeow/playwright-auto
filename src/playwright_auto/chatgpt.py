@@ -362,15 +362,23 @@ async def _backend_session_token(context: Any) -> str:
     return token
 
 
-async def _backend_get_object(context: Any, path: str, *, category: str) -> dict[str, Any]:
+async def _backend_get_object(
+    context: Any,
+    path: str,
+    *,
+    category: str,
+    method: str = "get",
+    data: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     state = _backend_context_state(context)
     token = await _backend_session_token(context)
     for attempt in range(2):
         try:
-            response = await context.request.get(
-                f"https://chatgpt.com{path}",
-                headers={"Authorization": f"Bearer {token}"},
-            )
+            request = getattr(context.request, method)
+            kwargs: dict[str, Any] = {"headers": {"Authorization": f"Bearer {token}"}}
+            if data is not None:
+                kwargs["data"] = dict(data)
+            response = await request(f"https://chatgpt.com{path}", **kwargs)
         except Exception:
             raise BackendUnavailableError(0, category) from None
         status = int(getattr(response, "status", 0) or 0)
@@ -382,9 +390,7 @@ async def _backend_get_object(context: Any, path: str, *, category: str) -> dict
             raise BackendAuthError(f"{category} remained unauthorized after one refresh")
         if status == 404:
             raise BackendNotReadyError(f"{category} is not ready")
-        if status == 429 or status >= 500:
-            raise BackendUnavailableError(status, category)
-        if status < 200 or status >= 300:
+        if status == 429 or status >= 500 or status < 200 or status >= 300:
             raise BackendUnavailableError(status, category)
         try:
             payload = await response.json()
@@ -424,6 +430,49 @@ async def backend_conversation(context: Any, conversation_id: str) -> dict[str, 
     ):
         raise BackendSchemaError("conversation response is missing graph shape")
     return payload
+
+
+async def backend_projects(context: Any) -> list[dict[str, str]]:
+    payload = await _backend_get_object(
+        context, "/backend-api/gizmos/snorlax/sidebar?conversations_per_gizmo=0", category="projects"
+    )
+    items = payload.get("items")
+    if not isinstance(items, list):
+        raise BackendSchemaError("projects response is missing items")
+    projects: list[dict[str, str]] = []
+    for item in items:
+        gizmo = item.get("gizmo") if isinstance(item, Mapping) else None
+        gizmo = gizmo.get("gizmo") if isinstance(gizmo, Mapping) else None
+        display = gizmo.get("display") if isinstance(gizmo, Mapping) else None
+        project_id = gizmo.get("id") if isinstance(gizmo, Mapping) else None
+        name = display.get("name") if isinstance(display, Mapping) else None
+        if not isinstance(project_id, str) or not project_id.startswith("g-p-") or not isinstance(name, str):
+            raise BackendSchemaError("projects response has unknown item shape")
+        projects.append({"id": project_id, "name": name})
+    return projects
+
+
+async def backend_create_project(context: Any, name: str) -> str:
+    payload = await _backend_get_object(
+        context, "/backend-api/projects", category="project_create", method="post",
+        data={"name": name, "instructions": ""},
+    )
+    resource = payload.get("resource")
+    gizmo = resource.get("gizmo") if isinstance(resource, Mapping) else None
+    project_id = gizmo.get("id") if isinstance(gizmo, Mapping) else None
+    if not isinstance(project_id, str) or not project_id.startswith("g-p-"):
+        raise BackendSchemaError("project_create response is missing resource.gizmo.id")
+    return project_id
+
+
+async def backend_set_conversation_project(context: Any, conversation_id: str, project_id: str) -> None:
+    exact_id = _safe_identity_string(conversation_id)
+    if exact_id is None or not isinstance(project_id, str) or not project_id.startswith("g-p-"):
+        raise ValueError("conversation and Project IDs must be valid")
+    await _backend_get_object(
+        context, f"/backend-api/conversation/{exact_id}", category="project_membership",
+        method="patch", data={"gizmo_id": project_id},
+    )
 
 
 class ChatGPTState(str, Enum):
@@ -3233,6 +3282,8 @@ class ChatGPTPage:
 
             manual_pending = last_snapshot.manual_input_pending
             choice_pending = last_snapshot.choice_prompt_pending
+            if rate_limit_dialogs(last_snapshot):
+                raise RateLimitBlockedError("request rate limit blocks clean-ready")
             if choice_pending and resolve_choice_prompt:
                 await self.resolve_choice_prompt(timeout_ms=timeout)
                 choice_pending = False

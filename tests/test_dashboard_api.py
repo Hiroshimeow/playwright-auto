@@ -8,13 +8,15 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
 from playwright_auto.cdpa_bootstraps import BootstrapCatalog
 from playwright_auto.cdpa_config import load_cdpa_config
 from playwright_auto.cdpa_projection import TaskProjection
 from playwright_auto.cdpa_runtime_db import RuntimeDB
 from playwright_auto.cdpa_store import TaskStore
 from playwright_auto.cdpa_worker import CDPAWorker
-from playwright_auto.dashboard_api import create_server
+from playwright_auto.dashboard_api import APIError, DashboardAPI, create_server
 
 from test_cdpa_core import write_config
 from test_cdpa_independent_commands import fail_after
@@ -427,6 +429,130 @@ def test_tasks_api_returns_worker_projected_waiting_order_without_derivation(
 
 
 
+def test_create_repository_inference_is_header_bounded_and_strict(tmp_path: Path):
+    config = load_cdpa_config(None, repository_root=tmp_path)
+    api = DashboardAPI(config)
+    repo_a = tmp_path / "repo-a"
+    repo_b = tmp_path / "repo-b"
+    repo_a.mkdir()
+    repo_b.mkdir()
+
+    explicit = api.normalize_create(
+        {
+            "task": "Title\nRepository relative/path",
+            "repository": str(repo_a),
+        }
+    )
+    assert explicit["repository"] == str(repo_a.resolve())
+
+    one_line = api.normalize_create(
+        {"task": f"Title\nRepository {repo_a}", "repository": None}
+    )
+    assert one_line["repository"] == str(repo_a.resolve())
+
+    embedded = api.normalize_create(
+        {"task": f"QMH task. Repository {repo_a}, use @mcp-g8 only."}
+    )
+    assert embedded["repository"] == str(repo_a.resolve())
+
+    embedded_target = api.normalize_create(
+        {"task": f"QMH task. Target repository {repo_b} use @mcp-g8 only."}
+    )
+    assert embedded_target["repository"] == str(repo_b.resolve())
+
+    remote = api.normalize_create(
+        {"task": r"Screens task. Target repository E:\python_project\Screens-Trans-Chatbot, use @mcp-thinkbook only."}
+    )
+    assert remote["repository"] == str(tmp_path.resolve())
+
+    two_line = api.normalize_create(
+        {
+            "task": f"Title\nRepository/worktree:\n\n{repo_b}\n\nPURPOSE\nDo work",
+            "repository": "   ",
+        }
+    )
+    assert two_line["repository"] == str(repo_b.resolve())
+
+    fallback = api.normalize_create(
+        {"task": f"Title\nPURPOSE\nRepository {repo_a}\nThis is later prose"}
+    )
+    assert fallback["repository"] == str(tmp_path.resolve())
+
+    arbitrary = api.normalize_create(
+        {"task": f"Title\nNotes\nExample: Repository {repo_b}"}
+    )
+    assert arbitrary["repository"] == str(tmp_path.resolve())
+
+    invalid = (
+        "Title\nRepository relative/path",
+        "Title Repository relative/path, use @mcp-g8 only.",
+        f"Title Repository {repo_a}, Repository relative/path",
+        f"Title. Repository {repo_a}, Target repository {repo_b}, use @mcp-g8 only.",
+        "Title\nRepository/worktree:",
+        "Title\nRepository/worktree:\nrelative/path",
+    )
+    for task in invalid:
+        with pytest.raises(APIError) as exc_info:
+            api.normalize_create({"task": task})
+        assert exc_info.value.status == 400
+        assert exc_info.value.code == "invalid_request"
+
+    outside = tmp_path.parent.parent / "outside-allowed-root"
+    with pytest.raises(APIError) as exc_info:
+        api.normalize_create({"task": f"Title\nRepository {outside}"})
+    assert exc_info.value.status == 400
+    assert exc_info.value.code == "repository_not_allowed"
+
+
+def test_inferred_repository_persists_through_runtime_create_command(tmp_path: Path):
+    config, db, server, thread = start_api(tmp_path)
+    execution_repository = tmp_path / "execution"
+    execution_repository.mkdir()
+    try:
+        status, _headers, data = request(
+            server,
+            "POST",
+            "/api/tasks",
+            body={
+                "task": f"Cross repo task\nRepository {execution_repository}",
+                "requested_team": "inferred-repo",
+            },
+            headers={"Idempotency-Key": "inferred-repository"},
+        )
+        assert status == 202
+        queued = json.loads(data)
+        command = db.get_command(queued["command_id"])
+        assert command["payload"]["repository"] == str(execution_repository.resolve())
+
+        store = TaskStore(config)
+        applied = CDPAWorker(config, store=store)._apply_next_command()
+        assert applied["status"] == "applied"
+        created = store.load_task_id(queued["task_id"])
+        assert created is not None
+        assert created["repository"] == str(execution_repository.resolve())
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_invalid_repository_header_does_not_enqueue_command(tmp_path: Path):
+    _config, db, server, thread = start_api(tmp_path)
+    try:
+        status, _headers, body = request(
+            server,
+            "POST",
+            "/api/tasks",
+            body={"task": "Title\nRepository relative/path"},
+            headers={"Idempotency-Key": "invalid-repository-header"},
+        )
+        assert status == 400
+        assert json.loads(body)["error"]["code"] == "invalid_request"
+        assert db.get_command_by_idempotency_key("invalid-repository-header") is None
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
 def test_mutations_require_idempotency_and_reuse_identical_command(tmp_path: Path):
     _config, db, server, thread = start_api(tmp_path)
     body = {"task": "new task", "requested_team": "new", "repository": str(tmp_path)}
@@ -630,6 +756,45 @@ def test_report_uses_exact_hashed_private_locator(tmp_path: Path):
     finally:
         server.shutdown()
         thread.join(timeout=5)
+
+
+def test_maintenance_report_keeps_control_repo_absolute_locator_for_cross_repo_task(tmp_path: Path):
+    control = tmp_path / "control"
+    execution = tmp_path / "execution"
+    control.mkdir()
+    execution.mkdir()
+    report = control / ".plan" / "maintenance" / "incident.md"
+    report.parent.mkdir(parents=True)
+    report.write_bytes(b"maintenance evidence")
+    private = {
+        "manifest_path": str(control / ".plan" / "alpha" / "task-a" / "task-a.json"),
+        "repository": str(execution),
+        "reports": {},
+        "maintenance_reports": {
+            "incident-1": {
+                "path": str(report),
+                "sha256": hashlib.sha256(b"maintenance evidence").hexdigest(),
+                "size": len(b"maintenance evidence"),
+            }
+        },
+    }
+
+    class ProjectionDB:
+        def ensure_schema(self):
+            pass
+
+        def get_task_private(self, task_id):
+            return private if task_id == "task-a" else None
+
+    api = DashboardAPI(
+        type("Config", (), {
+            "repository_root": control,
+            "plans_root": control / ".plan",
+            "repository_allowed_roots": (tmp_path.resolve(),),
+        })(),
+        db=ProjectionDB(),
+    )
+    assert api.report_bytes("task-a", "incident-1", maintenance=True) == b"maintenance evidence"
 
 
 def test_change_goal_endpoint_enqueues_strict_idempotent_command(tmp_path: Path):

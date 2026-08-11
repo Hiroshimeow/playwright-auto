@@ -20,6 +20,7 @@ This file is not a chronological incident log. Track one entry per stable root c
 ### P-008 — Worker state transitions and invariants are distributed across large mutable-dict branches
 
 - **Status:** `OPEN`
+- **Priority:** `LOW`
 - **Root cause:** `_apply_control()` is a large action dispatcher that directly mutates status, kanban, block, pause, hop, role, and timeline fields. Core invariant resets such as `block_code`, `block_retryable`, and `block_reason` are duplicated across many branches and other worker paths.
 - **Evidence:** `_apply_control()` begins near `cdpa_worker.py:895` and contains the control-specific transition logic inline. The same block-clear mutation cluster currently appears at multiple locations including lines near `528`, `952`, `974`, `993`, `1039`, `1160`, `1554`, and `2217`.
 - **Impact:** a repair can update one transition but miss another, leaving contradictory status/column/block/hop state; review and regression attribution become difficult, especially around recovery and accepted-send boundaries.
@@ -29,34 +30,29 @@ This file is not a chronological incident log. Track one entry per stable root c
 ### P-009 — Browser automation behavior is embedded and duplicated as large JavaScript strings
 
 - **Status:** `OPEN`
+- **Priority:** `LOW`
 - **Root cause:** send, composer inspection, visibility checks, text extraction, and attachment detection are implemented as large JavaScript bodies embedded in Python, with overlapping helper logic across `chatgpt.py` and `upload.py`.
 - **Evidence:** `click_send_button()` begins near `chatgpt.py:1033` and contains a large browser-side script; `wait_for_response()` begins near `3138`. Similar DOM helper and attachment-inspection logic exists in multiple scripts and upload paths rather than one tested contract.
 - **Impact:** selector or ownership fixes must be repeated, subtle semantic divergence is easy, Python review obscures browser-side behavior, and ChatGPT DOM changes are harder to isolate from local regressions.
 - **Owner:** none. This is lower priority than P-006/P-007 and should not be attempted during active runtime feature stabilization.
 - **Next verification:** extract shared scripts without changing call semantics, retain exact argument/result contracts, add fixture-based browser-script characterization tests, and prove upload ownership, composer conflict handling, accepted-send detection, and duplicate-send guards remain unchanged.
 
-### P-012 — Task creation conflates the CDPA control-plane repository with the execution workspace
+### P-012 — Remote execution target identity is implicit rather than durable task state
 
 - **Status:** `OPEN`
-- **Root cause:** the single task field `repository` currently represents both the local repository that owns the CDPA task store/configuration and the workspace in which an agent is expected to execute code. The dashboard is bound to one `CDPATaskStore`, resolves the submitted value as a local filesystem path, and rejects task creation unless it exactly equals `task_store.config.repository_root`. Worker prompts, route/repair validation, commands, maintenance, and workspace metadata also assume that the same value is a locally available `Path`.
-- **Evidence:** `dashboard.py` rejects `/api/tasks` and `/api/tasks/resume` with `task repository must match the dashboard CDPA repository` when the submitted path differs from the dashboard root. The create dialog labels the field `Repository / workspace`, while `CDPATaskStore.create_task()` stores the resolved path as the task repository. Worker code later uses `state["repository"]` both as the agent workspace and as a local `repository_root` for repository-bound operations. On 2026-07-31, a file-report workflow executed in a different allowed local workspace wrote the exact PLAN report under that execution workspace, while the worker validated the same relative handoff under the control-plane root. One route-repair response repeated the valid handoff, then the task blocked with `report_materialization_unavailable`; both accepted requests remained at one attempt. Materializing the already-authored bytes at the worker-owned path and resuming the preserved responded hop advanced the task to DEV without replay. On 2026-08-01, the same long-running legacy-inline task reached accepted PLAN hop 67 / turn 53 with a complete `DONE` response and one ledger attempt, but the canonical turn-53 report path already contained a different 5,980-byte orphan artifact from earlier operator steering and no manifest report record owned that artifact. The inline materializer correctly refused destructive overwrite and blocked with `inline_report_materialization_failed`. Recovery archived the orphan bytes, materialized the exact accepted response body (5,488 bytes, SHA-256 `3e54b416b4e59eda2bf4a3e8bd4cd2246266371dfab2a644e3f35ffedbaae95a`) at the canonical path, and resumed the same responded hop to `DONE` with ledger attempts still `1`.
-- **Impact:** a central/cloud CDPA control plane cannot create and manage a task whose code workspace lives on another machine and is accessible through a published MCP server. Absolute paths are host-specific, so even identical Git repositories may legitimately have different paths. Simply removing the equality check would be unsafe: it would permit arbitrary server-local paths while downstream code would still incorrectly attempt local filesystem operations against a remote workspace.
-- **Owner:** the current file-only report-contract and legacy-inline migration correction is tracked by `cdpa-idem-9c180b662c0cf70a8e5fed8c` (`cdpa-runtime-contract-root-fix`); the earlier `cross-workspace-report-materialization` task is historical. The broader execution-target data model and migration remain open and are related to the single-runtime-owner/API boundary in P-007.
-- **Next verification:** prove the bounded file-only report contract: same-root and cross-workspace new tasks stay file-mode; a legacy nonterminal inline accepted send drains exactly once without replay; and a pre-existing different canonical artifact with no owning manifest report cannot strand that accepted send or be destructively overwritten. Keep the separate Resume/accepted-user-provenance redesign out of this correction. The broader follow-up is to split the current field into (1) a local control-plane/task-store root owned exclusively by CDPA and (2) an explicit registered execution target such as `{executor_id, mcp_alias, workspace, repository_identity, capabilities}`. Task creation must select an allowlisted target rather than submit an arbitrary server path. Preserve manifests, queue, dependencies, reports, and controls centrally; route code/file/shell operations through the selected MCP target; keep control-plane files local; use stable executor/repository identity instead of absolute-path equality; add target health/capability checks, backward-compatible migration for existing local tasks, and live acceptance proving one CDPA server can run separate tasks against at least two machines without cross-target writes or path confusion.
-
-### P-018 — Runtime benchmark can stop the production worker and leave stale RUNNING projections
-
-- **Status:** `OPEN`
-- **Root cause:** the acceptance script `dev3-artifacts/run_benchmark.sh` executes `pm2 stop playwright-cdpa-worker` before launching an isolated fixture. Its EXIT cleanup attempts a restart, but a benchmark failure or PM2 race can leave the production worker stopped while API/SQLite continues serving its last projection.
-- **Architecture applicability:** introduced during the current lightweight runtime task; unrelated to the legacy dashboard API defect.
-- **Evidence:** the dev3 isolated benchmark failed with `isolated Playwright driver missing`, leaked PM2 process `dev3-exact-wait`, and left production stopped. The defect repeated during dev5: `run_real_wait_acceptance.sh` deliberately stopped production for its full warm-up and 300-second sample, leaving API commands queued and both active tasks frozen until EXIT cleanup restarted the worker. The dev5 cleanup succeeded, but normal control-plane availability was still removed for several minutes by a test harness.
-- **Impact:** false RUNNING state, no command application, no response observation/routing, no Maintainers, and possible accidental operational downtime from a test harness.
-- **Required correction:** benchmark must be isolated without stopping production. If any acceptance ever manipulates a production service, restoration must be a fail-closed verified postcondition: PM2 online, fresh heartbeat, CDP connected, exact task/hop identities preserved, and no leaked fixture process.
-- **Next verification:** benchmark runs without stopping production; forced isolated failure leaves production PID/service and heartbeat healthy; active tasks and mailbox commands continue advancing; no fixture/worker/driver process remains.
+- **Priority:** `LOW`
+- **Disposition:** `DEFERRED_LOW_IMPACT`
+- **Current classification:** `B — REAL BUT LOW-IMPACT / TOO NARROW`
+- **Current root cause:** same-host control-plane and execution repositories are now operationally separated: create accepts repositories inside configured allowed roots, task state persists that execution repository, workflow prompts use it as `workspace`, and report roots follow it. The remaining gap is limited to true cross-host execution: durable task state still has no typed executor/host/workspace identity, so remote repository and MCP authority are carried in task text while the task `repository` remains a local Linux path.
+- **Current evidence:** focused current-code verification passes for repository inference, persisted cross-repository creation, file-only cross-workspace routing, cross-workspace report hydration, and the explicit Windows-remote fallback. A live FPT workflow uses `/home/ayumi/Workspace/fpt/0808-format-worktrees/excel` as durable execution repository while the control plane remains `/home/ayumi/Workspace/git_project/playwright-auto`, and its role reports are available. Two recent ThinkBook workflows completed `DONE` even though their durable `repository`/prompt `workspace` remained the Linux control repository and the actual Windows repository plus `@mcp-thinkbook` authority lived in task text.
+- **Impact:** no current evidence shows wrong-host edits, failed routing, inability to create/manage the workflow, task loss, or cross-target writes caused by the missing typed remote execution identity. The demonstrated remote operational defect is report-byte availability, tracked separately by P-039; do not duplicate that fix here.
+- **Owner:** none. No production fix task is justified under current evidence.
+- **Revisit trigger:** reconsider only when a concrete normal operation fails because task text plus explicit MCP authority is insufficient to identify the execution host/workspace safely. At that point, fix the smallest demonstrated boundary; do not pre-build a target registry, capability framework, migration layer, or remote execution abstraction without such evidence.
 
 ### P-022 — CHECK_ALL independent jobs cannot bind the single incident they select
 
 - **Status:** `OPEN`
+- **Priority:** `MEDIUM`
 - **Root cause:** a canonical `check_all` event is activated with `target_task_id: null`, but `_queue_independent_task_control()` requires the requested target to equal the active event target and `_create_independent_repair_command()` rejects an active event without a target. The Resumer contract requires scanning all tasks, selecting exactly one incident, then using those two commands; the runtime provides no durable one-time claim/bind transition for that selection.
 - **Concrete evidence:** Resumer event `check-all:resumer:991949` started at `2026-07-31T14:30:00Z` with no target. It selected task `cdpa-idem-593e2ebe2e10a6f96d24d9a0`, which is `BLOCKED` on PLAN hop 60 with `accepted_user_provenance_ambiguous`. The owned conversation contains a newer explicit operator steering turn and a complete assistant route to DEV, while the accepted hop-60 user turn is absent from the current branch. Resume/retry would re-enter the obsolete receipt boundary, and the only independent control/repair APIs reject the selected task before any action because the active CHECK_ALL event remains targetless.
 - **Impact:** a periodic whole-runtime watchdog can detect and diagnose the highest-priority incident but cannot safely recover it or create the required deduplicated repair task. The job must escalate to the operator even when the evidence and desired target are unambiguous.
@@ -66,6 +62,7 @@ This file is not a chronological incident log. Track one entry per stable root c
 ### P-023 — Manual Run completion disables a recurring Recovery agent
 
 - **Status:** `OPEN`
+- **Priority:** `MEDIUM`
 - **Root cause:** `_release_independent_job()` decides whether to preserve `independent.enabled` from the active event `trigger_type` only. Completing a `manual` Run-now event therefore sets `enabled=false` even when the same long-lived identity is configured as the global recurring Recovery owner. The trigger settings remain `recovery=true`, but status becomes `PAUSED` and canonical Recovery events can no longer be claimed.
 - **Concrete evidence:** Maintainers `agent-7fa62f0a9c22c1b921092493-g4` remained `RUNNING / await_completion` with hop 2 already `responded` and a durable `REPAIR_REQUIRED` completion request from 2026-07-31. On 2026-08-01 Resumer replayed only that identical completion control; the job released, but source changed the agent to `PAUSED`, `enabled=false`, `pause_reason=independent agent disabled`. Resumer restored the exact pre-incident setting with `enabled=true`, after which API and manifest both showed `WAITING / waiting_trigger` with `recovery=true`. No work prompt or accepted send was replayed.
 - **Contract mismatch:** the independent runtime specification says direct/manual one-shot agents auto-pause, while recurring Interval/Recovery agents remain enabled and return to waiting. A manual Run-now operation on an already recurring agent must not silently destroy its recurrence.
@@ -75,52 +72,84 @@ This file is not a chronological incident log. Track one entry per stable root c
 ### P-028 — Dashboard role transcript still depends on browser/worker observation instead of the completion graph already fetched for routing
 
 - **Status:** `OPEN`
+- **Priority:** `LOW`
 - **Problem:** CDPA exposes role/tab availability and durable workflow state but does not preserve a lightweight role conversation transcript for the dashboard. The operator still has to open the real browser tab or add separate observation work to inspect completed role content.
 - **Current capability:** stream-status-primary completion already performs exactly one authenticated `GET /backend-api/conversation/<conversation_id>` after `stream_status=COMPLETE`. That response contains the full conversation object, `mapping`, `parent`/`children`, message metadata, and `current_node`; the same graph is already required to resolve the exact accepted turn before routing.
 - **Desired future feature:** reuse that exact completion graph read as the dashboard data source. When the worker successfully GETs the graph for routing, retain one deduplicated snapshot/reference keyed by `conversation_id` and expose an on-demand transcript projection per role. Do not poll the full graph every second and do not perform a second graph GET merely for dashboard display. While a response is still streaming, status/progress can remain lightweight; completed transcript data becomes available from the graph already captured at the terminal transition.
 - **Storage boundary:** do not copy a 200 KiB+ raw graph into every hop, task manifest, timeline row, or normal SQLite dashboard projection. Prefer one latest snapshot per conversation (or an equivalent deduplicated runtime artifact) plus a bounded transcript projection/reference for the UI. Preserve task/hop/report/control state in the existing CDPA store; the ChatGPT graph is conversation content, not a replacement workflow database.
 - **Architecture boundary:** the CDPA worker remains the only backend/browser owner. Dashboard reads must not Send, Stop, click, type, change page ownership, create a second poller, or bypass the existing command mailbox. A one-shot screenshot may remain a separate diagnostic action for popup/layout cases, but completed transcript rendering should not require DOM scraping or tab focus.
 - **Impact/opportunity:** one backend read can serve both completion routing and role transcript display, allowing completed source-role tabs to be backgrounded or closed after durable receipt/response handling and potentially deleting substantial DOM/message-display observation code without adding a new service.
-- **Owner:** none; intentionally deferred until the completion-graph regression in P-030 is corrected and verified.
-- **Next verification:** after P-030, complete real PLAN/DEV/REVIEW turns, prove each successful terminal graph GET is reused without any extra graph polling, close a completed source tab, and verify the dashboard can still render the retained transcript while routing, task ownership, CPU, and no-duplicate-send invariants remain correct.
+- **Owner:** none. The P-030 completion-graph regression is already repaired; this remains a low-priority dashboard simplification and should be built only if it still removes meaningful browser/DOM observation work.
+- **Next verification:** only if this low-priority simplification is selected later, complete real PLAN/DEV/REVIEW turns, prove each successful terminal graph GET is reused without any extra graph polling, close a completed source tab, and verify the dashboard can still render the retained transcript while routing, task ownership, CPU, and no-duplicate-send invariants remain correct.
 
-### P-029 — Live accepted Send can miss durable `conversation_id` enrichment
+### P-038 — Shared-profile concurrency policy: maximum 2 workflow teams RUNNING
 
-- **Status:** `OPEN`
-- **Root cause:** Phase 1+2 derives `conversation_id` only from the passive frontend response observer armed around Send. On the live Phase 3 DEV Send, the accepted user-message and later real conversation URL were observed, but the asynchronous frontend identity evidence never enriched the durable receipt/ledger. The observer path is therefore timing/transport-sensitive in production even though focused synthetic tests cover the intended late-body completion case.
-- **Concrete evidence:** Resumer cycle `check-all:resumer:1488186` restarted only `playwright-cdpa-worker` after the prior PLAN response reached backend `stream_status=COMPLETE`, replacing stale PID `769558` with fresh PID `819892` from current source. Phase 3 DEV hop 2 then performed exactly one accepted Send (`attempts=1`, `user_message_id=f69740c9-5e3e-4ea0-9fd2-5214114c6b92`). The hop initially used provisional `WEB:cd3adba2-4086-4d2b-a9a1-dd0a2a64dce4`, then settled to real URL `https://chatgpt.com/c/6a718370-66a8-83e8-aa01-6210f547f145`, while both hop receipt and `requests.json` remained `conversation_id: null` after waiting state/activity was established. No resend occurred.
-- **Impact:** Phase 3 cannot enter stream_status-primary completion for that request because its production gate requires durable exact `conversation_id + accepted user_message_id`; it must fall back to the legacy DOM path even though exact conversation identity exists in the live browser URL. A restart does not repair the already-missed durable identity.
-- **Owner:** current `stream-status-phase3` DEV is active in the shared worktree, so Resumer must not make a concurrent source fix. This problem remains open unless that task deliberately corrects and verifies the Phase 1+2 identity primitive or a dedicated follow-up repair owns it.
-- **Next verification:** after the current DEV role reaches a safe boundary, reproduce one fresh accepted Send with the current worker and prove the durable ledger receives the exact conversation ID without replay. If still missing, fix the smallest source timing gap in the existing observer/enrichment path (do not add a second identity resolver or derive authority from arbitrary DOM text), add a regression that models the real response-event ordering, and require one bounded live Send proving `attempts=1`, exact `user_message_id`, exact durable `conversation_id`, and no duplicate Send.
+- **Status:** `OPERATOR POLICY ACTIVE — USE EXISTING DEPENDENCIES/QUEUE, NO NEW SCHEDULER`
+- **Confirmed operational invariant (2026-08-11):** allow at most **2 workflow task teams in `RUNNING`** on the shared ChatGPT profile. Three workflow teams are materially more likely to hit rate limits, especially when one workflow creates additional verification/fix work.
+- **Unit:** workflow team, not role count. `WAITING`, `BLOCKED`, `PAUSED`, `DONE`, and `STOPPED` do not consume a RUNNING slot.
+- **Operating method:** use the existing dependency/queue machinery to serialize new verification and fix work. Do not create another scheduler, queue, sidecar, or generalized concurrency subsystem.
+- **Fix-task rule:** every fix task created from a problem verification must have an explicit dependency and must commit its own production fix so the change can be traced or reverted.
+- **Verification-task rule:** verify the defect against current source/runtime first. If the old failure no longer exists, or the impact is operationally negligible/too narrow, update `PROBLEM.md` and do not create a fix task.
 
-### P-030 — Stream-status completion rejects valid production graphs and silently falls back to background DOM
+## Candidate design investigations — GitHub Trending 2026-08-07
 
-- **Status:** `OPEN`
-- **Root cause:** `resolve_terminal_assistant()` walks the entire `current_node` parent chain to the graph root and `_node()` requires every graph node to contain a message object. Real ChatGPT conversation graphs contain the structural sentinel `client-created-root` with `message: null`, `parent: null`, so an otherwise valid completed turn raises `BackendSchemaError("graph node is missing message object")` before the resolver reaches its exact accepted-turn logic.
-- **Concrete evidence:** on `advance-clipboard-light-audit` task `cdpa-idem-87cf027782418da9ccdb7f36`, every observed hop reached backend `stream_status=COMPLETE`, then recorded `backend_fallback_category=graph_schema` and degraded to `dom_fallback`. Live authenticated graph probes without focusing the tab returned valid conversation graphs containing the exact accepted `user_message_id`, complete tool/reasoning chains, and a terminal assistant response; the only missing-message node on the current branch was index 0 `client-created-root`. Hop delays after backend COMPLETE ranged from tens of seconds to more than 35 minutes until background DOM activity/materialization allowed fallback extraction. A raw production dump confirmed `current_node` points at a finished assistant route while `mapping["client-created-root"].message` is null.
-- **Impact:** the production stream-status redesign is not actually backend-primary for normal graphs; it commonly becomes `COMPLETE -> graph_schema -> DOM fallback`. Routing can therefore appear to require the operator to click/focus a completed role tab, and a sleeping/background source tab can stall the workflow even though the backend already has the exact response.
-- **Required correction:** keep the durable exact `conversation_id + accepted_user_message_id` provenance contract, but resolve only the relevant current-branch suffix. Start at `current_node`, validate structural node identity/parent/cycle while walking backwards, and stop when the exact accepted user node is reached. Require that node to be the exact user message, reject an accepted ID that exists only off the current branch, preserve later-human/tool-chain/final-text guards, and do not parse historical structural nodes below the accepted turn. No regex or mapping insertion-order assumptions.
-- **Background wake:** extend the existing lightweight CDP page-activation helper rather than foregrounding tabs. Target-role acquisition already calls `_set_page_active()` before send; add focus emulation if required for background execution. When graph validation/backend read genuinely falls back to DOM, wake the exact source page through CDP lifecycle/focus emulation without `bring_to_front()`, then use the existing DOM fallback. Explicit operator `Open tab` may still foreground the page.
-- **Regression coverage:** add a production-shaped graph fixture with `client-created-root: {message: null}` and prove exact-turn resolution succeeds; retain off-branch, later-human, unresolved-tool, malformed-graph, and no-duplicate-send tests. Add a focused fallback test proving graph failure wakes the exact source tab without foregrounding it.
-- **Live acceptance:** one fresh multi-role workflow must show `stream_status=COMPLETE -> one graph GET -> responded/routed` with no `graph_schema` fallback, no operator focus, and source-tab closure after a completed durable turn must not prevent routing from the already-authoritative backend response. Only genuine graph/backend failure may enter DOM fallback.
-- **Follow-up:** once this is verified, implement the P-028 dashboard simplification by retaining/reusing the same successful completion graph instead of adding another conversation poller.
+These are **not accepted CDPA requirements and not evidence-backed defects**. They are design candidates captured for later operator review. Do not create implementation work from this section unless the operator explicitly selects an item. Prefer copying a small useful primitive into the current CDPA architecture over integrating another orchestration framework.
 
-### P-031 — Operator Resume forces source-tab recovery before backend-primary completion
+### C-002 — Layer General Team Bootstrap and reusable knowledge instead of injecting all context
 
-- **Status:** `IN_PROGRESS`
-- **Root cause:** `_recover_resume_waiting()` calls `_resume_exact_owned_role()` before using the exact backend identity already present in an accepted waiting-hop receipt. When the source was a temporary `WEB:` conversation and its tab disappears, Resume blocks `role_offline` even though `stream_status` and the terminal conversation graph remain authoritative. Separately, `_waiting()` checks an expired response deadline before polling backend status, so a released old hop immediately enters DOM fallback and again requires the missing tab.
-- **Concrete evidence:** task `cdpa-idem-a9b20a6db9869e671303c58c`, PLAN hop 1, request `cdpa-idem-a9b20a6db9869e671303c58c-hop1`, ledger attempts `1`, exact durable `conversation_id=6a735dde-aa34-83e8-be14-701c0d3b6119` and accepted `user_message_id=3fb8b701-51b5-4f71-b5b5-d4db22c2856e`. Operator Resume failed with `temporary WEB conversation cannot be reopened exactly`. An authenticated backend probe returned `COMPLETE`; one graph GET resolved the exact terminal route to DEV, and the canonical PLAN report already existed. Releasing status alone re-blocked through expired-deadline DOM fallback. Rearming only a bounded backend-recovery deadline/mode while preserving the same hop/request/receipt consumed the existing response and routed PLAN → DEV with no resend and attempts still `1`.
-- **Impact:** accepted work can remain blocked or tempt an unsafe Restart-role replay solely because the disposable source tab is gone, despite durable backend completion being available.
-- **Owner:** the existing active shared-worktree team confirmed by the operator. Duplicate repair task `cdpa-idem-a9061b653b8104063332ddfd` (`operator-resume-backend-first`) was stopped before any role Send.
-- **Required correction:** for waiting hops with exact `conversation_id + accepted_user_message_id`, explicit Resume must rearm a bounded backend-first recovery using the existing `_waiting()` stream-status/graph path before any exact-tab/DOM fallback. Preserve hop/request/receipt identity and never automatically Restart, New Chat, or resend. Legacy receipts without backend identity retain exact-tab recovery.
-- **Next verification:** focused tests for offline temporary source, expired deadline, worker restart, backend unavailable fallback, legacy DOM-only receipt, and unchanged graph identity guards; then a bounded live acceptance proving attempts remain `1` and the original response routes without source-tab reopening.
+- **Source:** `TencentCloud/TencentDB-Agent-Memory` — https://github.com/TencentCloud/TencentDB-Agent-Memory
+- **Why it is relevant:** its useful idea for CDPA is not the database product itself, but layered memory and selective context loading. The project separates raw conversation/facts/scenario knowledge/stable context and avoids injecting the entire memory corpus into every agent turn.
+- **Concept worth borrowing:** separate stable bootstrap context, reusable project knowledge, and task-specific context, then load detailed knowledge on demand.
+- **Potential CDPA shape:**
 
-### P-032 — Equivalent lightweight/full response snapshots reset the no-progress anchor and can starve DOM recovery
+  ```text
+  Stable bootstrap
+   |- operating principles
+   |- repository / server environment
+   `- routing conventions
 
-- **Status:** `OPEN`
-- **Root cause:** `response_activity_signature()` hashes representation-specific `response_activity_structure`. The lightweight probe represents activity as `bounded:<length>`, while a full snapshot records the concrete DOM tool structure. Alternating those probes therefore produces different fingerprints for the same activity turn, text, and length; `observe_response_activity()` treats each representation switch as progress and moves `activity_changed_at`, indefinitely postponing the configured no-progress refresh.
-- **Concrete evidence:** Advance-Clipboard Phase 2 task `cdpa-idem-89a1badcdc045e69deb9c75e`, PLAN hop 1, retained exact `conversation_id=6a7378cc-2f14-83ee-bb54-840bf0635f8c`, accepted `user_message_id=14fa76ef-05e9-43f9-9c12-28a0a471c978`, and ledger/receipt attempts `1`. Backend `stream_status` returned `COMPLETE`, but the exact current branch ended at a `finished_successfully` `api_tool.call_tool` result after assistant tool-call nodes still marked `in_progress`; no terminal assistant route existed and `resolve_terminal_assistant()` correctly raised `BackendNotReadyError`. Two full DOM samples twelve seconds apart had the same activity turn, exact 607-character text, length, and structure, while worker persistence alternated between lightweight/full fingerprints and moved `activity_changed_at` roughly every ten minutes. One bounded exact-page refresh and one exact foreground Open-tab action did not materialize continuation.
-- **Impact:** a genuinely incomplete tool chain can remain `wait_response` until the full two-hour deadline because representation changes masquerade as progress. The worker may never reach its 20-minute refresh boundary, dependency children remain held, and operators are tempted to Retry/Restart/New Chat across an already accepted send.
-- **Immediate disposition:** Phase 2 is held as `WAITING / waiting_repair` on urgent repair `cdpa-repair-96a41230f3e51ef08f9936ca`. Its original hop, request, receipt, conversation, accepted user message, response evidence, and attempts `1` are preserved; no Send, Retry, Restart, or New Chat was issued.
-- **Required correction:** make response progress canonical across lightweight and full probe representations. Only semantic generation progress may move the no-progress anchor. A backend `COMPLETE` graph that remains an unfinished tool chain after one bounded exact-page refresh must converge to an explicit non-replay recovery/repair state instead of extending the wait indefinitely.
-- **Next verification:** alternate lightweight/full snapshots with identical semantic activity and prove `activity_changed_at` remains fixed and one refresh becomes due; prove real semantic progress still moves the anchor; prove an unresolved `COMPLETE` tool chain performs at most one bounded refresh and then holds/blocks without Send or regeneration; release the repair gate and verify the preserved original request continues with attempts still `1`.
+  Reusable knowledge
+   |- LEARNING.md
+   |- known incidents
+   |- accepted patterns
+   `- role-specific knowledge
+
+  Task context
+   |- goal
+   |- handoff
+   `- evidence
+  ```
+
+- **Desired behavior:** a bootstrap conversation receives only stable reusable context. PLAN/DEV/REVIEW branches receive task context plus a minimal role loadout. Detailed lessons, incidents, or repository knowledge are retrieved only when the current task actually needs them.
+- **Expected benefit:** smaller branch prompts, less stale duplicated context, lower bootstrap renewal cost, clearer distinction between stable invariants and task-local evidence, and better scaling as `LEARNING.md` grows.
+- **Risk:** a full memory platform would add MemoryCore/knowledge/proxy/LLM pipelines and create another subsystem before CDPA has demonstrated the need.
+- **Boundary:** borrow the taxonomy and retrieval principle only. Do **not** install or integrate TencentDB Agent Memory unless a later measured context/retrieval problem justifies it.
+- **Evaluation before build:** measure current bootstrap/task prompt size and identify context that is repeatedly injected but rarely used. A first implementation should be static/minimal and reuse current files or existing retrieval capability rather than adding a new database.
+
+### C-004 — `agent-skills` / `superpowers`: mine individual skills, do not add another workflow layer
+
+- **Sources:** `addyosmani/agent-skills` and `obra/superpowers`.
+- **Current overlap:** CDPA already uses skill discovery and Superpowers-style smallest-relevant-skill selection plus PLAN/DEV/REVIEW, verification-before-completion, and report/route discipline.
+- **Potential value:** periodically inspect for a specific high-value skill/checklist that is missing locally, especially around code review, debugging, verification, or planning.
+- **Why not integrate wholesale:** marginal architecture value is currently low; another process layer would duplicate conventions CDPA already owns.
+- **Boundary:** cherry-pick individual reusable practices only when they close a demonstrated gap. Do not make these repositories another mandatory orchestration dependency.
+
+### C-005 — `cloudflare/computer`: monitor, but no current integration
+
+- **Source:** `cloudflare/computer`.
+- **Relevant concept:** standardized sandbox/workspace execution runtime for agents.
+- **Current CDPA position:** execution is already provided through G8/ThinkBook/MCP surfaces, and current architecture work is trying to make execution targets explicit without adding unnecessary runtime layers.
+- **Why defer:** the project is preview-oriented and its API/runtime contract may change; adding it now would not solve a demonstrated CDPA operational bottleneck and would create another execution abstraction.
+- **Future trigger to revisit:** only reconsider if CDPA needs disposable remote sandboxes, stronger per-task isolation, or portable cloud execution that existing MCP executors cannot provide cleanly.
+
+### Candidate priority / recommended order
+
+| Candidate | Potential CDPA value | Initial effort | Recommended action |
+|---|---:|---:|---|
+| C-002 layered bootstrap/memory | High | Low if concept-only | **Bootstrap roadmap candidate** |
+| C-004 agent-skills/superpowers | Low–medium marginal value | Low | **Mine individual ideas only** |
+| C-005 cloudflare/computer | Low today | Medium/high | **Defer** |
+
+**Recommended sequence after the selected C-003 and C-001 evaluations:** `C-002 bootstrap layering`.
+
+The governing constraint for all candidates is simplification: do not integrate three new frameworks. Prefer a small primitive that replaces existing CDPA complexity. If a candidate cannot delete/consolidate current logic or produce measurable operational value, do not build it.

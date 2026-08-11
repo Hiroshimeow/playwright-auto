@@ -5,7 +5,7 @@ import {
   detailCacheGet, detailCachePut, detailCacheInvalidate, pruneDetailCache,
 } from "./store.js";
 import {renderBoard, refreshElapsed} from "./views/board.js";
-import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js";
+import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260809-compact-ui-v2";
 import {renderHistory} from "./views/history.js";
 import {renderRuntime} from "./views/runtime.js?v=20260728-system-status-1";
 import {
@@ -57,7 +57,8 @@ const INLINE_BOOTSTRAP_VALUE = "__create_inline__";
 let viewSaveTimer = null;
 let closingOverlay = null;
 let bootstrapDefaultId = "";
-const agentReportBodies = new Map();
+const reportBodies = new Map();
+const selectedReportByTask = new Map();
 
 function idempotencyKey() {
   return crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
@@ -406,17 +407,20 @@ function renderAgents(current) {
   if (selected && !roots.agentSelect.value) resetAgentEditor();
 }
 
-async function loadAgentReports(detail) {
-  const reports = [...(detail?.reports || []), ...(detail?.maintenance_reports || [])];
+async function loadReports(detail) {
+  const reports = [
+    ...(detail?.reports || []),
+    ...(detail?.task_mode === "independent" ? (detail?.maintenance_reports || []) : []),
+  ];
   await Promise.all(reports.map(async report => {
-    if (!report.url || agentReportBodies.has(report.url)) return;
-    agentReportBodies.set(report.url, {status: "loading"});
+    if (!report.url || reportBodies.has(report.url)) return;
+    reportBodies.set(report.url, {status: "loading"});
     try {
       const response = await fetch(report.url, {headers: {Accept: "text/markdown"}});
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      agentReportBodies.set(report.url, {status: "ready", body: await response.text()});
+      reportBodies.set(report.url, {status: "ready", body: await response.text()});
     } catch (error) {
-      agentReportBodies.set(report.url, {status: "error", error: error.message});
+      reportBodies.set(report.url, {status: "error", error: error.message});
     }
     if (state.selectedDetail?.task_id === detail?.task_id) {
       commit(current => { current.agentReportsRevision += 1; });
@@ -502,19 +506,25 @@ function renderCommands(current) {
   const entries = [...current.pendingCommands.values()].sort(
     (a, b) => String(b.createdAt).localeCompare(String(a.createdAt)),
   );
-  const signature = JSON.stringify(entries.slice(0, 12).map(command => [
+  const signature = JSON.stringify([entries.length, entries.slice(0, 12).map(command => [
     command.kind, command.taskId, command.label, command.status, command.error, command.result,
-  ]));
+  ])]);
   if (roots.commands.dataset.signature !== signature) {
-    const fragment = document.createDocumentFragment();
-    const title = document.createElement("h3");
+    const header = document.createElement("header");
+    const title = document.createElement("h2");
     title.textContent = "Commands";
-    fragment.append(title);
+    const count = document.createElement("span");
+    count.className = "lane-count";
+    count.textContent = String(entries.length);
+    header.append(title, count);
+
+    const list = document.createElement("div");
+    list.className = "lane-list command-list";
     if (!entries.length) {
       const empty = document.createElement("p");
-      empty.className = "muted";
+      empty.className = "muted command-empty";
       empty.textContent = "No pending operations.";
-      fragment.append(empty);
+      list.append(empty);
     }
     for (const command of entries.slice(0, 12)) {
       const row = document.createElement("div");
@@ -531,9 +541,9 @@ function renderCommands(current) {
         detail.textContent = presentation.detail;
         row.append(detail);
       }
-      fragment.append(row);
+      list.append(row);
     }
-    roots.commands.replaceChildren(fragment);
+    roots.commands.replaceChildren(header, list);
     roots.commands.dataset.signature = signature;
   }
 
@@ -586,7 +596,8 @@ function render(current) {
     current.selectedDetailStatus,
     current.selectedDetailError,
     current.selectedIndependentTabByTask.get(current.selectedTaskId) || "overview",
-    agentReportBodies,
+    selectedReportByTask.get(current.selectedTaskId) || null,
+    reportBodies,
     current.agentReportsRevision,
   );
   renderBootstrapContext(current.selectedDetail);
@@ -633,6 +644,7 @@ subscribe(render);
 installSelectionResume(roots.detail);
 
 function selectTask(taskId, cached = null) {
+  if (state.selectedTaskId !== taskId) selectedReportByTask.clear();
   commit(current => {
     current.selectedTaskId = taskId;
     current.selectedDetail = cached;
@@ -685,6 +697,7 @@ function applyDetail(taskId, detail) {
       if (fallback) current.selectedRoleByTask.set(taskId, fallback);
     }
   });
+  if (state.selectedIndependentTabByTask.get(taskId) === "reports") loadReports(detail);
   return true;
 }
 
@@ -1065,12 +1078,12 @@ roots.detail.addEventListener("click", event => {
     openChangeGoal(state.selectedDetail);
     return;
   }
-  const independentTab = event.target.closest("[data-independent-tab]");
-  if (independentTab) {
-    const taskId = independentTab.dataset.taskId;
-    const tab = independentTab.dataset.independentTab;
+  const detailTab = event.target.closest("[data-detail-tab]");
+  if (detailTab) {
+    const taskId = detailTab.dataset.taskId;
+    const tab = detailTab.dataset.detailTab;
     commit(current => { current.selectedIndependentTabByTask.set(taskId, tab); });
-    if (tab === "reports") loadAgentReports(state.selectedDetail);
+    if (tab === "reports") loadReports(state.selectedDetail);
     return;
   }
   const independent = event.target.closest("[data-independent-action]");
@@ -1095,8 +1108,19 @@ roots.detail.addEventListener("click", event => {
     }
     return;
   }
+  const report = event.target.closest("[data-report-select]");
+  if (report) {
+    const taskId = report.dataset.taskId;
+    selectedReportByTask.set(taskId, report.dataset.reportSelect);
+    commit(current => {
+      if (report.dataset.reportRole) current.selectedRoleByTask.set(taskId, report.dataset.reportRole);
+      current.agentReportsRevision += 1;
+    });
+    return;
+  }
   const role = event.target.closest("[data-role-select]");
   if (role) {
+    selectedReportByTask.delete(role.dataset.taskId);
     commit(current => { current.selectedRoleByTask.set(role.dataset.taskId, role.dataset.roleSelect); });
     return;
   }

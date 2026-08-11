@@ -369,10 +369,12 @@ class BootstrapCatalog:
             existing = catalog["entries"].get(bootstrap_id)
             if existing is None:
                 raise ValueError(f"bootstrap does not exist: {bootstrap_id}")
-            donors = [
-                normalized_donor,
-                *[item for item in existing["donors"] if item != normalized_donor],
-            ][: int(existing["max_backups"])]
+            primary = existing["donors"][:1]
+            backups = [item for item in existing["donors"][1:] if item != normalized_donor]
+            donors = (
+                existing["donors"] if primary and primary[0] == normalized_donor
+                else [*primary, normalized_donor, *backups]
+            )[: int(existing["max_backups"])]
             if donors == existing["donors"]:
                 return existing
             updated = {

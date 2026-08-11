@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import warnings
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -12,17 +13,23 @@ from .cdpa_config import CDPAConfig
 from .cdpa_independent import is_independent_task
 from .chatgpt import (
     ChatGPTPage,
+    ComposerConflictError,
+    ManualInputPendingError,
     PageBinding,
+    RateLimitBlockedError,
     action_delay,
     action_delay_multiplier,
     backend_conversation as read_backend_conversation,
     backend_stream_status as read_backend_stream_status,
+    clear_composer,
     random_delay,
+    rate_limit_dialogs,
     refresh_page,
 )
 from .workspace import ChatGPTWorkspace
 
 _CHATGPT_HOSTS = frozenset({"chatgpt.com", "www.chatgpt.com"})
+_NEW_BRANCH_ENDPOINT = "https://chatgpt.com/backend-api/conversation/new_branch"
 
 
 def _reopenable_conversation_identity(value: Any) -> str | None:
@@ -43,6 +50,10 @@ def _reopenable_conversation_identity(value: Any) -> str | None:
 
 
 class BranchBootstrapError(RuntimeError):
+    pass
+
+
+class BranchTargetUnresolvedError(BranchBootstrapError):
     pass
 
 
@@ -70,6 +81,7 @@ class AcquiredRole:
     url: str
     created: bool
     new_chat: bool
+    conversation_id: str | None = None
 
 
 def _canonical_uuid_text(value: str, *, field: str) -> str:
@@ -84,6 +96,25 @@ def _canonical_uuid_text(value: str, *, field: str) -> str:
     return value
 
 
+def _canonical_conversation_uuid(value: Any) -> str | None:
+    try:
+        parsed = urlparse(str(value or ""))
+    except ValueError:
+        return None
+    if (parsed.hostname or "").lower() not in _CHATGPT_HOSTS:
+        return None
+    path = parsed.path.rstrip("/")
+    parts = path.split("/")
+    if len(parts) != 3 or parts[:2] != ["", "c"]:
+        return None
+    conversation_id = parts[2]
+    try:
+        parsed_id = UUID(conversation_id)
+    except (ValueError, AttributeError):
+        return None
+    return conversation_id if str(parsed_id) == conversation_id else None
+
+
 class CDPATabActions:
     def __init__(self, browser_context: Any, config: CDPAConfig) -> None:
         self.browser_context = browser_context
@@ -95,6 +126,66 @@ class CDPATabActions:
 
     async def backend_conversation(self, conversation_id: str) -> dict[str, Any]:
         return await read_backend_conversation(self.browser_context, conversation_id)
+
+    async def cleanup_rate_limited_chatgpt_pages(self) -> dict[str, Any]:
+        pages = [
+            page
+            for page in tuple(self.browser_context.pages)
+            if not page.is_closed() and self._supported(page)
+        ]
+        result: dict[str, Any] = {
+            "targeted": len(pages),
+            "closed": 0,
+            "cleared": 0,
+            "errors": [],
+        }
+        timeout = round(self.config.workspace_timeout_seconds * 1000)
+        for page in pages:
+            try:
+                client = ChatGPTPage(page, timeout_ms=timeout)
+                snapshot = await client.snapshot()
+                if snapshot.composer_text.strip():
+                    await clear_composer(page, timeout_ms=timeout)
+                    post = await client.snapshot()
+                    if post.composer_text.strip():
+                        raise ComposerConflictError(
+                            "rate-limit cleanup composer did not become empty"
+                        )
+                    await asyncio.sleep(0.1)
+                    stable = await client.snapshot()
+                    if stable.composer_text.strip():
+                        raise ComposerConflictError(
+                            "rate-limit cleanup composer rehydrated"
+                        )
+                    result["cleared"] += 1
+            except Exception as exc:
+                result["errors"].append(
+                    {
+                        "url": str(getattr(page, "url", ""))[:500],
+                        "error": f"{type(exc).__name__}: {exc}"[:500],
+                    }
+                )
+            finally:
+                if not page.is_closed():
+                    try:
+                        await page.close()
+                    except Exception as exc:
+                        result["errors"].append(
+                            {
+                                "url": str(getattr(page, "url", ""))[:500],
+                                "error": f"close failed: {type(exc).__name__}: {exc}"[:500],
+                            }
+                        )
+                if page.is_closed():
+                    result["closed"] += 1
+                else:
+                    result["errors"].append(
+                        {
+                            "url": str(getattr(page, "url", ""))[:500],
+                            "error": "ChatGPT page remained open after rate-limit cleanup",
+                        }
+                    )
+        return result
 
     async def _set_page_active(self, page: Any) -> None:
         try:
@@ -312,6 +403,167 @@ class CDPATabActions:
             new_chat=False,
         )
 
+    async def _sanitize_new_branch_composer(
+        self,
+        client: ChatGPTPage,
+        *,
+        timeout_ms: int,
+    ) -> None:
+        async def inspect(phase: str) -> Any:
+            try:
+                return await client.assert_ownership()
+            except Exception as exc:
+                raise ComposerConflictError(
+                    f"new branch composer {phase} inspection failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+
+        snapshot = await inspect("initial")
+        limited = rate_limit_dialogs(snapshot)
+        if limited:
+            raise RateLimitBlockedError(
+                f"request rate limit blocks branch composer cleanup: {list(limited)!r}"
+            )
+        if snapshot.attachment_markers:
+            raise ManualInputPendingError(
+                "new branch page contains attachments; automated composer cleanup blocked"
+            )
+
+        draft = snapshot.composer_text.strip()
+        if not draft:
+            return
+        if (
+            snapshot.requires_login
+            or not snapshot.composer_present
+            or not snapshot.composer_editable
+            or snapshot.stop_visible
+            or snapshot.blocking_dialogs
+            or str(getattr(snapshot.state, "value", snapshot.state)) == "error"
+        ):
+            raise ManualInputPendingError(
+                "new branch page has ambiguous state with composer text; automated cleanup blocked"
+            )
+
+        try:
+            await clear_composer(client.page, timeout_ms=timeout_ms)
+        except Exception as exc:
+            raise ComposerConflictError(
+                f"new branch composer clear failed: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        immediate = await inspect("post-clear")
+        if rate_limit_dialogs(immediate):
+            raise RateLimitBlockedError("request rate limit appeared during branch composer cleanup")
+        if immediate.attachment_markers:
+            raise ManualInputPendingError(
+                "attachments appeared during new branch composer cleanup"
+            )
+        if immediate.composer_text.strip():
+            raise ComposerConflictError("new branch composer did not become empty")
+
+        await asyncio.sleep(0.1)
+        stable = await inspect("stable-empty")
+        if rate_limit_dialogs(stable):
+            raise RateLimitBlockedError("request rate limit appeared after branch composer cleanup")
+        if stable.attachment_markers:
+            raise ManualInputPendingError(
+                "attachments appeared after new branch composer cleanup"
+            )
+        if stable.composer_text.strip():
+            raise ComposerConflictError("new branch composer rehydrated after cleanup")
+
+    @staticmethod
+    def _watch_new_branch_response(page: Any) -> tuple[asyncio.Future[Any], Any]:
+        future = asyncio.get_running_loop().create_future()
+
+        def capture(response: Any) -> None:
+            if future.done() or str(getattr(response, "url", "")) != _NEW_BRANCH_ENDPOINT:
+                return
+            future.set_result(response)
+
+        page.on("response", capture)
+        return future, capture
+
+    @staticmethod
+    async def _new_branch_conversation_id(
+        future: asyncio.Future[Any], *, timeout_ms: int
+    ) -> str:
+        try:
+            response = await asyncio.wait_for(future, timeout=max(timeout_ms, 1) / 1000)
+        except asyncio.TimeoutError as exc:
+            raise BranchTargetUnresolvedError(
+                "new_branch backend response did not provide canonical conversation identity"
+            ) from exc
+        status = int(getattr(response, "status", 0) or 0)
+        if status < 200 or status >= 300:
+            raise BranchTargetUnresolvedError(
+                f"new_branch backend response failed with HTTP {status}"
+            )
+        try:
+            payload = await response.json()
+            conversation = payload.get("conversation") if isinstance(payload, Mapping) else None
+            candidate = conversation.get("conversation_id") if isinstance(conversation, Mapping) else None
+            return _canonical_uuid_text(candidate, field="branch conversation id")
+        except Exception as exc:
+            raise BranchTargetUnresolvedError(
+                "new_branch backend response did not contain canonical conversation identity"
+            ) from exc
+
+    async def validate_branch_target(
+        self,
+        client: ChatGPTPage,
+        *,
+        source_conversation_id: str,
+        candidate_conversation_id: str,
+        physical_role: str,
+        task_id: str,
+        team: str,
+    ) -> str:
+        source_id = _canonical_uuid_text(
+            source_conversation_id,
+            field="source conversation id",
+        )
+        candidate_id = _canonical_uuid_text(
+            candidate_conversation_id,
+            field="branch conversation id",
+        )
+        if candidate_id == source_id:
+            raise BranchBootstrapError(
+                "branch target canonicalized back to source/donor conversation"
+            )
+
+        timeout_ms = round(self.config.workspace_timeout_seconds * 1000)
+        for page in tuple(self.browser_context.pages):
+            if page is client.page or page.is_closed() or not self._supported(page):
+                continue
+            metadata = await inspect_page_metadata(page)
+            owner_url = metadata.get("url") or getattr(page, "url", "")
+            if _canonical_conversation_uuid(owner_url) != candidate_id:
+                continue
+            owner_role = str(metadata.get("role") or "")
+            owner_task = str(metadata.get("task_id") or "")
+            owner_team = str(metadata.get("team") or "")
+            if not (owner_role and owner_task and owner_team):
+                other = ChatGPTPage(page, timeout_ms=timeout_ms)
+                try:
+                    owner = await other.snapshot()
+                except Exception:
+                    continue
+                owner_role = str(getattr(owner, "page_role", "") or "")
+                owner_task = str(getattr(owner, "page_task_id", "") or "")
+                owner_team = str(getattr(owner, "page_team", "") or "")
+            if not (owner_role and owner_task and owner_team):
+                continue
+            if (owner_task, owner_role, owner_team) != (
+                str(task_id),
+                str(physical_role),
+                str(team),
+            ):
+                raise BranchBootstrapError(
+                    "branch target conversation already has a foreign writable owner"
+                )
+        return candidate_id
+
     async def branch_from_anchor(
         self,
         manifest: Mapping[str, Any],
@@ -340,17 +592,41 @@ class CDPATabActions:
         branch_url = f"https://chatgpt.com/branch/{source_id}/{message_id}"
         timeout = round(self.config.workspace_timeout_seconds * 1000)
         client: ChatGPTPage | None = None
+        page: Any | None = None
+        response_listener = None
         try:
             await random_delay(action_delay_multiplier("open_tab"))
             workspace = ChatGPTWorkspace()
-            client = await workspace.open_role(
-                self.browser_context,
+            page = await self.browser_context.new_page()
+            branch_response, response_listener = self._watch_new_branch_response(page)
+            await page.goto(branch_url, wait_until="domcontentloaded", timeout=timeout)
+            await page.wait_for_url(
+                lambda url: str(url).split("?", 1)[0].rstrip("/") != branch_url,
+                wait_until="domcontentloaded",
+                timeout=timeout,
+            )
+            await page.locator('[contenteditable="true"][role="textbox"]').first.wait_for(
+                state="visible", timeout=timeout
+            )
+            client = await workspace.bind(
                 physical,
-                url=branch_url,
+                page,
                 timeout_ms=timeout,
                 force_new_page_id=True,
             )
+            await self._sanitize_new_branch_composer(client, timeout_ms=timeout)
             await client.wait_until_clean_ready(timeout_ms=timeout)
+            candidate_id = await self._new_branch_conversation_id(
+                branch_response, timeout_ms=timeout
+            )
+            await self.validate_branch_target(
+                client,
+                source_conversation_id=source_id,
+                candidate_conversation_id=candidate_id,
+                physical_role=physical,
+                task_id=task_id,
+                team=team,
+            )
             await client.bind_task_identity(task_id, team)
             snapshot = await client.assert_ownership()
             binding = client.binding
@@ -370,18 +646,32 @@ class CDPATabActions:
                 url=str(snapshot.url),
                 created=True,
                 new_chat=True,
+                conversation_id=candidate_id,
             )
         except Exception as exc:
-            if client is not None and not client.page.is_closed():
+            target_page = client.page if client is not None else page
+            if target_page is not None and not target_page.is_closed():
                 try:
-                    await client.page.close()
+                    await target_page.close()
                 except Exception:
                     pass
-            if isinstance(exc, BranchBootstrapError):
+            if isinstance(
+                exc,
+                (
+                    BranchBootstrapError,
+                    ComposerConflictError,
+                    ManualInputPendingError,
+                    RateLimitBlockedError,
+                ),
+            ):
                 raise
             raise BranchBootstrapError(
                 f"branch bootstrap failed: {type(exc).__name__}: {exc}"
             ) from exc
+        finally:
+            target_page = client.page if client is not None else page
+            if target_page is not None and response_listener is not None:
+                target_page.remove_listener("response", response_listener)
 
     async def acquire(
         self,

@@ -154,7 +154,8 @@ def test_worker_custom_hop_uses_snapshotted_prompt_and_dynamic_routes(tmp_path: 
     assert "CUSTOM_WORKER_PROMPT_MARKER" in hop["prompt"]
     prefix = f"alpha · role: {route_key.lower()}\n"
     envelope = json.loads(hop["prompt"].split("\n\nCUSTOM_WORKER_PROMPT_MARKER", 1)[0].removeprefix(prefix))
-    assert envelope["allowed-routes"] == ["PLAN", "REVIEW", route_key, "DONE"]
+    assert envelope["allowed-routes"] == ["PLAN", "REVIEW", route_key, "PAUSE", "DONE"]
+    assert "PAUSE" not in state["roles"]
 
     decision = parse_route_response(
         json.dumps({"route": route_key, "handoff": "x"}),

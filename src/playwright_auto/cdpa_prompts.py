@@ -58,7 +58,7 @@ class PromptBuilder:
                 for item in allowed_routes
             )
             guide = guide.replace(
-                "PLAN|DEV|TEST|REVIEW|AUDIT|DONE", route_contract
+                "PLAN|DEV|TEST|REVIEW|AUDIT|PAUSE|DONE", route_contract
             )
         return guide.replace(
             ".plan/<team>/<physical-role>_turn<N>_<task-id>.md",

@@ -396,7 +396,7 @@ def test_catalog_migrates_v1_anchor_to_unified_donor_runtime(tmp_path: Path):
     assert "expires_at" not in migrated
 
 
-def test_catalog_promotes_dedupes_caps_and_removes_donors_atomically(tmp_path: Path):
+def test_catalog_keeps_primary_donor_stable_while_refreshing_backups(tmp_path: Path):
     catalog = BootstrapCatalog(tmp_path)
     catalog.upsert(donor_record(max_backups=2))
     newest = {"conversation_id": CONVERSATION_ID_2, "assistant_message_id": MESSAGE_ID_2}
@@ -405,15 +405,16 @@ def test_catalog_promotes_dedupes_caps_and_removes_donors_atomically(tmp_path: P
         "assistant_message_id": "66666666-6666-4666-8666-666666666666",
     }
 
+    primary = donor_record()["donors"][0]
     promoted = catalog.add_donor("donor-team", newest)
-    assert promoted["donors"] == [newest, donor_record()["donors"][0]]
+    assert promoted["donors"] == [primary, newest]
     replayed = catalog.add_donor("donor-team", newest)
     assert replayed["donors"] == promoted["donors"]
     capped = catalog.add_donor("donor-team", third)
-    assert capped["donors"] == [third, newest]
+    assert capped["donors"] == [primary, third]
 
-    removed = catalog.remove_donor("donor-team", third)
-    assert removed["donors"] == [newest]
+    removed = catalog.remove_donor("donor-team", primary)
+    assert removed["donors"] == [third]
 
 
 def test_source_url_or_uuid_normalization_is_canonical():

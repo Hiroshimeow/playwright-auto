@@ -180,26 +180,22 @@ def test_normal_backend_completion_captures_remote_report_before_route_validatio
         conversation_id="conversation-remote",
     )
 
-    hop["receipt"] = receipt.to_dict()
-    hop["timestamps"]["sent_at"] = (now - timedelta(seconds=1)).isoformat()
-    state["roles"]["PLAN"]["page_id"] = "page-PLAN"
-    state = worker.store.save(Path(state["manifest_path"]), state)
-    hop = _active_hop(state)
-
     class BackendActions:
         async def backend_conversation(self, conversation_id):
             assert conversation_id == "conversation-remote"
             return graph
 
-    worker._capture_bootstrap_role_donor = (
-        lambda *_args, **_kwargs: asyncio.sleep(0, result=False)
-    )
-    asyncio.run(
-        worker._waiting(
-            state, hop, BackendActions(), Path(state["manifest_path"])
+    outcome, fallback = asyncio.run(
+        worker._waiting_backend_step(
+            state,
+            hop,
+            BackendActions(),
+            receipt,
+            persist_transport_state=lambda: None,
         )
     )
 
+    assert (outcome, fallback) == ("responded", None)
     assert hop["state"] == "responded"
     assert Path(hop["mirrored_report_path"]).read_bytes() == report.encode("utf-8")
     assert hop["validation_error"] is None
@@ -232,8 +228,13 @@ def test_remote_report_mirror_is_central_durable_and_served_after_remote_source_
     assert hop["report_sha256"] == hashlib.sha256(data).hexdigest()
     assert hop["report_size"] == len(data)
 
-    projection = build_task_projection(state, tasks=[state])
+    projection = build_task_projection(
+        state,
+        tasks=[state],
+        repository_allowed_roots=(tmp_path,),
+    )
     public = projection.detail["reports"][0]
+    assert public["availability"] == "available"
     assert public["url"] == "/api/reports/task-remote/1"
 
     class ProjectionDB:

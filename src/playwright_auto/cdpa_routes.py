@@ -12,7 +12,7 @@ from typing import Any, Sequence
 from .cdpa_workflow_agents import validate_workflow_route_key
 from .file_lock import exclusive_file_lock, fsync_parent_directory
 
-ROUTES = frozenset({"PLAN", "DEV", "REVIEW", "TEST", "AUDIT", "DONE"})
+ROUTES = frozenset({"PLAN", "DEV", "REVIEW", "TEST", "AUDIT", "PAUSE", "DONE"})
 _REPORT_MODES = frozenset({"file", "inline"})
 _KEYS = frozenset({"route", "handoff"})
 _FENCE = re.compile(r"^```json\s*(\{.*\})\s*```$", re.DOTALL | re.IGNORECASE)
@@ -109,8 +109,8 @@ def parse_route_response(
     else:
         try:
             allowed = frozenset(
-                "DONE"
-                if str(item).strip().upper() == "DONE"
+                str(item).strip().upper()
+                if str(item).strip().upper() in {"PAUSE", "DONE"}
                 else validate_workflow_route_key(item)
                 for item in allowed_routes
             )

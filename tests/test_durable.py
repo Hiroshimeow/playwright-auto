@@ -58,6 +58,7 @@ class FakeDurableClient:
         self.binding = PageBinding("page-1", "DEV")
         self.current = current or snapshot()
         self.set_calls = []
+        self.clear_calls = 0
         self.upload_calls = []
         self.send_calls = []
         self.wait_calls = []
@@ -72,6 +73,16 @@ class FakeDurableClient:
             attachments=self.current.attachment_markers,
             messages=self.current.messages,
             state=ChatGPTState.DRAFT,
+        )
+
+    async def clear(self, *, force=False, **_options):
+        assert force is True
+        self.clear_calls += 1
+        self.current = snapshot(
+            text="",
+            attachments=self.current.attachment_markers,
+            messages=self.current.messages,
+            state=ChatGPTState.NEW_CHAT,
         )
 
     async def upload_files(self, paths, *, request_marker, **_options):
@@ -98,6 +109,8 @@ class FakeDurableClient:
         max_attempts=2,
         recovery_reload=True,
         expected_attachment_count=0,
+        expected_attachment_names=(),
+        **_options,
     ):
         self.send_calls.append(
             (
@@ -254,6 +267,178 @@ def test_crash_resume_with_transcript_marker_waits_without_resend(tmp_path):
     )
 
 
+def test_pristine_new_dirty_composer_clears_once_then_sends_exactly_once(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    client = FakeDurableClient(snapshot(text="stale automation draft", state=ChatGPTState.DRAFT))
+
+    run_block(
+        DurableSendBlock(
+            "current task",
+            ledger_path=ledger_path,
+            request_id="request-pristine-cleanup",
+            wait_for_response=False,
+        ),
+        client,
+    )
+
+    record = RequestLedger(ledger_path).get("request-pristine-cleanup")
+    assert record is not None
+    assert client.clear_calls == 1
+    assert client.set_calls == [record.rendered_prompt]
+    assert len(client.send_calls) == 1
+    assert record.status is RequestStatus.SENT
+    assert record.attempts == 1
+
+
+def test_pristine_new_dirty_composer_rehydrate_blocks_without_send(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+
+    class RehydratingClient(FakeDurableClient):
+        def __init__(self):
+            super().__init__(snapshot(text="stale automation draft", state=ChatGPTState.DRAFT))
+            self.ownership_calls = 0
+
+        async def assert_ownership(self):
+            self.ownership_calls += 1
+            if self.clear_calls and self.ownership_calls >= 3:
+                self.current = snapshot(text="rehydrated stale draft", state=ChatGPTState.DRAFT)
+            return self.current
+
+    client = RehydratingClient()
+
+    with pytest.raises(Exception) as captured:
+        run_block(
+            DurableSendBlock(
+                "current task",
+                ledger_path=ledger_path,
+                request_id="request-rehydrate",
+                wait_for_response=False,
+            ),
+            client,
+        )
+
+    record = RequestLedger(ledger_path).get("request-rehydrate")
+    assert isinstance(captured.value.cause, DurableRequestError)
+    assert "composer cleanup" in str(captured.value.cause).lower()
+    assert record is not None and record.status is RequestStatus.NEW
+    assert record.attempts == 0
+    assert client.clear_calls == 1
+    assert client.set_calls == []
+    assert client.send_calls == []
+
+
+def test_pristine_new_dirty_composer_with_attachment_fails_closed_without_clear(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    client = FakeDurableClient(
+        snapshot(
+            text="stale automation draft",
+            attachments=("manual.txt",),
+            state=ChatGPTState.DRAFT,
+        )
+    )
+
+    with pytest.raises(Exception):
+        run_block(
+            DurableSendBlock(
+                "current task",
+                ledger_path=ledger_path,
+                request_id="request-attachment-ambiguity",
+                wait_for_response=False,
+            ),
+            client,
+        )
+
+    record = RequestLedger(ledger_path).get("request-attachment-ambiguity")
+    assert record is not None and record.status is RequestStatus.NEW
+    assert record.attempts == 0
+    assert client.clear_calls == 0
+    assert client.set_calls == []
+    assert client.send_calls == []
+
+
+def test_dirty_composer_with_prior_attempt_never_clears_or_resends(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(
+        role="DEV",
+        prompt="attempted task",
+        request_id="request-attempted-new",
+    )
+    ledger.update(record.request_id, attempts=1)
+    client = FakeDurableClient(snapshot(text="stale draft", state=ChatGPTState.DRAFT))
+
+    with pytest.raises(Exception):
+        run_block(
+            DurableSendBlock(
+                "attempted task",
+                ledger_path=ledger_path,
+                request_id=record.request_id,
+                wait_for_response=False,
+            ),
+            client,
+        )
+
+    persisted = ledger.get(record.request_id)
+    assert persisted is not None and persisted.status is RequestStatus.NEW
+    assert persisted.attempts == 1
+    assert client.clear_calls == 0
+    assert client.set_calls == []
+    assert client.send_calls == []
+
+
+def test_sent_dirty_composer_reconciles_without_clear_or_duplicate_send(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    block = DurableSendBlock(
+        "accepted task",
+        ledger_path=ledger_path,
+        request_id="request-sent-dirty",
+        wait_for_response=False,
+    )
+    client = FakeDurableClient(snapshot())
+    run_block(block, client)
+    record = RequestLedger(ledger_path).get("request-sent-dirty")
+    assert record is not None and record.status is RequestStatus.SENT
+    client.current = snapshot(
+        text="unrelated stale draft",
+        messages=client.current.messages,
+        state=ChatGPTState.DRAFT,
+    )
+
+    run_block(block, client)
+
+    persisted = RequestLedger(ledger_path).get("request-sent-dirty")
+    assert persisted is not None and persisted.status is RequestStatus.SENT
+    assert persisted.attempts == 1
+    assert client.clear_calls == 0
+    assert len(client.send_calls) == 1
+
+
+def test_completed_dirty_composer_returns_cached_without_clear_or_duplicate_send(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    block = DurableSendBlock(
+        "completed task",
+        ledger_path=ledger_path,
+        request_id="request-completed-dirty",
+    )
+    client = FakeDurableClient(snapshot())
+    run_block(block, client)
+    record = RequestLedger(ledger_path).get("request-completed-dirty")
+    assert record is not None and record.status is RequestStatus.COMPLETED
+    client.current = snapshot(
+        text="unrelated stale draft",
+        messages=client.current.messages,
+        state=ChatGPTState.DRAFT,
+    )
+
+    run_block(block, client)
+
+    persisted = RequestLedger(ledger_path).get("request-completed-dirty")
+    assert persisted is not None and persisted.status is RequestStatus.COMPLETED
+    assert persisted.attempts == 1
+    assert client.clear_calls == 0
+    assert len(client.send_calls) == 1
+
+
 def test_sending_without_marker_fails_closed_and_never_resends(tmp_path):
     ledger_path = tmp_path / "ledger.json"
     ledger = RequestLedger(ledger_path)
@@ -281,6 +466,7 @@ def test_sending_without_marker_fails_closed_and_never_resends(tmp_path):
 
     assert isinstance(captured.value.cause, DurableRequestError)
     assert "refusing to send again" in str(captured.value.cause)
+    assert client.clear_calls == 0
     assert client.send_calls == []
 
 
@@ -571,6 +757,20 @@ def test_per_request_lock_rejects_concurrent_owner(tmp_path):
                 record.request_id
             ):
                 pass
+
+
+def test_read_only_peek_does_not_rewrite_ledger(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(role="DEV", prompt="read only")
+    before_bytes = ledger_path.read_bytes()
+    before_mtime = ledger_path.stat().st_mtime_ns
+
+    observed = ledger.peek(record.request_id)
+
+    assert observed == record
+    assert ledger_path.read_bytes() == before_bytes
+    assert ledger_path.stat().st_mtime_ns == before_mtime
 
 
 def test_source_context_is_canonical_json_in_ledger(tmp_path):

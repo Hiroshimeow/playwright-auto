@@ -112,6 +112,35 @@ def _assistant_text(node: Mapping[str, Any]) -> tuple[str, str] | None:
     return (text, content_type) if text else None
 
 
+def _unique_forward_branch(
+    mapping: Mapping[str, Any], accepted_user_message_id: str
+) -> list[Mapping[str, Any]]:
+    chain: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    node_id = accepted_user_message_id
+    while True:
+        if node_id in seen:
+            raise BackendSchemaError("accepted user branch contains a cycle")
+        seen.add(node_id)
+        node = _node(mapping, node_id)
+        chain.append(node)
+        children = node.get("children") or []
+        if not isinstance(children, list):
+            raise BackendSchemaError("graph node children must be a list")
+        child_ids: list[str] = []
+        for child in children:
+            child_id = _exact_string(child, "child id")
+            child_node = _graph_node(mapping, child_id)
+            if child_node.get("parent") != node_id:
+                raise BackendSchemaError("graph child parent does not match its owner")
+            child_ids.append(child_id)
+        if not child_ids:
+            return chain
+        if len(child_ids) != 1:
+            raise GraphIdentityError("accepted user branch is not uniquely recoverable")
+        node_id = child_ids[0]
+
+
 def resolve_completed_file_write(
     graph: Mapping[str, Any],
     accepted_user_message_id: str,
@@ -190,9 +219,13 @@ def resolve_completed_file_write(
     return matches[0]
 
 
-
 def resolve_terminal_assistant(
-    graph: Mapping[str, Any], accepted_user_message_id: str
+    graph: Mapping[str, Any],
+    accepted_user_message_id: str,
+    *,
+    proven_later_human_message_ids: set[str] | frozenset[str] = frozenset(),
+    allow_manual_steering: bool = False,
+    allow_detached_branch: bool = False,
 ) -> ResolvedAssistant:
     if not isinstance(graph, Mapping):
         raise BackendSchemaError("conversation graph must be an object")
@@ -206,6 +239,7 @@ def resolve_terminal_assistant(
     reverse_chain: list[Mapping[str, Any]] = []
     seen: set[str] = set()
     node_id: str | None = current_node
+    chain: list[Mapping[str, Any]] | None = None
     while node_id is not None:
         if node_id in seen:
             raise BackendSchemaError("conversation graph current branch contains a cycle")
@@ -216,20 +250,24 @@ def resolve_terminal_assistant(
             parent = node.get("parent")
             if parent is not None and str(parent) in seen:
                 raise BackendSchemaError("conversation graph current branch contains a cycle")
+            chain = list(reversed(reverse_chain))
             break
         parent = node.get("parent")
         node_id = str(parent) if parent is not None else None
-    else:
-        if any(
+
+    if chain is None:
+        materialized = any(
             isinstance(raw, Mapping)
             and isinstance(raw.get("message"), Mapping)
             and raw["message"].get("id") == accepted_user_message_id
             for raw in mapping.values()
-        ):
+        )
+        if not materialized:
+            raise BackendNotReadyError("accepted user message is not materialized yet")
+        if not allow_detached_branch:
             raise GraphIdentityError("accepted user message is not on the current branch")
-        raise BackendNotReadyError("accepted user message is not materialized yet")
+        chain = _unique_forward_branch(mapping, accepted_user_message_id)
 
-    chain = list(reversed(reverse_chain))
     for node in chain:
         _node(mapping, str(node["id"]))
     if _message_role(chain[0]) != "user":
@@ -238,12 +276,32 @@ def resolve_terminal_assistant(
     terminal: ResolvedAssistant | None = None
     unresolved_tool_chain = False
     tool_result_seen = False
+    foreign_human_seen = False
+    proven_later_humans = frozenset(proven_later_human_message_ids)
     previous_role = "user"
     for node in chain[1:]:
         role = _message_role(node)
         if role == "user":
             if previous_role != "tool":
-                raise GraphIdentityError("a later human user turn follows the accepted turn")
+                message_id = str(node["message"]["id"])
+                if message_id in proven_later_humans:
+                    if terminal is None or unresolved_tool_chain:
+                        raise BackendNotReadyError(
+                            "accepted terminal assistant response is not materialized before later human turn"
+                        )
+                    foreign_human_seen = True
+                elif allow_manual_steering:
+                    terminal = None
+                    unresolved_tool_chain = False
+                    tool_result_seen = False
+                    foreign_human_seen = False
+                else:
+                    raise GraphIdentityError(
+                        "a later human user turn follows the accepted turn"
+                    )
+        elif foreign_human_seen:
+            previous_role = role
+            continue
         elif role == "tool":
             if unresolved_tool_chain:
                 tool_result_seen = True
@@ -292,6 +350,42 @@ def _current_branch_node_ids(graph: Mapping[str, Any]) -> tuple[Mapping[str, Any
         parent = raw.get("parent")
         node_id = str(parent) if parent is not None else None
     return mapping, list(reversed(reverse))
+
+
+def resolve_exact_new_user_message(
+    graph: Mapping[str, Any],
+    expected_text: str,
+    *,
+    excluded_message_ids: set[str] | frozenset[str] = frozenset(),
+) -> str:
+    """Resolve one exact post-baseline human user message on the current branch."""
+    mapping, chain = _current_branch_node_ids(graph)
+    excluded = frozenset(str(value) for value in excluded_message_ids)
+    anchor = max(
+        (index for index, node_id in enumerate(chain) if node_id in excluded),
+        default=-1,
+    )
+    scan = chain[anchor + 1 :] if anchor >= 0 else chain
+    previous_role = _message_role(_node(mapping, chain[anchor])) if anchor >= 0 else None
+    new_users: list[tuple[str, str]] = []
+    for node_id in scan:
+        node = _node(mapping, node_id)
+        role = _message_role(node)
+        if role == "user" and previous_role != "tool":
+            candidate = _assistant_text(node)
+            if candidate is None:
+                raise GraphIdentityError("new user message has no exact text content")
+            text, _content_type = candidate
+            new_users.append((node_id, text))
+        previous_role = role
+    if not new_users:
+        raise BackendNotReadyError("exact new user message is not materialized yet")
+    if len(new_users) != 1:
+        raise GraphIdentityError("multiple post-baseline human user messages are materialized")
+    message_id, text = new_users[0]
+    if text.strip() != str(expected_text).strip():
+        raise GraphIdentityError("post-baseline user message does not match the durable prompt")
+    return message_id
 
 
 def resolve_latest_terminal_assistant(graph: Mapping[str, Any]) -> ResolvedAssistant:

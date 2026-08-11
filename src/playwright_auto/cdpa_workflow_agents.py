@@ -56,6 +56,8 @@ def normalize_workflow_definition(
     route_key = validate_workflow_route_key(
         expected_route_key if expected_route_key is not None else value.get("route_key")
     )
+    if route_key in {"PAUSE", "DONE"}:
+        raise ValueError(f"workflow route key {route_key!r} is a reserved lifecycle route")
     if expected_route_key is not None and validate_workflow_route_key(
         value.get("route_key")
     ) != route_key:

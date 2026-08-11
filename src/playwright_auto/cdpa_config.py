@@ -65,9 +65,37 @@ def _resolve(root: Path, value: Any, name: str) -> Path:
     return (path if path.is_absolute() else root / path).resolve()
 
 
+_REPOSITORY_DECLARATION = re.compile(r"(?<![\w/])(Target repository|Repository)\s+([^\s,]+)")
 _REMOTE_REPOSITORY_DECLARATION = re.compile(
     r"(?<![\w/])(?:Actual product repository|Product repository):\s*([A-Za-z]:\\+[^\s,]+)"
 )
+_WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:\\+")
+
+
+def declared_repository_from_task(task: str) -> str | None:
+    """Return one strict local repository declaration from the task header."""
+    lines = [line.strip() for line in str(task or "").splitlines() if line.strip()]
+    declarations: list[str] = []
+    for index, line in enumerate(lines[:2]):
+        if line.startswith("Repository/worktree:"):
+            if line != "Repository/worktree:" or index + 1 >= len(lines):
+                raise ValueError("invalid repository declaration")
+            value = lines[index + 1]
+            if not Path(value).is_absolute() or any(char.isspace() for char in value):
+                raise ValueError("invalid repository declaration")
+            declarations.append(value)
+            continue
+        for match in _REPOSITORY_DECLARATION.finditer(line):
+            label, value = match.groups()
+            if _WINDOWS_ABSOLUTE.match(value):
+                continue
+            if Path(value).is_absolute():
+                declarations.append(value)
+                continue
+            raise ValueError("invalid repository declaration")
+    if len(declarations) > 1:
+        raise ValueError("ambiguous repository declaration")
+    return declarations[0] if declarations else None
 
 
 def remote_repository_from_task(task: str) -> str | None:
@@ -106,7 +134,6 @@ class CDPAConfig:
     route_repair_attempts: int
     response_timeout_seconds: float
     response_refresh_after_seconds: float
-    response_stream_status_poll_seconds: float
     response_stream_status_terminal_settle_seconds: float
     response_stable_ms: int
     response_poll_ms: int
@@ -280,12 +307,6 @@ def load_cdpa_config(
         route_repair_attempts=int(_positive(repair.get("max_attempts", 3), "route_repair.max_attempts", integer=True)),
         response_timeout_seconds=float(_positive(response.get("timeout_seconds", 7200), "response.timeout_seconds")),
         response_refresh_after_seconds=float(_positive(response.get("refresh_after_seconds", 1200), "response.refresh_after_seconds")),
-        response_stream_status_poll_seconds=_bounded_float(
-            response.get("stream_status_poll_seconds", 10.0),
-            "response.stream_status_poll_seconds",
-            minimum=0.2,
-            maximum=60.0,
-        ),
         response_stream_status_terminal_settle_seconds=_bounded_float(
             response.get("stream_status_terminal_settle_seconds", 5.0),
             "response.stream_status_terminal_settle_seconds",

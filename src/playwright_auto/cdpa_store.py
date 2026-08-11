@@ -347,6 +347,35 @@ class TaskStore(IndependentAgentStoreMixin):
             self._write_catalog_unlocked(value)
         return value
 
+    def repository_projects(self) -> dict[str, str]:
+        with exclusive_file_lock(self.allocation_lock):
+            catalog = self._load_catalog_unlocked(reconcile=False)
+            value = catalog.get("repository_projects", {})
+            if not isinstance(value, Mapping):
+                raise ValueError("CDPA catalog repository_projects must be an object")
+            result: dict[str, str] = {}
+            for repository, project_id in value.items():
+                canonical = str(Path(str(repository)).expanduser().resolve())
+                if canonical != repository or not isinstance(project_id, str) or not project_id.startswith("g-p-") or project_id in result.values():
+                    raise ValueError("CDPA catalog repository_projects contains invalid identity")
+                result[canonical] = project_id
+            return result
+
+    def set_repository_project(self, repository: str | Path, project_id: str) -> None:
+        canonical = str(Path(repository).expanduser().resolve())
+        if not isinstance(project_id, str) or not project_id.startswith("g-p-"):
+            raise ValueError("Project ID must start with g-p-")
+        with exclusive_file_lock(self.allocation_lock):
+            catalog = self._load_catalog_unlocked(reconcile=False)
+            projects = catalog.get("repository_projects", {})
+            if not isinstance(projects, dict):
+                raise ValueError("CDPA catalog repository_projects must be an object")
+            if any(owner != canonical and value == project_id for owner, value in projects.items()):
+                raise ValueError("Project ID is already mapped to another repository")
+            projects[canonical] = project_id
+            catalog["repository_projects"] = projects
+            self._write_catalog_unlocked(catalog)
+
     def _catalog_record_associates_team(
         self,
         key: str,

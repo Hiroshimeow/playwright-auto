@@ -102,7 +102,7 @@ def submit_task(
     config: CDPAConfig,
     *,
     task: str,
-    repository: Path,
+    repository: Path | None,
     team: str | None,
     new_roles: Sequence[str],
     new_all: bool,
@@ -111,21 +111,22 @@ def submit_task(
     upload_paths: Sequence[str | Path] = (),
     idempotency_key: str | None = None,
 ) -> Mapping[str, Any]:
-    repository_path = repository.expanduser().resolve()
+    payload = {
+        "task": task,
+        "requested_team": team,
+        "reuse_team": reuse_team,
+        "new_roles": list(new_roles),
+        "new_all": bool(new_all),
+        "report_mode": "file",
+        "depends_on_task_ids": list(depends_on_task_ids),
+        "upload_paths": [str(Path(path).expanduser().resolve()) for path in upload_paths],
+    }
+    if repository is not None:
+        payload["repository"] = str(repository.expanduser().resolve())
     return _post(
         config,
         "/api/tasks",
-        {
-            "task": task,
-            "repository": str(repository_path),
-            "requested_team": team,
-            "reuse_team": reuse_team,
-            "new_roles": list(new_roles),
-            "new_all": bool(new_all),
-            "report_mode": "file",
-            "depends_on_task_ids": list(depends_on_task_ids),
-            "upload_paths": [str(Path(path).expanduser().resolve()) for path in upload_paths],
-        },
+        payload,
         idempotency_key=idempotency_key or str(uuid.uuid4()),
     )
 
@@ -320,7 +321,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="file context to upload; repeat for multiple files",
     )
-    parser.add_argument("--repository", default=".", help="task repository/worktree")
+    parser.add_argument("--repository", default=None, help="task repository/worktree")
     parser.add_argument(
         "--config",
         default=None,
@@ -360,8 +361,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
 
         args = build_parser().parse_args(raw)
-        repository = Path(args.repository).expanduser().resolve()
-        config = load_cdpa_config(args.config, repository_root=repository)
+        repository = (
+            Path(args.repository).expanduser().resolve()
+            if args.repository is not None
+            else None
+        )
+        control_repository = repository or Path.cwd().resolve()
+        config = load_cdpa_config(args.config, repository_root=control_repository)
         if args.task and args.task_option:
             raise ValueError("provide task text either positionally or with --task, not both")
         task = str(args.task_option or args.task or "").strip()
@@ -393,7 +399,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise ValueError(
                     "--new, --new-all, --depends-on, and --upload are invalid in taskless resume mode"
                 )
-            state = resume_task(config, repository=repository, team=str(args.team))
+            state = resume_task(
+                config,
+                repository=control_repository,
+                team=str(args.team),
+            )
             mode = "resumed"
     except Exception as exc:
         print(f"cdpa: {type(exc).__name__}: {exc}", file=sys.stderr)

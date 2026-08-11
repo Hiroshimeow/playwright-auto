@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from playwright_auto.cdpa_projection import (
     build_dashboard_actions,
@@ -9,6 +11,7 @@ from playwright_auto.cdpa_projection import (
     build_waiting_order,
 )
 from playwright_auto.cdpa_team import exact_team_ready_waiters
+from playwright_auto.dashboard_api import APIError, DashboardAPI
 
 
 def raw_task(tmp_path: Path) -> dict:
@@ -161,6 +164,222 @@ def test_projection_splits_public_and_private_data(tmp_path: Path):
     assert projection.detail["role_inputs"]["PLAN"]["handoff"].endswith("alpha-plan_turn1_task-a.md")
     assert "/home/ayumi" not in public
     assert "secret-value" not in public
+
+
+def test_projection_hydrates_missing_file_report_evidence_inside_task_team_root(tmp_path: Path):
+    raw = raw_task(tmp_path)
+    raw["manifest_path"] = str(tmp_path / ".plan" / "alpha" / "task-a" / "task-a.json")
+    report = raw["reports"][0]
+    report_path = Path(report["path"])
+    report["path"] = str(report_path.relative_to(tmp_path))
+    report["sha256"] = None
+    report["size"] = None
+
+    projection = build_task_projection(raw, tasks=[raw])
+
+    assert projection.private["reports"]["r1"] == {
+        "path": str(report_path.resolve()),
+        "sha256": hashlib.sha256(b"report").hexdigest(),
+        "size": 6,
+        "repository": str(tmp_path.resolve()),
+        "team": "alpha",
+        "availability": "available",
+    }
+
+
+def test_projection_hydrates_missing_file_report_evidence_from_cross_workspace_repository(tmp_path: Path):
+    control = tmp_path / "control"
+    execution = tmp_path / "execution"
+    control.mkdir()
+    execution.mkdir()
+    raw = raw_task(control)
+    raw["repository"] = str(execution)
+    raw["manifest_path"] = str(control / ".plan" / "alpha" / "task-a" / "task-a.json")
+    report_path = execution / ".plan" / "alpha" / "alpha-plan_turn1_task-a.md"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text("cross-workspace report", encoding="utf-8")
+    report = raw["reports"][0]
+    report["path"] = str(report_path.relative_to(execution))
+    report["sha256"] = None
+    report["size"] = None
+
+    projection = build_task_projection(raw, tasks=[raw])
+    locator = projection.private["reports"]["r1"]
+
+    assert projection.private["repository"] == str(execution)
+    assert locator["sha256"] == hashlib.sha256(b"cross-workspace report").hexdigest()
+    assert locator["size"] == len(b"cross-workspace report")
+
+    class ProjectionDB:
+        def ensure_schema(self):
+            pass
+
+        def get_task_private(self, task_id):
+            return projection.private if task_id == projection.task_id else None
+
+    api = DashboardAPI(
+        SimpleNamespace(
+            repository_root=control,
+            plans_root=control / ".plan",
+            repository_allowed_roots=(tmp_path.resolve(),),
+        ),
+        db=ProjectionDB(),
+    )
+    assert api.report_bytes("task-a", "r1", maintenance=False) == b"cross-workspace report"
+
+
+def test_projection_recovers_legacy_report_from_strict_declared_repository(tmp_path: Path):
+    control = tmp_path / "control"
+    execution = tmp_path / "execution"
+    control.mkdir()
+    execution.mkdir()
+    raw = raw_task(control)
+    raw["task_text"] = f"QMH task. Target repository {execution}, use @mcp-g8 only.\nDetails"
+    raw["repository"] = str(control)
+    control_report = Path(raw["reports"][0]["path"])
+    control_report.unlink()
+    report = raw["reports"][0]
+    report["path"] = f".plan/alpha/{control_report.name}"
+    report["sha256"] = None
+    report["size"] = None
+    execution_report = execution / report["path"]
+    execution_report.parent.mkdir(parents=True)
+    execution_report.write_bytes(b"legacy qmh report")
+
+    projection = build_task_projection(
+        raw,
+        tasks=[raw],
+        repository_allowed_roots=(tmp_path,),
+    )
+    public = projection.detail["reports"][0]
+    locator = projection.private["reports"]["r1"]
+
+    assert public["availability"] == "available"
+    assert public["url"] == "/api/reports/task-a/r1"
+    assert locator == {
+        "path": str(execution_report.resolve()),
+        "sha256": hashlib.sha256(b"legacy qmh report").hexdigest(),
+        "size": len(b"legacy qmh report"),
+        "repository": str(execution.resolve()),
+        "team": "alpha",
+        "availability": "available",
+    }
+
+    class ProjectionDB:
+        def ensure_schema(self):
+            pass
+
+        def get_task_private(self, task_id):
+            return projection.private if task_id == projection.task_id else None
+
+    api = DashboardAPI(
+        SimpleNamespace(
+            repository_root=control,
+            plans_root=control / ".plan",
+            repository_allowed_roots=(tmp_path.resolve(),),
+        ),
+        db=ProjectionDB(),
+    )
+    assert api.report_bytes("task-a", "r1", maintenance=False) == b"legacy qmh report"
+
+
+def test_projection_legacy_report_fallback_fails_closed(tmp_path: Path):
+    control = tmp_path / "control"
+    execution = tmp_path / "execution"
+    control.mkdir()
+    execution.mkdir()
+
+    def projected(*, task_text: str, report_path: str, make_file: bool = False, symlink: bool = False, allowed=(tmp_path,)):
+        raw = raw_task(control)
+        Path(raw["reports"][0]["path"]).unlink(missing_ok=True)
+        raw["repository"] = str(control)
+        raw["task_text"] = task_text
+        raw["reports"][0].update({"path": report_path, "sha256": None, "size": None})
+        target = execution / report_path
+        if make_file:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if symlink:
+                outside = execution / "outside.md"
+                outside.write_text("outside", encoding="utf-8")
+                target.symlink_to(outside)
+            else:
+                target.write_text("candidate", encoding="utf-8")
+        return build_task_projection(raw, tasks=[raw], repository_allowed_roots=allowed)
+
+    declared = f"Legacy. Target repository {execution}, use @mcp-g8 only."
+    cases = [
+        projected(task_text=declared, report_path=".plan/alpha/missing.md"),
+        projected(task_text=declared, report_path=".plan/other/wrong-team.md", make_file=True),
+        projected(task_text=declared, report_path="not-a-report-path"),
+        projected(
+            task_text=f"Legacy. Repository {execution}, Target repository {control}, use @mcp-g8 only.",
+            report_path=".plan/alpha/ambiguous.md",
+            make_file=True,
+        ),
+        projected(
+            task_text=declared,
+            report_path=".plan/alpha/not-allowed.md",
+            make_file=True,
+            allowed=(control,),
+        ),
+    ]
+    symlink_projection = projected(
+        task_text=declared,
+        report_path=".plan/alpha/symlink.md",
+        make_file=True,
+        symlink=True,
+    )
+    cases.append(symlink_projection)
+
+    for projection in cases:
+        public = projection.detail["reports"][0]
+        assert public["availability"] == "unavailable"
+        assert "url" not in public
+        assert projection.private["reports"]["r1"]["availability"] == "unavailable"
+
+
+def test_projection_marks_strict_windows_remote_report_unmirrored(tmp_path: Path):
+    raw = raw_task(tmp_path)
+    Path(raw["reports"][0]["path"]).unlink()
+    raw["task_text"] = (
+        "Screens task\n"
+        "HARD EXECUTION AUTHORITY\n"
+        r"- Actual product repository: E:\python_project\Screens-Trans-Chatbot on Windows ThinkBook."
+        "\n- Use @mcp-thinkbook ONLY for product source and role reports."
+    )
+    report = raw["reports"][0]
+    report.update({"path": ".plan/alpha/alpha-plan_turn1_task-a.md", "sha256": None, "size": None})
+
+    projection = build_task_projection(raw, tasks=[raw], repository_allowed_roots=(tmp_path,))
+    public = projection.detail["reports"][0]
+    locator = projection.private["reports"]["r1"]
+
+    assert public["availability"] == "remote_unmirrored"
+    assert "url" not in public
+    assert locator["availability"] == "remote_unmirrored"
+
+    class ProjectionDB:
+        def ensure_schema(self):
+            pass
+
+        def get_task_private(self, task_id):
+            return projection.private
+
+    api = DashboardAPI(
+        SimpleNamespace(
+            repository_root=tmp_path,
+            plans_root=tmp_path / ".plan",
+            repository_allowed_roots=(tmp_path.resolve(),),
+        ),
+        db=ProjectionDB(),
+    )
+    try:
+        api.report_bytes("task-a", "r1", maintenance=False)
+    except APIError as exc:
+        assert exc.status == 409
+        assert exc.code == "report_remote_unmirrored"
+    else:
+        raise AssertionError("remote unmirrored report must not be served")
 
 
 def test_independent_projection_identifies_only_canonical_builtins(tmp_path: Path):

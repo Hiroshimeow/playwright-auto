@@ -116,6 +116,24 @@ class SuccessExecutor:
         }
 
 
+def test_clean_ready_raises_known_rate_limit_instead_of_waiting_or_mutating():
+    limited = snapshot(
+        dialogs=(
+            "Too many requests You’re making requests too quickly. "
+            "We’ve temporarily limited access. Got it",
+        )
+    )
+    page = ChatGPTPage(object(), timeout_ms=100)
+
+    async def owned():
+        return limited
+
+    page.assert_ownership = owned
+
+    with pytest.raises(RateLimitBlockedError, match="rate limit"):
+        asyncio.run(page.wait_until_clean_ready(timeout_ms=100))
+
+
 def test_rate_limit_dialog_is_classified_without_auto_accepting_unknown_dialog():
     limited = snapshot(
         dialogs=(

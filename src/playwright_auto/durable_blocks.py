@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
@@ -255,6 +256,50 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
             f"{recovery.value}; refusing to send again"
         )
 
+    @staticmethod
+    def _allows_pristine_composer_cleanup(record: Any) -> bool:
+        return bool(
+            record.status is RequestStatus.NEW
+            and record.attempts == 0
+            and record.accepted_at is None
+            and record.binding is None
+            and record.baseline is None
+            and record.session_id_before is None
+            and record.receipt is None
+            and record.upload_receipt is None
+            and record.response is None
+        )
+
+    async def _clear_pristine_composer(
+        self,
+        context: WorkflowContext[ChatGPTPage],
+        record: Any,
+        snapshot: Any,
+    ) -> Any:
+        if not snapshot.composer_text.strip() or not self._allows_pristine_composer_cleanup(record):
+            return snapshot
+        if snapshot.attachment_markers:
+            raise DurableRequestError(
+                "composer cleanup blocked by attachment ambiguity before Send"
+            )
+        try:
+            await context.client.clear(force=True)
+        except Exception as exc:
+            raise DurableRequestError(
+                f"composer cleanup failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        deadline = time.monotonic() + 0.2
+        latest = await context.client.assert_ownership()
+        while True:
+            if latest.composer_text.strip():
+                raise DurableRequestError(
+                    "composer cleanup failed: draft rehydrated before Send"
+                )
+            if time.monotonic() >= deadline:
+                return latest
+            await asyncio.sleep(0.05)
+            latest = await context.client.assert_ownership()
+
     async def run(self, context: WorkflowContext[ChatGPTPage]) -> dict[str, Any]:
         if context.client.binding is None:
             raise DurableRequestError(
@@ -387,6 +432,7 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
             )
 
         snapshot = await context.client.assert_ownership()
+        snapshot = await self._clear_pristine_composer(context, record, snapshot)
         recovery = classify_recovery_state(record, snapshot)
         context.variables[self.recovery_key] = recovery
 
