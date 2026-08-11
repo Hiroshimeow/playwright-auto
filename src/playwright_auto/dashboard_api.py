@@ -14,8 +14,9 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from .cdpa_bootstraps import BootstrapCatalog, normalize_bootstrap_record
 from .cdpa_commands import RepairRequest
-from .cdpa_config import CDPAConfig, load_cdpa_config
+from .cdpa_config import CDPAConfig, declared_repository_from_task, load_cdpa_config
 from .cdpa_identity import generate_idempotent_task_id, validate_task_id
 from .cdpa_independent import (
     normalize_agent_name,
@@ -165,12 +166,23 @@ class DashboardAPI:
         return str(repository)
 
     @staticmethod
+    def _declared_repository(task: str) -> str | None:
+        try:
+            return declared_repository_from_task(task)
+        except ValueError as exc:
+            raise APIError(400, "invalid_request", str(exc)) from exc
+
+    @staticmethod
     def _list(value: object, field: str) -> list[Any]:
         if value is None:
             return []
         if not isinstance(value, list):
             raise APIError(400, "invalid_request", f"{field} must be an array")
         return value
+
+    def _default_bootstrap_id(self) -> str | None:
+        record = BootstrapCatalog(self.config.repository_root).get("general-team-bootstrap")
+        return "general-team-bootstrap" if record and record.get("enabled") is True else None
 
     def _active_workflow_routes(self) -> tuple[str, ...]:
         snapshot = self.db.get_snapshot("agents")
@@ -217,6 +229,49 @@ class DashboardAPI:
         selected = set(roles)
         return [role for role in available if role in selected]
 
+    def _bootstrap_definition(self, value: Any) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise APIError(400, "invalid_request", "bootstrap_definition must be an object")
+        allowed = {"bootstrap_id", "name", "source", "prewarm_prompt", "max_backups"}
+        unknown = set(value) - allowed
+        if unknown:
+            raise APIError(
+                400,
+                "invalid_request",
+                f"unknown bootstrap_definition fields: {sorted(unknown)!r}",
+            )
+        source = value.get("source")
+        if isinstance(source, str) and not source.strip():
+            source = None
+        prewarm_prompt = value.get("prewarm_prompt")
+        if isinstance(prewarm_prompt, str) and not prewarm_prompt.strip():
+            prewarm_prompt = None
+        try:
+            normalized = normalize_bootstrap_record(
+                {
+                    "bootstrap_id": value.get("bootstrap_id"),
+                    "name": value.get("name"),
+                    "description": "",
+                    "source_conversation_id": source,
+                    "prewarm_prompt": prewarm_prompt,
+                    "max_backups": value.get("max_backups", 7),
+                    "donors": [],
+                    "enabled": True,
+                    "tags": [],
+                    "created_at": "2000-01-01T00:00:00+00:00",
+                    "updated_at": "2000-01-01T00:00:00+00:00",
+                }
+            )
+        except ValueError as exc:
+            raise APIError(400, "invalid_request", str(exc)) from exc
+        return {
+            "bootstrap_id": normalized["bootstrap_id"],
+            "name": normalized["name"],
+            "source_conversation_id": normalized["source_conversation_id"],
+            "prewarm_prompt": normalized["prewarm_prompt"],
+            "max_backups": normalized["max_backups"],
+        }
+
     def normalize_create(self, raw: Mapping[str, Any]) -> dict[str, Any]:
         allowed = {
             "task",
@@ -229,6 +284,8 @@ class DashboardAPI:
             "report_mode",
             "depends_on_task_ids",
             "upload_paths",
+            "bootstrap_id",
+            "bootstrap_definition",
         }
         unknown = set(raw) - allowed
         if unknown:
@@ -236,7 +293,12 @@ class DashboardAPI:
         task = str(raw.get("task") or "").strip()
         if not task:
             raise APIError(400, "invalid_request", "task must not be empty")
-        repository = self._repository(raw.get("repository"))
+        requested_repository = raw.get("repository")
+        if requested_repository is None or (
+            isinstance(requested_repository, str) and not requested_repository.strip()
+        ):
+            requested_repository = self._declared_repository(task)
+        repository = self._repository(requested_repository)
         try:
             report_mode = effective_report_mode(
                 raw.get("report_mode") or "file",
@@ -260,6 +322,34 @@ class DashboardAPI:
         }
         if "roles" in raw:
             normalized["roles"] = self._workflow_roles(raw.get("roles"))
+        definition = (
+            self._bootstrap_definition(raw.get("bootstrap_definition"))
+            if "bootstrap_definition" in raw
+            else None
+        )
+        if definition is not None:
+            requested_id = raw.get("bootstrap_id")
+            if requested_id not in {None, definition["bootstrap_id"]}:
+                raise APIError(
+                    400,
+                    "invalid_request",
+                    "bootstrap_id must match bootstrap_definition.bootstrap_id",
+                )
+            normalized["bootstrap_id"] = definition["bootstrap_id"]
+            normalized["bootstrap_definition"] = definition
+        elif "bootstrap_id" not in raw:
+            normalized["bootstrap_id"] = self._default_bootstrap_id()
+        elif raw.get("bootstrap_id") is None:
+            normalized["bootstrap_id"] = None
+        else:
+            bootstrap_id = raw.get("bootstrap_id")
+            if not isinstance(bootstrap_id, str) or not bootstrap_id.strip():
+                raise APIError(
+                    400,
+                    "invalid_request",
+                    "bootstrap_id must be a non-empty string or null",
+                )
+            normalized["bootstrap_id"] = bootstrap_id
         return normalized
 
     def normalize_workflow_agent_create(
@@ -520,6 +610,29 @@ class DashboardAPI:
                 raise APIError(400, "invalid_request", "expected_task_version must be non-negative")
         return {"goal": goal}, expected
 
+    @staticmethod
+    def normalize_parent_removal(raw: Mapping[str, Any]) -> int:
+        if set(raw) != {"expected_task_version"}:
+            raise APIError(
+                400,
+                "invalid_request",
+                "parent removal requires only expected_task_version",
+            )
+        expected = raw.get("expected_task_version")
+        if isinstance(expected, bool) or not isinstance(expected, int):
+            raise APIError(
+                400,
+                "invalid_request",
+                "expected_task_version must be an integer",
+            )
+        if expected < 0:
+            raise APIError(
+                400,
+                "invalid_request",
+                "expected_task_version must be non-negative",
+            )
+        return expected
+
     def enqueue(
         self,
         *,
@@ -581,24 +694,74 @@ class DashboardAPI:
             if expected_size != len(data) or hashlib.sha256(data).hexdigest() != expected_hash:
                 raise APIError(409, "report_changed", "report content changed after projection")
             return data
+        availability = str(locator.get("availability") or "")
+        if availability == "remote_unmirrored":
+            raise APIError(
+                409,
+                "report_remote_unmirrored",
+                "report is stored on a remote execution host and is not mirrored",
+            )
+        if availability == "unavailable":
+            raise APIError(404, "report_not_found", "report is not locally available")
+
         raw_path = Path(str(locator.get("path") or "")).expanduser()
-        plans_root = self.config.plans_root.resolve()
-        lexical_path = Path(os.path.abspath(raw_path))
+        control_repository = self.config.repository_root.resolve()
+        control_plans_root = self.config.plans_root.resolve()
+        plans_relative = control_plans_root.relative_to(control_repository)
+        execution_repository = Path(
+            str(locator.get("repository") or private.get("repository") or control_repository)
+        ).expanduser().resolve()
+        if not any(
+            execution_repository.is_relative_to(root.resolve())
+            for root in self.config.repository_allowed_roots
+        ):
+            raise APIError(403, "report_escape", "report repository is outside configured allowed roots")
+        execution_plans_root = execution_repository / plans_relative
+        team = str(locator.get("team") or "").strip()
+        if not team and not maintenance:
+            manifest_path = Path(str(private.get("manifest_path") or "")).expanduser()
+            try:
+                manifest_relative = Path(os.path.abspath(manifest_path)).relative_to(control_plans_root)
+            except ValueError:
+                manifest_relative = Path()
+            if len(manifest_relative.parts) >= 2:
+                team = manifest_relative.parts[0]
+        if maintenance:
+            containment_roots = (control_plans_root, execution_plans_root)
+        else:
+            if not team:
+                raise APIError(409, "report_locator_invalid", "report locator is missing team identity")
+            containment_roots = (execution_plans_root / team,)
+        lexical_path = Path(
+            os.path.abspath(raw_path if raw_path.is_absolute() else execution_repository / raw_path)
+        )
+        containment_root = next(
+            (root for root in containment_roots if lexical_path.is_relative_to(root)),
+            None,
+        )
+        if containment_root is None:
+            raise APIError(403, "report_escape", "report path escapes the report team root")
+        path_repository = (
+            control_repository
+            if maintenance and containment_root == control_plans_root
+            else execution_repository
+        )
         try:
-            lexical_relative = lexical_path.relative_to(plans_root)
+            repository_relative = lexical_path.relative_to(path_repository)
         except ValueError as exc:
-            raise APIError(403, "report_escape", "report path escapes the plans root") from exc
-        current = plans_root
-        for part in lexical_relative.parts:
+            raise APIError(403, "report_escape", "report path escapes the report repository") from exc
+        current = path_repository
+        for part in repository_relative.parts:
             current /= part
             if current.is_symlink():
                 raise APIError(403, "report_symlink", "report symlinks are forbidden")
         try:
             candidate = lexical_path.resolve(strict=True)
+            resolved_containment_root = containment_root.resolve(strict=True)
         except FileNotFoundError as exc:
             raise APIError(404, "report_not_found", "report does not exist") from exc
-        if not candidate.is_relative_to(plans_root):
-            raise APIError(403, "report_escape", "report path escapes the plans root")
+        if not candidate.is_relative_to(resolved_containment_root):
+            raise APIError(403, "report_escape", "report path escapes the report team root")
         if not candidate.is_file():
             raise APIError(404, "report_not_found", "report does not exist")
         body = candidate.read_bytes()
@@ -720,6 +883,28 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                 }
             )
             self._json(200, payload, headers={"ETag": etag})
+            return
+        if path == "/api/bootstraps":
+            entries = [
+                entry
+                for entry in BootstrapCatalog(app.config.repository_root).list()
+                if entry.get("enabled") is True
+            ]
+            items = [
+                {
+                    "bootstrap_id": entry["bootstrap_id"],
+                    "name": entry["name"],
+                    "description": entry["description"],
+                    "tags": list(entry.get("tags") or ()),
+                }
+                for entry in entries
+            ]
+            default_id = app._default_bootstrap_id()
+            self._json(
+                200,
+                {"items": items, "default_id": default_id},
+                headers={"Cache-Control": "no-store"},
+            )
             return
         if path == "/api/agents":
             snapshot = db.get_snapshot("agents")
@@ -957,7 +1142,23 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                     payload=payload,
                 )
             else:
-                if len(parts) == 4 and parts[:2] == ["api", "tasks"] and parts[3] == "goal":
+                if (
+                    len(parts) == 6
+                    and parts[:2] == ["api", "tasks"]
+                    and parts[3] == "parents"
+                    and parts[5] == "remove"
+                ):
+                    task_id = validate_task_id(parts[2])
+                    parent_task_id = validate_task_id(parts[4])
+                    expected = app.normalize_parent_removal(raw)
+                    command = app.enqueue(
+                        idempotency_key=key,
+                        kind="remove_parent_dependency",
+                        task_id=task_id,
+                        expected_task_version=expected,
+                        payload={"parent_task_id": parent_task_id},
+                    )
+                elif len(parts) == 4 and parts[:2] == ["api", "tasks"] and parts[3] == "goal":
                     task_id = validate_task_id(parts[2])
                     payload, expected = app.normalize_goal_change(raw)
                     command = app.enqueue(

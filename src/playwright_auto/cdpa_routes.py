@@ -12,7 +12,7 @@ from typing import Any, Sequence
 from .cdpa_workflow_agents import validate_workflow_route_key
 from .file_lock import exclusive_file_lock, fsync_parent_directory
 
-ROUTES = frozenset({"PLAN", "DEV", "REVIEW", "TEST", "AUDIT", "DONE"})
+ROUTES = frozenset({"PLAN", "DEV", "REVIEW", "TEST", "AUDIT", "PAUSE", "DONE"})
 _REPORT_MODES = frozenset({"file", "inline"})
 _KEYS = frozenset({"route", "handoff"})
 _FENCE = re.compile(r"^```json\s*(\{.*\})\s*```$", re.DOTALL | re.IGNORECASE)
@@ -109,8 +109,8 @@ def parse_route_response(
     else:
         try:
             allowed = frozenset(
-                "DONE"
-                if str(item).strip().upper() == "DONE"
+                str(item).strip().upper()
+                if str(item).strip().upper() in {"PAUSE", "DONE"}
                 else validate_workflow_route_key(item)
                 for item in allowed_routes
             )
@@ -271,46 +271,6 @@ def _validated_report_location(
     return root, team_root, candidate
 
 
-def validate_report(
-    handoff: str,
-    *,
-    repository_root: str | Path,
-    plans_root: str | Path,
-    team: str,
-    physical_role: str,
-    turn: int,
-    task_id: str,
-) -> ReportEvidence:
-    _root, team_root, candidate = _validated_report_location(
-        handoff,
-        repository_root=repository_root,
-        plans_root=plans_root,
-        team=team,
-        physical_role=physical_role,
-        turn=turn,
-        task_id=task_id,
-    )
-    if candidate.is_symlink():
-        raise RouteContractError("report path must not be a symlink")
-    resolved = candidate.resolve()
-    try:
-        resolved.relative_to(team_root)
-    except ValueError as exc:
-        raise RouteContractError("report path escapes the assigned team") from exc
-    if resolved != candidate:
-        raise RouteContractError("report path must not traverse symlinks")
-    try:
-        stat = candidate.stat()
-    except FileNotFoundError as exc:
-        raise RouteContractError("report file does not exist") from exc
-    if not candidate.is_file() or not os.path.isfile(candidate):
-        raise RouteContractError("report path must be a regular file")
-    if stat.st_size <= 0:
-        raise RouteContractError("report file must not be empty")
-    digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
-    return ReportEvidence(str(candidate), digest, stat.st_size)
-
-
 
 def materialize_inline_report(
     report: str,
@@ -384,12 +344,4 @@ def materialize_inline_report(
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
-    return validate_report(
-        expected_relative,
-        repository_root=repository_root,
-        plans_root=plans_root,
-        team=team,
-        physical_role=physical_role,
-        turn=turn,
-        task_id=task_id,
-    )
+    return ReportEvidence(str(target), hashlib.sha256(data).hexdigest(), len(data))

@@ -17,6 +17,7 @@ COMMAND_KINDS = frozenset(
     {
         "create_task",
         "change_goal",
+        "remove_parent_dependency",
         "create_independent_agent",
         "create_workflow_agent",
         "update_workflow_agent",

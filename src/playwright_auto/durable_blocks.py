@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import Any
 from .chatgpt import (
     ChatGPTPage,
     MessageSnapshot,
+    SendReceipt,
     attachment_names_match,
     capture_message_baseline,
     unique_new_user_message,
@@ -68,6 +70,65 @@ def _validate_upload_receipt(
     return receipt
 
 
+def _attach_frontend_identity_enrichment(
+    client: Any,
+    ledger: RequestLedger,
+    request_id: str,
+    accepted_receipt: SendReceipt,
+) -> None:
+    take_task = getattr(client, "take_frontend_identity_task", None)
+    if not callable(take_task):
+        return
+    try:
+        task = take_task()
+    except Exception:
+        return
+    if task is None:
+        return
+
+    def complete(done: Any) -> None:
+        try:
+            evidence = done.result()
+            if not isinstance(evidence, Mapping):
+                return
+            observed_user = evidence.get("observed_user_message_id")
+            conversation_id = evidence.get("conversation_id")
+            if observed_user != accepted_receipt.user_message_id:
+                return
+            if not isinstance(conversation_id, str) or not conversation_id:
+                return
+            record = ledger.get(request_id)
+            if (
+                record is None
+                or record.status is not RequestStatus.SENT
+                or not isinstance(record.receipt, Mapping)
+            ):
+                return
+            current = SendReceipt.from_dict(record.receipt)
+            accepted_base = accepted_receipt.to_dict()
+            current_base = current.to_dict()
+            accepted_base["conversation_id"] = None
+            current_base["conversation_id"] = None
+            if current_base != accepted_base:
+                return
+            if current.conversation_id not in {None, conversation_id}:
+                return
+            if current.conversation_id is None:
+                enriched = current.to_dict()
+                enriched["conversation_id"] = conversation_id
+                # Re-validate the exact allowlisted receipt before persistence.
+                validated = SendReceipt.from_dict(enriched)
+                ledger.update(request_id, receipt=validated.to_dict())
+        except Exception:
+            # Enrichment is shadow evidence: never authorize retry/replay or fail Send.
+            return
+
+    try:
+        task.add_done_callback(complete)
+    except Exception:
+        return
+
+
 class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
     """Idempotent Send + optional upload + response wait backed by a file ledger.
 
@@ -77,6 +138,7 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
     """
 
     retry_safe = False
+    UPLOAD_RETRY_AUTHORIZATION = "upload_retry_authorized"
 
     def __init__(
         self,
@@ -193,6 +255,50 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
             f"durable request {record.request_id} is in ambiguous state "
             f"{recovery.value}; refusing to send again"
         )
+
+    @staticmethod
+    def _allows_pristine_composer_cleanup(record: Any) -> bool:
+        return bool(
+            record.status is RequestStatus.NEW
+            and record.attempts == 0
+            and record.accepted_at is None
+            and record.binding is None
+            and record.baseline is None
+            and record.session_id_before is None
+            and record.receipt is None
+            and record.upload_receipt is None
+            and record.response is None
+        )
+
+    async def _clear_pristine_composer(
+        self,
+        context: WorkflowContext[ChatGPTPage],
+        record: Any,
+        snapshot: Any,
+    ) -> Any:
+        if not snapshot.composer_text.strip() or not self._allows_pristine_composer_cleanup(record):
+            return snapshot
+        if snapshot.attachment_markers:
+            raise DurableRequestError(
+                "composer cleanup blocked by attachment ambiguity before Send"
+            )
+        try:
+            await context.client.clear(force=True)
+        except Exception as exc:
+            raise DurableRequestError(
+                f"composer cleanup failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        deadline = time.monotonic() + 0.2
+        latest = await context.client.assert_ownership()
+        while True:
+            if latest.composer_text.strip():
+                raise DurableRequestError(
+                    "composer cleanup failed: draft rehydrated before Send"
+                )
+            if time.monotonic() >= deadline:
+                return latest
+            await asyncio.sleep(0.05)
+            latest = await context.client.assert_ownership()
 
     async def run(self, context: WorkflowContext[ChatGPTPage]) -> dict[str, Any]:
         if context.client.binding is None:
@@ -326,6 +432,7 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
             )
 
         snapshot = await context.client.assert_ownership()
+        snapshot = await self._clear_pristine_composer(context, record, snapshot)
         recovery = classify_recovery_state(record, snapshot)
         context.variables[self.recovery_key] = recovery
 
@@ -367,6 +474,21 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
                 context, ledger, record, receipt
             )
 
+        failed_upload_before_ready = bool(
+            record.status is RequestStatus.UPLOADING
+            and recovery is DurableRecoveryState.COMPOSER_PROMPT_MISSING_ATTACHMENTS
+            and str(record.error or "").startswith(
+                f"{self.UPLOAD_RETRY_AUTHORIZATION}:"
+            )
+            and int(record.attempts or 0) == 0
+            and record.binding is None
+            and record.baseline is None
+            and record.receipt is None
+            and record.accepted_at is None
+            and record.upload_receipt is None
+            and record.response is None
+            and record.session_id_before is None
+        )
         if recovery in {
             DurableRecoveryState.SENT_MARKER_MISSING,
             DurableRecoveryState.COMPOSER_ATTACHMENTS_WITHOUT_MARKER,
@@ -377,6 +499,7 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
         if (
             record.status is RequestStatus.UPLOADING
             and recovery is not DurableRecoveryState.UPLOAD_READY_NOT_SENT
+            and not failed_upload_before_ready
         ):
             self._raise_ambiguous(record, recovery)
 
@@ -439,15 +562,18 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
             self._raise_ambiguous(record, recovery)
 
         if identities and recovery is not DurableRecoveryState.UPLOAD_READY_NOT_SENT:
-            if record.status is not RequestStatus.PROMPT_SET:
+            if record.status is RequestStatus.PROMPT_SET:
+                record = ledger.update(
+                    record.request_id,
+                    status=RequestStatus.UPLOADING,
+                    error=None,
+                )
+            elif not failed_upload_before_ready:
                 raise DurableRequestError(
                     f"cannot start upload from durable status {record.status.value}"
                 )
-            record = ledger.update(
-                record.request_id,
-                status=RequestStatus.UPLOADING,
-                error=None,
-            )
+            else:
+                record = ledger.update(record.request_id, error=None)
             try:
                 upload_receipt = await context.client.upload_files(
                     paths,
@@ -563,6 +689,9 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
             baseline=receipt.baseline,
             session_id_before=receipt.session_id_before,
             error=None,
+        )
+        _attach_frontend_identity_enrichment(
+            context.client, ledger, record.request_id, receipt
         )
         context.variables[self.receipt_key] = receipt
         return await self._complete_from_receipt(

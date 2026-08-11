@@ -191,7 +191,11 @@ def test_public_auth_rejects_anonymous_before_proxy_even_with_alternate_host(tmp
 def test_public_login_rejects_wrong_password_and_accepts_opaque_secure_session(tmp_path: Path):
     upstream, upstream_thread = start_upstream()
     server, thread = start_frontend(tmp_path, api_port=upstream.server_address[1], auth_password="correct")
-    public = {"Host": "cdpa.hcu-lab.me", "Content-Type": "application/x-www-form-urlencoded"}
+    public = {
+        "Host": "cdpa.hcu-lab.me",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": "https://cdpa.hcu-lab.me",
+    }
     try:
         wrong = urlencode({"password": "wrong"}).encode()
         status, headers, body = request(server, "POST", "/auth/login", body=wrong, headers=public)
@@ -241,7 +245,11 @@ def test_authenticated_public_proxy_preserves_semantics_and_strips_only_auth_coo
             "POST",
             "/auth/login",
             body=login_body,
-            headers={"Host": "cdpa.hcu-lab.me", "Content-Type": "application/x-www-form-urlencoded"},
+            headers={
+                "Host": "cdpa.hcu-lab.me",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "https://cdpa.hcu-lab.me",
+            },
         )
         assert status == 303
         session_cookie = headers["Set-Cookie"].split(";", 1)[0]
@@ -255,6 +263,7 @@ def test_authenticated_public_proxy_preserves_semantics_and_strips_only_auth_coo
                 "Host": "cdpa.hcu-lab.me",
                 "Content-Type": "application/json",
                 "Content-Length": "12",
+                "Origin": "https://cdpa.hcu-lab.me",
                 "Idempotency-Key": "same-key",
                 "Cookie": f"other=keep; {session_cookie}",
             },
@@ -352,6 +361,185 @@ def test_frontend_assets_are_local_modular_and_suspend_hidden_polling():
 
 
 
+def test_commands_are_a_full_height_board_lane_without_changing_command_semantics():
+    html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+    app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
+    css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
+
+    board_open = html.index('<div id="board" class="board-grid"')
+    board_close = html.index("</div>", board_open)
+    commands_at = html.index('<aside id="commands"')
+    workspace_at = html.index('<section class="task-workspace"')
+    command_lane = css.split(".lane.command-lane {", 1)[1].split("}", 1)[0]
+
+    assert board_open < commands_at < board_close < workspace_at
+    assert 'class="lane command-lane"' in html
+    assert 'data-column="COMMANDS"' in html
+    assert 'count.className = "lane-count"' in app
+    assert 'className = "lane-list command-list"' in app
+    assert 'JSON.stringify([entries.length, entries.slice(0, 12)' in app
+    assert 'String(b.createdAt).localeCompare(String(a.createdAt))' in app
+    assert "commandPresentation(command)" in app
+    assert 'button.dataset.renderDisabled === "true"' in app
+    assert ".board-section > .command-panel" not in css
+    assert '.lane[data-column="COMMANDS"]' in css
+    assert ".command-list" in css
+    assert "order: 8;" in command_lane
+    assert "height:" not in command_lane
+    assert "min-height:" not in command_lane
+    assert "align-self:" not in command_lane
+    assert ".lane {\n  --lane-accent:" in css
+    assert "height: 388px;" in css
+    assert ".lane-list {" in css
+    assert "min-height: 0;" in css
+    assert "overflow-y: auto;" in css
+    mobile = css.split("@media (max-width: 720px)", 1)[1]
+    assert "grid-template-columns: repeat(8, min(86vw, 340px));" in mobile
+    assert "height: 388px;" in mobile
+    assert "min-height: 388px;" in mobile
+
+
+def test_workflow_report_model_selects_latest_per_role_and_retains_older_reports():
+    module = (ASSET_ROOT / "views" / "task_detail.js").resolve().as_uri()
+    script = f"""
+      import {{ workflowReportModel }} from {json.dumps(module)};
+      const detail = {{
+        status: "RUNNING",
+        roles: [
+          {{logical_role: "PLAN", physical_role: "alpha-plan"}},
+          {{logical_role: "DEV", physical_role: "alpha-dev"}},
+          {{logical_role: "REVIEW", physical_role: "alpha-review"}},
+          {{logical_role: "AUDIT", physical_role: "alpha-audit"}},
+        ],
+        reports: [
+          {{role: "PLAN", turn: 1, url: "/p1"}},
+          {{role: "DEV", turn: 1, url: "/d1"}},
+          {{role: "PLAN", turn: 2, url: "/p2"}},
+          {{physical_role: "alpha-dev", turn: 2, url: "/d2"}},
+          {{physical_role: "alpha-review", turn: 2, url: "/r2"}},
+        ],
+      }};
+      const running = workflowReportModel(detail, "DEV");
+      const fallback = workflowReportModel(detail, "AUDIT");
+      const done = workflowReportModel({{...detail, status: "DONE"}}, "DEV");
+      const explicit = workflowReportModel(detail, "PLAN", "/p1");
+      console.log(JSON.stringify({{
+        latest: running.roles.map(item => [item.role, item.latest?.url || null]),
+        older: running.olderReports.map(item => item.url),
+        running: running.selectedReport?.url || null,
+        fallback: fallback.selectedReport?.url || null,
+        done: done.selectedReport?.url || null,
+        explicit: explicit.selectedReport?.url || null,
+        explicitRole: explicit.selectedReport?._logicalRole || null,
+        coverage: running.coverage,
+      }}));
+    """
+    result = __import__("subprocess").run(
+        ["node", "--input-type=module", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == {
+        "latest": [["PLAN", "/p2"], ["DEV", "/d2"], ["REVIEW", "/r2"], ["AUDIT", None]],
+        "older": ["/d1", "/p1"],
+        "running": "/d2",
+        "fallback": "/r2",
+        "done": "/p2",
+        "explicit": "/p1",
+        "explicitRole": "PLAN",
+        "coverage": "3/4",
+    }
+
+
+def test_workflow_report_availability_distinguishes_remote_without_fetchable_url():
+    module = (ASSET_ROOT / "views" / "task_detail.js").resolve().as_uri()
+    app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
+    script = f"""
+      import {{ reportBody }} from {json.dumps(module)};
+      const bodies = new Map();
+      console.log(JSON.stringify([
+        reportBody({{availability: "remote_unmirrored"}}, bodies),
+        reportBody({{availability: "unavailable"}}, bodies),
+      ]));
+    """
+    result = __import__("subprocess").run(
+        ["node", "--input-type=module", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == [
+        "Report stored on remote execution host / not mirrored.",
+        "Report is unavailable on this dashboard host.",
+    ]
+    assert "if (!report.url || reportBodies.has(report.url)) return;" in app
+
+
+def test_workflow_report_polish_uses_coverage_rail_and_responsive_selector():
+    detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
+    css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
+
+    assert '["reports", `Reports ${model.coverage}`]' in detail
+    assert 'tabs.classList.add("workflow-detail-tabs")' in detail
+    assert '"workflow-report-layout"' in detail
+    assert '"workflow-report-content"' in detail
+    assert '`report-role${item.role === model.selectedReport?._logicalRole ? " selected" : ""}`' in detail
+    assert "role.disabled = !item.latest;" in detail
+    assert 'item.latest ? `Turn ${item.latest.turn ?? "—"}` : "No report"' in detail
+    assert ".workflow-report-layout {" in css
+    assert "grid-template-columns: 175px minmax(0, 1fr);" in css
+    assert "box-shadow: inset 2px 0 0 var(--accent);" in css
+    tablet = css.split("@media (max-width: 900px)", 1)[1]
+    assert ".workflow-report-layout { grid-template-columns: minmax(0, 1fr); }" in tablet
+    assert ".report-role-nav {" in tablet
+    assert "overflow-x: auto;" in tablet
+    mobile = css.split("@media (max-width: 720px)", 1)[1]
+    assert ".workflow-detail-tabs.detail-tabs" in mobile
+    assert "grid-template-columns: repeat(2, minmax(0, 1fr));" in mobile
+
+
+def test_task_goal_blocks_dedupe_and_disclosure_state_contract_is_keyed():
+    module = (ASSET_ROOT / "views" / "task_detail.js").resolve().as_uri()
+    detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
+    script = f"""
+      import {{ taskGoalBlocks }} from {json.dumps(module)};
+      console.log(JSON.stringify([
+        taskGoalBlocks({{task_id: "x", task_text: "same", effective_goal: "same"}}),
+        taskGoalBlocks({{task_id: "x", task_text: "task", effective_goal: "goal"}}),
+      ]));
+    """
+    result = __import__("subprocess").run(
+        ["node", "--input-type=module", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == [
+        [{"key": "task-goal", "label": "Task / Effective goal", "text": "same"}],
+        [
+            {"key": "task", "label": "Task", "text": "task"},
+            {"key": "effective-goal", "label": "Effective goal", "text": "goal"},
+        ],
+    ]
+    assert 'details.dataset.disclosureKey = block.key' in detail
+    assert '"task-disclosure-preview"' in detail
+    assert '"Show more"' in detail
+    assert '"Show less"' in detail
+    assert 'sameTask ? new Set' in detail
+    assert 'querySelectorAll("details[data-disclosure-key][open]")' in detail
+    assert 'details.open = openDisclosureKeys.has(details.dataset.disclosureKey)' in detail
+
+
+def test_task_controls_render_before_task_prompt():
+    detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
+    workflow = detail.split("function workflowOverview", 1)[1].split("function build", 1)[0]
+    independent = detail.split("function independentOverview", 1)[1].split("function independentHistory", 1)[0]
+
+    assert workflow.index("fragment.append(controls);") < workflow.index("fragment.append(taskSection);")
+    assert independent.index("fragment.append(independentControls(detail));") < independent.index("fragment.append(section);")
+
+
 def test_independent_agents_have_one_lane_and_operator_facing_controls():
     html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
     board = (ASSET_ROOT / "views" / "board.js").read_text(encoding="utf-8")
@@ -363,10 +551,19 @@ def test_independent_agents_have_one_lane_and_operator_facing_controls():
     assert 'text("span", "Independent Agent", "task-agent-context")' in board
     assert 'agent.tags' in board
     assert '"Custom Agent"' not in board
-    assert 'task.task_mode !== "independent" && task.status === "RUNNING"' in board
-    assert 'task.status === "DONE"' in board
-    assert 'completed_at' in board
+    assert 'agent.run_count' in board
+    assert 'agent.run_count_truncated' in board
+    assert 'agent.last_run_at' in board
+    assert 'task.status === "RUNNING"' in board
+    assert 'task.elapsed_end_at' in board
+    assert 'fixedDuration' in board
     assert 'data-elapsed-at' not in board.split('if (agent)', 1)[-1].split('function ensureLane', 1)[0]
+    agent_meta = board.split('meta.className = "task-meta";', 1)[1].split('} else {', 1)[0]
+    assert 'field("Status", task.status)' in agent_meta
+    assert 'field("Runs",' in agent_meta
+    assert 'elapsed(agent.last_run_at)' in agent_meta
+    assert 'field("Action", task.active_action)' not in agent_meta
+    assert 'field("Tab",' not in agent_meta
 
     for label in [
         '"Run task"', '"Pause"', '"Enable"', '"Reset"', '"Settings"',
@@ -383,7 +580,9 @@ def test_independent_agents_have_one_lane_and_operator_facing_controls():
     assert 'agent.tab_keep_open_until' in detail
     assert 'selectedIndependentTabByTask' in store
     assert 'dataset.renderDisabled' in detail
+    assert 'disabled: active || !enabled' in detail
     assert 'button.dataset.renderDisabled === "true"' in app
+    assert 'if (state.selectedDetail?.task_id === taskId) return;' in app
     assert '/api/independent-agents/${encodeURIComponent(taskId)}/run' in app
     assert 'body: {trigger_type: "manual", instruction}' in app
     assert 'action: control.dataset.control' in app
@@ -447,6 +646,31 @@ def test_create_task_sections_summary_validation_and_agent_panel_dismissal_are_e
     assert 'data-workflow-agent-select' in html
     assert 'renderTriggerChoices' in app
 
+def test_create_task_bootstrap_select_load_submit_and_detail_are_explicit():
+    html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+    app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
+
+    assert html.count('select name="bootstrap_id"') == 1
+    assert "None / Fresh context" in html
+    assert '"/api/bootstraps"' in app
+    assert "loadBootstrapOptions" in app
+    assert "data.default_id" in app
+    assert "body.bootstrap_id" in app
+    assert 'data-bootstrap-inline' in html
+    assert 'name="bootstrap_new_id"' in html
+    assert 'name="bootstrap_new_name"' in html
+    assert 'name="bootstrap_new_source"' in html
+    assert 'name="bootstrap_new_prewarm_prompt"' in html
+    assert 'name="bootstrap_new_max_backups"' in html
+    assert "body.bootstrap_definition" in app
+    assert "source: bootstrapSource" in app
+    assert 'name="bootstrap_kind"' not in html
+    assert 'name="bootstrap_import_generated"' not in html
+    assert "renderBootstrapContext" in app
+    assert "bootstrap_context" in app
+    assert "terminal_assistant_message_id" not in app
+
+
 def test_create_task_role_selection_defaults_and_reuse_lock_are_explicit():
     html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
     app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
@@ -463,6 +687,18 @@ def test_create_task_role_selection_defaults_and_reuse_lock_are_explicit():
     assert "applyReuseRoleSelection" in actions
     assert "item.roles" in actions
     assert 'input.disabled = locked || input.value === "PLAN"' in actions
+
+
+def test_parent_dependencies_render_exact_remove_actions_through_shared_command_path():
+    app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
+    detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
+    assert 'detail.depends_on_task_ids' in detail
+    assert '"Remove parent"' in detail
+    assert 'dataset.removeParent' in detail
+    assert '[data-remove-parent]' in app
+    assert '/parents/${encodeURIComponent(parentTaskId)}/remove' in app
+    assert 'kind: "remove_parent_dependency"' in app
+    assert 'expected_task_version' in app
 
 
 def test_change_goal_ui_contract_is_running_only_and_uses_shared_command_path():

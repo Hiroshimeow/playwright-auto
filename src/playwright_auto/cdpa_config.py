@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -45,12 +47,66 @@ def _positive(value: Any, name: str, *, integer: bool = False) -> float | int:
     return parsed
 
 
+def _bounded_float(value: Any, name: str, *, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise CDPAConfigError(f"{name} must be numeric") from exc
+    if not math.isfinite(parsed) or parsed < minimum or parsed > maximum:
+        raise CDPAConfigError(f"{name} must be between {minimum} and {maximum} seconds")
+    return parsed
+
+
 def _resolve(root: Path, value: Any, name: str) -> Path:
     text = str(value or "").strip()
     if not text:
         raise CDPAConfigError(f"{name} must not be empty")
     path = Path(text).expanduser()
     return (path if path.is_absolute() else root / path).resolve()
+
+
+_REPOSITORY_DECLARATION = re.compile(r"(?<![\w/])(Target repository|Repository)\s+([^\s,]+)")
+_REMOTE_REPOSITORY_DECLARATION = re.compile(
+    r"(?<![\w/])(?:Actual product repository|Product repository):\s*([A-Za-z]:\\+[^\s,]+)"
+)
+_WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:\\+")
+
+
+def declared_repository_from_task(task: str) -> str | None:
+    """Return one strict local repository declaration from the task header."""
+    lines = [line.strip() for line in str(task or "").splitlines() if line.strip()]
+    declarations: list[str] = []
+    for index, line in enumerate(lines[:2]):
+        if line.startswith("Repository/worktree:"):
+            if line != "Repository/worktree:" or index + 1 >= len(lines):
+                raise ValueError("invalid repository declaration")
+            value = lines[index + 1]
+            if not Path(value).is_absolute() or any(char.isspace() for char in value):
+                raise ValueError("invalid repository declaration")
+            declarations.append(value)
+            continue
+        for match in _REPOSITORY_DECLARATION.finditer(line):
+            label, value = match.groups()
+            if _WINDOWS_ABSOLUTE.match(value):
+                continue
+            if Path(value).is_absolute():
+                declarations.append(value)
+                continue
+            raise ValueError("invalid repository declaration")
+    if len(declarations) > 1:
+        raise ValueError("ambiguous repository declaration")
+    return declarations[0] if declarations else None
+
+
+def remote_repository_from_task(task: str) -> str | None:
+    """Return one strict Windows product-repository declaration near the task header."""
+    lines = [line.strip() for line in str(task or "").splitlines() if line.strip()]
+    declarations: list[str] = []
+    for line in lines[:12]:
+        declarations.extend(match.group(1) for match in _REMOTE_REPOSITORY_DECLARATION.finditer(line))
+    if len(declarations) != 1:
+        return None
+    return declarations[0]
 
 
 @dataclass(frozen=True)
@@ -78,6 +134,7 @@ class CDPAConfig:
     route_repair_attempts: int
     response_timeout_seconds: float
     response_refresh_after_seconds: float
+    response_stream_status_terminal_settle_seconds: float
     response_stable_ms: int
     response_poll_ms: int
     independent_seed_builtins: bool
@@ -250,6 +307,12 @@ def load_cdpa_config(
         route_repair_attempts=int(_positive(repair.get("max_attempts", 3), "route_repair.max_attempts", integer=True)),
         response_timeout_seconds=float(_positive(response.get("timeout_seconds", 7200), "response.timeout_seconds")),
         response_refresh_after_seconds=float(_positive(response.get("refresh_after_seconds", 1200), "response.refresh_after_seconds")),
+        response_stream_status_terminal_settle_seconds=_bounded_float(
+            response.get("stream_status_terminal_settle_seconds", 5.0),
+            "response.stream_status_terminal_settle_seconds",
+            minimum=0.0,
+            maximum=60.0,
+        ),
         response_stable_ms=int(_positive(response.get("stable_ms", 1000), "response.stable_ms", integer=True)),
         response_poll_ms=int(_positive(response.get("poll_ms", 100), "response.poll_ms", integer=True)),
         independent_seed_builtins=bool(
@@ -261,7 +324,7 @@ def load_cdpa_config(
                 "independent_agents.idle_close_seconds",
             )
         ),
-        cleanup_terminal_idle_seconds=float(_positive(cleanup.get("terminal_idle_seconds", 3600), "cleanup.terminal_idle_seconds")),
+        cleanup_terminal_idle_seconds=float(_positive(cleanup.get("terminal_idle_seconds", 300), "cleanup.terminal_idle_seconds")),
         worker_poll_seconds=float(_positive(worker.get("poll_seconds", 1), "worker.poll_seconds")),
         delay_minimum_seconds=minimum,
         delay_maximum_seconds=maximum,

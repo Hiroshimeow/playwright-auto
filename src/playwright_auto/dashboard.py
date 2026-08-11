@@ -4,9 +4,11 @@ import argparse
 import hmac
 import http.client
 import json
+import math
 import mimetypes
 import os
 import secrets
+import threading
 import time
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,6 +24,12 @@ ASSET_ROOT = Path(__file__).with_name("dashboard_assets")
 _AUTH_ENV_NAME = "CDPA_DASHBOARD_PASSWORD"
 _SESSION_COOKIE = "cdpa_session"
 _PUBLIC_HOST = "cdpa.hcu-lab.me"
+_PUBLIC_ORIGIN = f"https://{_PUBLIC_HOST}"
+_LOGIN_FAILURE_LIMIT = 5
+_LOGIN_FAILURE_WINDOW_SECONDS = 300
+_SESSION_TTL_SECONDS = 43200
+_STATE_CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_monotonic = time.monotonic
 _HOP_BY_HOP = frozenset(
     {
         "connection",
@@ -54,8 +62,10 @@ class FrontendApplication:
     def __init__(self, config: CDPAConfig, *, auth_password: str | None = None) -> None:
         self.config = config
         self.auth_password = auth_password or None
-        self.session_token = secrets.token_urlsafe(32) if self.auth_password else None
-        self.started_at = time.monotonic()
+        self.login_failures: dict[str, list[float]] = {}
+        self.sessions: dict[str, float] = {}
+        self.auth_lock = threading.Lock()
+        self.started_at = _monotonic()
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -103,17 +113,45 @@ class DashboardHandler(BaseHTTPRequestHandler):
         public_host = host == _PUBLIC_HOST or host.startswith(f"{_PUBLIC_HOST}:")
         return public_host or bool(self.headers.get("Cf-Ray", "").strip())
 
-    def _session_is_valid(self) -> bool:
-        expected = self.application.session_token
-        if not expected:
+    def _prune_auth_state_locked(self, now: float) -> None:
+        cutoff = now - _LOGIN_FAILURE_WINDOW_SECONDS
+        for peer, failures in list(self.application.login_failures.items()):
+            retained = [failed_at for failed_at in failures if failed_at > cutoff]
+            if retained:
+                self.application.login_failures[peer] = retained
+            else:
+                self.application.login_failures.pop(peer, None)
+        for token, expiry in list(self.application.sessions.items()):
+            if expiry <= now:
+                self.application.sessions.pop(token, None)
+
+    def _same_origin_request(self) -> bool:
+        origin = self.headers.get("Origin")
+        if origin is not None:
+            return origin.strip() == _PUBLIC_ORIGIN
+        referer = self.headers.get("Referer")
+        if not referer:
             return False
+        try:
+            parsed = urlsplit(referer.strip())
+        except ValueError:
+            return False
+        return parsed.scheme == "https" and parsed.netloc == _PUBLIC_HOST
+
+    def _session_is_valid(self) -> bool:
         parsed = cookies.SimpleCookie()
         try:
             parsed.load(self.headers.get("Cookie", ""))
         except cookies.CookieError:
             return False
         morsel = parsed.get(_SESSION_COOKIE)
-        return bool(morsel and hmac.compare_digest(morsel.value, expected))
+        if not morsel:
+            return False
+        now = _monotonic()
+        with self.application.auth_lock:
+            self._prune_auth_state_locked(now)
+            expiry = self.application.sessions.get(morsel.value)
+            return bool(expiry and expiry > now)
 
     def _serve_login(self, *, status: int = 200, error: bool = False) -> None:
         marker = b"<!--AUTH_ERROR-->"
@@ -139,10 +177,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(size).decode("utf-8", errors="replace") if size else ""
         submitted = parse_qs(body, keep_blank_values=True).get("password", [""])[0]
         configured = self.application.auth_password
-        if not configured or not hmac.compare_digest(submitted, configured):
+        authenticated = bool(configured and hmac.compare_digest(submitted, configured))
+        peer = self.client_address[0]
+        now = _monotonic()
+        retry_after: int | None = None
+        token: str | None = None
+        with self.application.auth_lock:
+            self._prune_auth_state_locked(now)
+            failures = self.application.login_failures.get(peer, [])
+            if len(failures) >= _LOGIN_FAILURE_LIMIT:
+                retry_after = max(
+                    1,
+                    math.ceil(failures[0] + _LOGIN_FAILURE_WINDOW_SECONDS - now),
+                )
+            elif not authenticated:
+                self.application.login_failures.setdefault(peer, []).append(now)
+            else:
+                self.application.login_failures.pop(peer, None)
+                token = secrets.token_urlsafe(32)
+                self.application.sessions[token] = now + _SESSION_TTL_SECONDS
+        if retry_after is not None:
+            self._send(429, headers={"Retry-After": str(retry_after)})
+            return
+        if not authenticated:
             self._serve_login(status=401, error=True)
             return
-        token = self.application.session_token
         if not token:
             self._send(503)
             return
@@ -150,7 +209,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             303,
             headers={
                 "Location": "/",
-                "Set-Cookie": f"{_SESSION_COOKIE}={token}; Path=/; HttpOnly; Secure; SameSite=Strict",
+                "Set-Cookie": (
+                    f"{_SESSION_COOKIE}={token}; Path=/; HttpOnly; Secure; SameSite=Strict; "
+                    f"Max-Age={_SESSION_TTL_SECONDS}"
+                ),
             },
         )
 
@@ -241,7 +303,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _handle(self) -> None:
         path = urlsplit(self.path).path
-        if self._is_public_request():
+        public_request = self._is_public_request()
+        if public_request:
+            if self.command in _STATE_CHANGING_METHODS and not self._same_origin_request():
+                self._send(403)
+                return
             if not self.application.auth_password:
                 if path.startswith("/api/"):
                     self._json(

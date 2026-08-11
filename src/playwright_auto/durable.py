@@ -397,6 +397,19 @@ class RequestLedger:
             value = data["records"].get(request_id)
             return DurableRequestRecord.from_dict(value) if value else None
 
+    def peek(self, request_id: str) -> DurableRequestRecord | None:
+        try:
+            raw = json.loads(self.path.read_bytes())
+        except FileNotFoundError:
+            return None
+        if raw.get("version") != self.VERSION:
+            raise DurableRequestError("unsupported durable ledger version")
+        records = raw.get("records")
+        if not isinstance(records, dict):
+            raise DurableRequestError("durable ledger records must be an object")
+        value = records.get(request_id)
+        return DurableRequestRecord.from_dict(value) if value else None
+
     def update(
         self,
         request_id: str,

@@ -54,6 +54,7 @@ class ChatGPTWorkspace:
         *,
         timeout_ms: int = 15_000,
         allow_rebind: bool = False,
+        force_new_page_id: bool = False,
     ) -> ChatGPTPage:
         role = validate_page_role(role)
         existing = self._clients.get(role)
@@ -71,7 +72,6 @@ class ChatGPTWorkspace:
             page, timeout_ms=timeout_ms
         )
         preflight = await client.snapshot()
-        force_new_page_id = False
         if preflight.page_id:
             other_role = self._page_ids.get(preflight.page_id)
             if other_role is not None:
@@ -110,6 +110,7 @@ class ChatGPTWorkspace:
         *,
         url: str = "https://chatgpt.com/",
         timeout_ms: int = 15_000,
+        force_new_page_id: bool = False,
     ) -> ChatGPTPage:
         if role in self._clients:
             raise WorkspaceBindingError(f"role {role!r} is already open")
@@ -119,7 +120,12 @@ class ChatGPTWorkspace:
             await page.locator(
                 '[contenteditable="true"][role="textbox"]'
             ).first.wait_for(state="visible", timeout=timeout_ms)
-            return await self.bind(role, page, timeout_ms=timeout_ms)
+            return await self.bind(
+                role,
+                page,
+                timeout_ms=timeout_ms,
+                force_new_page_id=force_new_page_id,
+            )
         except Exception:
             await page.close()
             raise

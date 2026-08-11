@@ -38,6 +38,7 @@
   "response": {
     "timeout_seconds": 7200,
     "refresh_after_seconds": 1200,
+    "stream_status_terminal_settle_seconds": 5.0,
     "stable_ms": 1000,
     "poll_ms": 1000
   },
@@ -46,7 +47,7 @@
     "idle_close_seconds": 60
   },
   "cleanup": {
-    "terminal_idle_seconds": 1800
+    "terminal_idle_seconds": 300
   },
   "delays": {
     "minimum_seconds": 1.0,
@@ -69,7 +70,8 @@
   },
   "repositories": {
     "allowed_roots": [
-      "/home/ayumi/Workspace/git_project"
+      "/home/ayumi/Workspace/git_project",
+      "/home/ayumi/Workspace/fpt"
     ]
   }
 }

@@ -5,7 +5,7 @@ import {
   detailCacheGet, detailCachePut, detailCacheInvalidate, pruneDetailCache,
 } from "./store.js";
 import {renderBoard, refreshElapsed} from "./views/board.js";
-import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js";
+import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260809-compact-ui-v2";
 import {renderHistory} from "./views/history.js";
 import {renderRuntime} from "./views/runtime.js?v=20260728-system-status-1";
 import {
@@ -29,6 +29,8 @@ const roots = {
   dependencyOptions: document.querySelector("#dependency-options"),
   reuseTeam: document.querySelector('#create-form select[name="reuse_team"]'),
   requestedTeam: document.querySelector('#create-form input[name="requested_team"]'),
+  bootstrapSelect: document.querySelector('#create-form select[name="bootstrap_id"]'),
+  bootstrapInline: document.querySelector("#create-form [data-bootstrap-inline]"),
   workflowAgentOptions: document.querySelector("#workflow-agent-options"),
   createSummary: document.querySelector("#create-selection-summary"),
   createValidation: document.querySelector("#create-validation"),
@@ -51,9 +53,12 @@ const roots = {
 const client = new APIClient(state.etags, state.inflight);
 const activeStatuses = new Set(["submitting", "unknown", "queued", "running"]);
 const OVERLAY_STATE = "cdpaOverlay";
+const INLINE_BOOTSTRAP_VALUE = "__create_inline__";
 let viewSaveTimer = null;
 let closingOverlay = null;
-const agentReportBodies = new Map();
+let bootstrapDefaultId = "";
+const reportBodies = new Map();
+const selectedReportByTask = new Map();
 
 function idempotencyKey() {
   return crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
@@ -216,6 +221,48 @@ function showCreateValidation(message = "") {
   roots.createValidation.hidden = !message;
 }
 
+async function loadBootstrapOptions() {
+  try {
+    const response = await client.request("bootstraps", "/api/bootstraps");
+    if (response.notModified) return;
+    const data = response.data || {};
+    const items = Array.isArray(data.items) ? data.items : [];
+    const options = [new Option("None / Fresh context", "")];
+    for (const item of items) {
+      const option = new Option(item.name || item.bootstrap_id, item.bootstrap_id);
+      option.title = item.description || "";
+      options.push(option);
+    }
+    options.push(new Option("Create bootstrap inline…", INLINE_BOOTSTRAP_VALUE));
+    roots.bootstrapSelect.replaceChildren(...options);
+    bootstrapDefaultId = String(data.default_id || "");
+    roots.bootstrapSelect.value = [...roots.bootstrapSelect.options].some(
+      option => option.value === bootstrapDefaultId,
+    ) ? bootstrapDefaultId : "";
+    syncBootstrapInlineFields();
+    updateCreateSummary();
+  } catch (error) {
+    bootstrapDefaultId = "";
+    roots.bootstrapSelect.replaceChildren(
+      new Option("None / Fresh context", ""),
+      new Option("Create bootstrap inline…", INLINE_BOOTSTRAP_VALUE),
+    );
+    syncBootstrapInlineFields();
+    toast(error.message);
+  }
+}
+
+function syncBootstrapInlineFields() {
+  roots.bootstrapInline.hidden = roots.bootstrapSelect.value !== INLINE_BOOTSTRAP_VALUE;
+}
+
+function resetBootstrapSelection() {
+  roots.bootstrapSelect.value = [...roots.bootstrapSelect.options].some(
+    option => option.value === bootstrapDefaultId,
+  ) ? bootstrapDefaultId : "";
+  syncBootstrapInlineFields();
+}
+
 function updateCreateSummary() {
   const roles = selectedWorkflowRoles();
   const dependencies = selectedDependencyIds(roots.dependencyOptions);
@@ -360,17 +407,20 @@ function renderAgents(current) {
   if (selected && !roots.agentSelect.value) resetAgentEditor();
 }
 
-async function loadAgentReports(detail) {
-  const reports = [...(detail?.reports || []), ...(detail?.maintenance_reports || [])];
+async function loadReports(detail) {
+  const reports = [
+    ...(detail?.reports || []),
+    ...(detail?.task_mode === "independent" ? (detail?.maintenance_reports || []) : []),
+  ];
   await Promise.all(reports.map(async report => {
-    if (!report.url || agentReportBodies.has(report.url)) return;
-    agentReportBodies.set(report.url, {status: "loading"});
+    if (!report.url || reportBodies.has(report.url)) return;
+    reportBodies.set(report.url, {status: "loading"});
     try {
       const response = await fetch(report.url, {headers: {Accept: "text/markdown"}});
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      agentReportBodies.set(report.url, {status: "ready", body: await response.text()});
+      reportBodies.set(report.url, {status: "ready", body: await response.text()});
     } catch (error) {
-      agentReportBodies.set(report.url, {status: "error", error: error.message});
+      reportBodies.set(report.url, {status: "error", error: error.message});
     }
     if (state.selectedDetail?.task_id === detail?.task_id) {
       commit(current => { current.agentReportsRevision += 1; });
@@ -456,19 +506,25 @@ function renderCommands(current) {
   const entries = [...current.pendingCommands.values()].sort(
     (a, b) => String(b.createdAt).localeCompare(String(a.createdAt)),
   );
-  const signature = JSON.stringify(entries.slice(0, 12).map(command => [
+  const signature = JSON.stringify([entries.length, entries.slice(0, 12).map(command => [
     command.kind, command.taskId, command.label, command.status, command.error, command.result,
-  ]));
+  ])]);
   if (roots.commands.dataset.signature !== signature) {
-    const fragment = document.createDocumentFragment();
-    const title = document.createElement("h3");
+    const header = document.createElement("header");
+    const title = document.createElement("h2");
     title.textContent = "Commands";
-    fragment.append(title);
+    const count = document.createElement("span");
+    count.className = "lane-count";
+    count.textContent = String(entries.length);
+    header.append(title, count);
+
+    const list = document.createElement("div");
+    list.className = "lane-list command-list";
     if (!entries.length) {
       const empty = document.createElement("p");
-      empty.className = "muted";
+      empty.className = "muted command-empty";
       empty.textContent = "No pending operations.";
-      fragment.append(empty);
+      list.append(empty);
     }
     for (const command of entries.slice(0, 12)) {
       const row = document.createElement("div");
@@ -485,9 +541,9 @@ function renderCommands(current) {
         detail.textContent = presentation.detail;
         row.append(detail);
       }
-      fragment.append(row);
+      list.append(row);
     }
-    roots.commands.replaceChildren(fragment);
+    roots.commands.replaceChildren(header, list);
     roots.commands.dataset.signature = signature;
   }
 
@@ -503,6 +559,32 @@ function renderCommands(current) {
   if (reload) reload.disabled = Boolean(pendingReload && activeStatuses.has(pendingReload.status));
 }
 
+function renderBootstrapContext(detail) {
+  const context = detail?.bootstrap_context;
+  const existing = roots.detail.querySelector("[data-bootstrap-context]");
+  if (!context) {
+    existing?.remove();
+    return;
+  }
+  const signature = JSON.stringify(context);
+  if (existing?.dataset.signature === signature) return;
+  const section = existing || document.createElement("section");
+  section.dataset.bootstrapContext = "";
+  section.dataset.signature = signature;
+  section.className = "detail-section";
+  const title = document.createElement("strong");
+  title.textContent = `Context · ${context.name || "Fresh context"}`;
+  const meta = document.createElement("p");
+  meta.textContent = context.bootstrap_id ? `Bootstrap ${context.bootstrap_id}` : "Fresh context";
+  const roles = document.createElement("p");
+  roles.textContent = Object.entries(context.roles || {}).map(([role, value]) => {
+    const fallback = value?.fallback && value.fallback !== "none" ? ` · ${value.fallback}` : "";
+    return `${role}: ${value?.source || "pending"}${fallback}`;
+  }).join(" · ");
+  section.replaceChildren(title, meta, roles);
+  if (!existing) roots.detail.append(section);
+}
+
 function render(current) {
   renderBoard(roots.board, current);
   renderTaskDetail(
@@ -514,9 +596,11 @@ function render(current) {
     current.selectedDetailStatus,
     current.selectedDetailError,
     current.selectedIndependentTabByTask.get(current.selectedTaskId) || "overview",
-    agentReportBodies,
+    selectedReportByTask.get(current.selectedTaskId) || null,
+    reportBodies,
     current.agentReportsRevision,
   );
+  renderBootstrapContext(current.selectedDetail);
   renderCommands(current);
   renderRuntime(roots.services, current);
   renderAgents(current);
@@ -560,6 +644,7 @@ subscribe(render);
 installSelectionResume(roots.detail);
 
 function selectTask(taskId, cached = null) {
+  if (state.selectedTaskId !== taskId) selectedReportByTask.clear();
   commit(current => {
     current.selectedTaskId = taskId;
     current.selectedDetail = cached;
@@ -572,6 +657,7 @@ function selectTask(taskId, cached = null) {
 
 function beginDetailLoad(taskId) {
   if (state.selectedTaskId !== taskId) return;
+  if (state.selectedDetail?.task_id === taskId) return;
   commit(current => {
     if (current.selectedTaskId !== taskId) return;
     current.selectedDetail = null;
@@ -611,6 +697,7 @@ function applyDetail(taskId, detail) {
       if (fallback) current.selectedRoleByTask.set(taskId, fallback);
     }
   });
+  if (state.selectedIndependentTabByTask.get(taskId) === "reports") loadReports(detail);
   return true;
 }
 
@@ -899,6 +986,7 @@ function openCreate() {
   showCreateValidation();
   updateCreateSummary();
   loadDashboardActions();
+  loadBootstrapOptions();
 }
 
 function closeCreate() {
@@ -970,17 +1058,32 @@ roots.detail.addEventListener("scroll", () => {
 }, {passive: true});
 
 roots.detail.addEventListener("click", event => {
+  const removeParent = event.target.closest("[data-remove-parent]");
+  if (removeParent) {
+    const taskId = removeParent.dataset.taskId;
+    const parentTaskId = removeParent.dataset.removeParent;
+    if (window.confirm(`Remove parent ${parentTaskId} from ${taskId}?`)) {
+      queueCommand({
+        kind: "remove_parent_dependency",
+        taskId,
+        endpoint: `/api/tasks/${encodeURIComponent(taskId)}/parents/${encodeURIComponent(parentTaskId)}/remove`,
+        body: {expected_task_version: Number(removeParent.dataset.version)},
+        label: `Remove parent · ${parentTaskId}`,
+      });
+    }
+    return;
+  }
   const changeGoal = event.target.closest("[data-change-goal]");
   if (changeGoal) {
     openChangeGoal(state.selectedDetail);
     return;
   }
-  const independentTab = event.target.closest("[data-independent-tab]");
-  if (independentTab) {
-    const taskId = independentTab.dataset.taskId;
-    const tab = independentTab.dataset.independentTab;
+  const detailTab = event.target.closest("[data-detail-tab]");
+  if (detailTab) {
+    const taskId = detailTab.dataset.taskId;
+    const tab = detailTab.dataset.detailTab;
     commit(current => { current.selectedIndependentTabByTask.set(taskId, tab); });
-    if (tab === "reports") loadAgentReports(state.selectedDetail);
+    if (tab === "reports") loadReports(state.selectedDetail);
     return;
   }
   const independent = event.target.closest("[data-independent-action]");
@@ -1005,8 +1108,19 @@ roots.detail.addEventListener("click", event => {
     }
     return;
   }
+  const report = event.target.closest("[data-report-select]");
+  if (report) {
+    const taskId = report.dataset.taskId;
+    selectedReportByTask.set(taskId, report.dataset.reportSelect);
+    commit(current => {
+      if (report.dataset.reportRole) current.selectedRoleByTask.set(taskId, report.dataset.reportRole);
+      current.agentReportsRevision += 1;
+    });
+    return;
+  }
   const role = event.target.closest("[data-role-select]");
   if (role) {
+    selectedReportByTask.delete(role.dataset.taskId);
     commit(current => { current.selectedRoleByTask.set(role.dataset.taskId, role.dataset.roleSelect); });
     return;
   }
@@ -1159,6 +1273,31 @@ roots.form.addEventListener("submit", event => {
     depends_on_task_ids: dependencies,
   };
   body.roles = selectedWorkflowRoles();
+  const bootstrapId = String(values.get("bootstrap_id") || "");
+  if (bootstrapId === INLINE_BOOTSTRAP_VALUE) {
+    const bootstrapNewId = String(values.get("bootstrap_new_id") || "").trim();
+    const bootstrapName = String(values.get("bootstrap_new_name") || "").trim();
+    const bootstrapSource = String(values.get("bootstrap_new_source") || "").trim() || null;
+    const bootstrapPrewarm = String(values.get("bootstrap_new_prewarm_prompt") || "").trim() || null;
+    const bootstrapMaxBackups = Number(values.get("bootstrap_new_max_backups") || 7);
+    if (!bootstrapNewId || !bootstrapName) {
+      showCreateValidation("Inline bootstrap ID and name are required.");
+      return;
+    }
+    if (!bootstrapSource && !bootstrapPrewarm) {
+      showCreateValidation("Inline bootstrap requires a source or prewarm prompt.");
+      return;
+    }
+    body.bootstrap_definition = {
+      bootstrap_id: bootstrapNewId,
+      name: bootstrapName,
+      source: bootstrapSource,
+      prewarm_prompt: bootstrapPrewarm,
+      max_backups: bootstrapMaxBackups,
+    };
+  } else {
+    body.bootstrap_id = bootstrapId || null;
+  }
   if (reuseTeam) body.reuse_team = reuseTeam;
   else if (requestedTeam) body.requested_team = requestedTeam;
   queueCommand({
@@ -1169,6 +1308,7 @@ roots.form.addEventListener("submit", event => {
     label: task.split("\n")[0],
   });
   roots.form.reset();
+  resetBootstrapSelection();
   roots.requestedTeam.disabled = false;
   applyReuseRoleSelection(roots.roleInputs, null, {reset: true});
   updateCreateSummary();
@@ -1180,6 +1320,11 @@ roots.form.addEventListener("input", event => {
     showCreateValidation();
     updateCreateSummary();
   }
+});
+roots.bootstrapSelect.addEventListener("change", () => {
+  syncBootstrapInlineFields();
+  showCreateValidation();
+  updateCreateSummary();
 });
 roots.dependencyOptions.addEventListener("change", updateCreateSummary);
 roots.workflowAgentOptions.addEventListener("change", updateCreateSummary);

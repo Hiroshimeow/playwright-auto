@@ -42,6 +42,53 @@ function selectedInput(detail, selectedRole) {
   return (role && detail.role_inputs?.[role]) || detail.active_input || null;
 }
 
+export function taskGoalBlocks(detail = {}) {
+  const task = detail.task_text || detail.task_title || detail.task_id || "";
+  const goal = detail.effective_goal || detail.task_text || detail.task_id || "";
+  if (task === goal) {
+    return [{key: "task-goal", label: "Task / Effective goal", text: task}];
+  }
+  return [
+    {key: "task", label: "Task", text: task},
+    {key: "effective-goal", label: "Effective goal", text: goal},
+  ];
+}
+
+function reportSort(a, b) {
+  const turn = Number(b.turn || 0) - Number(a.turn || 0);
+  return turn || b._order - a._order;
+}
+
+export function workflowReportModel(detail = {}, selectedRole = null, selectedReportUrl = null) {
+  const roles = detail.roles || [];
+  const physicalRoles = new Map(roles.map(role => [role.physical_role, role.logical_role]));
+  const logicalRoles = new Set(roles.map(role => role.logical_role));
+  const reports = (detail.reports || []).map((report, _order) => ({
+    ...report,
+    _order,
+    _logicalRole: report.role || physicalRoles.get(report.physical_role) || null,
+  })).filter(report => report._logicalRole && logicalRoles.has(report._logicalRole));
+
+  const roleModels = roles.map(role => {
+    const roleReports = reports.filter(report => report._logicalRole === role.logical_role).sort(reportSort);
+    return {
+      role: role.logical_role,
+      physicalRole: role.physical_role,
+      latest: roleReports[0] || null,
+      reports: roleReports,
+    };
+  });
+  const latestOrders = new Set(roleModels.filter(item => item.latest).map(item => item.latest._order));
+  const olderReports = reports.filter(report => !latestOrders.has(report._order)).sort(reportSort);
+  const newest = [...reports].sort(reportSort)[0] || null;
+  const explicit = selectedReportUrl ? reports.find(report => report.url === selectedReportUrl) : null;
+  const selectedReport = explicit || (detail.status === "DONE"
+    ? roleModels.find(item => item.role === "PLAN")?.latest || newest
+    : roleModels.find(item => item.role === selectedRole)?.latest || newest);
+  const coverage = `${roleModels.filter(item => item.latest).length}/${roleModels.length}`;
+  return {roles: roleModels, olderReports, selectedReport, coverage};
+}
+
 function relativeTime(value, now = Date.now()) {
   const at = Date.parse(value || "");
   if (!Number.isFinite(at)) return "—";
@@ -157,7 +204,7 @@ function independentControls(detail) {
   const inFlight = ["sending", "sent", "waiting"].includes(detail.active_hop?.state);
   const tabOpen = Boolean(agent.tab_open);
 
-  controls.append(independentButton("run-task", "Run task", detail, {disabled: active}));
+  controls.append(independentButton("run-task", "Run task", detail, {disabled: active || !enabled}));
   controls.append(button(enabled ? "pause" : "resume", enabled ? "Pause" : "Enable", detail));
   controls.append(button("reset", "Reset", detail, {disabled: !active}));
   controls.append(independentButton("settings", "Settings", detail));
@@ -172,6 +219,7 @@ function independentControls(detail) {
 function independentOverview(detail, timeline, selectedRole) {
   const fragment = document.createDocumentFragment();
   const agent = detail.agent || {};
+  fragment.append(independentControls(detail));
   const section = el("section", null, "detail-section independent-overview");
   section.append(el("h3", "Independent Agent"));
   const prompt = agent.system_prompt || detail.task_text || "No system prompt projected.";
@@ -198,7 +246,6 @@ function independentOverview(detail, timeline, selectedRole) {
     fragment.append(problem);
   }
 
-  fragment.append(independentControls(detail));
   const tabState = el("p", null, "tab-state-help");
   if (agent.tab_open) {
     const keepOpen = agent.tab_keep_open_until
@@ -239,6 +286,29 @@ function independentHistory(detail) {
   return section;
 }
 
+export function reportBody(report, reportBodies) {
+  if (report?.availability === "remote_unmirrored") {
+    return "Report stored on remote execution host / not mirrored.";
+  }
+  if (report?.availability === "unavailable") {
+    return "Report is unavailable on this dashboard host.";
+  }
+  const loaded = report?.url ? reportBodies.get(report.url) : null;
+  if (loaded?.status === "ready") return loaded.body;
+  if (loaded?.status === "error") return `Report load failed: ${loaded.error}`;
+  if (report?.content || report?.message) return report.content || report.message;
+  return "Loading report body…";
+}
+
+function reportLink(report) {
+  if (!report?.url) return null;
+  const link = el("a", "Open raw report");
+  link.href = report.url;
+  link.target = "_blank";
+  link.rel = "noopener";
+  return link;
+}
+
 function independentReports(detail, reportBodies) {
   const section = el("section", null, "detail-section independent-reports");
   const reports = [...(detail.reports || []), ...(detail.maintenance_reports || [])];
@@ -250,34 +320,24 @@ function independentReports(detail, reportBodies) {
   for (const report of reports) {
     const article = el("article", null, "history-card");
     article.append(el("strong", report.summary || report.outcome || report.role || "Report"));
-    if (report.url) {
-      const link = el("a", report.url);
-      link.href = report.url;
-      link.target = "_blank";
-      link.rel = "noopener";
-      article.append(link);
-    }
-    const loaded = report.url ? reportBodies.get(report.url) : null;
-    const body = el("pre", null, "task-text");
-    if (loaded?.status === "ready") body.textContent = loaded.body;
-    else if (loaded?.status === "error") body.textContent = `Report load failed: ${loaded.error}`;
-    else if (report.content || report.message) body.textContent = report.content || report.message;
-    else body.textContent = "Loading report body…";
-    article.append(body);
+    const link = reportLink(report);
+    if (link) article.append(link);
+    article.append(el("pre", reportBody(report, reportBodies), "task-text"));
     list.append(article);
   }
   section.append(list);
   return section;
 }
 
-function independentTabs(detail, selectedTab) {
-  const tabs = el("div", null, "independent-tabs");
+function detailTabs(detail, selectedTab, items, ariaLabel, independent = false) {
+  const tabs = el("div", null, "independent-tabs detail-tabs");
   tabs.setAttribute("role", "tablist");
-  tabs.setAttribute("aria-label", "Independent agent detail");
-  for (const [id, label] of [["overview", "Overview"], ["history", "History"], ["reports", "Reports"]]) {
+  tabs.setAttribute("aria-label", ariaLabel);
+  for (const [id, label] of items) {
     const tab = el("button", label);
     tab.type = "button";
-    tab.dataset.independentTab = id;
+    tab.dataset.detailTab = id;
+    if (independent) tab.dataset.independentTab = id;
     tab.dataset.taskId = detail.task_id;
     tab.setAttribute("role", "tab");
     tab.setAttribute("aria-selected", String(selectedTab === id));
@@ -287,13 +347,136 @@ function independentTabs(detail, selectedTab) {
   return tabs;
 }
 
-function workflowContent(detail, timeline, selectedRole) {
+function independentTabs(detail, selectedTab) {
+  return detailTabs(
+    detail,
+    selectedTab,
+    [["overview", "Overview"], ["history", "History"], ["reports", "Reports"]],
+    "Independent agent detail",
+    true,
+  );
+}
+
+function workflowTabs(detail, selectedTab) {
+  const model = workflowReportModel(detail);
+  const tabs = detailTabs(
+    detail,
+    selectedTab,
+    [["overview", "Overview"], ["reports", `Reports ${model.coverage}`]],
+    "Workflow task detail",
+  );
+  tabs.classList.add("workflow-detail-tabs");
+  return tabs;
+}
+
+function workflowReports(detail, selectedRole, selectedReportUrl, reportBodies) {
+  const section = el("section", null, "detail-section workflow-reports");
+  const model = workflowReportModel(detail, selectedRole, selectedReportUrl);
+  const layout = el("div", null, "workflow-report-layout");
+  const navigator = el("div", null, "report-role-nav");
+  const content = el("div", null, "workflow-report-content");
+  for (const item of model.roles) {
+    const role = el("button", null, `report-role${item.role === model.selectedReport?._logicalRole ? " selected" : ""}`);
+    role.type = "button";
+    role.disabled = !item.latest;
+    role.dataset.taskId = detail.task_id;
+    role.append(el("strong", item.role));
+    role.append(el("span", item.latest ? `Turn ${item.latest.turn ?? "—"}` : "No report"));
+    if (item.latest?.url) {
+      role.dataset.reportSelect = item.latest.url;
+      role.dataset.reportRole = item.role;
+    }
+    navigator.append(role);
+  }
+  layout.append(navigator, content);
+  section.append(layout);
+
+  const report = model.selectedReport;
+  if (!report) {
+    content.append(el("p", "No workflow reports are available yet.", "muted"));
+    return section;
+  }
+
+  const reader = el("article", null, "report-reader");
+  const meta = [report._logicalRole || report.role, `Turn ${report.turn ?? "—"}`, report.created_at].filter(Boolean).join(" · ");
+  reader.append(el("strong", meta || "Report"));
+  const link = reportLink(report);
+  if (link) reader.append(link);
+  reader.append(el("pre", reportBody(report, reportBodies), "task-text report-body"));
+  content.append(reader);
+
+  if (model.olderReports.length) {
+    const older = el("details", null, "older-reports");
+    older.append(el("summary", `Older reports (${model.olderReports.length})`));
+    const list = el("div", null, "older-report-list");
+    for (const item of model.olderReports) {
+      const select = el("button", null, "older-report");
+      select.type = "button";
+      select.dataset.taskId = detail.task_id;
+      select.dataset.reportSelect = item.url || "";
+      select.dataset.reportRole = item._logicalRole || "";
+      select.append(el("strong", `${item._logicalRole} · Turn ${item.turn ?? "—"}`));
+      if (item.created_at) select.append(el("span", item.created_at));
+      list.append(select);
+    }
+    older.append(list);
+    content.append(older);
+  }
+  return section;
+}
+
+function dependencySection(detail) {
+  const section = el("section", null, "detail-section");
+  section.append(el("h3", "Parents"));
+  const list = el("div", null, "history-list");
+  for (const parentTaskId of detail.depends_on_task_ids || []) {
+    const row = el("article", null, "history-card");
+    row.append(el("strong", parentTaskId));
+    const remove = el("button", "Remove parent");
+    remove.type = "button";
+    remove.dataset.removeParent = parentTaskId;
+    remove.dataset.taskId = detail.task_id;
+    remove.dataset.version = String(detail.version || 0);
+    row.append(remove);
+    list.append(row);
+  }
+  section.append(list);
+  return section;
+}
+
+function workflowOverview(detail, timeline, selectedRole) {
   const fragment = document.createDocumentFragment();
-  const taskSection = el("section", null, "detail-section");
-  taskSection.append(el("h3", "Task"));
-  taskSection.append(el("pre", detail.task_text || detail.task_title || detail.task_id, "task-text"));
-  taskSection.append(el("h3", "Effective goal"));
-  taskSection.append(el("pre", detail.effective_goal || detail.task_text || detail.task_id, "task-text"));
+  const controls = el("div", null, "control-grid");
+  if (detail.status === "RUNNING") controls.append(changeGoalButton(detail));
+  for (const [action, label] of [
+    ["pause", "Pause"], ["resume", "Resume"], ["retry", "Retry hop"],
+    ["restart_role", "Restart role"], ["new_chat", "New chat"],
+    ["open_tab", "Open tab"], ["route_plan", "Route PLAN"],
+    ["stop", "Stop"], ["clear_team", "Clear team"],
+  ]) controls.append(button(action, label, detail));
+  fragment.append(controls);
+  if ((detail.depends_on_task_ids || []).length) {
+    fragment.append(dependencySection(detail));
+  }
+
+  const taskSection = el("section", null, "detail-section task-goal-section");
+  for (const block of taskGoalBlocks(detail)) {
+    const details = el("details", null, "task-disclosure");
+    details.dataset.disclosureKey = block.key;
+    const summary = el("summary", null, "task-disclosure-summary");
+    summary.append(
+      el("strong", block.label, "task-disclosure-label"),
+      el("span", block.text, "task-disclosure-preview"),
+    );
+    const toggle = el("span", null, "task-disclosure-toggle");
+    toggle.append(
+      el("span", "Show more", "task-disclosure-more"),
+      el("span", "Show less", "task-disclosure-less"),
+    );
+    summary.append(toggle);
+    details.append(summary, el("pre", block.text, "task-text"));
+    taskSection.append(details);
+  }
   const revisions = detail.goal_revisions || [];
   if (revisions.length) {
     const history = el("div", null, "goal-revision-list");
@@ -316,19 +499,11 @@ function workflowContent(detail, timeline, selectedRole) {
     fragment.append(problem);
   }
 
-  const controls = el("div", null, "control-grid");
-  if (detail.status === "RUNNING") controls.append(changeGoalButton(detail));
-  for (const [action, label] of [
-    ["pause", "Pause"], ["resume", "Resume"], ["retry", "Retry hop"],
-    ["restart_role", "Restart role"], ["new_chat", "New chat"],
-    ["open_tab", "Open tab"], ["route_plan", "Route PLAN"],
-    ["stop", "Stop"], ["clear_team", "Clear team"],
-  ]) controls.append(button(action, label, detail));
-  fragment.append(controls, rolesSection(detail, selectedRole), timelineSection(detail, timeline));
+  fragment.append(rolesSection(detail, selectedRole), timelineSection(detail, timeline));
   return fragment;
 }
 
-function build(detail, timeline, selectedRole, selectedTab, reportBodies) {
+function build(detail, timeline, selectedRole, selectedTab, selectedReportUrl, reportBodies) {
   const fragment = document.createDocumentFragment();
   const agent = detail.task_mode === "independent" ? (detail.agent || {}) : null;
   const displayTitle = agent
@@ -342,7 +517,14 @@ function build(detail, timeline, selectedRole, selectedTab, reportBodies) {
   fragment.append(head);
 
   if (!agent) {
-    fragment.append(workflowContent(detail, timeline, selectedRole));
+    const tab = ["overview", "reports"].includes(selectedTab) ? selectedTab : "overview";
+    fragment.append(workflowTabs(detail, tab));
+    const panel = el("div", null, "independent-tab-panel");
+    panel.setAttribute("role", "tabpanel");
+    panel.append(tab === "reports"
+      ? workflowReports(detail, selectedRole, selectedReportUrl, reportBodies)
+      : workflowOverview(detail, timeline, selectedRole));
+    fragment.append(panel);
     return fragment;
   }
 
@@ -385,6 +567,7 @@ export function renderTaskDetail(
   status = "idle",
   error = null,
   selectedTab = "overview",
+  selectedReportUrl = null,
   reportBodies = new Map(),
   reportRevision = 0,
 ) {
@@ -410,12 +593,18 @@ export function renderTaskDetail(
   if (sameTask && selection && !selection.isCollapsed && root.contains(selection.anchorNode)) {
     root._pendingRender = () => renderTaskDetail(
       root, detail, timeline, selectedRole, selectedTaskId, status, error,
-      selectedTab, reportBodies, reportRevision,
+      selectedTab, selectedReportUrl, reportBodies, reportRevision,
     );
     return;
   }
+  const openDisclosureKeys = sameTask ? new Set(
+    [...root.querySelectorAll("details[data-disclosure-key][open]")].map(details => details.dataset.disclosureKey),
+  ) : new Set();
   const scroll = root.scrollTop;
-  root.replaceChildren(build(detail, timeline, selectedRole, selectedTab, reportBodies));
+  root.replaceChildren(build(detail, timeline, selectedRole, selectedTab, selectedReportUrl, reportBodies));
+  for (const details of root.querySelectorAll("details[data-disclosure-key]")) {
+    details.open = openDisclosureKeys.has(details.dataset.disclosureKey);
+  }
   root.className = "panel";
   root.dataset.signature = signature;
   root.dataset.taskId = detail.task_id;

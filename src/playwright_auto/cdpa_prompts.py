@@ -36,6 +36,11 @@ class PromptBuilder:
     def naming_rule(self) -> str:
         return f"{self._plans_prefix()}/<team>/<physical-role>_turn<N>_<task-id>.md"
 
+    def _base_context(self) -> str:
+        return self.config.response_guide_path.with_name("BASE_CONTEXT.md").read_text(
+            encoding="utf-8"
+        ).strip()
+
     def _guide(
         self,
         report_mode: str = "file",
@@ -53,7 +58,7 @@ class PromptBuilder:
                 for item in allowed_routes
             )
             guide = guide.replace(
-                "PLAN|DEV|TEST|REVIEW|AUDIT|DONE", route_contract
+                "PLAN|DEV|TEST|REVIEW|AUDIT|PAUSE|DONE", route_contract
             )
         return guide.replace(
             ".plan/<team>/<physical-role>_turn<N>_<task-id>.md",
@@ -78,6 +83,8 @@ class PromptBuilder:
         conversation_generation: int,
         report_mode: str = "file",
         constructor_text: str | None = None,
+        is_system_role: bool = True,
+        bootstrap_inherited: bool = False,
     ) -> BuiltPrompt:
         role = validate_workflow_route_key(logical_role)
         allowed = tuple(str(item).strip().upper() for item in allowed_routes)
@@ -117,6 +124,8 @@ class PromptBuilder:
                 .read_text(encoding="utf-8")
                 .strip()
             )
+            if is_system_role and not bootstrap_inherited:
+                sections.append(self._base_context())
             sections.append(constructor)
         sections.append(self._guide(report_mode, allowed_routes))
         return BuiltPrompt("\n\n".join(sections).strip(), include, generation)

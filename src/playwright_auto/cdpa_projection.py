@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .cdpa_config import CDPA_ROLES
+from .cdpa_config import CDPA_ROLES, declared_repository_from_task, remote_repository_from_task
 from .cdpa_dependencies import dependency_parent_ids
 from .cdpa_independent import independent_tags, is_independent_task
 from .cdpa_safety import sanitize_text, sanitize_value
@@ -65,6 +66,7 @@ _PRIVATE_IDENTITY_KEYS = frozenset(
         "page_id",
         "page_url",
         "request_id",
+        "terminal_assistant_message_id",
         "user_message_id",
         "user_turn_id",
     }
@@ -93,6 +95,7 @@ _PRIVATE_PUBLIC_KEYS = frozenset(
         "response_sha256",
         "root",
         "system_prompt",
+        "terminal_assistant_message_id",
         "user_message_id",
         "user_turn_id",
         "workspace",
@@ -349,6 +352,64 @@ def _int_or_zero(value: object) -> int:
     return max(0, parsed)
 
 
+def _hydrate_file_report_evidence(
+    raw: Mapping[str, Any],
+    report_path: str,
+    *,
+    repository: str,
+    repository_allowed_roots: Sequence[str | Path] = (),
+    declared_hash: str = "",
+    declared_size: int = 0,
+) -> tuple[str, str, int, str] | None:
+    team = str(raw.get("team") or "").strip()
+    primary_repository = str(raw.get("repository") or "").strip()
+    if not repository or not team or not report_path:
+        return None
+    repository_root = Path(repository).expanduser().resolve()
+    primary_root = Path(primary_repository).expanduser().resolve() if primary_repository else None
+    allowed_roots = tuple(Path(root).expanduser().resolve() for root in repository_allowed_roots)
+    if repository_root != primary_root and not any(
+        repository_root.is_relative_to(root) for root in allowed_roots
+    ):
+        return None
+
+    team_root = repository_root / ".plan" / team
+    path = Path(report_path).expanduser()
+    lexical = Path(os.path.abspath(path if path.is_absolute() else repository_root / path))
+    try:
+        relative = lexical.relative_to(team_root)
+    except ValueError:
+        return None
+    if not relative.parts:
+        return None
+
+    current = repository_root
+    for part in (".plan", team, *relative.parts):
+        current /= part
+        if current.is_symlink():
+            return None
+    try:
+        candidate = lexical.resolve(strict=True)
+        resolved_team_root = team_root.resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        return None
+    if not candidate.is_relative_to(resolved_team_root) or not candidate.is_file():
+        return None
+    try:
+        size = candidate.stat().st_size
+    except OSError:
+        return None
+    if declared_hash and declared_size > 0:
+        if size != declared_size:
+            return None
+        return str(candidate), declared_hash, declared_size, str(repository_root)
+    try:
+        body = candidate.read_bytes()
+    except OSError:
+        return None
+    return str(candidate), hashlib.sha256(body).hexdigest(), len(body), str(repository_root)
+
+
 def _report_rows(
     raw: Mapping[str, Any],
     *,
@@ -356,9 +417,13 @@ def _report_rows(
     report_id_prefix: str = "",
     source_task_id: str | None = None,
     generation: int | None = None,
+    repository_allowed_roots: Sequence[str | Path] = (),
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     task_id = str(public_task_id or raw.get("task_id") or "")
     source_id = str(source_task_id or raw.get("task_id") or "")
+    team = str(raw.get("team") or "").strip()
+    primary_repository = str(raw.get("repository") or "").strip()
+    task_text = str(raw.get("task_text") or "")
     public: list[dict[str, Any]] = []
     private: dict[str, dict[str, Any]] = {}
     for index, report in enumerate(raw.get("reports") or [], start=1):
@@ -368,7 +433,7 @@ def _report_rows(
         report_id = f"{report_id_prefix}{original_id}"
         content = report.get("content")
         encoded = str(content).encode("utf-8") if content is not None else None
-        public.append({
+        public_row = {
             "report_id": report_id,
             "physical_role": str(report.get("physical_role") or "") or None,
             "role": str(report.get("role") or "") or None,
@@ -378,22 +443,69 @@ def _report_rows(
             "outcome": str(report.get("outcome") or "") or None,
             "source_task_id": source_id,
             "generation": generation,
-            "url": f"/api/reports/{task_id}/{report_id}",
-        })
+        }
         if encoded is not None:
+            public_row.update(
+                availability="available",
+                url=f"/api/reports/{task_id}/{report_id}",
+            )
             private[report_id] = {
                 "content": str(content),
                 "sha256": str(report.get("sha256") or hashlib.sha256(encoded).hexdigest()),
                 "size": _int_or_zero(report.get("size")) or len(encoded),
+                "availability": "available",
             }
         else:
+            path = str(report.get("path") or "")
+            declared_hash = str(report.get("sha256") or "")
+            declared_size = _int_or_zero(report.get("size"))
+            hydrated = _hydrate_file_report_evidence(
+                raw,
+                path,
+                repository=primary_repository,
+                repository_allowed_roots=repository_allowed_roots,
+                declared_hash=declared_hash,
+                declared_size=declared_size,
+            )
+            if hydrated is None:
+                try:
+                    declared_repository = declared_repository_from_task(task_text)
+                except ValueError:
+                    declared_repository = None
+                if declared_repository and declared_repository != primary_repository:
+                    hydrated = _hydrate_file_report_evidence(
+                        raw,
+                        path,
+                        repository=declared_repository,
+                        repository_allowed_roots=repository_allowed_roots,
+                        declared_hash=declared_hash,
+                        declared_size=declared_size,
+                    )
+            if hydrated is not None:
+                resolved_path, resolved_hash, resolved_size, resolved_repository = hydrated
+                availability = "available"
+                public_row["url"] = f"/api/reports/{task_id}/{report_id}"
+            else:
+                resolved_path = path
+                resolved_hash = declared_hash
+                resolved_size = declared_size
+                resolved_repository = primary_repository
+                availability = (
+                    "remote_unmirrored"
+                    if remote_repository_from_task(task_text) is not None
+                    else "unavailable"
+                )
+            public_row["availability"] = availability
             private[report_id] = {
-                "path": str(report.get("path") or ""),
-                "sha256": str(report.get("sha256") or ""),
-                "size": _int_or_zero(report.get("size")),
+                "path": resolved_path,
+                "sha256": resolved_hash,
+                "size": resolved_size,
+                "repository": resolved_repository,
+                "team": team,
+                "availability": availability,
             }
+        public.append(public_row)
     return public, private
-
 
 def _independent_response_rows(
     raw: Mapping[str, Any],
@@ -820,6 +932,7 @@ def build_task_projection(
     waiting_order: Mapping[str, Mapping[str, Any]] | None = None,
     browser_pages: Sequence[Mapping[str, Any]] = (),
     browser_connected: bool | None = None,
+    repository_allowed_roots: Sequence[str | Path] = (),
 ) -> TaskProjection:
     task_id = str(raw.get("task_id") or "")
     team = str(raw.get("team") or "")
@@ -840,7 +953,9 @@ def build_task_projection(
         independent_history, reports, report_private = _independent_lifecycle(raw, tasks)
     else:
         independent_history = []
-        reports, report_private = _report_rows(raw)
+        reports, report_private = _report_rows(
+            raw, repository_allowed_roots=repository_allowed_roots
+        )
     maintenance_reports, maintenance_private = _maintenance_reports(raw)
     timeline = _timeline(raw)
     problem = _problem(raw)
@@ -853,6 +968,19 @@ def build_task_projection(
         if active_input is not None:
             active_input = {**active_input, "input": None, "handoff": None}
     queue = raw.get("queue") if isinstance(raw.get("queue"), Mapping) else {}
+    waiting = raw.get("waiting") if isinstance(raw.get("waiting"), Mapping) else {}
+    elapsed_end_at = None
+    if status != "RUNNING":
+        elapsed_end_at = str(
+            (
+                raw.get("completed_at") if status == "DONE"
+                else raw.get("stopped_at") if status == "STOPPED"
+                else raw.get("blocked_at") if status == "BLOCKED"
+                else waiting.get("since") if status == "WAITING"
+                else raw.get("updated_at")
+            )
+            or updated_at
+        ) or None
     title = _public_text(
         str(raw.get("task_text") or raw.get("task_title") or "").splitlines()[0],
         max_chars=240,
@@ -883,6 +1011,7 @@ def build_task_projection(
         "started_at": str(raw.get("started_at") or "") or None,
         "updated_at": updated_at,
         "effective_activity_at": str(raw.get("last_role_activity_at") or updated_at),
+        "elapsed_end_at": elapsed_end_at,
         "availability": availability,
         "primary_problem": problem,
         "waiting_reason": _public_text(raw.get("waiting_reason"), max_chars=500) or None,
@@ -914,6 +1043,24 @@ def build_task_projection(
             if isinstance(independent.get("active_event"), Mapping)
             else {}
         )
+        job_history = [
+            item
+            for item in independent.get("job_history") or []
+            if isinstance(item, Mapping)
+        ]
+        run_event_keys = {
+            str(item.get("event_key") or "")
+            for item in job_history
+            if str(item.get("event_key") or "")
+        }
+        active_event_key = str(active_event.get("event_key") or "")
+        if active_event_key:
+            run_event_keys.add(active_event_key)
+        last_run_at = str(
+            active_event.get("occurred_at")
+            or (job_history[-1].get("released_at") if job_history else "")
+            or ""
+        ) or None
         summary["task_mode"] = "independent"
         summary["agent"] = {
             "name": _public_text(
@@ -950,7 +1097,47 @@ def build_task_projection(
                 independent.get("idle_tab_closed_at") or ""
             ) or None,
             "last_outcome": _public_value(independent.get("last_outcome")),
+            "run_count": len(run_event_keys),
+            "run_count_truncated": len(job_history) >= 200,
+            "last_run_at": last_run_at,
         }
+    bootstrap_context = None
+    bootstrap = raw.get("bootstrap") if isinstance(raw.get("bootstrap"), Mapping) else None
+    if independent is None and bootstrap is not None:
+        role_records = raw.get("roles") if isinstance(raw.get("roles"), Mapping) else {}
+        labels = {
+            "bootstrap_donor": {
+                "source": "Bootstrap / donor branch",
+                "fallback": "lazy donor failover",
+            },
+            "bootstrap_native": {
+                "source": "Bootstrap / native branch",
+                "fallback": "legacy task",
+            },
+            "bootstrap_ui": {
+                "source": "Bootstrap / UI branch",
+                "fallback": "native branch failed",
+            },
+            "fresh_fallback": {
+                "source": "Fresh context",
+                "fallback": "bootstrap fallback exhausted",
+            },
+        }
+        bootstrap_context = {
+            "bootstrap_id": str(bootstrap.get("bootstrap_id") or "") or None,
+            "name": _public_text(bootstrap.get("name"), max_chars=200),
+            "roles": {
+                str(role): dict(
+                    labels.get(
+                        record.get("context_source"),
+                        {"source": "pending", "fallback": "pending"},
+                    )
+                )
+                for role, record in role_records.items()
+                if isinstance(record, Mapping)
+            },
+        }
+
     goal_revisions = []
     for revision in raw.get("goal_revisions") or []:
         if not isinstance(revision, Mapping):
@@ -970,6 +1157,11 @@ def build_task_projection(
             raw.get("effective_goal") or raw.get("task_text"), max_chars=None
         ),
         "goal_revisions": goal_revisions,
+        **(
+            {"bootstrap_context": bootstrap_context}
+            if bootstrap_context is not None
+            else {}
+        ),
         "roles": roles,
         "active_hop": active_input,
         "active_input": active_input,
@@ -993,6 +1185,7 @@ def build_task_projection(
     }
     private = {
         "manifest_path": str(raw.get("manifest_path") or ""),
+        "repository": str(raw.get("repository") or ""),
         "reports": report_private,
         "maintenance_reports": maintenance_private,
         "timeline": timeline,
