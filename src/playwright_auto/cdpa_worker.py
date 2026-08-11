@@ -4708,6 +4708,7 @@ class CDPAWorker:
         hop: dict[str, Any],
         control: dict[str, Any],
         actions: CDPATabActions,
+        ledger: RequestLedger,
         record: Any,
     ) -> bool:
         if record is None or record.status is not RequestStatus.UPLOADING:
@@ -4838,6 +4839,29 @@ class CDPAWorker:
                 f"The failed upload composer is {recovery.value}; automatic continuation is unsafe.",
                 "Preserve the current composer and attachments; resolve ownership ambiguity manually.",
             )
+        if recovery is DurableRecoveryState.COMPOSER_PROMPT_MISSING_ATTACHMENTS:
+            authorization_prefix = f"{DurableSendBlock.UPLOAD_RETRY_AUTHORIZATION}:"
+            retry_authorized = str(record.error or "").startswith(
+                authorization_prefix
+            )
+            if not retry_authorized and not str(record.error or "").strip():
+                return recovery_required(
+                    "attachment_upload_outcome_ambiguous",
+                    "The UPLOADING request has no completed failure evidence; the prior browser upload outcome is unknown.",
+                    "Do not re-upload automatically. Restore explicit failure/readiness evidence before Resume.",
+                )
+            if not retry_authorized:
+                control_id = control.get("control_id")
+                if not isinstance(control_id, int) or isinstance(control_id, bool):
+                    return recovery_required(
+                        "attachment_upload_retry_unauthorized",
+                        "The failed upload retry has no durable Resume control identity.",
+                        "Issue one normal operator Resume for this exact failed upload.",
+                    )
+                record = ledger.update(
+                    record.request_id,
+                    error=f"{authorization_prefix}{control_id}",
+                )
 
         self._record_acquired(state, role, acquired)
         hop["conversation_url"] = acquired.url
@@ -4884,7 +4908,7 @@ class CDPAWorker:
             )
             return
         if await self._recover_failed_upload_before_ready(
-            state, hop, control, actions, record
+            state, hop, control, actions, ledger, record
         ):
             return
         if record is None or record.status is not RequestStatus.SENDING:

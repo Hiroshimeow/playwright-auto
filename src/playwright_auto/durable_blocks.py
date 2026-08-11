@@ -137,6 +137,7 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
     """
 
     retry_safe = False
+    UPLOAD_RETRY_AUTHORIZATION = "upload_retry_authorized"
 
     def __init__(
         self,
@@ -430,6 +431,9 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
         failed_upload_before_ready = bool(
             record.status is RequestStatus.UPLOADING
             and recovery is DurableRecoveryState.COMPOSER_PROMPT_MISSING_ATTACHMENTS
+            and str(record.error or "").startswith(
+                f"{self.UPLOAD_RETRY_AUTHORIZATION}:"
+            )
             and int(record.attempts or 0) == 0
             and record.binding is None
             and record.baseline is None
@@ -522,6 +526,8 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
                 raise DurableRequestError(
                     f"cannot start upload from durable status {record.status.value}"
                 )
+            else:
+                record = ledger.update(record.request_id, error=None)
             try:
                 upload_receipt = await context.client.upload_files(
                     paths,

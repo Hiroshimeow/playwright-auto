@@ -288,7 +288,7 @@ def test_sending_without_marker_fails_closed_and_never_resends(tmp_path):
 
 
 
-def test_failed_upload_before_ready_reuses_same_request_and_sends_once(tmp_path):
+def test_authorized_failed_upload_before_ready_reuses_same_request_and_sends_once(tmp_path):
     ledger_path = tmp_path / "ledger.json"
     attachment = tmp_path / "context.txt"
     attachment.write_text("context", encoding="utf-8")
@@ -299,7 +299,7 @@ def test_failed_upload_before_ready_reuses_same_request_and_sends_once(tmp_path)
     record = ledger.update(
         record.request_id,
         status=RequestStatus.UPLOADING,
-        error="RuntimeError: synthetic upload failure before readiness",
+        error="upload_retry_authorized:1",
     )
     original_request_id = record.request_id
     assert record.attempts == 0
@@ -350,6 +350,89 @@ def test_failed_upload_before_ready_reuses_same_request_and_sends_once(tmp_path)
     assert current.attempts == 1
     assert len(client.upload_calls) == 1
     assert len(client.send_calls) == 1
+
+
+def test_interrupted_upload_without_retry_authorization_fails_closed(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    attachment = tmp_path / "context.txt"
+    attachment.write_text("context", encoding="utf-8")
+    identities = collect_file_identities([attachment])
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(role="DEV", prompt="upload interrupted", files=identities)
+    record = ledger.update(record.request_id, status=RequestStatus.PROMPT_SET)
+    record = ledger.update(record.request_id, status=RequestStatus.UPLOADING, error=None)
+    client = FakeDurableClient(
+        snapshot(text=record.rendered_prompt, state=ChatGPTState.DRAFT)
+    )
+
+    with pytest.raises(Exception) as captured:
+        run_block(
+            DurableSendBlock(
+                "upload interrupted",
+                ledger_path=ledger_path,
+                files=[str(attachment)],
+                stable_ms=0,
+            ),
+            client,
+        )
+
+    assert isinstance(captured.value.cause, DurableRequestError)
+    assert client.upload_calls == []
+    assert client.send_calls == []
+
+
+def test_consumed_upload_retry_authorization_crash_is_not_replayed(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    attachment = tmp_path / "context.txt"
+    attachment.write_text("context", encoding="utf-8")
+    identities = collect_file_identities([attachment])
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(role="DEV", prompt="upload retry crash", files=identities)
+    record = ledger.update(record.request_id, status=RequestStatus.PROMPT_SET)
+    record = ledger.update(
+        record.request_id,
+        status=RequestStatus.UPLOADING,
+        error="upload_retry_authorized:7",
+    )
+
+    class UploadCrash(BaseException):
+        pass
+
+    class CrashClient(FakeDurableClient):
+        async def upload_files(self, paths, *, request_marker, **_options):
+            self.upload_calls.append((tuple(paths), request_marker))
+            consumed = ledger.get(record.request_id)
+            assert consumed is not None and consumed.error is None
+            raise UploadCrash()
+
+    crash_client = CrashClient(
+        snapshot(text=record.rendered_prompt, state=ChatGPTState.DRAFT)
+    )
+    block = DurableSendBlock(
+        "upload retry crash",
+        ledger_path=ledger_path,
+        files=[str(attachment)],
+        wait_for_response=False,
+        stable_ms=0,
+    )
+
+    with pytest.raises(UploadCrash):
+        run_block(block, crash_client)
+
+    interrupted = ledger.get(record.request_id)
+    assert interrupted is not None and interrupted.error is None
+    assert len(crash_client.upload_calls) == 1
+    assert crash_client.send_calls == []
+
+    restarted = FakeDurableClient(
+        snapshot(text=record.rendered_prompt, state=ChatGPTState.DRAFT)
+    )
+    with pytest.raises(Exception) as captured:
+        run_block(block, restarted)
+
+    assert isinstance(captured.value.cause, DurableRequestError)
+    assert restarted.upload_calls == []
+    assert restarted.send_calls == []
 
 
 def test_failed_upload_with_unproven_attachment_fails_closed_without_discard(tmp_path):

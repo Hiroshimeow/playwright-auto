@@ -549,6 +549,12 @@ def test_resume_failed_attachment_upload_reuses_same_request_and_owned_page(tmp_
 
     asyncio.run(fresh_worker._recover_resume_sending(state, hop, control, actions))
 
+    authorized = ledger.get(original_request_id)
+    assert authorized is not None
+    assert authorized.error == (
+        f"{worker_module.DurableSendBlock.UPLOAD_RETRY_AUTHORIZATION}:"
+        f"{control['control_id']}"
+    )
     assert control["status"] == "applied", control["result"]["reason"]
     assert control["result"]["action"] == "continue_failed_upload"
     assert control["result"]["postcondition"] == "same_request_upload_recovery_ready"
@@ -561,7 +567,10 @@ def test_resume_failed_attachment_upload_reuses_same_request_and_owned_page(tmp_
 
     repeated = {"role": "PLAN", "result": {"before": {}}}
     asyncio.run(fresh_worker._recover_resume_sending(state, hop, repeated, actions))
+    repeated_record = ledger.get(original_request_id)
     assert repeated["status"] == "applied"
+    assert repeated_record is not None
+    assert repeated_record.error == authorized.error
     assert client.upload_calls == 1
     assert client.send_calls == []
 
@@ -576,6 +585,72 @@ def test_resume_failed_attachment_upload_reuses_same_request_and_owned_page(tmp_
     assert hop["request_id"] == original_request_id
     assert client.upload_calls == 2
     assert len(client.send_calls) == 1
+
+
+def test_resume_interrupted_upload_without_failure_evidence_stays_fail_closed(tmp_path: Path):
+    config, store, state, worker = setup_task(
+        tmp_path, task_id="task-resume-interrupted-upload"
+    )
+    attachment = tmp_path / "resume-context.txt"
+    attachment.write_text("stable attachment", encoding="utf-8")
+    identities = collect_file_identities([attachment])
+    state["attachments"] = [item.to_dict() for item in identities]
+    path = Path(state["manifest_path"])
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    constructor = worker_module.task_workflow_definitions(state, config)["PLAN"][
+        "system_prompt"
+    ]
+    ledger = RequestLedger(hop["ledger_path"])
+    record = ledger.begin(
+        role=hop["physical_role"],
+        prompt=hop["prompt"],
+        source_context={
+            "task_id": state["task_id"],
+            "team": state["team"],
+            "hop_id": hop["hop_id"],
+            "manifest": state["manifest_path"],
+        },
+        role_prompt_hash=worker_module._sha(str(constructor)),
+        files=identities,
+        request_id=hop["request_id"],
+        render_request_marker=False,
+    )
+    record = ledger.update(record.request_id, status=RequestStatus.PROMPT_SET)
+    ledger.update(record.request_id, status=RequestStatus.UPLOADING, error=None)
+
+    client = RecordingCDPASendClient(task_id=state["task_id"], team=state["team"])
+    client.binding = PageBinding(client.binding.page_id, hop["physical_role"])
+    client.current = replace(
+        client.current,
+        page_role=client.binding.role,
+        composer_text=record.rendered_prompt,
+        state=ChatGPTState.DRAFT,
+    )
+    actions = RecordingCDPASendActions(client)
+    worker._record_acquired(
+        state,
+        "PLAN",
+        AcquiredRole(client, client.binding.page_id, client.current.url, False, False),
+    )
+    state = store.save(path, state)
+    state = _queue_blocked_resume(
+        store,
+        state,
+        code="attachment_upload_failed",
+        reason="worker died during upload before outcome was durable",
+    )
+    hop = _active_hop(state)
+    control = state["controls"][-1]
+
+    asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
+
+    current = ledger.get(record.request_id)
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "attachment_upload_outcome_ambiguous"
+    assert state["status"] == "BLOCKED"
+    assert current is not None and current.error is None
+    assert client.send_calls == []
 
 
 def test_sending_boundary_classifier_uses_durable_evidence_not_hop_label(tmp_path: Path):
