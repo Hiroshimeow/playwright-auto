@@ -361,6 +361,120 @@ def test_frontend_assets_are_local_modular_and_suspend_hidden_polling():
 
 
 
+def test_notify_selector_keeps_latest_relevant_task_per_exact_team():
+    module_path = ASSET_ROOT / "views" / "notify.js"
+    assert module_path.is_file(), "Notify view module is not implemented yet"
+    script = f"""
+      import {{ selectNotifyTasks }} from {json.dumps(module_path.resolve().as_uri())};
+      const rows = selectNotifyTasks([
+        {{task_id: "alpha-old", team: "alpha", status: "DONE", elapsed_end_at: "2026-08-10T10:00:00Z", effective_activity_at: "2026-08-12T23:00:00Z", updated_at: "2026-08-12T23:30:00Z"}},
+        {{task_id: "alpha-new", team: "alpha", status: "PAUSED", effective_activity_at: "2026-08-10T11:00:00Z", updated_at: "2026-08-12T23:59:00Z"}},
+        {{task_id: "beta-block", team: "beta", status: "BLOCKED", elapsed_end_at: "2026-08-10T12:00:00Z"}},
+        {{task_id: "gamma-stop", team: "gamma", status: "STOPPED", updated_at: "2026-08-10T09:00:00Z"}},
+        {{task_id: "ignored", team: "delta", status: "RUNNING", updated_at: "2026-08-13T00:00:00Z"}},
+      ]);
+      console.log(JSON.stringify(rows.map(task => [task.task_id, task.status])));
+    """
+    result = __import__("subprocess").run(
+        ["node", "--input-type=module", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == [
+        ["beta-block", "BLOCKED"],
+        ["alpha-new", "PAUSED"],
+        ["gamma-stop", "STOPPED"],
+    ]
+
+
+def test_notify_report_fallback_uses_chronologically_latest_cross_role_report():
+    module = (ASSET_ROOT / "views" / "notify.js").resolve().as_uri()
+    script = f"""
+      import {{ notifyReportModel }} from {json.dumps(module)};
+      const detail = {{
+        status: "PAUSED",
+        active_role: "AUDIT",
+        roles: [
+          {{logical_role: "TEST", physical_role: "alpha-test"}},
+          {{logical_role: "REVIEW", physical_role: "alpha-review"}},
+          {{logical_role: "PLAN", physical_role: "alpha-plan"}},
+          {{logical_role: "AUDIT", physical_role: "alpha-audit"}},
+        ],
+        reports: [
+          {{role: "TEST", turn: 4, url: "/test-turn4", created_at: "2026-08-11T14:04:00Z"}},
+          {{role: "REVIEW", turn: 1, url: "/review-turn1", created_at: "2026-08-11T14:12:00Z"}},
+          {{role: "PLAN", turn: 2, url: "/plan-turn2", created_at: "2026-08-11T14:24:00Z"}},
+        ],
+      }};
+      const fallback = notifyReportModel(detail);
+      const active = notifyReportModel({{
+        ...detail,
+        reports: [...detail.reports, {{role: "AUDIT", turn: 1, url: "/audit-turn1", created_at: "2026-08-11T14:20:00Z"}}],
+      }});
+      const done = notifyReportModel({{...detail, status: "DONE"}});
+      console.log(JSON.stringify({{
+        fallback: fallback.selectedReport?.url || null,
+        active: active.selectedReport?.url || null,
+        done: done.selectedReport?.url || null,
+      }}));
+    """
+    result = __import__("subprocess").run(
+        ["node", "--input-type=module", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == {
+        "fallback": "/plan-turn2",
+        "active": "/audit-turn1",
+        "done": "/plan-turn2",
+    }
+
+
+def test_notify_frontend_contract_reuses_secondary_report_path_and_preserves_history():
+    html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+    app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
+    notify_path = ASSET_ROOT / "views" / "notify.js"
+    assert notify_path.is_file(), "Notify view module is not implemented yet"
+    notify = notify_path.read_text(encoding="utf-8")
+    css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
+
+    assert 'data-view="notify">Notify</button>' in html
+    assert 'data-view="history">History</button>' in html
+    assert 'data-action="reload_catalog"' not in html
+    assert 'import {renderHistory} from "./views/history.js";' in app
+    assert 'if (view === "history" && !state.history.length) loadHistory();' in app
+    assert 'if (current.drawer === "history") renderHistory(roots.secondaryContent, current);' in app
+    assert 'if (current.drawer === "notify") renderNotify(roots.secondaryContent, current);' in app
+    assert 'if (view === "notify") delete roots.secondaryContent.dataset.secondaryView;' in app
+    assert '/assets/app.js?v=20260812-notify-v2' in html
+    assert './views/notify.js?v=20260812-notify-v2' in app
+    assert 'data-notify-task-id' in notify
+    assert 'workflowReportModel(detail, detail.active_role)' in notify
+    assert 'reportBody(report, reportBodies)' in notify
+    assert 'data-notify-back' in notify
+    assert 'Open raw report' in notify
+    assert 'No report yet' in notify
+    assert 'event.target.closest("[data-notify-task-id]")' in app
+    notify_open = app.split("async function openNotifyReport", 1)[1].split("\n}", 1)[0]
+    assert "loadTaskDetail(taskId)" in notify_open
+    assert "loadReports(detail)" in notify_open
+    assert "selectTask(" not in notify_open
+    assert 'kind: "reload_catalog"' not in app
+    done = css.split('.notify-row[data-status="DONE"] {', 1)[1].split("}", 1)[0]
+    blocked = css.split('.notify-row[data-status="BLOCKED"] {', 1)[1].split("}", 1)[0]
+    paused = css.split('.notify-row[data-status="PAUSED"] {', 1)[1].split("}", 1)[0]
+    stopped = css.split('.notify-row[data-status="STOPPED"] {', 1)[1].split("}", 1)[0]
+    assert "var(--good)" in done
+    assert "var(--bad)" in blocked
+    assert "var(--warn)" in paused
+    assert "#05070a" in stopped
+    mobile = css.split("@media (max-width: 720px)", 1)[1]
+    assert ".notify-row" in mobile
+    assert "grid-template-columns: minmax(0, 1fr);" in mobile
+
+
 def test_commands_are_a_full_height_board_lane_without_changing_command_semantics():
     html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
     app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")

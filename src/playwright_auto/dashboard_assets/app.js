@@ -7,6 +7,7 @@ import {
 import {renderBoard, refreshElapsed} from "./views/board.js";
 import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260809-compact-ui-v2";
 import {renderHistory} from "./views/history.js";
+import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20260812-notify-v2";
 import {renderRuntime} from "./views/runtime.js?v=20260728-system-status-1";
 import {
   applyReuseRoleSelection, renderCreateActions, renderResume, renderWorkflowAgentOptions,
@@ -554,9 +555,6 @@ function renderCommands(current) {
     button.disabled = button.dataset.renderDisabled === "true"
       || Boolean(pending && activeStatuses.has(pending.status));
   }
-  const reload = document.querySelector('[data-action="reload_catalog"]');
-  const pendingReload = current.pendingCommands.get(commandKey("reload_catalog"));
-  if (reload) reload.disabled = Boolean(pendingReload && activeStatuses.has(pendingReload.status));
 }
 
 function renderBootstrapContext(detail) {
@@ -627,10 +625,11 @@ function render(current) {
   if (historyButton && historyButton.textContent !== historyLabel) historyButton.textContent = historyLabel;
 
   if (current.drawer) {
-    const title = current.drawer === "resume" ? "Resume teams" : "History";
+    const title = current.drawer === "resume" ? "Resume teams" : current.drawer === "notify" ? "Notify" : "History";
     if (roots.secondaryTitle.textContent !== title) roots.secondaryTitle.textContent = title;
     if (current.drawer === "history") renderHistory(roots.secondaryContent, current);
     if (current.drawer === "resume") renderResume(roots.secondaryContent, current);
+    if (current.drawer === "notify") renderNotify(roots.secondaryContent, current);
     if (!roots.secondaryDialog.open) roots.secondaryDialog.showModal();
   } else if (roots.secondaryDialog.open) {
     roots.secondaryDialog.close();
@@ -949,6 +948,7 @@ function pushOverlay(name) {
 
 function openDrawer(view) {
   if (!state.drawer) pushOverlay("drawer");
+  if (view === "notify") delete roots.secondaryContent.dataset.secondaryView;
   commit(current => {
     current.drawer = view;
     if (view === "resume") current.resumeBatchResult = null;
@@ -1147,9 +1147,26 @@ roots.detail.addEventListener("click", event => {
   if (event.target.closest("[data-load-timeline]")) loadTimeline();
 });
 
-roots.secondaryContent.addEventListener("click", event => {
+async function openNotifyReport(taskId) {
+  const detail = await loadTaskDetail(taskId);
+  if (!detail || state.drawer !== "notify") return;
+  await loadReports(detail);
+  if (state.drawer === "notify") renderNotifyReport(roots.secondaryContent, detail, reportBodies);
+}
+
+roots.secondaryContent.addEventListener("click", async event => {
   if (event.target.closest("[data-resume-selected]")) {
     submitResumeBatch();
+    return;
+  }
+  if (event.target.closest("[data-notify-back]")) {
+    delete roots.secondaryContent.dataset.secondaryView;
+    renderNotify(roots.secondaryContent, state);
+    return;
+  }
+  const notify = event.target.closest("[data-notify-task-id]");
+  if (notify) {
+    await openNotifyReport(notify.dataset.notifyTaskId);
     return;
   }
   const task = event.target.closest("[data-task-id]");
@@ -1204,12 +1221,6 @@ document.addEventListener("click", event => {
   if (event.target.closest("[data-close-agent-settings]")) roots.agentSettingsDialog.close();
   const view = event.target.closest("[data-view]")?.dataset.view;
   if (view) openDrawer(view);
-  if (event.target.closest('[data-action="reload_catalog"]')) {
-    queueCommand({
-      kind: "reload_catalog", endpoint: "/api/runtime/reload", body: {},
-      label: "Reload catalog",
-    });
-  }
 });
 
 document.addEventListener("keydown", event => {

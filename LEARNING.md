@@ -46,7 +46,7 @@ Reusable lessons for CDPA teams. Read before starting a task. Add only evidence-
 - Prompt contract tests must inspect the final composer/send payload and persisted receipt, not only `PromptBuilder` output; a shared durable layer can otherwise append forbidden transport markers after prompt construction.
 - Machine state and human reports serve different purposes. Keep the atomic task manifest separate from role-authored Markdown reports.
 - Only the worker/dashboard mutates task state. Concurrent agents must never edit the manifest directly.
-- Treat report location as projected evidence, not durable identity: resolve legacy cross-repository files only from one strict declared repository with allowed-root and exact team containment, publish immutable hash/size before serving, and represent remote-host path-only reports as explicitly unmirrored rather than searching or rewriting history.
+- Treat report location as projected evidence, not durable identity: resolve legacy cross-repository files only from one strict declared repository with allowed-root and exact team containment, publish immutable hash/size before serving, and represent remote-host path-only reports as explicitly unmirrored rather than searching or rewriting history. Workflow turn numbers are role-local, not a global chronology; when selecting the latest report or event across different roles, use explicit timestamps first and a stable append/order signal only as fallback, never cross-role turn numbers as recency.
 
 ## Dashboard and operations
 

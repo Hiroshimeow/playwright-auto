@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>CDPA Control Center</title>
-  <link rel="stylesheet" href="/assets/dashboard.css?v=20260810-command-lane-height-v1">
+  <link rel="stylesheet" href="/assets/dashboard.css?v=20260812-notify-v1">
 </head>
 <body>
   <header class="app-header">
@@ -19,7 +19,7 @@
     <nav class="header-actions" aria-label="Dashboard actions">
       <button type="button" class="button primary" data-open-create>Create task</button>
       <button type="button" class="button" aria-expanded="false" aria-controls="agents-panel" data-open-agent>Add Agents</button>
-      <button type="button" class="button" data-action="reload_catalog">Reload catalog</button>
+      <button type="button" class="button" data-view="notify">Notify</button>
       <button type="button" class="button" data-view="resume">Resume teams</button>
       <button type="button" class="button" data-view="history">History</button>
     </nav>
@@ -300,6 +300,6 @@
   <datalist id="workflow-task-team-options"></datalist>
 
   <div id="toast" class="toast" hidden role="status"></div>
-  <script type="module" src="/assets/app.js?v=20260809-compact-ui-v2"></script>
+  <script type="module" src="/assets/app.js?v=20260812-notify-v2"></script>
 </body>
 </html>
