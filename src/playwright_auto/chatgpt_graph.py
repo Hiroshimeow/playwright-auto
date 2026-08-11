@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import ntpath
 from typing import Any, Mapping
 
 
@@ -108,6 +110,85 @@ def _assistant_text(node: Mapping[str, Any]) -> tuple[str, str] | None:
                 chunks.append(text)
     text = "".join(chunks).strip()
     return (text, content_type) if text else None
+
+
+def resolve_completed_file_write(
+    graph: Mapping[str, Any],
+    accepted_user_message_id: str,
+    terminal_assistant_message_id: str,
+    *,
+    recipient: str,
+    expected_path: str,
+) -> str:
+    """Return exact content from one completed file write on the accepted branch."""
+    if not isinstance(graph, Mapping):
+        raise BackendSchemaError("conversation graph must be an object")
+    mapping = graph.get("mapping")
+    if not isinstance(mapping, Mapping):
+        raise BackendSchemaError("conversation graph requires mapping")
+    if not isinstance(accepted_user_message_id, str) or not accepted_user_message_id:
+        raise GraphIdentityError("accepted user message id is missing")
+    if not isinstance(terminal_assistant_message_id, str) or not terminal_assistant_message_id:
+        raise GraphIdentityError("terminal assistant message id is missing")
+    exact_recipient = _exact_string(recipient, "file write recipient")
+    exact_expected = _exact_string(expected_path, "expected file write path")
+    if not ntpath.isabs(exact_expected):
+        raise BackendSchemaError("expected file write path must be absolute")
+
+    reverse_chain: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    node_id: str | None = terminal_assistant_message_id
+    while node_id is not None:
+        if node_id in seen:
+            raise BackendSchemaError("file write branch contains a cycle")
+        seen.add(node_id)
+        node = _node(mapping, node_id)
+        reverse_chain.append(node)
+        if node_id == accepted_user_message_id:
+            break
+        parent = node.get("parent")
+        node_id = str(parent) if parent is not None else None
+    if not reverse_chain or str(reverse_chain[-1]["message"]["id"]) != accepted_user_message_id:
+        raise GraphIdentityError("terminal assistant is not on the accepted user branch")
+    chain = list(reversed(reverse_chain))
+    terminal_index = len(chain) - 1
+    if _message_role(chain[0]) != "user":
+        raise GraphIdentityError("accepted user message id does not identify a user node")
+    terminal = chain[terminal_index]
+    if _message_role(terminal) != "assistant" or _message_recipient(terminal) != "all":
+        raise GraphIdentityError("terminal assistant identity is not a public assistant response")
+
+    normalized_expected = ntpath.normcase(ntpath.normpath(exact_expected))
+    matches: list[str] = []
+    for index, node in enumerate(chain[1:terminal_index], start=1):
+        if _message_role(node) != "assistant" or _message_recipient(node) != exact_recipient:
+            continue
+        extracted = _assistant_text(node)
+        if extracted is None:
+            raise BackendSchemaError("file write tool call is missing JSON arguments")
+        raw_arguments, _content_type = extracted
+        try:
+            arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError as exc:
+            raise BackendSchemaError("file write tool call arguments must be JSON") from exc
+        if not isinstance(arguments, Mapping):
+            raise BackendSchemaError("file write tool call arguments must be an object")
+        path = arguments.get("path")
+        content = arguments.get("content")
+        if not isinstance(path, str) or not ntpath.isabs(path):
+            raise BackendSchemaError("file write tool call path must be absolute")
+        if not isinstance(content, str):
+            raise BackendSchemaError("file write tool call content must be a string")
+        if ntpath.normcase(ntpath.normpath(path)) != normalized_expected:
+            continue
+        if index + 1 >= len(chain) or _message_role(chain[index + 1]) != "tool":
+            raise BackendSchemaError("matching file write tool call has no completed tool result")
+        matches.append(content)
+
+    if len(matches) != 1:
+        raise BackendSchemaError("expected exactly one completed write for the exact report path")
+    return matches[0]
+
 
 
 def resolve_terminal_assistant(

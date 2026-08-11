@@ -8,11 +8,12 @@ import inspect
 import json
 import os
 import random
+import re
 import sys
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable, Mapping, Sequence
 
 from .cdpa_actions import (
@@ -30,7 +31,7 @@ from .cdpa_commands import (
     conversation_identity,
     validate_worker_command,
 )
-from .cdpa_config import CDPAConfig, load_cdpa_config
+from .cdpa_config import CDPAConfig, load_cdpa_config, remote_repository_from_task
 from .cdpa_browser_projection import build_browser_projection
 from .cdpa_independent import (
     BUILTIN_MAINTAINERS_PROMPT,
@@ -112,6 +113,7 @@ from .chatgpt_graph import (
     BackendSchemaError,
     BackendUnavailableError,
     GraphIdentityError,
+    resolve_completed_file_write,
     resolve_terminal_assistant,
     resolve_bootstrap_donor,
     resolve_inherited_assistant,
@@ -299,6 +301,29 @@ def _workflow_report_roots(
             "workflow plans_root must be inside the control repository"
         ) from exc
     return repository, (repository / plans_relative).resolve()
+
+
+_REMOTE_MCP_AUTHORITY = re.compile(r"\bUse\s+@(mcp-[A-Za-z0-9_-]+)\b", re.IGNORECASE)
+
+
+def _assigned_remote_mcp_recipient(task_text: str) -> str:
+    lines = [line.strip() for line in str(task_text or "").splitlines() if line.strip()]
+    matches = {
+        match.group(1).lower()
+        for line in lines[:12]
+        for match in _REMOTE_MCP_AUTHORITY.finditer(line)
+    }
+    if len(matches) != 1:
+        raise RouteContractError("remote report task must declare exactly one assigned MCP authority")
+    return f"{next(iter(matches))}.write_file"
+
+
+def _remote_report_path(remote_repository: str, expected_report_path: str) -> str:
+    relative = PurePosixPath(str(expected_report_path).strip())
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        raise RouteContractError("remote report path must be one bounded relative path")
+    candidate = PureWindowsPath(remote_repository).joinpath(*relative.parts)
+    return str(candidate)
 
 
 class CDPAWorker:
@@ -3037,6 +3062,7 @@ class CDPAWorker:
         receipt: SendReceipt,
         snapshot: Any,
         manifest_path: Path,
+        persistence_baseline: dict[str, Any] | None = None,
     ) -> SendReceipt | None:
         if receipt.user_message_id or receipt.user_turn_id:
             return receipt
@@ -3059,15 +3085,111 @@ class CDPAWorker:
         record = ledger.get(str(hop["request_id"]))
         if record is None:
             raise RuntimeError("durable request disappeared while upgrading receipt")
-        baseline = json.loads(json.dumps(state, ensure_ascii=False, default=str))
+        baseline = json.loads(
+            json.dumps(
+                persistence_baseline if persistence_baseline is not None else state,
+                ensure_ascii=False,
+                default=str,
+            )
+        )
         ledger.update(
             record.request_id,
             receipt=upgraded.to_dict(),
             error=None,
         )
         hop["receipt"] = upgraded.to_dict()
-        self._persist_transport_result(manifest_path, baseline, state)
+        saved = self._persist_transport_result(manifest_path, baseline, state)
+        state["updated_at"] = saved["updated_at"]
+        if persistence_baseline is not None:
+            persistence_baseline.clear()
+            persistence_baseline.update(
+                json.loads(json.dumps(state, ensure_ascii=False, default=str))
+            )
         return upgraded
+
+    def _capture_remote_report_mirror(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        graph: Mapping[str, Any],
+        *,
+        accepted_user_message_id: str,
+        terminal_assistant_message_id: str,
+        response_text: str,
+    ) -> None:
+        task_text = str(state.get("task_text") or "")
+        remote_repository = remote_repository_from_task(task_text)
+        if remote_repository is None or _report_mode(state) == "inline":
+            return
+        parsed = parse_role_response(
+            response_text,
+            source_role=str(hop["target_role"]),
+            report_mode=_report_mode(state),
+            allowed_routes=tuple(task_workflow_definitions(state, self.config))
+            + ("PAUSE", "DONE"),
+        )
+        if parsed.inline_report is not None:
+            return
+        expected_handoff = str(hop.get("expected_report_path") or "").strip()
+        if parsed.decision.handoff != expected_handoff:
+            raise RouteContractError("remote report handoff must exactly match the expected role report")
+        remote_path = _remote_report_path(remote_repository, expected_handoff)
+        report = resolve_completed_file_write(
+            graph,
+            accepted_user_message_id,
+            terminal_assistant_message_id,
+            recipient=_assigned_remote_mcp_recipient(task_text),
+            expected_path=remote_path,
+        )
+        report_repository, report_plans_root = _workflow_report_roots(self.config, state)
+        evidence = materialize_inline_report(
+            report,
+            expected_report_path=expected_handoff,
+            repository_root=report_repository,
+            plans_root=report_plans_root,
+            team=str(state["team"]),
+            physical_role=str(hop["physical_role"]),
+            turn=int(hop["turn"]),
+            task_id=str(state["task_id"]),
+        )
+        hop["mirrored_report_path"] = evidence.path
+        hop["mirrored_report_sha256"] = evidence.sha256
+        hop["mirrored_report_size"] = evidence.size
+        hop["mirrored_report_handoff"] = expected_handoff
+        hop["mirrored_report_response_sha256"] = _sha(response_text)
+
+    def _validated_remote_report_mirror(
+        self,
+        state: Mapping[str, Any],
+        hop: Mapping[str, Any],
+        *,
+        decision_handoff: str,
+    ) -> tuple[str, str, int]:
+        expected_handoff = str(hop.get("expected_report_path") or "").strip()
+        if decision_handoff != expected_handoff or hop.get("mirrored_report_handoff") != expected_handoff:
+            raise RouteContractError("remote report mirror identity does not match the routed handoff")
+        if hop.get("mirrored_report_response_sha256") != _sha(str(hop.get("response") or "")):
+            raise RouteContractError("remote report mirror belongs to a different terminal response")
+
+        report_repository, _report_plans_root = _workflow_report_roots(self.config, state)
+        expected_path = Path(os.path.abspath(report_repository / expected_handoff))
+        mirrored_raw = hop.get("mirrored_report_path")
+        if not isinstance(mirrored_raw, str) or not mirrored_raw.strip():
+            raise RouteContractError("remote report bytes were not durably mirrored")
+        mirrored_path = Path(os.path.abspath(Path(mirrored_raw).expanduser()))
+        if mirrored_path != expected_path or mirrored_path.is_symlink() or not mirrored_path.is_file():
+            raise RouteContractError("remote report mirror path is not the exact control-plane report path")
+
+        expected_sha = hop.get("mirrored_report_sha256")
+        expected_size = hop.get("mirrored_report_size")
+        if not isinstance(expected_sha, str) or len(expected_sha) != 64:
+            raise RouteContractError("remote report mirror hash is invalid")
+        if isinstance(expected_size, bool) or not isinstance(expected_size, int) or expected_size < 0:
+            raise RouteContractError("remote report mirror size is invalid")
+        data = mirrored_path.read_bytes()
+        if len(data) != expected_size or hashlib.sha256(data).hexdigest() != expected_sha:
+            raise RouteContractError("remote report mirror hash or size changed after capture")
+        return str(mirrored_path), expected_sha, expected_size
 
     def _validate_response_candidate(
         self,
@@ -3661,6 +3783,14 @@ class CDPAWorker:
         validation_error: str | None = None
         try:
             self._validate_response_candidate(state, hop, response)
+            self._capture_remote_report_mirror(
+                state,
+                hop,
+                graph,
+                accepted_user_message_id=receipt.user_message_id,
+                terminal_assistant_message_id=resolved.message_id,
+                response_text=resolved.text,
+            )
         except Exception as exc:
             validation_error = sanitize_exception(exc)
         self._record_response(
@@ -3679,6 +3809,11 @@ class CDPAWorker:
         transport_baseline: dict[str, Any] | None = None,
     ) -> None:
         role = str(hop["target_role"])
+        persistence_baseline = (
+            transport_baseline
+            if transport_baseline is not None
+            else json.loads(json.dumps(state, ensure_ascii=False, default=str))
+        )
         acquired = await self._owned_or_block(state, role, actions)
         if acquired is None:
             return
@@ -3698,6 +3833,7 @@ class CDPAWorker:
             receipt,
             snapshot,
             manifest_path,
+            persistence_baseline,
         )
         if receipt is None:
             return
@@ -3803,7 +3939,7 @@ class CDPAWorker:
                 return
         if should_refresh:
             refresh_baseline = json.loads(
-                json.dumps(state, ensure_ascii=False, default=str)
+                json.dumps(persistence_baseline, ensure_ascii=False, default=str)
             )
             wait["recovery_baseline"] = merge_response_recovery_baselines(
                 wait.get("recovery_baseline"),
@@ -4055,9 +4191,16 @@ class CDPAWorker:
                 )
             if parsed.inline_report is None:
                 routed_handoff = decision.handoff
-                report_path = decision.handoff
-                report_sha256 = None
-                report_size = None
+                if remote_repository_from_task(str(state.get("task_text") or "")) is None:
+                    report_path = decision.handoff
+                    report_sha256 = None
+                    report_size = None
+                else:
+                    report_path, report_sha256, report_size = self._validated_remote_report_mirror(
+                        state,
+                        hop,
+                        decision_handoff=decision.handoff,
+                    )
             else:
                 report_repository, report_plans_root = _workflow_report_roots(
                     self.config, state

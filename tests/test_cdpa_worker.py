@@ -1400,6 +1400,62 @@ def _enable_backend_wait_identity(store, state, path, hop, receipt, *, conversat
     return state, _active_hop(state), enriched
 
 
+def test_legacy_receipt_upgrade_advances_wait_persistence_baseline(tmp_path: Path):
+    from dataclasses import replace
+
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-legacy-receipt-persistence-baseline"
+    )
+    legacy = replace(
+        receipt,
+        accepted_via="legacy_send_receipt",
+        user_message_id=None,
+        user_turn_id=None,
+    )
+    RequestLedger(hop["ledger_path"]).update(
+        hop["request_id"], receipt=legacy.to_dict()
+    )
+    hop["receipt"] = legacy.to_dict()
+    state = store.save(path, state)
+    hop = _active_hop(state)
+    persistence_baseline = json.loads(json.dumps(state))
+
+    observed_at = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+    hop["wait"]["continuous_responding_since"] = observed_at
+    snapshot = SimpleNamespace(
+        messages=(
+            MessageSnapshot(
+                "user",
+                "accepted-user-upgrade",
+                "accepted-turn-upgrade",
+                receipt.prompt,
+                (),
+            ),
+        )
+    )
+
+    upgraded = worker._upgrade_legacy_receipt(
+        state,
+        hop,
+        legacy,
+        snapshot,
+        path,
+        persistence_baseline,
+    )
+
+    assert upgraded is not None
+    assert upgraded.user_message_id == "accepted-user-upgrade"
+    assert upgraded.user_turn_id == "accepted-turn-upgrade"
+    persisted = store.load(path)
+    assert _active_hop(persisted)["wait"]["continuous_responding_since"] == observed_at
+    assert _active_hop(persisted)["receipt"]["user_message_id"] == "accepted-user-upgrade"
+
+    hop["wait"]["activity_length"] = 7
+    saved = worker._persist_transport_result(path, persistence_baseline, state)
+    assert _active_hop(saved)["wait"]["activity_length"] == 7
+
+
+
 def _backend_graph(user_id: str, assistant_id: str, text: str):
     return {
         "current_node": assistant_id,
@@ -1936,11 +1992,15 @@ def test_complete_graph_not_ready_refreshes_once_then_blocks_without_replay(
             **snapshot.__dict__,
             "composer_empty": True,
             "manual_input_pending": False,
+            "stop_visible": True,
             "response_activity_text": "",
             "response_activity_structure": "",
             "response_activity_turn_id": None,
             "response_activity_length": 0,
         }
+    )
+    full_snapshot = SimpleNamespace(
+        **{**snapshot.__dict__, "stop_visible": False}
     )
     calls = {
         "status": 0,
@@ -1957,7 +2017,7 @@ def test_complete_graph_not_ready_refreshes_once_then_blocks_without_replay(
 
     class Client:
         async def wait_snapshot(self, _receipt, **_kwargs):
-            return snapshot
+            return full_snapshot if _kwargs.get("force_full") else snapshot
 
         async def wait_for_response(self, _receipt, **_kwargs):
             calls["wait"] += 1
@@ -2029,6 +2089,16 @@ def test_complete_graph_not_ready_refreshes_once_then_blocks_without_replay(
     assert wait["terminal_continuation_unresolved"]["request_id"] == hop["request_id"]
     assert wait["terminal_continuation_unresolved"]["refresh_baseline"] == 0
 
+    # Reproduce the live CAS failure: the durable lightweight observation says
+    # the response is still active, while the forced-full snapshot used before
+    # refresh clears that UI-only signal in memory. The refresh journal must
+    # persist from the durable step baseline, not from the mutated RAM snapshot.
+    wait["continuous_responding_since"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=30)
+    ).isoformat()
+    state = store.save(path, state)
+    hop = _active_hop(state)
+    wait = hop["wait"]
     wait["dom_fallback_ready_at"] = (
         datetime.now(timezone.utc) - timedelta(seconds=1)
     ).isoformat()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -62,6 +63,22 @@ def _resolve(root: Path, value: Any, name: str) -> Path:
         raise CDPAConfigError(f"{name} must not be empty")
     path = Path(text).expanduser()
     return (path if path.is_absolute() else root / path).resolve()
+
+
+_REMOTE_REPOSITORY_DECLARATION = re.compile(
+    r"(?<![\w/])(?:Actual product repository|Product repository):\s*([A-Za-z]:\\+[^\s,]+)"
+)
+
+
+def remote_repository_from_task(task: str) -> str | None:
+    """Return one strict Windows product-repository declaration near the task header."""
+    lines = [line.strip() for line in str(task or "").splitlines() if line.strip()]
+    declarations: list[str] = []
+    for line in lines[:12]:
+        declarations.extend(match.group(1) for match in _REMOTE_REPOSITORY_DECLARATION.finditer(line))
+    if len(declarations) != 1:
+        return None
+    return declarations[0]
 
 
 @dataclass(frozen=True)
