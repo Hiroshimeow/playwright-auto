@@ -120,7 +120,13 @@ from .chatgpt_graph import (
     resolve_latest_terminal_assistant,
 )
 from .connection import connected_browser, is_cdp_disconnect
-from .durable import DurableRequestError, RequestLedger, RequestStatus
+from .durable import (
+    DurableRecoveryState,
+    DurableRequestError,
+    RequestLedger,
+    RequestStatus,
+    classify_recovery_state,
+)
 from .durable_blocks import DurableSendBlock
 from .upload import UploadIdentityChangedError, UploadReceipt, collect_file_identities
 from .workflow import WorkflowContext
@@ -1639,6 +1645,41 @@ class CDPAWorker:
             raise RuntimeError("independent agents use Reset; Stop is not supported")
         raise RuntimeError(f"unsupported independent control action {action!r}")
 
+    def _sending_hop_durable_boundary_state(self, hop: Mapping[str, Any]) -> str:
+        receipt = hop.get("receipt")
+        if isinstance(receipt, Mapping) and receipt:
+            return "crossed"
+        ledger_path = str(hop.get("ledger_path") or "").strip()
+        request_id = str(hop.get("request_id") or "").strip()
+        if not ledger_path or not request_id:
+            return "preboundary"
+        try:
+            ledger = RequestLedger(ledger_path)
+            record = ledger.get(request_id) if ledger.path.exists() else None
+        except Exception:
+            return "ambiguous"
+        if record is None:
+            return "preboundary"
+        if record.status in {
+            RequestStatus.SENDING,
+            RequestStatus.SENT,
+            RequestStatus.COMPLETED,
+        }:
+            return "crossed"
+        if int(record.attempts or 0) > 0 or any(
+            value is not None
+            for value in (
+                record.binding,
+                record.baseline,
+                record.receipt,
+                record.accepted_at,
+                record.response,
+                record.session_id_before,
+            )
+        ):
+            return "crossed"
+        return "preboundary"
+
     async def _apply_control(
         self,
         state: dict[str, Any],
@@ -1800,9 +1841,22 @@ class CDPAWorker:
                     raise RuntimeError(
                         "blocked role restart requires the active hop to belong to the selected role"
                     )
-                if hop_state in IN_FLIGHT:
+                if hop_state in {"sent", "waiting"}:
                     raise RuntimeError(
                         "cannot restart a role across an in-flight send boundary"
+                    )
+                if hop_state == "sending":
+                    boundary_state = self._sending_hop_durable_boundary_state(hop or {})
+                    if boundary_state == "crossed":
+                        raise RuntimeError(
+                            "cannot restart a role across an in-flight send boundary"
+                        )
+                    if boundary_state == "ambiguous":
+                        raise RuntimeError(
+                            "cannot restart a role while durable Send-boundary evidence is ambiguous; use Resume"
+                        )
+                    raise RuntimeError(
+                        "cannot restart a role while a pre-acceptance durable request is pending; use Resume to continue the same request"
                     )
                 old_page_id = state["roles"][role].get("page_id")
                 acquired = await actions.restart(
@@ -1862,8 +1916,19 @@ class CDPAWorker:
             elif action == "new_chat":
                 if state.get("status") in TERMINAL:
                     raise RuntimeError("cannot start a new chat for a terminal task")
-                if hop_state in IN_FLIGHT:
+                if hop_state in {"sent", "waiting"}:
                     raise RuntimeError("cannot reset a role across an in-flight send boundary")
+                if hop_state == "sending":
+                    boundary_state = self._sending_hop_durable_boundary_state(hop or {})
+                    if boundary_state == "crossed":
+                        raise RuntimeError("cannot reset a role across an in-flight send boundary")
+                    if boundary_state == "ambiguous":
+                        raise RuntimeError(
+                            "cannot reset a role while durable Send-boundary evidence is ambiguous; use Resume"
+                        )
+                    raise RuntimeError(
+                        "cannot reset a role while a pre-acceptance durable request is pending; use Resume to continue the same request"
+                    )
                 acquired = await actions.new_chat(state, role)
                 self._record_acquired(state, role, acquired)
                 state["roles"][role]["constructor_sent_generation"] = None
@@ -4637,6 +4702,162 @@ class CDPAWorker:
             next_safe_action="Inspect the exact conversation and choose Retry generation only if the accepted turn is visible.",
         )
 
+    async def _recover_failed_upload_before_ready(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        control: dict[str, Any],
+        actions: CDPATabActions,
+        record: Any,
+    ) -> bool:
+        if record is None or record.status is not RequestStatus.UPLOADING:
+            return False
+
+        def recovery_required(reason_code: str, reason: str, next_safe_action: str) -> bool:
+            self._require_resume_recovery(
+                state,
+                control,
+                action="none",
+                reason_code=reason_code,
+                reason=reason,
+                next_safe_action=next_safe_action,
+            )
+            return True
+
+        if int(record.attempts or 0) != 0 or any(
+            value is not None
+            for value in (
+                record.binding,
+                record.baseline,
+                record.receipt,
+                record.accepted_at,
+                record.upload_receipt,
+                record.response,
+                record.session_id_before,
+            )
+        ):
+            return recovery_required(
+                "attachment_upload_boundary_ambiguous",
+                "The UPLOADING request contains durable Send-boundary evidence and cannot be replayed.",
+                "Inspect the exact durable request; do not upload, rebind, or send it again.",
+            )
+
+        role = str(hop.get("target_role") or "").upper()
+        role_record = state.get("roles", {}).get(role)
+        attachments = state.get("attachments")
+        if not isinstance(role_record, Mapping) or not isinstance(attachments, list):
+            return recovery_required(
+                "attachment_upload_identity_mismatch",
+                "The failed upload no longer has exact role or attachment snapshot metadata.",
+                "Restore the immutable task attachment snapshot before Resume.",
+            )
+        try:
+            state_files = tuple(dict(item) for item in attachments)
+        except (TypeError, ValueError):
+            state_files = ()
+        if state_files != tuple(item.to_dict() for item in record.files):
+            return recovery_required(
+                "attachment_upload_identity_mismatch",
+                "The failed upload durable file identities do not match the task attachment snapshot.",
+                "Restore the immutable task attachment snapshot before Resume.",
+            )
+
+        expected_source = {
+            "task_id": state.get("task_id"),
+            "team": state.get("team"),
+            "hop_id": hop.get("hop_id"),
+            "manifest": state.get("manifest_path"),
+        }
+        prompt = str(hop.get("prompt") or "")
+        if (
+            record.request_id != str(hop.get("request_id") or "")
+            or record.role != str(hop.get("physical_role") or "")
+            or record.source_context != expected_source
+            or record.prompt != prompt
+            or record.rendered_prompt != prompt
+        ):
+            return recovery_required(
+                "attachment_upload_identity_mismatch",
+                "The failed upload prompt or request identity no longer matches this hop.",
+                "Restore the exact durable request identity before Resume.",
+            )
+
+        expected_page_id = str(role_record.get("page_id") or "").strip()
+        expected_page_url = str(role_record.get("page_url") or "").strip()
+        if not expected_page_id or not expected_page_url:
+            return recovery_required(
+                "attachment_upload_owner_missing",
+                "The failed upload has no exact live role page to continue safely.",
+                "Restore the exact owned role tab; do not create or rebind a replacement chat.",
+            )
+        try:
+            acquired = await actions.locate_owned(state, role)
+        except Exception as exc:
+            return recovery_required(
+                "attachment_upload_owner_missing",
+                sanitize_exception(exc),
+                "Restore the exact owned role tab; do not create or rebind a replacement chat.",
+            )
+        if (
+            acquired is None
+            or str(acquired.page_id) != expected_page_id
+            or str(acquired.url) != expected_page_url
+        ):
+            return recovery_required(
+                "attachment_upload_owner_missing",
+                "The failed upload is not attached to the exact recorded live role page.",
+                "Restore the exact owned role tab; do not create or rebind a replacement chat.",
+            )
+        try:
+            snapshot = await acquired.client.assert_ownership()
+        except Exception as exc:
+            return recovery_required(
+                "attachment_upload_owner_missing",
+                sanitize_exception(exc),
+                "Restore exact page ownership before Resume.",
+            )
+        if (
+            str(getattr(snapshot, "page_id", "") or "") != expected_page_id
+            or str(getattr(snapshot, "page_task_id", "") or "")
+            != str(state.get("task_id") or "")
+            or str(getattr(snapshot, "page_team", "") or "")
+            != str(state.get("team") or "")
+        ):
+            return recovery_required(
+                "attachment_upload_owner_mismatch",
+                "The live page ownership does not match the failed upload task/team/page identity.",
+                "Restore the exact owned role tab; preserve the current composer unchanged.",
+            )
+        recovery = classify_recovery_state(record, snapshot)
+        if recovery not in {
+            DurableRecoveryState.COMPOSER_PROMPT_MISSING_ATTACHMENTS,
+            DurableRecoveryState.UPLOAD_READY_NOT_SENT,
+        }:
+            return recovery_required(
+                "attachment_upload_recovery_ambiguous",
+                f"The failed upload composer is {recovery.value}; automatic continuation is unsafe.",
+                "Preserve the current composer and attachments; resolve ownership ambiguity manually.",
+            )
+
+        self._record_acquired(state, role, acquired)
+        hop["conversation_url"] = acquired.url
+        state["status"] = "RUNNING"
+        state["kanban_column"] = _column_for(role)
+        state["active_action"] = "send"
+        state["block_code"] = None
+        state["block_retryable"] = False
+        state["block_reason"] = None
+        self._finish_resume_control(
+            state,
+            control,
+            outcome="continued",
+            action="continue_failed_upload",
+            reason_code=None,
+            reason="The exact failed pre-acceptance upload remains owned and can continue on the same durable request.",
+            postcondition="same_request_upload_recovery_ready",
+        )
+        return True
+
     async def _recover_resume_sending(
         self,
         state: dict[str, Any],
@@ -4661,6 +4882,10 @@ class CDPAWorker:
                 ),
                 postcondition="send_not_started",
             )
+            return
+        if await self._recover_failed_upload_before_ready(
+            state, hop, control, actions, record
+        ):
             return
         if record is None or record.status is not RequestStatus.SENDING:
             self._require_resume_recovery(

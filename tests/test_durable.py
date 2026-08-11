@@ -288,7 +288,71 @@ def test_sending_without_marker_fails_closed_and_never_resends(tmp_path):
 
 
 
-def test_uploading_crash_without_ready_attachments_fails_closed(tmp_path):
+def test_failed_upload_before_ready_reuses_same_request_and_sends_once(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    attachment = tmp_path / "context.txt"
+    attachment.write_text("context", encoding="utf-8")
+    identities = collect_file_identities([attachment])
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(role="DEV", prompt="upload recoverable", files=identities)
+    record = ledger.update(record.request_id, status=RequestStatus.PROMPT_SET)
+    record = ledger.update(
+        record.request_id,
+        status=RequestStatus.UPLOADING,
+        error="RuntimeError: synthetic upload failure before readiness",
+    )
+    original_request_id = record.request_id
+    assert record.attempts == 0
+    assert record.binding is None
+    assert record.baseline is None
+    assert record.receipt is None
+    assert record.accepted_at is None
+    assert record.upload_receipt is None
+
+    class RecoveryClient(FakeDurableClient):
+        async def upload_files(self, paths, *, request_marker, **options):
+            receipt = await super().upload_files(
+                paths, request_marker=request_marker, **options
+            )
+            return UploadReceipt(
+                request_marker=receipt.request_marker,
+                method=receipt.method,
+                files=receipt.files,
+                attachment_count=receipt.attachment_count,
+                ownership_token="owned-retry",
+            )
+
+        async def send(self, text, **options):
+            assert options.pop("expected_attachment_ownership_token") == "owned-retry"
+            options.pop("expected_attachment_names", None)
+            return await super().send(text, **options)
+
+    client = RecoveryClient(
+        snapshot(text=record.rendered_prompt, state=ChatGPTState.DRAFT)
+    )
+    block = DurableSendBlock(
+        "upload recoverable",
+        ledger_path=ledger_path,
+        files=[str(attachment)],
+        wait_for_response=False,
+        stable_ms=0,
+    )
+
+    first = run_block(block, client)
+    second = run_block(block, client)
+
+    current = ledger.get(original_request_id)
+    assert current is not None
+    assert first.context.results["durable_send"]["record"]["request_id"] == original_request_id
+    assert second.context.results["durable_send"]["record"]["request_id"] == original_request_id
+    assert current.request_id == original_request_id
+    assert current.status is RequestStatus.SENT
+    assert current.attempts == 1
+    assert len(client.upload_calls) == 1
+    assert len(client.send_calls) == 1
+
+
+def test_failed_upload_with_unproven_attachment_fails_closed_without_discard(tmp_path):
     ledger_path = tmp_path / "ledger.json"
     attachment = tmp_path / "context.txt"
     attachment.write_text("context", encoding="utf-8")
@@ -296,7 +360,102 @@ def test_uploading_crash_without_ready_attachments_fails_closed(tmp_path):
     ledger = RequestLedger(ledger_path)
     record = ledger.begin(role="DEV", prompt="upload ambiguous", files=identities)
     record = ledger.update(record.request_id, status=RequestStatus.PROMPT_SET)
-    ledger.update(record.request_id, status=RequestStatus.UPLOADING)
+    record = ledger.update(
+        record.request_id,
+        status=RequestStatus.UPLOADING,
+        error="RuntimeError: synthetic upload failure before readiness",
+    )
+    client = FakeDurableClient(
+        snapshot(
+            text=record.rendered_prompt,
+            attachments=("manual.txt",),
+            state=ChatGPTState.DRAFT,
+        )
+    )
+
+    with pytest.raises(Exception) as captured:
+        run_block(
+            DurableSendBlock(
+                "upload ambiguous",
+                ledger_path=ledger_path,
+                files=[str(attachment)],
+                stable_ms=0,
+            ),
+            client,
+        )
+
+    assert isinstance(captured.value.cause, DurableRequestError)
+    assert client.current.composer_text == record.rendered_prompt
+    assert client.current.attachment_markers == ("manual.txt",)
+    assert client.upload_calls == []
+    assert client.send_calls == []
+
+
+def test_uploading_ready_attachment_reconciles_live_ownership_without_reupload(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    attachment = tmp_path / "context.txt"
+    attachment.write_text("context", encoding="utf-8")
+    identities = collect_file_identities([attachment])
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(role="DEV", prompt="upload ready", files=identities)
+    record = ledger.update(record.request_id, status=RequestStatus.PROMPT_SET)
+    record = ledger.update(record.request_id, status=RequestStatus.UPLOADING)
+
+    class ReadyClient(FakeDurableClient):
+        async def current_attachment_ownership_token(self, *, expected_files):
+            assert tuple(expected_files) == identities
+            return "live-ready-owner"
+
+        async def send(self, text, **options):
+            assert options.pop("expected_attachment_ownership_token") == "live-ready-owner"
+            options.pop("expected_attachment_names", None)
+            return await super().send(text, **options)
+
+    client = ReadyClient(
+        snapshot(
+            text=record.rendered_prompt,
+            attachments=(attachment.name,),
+            state=ChatGPTState.DRAFT,
+        )
+    )
+
+    run_block(
+        DurableSendBlock(
+            "upload ready",
+            ledger_path=ledger_path,
+            files=[str(attachment)],
+            wait_for_response=False,
+            stable_ms=0,
+        ),
+        client,
+    )
+
+    current = ledger.get(record.request_id)
+    assert current is not None
+    assert current.status is RequestStatus.SENT
+    assert current.attempts == 1
+    assert client.upload_calls == []
+    assert len(client.send_calls) == 1
+    recovered = UploadReceipt.from_dict(current.upload_receipt)
+    assert recovered.method == "recovered"
+    assert recovered.ownership_token == "live-ready-owner"
+
+
+def test_uploading_with_send_boundary_evidence_never_reuploads(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    attachment = tmp_path / "context.txt"
+    attachment.write_text("context", encoding="utf-8")
+    identities = collect_file_identities([attachment])
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(role="DEV", prompt="upload crossed", files=identities)
+    record = ledger.update(record.request_id, status=RequestStatus.PROMPT_SET)
+    record = ledger.update(
+        record.request_id,
+        status=RequestStatus.UPLOADING,
+        binding=PageBinding("page-1", "DEV"),
+        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+        session_id_before="session-1",
+    )
     client = FakeDurableClient(
         snapshot(text=record.rendered_prompt, state=ChatGPTState.DRAFT)
     )
@@ -304,7 +463,7 @@ def test_uploading_crash_without_ready_attachments_fails_closed(tmp_path):
     with pytest.raises(Exception) as captured:
         run_block(
             DurableSendBlock(
-                "upload ambiguous",
+                "upload crossed",
                 ledger_path=ledger_path,
                 files=[str(attachment)],
                 stable_ms=0,

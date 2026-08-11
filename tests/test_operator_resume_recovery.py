@@ -25,13 +25,19 @@ from playwright_auto.chatgpt import (
 from playwright_auto.cdpa_runtime_db import RuntimeDB
 from playwright_auto.cdpa_store import utc_now
 from playwright_auto.durable import RequestLedger, RequestStatus
+from playwright_auto.upload import UploadReceipt, collect_file_identities
 
 import playwright_auto.cdpa_worker as worker_module
 from playwright_auto.cdpa_worker import _active_hop
 
 from test_dashboard_api import request, start_api
-from test_cdpa_worker import FakeActions, _prepare_sent_waiting_task, setup_task
-
+from test_cdpa_worker import (
+    FakeActions,
+    RecordingCDPASendActions,
+    RecordingCDPASendClient,
+    _prepare_sent_waiting_task,
+    setup_task,
+)
 
 def _queue_blocked_resume(store, state, *, code="response_timeout", reason="expired wait"):
     path = Path(state["manifest_path"])
@@ -458,6 +464,147 @@ def test_exact_owned_sending_draft_is_accepted_once(tmp_path: Path, monkeypatch)
 
 
 
+
+def test_resume_failed_attachment_upload_reuses_same_request_and_owned_page(tmp_path: Path):
+    config, store, state, worker = setup_task(
+        tmp_path, task_id="task-resume-failed-upload"
+    )
+    attachment = tmp_path / "resume-context.txt"
+    attachment.write_text("stable attachment", encoding="utf-8")
+    identities = collect_file_identities([attachment])
+    state["attachments"] = [item.to_dict() for item in identities]
+    path = Path(state["manifest_path"])
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+
+    class FailingOnceUploadClient(RecordingCDPASendClient):
+        def __init__(self):
+            super().__init__(task_id=state["task_id"], team=state["team"])
+            self.binding = PageBinding(
+                self.binding.page_id, state["roles"]["PLAN"]["physical_role"]
+            )
+            self.current = replace(self.current, page_role=self.binding.role)
+            self.upload_calls = 0
+
+        async def upload_files(self, paths, *, request_marker, **_options):
+            self.upload_calls += 1
+            if self.upload_calls == 1:
+                raise RuntimeError("synthetic upload failure before readiness")
+            uploaded = collect_file_identities(paths)
+            self.current = replace(
+                self.current,
+                attachment_markers=tuple(item.name for item in uploaded),
+                state=ChatGPTState.DRAFT,
+            )
+            return UploadReceipt(
+                request_marker=request_marker,
+                method="input",
+                files=uploaded,
+                attachment_count=len(uploaded),
+                ownership_token="resume-owned-attachment",
+            )
+
+    client = FailingOnceUploadClient()
+    actions = RecordingCDPASendActions(client)
+    worker._record_acquired(
+        state,
+        "PLAN",
+        AcquiredRole(
+            client=client,
+            page_id=client.binding.page_id,
+            url=client.current.url,
+            created=False,
+            new_chat=False,
+        ),
+    )
+    original_hop_id = hop["hop_id"]
+    original_request_id = hop["request_id"]
+
+    asyncio.run(worker._sending(state, hop, actions))
+
+    ledger = RequestLedger(hop["ledger_path"])
+    failed = ledger.get(original_request_id)
+    assert failed is not None
+    assert failed.status is RequestStatus.UPLOADING
+    assert failed.attempts == 0
+    assert failed.binding is None
+    assert failed.baseline is None
+    assert failed.receipt is None
+    assert failed.accepted_at is None
+    assert failed.upload_receipt is None
+    assert client.upload_calls == 1
+    assert client.send_calls == []
+    assert state["block_code"] == "attachment_upload_failed"
+
+    state = store.save(path, state)
+    state = _queue_blocked_resume(
+        store,
+        state,
+        code="attachment_upload_failed",
+        reason="retry same pre-acceptance upload",
+    )
+    hop = _active_hop(state)
+    control = state["controls"][-1]
+    fresh_worker = worker_module.CDPAWorker(config, store=store)
+
+    asyncio.run(fresh_worker._recover_resume_sending(state, hop, control, actions))
+
+    assert control["status"] == "applied", control["result"]["reason"]
+    assert control["result"]["action"] == "continue_failed_upload"
+    assert control["result"]["postcondition"] == "same_request_upload_recovery_ready"
+    assert state["active_action"] == "send"
+    assert state["block_code"] is None
+    assert hop["hop_id"] == original_hop_id
+    assert hop["request_id"] == original_request_id
+    assert client.upload_calls == 1
+    assert client.send_calls == []
+
+    repeated = {"role": "PLAN", "result": {"before": {}}}
+    asyncio.run(fresh_worker._recover_resume_sending(state, hop, repeated, actions))
+    assert repeated["status"] == "applied"
+    assert client.upload_calls == 1
+    assert client.send_calls == []
+
+    asyncio.run(fresh_worker._sending(state, hop, actions))
+
+    sent = ledger.get(original_request_id)
+    assert sent is not None
+    assert sent.request_id == original_request_id
+    assert sent.status is RequestStatus.SENT
+    assert sent.attempts == 1
+    assert hop["hop_id"] == original_hop_id
+    assert hop["request_id"] == original_request_id
+    assert client.upload_calls == 2
+    assert len(client.send_calls) == 1
+
+
+def test_sending_boundary_classifier_uses_durable_evidence_not_hop_label(tmp_path: Path):
+    _config, _store, state, worker = setup_task(
+        tmp_path, task_id="task-sending-boundary-evidence"
+    )
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    assert hop["state"] == "sending"
+    assert worker._sending_hop_durable_boundary_state(hop) == "preboundary"
+
+    ledger = RequestLedger(hop["ledger_path"])
+    record = ledger.begin(
+        role=hop["physical_role"],
+        prompt=hop["prompt"],
+        request_id=hop["request_id"],
+        render_request_marker=False,
+    )
+    assert worker._sending_hop_durable_boundary_state(hop) == "preboundary"
+
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=PageBinding("page-boundary", hop["physical_role"]),
+        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+        session_id_before="boundary-session",
+    )
+    assert worker._sending_hop_durable_boundary_state(hop) == "crossed"
 
 
 def test_dashboard_distinguishes_continued_recovery_failed_queued_and_stale_worker():

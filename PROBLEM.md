@@ -17,15 +17,6 @@ This file is not a chronological incident log. Track one entry per stable root c
 
 ## Active problems
 
-### P-003 — Failed attachment upload is treated as an irreversible in-flight send
-
-- **Status:** `OPEN`
-- **Root cause:** hop state `sending` is included in the generic `IN_FLIGHT` guard even when upload failed before ChatGPT accepted a message and the hop has no receipt, message identity, rendered prompt hash, or response.
-- **Evidence:** tasks `cdpa-20260724-162733-73d86cc1` and `cdpa-20260724-164821-73f7419c` blocked with `attachment_upload_failed`. Maintainers selected a clean New Chat because no send-boundary evidence existed, but worker controls were rejected with `cannot reset a role across an in-flight send boundary`.
-- **Impact:** a recoverable durable upload request cannot use New Chat/restart recovery and must be manually stopped or repaired outside the normal recovery contract.
-- **Owner:** no dedicated repair task or waiting repair dependency was found. `cdpa-20260724-170528-d68a7cc3` is `DONE` and proves the final upload happy path, but it does not cover recovery from a failed pre-acceptance upload.
-- **Next verification:** distinguish pre-acceptance upload/sending from accepted send using receipt/ledger/message evidence; safely replay the same immutable attachment snapshot and request without a new hop or duplicate send; add focused regression and controlled live failure/recovery acceptance.
-
 ### P-008 — Worker state transitions and invariants are distributed across large mutable-dict branches
 
 - **Status:** `OPEN`

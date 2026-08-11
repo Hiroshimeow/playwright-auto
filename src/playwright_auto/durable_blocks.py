@@ -427,6 +427,18 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
                 context, ledger, record, receipt
             )
 
+        failed_upload_before_ready = bool(
+            record.status is RequestStatus.UPLOADING
+            and recovery is DurableRecoveryState.COMPOSER_PROMPT_MISSING_ATTACHMENTS
+            and int(record.attempts or 0) == 0
+            and record.binding is None
+            and record.baseline is None
+            and record.receipt is None
+            and record.accepted_at is None
+            and record.upload_receipt is None
+            and record.response is None
+            and record.session_id_before is None
+        )
         if recovery in {
             DurableRecoveryState.SENT_MARKER_MISSING,
             DurableRecoveryState.COMPOSER_ATTACHMENTS_WITHOUT_MARKER,
@@ -437,6 +449,7 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
         if (
             record.status is RequestStatus.UPLOADING
             and recovery is not DurableRecoveryState.UPLOAD_READY_NOT_SENT
+            and not failed_upload_before_ready
         ):
             self._raise_ambiguous(record, recovery)
 
@@ -499,15 +512,16 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
             self._raise_ambiguous(record, recovery)
 
         if identities and recovery is not DurableRecoveryState.UPLOAD_READY_NOT_SENT:
-            if record.status is not RequestStatus.PROMPT_SET:
+            if record.status is RequestStatus.PROMPT_SET:
+                record = ledger.update(
+                    record.request_id,
+                    status=RequestStatus.UPLOADING,
+                    error=None,
+                )
+            elif not failed_upload_before_ready:
                 raise DurableRequestError(
                     f"cannot start upload from durable status {record.status.value}"
                 )
-            record = ledger.update(
-                record.request_id,
-                status=RequestStatus.UPLOADING,
-                error=None,
-            )
             try:
                 upload_receipt = await context.client.upload_files(
                     paths,
