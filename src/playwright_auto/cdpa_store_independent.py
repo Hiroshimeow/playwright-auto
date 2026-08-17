@@ -61,6 +61,7 @@ class IndependentAgentStoreMixin:
         watermarks: Mapping[str, Any] | None = None,
         occurrence_counts: Mapping[str, Any] | None = None,
         last_outcome: Mapping[str, Any] | None = None,
+        temporary_chat: bool = False,
         new_chat_next_job: bool = False,
         new_chat_deferred_task_id: str | None = None,
         close_tab_when_idle: bool = False,
@@ -186,6 +187,7 @@ class IndependentAgentStoreMixin:
                 "continuation_request": None,
                 "settings_reset_request": None,
                 "job_history": [],
+                "temporary_chat": bool(temporary_chat),
                 "new_chat_next_job": bool(new_chat_next_job),
                 "new_chat_deferred_task_id": new_chat_deferred_task_id,
                 "close_tab_when_idle": bool(close_tab_when_idle),
@@ -431,6 +433,7 @@ class IndependentAgentStoreMixin:
         repository: str | Path | None = None,
         enabled: bool = True,
         max_cycles: int | None = None,
+        temporary_chat: bool | None = None,
         external_command_id: str | None = None,
         _seed_only: bool = False,
     ) -> dict[str, Any]:
@@ -443,6 +446,8 @@ class IndependentAgentStoreMixin:
         )
         if max_cycles is not None:
             normalize_max_cycles(max_cycles)
+        if temporary_chat is not None and not isinstance(temporary_chat, bool):
+            raise ValueError("temporary_chat must be a boolean")
         requested_id = _validate_task_id(task_id) if task_id is not None else None
         self.root.mkdir(parents=True, exist_ok=True)
         with exclusive_file_lock(self.allocation_lock):
@@ -504,6 +509,13 @@ class IndependentAgentStoreMixin:
                     if previous is not None
                     else 0
                 )
+            )
+            effective_temporary_chat = (
+                temporary_chat
+                if temporary_chat is not None
+                else previous["independent"].get("temporary_chat") is True
+                if previous is not None
+                else True
             )
             repository_path = Path(
                 repository
@@ -578,6 +590,7 @@ class IndependentAgentStoreMixin:
                 enabled=enabled,
                 max_cycles=effective_max_cycles,
                 max_cycles_explicit=max_cycles is not None,
+                temporary_chat=effective_temporary_chat,
                 inherited_role=(
                     previous["roles"][INDEPENDENT_ROLE]
                     if previous is not None
@@ -629,6 +642,7 @@ class IndependentAgentStoreMixin:
             system_prompt=system_prompt,
             trigger_settings=trigger_settings,
             max_cycles=max_cycles,
+            temporary_chat=False,
             _seed_only=True,
         )
 
@@ -895,7 +909,9 @@ class IndependentAgentStoreMixin:
                 datetime.fromisoformat(now.replace("Z", "+00:00"))
                 + timedelta(seconds=int(self.config.independent_idle_close_seconds))
             ).isoformat(),
-            close_tab_when_idle=False,
+            close_tab_when_idle=(
+                disposition == "COMPLETED" and independent.get("temporary_chat") is True
+            ),
             successor_task_id=None,
         )
         state.pop("completed_at", None)
@@ -1196,6 +1212,7 @@ class IndependentAgentStoreMixin:
             independent["completion_request"] = None
             independent["continuation_request"] = None
             independent["idle_since"] = None
+            independent["idle_tab_closed_at"] = None
             state["status"] = "RUNNING"
             state["kanban_column"] = INDEPENDENT_COLUMN
             state["active_action"] = "queued"

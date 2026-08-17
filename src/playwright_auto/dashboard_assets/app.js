@@ -325,6 +325,8 @@ function resetAgentEditor() {
   form.elements.is_system.value = "false";
   form.elements.independent.disabled = false;
   form.elements.independent.checked = false;
+  form.elements.temporary_chat.checked = true;
+  form.elements.temporary_chat.closest("label").hidden = false;
   form.elements.trigger_type.value = "manual";
   form.elements.max_cycles.value = "0";
   rememberTriggerSettings(form, {});
@@ -359,6 +361,7 @@ function loadAgentEditor(value) {
   form.elements.is_system.value = String(Boolean(agent.is_system || agent.is_builtin));
   form.elements.independent.checked = kind === "independent";
   form.elements.independent.disabled = true;
+  form.elements.temporary_chat.closest("label").hidden = true;
   roots.deleteAgent.hidden = Boolean(agent.is_system || agent.is_builtin);
   if (kind === "independent") {
     const settings = agent.trigger_settings || {};
@@ -1360,6 +1363,7 @@ roots.agentForm.addEventListener("submit", event => {
       endpoint: "/api/independent-agents",
       body: {
         name, system_prompt: systemPrompt, mode: "Independent",
+        temporary_chat: values.has("temporary_chat"),
         max_cycles: Math.max(0, Number(values.get("max_cycles") || 0)),
         trigger_settings: basicTriggerSettings(values),
       },

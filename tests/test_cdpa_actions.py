@@ -381,6 +381,40 @@ def test_workspace_open_role_can_force_fresh_page_identity(monkeypatch):
     assert client.binding.page_id == "fresh-page-1"
 
 
+def test_fresh_chat_opens_exact_url_and_binds_task_identity(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    monkeypatch.setattr(actions_module, "ChatGPTWorkspace", FakeWorkspace)
+    monkeypatch.setattr(
+        actions_module,
+        "random_delay",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+    context = FakeContext()
+    actions = CDPATabActions(context, config)
+    current = manifest(
+        team="agent-temporary",
+        task_id="agent-temporary-g1",
+        physical_role="agent-temporary-agent",
+        page_id=None,
+        page_url=None,
+    )
+
+    acquired = asyncio.run(
+        actions.fresh_chat(
+            current,
+            "PLAN",
+            url="https://chatgpt.com/?temporary-chat=true",
+        )
+    )
+
+    assert context.new_page_calls == 1
+    assert acquired.created is True
+    assert acquired.new_chat is True
+    assert acquired.url == "https://chatgpt.com/?temporary-chat=true"
+    assert acquired.client.page.goto_calls == ["https://chatgpt.com/?temporary-chat=true"]
+    assert acquired.client.bind_calls == [("agent-temporary-g1", "agent-temporary")]
+
+
 def test_branch_from_anchor_opens_native_route_and_binds_clean_fresh_target(
     tmp_path, monkeypatch
 ):

@@ -346,6 +346,8 @@ def validate_independent_object(value: Any) -> str | None:
         return "independent enabled must be a boolean"
     if not isinstance(value.get("max_cycles_explicit", False), bool):
         return "independent max_cycles_explicit must be a boolean"
+    if "temporary_chat" in value and not isinstance(value["temporary_chat"], bool):
+        return "independent temporary_chat must be a boolean"
     if not isinstance(value.get("new_chat_next_job"), bool):
         return "independent new_chat_next_job must be a boolean"
     if not isinstance(value.get("close_tab_when_idle", False), bool):
@@ -929,6 +931,7 @@ def claim_oldest_event(
     independent["completion_request"] = None
     independent["continuation_request"] = None
     independent["idle_since"] = None
+    independent["idle_tab_closed_at"] = None
     if event["failure_signature"] and event["target_team"]:
         key = f"{event['target_team']}:{event['failure_signature']}"
         counts = independent.setdefault("occurrence_counts", {})

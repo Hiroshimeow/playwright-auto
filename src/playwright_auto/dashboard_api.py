@@ -382,7 +382,14 @@ class DashboardAPI:
         return {}
 
     def normalize_independent_create(self, raw: Mapping[str, Any]) -> dict[str, Any]:
-        allowed = {"name", "system_prompt", "mode", "trigger_settings", "max_cycles"}
+        allowed = {
+            "name",
+            "system_prompt",
+            "mode",
+            "trigger_settings",
+            "max_cycles",
+            "temporary_chat",
+        }
         unknown = set(raw) - allowed
         if unknown:
             raise APIError(400, "invalid_request", f"unknown fields: {sorted(unknown)!r}")
@@ -402,9 +409,17 @@ class DashboardAPI:
                 if "max_cycles" in raw
                 else None
             )
+            temporary_chat = raw.get("temporary_chat", True)
+            if not isinstance(temporary_chat, bool):
+                raise ValueError("temporary_chat must be a boolean")
         except ValueError as exc:
             raise APIError(400, "invalid_request", str(exc)) from exc
-        payload = {"name": name, "system_prompt": prompt, "mode": "Independent"}
+        payload = {
+            "name": name,
+            "system_prompt": prompt,
+            "mode": "Independent",
+            "temporary_chat": temporary_chat,
+        }
         if settings is not None:
             payload["trigger_settings"] = settings
         if max_cycles is not None:

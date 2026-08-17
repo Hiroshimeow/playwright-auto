@@ -49,6 +49,7 @@ def setup_agent(tmp_path: Path):
         task_id="agent-maintainers-g1",
         trigger_settings={"recovery": True},
         max_cycles=5,
+        temporary_chat=False,
     )
     standby = store.update(
         standby["manifest_path"],
@@ -70,6 +71,52 @@ def setup_agent(tmp_path: Path):
     )
     claimed = store.save(claimed["manifest_path"], claimed)
     return config, store, blocked, claimed, CDPAWorker(config, store=store)
+
+
+def test_temporary_independent_pre_send_opens_exact_fresh_url_and_ignores_saved_chat(tmp_path: Path):
+    _config, _store, _blocked, state, worker = setup_agent(tmp_path)
+    state["independent"]["temporary_chat"] = True
+    role = state["roles"]["AGENT"]
+    role.update(
+        page_id="old-page",
+        page_url="https://chatgpt.com/c/old-conversation",
+        online=False,
+    )
+    hop = _active_hop(state)
+
+    class TemporaryActions(FakeActions):
+        def __init__(self):
+            super().__init__()
+            self.fresh_urls = []
+
+        async def acquire(self, *_args, **_kwargs):
+            raise AssertionError("temporary chat must not use persistent acquisition")
+
+        async def reopen(self, *_args, **_kwargs):
+            raise AssertionError("temporary chat must not reopen the saved conversation")
+
+        async def new_chat(self, *_args, **_kwargs):
+            raise AssertionError("temporary chat must use the exact temporary URL")
+
+        async def fresh_chat(self, current, logical_role, *, url):
+            self.fresh_urls.append(url)
+            record = current["roles"][logical_role]
+            acquired = await FakeActions.acquire(self, current, logical_role)
+            return type(acquired)(
+                client=acquired.client,
+                page_id=f"temporary-{record['physical_role']}",
+                url=url,
+                created=True,
+                new_chat=True,
+            )
+
+    actions = TemporaryActions()
+    asyncio.run(worker._pre_send(state, hop, actions))
+
+    assert actions.fresh_urls == ["https://chatgpt.com/?temporary-chat=true"]
+    assert role["page_id"].startswith("temporary-")
+    assert role["page_url"] == "https://chatgpt.com/?temporary-chat=true"
+    assert hop["state"] == "sending"
 
 
 def test_independent_pre_send_uses_shared_prompt_without_route_contract(tmp_path: Path):

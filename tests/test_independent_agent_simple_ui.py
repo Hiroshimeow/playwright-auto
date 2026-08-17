@@ -37,6 +37,7 @@ def setup_agent(tmp_path: Path, *, prompt: str = "Inspect the requested work."):
             "states": ["RUNNING", "BLOCKED"],
             "check_all": True,
         },
+        temporary_chat=False,
     )
     return config, store, state, CDPAWorker(config, store=store)
 
@@ -355,6 +356,75 @@ def test_completed_job_closes_after_one_minute_and_next_trigger_reopens_saved_ur
     ]
     assert _active_hop(running)["state"] == "sending"
 
+def test_temporary_completed_job_requests_immediate_close_and_next_trigger_is_fresh(
+    tmp_path: Path,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_independent_agent(
+        "Temporary Agent",
+        system_prompt="Run once and forget the tab.",
+        task_id="agent-temporary-simple-g1",
+        temporary_chat=True,
+    )
+    responded = mark_responded(store, state)
+    assert responded["independent"]["close_tab_when_idle"] is False
+    completed = store.complete_independent_task(
+        responded["manifest_path"], outcome="SUCCESS", summary="Temporary job completed."
+    )
+
+    assert completed["reports"][-1]["content"] == "Completed and verified."
+    assert completed["independent"]["close_tab_when_idle"] is True
+    assert completed["roles"]["AGENT"]["page_url"] == (
+        "https://chatgpt.com/c/saved-conversation"
+    )
+
+    worker = CDPAWorker(config, store=store)
+    worker.hydrate_runtime(startup=False)
+    actions = FakeActions()
+    idle_epoch = datetime.fromisoformat(completed["independent"]["idle_since"]).timestamp()
+    changed = asyncio.run(
+        worker._close_idle_independent_tabs(actions, now_epoch=idle_epoch)
+    )
+    closed = store.load(completed["manifest_path"])
+    assert completed["task_id"] in changed
+    assert actions.closed_teams == 1
+    assert closed["independent"]["idle_tab_closed_at"]
+
+    closed = store.update_independent_agent(closed["manifest_path"], enabled=True)
+    running = store.run_independent_now(closed["manifest_path"], trigger_type="manual")
+    assert running["independent"].get("idle_tab_closed_at") is None
+
+    class FreshActions(FakeActions):
+        def __init__(self):
+            super().__init__()
+            self.fresh_urls = []
+
+        async def acquire(self, *_args, **_kwargs):
+            raise AssertionError("temporary agent must not reopen persistent acquisition")
+
+        async def reopen(self, *_args, **_kwargs):
+            raise AssertionError("temporary agent must not reopen its saved UUID")
+
+        async def fresh_chat(self, current, logical_role, *, url):
+            self.fresh_urls.append(url)
+            acquired = await FakeActions.acquire(self, current, logical_role)
+            return type(acquired)(
+                client=acquired.client,
+                page_id="temporary-page-2",
+                url=url,
+                created=True,
+                new_chat=True,
+            )
+
+    fresh = FreshActions()
+    asyncio.run(worker._pre_send(running, _active_hop(running), fresh))
+    assert fresh.fresh_urls == ["https://chatgpt.com/?temporary-chat=true"]
+    assert running["roles"]["AGENT"]["page_url"] == (
+        "https://chatgpt.com/?temporary-chat=true"
+    )
+
+
 def test_board_uses_operator_labels_run_task_and_restored_settings():
     html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
     app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
@@ -381,6 +451,7 @@ def test_board_uses_operator_labels_run_task_and_restored_settings():
     assert 'aria-label="Close Add Agents panel"' in html
     assert 'data-new-agent>New agent</button>' in html
     assert 'name="independent"' in create_form
+    assert 'name="temporary_chat" checked' in create_form
     assert 'New agents are Custom Workflow Agents' in create_form
     assert 'name="mode"' not in create_form
     assert 'Add independent agent' not in html
@@ -406,6 +477,8 @@ def test_board_uses_operator_labels_run_task_and_restored_settings():
     assert app.count("configuredTriggerSettings(roots.agentSettingsForm, values)") == 1
     assert 'task_done: ["task_team"]' in app
     assert 'mode: "Independent"' in app
+    assert 'form.elements.temporary_chat.checked = true' in app
+    assert 'temporary_chat: values.has("temporary_chat")' in app
     assert 'Create independent agent · ${name}' in app
     assert 'Create workflow agent · ${name}' in app
     assert "No lifecycle records for this agent." in detail
@@ -414,5 +487,5 @@ def test_board_uses_operator_labels_run_task_and_restored_settings():
     assert 'body: {trigger_type: "manual", instruction}' in app
     assert '/api/independent-agents/${encodeURIComponent(taskId)}/reset' in app
     assert '.filter(item => !item.agent?.deleted_at)' in app
-    assert 'app.js?v=20260809-compact-ui-v2' in html
+    assert 'app.js?v=20260817-temporary-chat' in html
     assert "new_chat_next_job" not in html[html.index('id="agent-settings-dialog"') :]

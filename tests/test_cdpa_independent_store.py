@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from playwright_auto.cdpa_config import load_cdpa_config
-from playwright_auto.cdpa_independent import canonical_independent_events
+from playwright_auto.cdpa_independent import canonical_independent_events, validate_independent_object
 from playwright_auto.cdpa_store import TaskStore
 from playwright_auto.cdpa_worker import CDPAWorker
 
@@ -43,6 +43,68 @@ def test_independent_agent_is_one_waiting_task_with_one_agent_role(tmp_path: Pat
         "check_all": False,
     }
     assert store.load(state["manifest_path"])["task_mode"] == "independent"
+
+
+def test_independent_temporary_chat_defaults_true_explicit_false_and_legacy_missing(tmp_path: Path):
+    config = load_cdpa_config(None, repository_root=tmp_path)
+    store = TaskStore(config)
+
+    temporary = store.create_independent_agent(
+        "Temporary Watcher",
+        system_prompt="Inspect once.",
+        task_id="agent-temporary-watcher-g1",
+    )
+    persistent = store.create_independent_agent(
+        "Persistent Watcher",
+        system_prompt="Keep the conversation.",
+        task_id="agent-persistent-watcher-g1",
+        temporary_chat=False,
+    )
+    legacy = dict(persistent["independent"])
+    legacy.pop("temporary_chat", None)
+
+    assert temporary["independent"]["temporary_chat"] is True
+    assert persistent["independent"]["temporary_chat"] is False
+    assert validate_independent_object(legacy) is None
+    assert legacy.get("temporary_chat", False) is False
+
+
+def test_independent_recreation_preserves_legacy_persistent_mode(tmp_path: Path):
+    config = load_cdpa_config(None, repository_root=tmp_path)
+    store = TaskStore(config)
+    first = store.create_independent_agent(
+        "Legacy Persistent",
+        system_prompt="Keep the conversation.",
+        task_id="agent-legacy-persistent-g1",
+        temporary_chat=False,
+    )
+    first = store.update(
+        first["manifest_path"],
+        lambda current: (
+            current["independent"].pop("temporary_chat", None) or current
+        ),
+    )
+    store.delete_independent_agent(first["manifest_path"])
+
+    recreated = store.create_independent_agent(
+        "Legacy Persistent",
+        system_prompt="Keep the conversation.",
+    )
+
+    assert recreated["independent"]["temporary_chat"] is False
+
+
+def test_builtin_seed_stays_persistent(tmp_path: Path):
+    config = load_cdpa_config(None, repository_root=tmp_path)
+    store = TaskStore(config)
+
+    seeded = store.seed_independent_agent(
+        "Maintainers",
+        system_prompt="Recover tasks.",
+        trigger_settings={"recovery": True},
+    )
+
+    assert seeded["independent"]["temporary_chat"] is False
 
 
 def test_same_agent_name_reuses_current_identity_and_exact_team(tmp_path: Path):

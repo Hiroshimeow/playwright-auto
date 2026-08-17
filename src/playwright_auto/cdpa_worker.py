@@ -3082,7 +3082,17 @@ class CDPAWorker:
         if self._attachment_files_for_generation(state, role) is None:
             return
         independent = state.get("independent") if is_independent_task(state) else None
-        if (
+        if isinstance(independent, dict) and independent.get("temporary_chat") is True:
+            if self._rate_limit_gate_active():
+                state["active_action"] = "rate_limit_cooldown"
+                return
+            acquired = await actions.fresh_chat(
+                state,
+                role,
+                url="https://chatgpt.com/?temporary-chat=true",
+            )
+            await self._dismiss_known_rate_limit_on_existing(acquired)
+        elif (
             isinstance(independent, dict)
             and independent.get("new_chat_next_job") is True
             and independent.get("new_chat_deferred_task_id")
@@ -8186,6 +8196,9 @@ class CDPAWorker:
                         int(payload["max_cycles"])
                         if "max_cycles" in payload
                         else None
+                    ),
+                    temporary_chat=(
+                        payload["temporary_chat"] if "temporary_chat" in payload else None
                     ),
                     external_command_id=command_id,
                 )

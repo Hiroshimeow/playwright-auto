@@ -6,11 +6,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from playwright_auto.cdpa_config import load_cdpa_config
 from playwright_auto.cdpa_runtime_db import RuntimeDB
 from playwright_auto.cdpa_store import TaskStore
 from playwright_auto.cdpa_worker import CDPAWorker
-from playwright_auto.dashboard_api import DashboardAPI
+from playwright_auto.dashboard_api import APIError, DashboardAPI
 
 from test_cdpa_core import write_config
 
@@ -83,6 +85,7 @@ def test_create_independent_agent_command_is_idempotent(tmp_path: Path):
     assert len(agents) == 1
     assert agents[0]["status"] == "WAITING"
     assert agents[0]["independent"]["system_prompt"] == "Review releases."
+    assert agents[0]["independent"]["temporary_chat"] is True
     assert agents[0]["independent"]["trigger_settings"] == {
         "recovery": False,
         "interval_minutes": None,
@@ -310,6 +313,23 @@ def test_dashboard_normalizes_independent_creation_completion_activation_repair_
             },
         }
     )
+    persistent = api.normalize_independent_create(
+        {
+            "name": "Persistent Agent",
+            "system_prompt": "Keep context.",
+            "mode": "Independent",
+            "temporary_chat": False,
+        }
+    )
+    with pytest.raises(APIError, match="temporary_chat"):
+        api.normalize_independent_create(
+            {
+                "name": "Invalid Agent",
+                "system_prompt": "Reject invalid flag.",
+                "mode": "Independent",
+                "temporary_chat": "false",
+            }
+        )
     completed = api.normalize_independent_completion(
         {"outcome": "SUCCESS", "summary": "Checks passed."}
     )
@@ -342,6 +362,7 @@ def test_dashboard_normalizes_independent_creation_completion_activation_repair_
         "name": "Monitor Two",
         "system_prompt": "Inspect progress.",
         "mode": "Independent",
+        "temporary_chat": True,
         "trigger_settings": {
             "recovery": False,
             "interval_minutes": 20,
@@ -352,6 +373,7 @@ def test_dashboard_normalizes_independent_creation_completion_activation_repair_
             "check_all": False,
         },
     }
+    assert persistent["temporary_chat"] is False
     assert completed["outcome"] == "SUCCESS"
     assert completed["summary"] == "Checks passed."
     assert activated == {"agent_name": "Maintainers", "target_task_id": "target-a"}

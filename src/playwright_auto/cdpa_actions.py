@@ -878,6 +878,46 @@ class CDPATabActions:
             await client.page.close()
             raise
 
+    async def fresh_chat(
+        self,
+        manifest: Mapping[str, Any],
+        logical_role: str,
+        *,
+        url: str,
+    ) -> AcquiredRole:
+        selected = await self.preflight_team(manifest)
+        if selected:
+            await self.close_team(manifest, preflighted_pages=selected)
+            if await self.preflight_team(manifest):
+                raise TeamCloseError("fresh chat could not close the previous owned tab")
+        logical_role = str(logical_role).upper()
+        record = manifest["roles"][logical_role]
+        physical = str(record["physical_role"])
+        await random_delay(action_delay_multiplier("open_tab"))
+        workspace = ChatGPTWorkspace()
+        client = await workspace.open_role(
+            self.browser_context,
+            physical,
+            url=url,
+            timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
+            force_new_page_id=True,
+        )
+        try:
+            await client.bind_task_identity(str(manifest["task_id"]), str(manifest["team"]))
+            snapshot = await client.assert_ownership()
+            assert client.binding is not None
+            await self._set_page_active(client.page)
+            return AcquiredRole(
+                client=client,
+                page_id=client.binding.page_id,
+                url=str(snapshot.url),
+                created=True,
+                new_chat=True,
+            )
+        except Exception:
+            await client.page.close()
+            raise
+
     async def new_chat(
         self,
         manifest: Mapping[str, Any],
