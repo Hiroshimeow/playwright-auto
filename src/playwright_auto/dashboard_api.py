@@ -382,14 +382,7 @@ class DashboardAPI:
         return {}
 
     def normalize_independent_create(self, raw: Mapping[str, Any]) -> dict[str, Any]:
-        allowed = {
-            "name",
-            "system_prompt",
-            "mode",
-            "trigger_settings",
-            "max_cycles",
-            "temporary_chat",
-        }
+        allowed = {"name", "system_prompt", "mode", "trigger_settings", "max_cycles", "temporary_chat"}
         unknown = set(raw) - allowed
         if unknown:
             raise APIError(400, "invalid_request", f"unknown fields: {sorted(unknown)!r}")

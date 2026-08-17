@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
+from playwright_auto.cdpa_actions import AcquiredRole
 from playwright_auto.cdpa_config import load_cdpa_config
 from playwright_auto.cdpa_independent import (
     RECOVERY_WARMUP_SECONDS,
@@ -117,6 +119,60 @@ def test_temporary_independent_pre_send_opens_exact_fresh_url_and_ignores_saved_
     assert role["page_id"].startswith("temporary-")
     assert role["page_url"] == "https://chatgpt.com/?temporary-chat=true"
     assert hop["state"] == "sending"
+
+
+def test_temporary_independent_continuation_reuses_current_owned_chat(tmp_path: Path):
+    _config, store, _blocked, state, worker = setup_agent(tmp_path)
+    state["independent"]["temporary_chat"] = True
+    role = state["roles"]["AGENT"]
+    role.update(
+        page_id="temporary-page",
+        page_url="https://chatgpt.com/c/current-temporary",
+        online=True,
+        conversation_generation=1,
+    )
+    first_hop = _active_hop(state)
+    first_hop.update(
+        state="responded",
+        response="Continue this job.",
+        response_sha256="a" * 64,
+        conversation_url=role["page_url"],
+    )
+    state = store.save(state["manifest_path"], state)
+    continued = store.continue_independent_task(
+        state["manifest_path"], reason="Continue in the same conversation."
+    )
+    hop = _active_hop(continued)
+
+    class ContinuationActions(FakeActions):
+        async def fresh_chat(self, *_args, **_kwargs):
+            raise AssertionError("same-job continuation must not open a fresh temporary chat")
+
+        async def acquire(self, *_args, **_kwargs):
+            raise AssertionError("same-job continuation must not use persistent acquisition")
+
+        async def reopen(self, *_args, **_kwargs):
+            raise AssertionError("same-job continuation must not reopen a saved conversation")
+
+        async def locate_owned(self, current, logical_role):
+            record = current["roles"][logical_role]
+            return AcquiredRole(
+                client=SimpleNamespace(),
+                page_id=record["page_id"],
+                url=record["page_url"],
+                created=False,
+                new_chat=False,
+            )
+
+    asyncio.run(worker._pre_send(continued, hop, ContinuationActions()))
+
+    current_role = continued["roles"]["AGENT"]
+    assert continued["independent"]["cycle"] == 2
+    assert hop["kind"] == "independent_cycle"
+    assert hop["state"] == "sending"
+    assert current_role["page_id"] == "temporary-page"
+    assert current_role["page_url"] == "https://chatgpt.com/c/current-temporary"
+    assert current_role["conversation_generation"] == 1
 
 
 def test_independent_pre_send_uses_shared_prompt_without_route_contract(tmp_path: Path):
