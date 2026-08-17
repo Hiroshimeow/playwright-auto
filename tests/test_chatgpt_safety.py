@@ -109,6 +109,97 @@ def test_provenance_helpers_reject_old_and_non_exact_messages():
     assert [item.message_id for item in new_assistant_turns(current, baseline)] == ["a2"]
 
 
+def test_send_reuses_hydrated_existing_conversation_baseline(monkeypatch):
+    import types
+
+    history = (
+        MessageSnapshot("user", "u-old", "t-old", "older prompt", ()),
+        MessageSnapshot("assistant", "a-old", "t-old", "older answer", ()),
+    )
+    empty = replace(
+        snapshot(task_id="task-a"),
+        url="https://chatgpt.com/c/reused",
+        session_id="reused",
+        page_team="alpha",
+    )
+    hydrated = replace(empty, messages=history)
+    accepted = MessageSnapshot("user", "u-new", "t-new", "prompt", ())
+    page = DummyPage(empty)
+    client = ChatGPTPage(page)
+    client.binding = PageBinding("page-1", "DEV")
+    reads = 0
+
+    async def fake_assert(self):
+        nonlocal reads
+        reads += 1
+        return empty if reads == 1 else hydrated
+
+    async def fake_prepare(self, *_args, **_kwargs):
+        return None
+
+    async def fake_accept(self, *_args, **_kwargs):
+        return ("exact_user_message", accepted)
+
+    async def fake_click(target, **_kwargs):
+        target.clicks += 1
+
+    client.assert_ownership = types.MethodType(fake_assert, client)
+    client._prepare_prompt_locked = types.MethodType(fake_prepare, client)
+    client._wait_send_acceptance = types.MethodType(fake_accept, client)
+    monkeypatch.setattr(chatgpt, "click_send_button", fake_click)
+
+    receipt = asyncio.run(
+        client.send(
+            "prompt",
+            wait_for_stop=False,
+            max_attempts=1,
+            expected_task_id="task-a",
+            expected_team="alpha",
+            require_existing_conversation_baseline=True,
+        )
+    )
+
+    assert receipt.baseline.message_ids == frozenset({"u-old", "a-old"})
+    assert page.clicks == 1
+
+
+def test_send_refuses_persistently_empty_existing_conversation_without_click(monkeypatch):
+    import types
+
+    empty = replace(
+        snapshot(task_id="task-a"),
+        url="https://chatgpt.com/c/reused",
+        session_id="reused",
+        page_team="alpha",
+    )
+    page = DummyPage(empty)
+    client = ChatGPTPage(page)
+    client.binding = PageBinding("page-1", "DEV")
+
+    async def fake_assert(self):
+        return empty
+
+    async def fake_click(target, **_kwargs):
+        target.clicks += 1
+
+    client.assert_ownership = types.MethodType(fake_assert, client)
+    monkeypatch.setattr(chatgpt, "click_send_button", fake_click)
+
+    with pytest.raises(UnsafePageStateError, match="transcript.*hydrated"):
+        asyncio.run(
+            client.send(
+                "prompt",
+                wait_for_stop=False,
+                max_attempts=1,
+                expected_task_id="task-a",
+                expected_team="alpha",
+                require_existing_conversation_baseline=True,
+            )
+        )
+
+    assert page.clicks == 0
+
+
 def test_manual_composer_is_not_overwritten(monkeypatch):
     page = DummyPage(snapshot(composer_text="manual draft", state=ChatGPTState.DRAFT))
     client = ChatGPTPage(page)

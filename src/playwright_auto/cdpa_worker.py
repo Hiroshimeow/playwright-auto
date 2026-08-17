@@ -84,6 +84,8 @@ from .cdpa_store import (
 from .cdpa_team import cleanup_eligible, has_other_nonterminal_team_work
 from .cdpa_workflow_agents import task_workflow_definitions
 from .chatgpt import (
+    ChatGPTAutomationError,
+    ChatGPTPage,
     ChoicePromptBlockedError,
     ComposerConflictError,
     PageOwnershipError,
@@ -96,6 +98,7 @@ from .chatgpt import (
     capture_message_baseline,
     capture_response_recovery_baseline,
     configure_action_delays,
+    ConversationTranscriptNotReadyError,
     IncompleteResponseTimeoutError,
     ManualInputPendingError,
     merge_response_recovery_baselines,
@@ -119,6 +122,8 @@ from .chatgpt_graph import (
     GraphIdentityError,
     resolve_completed_file_write,
     resolve_exact_new_user_message,
+    resolve_exact_user_message,
+    resolve_unique_exact_user_message,
     resolve_terminal_assistant,
     resolve_bootstrap_donor,
     resolve_inherited_assistant,
@@ -140,7 +145,6 @@ from .workspace import ChatGPTWorkspace
 
 TERMINAL = frozenset({"DONE", "STOPPED"})
 IN_FLIGHT = frozenset({"sending", "sent", "waiting"})
-_RATE_LIMIT_COOLDOWN_SECONDS = 60.0
 _STREAM_STATUS_RECOVERY_SECONDS = 30.0
 _CONSECUTIVE_SELF_ROUTE_LIMIT = 3
 _CONSECUTIVE_SELF_ROUTE_BLOCK_CODE = "consecutive_self_route_limit"
@@ -151,8 +155,6 @@ _DOM_FALLBACK_SETTLE_SECONDS = 30.0
 _STREAM_STATUS_POLL_MIN_SECONDS = 10.0
 _STREAM_STATUS_POLL_MAX_SECONDS = 15.0
 _AUTOMATED_SEND_SPACING_SECONDS = 10.0
-_AUTOMATED_SEND_SKIPPED = object()
-_POST_RELEASE_ACQUISITION_BLOCKED = object()
 _SENDING_CONTINUATION_STARTED = "bounded continuation started after proven atomic non-acceptance"
 _PROVEN_ATOMIC_NONACCEPTANCE_ERRORS = (
     "ComposerConflictError: composer changed or became unavailable inside the atomic send boundary",
@@ -162,12 +164,6 @@ _PROVEN_ATOMIC_NONACCEPTANCE_ERRORS = (
 )
 _RATE_LIMIT_BLOCK_MESSAGE = (
     "Too many requests; shared browser-profile cooldown is active"
-)
-_RATE_LIMIT_DEFERRED_CONTROLS = frozenset(
-    {"resume", "retry", "restart_role", "new_chat", "open_tab", "route_plan"}
-)
-_RATE_LIMIT_DEFERRED_COMMANDS = frozenset(
-    {"independent_run_now", "independent_activate_agent"}
 )
 
 
@@ -225,6 +221,7 @@ def _waiting_working_copy(state: Mapping[str, Any]) -> dict[str, Any]:
         "route_timeline",
         "dependency_events",
         "queue_events",
+        "repair_wait",
     ):
         value = state.get(key)
         if isinstance(value, (dict, list)):
@@ -365,18 +362,18 @@ class CDPAWorker:
         self._last_browser_inventory_at = 0.0
         self._last_browser_page_count = -1
         self._browser_projection: dict[str, Any] | None = None
+        self._browser_inventory_task: asyncio.Task[Any] | None = None
         self._browser_connected = False
         self._browser_error: str | None = None
         self._browser_cycle_active = False
         self._rate_limit_cooldown: dict[str, Any] | None = None
         self._rate_limit_lock = asyncio.Lock()
-        self._post_release_acquisition_owner: asyncio.Task[Any] | None = None
         self._send_gate_lock = asyncio.Lock()
         self._last_automated_send_at: float | None = None
         self._bootstrap_prepare_lock = asyncio.Lock()
         self._repository_project_lock = asyncio.Lock()
         self._repository_project_tasks: set[asyncio.Task[Any]] = set()
-        self.rate_limit_cooldown_seconds = _RATE_LIMIT_COOLDOWN_SECONDS
+        self.rate_limit_cooldown_seconds = config.rate_limit_quiet_seconds
         self._manifest_cache: dict[
             Path, tuple[tuple[int, int, int, int], dict[str, Any]]
         ] = {}
@@ -464,86 +461,14 @@ class CDPAWorker:
         task.add_done_callback(self._repository_project_tasks.discard)
 
     def _rate_limit_gate_active(self) -> bool:
-        return (
-            isinstance(self._rate_limit_cooldown, Mapping)
-            and self._rate_limit_cooldown.get("state") == "active"
-        )
-
-    def _begin_post_release_acquisition(self) -> str:
         cooldown = self._rate_limit_cooldown
-        if not isinstance(cooldown, dict) or cooldown.get("state") != "released":
-            return "unrestricted"
-        marker = cooldown.get("post_release_acquisition")
-        current = asyncio.current_task()
-        if marker == "pending":
-            cooldown["post_release_acquisition"] = "in_progress"
-            cooldown["post_release_acquisition_started_at"] = utc_now()
-            self._post_release_acquisition_owner = current
-            self._publish_heartbeat(force=True)
-            return "claimed"
-        if marker == "in_progress":
-            return (
-                "reentrant"
-                if self._post_release_acquisition_owner is current and current is not None
-                else "blocked"
-            )
-        return "unrestricted"
-
-    def _finish_post_release_acquisition(self, token: str) -> None:
-        if token != "claimed":
-            return
-        cooldown = self._rate_limit_cooldown
-        current = asyncio.current_task()
-        if self._post_release_acquisition_owner is current:
-            self._post_release_acquisition_owner = None
-        if (
-            isinstance(cooldown, dict)
-            and cooldown.get("state") == "released"
-            and cooldown.get("post_release_acquisition") == "in_progress"
-        ):
-            cooldown["post_release_acquisition"] = "consumed"
-            cooldown["post_release_acquisition_at"] = utc_now()
-            self._publish_heartbeat(force=True)
-
-    async def _run_post_release_acquisition(
-        self,
-        state: Mapping[str, Any],
-        actions: CDPATabActions,
-        operation: Callable[[], Any],
-    ) -> Any:
-        token = self._begin_post_release_acquisition()
-        if token == "blocked":
-            return _POST_RELEASE_ACQUISITION_BLOCKED
-        try:
-            return await operation()
-        except RateLimitBlockedError as exc:
-            await self._enter_rate_limit_cooldown(state, actions, exc)
-            raise
-        finally:
-            self._finish_post_release_acquisition(token)
-
-    def _cooldown_allows_hop(self, hop: Mapping[str, Any]) -> bool:
-        hop_state = str(hop.get("state") or "")
-        if hop_state in {"sent", "waiting", "responded", "routed"}:
-            return True
-        receipt = hop.get("receipt")
-        if isinstance(receipt, Mapping) and (
-            receipt.get("user_message_id") or receipt.get("user_turn_id")
-        ):
-            return True
-        ledger_path = hop.get("ledger_path")
-        request_id = hop.get("request_id")
-        if not ledger_path or not request_id:
+        if not isinstance(cooldown, Mapping) or cooldown.get("state") != "active":
             return False
-        try:
-            record = RequestLedger(str(ledger_path)).get(str(request_id))
-        except Exception:
+        release_at = parse_time(cooldown.get("release_not_before"))
+        if release_at is not None and datetime.now(timezone.utc) >= release_at:
+            self._rate_limit_cooldown = None
             return False
-        return bool(
-            record is not None
-            and record.status
-            in {RequestStatus.SENDING, RequestStatus.SENT, RequestStatus.COMPLETED}
-        )
+        return True
 
     def _restore_rate_limit_cooldown(self) -> None:
         if self._rate_limit_cooldown is not None:
@@ -557,12 +482,9 @@ class CDPAWorker:
         )
         if isinstance(cooldown, Mapping):
             restored = dict(cooldown)
-            if (
-                restored.get("state") == "released"
-                and restored.get("post_release_acquisition") == "in_progress"
-            ):
-                restored["post_release_acquisition"] = "pending"
-            self._rate_limit_cooldown = restored
+            if restored.get("state") == "active":
+                self._rate_limit_cooldown = restored
+                self._rate_limit_gate_active()
 
     async def _enter_rate_limit_cooldown(
         self,
@@ -570,19 +492,13 @@ class CDPAWorker:
         actions: CDPATabActions,
         error: BaseException | str,
     ) -> dict[str, Any]:
+        del actions
         async with self._rate_limit_lock:
-            if self._rate_limit_gate_active():
-                assert self._rate_limit_cooldown is not None
-                return self._rate_limit_cooldown
             now = datetime.now(timezone.utc)
             role = str(state.get("active_role") or "").upper()
             if not role and state.get("active_hop_id") is not None:
                 role = str(_active_hop(state).get("target_role") or "").upper()
-            cooldown_seconds = max(
-                _RATE_LIMIT_COOLDOWN_SECONDS,
-                float(self.rate_limit_cooldown_seconds),
-            )
-            self._post_release_acquisition_owner = None
+            cooldown_seconds = float(self.rate_limit_cooldown_seconds)
             self._rate_limit_cooldown = {
                 "state": "active",
                 "detected_at": now.isoformat(),
@@ -593,26 +509,7 @@ class CDPAWorker:
                 "profile": str(self.config.cdp_url),
                 "detector_task_id": str(state.get("task_id") or "") or None,
                 "detector_role": role or None,
-                "cleanup": None,
-                "post_release_acquisition": None,
             }
-            self._publish_heartbeat(force=True)
-            try:
-                cleanup = await actions.cleanup_rate_limited_chatgpt_pages()
-            except Exception as exc:
-                cleanup = {
-                    "targeted": None,
-                    "closed": None,
-                    "cleared": None,
-                    "errors": [
-                        {
-                            "error": sanitize_text(
-                                f"{type(exc).__name__}: {exc}", max_chars=500
-                            )
-                        }
-                    ],
-                }
-            self._rate_limit_cooldown["cleanup"] = cleanup
             self._publish_heartbeat(force=True)
             return self._rate_limit_cooldown
 
@@ -621,88 +518,30 @@ class CDPAWorker:
         state: dict[str, Any],
         hop: Mapping[str, Any],
     ) -> None:
-        if self._cooldown_allows_hop(hop):
-            state["active_action"] = "rate_limit_cooldown_reconcile"
-            state["block_code"] = None
-            state["block_retryable"] = False
-            state["block_reason"] = None
-            return
-        self._block(
-            state,
-            _RATE_LIMIT_BLOCK_MESSAGE,
-            code="rate_limit_cooldown",
-            retryable=True,
-        )
-
-    def _release_rate_limit_blocked_tasks(self) -> set[str]:
-        if self.registry is None:
-            return set()
-        changed: set[str] = set()
-        for snapshot in list(self.registry.tasks_by_id.values()):
-            if (
-                str(snapshot.get("status") or "").upper() != "BLOCKED"
-                or snapshot.get("block_code") != "rate_limit_cooldown"
-            ):
-                continue
-            task_id = str(snapshot.get("task_id") or "")
-            path = self.registry.paths_by_id.get(task_id)
-            if path is None:
-                continue
-
-            def release(current: dict[str, Any]) -> dict[str, Any]:
-                if (
-                    str(current.get("status") or "").upper() != "BLOCKED"
-                    or current.get("block_code") != "rate_limit_cooldown"
-                ):
-                    return current
-                role = str(current.get("active_role") or "PLAN").upper()
-                current["status"] = "RUNNING"
-                current["kanban_column"] = (
-                    INDEPENDENT_COLUMN
-                    if is_independent_task(current)
-                    else _column_for(role)
-                )
-                current["block_code"] = None
-                current["block_retryable"] = False
-                current["block_reason"] = None
-                try:
-                    hop_state = str(_active_hop(current).get("state") or "")
-                except RuntimeError:
-                    hop_state = ""
-                current["active_action"] = (
-                    "wait_response"
-                    if hop_state in {"sent", "waiting"}
-                    else "send"
-                    if hop_state == "sending"
-                    else "queued"
-                )
-                return current
-
-            saved = self.store.update(path, release)
-            if saved != snapshot:
-                changed.update(self.registry.update_task(saved, now=time.time()))
-        self._publish_affected(changed)
-        return changed
+        del hop
+        state["active_action"] = "rate_limit_cooldown"
+        state["block_code"] = None
+        state["block_retryable"] = False
+        state["block_reason"] = None
 
     async def _refresh_rate_limit_cooldown(
         self, browser_context: Any
     ) -> bool:
         del browser_context
-        if not self._rate_limit_gate_active():
-            return False
-        assert self._rate_limit_cooldown is not None
-        release_at = parse_time(self._rate_limit_cooldown.get("release_not_before"))
-        if release_at is None or datetime.now(timezone.utc) < release_at:
-            return False
-        self._post_release_acquisition_owner = None
-        self._rate_limit_cooldown.update(
-            state="released",
-            released_at=utc_now(),
-            post_release_acquisition="pending",
-        )
-        self._release_rate_limit_blocked_tasks()
-        self._publish_heartbeat(force=True)
-        return True
+        had_cooldown = self._rate_limit_cooldown is not None
+        active = self._rate_limit_gate_active()
+        cleared = had_cooldown and not active and self._rate_limit_cooldown is None
+        if cleared:
+            self._publish_heartbeat(force=True)
+        return cleared
+
+    async def _dismiss_known_rate_limit_on_existing(
+        self, acquired: AcquiredRole
+    ) -> None:
+        visible = getattr(acquired.client, "known_rate_limit_visible", None)
+        dismiss = getattr(acquired.client, "dismiss_known_rate_limit", None)
+        if callable(visible) and await visible() and callable(dismiss):
+            await dismiss(timeout_ms=15_000)
 
     def _block(
         self,
@@ -965,40 +804,35 @@ class CDPAWorker:
                 self._active_recovery_context(state, role)
             )
             acquired = await actions.locate_owned(state, role)
+            if acquired is not None:
+                await self._dismiss_known_rate_limit_on_existing(acquired)
             live_conversation = (
-                _recoverable_conversation_identity(acquired.url) if acquired is not None else None
+                _recoverable_conversation_identity(acquired.url)
+                if acquired is not None
+                else None
             )
-            if (
-                acquired is not None
-                and live_conversation is not None
-                and expected_conversation is None
-            ):
+            if acquired is not None and live_conversation is not None and expected_conversation is None:
                 expected_conversation = live_conversation
                 hop["conversation_url"] = acquired.url
-            if acquired is None and expected_conversation is None:
-                physical_role = state["roles"][role]["physical_role"]
-                raise RoleOwnershipError(
-                    f"owned {physical_role} tab is offline", code="role_offline"
-                )
-            if (
+            needs_reopen = (
                 acquired is None
-                or (
-                    expected_conversation is not None
-                    and _recoverable_conversation_identity(acquired.url) != expected_conversation
-                )
-                or (
-                    expected_page_id is not None
-                    and str(acquired.page_id) != expected_page_id
-                )
-            ):
-                acquired = await self._run_post_release_acquisition(
-                    state,
-                    actions,
-                    lambda: self._recover_active_role(state, role, actions),
-                )
-                if acquired is _POST_RELEASE_ACQUISITION_BLOCKED:
-                    state["active_action"] = "post_release_acquisition_wait"
+                or (expected_conversation is not None and live_conversation != expected_conversation)
+                or (expected_page_id is not None and str(acquired.page_id) != expected_page_id)
+            )
+            if needs_reopen:
+                if expected_conversation is None:
+                    physical_role = state["roles"][role]["physical_role"]
+                    raise RoleOwnershipError(
+                        f"owned {physical_role} tab is offline", code="role_offline"
+                    )
+                if self._rate_limit_gate_active():
+                    state["active_action"] = "rate_limit_cooldown"
                     return None
+                acquired = await self._recover_active_role(state, role, actions)
+        except RateLimitBlockedError as exc:
+            await self._enter_rate_limit_cooldown(state, actions, exc)
+            state["active_action"] = "rate_limit_cooldown"
+            return None
         except Exception as exc:
             code = _role_ownership_block_code(exc) or "role_ownership_ambiguous"
             self._block(state, exc, code=code, retryable=False)
@@ -1658,6 +1492,9 @@ class CDPAWorker:
             reopened = False
             created = False
             if acquired is None:
+                if self._rate_limit_gate_active():
+                    state["active_action"] = "rate_limit_cooldown"
+                    return {"deferred": True, "reason": "rate_limit_cooldown"}
                 role_record = state["roles"][role]
                 active_hop_url = str((hop or {}).get("conversation_url") or "").strip()
                 saved_identity = bool(
@@ -1782,11 +1619,6 @@ class CDPAWorker:
         if control is None:
             return False
         action = str(control.get("action") or "")
-        if (
-            self._rate_limit_gate_active()
-            and action in _RATE_LIMIT_DEFERRED_CONTROLS
-        ):
-            return False
         control_id = control.get("control_id")
         baseline = json.loads(json.dumps(state, ensure_ascii=False, default=str))
         baseline_control_id = control.get("control_id")
@@ -1811,21 +1643,9 @@ class CDPAWorker:
             hop_state = str(hop.get("state") or "") if hop else ""
             if is_independent_task(state):
                 if action == "open_tab":
-                    result = await self._run_post_release_acquisition(
-                        state,
-                        actions,
-                        lambda: self._apply_independent_control(
-                            state,
-                            control,
-                            actions,
-                            role=role,
-                            hop=hop,
-                        ),
+                    result = await self._apply_independent_control(
+                        state, control, actions, role=role, hop=hop
                     )
-                    if result is _POST_RELEASE_ACQUISITION_BLOCKED:
-                        state.clear()
-                        state.update(baseline)
-                        return False
                 else:
                     result = await self._apply_independent_control(
                         state,
@@ -2074,68 +1894,66 @@ class CDPAWorker:
                         "cannot restart a role while a pre-acceptance durable request is pending; use Resume to continue the same request"
                     )
                 old_page_id = state["roles"][role].get("page_id")
-                acquired = await self._run_post_release_acquisition(
-                    state,
-                    actions,
-                    lambda: actions.restart(
+                locator = getattr(actions, "locate_owned", None)
+                existing_role = await locator(state, role) if callable(locator) else True
+                if existing_role is None and self._rate_limit_gate_active():
+                    state["active_action"] = "rate_limit_cooldown"
+                    result = {"deferred": True, "reason": "rate_limit_cooldown"}
+                else:
+                    acquired = await actions.restart(
                         state,
                         role,
                         known_automated_draft=(
                             str(hop.get("prompt") or "") if hop is not None else None
                         ) or None,
-                    ),
-                )
-                if acquired is _POST_RELEASE_ACQUISITION_BLOCKED:
-                    state.clear()
-                    state.update(baseline)
-                    return False
-                self._record_acquired(state, role, acquired)
-                state["roles"][role]["constructor_sent_generation"] = None
-                if blocked_restart:
-                    assert hop is not None
-                    old_hop_id = int(hop["hop_id"])
-                    abandon_reason = (
-                        str(control.get("reason") or "").strip()
-                        or "manual role restart"
                     )
-                    hop["state"] = "abandoned"
-                    hop["abandon_reason"] = abandon_reason
-                    hop["timestamps"]["abandoned_at"] = utc_now()
-                    new_hop = self._append_hop(
-                        state,
-                        source_role=role,
-                        target_role=role,
-                        handoff=str(hop["handoff"]),
-                        kind="role_restart",
-                    )
-                    state["block_code"] = None
-                    state["block_retryable"] = False
-                    state["block_reason"] = None
-                    state["pause_reason"] = None
-                    state.setdefault("route_timeline", []).append(
-                        {
-                            "at": utc_now(),
-                            "hop_id": old_hop_id,
-                            "source_role": role,
-                            "route": role,
-                            "kind": "role_restart",
+                    self._record_acquired(state, role, acquired)
+                    state["roles"][role]["constructor_sent_generation"] = None
+                    if blocked_restart:
+                        assert hop is not None
+                        old_hop_id = int(hop["hop_id"])
+                        abandon_reason = (
+                            str(control.get("reason") or "").strip()
+                            or "manual role restart"
+                        )
+                        hop["state"] = "abandoned"
+                        hop["abandon_reason"] = abandon_reason
+                        hop["timestamps"]["abandoned_at"] = utc_now()
+                        new_hop = self._append_hop(
+                            state,
+                            source_role=role,
+                            target_role=role,
+                            handoff=str(hop["handoff"]),
+                            kind="role_restart",
+                        )
+                        state["block_code"] = None
+                        state["block_retryable"] = False
+                        state["block_reason"] = None
+                        state["pause_reason"] = None
+                        state.setdefault("route_timeline", []).append(
+                            {
+                                "at": utc_now(),
+                                "hop_id": old_hop_id,
+                                "source_role": role,
+                                "route": role,
+                                "kind": "role_restart",
+                                "new_hop_id": new_hop["hop_id"],
+                                "reason": abandon_reason,
+                            }
+                        )
+                        result = {
+                            "old_hop_id": old_hop_id,
                             "new_hop_id": new_hop["hop_id"],
-                            "reason": abandon_reason,
+                            "old_page_id": old_page_id,
+                            "page_id": acquired.page_id,
+                            "new_chat": True,
                         }
-                    )
-                    result = {
-                        "old_hop_id": old_hop_id,
-                        "new_hop_id": new_hop["hop_id"],
-                        "old_page_id": old_page_id,
-                        "page_id": acquired.page_id,
-                        "new_chat": True,
-                    }
-                else:
-                    result = {
-                        "page_id": acquired.page_id,
-                        "old_page_id": old_page_id,
-                        "new_chat": True,
-                    }
+                    else:
+                        result = {
+                            "page_id": acquired.page_id,
+                            "old_page_id": old_page_id,
+                            "new_chat": True,
+                        }
             elif action == "new_chat":
                 if state.get("status") in TERMINAL:
                     raise RuntimeError("cannot start a new chat for a terminal task")
@@ -2152,18 +1970,17 @@ class CDPAWorker:
                     raise RuntimeError(
                         "cannot reset a role while a pre-acceptance durable request is pending; use Resume to continue the same request"
                     )
-                acquired = await self._run_post_release_acquisition(
-                    state,
-                    actions,
-                    lambda: actions.new_chat(state, role),
-                )
-                if acquired is _POST_RELEASE_ACQUISITION_BLOCKED:
-                    state.clear()
-                    state.update(baseline)
-                    return False
-                self._record_acquired(state, role, acquired)
-                state["roles"][role]["constructor_sent_generation"] = None
-                result = {"page_id": acquired.page_id, "new_chat": True}
+                locator = getattr(actions, "locate_owned", None)
+                existing_role = await locator(state, role) if callable(locator) else True
+                if existing_role is None and self._rate_limit_gate_active():
+                    state["active_action"] = "rate_limit_cooldown"
+                    result = {"deferred": True, "reason": "rate_limit_cooldown"}
+                else:
+                    acquired = await actions.new_chat(state, role)
+                    await self._dismiss_known_rate_limit_on_existing(acquired)
+                    self._record_acquired(state, role, acquired)
+                    state["roles"][role]["constructor_sent_generation"] = None
+                    result = {"page_id": acquired.page_id, "new_chat": True}
             elif action == "open_tab":
                 blocked_role_recovery = _is_verified_role_offline_block(state, role)
                 if blocked_role_recovery:
@@ -2253,71 +2070,91 @@ class CDPAWorker:
                     await actions.open_tab(current)
                     return current
 
-                acquired = await self._run_post_release_acquisition(
-                    state,
-                    actions,
-                    acquire_open_tab,
-                )
-                if acquired is _POST_RELEASE_ACQUISITION_BLOCKED:
-                    state.clear()
-                    state.update(baseline)
-                    return False
-                recovered = blocked_role_recovery or bool(acquired.created)
-                acquired_conversation = conversation_identity(acquired.url)
-                if expected_conversation and acquired_conversation != expected_conversation:
-                    raise IneffectiveControlError(
-                        "OPEN_ROLE_TAB reopened a different conversation; operational block remains"
-                    )
-                if (
-                    expected_binding_page_id is not None
-                    and str(acquired.page_id) != expected_binding_page_id
-                ):
-                    raise IneffectiveControlError(
-                        "OPEN_ROLE_TAB did not restore the accepted-send page binding"
-                    )
-                self._record_acquired(state, role, acquired)
-                role_after = state["roles"][role]
-                if (
-                    not bool(role_after.get("online"))
-                    or str(role_after.get("page_id") or "") != str(acquired.page_id)
-                    or (
-                        expected_conversation
-                        and conversation_identity(role_after.get("page_url"))
-                        != expected_conversation
-                    )
-                ):
-                    raise IneffectiveControlError(
-                        "OPEN_ROLE_TAB did not establish the required role ownership postcondition"
-                    )
-                result = {"page_id": acquired.page_id, "recovered": recovered}
-                if blocked_role_recovery:
-                    state["status"] = "RUNNING"
-                    state["kanban_column"] = _column_for(role)
-                    state["block_code"] = None
-                    state["block_retryable"] = False
-                    state["block_reason"] = None
-                    state["pause_reason"] = None
-                    state["active_action"] = "resuming"
-                    result.update(
-                        resumed=True,
-                        hop_id=hop["hop_id"],
-                        request_id=hop["request_id"],
-                    )
+                locator = getattr(actions, "locate_owned", None)
+                existing_open_tab = await locator(state, role) if callable(locator) else True
+                if existing_open_tab is None and self._rate_limit_gate_active():
+                    state["active_action"] = "rate_limit_cooldown"
+                    result = {"deferred": True, "reason": "rate_limit_cooldown"}
+                    acquired = None
+                else:
+                    acquired = await acquire_open_tab()
+                if acquired is None:
+                    recovered = False
+                else:
+                    await self._dismiss_known_rate_limit_on_existing(acquired)
+                    recovered = blocked_role_recovery or bool(acquired.created)
+                if acquired is not None:
+                    acquired_conversation = conversation_identity(acquired.url)
+                    if expected_conversation and acquired_conversation != expected_conversation:
+                        raise IneffectiveControlError(
+                            "OPEN_ROLE_TAB reopened a different conversation; operational block remains"
+                        )
+                    if (
+                        expected_binding_page_id is not None
+                        and str(acquired.page_id) != expected_binding_page_id
+                    ):
+                        raise IneffectiveControlError(
+                            "OPEN_ROLE_TAB did not restore the accepted-send page binding"
+                        )
+                    self._record_acquired(state, role, acquired)
+                    role_after = state["roles"][role]
+                    if (
+                        not bool(role_after.get("online"))
+                        or str(role_after.get("page_id") or "") != str(acquired.page_id)
+                        or (
+                            expected_conversation
+                            and conversation_identity(role_after.get("page_url"))
+                            != expected_conversation
+                        )
+                    ):
+                        raise IneffectiveControlError(
+                            "OPEN_ROLE_TAB did not establish the required role ownership postcondition"
+                        )
+                    result = {"page_id": acquired.page_id, "recovered": recovered}
+                    if blocked_role_recovery:
+                        state["status"] = "RUNNING"
+                        state["kanban_column"] = _column_for(role)
+                        state["block_code"] = None
+                        state["block_retryable"] = False
+                        state["block_reason"] = None
+                        state["pause_reason"] = None
+                        state["active_action"] = "resuming"
+                        result.update(
+                            resumed=True,
+                            hop_id=hop["hop_id"],
+                            request_id=hop["request_id"],
+                        )
             elif action == "route_plan":
                 if guard_blocked:
                     raise RuntimeError(
                         "Route PLAN cannot bypass consecutive self-route guard; explicit operator Resume is required"
                     )
                 assert hop is not None
-                result = self._route_to_plan(
-                    state,
-                    hop,
-                    reason=(
-                        str(control.get("reason") or "").strip()
-                        or "manual route to PLAN"
-                    ),
-                    kind="control",
+                route_reason = (
+                    str(control.get("reason") or "").strip()
+                    or "manual route to PLAN"
                 )
+                if (
+                    str(state.get("status") or "").upper() == "BLOCKED"
+                    and str(state.get("block_code") or "")
+                    == "accepted_conversation_identity_unresolved"
+                ):
+                    if str(control.get("origin") or "operator").strip().lower() != "operator":
+                        raise RuntimeError(
+                            "accepted-send reconciliation requires explicit operator Route PLAN"
+                        )
+                    result = self._route_unresolved_accepted_to_plan(
+                        state,
+                        hop,
+                        reason=route_reason,
+                    )
+                else:
+                    result = self._route_to_plan(
+                        state,
+                        hop,
+                        reason=route_reason,
+                        kind="control",
+                    )
             elif action == "clear_team":
                 cleanup = state.setdefault("cleanup", {})
                 if cleanup.get("state") == "CLEARED":
@@ -2412,7 +2249,7 @@ class CDPAWorker:
             detail = sanitize_exception(exc)
             control_id = control.get("control_id")
             state.clear()
-            state.update(baseline)
+            state.update(copy.deepcopy(baseline))
             current_control = next(
                 (
                     item
@@ -2648,15 +2485,28 @@ class CDPAWorker:
         role: str,
         actions: CDPATabActions,
     ) -> AcquiredRole | None:
+        existing = await actions.locate_owned(state, role)
+        if existing is not None:
+            await self._dismiss_known_rate_limit_on_existing(existing)
+        elif self._rate_limit_gate_active():
+            state["active_action"] = "rate_limit_cooldown"
+            return None
         try:
-            return await actions.acquire(state, role)
+            acquired = await actions.acquire(state, role)
+            await self._dismiss_known_rate_limit_on_existing(acquired)
+            return acquired
         except RoleOwnershipError as exc:
             if _role_ownership_block_code(exc) != "role_offline":
                 raise
             _, expected_conversation, _, _ = self._active_recovery_context(state, role)
             if expected_conversation is None:
                 raise
-            return await self._recover_active_role(state, role, actions)
+            if self._rate_limit_gate_active():
+                state["active_action"] = "rate_limit_cooldown"
+                return None
+            acquired = await self._recover_active_role(state, role, actions)
+            await self._dismiss_known_rate_limit_on_existing(acquired)
+            return acquired
         except UnsafePageStateError as exc:
             if str(exc).strip().casefold() != "page is already responding":
                 raise
@@ -2697,19 +2547,10 @@ class CDPAWorker:
                 remaining = _AUTOMATED_SEND_SPACING_SECONDS - (time.monotonic() - last)
                 if remaining > 0:
                     await asyncio.sleep(remaining)
-            attempted = False
             try:
-                result = await operation()
-                if result is _AUTOMATED_SEND_SKIPPED:
-                    return result
-                attempted = True
-                return result
-            except Exception:
-                attempted = True
-                raise
+                return await operation()
             finally:
-                if attempted:
-                    self._last_automated_send_at = time.monotonic()
+                self._last_automated_send_at = time.monotonic()
 
     def _bootstrap_for_state(self, state: Mapping[str, Any]) -> dict[str, Any] | None:
         snapshot = state.get("bootstrap")
@@ -2817,9 +2658,6 @@ class CDPAWorker:
         prewarm_prompt = str(bootstrap.get("prewarm_prompt") or "").strip()
         if not prewarm_prompt:
             return None
-        if self._rate_limit_gate_active():
-            state["active_action"] = "bootstrap_regenerate"
-            return None
         async with self._bootstrap_prepare_lock:
             current = self._bootstrap_for_state(state) or dict(bootstrap)
             if current.get("donors"):
@@ -2838,7 +2676,9 @@ class CDPAWorker:
             existing = ledger.get(request_id) if ledger.path.exists() else None
 
             async def acquire_prewarm_role() -> AcquiredRole:
-                current_acquired = await actions.acquire_global_role("BOOTSTRAP")
+                current_acquired = await actions.acquire_global_role(
+                    "BOOTSTRAP", allow_create=not self._rate_limit_gate_active()
+                )
                 if existing is None:
                     await current_acquired.client.new_chat(
                         discard_draft=False,
@@ -2857,14 +2697,14 @@ class CDPAWorker:
                         )
                 return current_acquired
 
-            acquired = await self._run_post_release_acquisition(
-                state,
-                actions,
-                acquire_prewarm_role,
-            )
-            if acquired is _POST_RELEASE_ACQUISITION_BLOCKED:
-                state["active_action"] = "bootstrap_regenerate"
-                return None
+            try:
+                acquired = await acquire_prewarm_role()
+            except RoleOwnershipError:
+                if self._rate_limit_gate_active():
+                    state["active_action"] = "rate_limit_cooldown"
+                    return None
+                raise
+            await self._dismiss_known_rate_limit_on_existing(acquired)
             block = DurableSendBlock(
                 prewarm_prompt,
                 ledger_path=ledger_path,
@@ -2881,22 +2721,8 @@ class CDPAWorker:
                 block_id="bootstrap_prewarm",
             )
 
-            crossed_send_boundary = bool(
-                existing is not None
-                and existing.status
-                in {RequestStatus.SENDING, RequestStatus.SENT, RequestStatus.COMPLETED}
-            )
-
             async def perform_send() -> Any:
-                if self._rate_limit_gate_active() and not crossed_send_boundary:
-                    state["active_action"] = "bootstrap_regenerate"
-                    return _AUTOMATED_SEND_SKIPPED
-                try:
-                    return await block.run(WorkflowContext(acquired.client))
-                except RateLimitBlockedError as exc:
-                    await self._enter_rate_limit_cooldown(state, actions, exc)
-                    state["active_action"] = "bootstrap_regenerate"
-                    return _AUTOMATED_SEND_SKIPPED
+                return await block.run(WorkflowContext(acquired.client))
 
             try:
                 output = await self._run_automated_send(perform_send)
@@ -2907,8 +2733,6 @@ class CDPAWorker:
                     code="bootstrap_prewarm_recovery_required",
                     retryable=False,
                 )
-                return None
-            if output is _AUTOMATED_SEND_SKIPPED:
                 return None
             if not isinstance(output, Mapping):
                 raise RuntimeError("bootstrap prewarm durable send returned invalid output")
@@ -3020,11 +2844,29 @@ class CDPAWorker:
                 conversation_id=candidate_id,
             )
         except Exception as exc:
+            rate_limit_error = None
+            if page is not None and not page.is_closed() and not isinstance(
+                exc,
+                (
+                    BootstrapUIBranchError,
+                    BranchBootstrapError,
+                    ChatGPTAutomationError,
+                ),
+            ):
+                try:
+                    if await ChatGPTPage(page, timeout_ms=timeout_ms).known_rate_limit_visible():
+                        rate_limit_error = RateLimitBlockedError(
+                            "request rate limit blocks UI bootstrap branch"
+                        )
+                except Exception:
+                    pass
             if page is not None and not page.is_closed():
                 try:
                     await page.close()
                 except Exception:
                     pass
+            if rate_limit_error is not None:
+                raise rate_limit_error from exc
             if isinstance(
                 exc,
                 (
@@ -3110,9 +2952,6 @@ class CDPAWorker:
         role: str,
         actions: CDPATabActions,
     ) -> AcquiredRole | None:
-        if self._rate_limit_gate_active():
-            state["active_action"] = "rate_limit_cooldown"
-            return None
         bootstrap = self._bootstrap_for_state(state)
         role_record = state["roles"][role]
         first_allocation = (
@@ -3123,15 +2962,7 @@ class CDPAWorker:
             and role_record.get("context_source") is None
         )
         if not first_allocation:
-            acquired = await self._run_post_release_acquisition(
-                state,
-                actions,
-                lambda: self._acquire_existing_role(state, role, actions),
-            )
-            if acquired is _POST_RELEASE_ACQUISITION_BLOCKED:
-                state["active_action"] = "post_release_acquisition_wait"
-                return None
-            return acquired
+            return await self._acquire_existing_role(state, role, actions)
         if bootstrap is None:
             self._block(
                 state,
@@ -3143,7 +2974,11 @@ class CDPAWorker:
 
         owned = await actions.locate_owned(state, role)
         if owned is not None:
+            await self._dismiss_known_rate_limit_on_existing(owned)
             return owned
+        if self._rate_limit_gate_active():
+            state["active_action"] = "rate_limit_cooldown"
+            return None
 
         catalog = BootstrapCatalog(self.config.repository_root)
         saw_transient = False
@@ -3178,26 +3013,13 @@ class CDPAWorker:
                 saw_transient = True
                 continue
 
-            single_post_release_attempt = (
-                isinstance(self._rate_limit_cooldown, Mapping)
-                and self._rate_limit_cooldown.get("state") == "released"
-                and self._rate_limit_cooldown.get("post_release_acquisition")
-                in {"pending", "in_progress"}
-            )
             try:
-                acquired = await self._run_post_release_acquisition(
+                acquired = await actions.branch_from_anchor(
                     state,
-                    actions,
-                    lambda: actions.branch_from_anchor(
-                        state,
-                        role,
-                        source_conversation_id=donor["conversation_id"],
-                        assistant_message_id=donor["assistant_message_id"],
-                    ),
+                    role,
+                    source_conversation_id=donor["conversation_id"],
+                    assistant_message_id=donor["assistant_message_id"],
                 )
-                if acquired is _POST_RELEASE_ACQUISITION_BLOCKED:
-                    state["active_action"] = "post_release_acquisition_wait"
-                    return None
                 await self._reject_foreign_durable_branch_owner(state, role, acquired)
             except BranchTargetUnresolvedError as exc:
                 self._block(
@@ -3208,9 +3030,6 @@ class CDPAWorker:
                 )
                 return None
             except BranchBootstrapError:
-                if single_post_release_attempt:
-                    state["active_action"] = "bootstrap_retry"
-                    return None
                 try:
                     acquired = await self._branch_from_bootstrap_ui(
                         state, role, actions, donor
@@ -3256,9 +3075,6 @@ class CDPAWorker:
         hop: dict[str, Any],
         actions: CDPATabActions,
     ) -> None:
-        if self._rate_limit_gate_active():
-            self._apply_rate_limit_to_state(state, hop)
-            return
         if not self._pre_send_request_identity_is_safe(state, hop):
             return
         self._normalize_legacy_pre_send_report_mode(state, hop)
@@ -3272,14 +3088,12 @@ class CDPAWorker:
             and independent.get("new_chat_deferred_task_id")
             != str(state.get("task_id") or "")
         ):
-            acquired = await self._run_post_release_acquisition(
-                state,
-                actions,
-                lambda: actions.new_chat(state, role),
-            )
-            if acquired is _POST_RELEASE_ACQUISITION_BLOCKED:
-                state["active_action"] = "post_release_acquisition_wait"
+            current = await actions.locate_owned(state, role)
+            if current is None and self._rate_limit_gate_active():
+                state["active_action"] = "rate_limit_cooldown"
                 return
+            acquired = await actions.new_chat(state, role)
+            await self._dismiss_known_rate_limit_on_existing(acquired)
             independent["new_chat_next_job"] = False
             independent["new_chat_deferred_task_id"] = None
         else:
@@ -3404,9 +3218,6 @@ class CDPAWorker:
         hop: dict[str, Any],
         actions: CDPATabActions,
     ) -> None:
-        if self._rate_limit_gate_active():
-            self._apply_rate_limit_to_state(state, hop)
-            return
         role = str(hop["target_role"])
         ledger = RequestLedger(str(hop["ledger_path"]))
         record = (
@@ -3427,6 +3238,7 @@ class CDPAWorker:
         acquired = await self._owned_or_block(state, role, actions)
         if acquired is None:
             return
+        await self._dismiss_known_rate_limit_on_existing(acquired)
         if is_independent_task(state):
             independent = state.get("independent")
             if not isinstance(independent, Mapping):
@@ -3441,6 +3253,14 @@ class CDPAWorker:
             constructor = str(
                 task_workflow_definitions(state, self.config)[role]["system_prompt"]
             )
+        prior_accepted_role_turn = any(
+            isinstance(item, Mapping)
+            and item.get("hop_id") != hop.get("hop_id")
+            and str(item.get("target_role") or "").upper() == role
+            and isinstance(item.get("receipt"), Mapping)
+            and bool(item.get("receipt"))
+            for item in state.get("hops") or []
+        )
         block = DurableSendBlock(
             str(hop["prompt"]),
             ledger_path=hop["ledger_path"],
@@ -3456,37 +3276,30 @@ class CDPAWorker:
             request_id=str(hop["request_id"]),
             render_request_marker=False,
             wait_for_response=False,
+            require_existing_conversation_baseline=prior_accepted_role_turn,
             response_timeout_ms=None,
         )
         try:
             async def perform_send() -> Any:
-                current_record = (
-                    ledger.get(str(hop["request_id"]))
-                    if ledger.path.exists()
-                    else None
-                )
-                crossed_send_boundary = (
-                    current_record is not None
-                    and current_record.status
-                    in {
-                        RequestStatus.SENDING,
-                        RequestStatus.SENT,
-                        RequestStatus.COMPLETED,
-                    }
-                )
-                if self._rate_limit_gate_active() and not crossed_send_boundary:
-                    self._apply_rate_limit_to_state(state, hop)
-                    return _AUTOMATED_SEND_SKIPPED
-                try:
-                    return await block.run(WorkflowContext(acquired.client))
-                except RateLimitBlockedError as exc:
-                    await self._enter_rate_limit_cooldown(state, actions, exc)
-                    self._apply_rate_limit_to_state(state, hop)
-                    return _AUTOMATED_SEND_SKIPPED
+                return await block.run(WorkflowContext(acquired.client))
 
             output = await self._run_automated_send(perform_send)
-            if output is _AUTOMATED_SEND_SKIPPED:
-                return
+        except ConversationTranscriptNotReadyError as exc:
+            current_record = ledger.get(str(hop["request_id"]))
+            if (
+                current_record is None
+                or current_record.status
+                in {RequestStatus.SENDING, RequestStatus.SENT, RequestStatus.COMPLETED}
+                or int(current_record.attempts or 0) != 0
+            ):
+                raise
+            self._block(
+                state,
+                str(exc),
+                code="conversation_transcript_not_ready",
+                retryable=True,
+            )
+            return
         except UploadIdentityChangedError:
             attachment = next(
                 (
@@ -3754,6 +3567,81 @@ class CDPAWorker:
             hop["receipt"] = ledger_receipt.to_dict()
         self._canonicalize_receipt_conversation_url(state, hop)
 
+    async def _discover_accepted_conversation_identity(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        actions: CDPATabActions,
+        receipt: SendReceipt,
+    ) -> SendReceipt:
+        if receipt.conversation_id:
+            return receipt
+        if receipt.attempts < 1 or not receipt.user_message_id:
+            raise DurableRequestError(
+                "accepted conversation discovery requires exact accepted user identity"
+            )
+        ledger_path = str(hop.get("ledger_path") or "").strip()
+        request_id = str(hop.get("request_id") or "").strip()
+        task_id = str(state.get("task_id") or "").strip()
+        if not ledger_path or not request_id or not task_id:
+            raise DurableRequestError(
+                "accepted conversation discovery is missing durable request context"
+            )
+        ledger = RequestLedger(ledger_path)
+        record = ledger.get(request_id)
+        if (
+            record is None
+            or record.status is not RequestStatus.SENT
+            or record.attempts < 1
+            or record.accepted_at is None
+            or not isinstance(record.receipt, Mapping)
+        ):
+            raise DurableRequestError(
+                "accepted conversation discovery requires an accepted SENT ledger record"
+            )
+        durable_receipt = SendReceipt.from_dict(record.receipt)
+        durable_base = durable_receipt.to_dict()
+        manifest_base = receipt.to_dict()
+        durable_base["conversation_id"] = None
+        manifest_base["conversation_id"] = None
+        if durable_base != manifest_base:
+            raise DurableRequestError(
+                "accepted conversation discovery found immutable receipt divergence"
+            )
+        candidates = await actions.backend_search_conversations(
+            task_id, max_candidates=25
+        )
+        verified: list[str] = []
+        for conversation_id in candidates:
+            graph = await actions.backend_conversation(conversation_id)
+            try:
+                resolve_exact_user_message(
+                    graph,
+                    receipt.user_message_id,
+                    record.rendered_prompt,
+                )
+            except GraphIdentityError:
+                continue
+            verified.append(conversation_id)
+            if len(verified) > 1:
+                break
+        if len(verified) != 1:
+            raise GraphIdentityError(
+                "accepted conversation identity could not be uniquely verified from backend search"
+            )
+        ledger.enrich_receipt_conversation_id(
+            request_id,
+            accepted_receipt=receipt,
+            conversation_id=verified[0],
+        )
+        self._reconcile_hop_conversation_identity(state, hop)
+        enriched = SendReceipt.from_dict(hop["receipt"])
+        if enriched.conversation_id != verified[0]:
+            raise DurableRequestError(
+                "accepted conversation identity was not durably canonicalized"
+            )
+        return enriched
+
     async def _flush_hop_conversation_identity(
         self, state: dict[str, Any], hop: dict[str, Any]
     ) -> None:
@@ -4011,19 +3899,16 @@ class CDPAWorker:
                 or live_conversation != expected_conversation
                 or str(acquired.page_id) != str(receipt.binding.page_id)
             ):
-                acquired = await self._run_post_release_acquisition(
-                    state,
-                    actions,
-                    lambda: actions.reopen(
-                        state,
-                        role,
-                        require_clean_ready=False,
-                        foreground=False,
-                    ),
-                )
-                if acquired is _POST_RELEASE_ACQUISITION_BLOCKED:
-                    state["active_action"] = "post_release_acquisition_wait"
+                if self._rate_limit_gate_active():
+                    state["active_action"] = "rate_limit_cooldown"
                     return None
+                acquired = await actions.reopen(
+                    state,
+                    role,
+                    require_clean_ready=False,
+                    foreground=False,
+                )
+            await self._dismiss_known_rate_limit_on_existing(acquired)
             if _recoverable_conversation_identity(acquired.url) != expected_conversation:
                 raise RoleOwnershipError(
                     "backend completion fallback reopened a different conversation"
@@ -4167,6 +4052,13 @@ class CDPAWorker:
             mode = "terminal_graph_retry"
 
         deadline_expired = remaining_timeout_ms(wait, now=now) <= 0
+        unresolved = wait.get("terminal_continuation_unresolved")
+        terminal_continuation_recovery = bool(
+            isinstance(unresolved, Mapping)
+            and unresolved.get("request_id") == request_id
+            and int(wait.get("refresh_count") or 0)
+            > int(unresolved.get("refresh_baseline") or 0)
+        )
 
         graph_mode: str | None = None
         if mode == "terminal_graph_retry":
@@ -4265,25 +4157,35 @@ class CDPAWorker:
                                 return "dom_fallback", "response_deadline"
                         return "waiting", None
 
-                    wait["completion_mode"] = "terminal_graph_retry"
-                    wait["terminal_complete_seen_at"] = now.isoformat()
-                    wait["terminal_graph_attempts"] = 0
-                    wait.pop("terminal_graph_request_id", None)
-                    wait.pop("status_recovery_graph_next_at", None)
-                    settle_seconds = (
-                        0.0
-                        if resume_recovery
-                        else float(
-                            self.config.response_stream_status_terminal_settle_seconds
+                    if terminal_continuation_recovery and mode == "status_recovery":
+                        wait["completion_mode"] = "status_recovery"
+                        wait["backend_fallback_category"] = "graph_not_ready"
+                        wait["stream_status_next_poll_at"] = (
+                            now + timedelta(seconds=_STREAM_STATUS_RECOVERY_SECONDS)
+                        ).isoformat()
+                        if deadline_expired:
+                            persist_transport_state()
+                            return "dom_fallback", "response_deadline"
+                    else:
+                        wait["completion_mode"] = "terminal_graph_retry"
+                        wait["terminal_complete_seen_at"] = now.isoformat()
+                        wait["terminal_graph_attempts"] = 0
+                        wait.pop("terminal_graph_request_id", None)
+                        wait.pop("status_recovery_graph_next_at", None)
+                        settle_seconds = (
+                            0.0
+                            if resume_recovery
+                            else float(
+                                self.config.response_stream_status_terminal_settle_seconds
+                            )
                         )
-                    )
-                    wait["terminal_graph_ready_at"] = (
-                        now + timedelta(seconds=settle_seconds)
-                    ).isoformat()
-                    persist_transport_state()
-                    if settle_seconds > 0:
-                        return "waiting", None
-                    graph_mode = "terminal"
+                        wait["terminal_graph_ready_at"] = (
+                            now + timedelta(seconds=settle_seconds)
+                        ).isoformat()
+                        persist_transport_state()
+                        if settle_seconds > 0:
+                            return "waiting", None
+                        graph_mode = "terminal"
 
             if graph_mode is None and mode == "status_recovery":
                 graph_ready_at = parse_time(wait.get("status_recovery_graph_next_at"))
@@ -4405,9 +4307,6 @@ class CDPAWorker:
         manifest_path: Path,
         transport_baseline: dict[str, Any] | None = None,
     ) -> None:
-        if self._rate_limit_gate_active():
-            self._apply_rate_limit_to_state(state, hop)
-            return
         self._start_wait_budget_from_sent(hop)
         self._reconcile_hop_conversation_identity(state, hop)
         receipt = SendReceipt.from_dict(hop["receipt"])
@@ -4424,19 +4323,6 @@ class CDPAWorker:
         await self._capture_bootstrap_role_donor(state, hop, actions)
         wait = hop["wait"]
         now = datetime.now(timezone.utc)
-        if str(wait.get("completion_mode") or "stream_status") == "dom_fallback":
-            ready_at = parse_time(wait.get("dom_fallback_ready_at"))
-            if ready_at is not None and now < ready_at:
-                return
-            await self._waiting_dom(
-                state,
-                hop,
-                actions,
-                manifest_path,
-                transport_baseline,
-            )
-            return
-
         backend_before = copy.deepcopy(state)
         persistence_baseline = (
             transport_baseline if transport_baseline is not None else backend_before
@@ -4449,6 +4335,57 @@ class CDPAWorker:
             )
             state["updated_at"] = saved["updated_at"]
             persistence_baseline = copy.deepcopy(state)
+
+        repair_wait = state.get("repair_wait")
+        unresolved = wait.get("terminal_continuation_unresolved")
+        repair_release_rearm = (
+            isinstance(repair_wait, dict)
+            and repair_wait.get("state") == "RELEASED"
+            and repair_wait.get("original_block_code")
+            == "terminal_continuation_unresolved"
+            and repair_wait.get("preserved_hop_id") == hop.get("hop_id")
+            and repair_wait.get("preserved_request_id") == hop.get("request_id")
+            and repair_wait.get("transport_rearmed_request_id")
+            != hop.get("request_id")
+            and str(wait.get("completion_mode") or "") == "dom_fallback"
+            and wait.get("backend_fallback_category") == "graph_not_ready"
+            and isinstance(unresolved, Mapping)
+            and unresolved.get("request_id") == str(hop["request_id"])
+        )
+        if repair_release_rearm:
+            recover_incomplete_refresh(wait)
+            repair_wait["transport_rearmed_request_id"] = str(hop["request_id"])
+            repair_wait["transport_rearmed_at"] = now.isoformat()
+            wait["completion_mode"] = "status_recovery"
+            wait["backend_fallback_category"] = "graph_not_ready"
+            wait["stream_status_next_poll_at"] = now.isoformat()
+            wait["status_recovery_graph_next_at"] = now.isoformat()
+            wait["deadline_at"] = (
+                now + timedelta(seconds=self.config.response_timeout_seconds)
+            ).isoformat()
+            for key in (
+                "dom_fallback_ready_at",
+                "terminal_complete_seen_at",
+                "terminal_graph_ready_at",
+                "terminal_graph_attempts",
+                "terminal_graph_request_id",
+                "terminal_graph_attempted_at",
+            ):
+                wait.pop(key, None)
+            persist_transport_state()
+
+        if str(wait.get("completion_mode") or "stream_status") == "dom_fallback":
+            ready_at = parse_time(wait.get("dom_fallback_ready_at"))
+            if ready_at is not None and now < ready_at:
+                return
+            await self._waiting_dom(
+                state,
+                hop,
+                actions,
+                manifest_path,
+                transport_baseline,
+            )
+            return
 
         outcome, fallback_category = await self._waiting_backend_step(
             state,
@@ -4540,15 +4477,39 @@ class CDPAWorker:
                 state, hop, acquired, receipt, wait
             ):
                 return
-            self._block(
-                state,
-                (
-                    "backend reported COMPLETE, but no terminal assistant continuation "
-                    "materialized after one bounded refresh"
-                ),
-                code="terminal_continuation_unresolved",
-                retryable=False,
-            )
+            if remaining_timeout_ms(wait) <= 0:
+                self._block(
+                    state,
+                    "response timeout budget exhausted after final response reconciliation",
+                    code="response_timeout",
+                    retryable=False,
+                )
+                return
+            now = datetime.now(timezone.utc)
+            wait["completion_mode"] = "status_recovery"
+            wait["backend_fallback_category"] = "graph_not_ready"
+            wait["stream_status_next_poll_at"] = (
+                now + timedelta(seconds=_STREAM_STATUS_RECOVERY_SECONDS)
+            ).isoformat()
+            wait["status_recovery_graph_next_at"] = (
+                now + timedelta(seconds=_STATUS_RECOVERY_GRAPH_SECONDS)
+            ).isoformat()
+            wait.pop("dom_fallback_ready_at", None)
+            for key in (
+                "terminal_complete_seen_at",
+                "terminal_graph_ready_at",
+                "terminal_graph_attempts",
+                "terminal_graph_request_id",
+                "terminal_graph_attempted_at",
+            ):
+                wait.pop(key, None)
+            hop["state"] = "waiting"
+            state["status"] = "RUNNING"
+            state["kanban_column"] = _column_for(role)
+            state["active_action"] = "wait_response"
+            state["block_code"] = None
+            state["block_retryable"] = False
+            state["block_reason"] = None
             return
         remaining = remaining_timeout_ms(wait)
         refreshed_this_cycle = False
@@ -4605,8 +4566,6 @@ class CDPAWorker:
                     retryable=False,
                 )
                 return
-        if self._rate_limit_gate_active():
-            should_refresh = False
         if should_refresh:
             refresh_baseline = json.loads(
                 json.dumps(persistence_baseline, ensure_ascii=False, default=str)
@@ -4726,6 +4685,103 @@ class CDPAWorker:
         wait["recovery_baseline"] = None
         await self._flush_hop_conversation_identity(state, hop)
         self._record_response(state, hop, response)
+
+    def _route_unresolved_accepted_to_plan(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        *,
+        reason: str,
+    ) -> dict[str, int]:
+        if is_independent_task(state):
+            raise RuntimeError("accepted-send reconciliation is not available to independent tasks")
+        if (
+            str(state.get("status") or "").upper() != "BLOCKED"
+            or str(state.get("block_code") or "")
+            != "accepted_conversation_identity_unresolved"
+            or str(hop.get("state") or "") != "waiting"
+        ):
+            raise RuntimeError(
+                "accepted-send reconciliation requires the exact unresolved accepted-wait block"
+            )
+        receipt_value = hop.get("receipt")
+        if not isinstance(receipt_value, Mapping):
+            raise RuntimeError("accepted-send reconciliation requires a durable receipt")
+        receipt = SendReceipt.from_dict(receipt_value)
+        if (
+            receipt.conversation_id is not None
+            or receipt.attempts < 1
+            or not receipt.user_message_id
+        ):
+            raise RuntimeError(
+                "accepted-send reconciliation requires accepted user identity without conversation identity"
+            )
+        ledger_path = str(hop.get("ledger_path") or "").strip()
+        request_id = str(hop.get("request_id") or "").strip()
+        if not ledger_path or not request_id:
+            raise RuntimeError("accepted-send reconciliation lost its durable request identity")
+        record = RequestLedger(ledger_path).get(request_id)
+        if (
+            record is None
+            or record.status is not RequestStatus.SENT
+            or record.attempts < 1
+            or record.accepted_at is None
+            or not isinstance(record.receipt, Mapping)
+            or SendReceipt.from_dict(record.receipt).to_dict() != receipt.to_dict()
+        ):
+            raise RuntimeError(
+                "accepted-send reconciliation requires the unchanged accepted SENT ledger record"
+            )
+        retained_reports = [
+            item
+            for item in state.get("reports") or []
+            if isinstance(item, Mapping) and str(item.get("path") or "").strip()
+        ]
+        latest_report = (
+            str(retained_reports[-1]["path"]) if retained_reports else "none recorded"
+        )
+        reconciliation_handoff = (
+            "ACCEPTED-SEND RECONCILIATION ONLY.\n"
+            f"Prior request {request_id} / user message {receipt.user_message_id} crossed "
+            "the accepted-user boundary exactly once, but its canonical conversation identity "
+            "could not be recovered.\n"
+            "The prior prompt must not be replayed. Prior external/business side effects must not "
+            "be repeated, retracted, or edited for recovery.\n"
+            "Use durable role reports, request ledger, tracker, and existing task evidence only; "
+            "reconcile bookkeeping and terminalize/route from that evidence.\n"
+            f"Latest durable role report: {latest_report}"
+        )
+        old_hop_id = int(hop["hop_id"])
+        source_role = str(hop.get("target_role") or state.get("active_role") or "PLAN").upper()
+        hop["state"] = "abandoned"
+        hop["abandon_reason"] = reason
+        hop["accepted_send_reconciliation"] = {
+            "request_id": request_id,
+            "user_message_id": receipt.user_message_id,
+            "attempts": record.attempts,
+            "accepted_at": record.accepted_at,
+            "reason": reason,
+        }
+        hop.setdefault("timestamps", {})["abandoned_at"] = utc_now()
+        child = self._append_hop(
+            state,
+            source_role=source_role,
+            target_role="PLAN",
+            handoff=reconciliation_handoff,
+            kind="accepted_send_reconciliation",
+        )
+        state.setdefault("route_timeline", []).append(
+            {
+                "at": utc_now(),
+                "hop_id": old_hop_id,
+                "source_role": source_role,
+                "route": "PLAN",
+                "kind": "accepted_send_reconciliation",
+                "new_hop_id": child["hop_id"],
+                "reason": reason,
+            }
+        )
+        return {"old_hop_id": old_hop_id, "new_hop_id": int(child["hop_id"])}
 
     def _route_to_plan(
         self,
@@ -5202,23 +5258,14 @@ class CDPAWorker:
         expected_page_id: str | None,
     ) -> tuple[AcquiredRole, bool] | None:
         role = str(hop["target_role"])
-
-        async def acquire_exact_role() -> tuple[AcquiredRole, bool]:
-            current = await actions.locate_owned(state, role)
-            reopened = current is None
-            if current is None:
-                current = await actions.reopen(state, role)
-            return current, reopened
-
-        acquired_result = await self._run_post_release_acquisition(
-            state,
-            actions,
-            acquire_exact_role,
-        )
-        if acquired_result is _POST_RELEASE_ACQUISITION_BLOCKED:
-            state["active_action"] = "post_release_acquisition_wait"
-            return None
-        acquired, reopened = acquired_result
+        acquired = await actions.locate_owned(state, role)
+        reopened = acquired is None
+        if acquired is None:
+            if self._rate_limit_gate_active():
+                state["active_action"] = "rate_limit_cooldown"
+                return None
+            acquired = await actions.reopen(state, role)
+        await self._dismiss_known_rate_limit_on_existing(acquired)
         if expected_page_id and str(acquired.page_id) != expected_page_id:
             raise PageOwnershipError(
                 "recovered tab does not match the durable accepted-send page binding"
@@ -5232,9 +5279,8 @@ class CDPAWorker:
             and conversation_identity(acquired.url) != expected_conversation
         ):
             raise PageOwnershipError(
-                "recovered tab does not match the durable conversation identity"
+                "recovered tab does not match the durable accepted conversation"
             )
-        self._record_acquired(state, role, acquired)
         return acquired, reopened
 
     async def _recover_resume_waiting(
@@ -5258,6 +5304,37 @@ class CDPAWorker:
         self._start_wait_budget_from_sent(hop)
         self._reconcile_hop_conversation_identity(state, hop)
         receipt = SendReceipt.from_dict(hop["receipt"])
+        role = str(hop.get("target_role") or "").upper()
+        recorded_recovery_url = (
+            hop.get("conversation_url")
+            or state.get("roles", {}).get(role, {}).get("page_url")
+        )
+        if (
+            receipt.conversation_id is None
+            and conversation_identity(recorded_recovery_url) is None
+            and receipt.attempts > 0
+            and receipt.user_message_id
+        ):
+            try:
+                receipt = await self._discover_accepted_conversation_identity(
+                    state, hop, actions, receipt
+                )
+            except (BackendError, DurableRequestError, KeyError, ValueError) as exc:
+                self._require_resume_recovery(
+                    state,
+                    control,
+                    action="none",
+                    reason_code="accepted_conversation_identity_unresolved",
+                    reason=(
+                        "Accepted request identity is unresolved after bounded backend "
+                        f"reconciliation: {sanitize_exception(exc)}"
+                    ),
+                    next_safe_action=(
+                        "Use Route PLAN only if durable side effects are already reconciled; "
+                        "do not Resume, Restart Role, New Chat, retry, or resend this accepted request."
+                    ),
+                )
+                return
         if receipt.conversation_id and receipt.user_message_id:
             try:
                 backend_outcome, _fallback_category = await self._waiting_backend_step(
@@ -5336,12 +5413,11 @@ class CDPAWorker:
                 self._finish_resume_control(
                     state,
                     control,
-                    outcome="recovery_required",
-                    action="reopen_exact_tab",
-                    reason_code="post_release_acquisition_wait",
-                    reason="Another post-release ChatGPT acquisition is already in progress.",
-                    next_safe_action="Retry Resume after the current post-release acquisition completes.",
-                    postcondition=None,
+                    outcome="continued",
+                    action="defer_tab_open",
+                    reason_code=None,
+                    reason="New tab creation is paused for the request-rate-limit cooldown.",
+                    postcondition="tab_open_deferred",
                 )
                 return
             acquired, reopened = acquired_result
@@ -5642,48 +5718,37 @@ class CDPAWorker:
                     )
                     return
             use_ui_branch = not exact_donor
-            single_post_release_attempt = (
-                isinstance(self._rate_limit_cooldown, Mapping)
-                and self._rate_limit_cooldown.get("state") == "released"
-                and self._rate_limit_cooldown.get("post_release_acquisition")
-                in {"pending", "in_progress"}
-            )
+            if self._rate_limit_gate_active():
+                state["active_action"] = "rate_limit_cooldown"
+                self._finish_resume_control(
+                    state,
+                    control,
+                    outcome="continued",
+                    action="defer_tab_open",
+                    reason_code=None,
+                    reason="New tab creation is paused for the request-rate-limit cooldown.",
+                    postcondition="tab_open_deferred",
+                )
+                return
             if exact_donor:
                 try:
-                    acquired = await self._run_post_release_acquisition(
+                    acquired = await actions.branch_from_anchor(
                         state,
-                        actions,
-                        lambda: actions.branch_from_anchor(
-                            state,
-                            role,
-                            source_conversation_id=donor["conversation_id"],
-                            assistant_message_id=donor["assistant_message_id"],
-                        ),
+                        role,
+                        source_conversation_id=donor["conversation_id"],
+                        assistant_message_id=donor["assistant_message_id"],
                     )
-                    if acquired is _POST_RELEASE_ACQUISITION_BLOCKED:
-                        self._finish_resume_control(
-                            state,
-                            control,
-                            outcome="recovery_required",
-                            action="reacquire_preboundary_role",
-                            reason_code="post_release_acquisition_wait",
-                            reason="Another post-release ChatGPT acquisition is already in progress.",
-                            next_safe_action="Retry Resume after the current post-release acquisition completes.",
-                            postcondition=None,
-                        )
-                        return
                 except RateLimitBlockedError as exc:
                     await self._enter_rate_limit_cooldown(state, actions, exc)
                     self._apply_rate_limit_to_state(state, hop)
                     self._finish_resume_control(
                         state,
                         control,
-                        outcome="recovery_required",
-                        action="reacquire_preboundary_role",
-                        reason_code="rate_limit_cooldown",
-                        reason=sanitize_exception(exc),
-                        next_safe_action="Wait for the global request-rate-limit cooldown before Resume.",
-                        postcondition=None,
+                        outcome="continued",
+                        action="defer_tab_open",
+                        reason_code=None,
+                        reason="New tab creation is paused for the request-rate-limit cooldown.",
+                        postcondition="tab_open_deferred",
                     )
                     return
                 except (ComposerConflictError, ManualInputPendingError) as exc:
@@ -5709,53 +5774,24 @@ class CDPAWorker:
                         ),
                     )
                     return
-                except BranchBootstrapError as exc:
-                    if single_post_release_attempt:
-                        self._finish_resume_control(
-                            state,
-                            control,
-                            outcome="recovery_required",
-                            action="reacquire_preboundary_role",
-                            reason_code="post_release_acquisition_failed",
-                            reason=sanitize_exception(exc),
-                            next_safe_action="Retry Resume without fanning out to another ChatGPT page.",
-                            postcondition=None,
-                        )
-                        return
+                except BranchBootstrapError:
                     use_ui_branch = True
             if use_ui_branch:
                 try:
-                    acquired = await self._run_post_release_acquisition(
-                        state,
-                        actions,
-                        lambda: self._branch_from_bootstrap_ui(
-                            state, role, actions, donor
-                        ),
+                    acquired = await self._branch_from_bootstrap_ui(
+                        state, role, actions, donor
                     )
-                    if acquired is _POST_RELEASE_ACQUISITION_BLOCKED:
-                        self._finish_resume_control(
-                            state,
-                            control,
-                            outcome="recovery_required",
-                            action="reacquire_preboundary_role",
-                            reason_code="post_release_acquisition_wait",
-                            reason="Another post-release ChatGPT acquisition is already in progress.",
-                            next_safe_action="Retry Resume after the current post-release acquisition completes.",
-                            postcondition=None,
-                        )
-                        return
                 except RateLimitBlockedError as exc:
                     await self._enter_rate_limit_cooldown(state, actions, exc)
                     self._apply_rate_limit_to_state(state, hop)
                     self._finish_resume_control(
                         state,
                         control,
-                        outcome="recovery_required",
-                        action="reacquire_preboundary_role",
-                        reason_code="rate_limit_cooldown",
-                        reason=sanitize_exception(exc),
-                        next_safe_action="Wait for the global request-rate-limit cooldown before Resume.",
-                        postcondition=None,
+                        outcome="continued",
+                        action="defer_tab_open",
+                        reason_code=None,
+                        reason="New tab creation is paused for the request-rate-limit cooldown.",
+                        postcondition="tab_open_deferred",
                     )
                     return
                 except (ComposerConflictError, ManualInputPendingError) as exc:
@@ -5850,29 +5886,36 @@ class CDPAWorker:
             )
             return
         generation = int(role_record.get("conversation_generation") or 0)
-        try:
-            acquired = await self._run_post_release_acquisition(
-                state,
-                actions,
-                lambda: actions.branch_from_anchor(
-                    state,
-                    role,
-                    source_conversation_id=donor["conversation_id"],
-                    assistant_message_id=donor["assistant_message_id"],
-                ),
-            )
-        except RateLimitBlockedError as exc:
-            await self._enter_rate_limit_cooldown(state, actions, exc)
-            self._block(state, _RATE_LIMIT_BLOCK_MESSAGE, code="rate_limit_cooldown", retryable=True)
+        if self._rate_limit_gate_active():
+            state["active_action"] = "rate_limit_cooldown"
             self._finish_resume_control(
                 state,
                 control,
-                outcome="recovery_required",
-                action="none",
-                reason_code="rate_limit_cooldown",
-                reason=_RATE_LIMIT_BLOCK_MESSAGE,
-                next_safe_action="Wait for the global cooldown before Resume.",
-                postcondition=None,
+                outcome="continued",
+                action="defer_tab_open",
+                reason_code=None,
+                reason="New tab creation is paused for the request-rate-limit cooldown.",
+                postcondition="tab_open_deferred",
+            )
+            return
+        try:
+            acquired = await actions.branch_from_anchor(
+                state,
+                role,
+                source_conversation_id=donor["conversation_id"],
+                assistant_message_id=donor["assistant_message_id"],
+            )
+        except RateLimitBlockedError as exc:
+            await self._enter_rate_limit_cooldown(state, actions, exc)
+            state["active_action"] = "rate_limit_cooldown"
+            self._finish_resume_control(
+                state,
+                control,
+                outcome="continued",
+                action="defer_tab_open",
+                reason_code=None,
+                reason="New tab creation is paused for the request-rate-limit cooldown.",
+                postcondition="tab_open_deferred",
             )
             return
         except (ComposerConflictError, ManualInputPendingError) as exc:
@@ -5895,19 +5938,6 @@ class CDPAWorker:
                 next_safe_action="Restore the exact donor; do not fan out to another replacement page.",
             )
             return
-        if acquired is _POST_RELEASE_ACQUISITION_BLOCKED:
-            self._finish_resume_control(
-                state,
-                control,
-                outcome="recovery_required",
-                action="reacquire_sending_role",
-                reason_code="post_release_acquisition_wait",
-                reason="Another post-release ChatGPT acquisition is already in progress.",
-                next_safe_action="Retry Resume after that acquisition completes.",
-                postcondition=None,
-            )
-            return
-
         snapshot = await acquired.client.assert_ownership()
         binding = acquired.client.binding
         if binding is None:
@@ -5942,29 +5972,12 @@ class CDPAWorker:
                 )
             )
         except Exception as exc:
+            if isinstance(exc, RateLimitBlockedError):
+                await self._enter_rate_limit_cooldown(state, actions, exc)
             ledger.update(
                 record.request_id,
                 error=f"{_SENDING_CONTINUATION_STARTED}: {type(exc).__name__}: {exc}",
             )
-            if isinstance(exc, RateLimitBlockedError):
-                await self._enter_rate_limit_cooldown(state, actions, exc)
-                self._block(
-                    state,
-                    _RATE_LIMIT_BLOCK_MESSAGE,
-                    code="rate_limit_cooldown",
-                    retryable=True,
-                )
-                self._finish_resume_control(
-                    state,
-                    control,
-                    outcome="recovery_required",
-                    action="none",
-                    reason_code="rate_limit_cooldown",
-                    reason=_RATE_LIMIT_BLOCK_MESSAGE,
-                    next_safe_action="Wait for the global cooldown; the bounded Send must not be retried.",
-                    postcondition=None,
-                )
-                return
             self._require_resume_recovery(
                 state,
                 control,
@@ -6192,18 +6205,8 @@ class CDPAWorker:
         ledger_exists = ledger.path.exists()
         record = ledger.get(str(hop.get("request_id") or "")) if ledger_exists else None
         if record is None and ledger_exists:
-            state["active_action"] = "send"
-            self._finish_resume_control(
-                state,
-                control,
-                outcome="continued",
-                action="await_durable_send",
-                reason_code=None,
-                reason=(
-                    "Resume arrived after pre-send preparation but before this hop "
-                    "created its durable request record; the send boundary has not started."
-                ),
-                postcondition="send_not_started",
+            await self._recover_pristine_preboundary_sending(
+                state, hop, control, actions
             )
             return
         if await self._recover_failed_upload_before_ready(
@@ -6245,6 +6248,7 @@ class CDPAWorker:
             return
         def accept_proven(receipt: SendReceipt, reason: str) -> None:
             self._record_resume_send_acceptance(state, hop, ledger, record, receipt)
+            self._canonicalize_receipt_conversation_url(state, hop)
             self._finish_resume_control(
                 state,
                 control,
@@ -6283,8 +6287,10 @@ class CDPAWorker:
             return
 
         session_id = str(record.session_id_before or "").strip()
+        provisional_session = session_id.startswith("WEB:")
         role = str(hop["target_role"])
-        role_url = state["roles"][role].get("page_url")
+        role_record = state["roles"][role]
+        role_url = role_record.get("page_url")
         backend_ids = {
             identity
             for value in (hop.get("conversation_url"), role_url)
@@ -6293,20 +6299,47 @@ class CDPAWorker:
         backend_conversation = getattr(actions, "backend_conversation", None)
         if (
             session_id
-            and not session_id.startswith("WEB:")
+            and not provisional_session
             and backend_ids == {f"/c/{session_id}"}
             and callable(backend_conversation)
         ):
+            empty_baseline = not (
+                record.baseline.message_ids
+                or record.baseline.turn_ids
+                or record.baseline.assistant_turn_ids
+                or record.baseline.user_message_ids
+            )
+            if empty_baseline and str(role_record.get("page_id") or "") != str(
+                record.binding.page_id
+            ):
+                self._require_resume_recovery(
+                    state,
+                    control,
+                    action="none",
+                    reason_code="sending_provenance_ambiguous",
+                    reason=(
+                        "The damaged empty-baseline SENDING record no longer retains "
+                        "the exact durable page binding."
+                    ),
+                    next_safe_action="Restore exact durable binding provenance; do not resend.",
+                )
+                return
             try:
                 graph = await backend_conversation(session_id)
-                accepted_id = resolve_exact_new_user_message(
-                    graph,
-                    record.rendered_prompt,
-                    excluded_message_ids=(
-                        frozenset(record.baseline.message_ids)
-                        | frozenset(record.baseline.user_message_ids)
-                    ),
-                )
+                if empty_baseline:
+                    accepted_id = resolve_unique_exact_user_message(
+                        graph,
+                        record.rendered_prompt,
+                    )
+                else:
+                    accepted_id = resolve_exact_new_user_message(
+                        graph,
+                        record.rendered_prompt,
+                        excluded_message_ids=(
+                            frozenset(record.baseline.message_ids)
+                            | frozenset(record.baseline.user_message_ids)
+                        ),
+                    )
             except GraphIdentityError as exc:
                 self._require_resume_recovery(
                     state,
@@ -6317,7 +6350,17 @@ class CDPAWorker:
                     next_safe_action="Resolve the conflicting backend user turn; do not resend.",
                 )
                 return
-            except BackendError:
+            except BackendError as exc:
+                if empty_baseline:
+                    self._require_resume_recovery(
+                        state,
+                        control,
+                        action="none",
+                        reason_code="sending_provenance_ambiguous",
+                        reason=sanitize_exception(exc),
+                        next_safe_action="Restore unique exact backend prompt provenance; do not resend.",
+                    )
+                    return
                 pass
             else:
                 accept_proven(
@@ -6336,31 +6379,138 @@ class CDPAWorker:
                 )
                 return
 
-        if self._rate_limit_gate_active():
-            self._block(state, _RATE_LIMIT_BLOCK_MESSAGE, code="rate_limit_cooldown", retryable=True)
-            self._finish_resume_control(
-                state,
-                control,
-                outcome="recovery_required",
-                action="none",
-                reason_code="rate_limit_cooldown",
-                reason=_RATE_LIMIT_BLOCK_MESSAGE,
-                next_safe_action="Wait for the global cooldown before Resume.",
-                postcondition=None,
-            )
-            return
-        try:
-            acquired = await actions.locate_owned(state, role)
-        except (RoleOwnershipError, PageOwnershipError) as exc:
-            self._require_resume_recovery(
-                state,
-                control,
-                action="none",
-                reason_code="sending_provenance_ambiguous",
-                reason=sanitize_exception(exc),
-                next_safe_action="Restore positive accepted/non-accepted provenance; do not recreate or resend.",
-            )
-            return
+        acquired: AcquiredRole | None = None
+        owned_lookup_performed = False
+        if provisional_session:
+            owned_lookup_performed = True
+            try:
+                acquired = await actions.locate_owned(state, role)
+            except (RoleOwnershipError, PageOwnershipError) as exc:
+                self._require_resume_recovery(
+                    state,
+                    control,
+                    action="none",
+                    reason_code="sending_provenance_ambiguous",
+                    reason=sanitize_exception(exc),
+                    next_safe_action="Restore the exact provisional page binding; do not recreate or resend.",
+                )
+                return
+            if acquired is not None:
+                if (
+                    getattr(acquired.client, "binding", None) != record.binding
+                    or str(acquired.page_id) != str(record.binding.page_id)
+                ):
+                    self._require_resume_recovery(
+                        state,
+                        control,
+                        action="none",
+                        reason_code="durable_send_binding_mismatch",
+                        reason="The canonicalized live page does not match the durable provisional SENDING binding.",
+                        next_safe_action="Restore the exact physical/logical page binding; do not resend.",
+                    )
+                    return
+                snapshot = await acquired.client.assert_ownership()
+                if (
+                    str(getattr(snapshot, "page_id", "") or "")
+                    != str(record.binding.page_id)
+                    or str(getattr(snapshot, "page_role", "") or "")
+                    != str(record.binding.role)
+                    or getattr(snapshot, "page_task_id", None) != state.get("task_id")
+                    or getattr(snapshot, "page_team", None) != state.get("team")
+                ):
+                    self._require_resume_recovery(
+                        state,
+                        control,
+                        action="none",
+                        reason_code="sending_provenance_ambiguous",
+                        reason="The canonicalized live page ownership does not exactly match the durable provisional request.",
+                        next_safe_action="Restore the exact page/task/team binding; do not rebind or resend.",
+                    )
+                    return
+                live_values = [
+                    acquired.url,
+                    getattr(snapshot, "url", None),
+                    getattr(snapshot, "conversation_url", None),
+                ]
+                snapshot_session = str(getattr(snapshot, "session_id", "") or "").strip()
+                if snapshot_session:
+                    live_values.append(f"https://chatgpt.com/c/{snapshot_session}")
+                live_backend_ids = {
+                    identity
+                    for value in live_values
+                    if (identity := _recoverable_conversation_identity(value)) is not None
+                }
+                if len(live_backend_ids) != 1 or not callable(backend_conversation):
+                    self._require_resume_recovery(
+                        state,
+                        control,
+                        action="none",
+                        reason_code="sending_provenance_ambiguous",
+                        reason=(
+                            "The exact provisional SENDING page has no unique canonical backend identity "
+                            "with positive acceptance provenance."
+                        ),
+                        next_safe_action="Preserve the exact page/request and restore unique backend provenance; do not resend.",
+                    )
+                    return
+                canonical_identity = next(iter(live_backend_ids))
+                canonical_conversation_id = canonical_identity.rsplit("/", 1)[-1]
+                try:
+                    graph = await backend_conversation(canonical_conversation_id)
+                    excluded_message_ids = (
+                        frozenset(record.baseline.message_ids)
+                        | frozenset(record.baseline.user_message_ids)
+                    )
+                    if not excluded_message_ids:
+                        source_donor = state["roles"][role].get("bootstrap_source_donor")
+                        if source_donor is not None:
+                            donor = normalize_bootstrap_donor(source_donor)
+                            resolve_bootstrap_donor(graph, donor["assistant_message_id"])
+                            excluded_message_ids = frozenset({donor["assistant_message_id"]})
+                    accepted_id = resolve_exact_new_user_message(
+                        graph,
+                        record.rendered_prompt,
+                        excluded_message_ids=excluded_message_ids,
+                    )
+                except (BackendError, ValueError) as exc:
+                    self._require_resume_recovery(
+                        state,
+                        control,
+                        action="none",
+                        reason_code="sending_provenance_ambiguous",
+                        reason=sanitize_exception(exc),
+                        next_safe_action="Preserve the exact canonicalized page and resolve backend acceptance provenance; do not resend.",
+                    )
+                    return
+                accept_proven(
+                    SendReceipt(
+                        prompt=record.rendered_prompt,
+                        prompt_sha256=_sha(record.rendered_prompt),
+                        binding=record.binding,
+                        baseline=record.baseline,
+                        attempts=max(1, int(record.attempts or 0)),
+                        accepted_via="user_message_identity",
+                        session_id_before=record.session_id_before,
+                        user_message_id=accepted_id,
+                        conversation_id=canonical_conversation_id,
+                    ),
+                    "Same-page canonical backend provenance proves provisional SENDING acceptance; no Send was replayed.",
+                )
+                return
+
+        if not owned_lookup_performed:
+            try:
+                acquired = await actions.locate_owned(state, role)
+            except (RoleOwnershipError, PageOwnershipError) as exc:
+                self._require_resume_recovery(
+                    state,
+                    control,
+                    action="none",
+                    reason_code="sending_provenance_ambiguous",
+                    reason=sanitize_exception(exc),
+                    next_safe_action="Restore positive accepted/non-accepted provenance; do not recreate or resend.",
+                )
+                return
         if acquired is None:
             if any(
                 str(record.error or "").startswith(prefix)
@@ -6379,6 +6529,7 @@ class CDPAWorker:
                 next_safe_action="Restore positive provenance; do not reopen, branch, Restart, New Chat, or resend.",
             )
             return
+        await self._dismiss_known_rate_limit_on_existing(acquired)
         if getattr(acquired.client, "binding", None) != record.binding:
             self._require_resume_recovery(
                 state,
@@ -6516,6 +6667,17 @@ class CDPAWorker:
                 )
 
             receipt = await self._run_automated_send(resume_send)
+        except RateLimitBlockedError as exc:
+            await self._enter_rate_limit_cooldown(state, actions, exc)
+            self._require_resume_recovery(
+                state,
+                control,
+                action="accept_owned_draft",
+                reason_code="send_acceptance_ambiguous",
+                reason=sanitize_exception(exc),
+                next_safe_action="Inspect durable/backend provenance; do not send again.",
+            )
+            return
         except (ComposerConflictError, PageOwnershipError, TaskBindingError) as exc:
             self._require_resume_recovery(
                 state,
@@ -6635,6 +6797,18 @@ class CDPAWorker:
                 reason_code="resume_state_unsupported",
                 reason=f"Resume cannot safely continue hop state {hop_state!r}.",
                 next_safe_action="Inspect the active hop and restore a supported durable state.",
+            )
+        except RateLimitBlockedError as exc:
+            await self._enter_rate_limit_cooldown(state, actions, exc)
+            self._apply_rate_limit_to_state(state, hop)
+            self._finish_resume_control(
+                state,
+                control,
+                outcome="continued",
+                action="defer_tab_open",
+                reason_code=None,
+                reason="New tab creation is paused for the request-rate-limit cooldown; existing tabs remain runnable.",
+                postcondition="tab_open_deferred",
             )
         except (ComposerConflictError, ManualInputPendingError) as exc:
             self._require_resume_recovery(
@@ -6920,17 +7094,6 @@ class CDPAWorker:
                 if state.get("status") in {"PAUSED", "BLOCKED"}:
                     return state
                 hop = _active_hop(state)
-                if self._rate_limit_gate_active() and str(hop.get("state") or "") not in {
-                    "responded",
-                    "routed",
-                }:
-                    self._apply_rate_limit_to_state(state, hop)
-                    saved = self._persist_transport_result(
-                        path, transport_baseline, state
-                    )
-                    state.clear()
-                    state.update(saved)
-                    return saved
                 completed_hop_id: int | None = None
                 try:
                     if hop["state"] == "pre_send":
@@ -7245,7 +7408,7 @@ class CDPAWorker:
         )
 
     def _activate_independent_agents(self) -> set[str]:
-        if self.registry is None or self._rate_limit_gate_active():
+        if self.registry is None:
             return set()
         changed: set[str] = set()
         tasks = list(self.registry.tasks_by_id.values())
@@ -8354,13 +8517,7 @@ class CDPAWorker:
             "resume_team",
             "task_control",
         )
-        if self._rate_limit_gate_active():
-            allowed = tuple(
-                kind
-                for kind in browser_safe_commands
-                if kind not in _RATE_LIMIT_DEFERRED_COMMANDS
-            )
-        elif self._browser_cycle_active:
+        if self._browser_cycle_active:
             allowed = browser_safe_commands
         else:
             allowed = None
@@ -8424,9 +8581,24 @@ class CDPAWorker:
             and now - self._last_browser_inventory_at < self.config.browser_inventory_seconds
         ):
             return
-        projection = await build_browser_projection(
-            browser_context, previous=self._browser_projection
+        if self._browser_inventory_task is not None:
+            return
+        task = asyncio.create_task(
+            build_browser_projection(browser_context, previous=self._browser_projection)
         )
+        self._browser_inventory_task = task
+
+        def consume(done: asyncio.Task[Any]) -> None:
+            if not done.cancelled():
+                done.exception()
+            if self._browser_inventory_task is done:
+                self._browser_inventory_task = None
+
+        task.add_done_callback(consume)
+        done, _pending = await asyncio.wait({task}, timeout=1.5)
+        if task not in done:
+            return
+        projection = task.result()
         self._last_browser_inventory_at = now
         self._last_browser_page_count = page_count
         self._publish_browser_projection(projection)
@@ -8476,43 +8648,79 @@ class CDPAWorker:
             )
             now = time.time()
             due_at = now + MINIMUM_DEADLINE_SECONDS if hydrated_now else now
-            due_ids = list(self.registry.due_task_ids(due_at))
-            paths = [self.registry.paths_by_id[task_id] for task_id in due_ids]
-            scheduling_tasks = list(self.registry.tasks_by_id.values())
-            raw_results = await asyncio.gather(
-                *(
-                    self.advance(
-                        path,
-                        browser_context,
-                        scheduling_tasks=scheduling_tasks,
-                    )
-                    for path in paths
-                ),
-                return_exceptions=True,
-            )
             results: list[dict[str, Any] | None] = []
             disconnect: BaseException | None = None
             affected: set[str] = set()
-            for task_id, path, result in zip(due_ids, paths, raw_results, strict=True):
-                if isinstance(result, BaseException):
-                    if is_cdp_disconnect(result):
-                        disconnect = disconnect or result
-                    else:
-                        print(
-                            f"cdpa-worker: manifest {path}: {type(result).__name__}: {result}",
-                            file=sys.stderr,
+            running: dict[asyncio.Task[Any], tuple[str, Path]] = {}
+            scheduled_versions: dict[str, str] = {}
+
+            def schedule_due(at: float, *, controls_only: bool = False) -> None:
+                scheduling_tasks = list(self.registry.tasks_by_id.values())
+                active_ids = {task_id for task_id, _path in running.values()}
+                for task_id in self.registry.due_task_ids(at):
+                    state = self.registry.tasks_by_id[task_id]
+                    if controls_only and not any(
+                        isinstance(item, Mapping) and item.get("status") == "requested"
+                        for item in state.get("controls") or []
+                    ):
+                        continue
+                    version = str(state.get("updated_at") or "")
+                    if task_id in active_ids or scheduled_versions.get(task_id) == version:
+                        continue
+                    path = self.registry.paths_by_id[task_id]
+                    task = asyncio.create_task(
+                        self.advance(
+                            path,
+                            browser_context,
+                            scheduling_tasks=scheduling_tasks,
                         )
-                    results.append(None)
-                else:
-                    results.append(result)
-                    if isinstance(result, Mapping):
-                        previous = self.registry.tasks_by_id.get(task_id)
-                        if previous != result:
-                            affected.update(
-                                self.registry.update_task(result, now=time.time())
+                    )
+                    running[task] = (task_id, path)
+                    scheduled_versions[task_id] = version
+
+            schedule_due(due_at)
+            while running:
+                done, _pending = await asyncio.wait(
+                    tuple(running),
+                    timeout=MINIMUM_DEADLINE_SECONDS,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    task_id, path = running.pop(task)
+                    try:
+                        result = task.result()
+                    except BaseException as exc:
+                        result = exc
+                    if isinstance(result, BaseException):
+                        if is_cdp_disconnect(result):
+                            disconnect = disconnect or result
+                        else:
+                            print(
+                                f"cdpa-worker: manifest {path}: {type(result).__name__}: {result}",
+                                file=sys.stderr,
                             )
+                        results.append(None)
                     else:
-                        affected.add(task_id)
+                        results.append(result)
+                        if isinstance(result, Mapping):
+                            previous = self.registry.tasks_by_id.get(task_id)
+                            merged = result
+                            if previous != result and previous is not None and (
+                                str(previous.get("updated_at") or "")
+                                != str(result.get("updated_at") or "")
+                            ):
+                                canonical = self.store.load(path)
+                                if str(canonical.get("updated_at") or "") != str(
+                                    result.get("updated_at") or ""
+                                ):
+                                    merged = canonical
+                            if previous != merged:
+                                affected.update(
+                                    self.registry.update_task(merged, now=time.time())
+                                )
+                        else:
+                            affected.add(task_id)
+                schedule_due(time.time(), controls_only=True)
             if disconnect is not None:
                 raise disconnect
             self._publish_affected(affected)

@@ -30,7 +30,8 @@
     "api_port": 9225
   },
   "worker": {
-    "poll_seconds": 1
+    "poll_seconds": 1,
+    "rate_limit_quiet_seconds": 300
   },
   "route_repair": {
     "max_attempts": 3

@@ -1,6 +1,5 @@
 const COLUMNS = ["RUNNING", "WAITING", "BLOCKED", "PAUSED", "DONE", "STOPPED", "INDEPENDENT_AGENTS"];
 const COLUMN_LABELS = {INDEPENDENT_AGENTS: "AGENTS"};
-const roleClocks = new Map();
 
 function text(tag, value, className) {
   const node = document.createElement(tag);
@@ -27,6 +26,14 @@ function elapsed(value, now = Date.now()) {
   return durationSeconds((now - started) / 1000);
 }
 
+function accumulatedElapsed(seconds, activeSince, now = Date.now()) {
+  let total = Number(seconds || 0);
+  if (!Number.isFinite(total) || total < 0) total = 0;
+  const started = Date.parse(activeSince || "");
+  if (Number.isFinite(started) && started <= now) total += (now - started) / 1000;
+  return durationSeconds(total);
+}
+
 function fixedDuration(startedAt, completedAt) {
   const started = Date.parse(startedAt || "");
   const completed = Date.parse(completedAt || "");
@@ -34,22 +41,17 @@ function fixedDuration(startedAt, completedAt) {
   return durationSeconds((completed - started) / 1000);
 }
 
-function activeRoleStartedAt(task, now = Date.now()) {
+function activeRoleClock(task) {
   if (task.task_mode === "independent" || task.status !== "RUNNING" || !task.active_role) {
-    roleClocks.delete(task.task_id);
     return null;
   }
-  const identity = `${task.active_role}:${task.active_hop_id ?? "none"}`;
-  const previous = roleClocks.get(task.task_id);
-  if (previous?.identity === identity) return previous.startedAt;
-
-  const projectedValue = task.effective_activity_at || task.updated_at || null;
-  const projected = Date.parse(projectedValue || "");
-  const value = Number.isFinite(projected) && projected <= now
-    ? projectedValue
-    : new Date(now).toISOString();
-  roleClocks.set(task.task_id, {identity, startedAt: value});
-  return value;
+  if (task.active_role_running_elapsed_seconds == null) {
+    return {legacySince: task.active_role_started_at || null};
+  }
+  return {
+    seconds: Number(task.active_role_running_elapsed_seconds || 0),
+    since: task.active_role_running_since || null,
+  };
 }
 
 function field(label, value, className = "task-field") {
@@ -116,6 +118,11 @@ function taskSignature(task, board) {
     task.completed_at,
     task.created_at,
     task.effective_activity_at,
+    task.active_role_started_at,
+    task.running_elapsed_seconds,
+    task.running_since,
+    task.active_role_running_elapsed_seconds,
+    task.active_role_running_since,
     task.updated_at,
     task.primary_problem?.code,
     task.primary_problem?.message,
@@ -164,10 +171,18 @@ function card(task, selected, board) {
     roleGroup.append(text("span", agent.trigger_type ? "ACTIVE" : "IDLE", "task-role"));
   } else {
     roleGroup.append(text("span", task.active_role || "—", "task-role"));
-    const roleTimestamp = activeRoleStartedAt(task);
-    if (roleTimestamp) {
-      const roleClock = text("span", elapsed(roleTimestamp), "task-role-clock");
-      roleClock.dataset.elapsedAt = roleTimestamp;
+    const roleTimer = activeRoleClock(task);
+    if (roleTimer) {
+      const roleClock = text(
+        "span",
+        roleTimer.legacySince
+          ? elapsed(roleTimer.legacySince)
+          : accumulatedElapsed(roleTimer.seconds, roleTimer.since),
+        "task-role-clock",
+      );
+      roleClock.dataset.elapsedBaseSeconds = String(roleTimer.seconds || 0);
+      roleClock.dataset.elapsedAt = roleTimer.legacySince || roleTimer.since || "";
+      if (roleTimer.legacySince) roleClock.dataset.elapsedLegacy = "true";
       roleClock.dataset.roleTimer = `${task.active_role}:${task.active_hop_id ?? "none"}`;
       roleGroup.append(roleClock);
     }
@@ -230,14 +245,28 @@ function card(task, selected, board) {
     const normalWaiting = task.status === "WAITING";
     meta.append(normalWaiting ? waitingOrderField(task) : field("Status", task.status));
     meta.append(field("Action", task.active_action));
-    const timestamp = task.started_at || task.created_at;
-    if (task.status === "RUNNING") {
-      const running = field("Total", elapsed(timestamp), "task-field task-elapsed");
-      running.dataset.elapsedAt = timestamp || "";
-      meta.append(running);
+    if (task.running_elapsed_seconds == null) {
+      const timestamp = task.started_at || task.created_at;
+      if (task.status === "RUNNING") {
+        const running = field("Total", elapsed(timestamp), "task-field task-elapsed");
+        running.dataset.elapsedAt = timestamp || "";
+        running.dataset.elapsedLegacy = "true";
+        meta.append(running);
+      } else {
+        const duration = fixedDuration(timestamp, task.elapsed_end_at);
+        if (duration) meta.append(field("Total", duration, "task-field task-elapsed"));
+      }
     } else {
-      const duration = fixedDuration(timestamp, task.elapsed_end_at);
-      if (duration) meta.append(field("Total", duration, "task-field task-elapsed"));
+      const runningSeconds = Number(task.running_elapsed_seconds || 0);
+      const runningSince = task.status === "RUNNING" ? (task.running_since || null) : null;
+      const total = field(
+        "Total",
+        accumulatedElapsed(runningSeconds, runningSince),
+        "task-field task-elapsed",
+      );
+      total.dataset.elapsedBaseSeconds = String(runningSeconds || 0);
+      total.dataset.elapsedAt = runningSince || "";
+      meta.append(total);
     }
   }
   node.append(meta);
@@ -265,7 +294,13 @@ export function refreshElapsed(root, now = Date.now()) {
   if (selection && !selection.isCollapsed && root.contains(selection.anchorNode)) return;
   for (const node of root.querySelectorAll("[data-elapsed-at]")) {
     const value = node.matches(".task-role-clock") ? node : node.querySelector("span");
-    if (value) value.textContent = elapsed(node.dataset.elapsedAt, now);
+    if (!value) continue;
+    if (node.dataset.elapsedLegacy === "true") {
+      value.textContent = elapsed(node.dataset.elapsedAt, now);
+      continue;
+    }
+    const base = Number(node.dataset.elapsedBaseSeconds || 0);
+    value.textContent = accumulatedElapsed(base, node.dataset.elapsedAt, now);
   }
 }
 

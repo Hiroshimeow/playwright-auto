@@ -141,6 +141,7 @@ class CDPAConfig:
     independent_idle_close_seconds: float
     cleanup_terminal_idle_seconds: float
     worker_poll_seconds: float
+    rate_limit_quiet_seconds: float
     delay_minimum_seconds: float
     delay_maximum_seconds: float
     delay_multipliers: Mapping[str, float]
@@ -326,6 +327,12 @@ def load_cdpa_config(
         ),
         cleanup_terminal_idle_seconds=float(_positive(cleanup.get("terminal_idle_seconds", 300), "cleanup.terminal_idle_seconds")),
         worker_poll_seconds=float(_positive(worker.get("poll_seconds", 1), "worker.poll_seconds")),
+        rate_limit_quiet_seconds=float(
+            _positive(
+                worker.get("rate_limit_quiet_seconds", 300),
+                "worker.rate_limit_quiet_seconds",
+            )
+        ),
         delay_minimum_seconds=minimum,
         delay_maximum_seconds=maximum,
         delay_multipliers=delay_multipliers,

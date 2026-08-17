@@ -1035,63 +1035,6 @@ def test_branch_from_anchor_wraps_navigation_failure_after_workspace_closes_page
     assert context.pages[-1].closed is True
 
 
-def test_rate_limit_cleanup_clears_and_closes_all_chatgpt_tabs_only(tmp_path, monkeypatch):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    active = FakePage(page_id="active", role="PLAN", team="team-a", task_id="task-a")
-    idle = FakePage(page_id="idle", role="DEV", team="team-b", task_id="task-b")
-    free = FakePage(page_id=None, role=None, team=None)
-    unrelated = FakePage(page_id=None, role=None, team=None)
-    unrelated.url = "http://127.0.0.1:9224/dashboard"
-    unrelated.snapshot_value.url = unrelated.url
-    active.snapshot_value.composer_text = "stale active draft"
-    free.snapshot_value.composer_text = "stale free draft"
-    context = FakeContext([active, idle, free, unrelated])
-    actions = CDPATabActions(context, config)
-    cleared = []
-
-    async def fake_clear(page, **_kwargs):
-        cleared.append(page)
-        page.snapshot_value.composer_text = ""
-
-    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
-    monkeypatch.setattr(actions_module, "clear_composer", fake_clear, raising=False)
-
-    result = asyncio.run(actions.cleanup_rate_limited_chatgpt_pages())
-
-    assert result["targeted"] == 3
-    assert result["closed"] == 3
-    assert result["cleared"] == 2
-    assert result["errors"] == []
-    assert cleared == [active, free]
-    assert active.closed is idle.closed is free.closed is True
-    assert unrelated.closed is False
-    assert context.new_page_calls == 0
-
-
-def test_rate_limit_cleanup_closes_page_even_when_clear_verification_fails(tmp_path, monkeypatch):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    dirty = FakePage(page_id=None, role=None, team=None)
-    dirty.snapshot_value.composer_text = "rehydrating draft"
-    context = FakeContext([dirty])
-    actions = CDPATabActions(context, config)
-
-    async def ineffective_clear(_page, **_kwargs):
-        return None
-
-    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
-    monkeypatch.setattr(actions_module, "clear_composer", ineffective_clear, raising=False)
-
-    result = asyncio.run(actions.cleanup_rate_limited_chatgpt_pages())
-
-    assert result["targeted"] == 1
-    assert result["closed"] == 1
-    assert result["cleared"] == 0
-    assert len(result["errors"]) == 1
-    assert "composer" in result["errors"][0]["error"].lower()
-    assert dirty.closed is True
-    assert context.new_page_calls == 0
-
-
 def test_temporary_web_conversation_remains_non_reopenable():
     assert (
         actions_module._reopenable_conversation_identity(

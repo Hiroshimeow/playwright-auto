@@ -10,14 +10,16 @@ import weakref
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any, Callable, Mapping, Sequence
-from urllib.parse import urlparse
+from typing import Any, Awaitable, Callable, Mapping, Sequence
+from urllib.parse import quote, urlparse
 
 from .chatgpt_graph import (
     BackendAuthError,
     BackendNotReadyError,
     BackendSchemaError,
     BackendUnavailableError,
+    normalize_visible_text,
+    visible_text_matches,
 )
 from .observability import record_page_action
 from .role_indicator import WINDOW_NAME_PREFIX, ensure_role_indicator
@@ -147,15 +149,6 @@ _ROLE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 _TEAM_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
-def normalize_visible_text(value: Any) -> str:
-    """Canonicalize browser-visible whitespace without changing non-whitespace text."""
-    return re.sub(r"\s+", " ", str(value or "")).strip()
-
-
-def visible_text_matches(actual: Any, expected: Any) -> bool:
-    return normalize_visible_text(actual) == normalize_visible_text(expected)
-
-
 def attachment_name_matches(actual: str, expected: str) -> bool:
     if actual == expected:
         return True
@@ -242,6 +235,10 @@ class UnsafePageStateError(ChatGPTAutomationError):
     pass
 
 
+class ConversationTranscriptNotReadyError(UnsafePageStateError):
+    pass
+
+
 class RateLimitBlockedError(UnsafePageStateError):
     pass
 
@@ -288,6 +285,7 @@ _RATE_LIMIT_MARKERS = (
     "making requests too quickly",
     "temporarily limited access",
 )
+_RATE_LIMIT_DIALOG_TEST_IDS = ("modal-conversation-history-rate-limit",)
 
 
 def _page_lock(registry: weakref.WeakKeyDictionary[Any, asyncio.Lock], page: Any) -> asyncio.Lock:
@@ -430,6 +428,75 @@ async def backend_conversation(context: Any, conversation_id: str) -> dict[str, 
     ):
         raise BackendSchemaError("conversation response is missing graph shape")
     return payload
+
+
+async def backend_search_conversations(
+    context: Any,
+    query: str,
+    *,
+    max_candidates: int = 25,
+) -> list[str]:
+    exact_query = _safe_identity_string(query, max_length=2048)
+    if exact_query is None:
+        raise ValueError("conversation search query must be a bounded printable string")
+    limit = int(max_candidates)
+    if limit < 1 or limit > 100:
+        raise ValueError("max_candidates must be between 1 and 100")
+    candidates: list[str] = []
+    seen: set[str] = set()
+    seen_cursors: set[str] = set()
+    cursor: str | None = None
+    pages = 0
+    while len(candidates) < limit:
+        pages += 1
+        if pages > limit:
+            raise BackendSchemaError("conversation_search exceeded the bounded page limit")
+        path = f"/backend-api/conversations/search?query={quote(exact_query, safe='')}"
+        if cursor is not None:
+            path += f"&cursor={quote(cursor, safe='')}"
+        payload = await _backend_get_object(
+            context,
+            path,
+            category="conversation_search",
+        )
+        items = payload.get("items")
+        if not isinstance(items, list):
+            raise BackendSchemaError("conversation_search response is missing items")
+        for item in items:
+            conversation_id = (
+                _safe_identity_string(item.get("conversation_id"))
+                if isinstance(item, Mapping)
+                else None
+            )
+            if conversation_id is None:
+                raise BackendSchemaError(
+                    "conversation_search response has unknown item shape"
+                )
+            if conversation_id not in seen:
+                if len(candidates) >= limit:
+                    raise BackendSchemaError(
+                        "conversation_search exceeded the bounded candidate limit"
+                    )
+                seen.add(conversation_id)
+                candidates.append(conversation_id)
+        next_cursor = payload.get("cursor")
+        if next_cursor is None:
+            break
+        if len(candidates) >= limit:
+            raise BackendSchemaError(
+                "conversation_search exceeded the bounded candidate limit"
+            )
+        cursor = _safe_identity_string(next_cursor, max_length=4096)
+        if cursor is None:
+            raise BackendSchemaError("conversation_search cursor is invalid")
+        if cursor in seen_cursors:
+            raise BackendSchemaError("conversation_search pagination cursor repeated")
+        seen_cursors.add(cursor)
+        if not items:
+            raise BackendSchemaError(
+                "conversation_search returned an empty page with a continuation cursor"
+            )
+    return candidates
 
 
 async def backend_projects(context: Any) -> list[dict[str, str]]:
@@ -974,6 +1041,32 @@ def capture_message_baseline(messages: Sequence[MessageSnapshot]) -> MessageBase
             message.message_id for message in messages if message.role == "user"
         ),
     )
+
+
+async def wait_for_existing_conversation_messages(
+    snapshot: ChatGPTSnapshot,
+    read_snapshot: Callable[[], Awaitable[ChatGPTSnapshot]],
+    *,
+    timeout_seconds: float = 0.5,
+) -> ChatGPTSnapshot:
+    """Boundedly wait for a known reused conversation transcript to hydrate."""
+    if snapshot.session_id is None or snapshot.messages:
+        return snapshot
+    session_id = snapshot.session_id
+    deadline = time.monotonic() + timeout_seconds
+    latest = snapshot
+    while not latest.messages and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+        latest = await read_snapshot()
+        if latest.session_id != session_id:
+            raise UnsafePageStateError(
+                "existing conversation identity changed while waiting for transcript hydration"
+            )
+    if not latest.messages:
+        raise ConversationTranscriptNotReadyError(
+            "existing conversation transcript is not hydrated before send"
+        )
+    return latest
 
 
 def new_messages_since(
@@ -3201,7 +3294,7 @@ class ChatGPTPage:
         """Lightweight read-only check for the known account-throttle dialog."""
         return bool(
             await self.page.evaluate(
-                r"""markers => {
+                r"""([markers, testids]) => {
                   const visible = (element) => Boolean(
                     element && (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
                   );
@@ -3209,9 +3302,12 @@ class ChatGPTPage:
                     .replace(/\s+/g, ' ').trim().toLowerCase();
                   return [...document.querySelectorAll('[role=\"dialog\"], [data-testid^=\"modal-\"]')]
                     .filter(visible)
-                    .some((dialog) => markers.some((marker) => text(dialog).includes(marker)));
+                    .some((dialog) =>
+                      testids.includes(dialog.getAttribute('data-testid') || '') ||
+                      markers.some((marker) => text(dialog).includes(marker))
+                    );
                 }""",
-                list(_RATE_LIMIT_MARKERS),
+                [list(_RATE_LIMIT_MARKERS), list(_RATE_LIMIT_DIALOG_TEST_IDS)],
             )
         )
 
@@ -3283,7 +3379,9 @@ class ChatGPTPage:
             manual_pending = last_snapshot.manual_input_pending
             choice_pending = last_snapshot.choice_prompt_pending
             if rate_limit_dialogs(last_snapshot):
-                raise RateLimitBlockedError("request rate limit blocks clean-ready")
+                await dismiss_rate_limit_dialog(self.page, timeout_ms=min(timeout, 10_000))
+                await asyncio.sleep(poll_ms / 1000)
+                continue
             if choice_pending and resolve_choice_prompt:
                 await self.resolve_choice_prompt(timeout_ms=timeout)
                 choice_pending = False
@@ -3661,6 +3759,9 @@ class ChatGPTPage:
         timeout = timeout_ms or self.timeout_ms
         async with self.mutation_guard():
             snapshot = await self.assert_ownership()
+            if rate_limit_dialogs(snapshot):
+                await dismiss_rate_limit_dialog(self.page, timeout_ms=min(timeout, 10_000))
+                snapshot = await self.assert_ownership()
             current_task = snapshot.page_task_id
             if current_task == task_id and not force_new_chat:
                 await ensure_role_indicator(
@@ -3780,6 +3881,9 @@ class ChatGPTPage:
         allow_attachments: bool = False,
     ) -> ChatGPTSnapshot:
         snapshot = await self.assert_ownership()
+        if rate_limit_dialogs(snapshot):
+            await dismiss_rate_limit_dialog(self.page, timeout_ms=min(timeout_ms, 10_000))
+            snapshot = await self.assert_ownership()
         if snapshot.composer_present and snapshot.composer_editable:
             self._assert_interaction_safe(
                 snapshot,
@@ -3877,6 +3981,9 @@ class ChatGPTPage:
         timeout = timeout_ms or self.timeout_ms
         async with self.mutation_guard():
             snapshot = await self.assert_ownership()
+            if rate_limit_dialogs(snapshot):
+                await dismiss_rate_limit_dialog(self.page, timeout_ms=min(timeout, 10_000))
+                snapshot = await self.assert_ownership()
             if snapshot.stop_visible:
                 if not stop_first:
                     raise UnsafePageStateError(
@@ -3884,6 +3991,9 @@ class ChatGPTPage:
                     )
                 await stop_response(self.page, timeout_ms=timeout)
                 snapshot = await self.assert_ownership()
+                if rate_limit_dialogs(snapshot):
+                    await dismiss_rate_limit_dialog(self.page, timeout_ms=min(timeout, 10_000))
+                    snapshot = await self.assert_ownership()
             if snapshot.blocking_dialogs:
                 limited = rate_limit_dialogs(snapshot)
                 if limited:
@@ -4048,6 +4158,7 @@ class ChatGPTPage:
         expected_attachment_ownership_token: str | None = None,
         expected_attachment_count: int = 0,
         expected_attachment_names: Sequence[str] | None = None,
+        require_existing_conversation_baseline: bool = False,
     ) -> SendReceipt:
         prompt = text.strip()
         if not prompt:
@@ -4084,6 +4195,17 @@ class ChatGPTPage:
 
         async with self.mutation_guard():
             before = await self.assert_ownership()
+            if require_existing_conversation_baseline:
+                try:
+                    before = await wait_for_existing_conversation_messages(
+                        before,
+                        self.assert_ownership,
+                    )
+                except ConversationTranscriptNotReadyError as exc:
+                    raise UnsafePageStateError(
+                        "page state changed inside the atomic send boundary: "
+                        "existing conversation transcript is not hydrated before send"
+                    ) from exc
             self._assert_interaction_safe(
                 before, allow_attachments=expected_count > 0
             )
@@ -4425,9 +4547,9 @@ class ChatGPTPage:
             last_snapshot = snapshot
             limited = rate_limit_dialogs(snapshot)
             if limited:
-                raise RateLimitBlockedError(
-                    f"request rate limit is active while waiting for response: {list(limited)!r}"
-                )
+                await dismiss_rate_limit_dialog(self.page, timeout_ms=min(timeout, 10_000))
+                unchanged_ticks = 0
+                continue
             manual_input_pending = snapshot.manual_input_pending
             choice_prompt_pending = snapshot.choice_prompt_pending
 

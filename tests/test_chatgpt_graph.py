@@ -334,6 +334,143 @@ def test_exact_new_user_uses_latest_baseline_anchor_not_unrendered_history():
     assert resolved == "u-accepted"
 
 
+def test_exact_new_user_accepts_browser_visible_whitespace_equivalence():
+    graph = {
+        "current_node": "u-accepted",
+        "mapping": {
+            "u-base": msg("u-base", "user", text="recent", children=("a-base",)),
+            "a-base": msg(
+                "a-base",
+                "assistant",
+                parent="u-base",
+                text="recent answer",
+                children=("u-accepted",),
+            ),
+            "u-accepted": msg(
+                "u-accepted",
+                "user",
+                parent="a-base",
+                text="line one\u00a0\u00a0line two\nline three",
+            ),
+        },
+    }
+
+    resolved = resolve_exact_new_user_message(
+        graph,
+        "line one  line two   line three",
+        excluded_message_ids={"u-base", "a-base"},
+    )
+
+    assert resolved == "u-accepted"
+
+
+def test_exact_new_user_allows_leading_message_less_structural_root_with_empty_baseline():
+    graph = {
+        "current_node": "a-final",
+        "mapping": {
+            "client-created-root": {
+                "id": "client-created-root",
+                "message": None,
+                "parent": None,
+                "children": ["u-accepted"],
+            },
+            "u-accepted": msg(
+                "u-accepted",
+                "user",
+                parent="client-created-root",
+                text="line one\u00a0\u00a0line two",
+                children=("a-call",),
+            ),
+            "a-call": msg(
+                "a-call",
+                "assistant",
+                parent="u-accepted",
+                recipient="web.run",
+                text="call",
+                children=("tool",),
+            ),
+            "tool": msg(
+                "tool",
+                "tool",
+                parent="a-call",
+                recipient="assistant",
+                text="result",
+                children=("u-internal",),
+            ),
+            "u-internal": msg(
+                "u-internal",
+                "user",
+                parent="tool",
+                text="continue",
+                children=("a-final",),
+            ),
+            "a-final": msg(
+                "a-final",
+                "assistant",
+                parent="u-internal",
+                text="done",
+            ),
+        },
+    }
+
+    resolved = resolve_exact_new_user_message(graph, "line one  line two")
+
+    assert resolved == "u-accepted"
+
+
+def test_exact_new_user_rejects_message_less_node_after_materialized_message():
+    graph = {
+        "current_node": "u-accepted",
+        "mapping": {
+            "u-base": msg("u-base", "user", text="recent", children=("structural",)),
+            "structural": {
+                "id": "structural",
+                "message": None,
+                "parent": "u-base",
+                "children": ["u-accepted"],
+            },
+            "u-accepted": msg(
+                "u-accepted",
+                "user",
+                parent="structural",
+                text="durable prompt",
+            ),
+        },
+    }
+
+    with pytest.raises(BackendSchemaError):
+        resolve_exact_new_user_message(graph, "durable prompt")
+
+
+def test_exact_new_user_rejects_changed_non_whitespace_content():
+    graph = {
+        "current_node": "u-accepted",
+        "mapping": {
+            "u-base": msg("u-base", "user", text="recent", children=("a-base",)),
+            "a-base": msg(
+                "a-base",
+                "assistant",
+                parent="u-base",
+                text="recent answer",
+                children=("u-accepted",),
+            ),
+            "u-accepted": msg(
+                "u-accepted",
+                "user",
+                parent="a-base",
+                text="durable\u00a0prompt changed",
+            ),
+        },
+    }
+
+    with pytest.raises(GraphIdentityError):
+        resolve_exact_new_user_message(
+            graph,
+            "durable prompt original",
+            excluded_message_ids={"u-base", "a-base"},
+        )
+
+
 def test_exact_new_user_ignores_tool_internal_user_continuation():
     graph = {
         "current_node": "a-final",

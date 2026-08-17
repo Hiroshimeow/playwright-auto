@@ -14,6 +14,7 @@ from .chatgpt import (
     capture_message_baseline,
     unique_new_user_message,
     visible_text_matches,
+    wait_for_existing_conversation_messages,
 )
 from .durable import (
     DurableRecoveryState,
@@ -97,28 +98,11 @@ def _attach_frontend_identity_enrichment(
                 return
             if not isinstance(conversation_id, str) or not conversation_id:
                 return
-            record = ledger.get(request_id)
-            if (
-                record is None
-                or record.status is not RequestStatus.SENT
-                or not isinstance(record.receipt, Mapping)
-            ):
-                return
-            current = SendReceipt.from_dict(record.receipt)
-            accepted_base = accepted_receipt.to_dict()
-            current_base = current.to_dict()
-            accepted_base["conversation_id"] = None
-            current_base["conversation_id"] = None
-            if current_base != accepted_base:
-                return
-            if current.conversation_id not in {None, conversation_id}:
-                return
-            if current.conversation_id is None:
-                enriched = current.to_dict()
-                enriched["conversation_id"] = conversation_id
-                # Re-validate the exact allowlisted receipt before persistence.
-                validated = SendReceipt.from_dict(enriched)
-                ledger.update(request_id, receipt=validated.to_dict())
+            ledger.enrich_receipt_conversation_id(
+                request_id,
+                accepted_receipt=accepted_receipt,
+                conversation_id=conversation_id,
+            )
         except Exception:
             # Enrichment is shadow evidence: never authorize retry/replay or fail Send.
             return
@@ -155,6 +139,7 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
         wait_for_stop: bool = True,
         max_attempts: int = 2,
         recovery_reload: bool = True,
+        require_existing_conversation_baseline: bool = False,
         response_timeout_ms: int | None = None,
         stable_ms: int = 1_000,
         poll_ms: int = 100,
@@ -182,6 +167,9 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
         self.wait_for_stop = wait_for_stop
         self.max_attempts = max_attempts
         self.recovery_reload = recovery_reload
+        self.require_existing_conversation_baseline = bool(
+            require_existing_conversation_baseline
+        )
         self.response_timeout_ms = response_timeout_ms
         self.stable_ms = stable_ms
         self.poll_ms = poll_ms
@@ -597,6 +585,11 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
             )
 
         before_send = await context.client.assert_ownership()
+        if self.require_existing_conversation_baseline:
+            before_send = await wait_for_existing_conversation_messages(
+                before_send,
+                context.client.assert_ownership,
+            )
         source_task_id: str | None = None
         source_team: str | None = None
         if isinstance(record.source_context, Mapping):
@@ -641,12 +634,14 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
             session_id_before=before_send.session_id,
             error=None,
         )
-        send_ownership: dict[str, str] = {}
+        send_ownership: dict[str, Any] = {}
         if source_task_id is not None and source_team is not None:
             send_ownership = {
                 "expected_task_id": source_task_id,
                 "expected_team": source_team,
             }
+        if self.require_existing_conversation_baseline:
+            send_ownership["require_existing_conversation_baseline"] = True
         if validated_upload_receipt is not None:
             send_ownership["expected_attachment_ownership_token"] = str(
                 validated_upload_receipt.ownership_token

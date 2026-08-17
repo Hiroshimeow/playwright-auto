@@ -160,7 +160,19 @@ def test_config_loads_root_json_compatible_yaml_and_validates_defaults(tmp_path:
     assert config.response_timeout_seconds == 7200
     assert config.response_refresh_after_seconds == 1200
     assert config.response_stream_status_terminal_settle_seconds == 5.0
+    assert config.rate_limit_quiet_seconds == 300.0
     assert config.dashboard_url == "http://127.0.0.1:9224"
+
+
+def test_config_rate_limit_quiet_period_is_overridable(tmp_path: Path):
+    path = write_config(tmp_path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["worker"]["rate_limit_quiet_seconds"] = 12.5
+    path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+
+    config = load_cdpa_config(path, repository_root=tmp_path)
+
+    assert config.rate_limit_quiet_seconds == 12.5
 
 
 

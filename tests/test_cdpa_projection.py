@@ -529,6 +529,27 @@ def test_waiting_order_projects_dependency_levels_and_shared_frontiers():
 
 
 
+
+
+def test_projection_active_role_clock_uses_active_hop_creation_time(tmp_path: Path):
+    raw = raw_task(tmp_path)
+    raw["started_at"] = "2026-07-25T00:00:00+00:00"
+    raw["last_role_activity_at"] = "2026-07-25T00:09:00+00:00"
+    raw["hops"][1]["timestamps"] = {
+        "created_at": "2026-07-25T00:06:00+00:00",
+        "sending_at": "2026-07-25T00:09:00+00:00",
+    }
+
+    projection = build_task_projection(raw, tasks=[raw])
+
+    assert projection.summary["started_at"] == "2026-07-25T00:00:00+00:00"
+    assert projection.summary["active_role_started_at"] == "2026-07-25T00:06:00+00:00"
+    assert projection.summary["effective_activity_at"] == "2026-07-25T00:09:00+00:00"
+    assert projection.summary["running_elapsed_seconds"] is None
+    assert projection.summary["running_since"] is None
+    assert projection.summary["active_role_running_elapsed_seconds"] is None
+    assert projection.summary["active_role_running_since"] is None
+
 def test_projection_summary_is_compact_and_deterministic(tmp_path: Path):
     raw = raw_task(tmp_path)
     first = build_task_projection(raw, tasks=[raw])
@@ -539,7 +560,9 @@ def test_projection_summary_is_compact_and_deterministic(tmp_path: Path):
     assert set(first.summary) <= {
         "task_id", "team", "status", "column", "surface", "active_role",
         "active_hop_id", "active_action", "created_at", "started_at", "updated_at",
-        "effective_activity_at", "elapsed_end_at",
+        "effective_activity_at", "active_role_started_at", "running_elapsed_seconds",
+        "running_since", "active_role_running_elapsed_seconds", "active_role_running_since",
+        "elapsed_end_at",
         "availability", "primary_problem", "waiting_reason", "block_code",
         "queue_position", "queue_length", "waiting_order", "roles", "has_reports", "task_title",
         "version", "projection_sha256",

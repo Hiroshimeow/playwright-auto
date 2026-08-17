@@ -191,3 +191,107 @@ def test_check_all_interval_emits_full_review_trigger():
     assert len(events) == 1
     assert events[0]["trigger_type"] == "check_all"
     assert events[0]["event_key"].startswith("check-all:monitor:")
+
+
+def test_task_done_respects_selected_teams_and_preserves_global_and_dedup():
+    current = agent(name="DoneMonitor", recovery=False)
+    current["independent"]["trigger_settings"] = validate_trigger_settings(
+        {"task_done": True, "teams": ["wanted"]}
+    )
+    foreign = workflow(
+        "task-foreign-done",
+        team="foreign",
+        status="DONE",
+        updated_at="2026-07-26T01:00:00+00:00",
+    )
+    matching = workflow(
+        "task-wanted-done",
+        team="wanted",
+        status="DONE",
+        updated_at="2026-07-26T01:01:00+00:00",
+    )
+
+    scoped = canonical_independent_events(current, [foreign, matching, current])
+    done_events = [item for item in scoped if item["trigger_type"] == "task_done"]
+    assert [item["target_task_id"] for item in done_events] == ["task-wanted-done"]
+
+    seen = deepcopy(current)
+    seen["independent"]["watermarks"]["seen_event_keys"] = [done_events[0]["event_key"]]
+    assert not [
+        item
+        for item in canonical_independent_events(seen, [foreign, matching, seen])
+        if item["trigger_type"] == "task_done"
+    ]
+
+    global_agent = deepcopy(current)
+    global_agent["independent"]["trigger_settings"] = validate_trigger_settings(
+        {"task_done": True, "teams": []}
+    )
+    global_events = canonical_independent_events(
+        global_agent, [foreign, matching, global_agent]
+    )
+    assert [
+        item["target_task_id"]
+        for item in global_events
+        if item["trigger_type"] == "task_done"
+    ] == ["task-foreign-done", "task-wanted-done"]
+
+
+def test_role_completed_respects_selected_teams_and_preserves_global_and_dedup():
+    current = agent(name="RoleMonitor", recovery=False)
+    current["independent"]["trigger_settings"] = validate_trigger_settings(
+        {"role_completed": ["PLAN"], "teams": ["wanted"]}
+    )
+    foreign = workflow(
+        "task-foreign-role",
+        team="foreign",
+        status="RUNNING",
+        updated_at="2026-07-26T02:00:00+00:00",
+    )
+    foreign["reports"] = [
+        {
+            "report_id": "foreign-plan-report",
+            "role": "PLAN",
+            "hop_id": 1,
+            "created_at": "2026-07-26T02:00:00+00:00",
+        }
+    ]
+    matching = workflow(
+        "task-wanted-role",
+        team="wanted",
+        status="RUNNING",
+        updated_at="2026-07-26T02:01:00+00:00",
+    )
+    matching["reports"] = [
+        {
+            "report_id": "wanted-plan-report",
+            "role": "PLAN",
+            "hop_id": 1,
+            "created_at": "2026-07-26T02:01:00+00:00",
+        }
+    ]
+
+    scoped = canonical_independent_events(current, [foreign, matching, current])
+    role_events = [item for item in scoped if item["trigger_type"] == "role_completed"]
+    assert [item["target_task_id"] for item in role_events] == ["task-wanted-role"]
+
+    seen = deepcopy(current)
+    seen["independent"]["watermarks"]["seen_event_keys"] = [role_events[0]["event_key"]]
+    assert not [
+        item
+        for item in canonical_independent_events(seen, [foreign, matching, seen])
+        if item["trigger_type"] == "role_completed"
+    ]
+
+    global_agent = deepcopy(current)
+    global_agent["independent"]["trigger_settings"] = validate_trigger_settings(
+        {"role_completed": ["PLAN"], "teams": []}
+    )
+    global_events = canonical_independent_events(
+        global_agent, [foreign, matching, global_agent]
+    )
+    assert [
+        item["target_task_id"]
+        for item in global_events
+        if item["trigger_type"] == "role_completed"
+    ] == ["task-foreign-role", "task-wanted-role"]

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import ntpath
+import re
 from typing import Any, Mapping
 
 
@@ -31,6 +32,15 @@ class BackendSchemaError(BackendError):
 
 class GraphIdentityError(BackendError):
     """Durable accepted-user identity is ambiguous or belongs to another branch."""
+
+
+def normalize_visible_text(value: Any) -> str:
+    """Canonicalize browser-visible whitespace without changing non-whitespace text."""
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def visible_text_matches(actual: Any, expected: Any) -> bool:
+    return normalize_visible_text(actual) == normalize_visible_text(expected)
 
 
 @dataclass(frozen=True)
@@ -352,6 +362,63 @@ def _current_branch_node_ids(graph: Mapping[str, Any]) -> tuple[Mapping[str, Any
     return mapping, list(reversed(reverse))
 
 
+def resolve_exact_user_message(
+    graph: Mapping[str, Any],
+    message_id: str,
+    expected_text: str,
+) -> str:
+    """Verify one durable accepted user message by exact backend node identity and text."""
+    if not isinstance(graph, Mapping):
+        raise BackendSchemaError("conversation graph must be an object")
+    mapping = graph.get("mapping")
+    if not isinstance(mapping, Mapping):
+        raise BackendSchemaError("conversation graph requires mapping")
+    exact_id = _exact_string(message_id, "accepted user message id")
+    if exact_id not in mapping:
+        raise GraphIdentityError("accepted user message id is not present in conversation graph")
+    node = _node(mapping, exact_id)
+    if _message_role(node) != "user":
+        raise GraphIdentityError("accepted message identity does not belong to a user message")
+    candidate = _assistant_text(node)
+    if candidate is None:
+        raise GraphIdentityError("accepted user message has no exact text content")
+    text, _content_type = candidate
+    if not visible_text_matches(text, expected_text):
+        raise GraphIdentityError("accepted user message does not match the durable prompt")
+    return exact_id
+
+
+def resolve_unique_exact_user_message(
+    graph: Mapping[str, Any],
+    expected_text: str,
+) -> str:
+    """Resolve one human user message by exact full prompt on the current branch."""
+    mapping, chain = _current_branch_node_ids(graph)
+    matches: list[str] = []
+    previous_role: str | None = None
+    for node_id in chain:
+        raw = _graph_node(mapping, node_id)
+        if not isinstance(raw.get("message"), Mapping):
+            if previous_role is None and raw.get("parent") is None:
+                continue
+            raise BackendSchemaError("graph node is missing message object")
+        node = _node(mapping, node_id)
+        role = _message_role(node)
+        if role == "user" and previous_role != "tool":
+            candidate = _assistant_text(node)
+            if candidate is None:
+                raise GraphIdentityError("user message has no exact text content")
+            text, _content_type = candidate
+            if visible_text_matches(text, expected_text):
+                matches.append(node_id)
+        previous_role = role
+    if not matches:
+        raise BackendNotReadyError("exact durable prompt user message is not materialized yet")
+    if len(matches) != 1:
+        raise GraphIdentityError("multiple exact durable prompt user messages are materialized")
+    return matches[0]
+
+
 def resolve_exact_new_user_message(
     graph: Mapping[str, Any],
     expected_text: str,
@@ -369,6 +436,11 @@ def resolve_exact_new_user_message(
     previous_role = _message_role(_node(mapping, chain[anchor])) if anchor >= 0 else None
     new_users: list[tuple[str, str]] = []
     for node_id in scan:
+        raw = _graph_node(mapping, node_id)
+        if not isinstance(raw.get("message"), Mapping):
+            if previous_role is None and not new_users and raw.get("parent") is None:
+                continue
+            raise BackendSchemaError("graph node is missing message object")
         node = _node(mapping, node_id)
         role = _message_role(node)
         if role == "user" and previous_role != "tool":
@@ -383,7 +455,7 @@ def resolve_exact_new_user_message(
     if len(new_users) != 1:
         raise GraphIdentityError("multiple post-baseline human user messages are materialized")
     message_id, text = new_users[0]
-    if text.strip() != str(expected_text).strip():
+    if not visible_text_matches(text, expected_text):
         raise GraphIdentityError("post-baseline user message does not match the durable prompt")
     return message_id
 

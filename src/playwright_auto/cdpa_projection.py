@@ -969,6 +969,14 @@ def build_task_projection(
             active_input = {**active_input, "input": None, "handoff": None}
     queue = raw.get("queue") if isinstance(raw.get("queue"), Mapping) else {}
     waiting = raw.get("waiting") if isinstance(raw.get("waiting"), Mapping) else {}
+    active_role_started_at = None
+    if status == "RUNNING" and raw.get("active_role") and raw.get("active_hop_id") is not None:
+        for hop in raw.get("hops") or []:
+            if not isinstance(hop, Mapping) or hop.get("hop_id") != raw.get("active_hop_id"):
+                continue
+            timestamps = hop.get("timestamps") if isinstance(hop.get("timestamps"), Mapping) else {}
+            active_role_started_at = str(timestamps.get("created_at") or "") or None
+            break
     elapsed_end_at = None
     if status != "RUNNING":
         elapsed_end_at = str(
@@ -1011,6 +1019,20 @@ def build_task_projection(
         "started_at": str(raw.get("started_at") or "") or None,
         "updated_at": updated_at,
         "effective_activity_at": str(raw.get("last_role_activity_at") or updated_at),
+        "active_role_started_at": active_role_started_at,
+        "running_elapsed_seconds": (
+            float(raw.get("running_elapsed_seconds") or 0.0)
+            if "running_elapsed_seconds" in raw or "running_since" in raw
+            else None
+        ),
+        "running_since": str(raw.get("running_since") or "") or None,
+        "active_role_running_elapsed_seconds": (
+            float(raw.get("active_role_running_elapsed_seconds") or 0.0)
+            if "active_role_running_elapsed_seconds" in raw
+            or "active_role_running_since" in raw
+            else None
+        ),
+        "active_role_running_since": str(raw.get("active_role_running_since") or "") or None,
         "elapsed_end_at": elapsed_end_at,
         "availability": availability,
         "primary_problem": problem,

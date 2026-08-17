@@ -17,6 +17,7 @@ from playwright_auto.chatgpt import (
     ChatGPTSnapshot,
     ChatGPTState,
     ComposerConflictError,
+    PageOwnershipError,
     ManualInputPendingError,
     RateLimitBlockedError,
     MessageBaseline,
@@ -793,15 +794,17 @@ def test_resume_does_not_block_send_preparation_before_durable_boundary(tmp_path
     applied = asyncio.run(worker._apply_control(state, FakeActions(), path))
     assert applied is True
     control = state["controls"][-1]
-    asyncio.run(worker._recover_resume_control(state, control, FakeActions()))
+    actions = FakeActions()
+    asyncio.run(worker._recover_resume_control(state, control, actions))
 
     assert state["status"] == "RUNNING"
     assert state["block_code"] is None
     assert _active_hop(state)["state"] == "sending"
+    assert actions.located_roles == ["PLAN"]
     assert control["status"] == "applied"
     assert control["result"]["outcome"] == "continued"
-    assert control["result"]["action"] == "await_durable_send"
-    assert control["result"]["postcondition"] == "send_not_started"
+    assert control["result"]["action"] == "confirm_preboundary_role"
+    assert control["result"]["postcondition"] == "ownership_confirmed_before_send"
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]) is None
 
 
@@ -1188,7 +1191,6 @@ def test_resume_legacy_donorless_pristine_new_uses_one_current_default_bootstrap
     ("error", "reason_code"),
     [
         (ManualInputPendingError("manual bootstrap composer"), "manual_composer_conflict"),
-        (RateLimitBlockedError("bootstrap rate limit"), "rate_limit_cooldown"),
     ],
 )
 def test_resume_legacy_donorless_stops_on_bootstrap_safety_signal(
@@ -1236,9 +1238,6 @@ def test_resume_legacy_donorless_stops_on_bootstrap_safety_signal(
     assert current is not None
     assert current.status is RequestStatus.NEW
     assert current.attempts == 0
-    if reason_code == "rate_limit_cooldown":
-        assert state["block_retryable"] is True
-        assert worker._rate_limit_cooldown["state"] == "active"
 
 
 @pytest.mark.parametrize(
@@ -1346,6 +1345,10 @@ def _real_ui_fallback_actions(
     *,
     draft: str,
     rehydrate: bool = False,
+    hover_error: BaseException | None = None,
+    rate_limit_testid: str | None = None,
+    clean_ready_error: BaseException | None = None,
+    validate_branch_error: BaseException | None = None,
 ):
     clear_calls = []
 
@@ -1376,6 +1379,8 @@ def _real_ui_fallback_actions(
             self.page = page
 
         async def hover(self):
+            if hover_error is not None:
+                raise hover_error
             return None
 
         def get_by_role(self, _role, *, name, exact):
@@ -1402,6 +1407,14 @@ def _real_ui_fallback_actions(
 
         async def goto(self, url, **_kwargs):
             self.url = url
+
+        async def evaluate(self, _script, payload=None):
+            if rate_limit_testid is None:
+                return False
+            if not isinstance(payload, list) or len(payload) != 2:
+                return False
+            _markers, testids = payload
+            return rate_limit_testid in testids
 
         def locator(self, _selector):
             return Assistant(self)
@@ -1469,6 +1482,8 @@ def _real_ui_fallback_actions(
 
         async def wait_until_clean_ready(self, *, timeout_ms):
             del timeout_ms
+            if clean_ready_error is not None:
+                raise clean_ready_error
             if self.snapshot_value.composer_text.strip() or self.snapshot_value.attachment_markers:
                 raise ManualInputPendingError(
                     "composer still contains manual text or attachments; automated mutation blocked"
@@ -1519,7 +1534,162 @@ def _real_ui_fallback_actions(
             self.branch_calls.append((role, source_conversation_id, assistant_message_id))
             raise BranchBootstrapError("native branch unavailable")
 
+        async def validate_branch_target(self, client, **kwargs):
+            if validate_branch_error is not None:
+                raise validate_branch_error
+            return await super().validate_branch_target(client, **kwargs)
+
     return Actions(), context, page, clear_calls
+
+
+def test_resume_ui_bootstrap_hover_timeout_without_rate_limit_stays_fail_closed(
+    tmp_path: Path, monkeypatch
+):
+    _store, state, worker, _path, hop, ledger, donor = _prepare_pristine_new_sending_record(
+        tmp_path, task_id="task-resume-ui-hover-timeout"
+    )
+    original = {
+        "task_id": state["task_id"],
+        "team": state["team"],
+        "hop_id": hop["hop_id"],
+        "request_id": hop["request_id"],
+        "turn": hop["turn"],
+        "prompt": hop["prompt"],
+        "prompt_sha256": hop["prompt_sha256"],
+        "generation": state["roles"]["PLAN"]["conversation_generation"],
+        "donor": dict(state["roles"]["PLAN"]["bootstrap_source_donor"]),
+    }
+    hover_error = TimeoutError(
+        "Locator.hover: Timeout while <div data-testid=\"modal-conversation-history-rate-limit\"> "
+        "intercepts pointer events"
+    )
+    actions, context, page, clear_calls = _real_ui_fallback_actions(
+        worker,
+        state,
+        donor,
+        monkeypatch,
+        draft="",
+        hover_error=hover_error,
+    )
+    control = state["controls"][-1]
+
+    asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
+
+    record = ledger.get(original["request_id"])
+    role = state["roles"]["PLAN"]
+    assert actions.branch_calls == [
+        ("PLAN", donor["conversation_id"], donor["assistant_message_id"])
+    ]
+    assert context.new_page_calls == 1
+    assert clear_calls == []
+    assert page.closed is True
+    assert page.snapshot_value is None
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "preboundary_context_unrecoverable"
+    assert state["block_code"] == "preboundary_context_unrecoverable"
+    assert state["block_retryable"] is False
+    assert worker._rate_limit_cooldown is None
+    assert role["page_id"] == "WEB:presend-lost"
+    assert role["conversation_generation"] == original["generation"]
+    assert role["bootstrap_source_donor"] == original["donor"]
+    assert state["task_id"] == original["task_id"]
+    assert state["team"] == original["team"]
+    assert hop["hop_id"] == original["hop_id"]
+    assert hop["request_id"] == original["request_id"]
+    assert hop["turn"] == original["turn"]
+    assert hop["prompt"] == original["prompt"]
+    assert hop["prompt_sha256"] == original["prompt_sha256"]
+    assert record is not None
+    assert record.status is RequestStatus.NEW
+    assert record.attempts == 0
+    assert record.binding is None
+    assert record.baseline is None
+    assert record.receipt is None
+    assert record.accepted_at is None
+
+
+def test_resume_ui_bootstrap_ownership_failure_stays_fail_closed_with_rate_limit_modal(
+    tmp_path: Path, monkeypatch
+):
+    _store, state, worker, _path, hop, ledger, donor = _prepare_pristine_new_sending_record(
+        tmp_path, task_id="task-resume-ui-ownership-failure-rate-limit-modal"
+    )
+    actions, context, page, clear_calls = _real_ui_fallback_actions(
+        worker,
+        state,
+        donor,
+        monkeypatch,
+        draft="",
+        rate_limit_testid="modal-conversation-history-rate-limit",
+        clean_ready_error=PageOwnershipError("physical tab changed during clean-ready"),
+    )
+    monkeypatch.setattr(worker, "_publish_heartbeat", lambda *args, **kwargs: None)
+    control = state["controls"][-1]
+
+    asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
+
+    record = ledger.get(hop["request_id"])
+    assert actions.branch_calls == [
+        ("PLAN", donor["conversation_id"], donor["assistant_message_id"])
+    ]
+    assert context.new_page_calls == 1
+    assert clear_calls == []
+    assert page.closed is True
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "preboundary_context_unrecoverable"
+    assert state["block_code"] == "preboundary_context_unrecoverable"
+    assert state["block_retryable"] is False
+    assert worker._rate_limit_cooldown is None
+    assert record is not None
+    assert record.status is RequestStatus.NEW
+    assert record.attempts == 0
+    assert record.binding is None
+    assert record.baseline is None
+    assert record.receipt is None
+    assert record.accepted_at is None
+
+
+def test_resume_ui_bootstrap_semantic_failure_stays_fail_closed_with_rate_limit_modal(
+    tmp_path: Path, monkeypatch
+):
+    _store, state, worker, _path, hop, ledger, donor = _prepare_pristine_new_sending_record(
+        tmp_path, task_id="task-resume-ui-semantic-failure-rate-limit-modal"
+    )
+    actions, context, page, clear_calls = _real_ui_fallback_actions(
+        worker,
+        state,
+        donor,
+        monkeypatch,
+        draft="",
+        rate_limit_testid="modal-conversation-history-rate-limit",
+        validate_branch_error=BranchBootstrapError(
+            "branch target canonicalized back to source/donor conversation"
+        ),
+    )
+    monkeypatch.setattr(worker, "_publish_heartbeat", lambda *args, **kwargs: None)
+    control = state["controls"][-1]
+
+    asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
+
+    record = ledger.get(hop["request_id"])
+    assert actions.branch_calls == [
+        ("PLAN", donor["conversation_id"], donor["assistant_message_id"])
+    ]
+    assert context.new_page_calls == 1
+    assert clear_calls == []
+    assert page.closed is True
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "preboundary_context_unrecoverable"
+    assert state["block_code"] == "preboundary_context_unrecoverable"
+    assert state["block_retryable"] is False
+    assert worker._rate_limit_cooldown is None
+    assert record is not None
+    assert record.status is RequestStatus.NEW
+    assert record.attempts == 0
+    assert record.binding is None
+    assert record.baseline is None
+    assert record.receipt is None
+    assert record.accepted_at is None
 
 
 def test_resume_generic_native_failure_ui_fallback_clears_fresh_stale_composer(
@@ -1728,6 +1898,142 @@ def test_resume_reacquires_lost_bootstrap_role_for_pristine_new_request(tmp_path
     assert current.baseline is None
     assert current.receipt is None
     assert current.accepted_at is None
+
+
+
+def test_resume_reacquires_empty_ledger_dead_page_before_send_and_sends_once(tmp_path: Path):
+    _store, state, worker, _path, hop, ledger, donor = _prepare_pristine_new_sending_record(
+        tmp_path, task_id="task-resume-empty-ledger-dead-page"
+    )
+    ledger.path.write_text(
+        json.dumps({"version": RequestLedger.VERSION, "records": {}}, indent=2),
+        encoding="utf-8",
+    )
+    assert ledger.get(hop["request_id"]) is None
+    original = {
+        "task_id": state["task_id"],
+        "team": state["team"],
+        "hop_id": hop["hop_id"],
+        "request_id": hop["request_id"],
+        "turn": hop["turn"],
+        "prompt": hop["prompt"],
+        "prompt_sha256": hop["prompt_sha256"],
+        "generation": state["roles"]["PLAN"]["conversation_generation"],
+        "donor": dict(state["roles"]["PLAN"]["bootstrap_source_donor"]),
+    }
+
+    class Client:
+        def __init__(self):
+            self.binding = PageBinding("WEB:empty-ledger-replacement", hop["physical_role"])
+            self.send_calls = 0
+            self.current = SimpleNamespace(
+                state=ChatGPTState.NEW_CHAT,
+                page_id=self.binding.page_id,
+                page_role=self.binding.role,
+                page_task_id=state["task_id"],
+                page_team=state["team"],
+                composer_text="",
+                composer_empty=True,
+                manual_input_pending=False,
+                attachment_markers=(),
+                send_enabled=False,
+                stop_visible=False,
+                retry_visible=False,
+                blocking_dialogs=(),
+                messages=(),
+                session_id="empty-ledger-session",
+                conversation_url="https://chatgpt.com/c/WEB:empty-ledger-replacement",
+                url="https://chatgpt.com/c/WEB:empty-ledger-replacement",
+            )
+
+        async def assert_ownership(self):
+            return self.current
+
+        async def set_text(self, text):
+            self.current.composer_text = text
+            self.current.composer_empty = False
+            self.current.send_enabled = True
+            self.current.state = ChatGPTState.DRAFT
+
+        async def send(self, text, **kwargs):
+            self.send_calls += 1
+            assert kwargs["expected_task_id"] == state["task_id"]
+            assert kwargs["expected_team"] == state["team"]
+            baseline = capture_message_baseline(self.current.messages)
+            self.current.messages = (
+                MessageSnapshot("user", "u-empty-ledger", "t-empty-ledger", text, ()),
+            )
+            self.current.composer_text = ""
+            self.current.composer_empty = True
+            self.current.send_enabled = False
+            self.current.state = ChatGPTState.SUBMITTING
+            return SendReceipt(
+                prompt=text,
+                prompt_sha256=worker_module._sha(text),
+                binding=self.binding,
+                baseline=baseline,
+                attempts=1,
+                accepted_via="user_message_identity",
+                session_id_before="empty-ledger-session",
+                user_message_id="u-empty-ledger",
+                user_turn_id="t-empty-ledger",
+            )
+
+    client = Client()
+    acquired = AcquiredRole(
+        client=client,
+        page_id=client.binding.page_id,
+        url=client.current.url,
+        created=True,
+        new_chat=True,
+    )
+
+    class Actions:
+        def __init__(self):
+            self.branch_calls = []
+
+        async def locate_owned(self, _state, _role):
+            role = state["roles"]["PLAN"]
+            if role.get("page_id") == client.binding.page_id and role.get("online") is True:
+                return AcquiredRole(client, client.binding.page_id, client.current.url, False, False)
+            return None
+
+        async def branch_from_anchor(
+            self, _state, role, *, source_conversation_id, assistant_message_id
+        ):
+            self.branch_calls.append((role, source_conversation_id, assistant_message_id))
+            return acquired
+
+    actions = Actions()
+    control = state["controls"][-1]
+    asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
+
+    assert actions.branch_calls == [
+        ("PLAN", donor["conversation_id"], donor["assistant_message_id"])
+    ]
+    assert client.send_calls == 0
+    assert control["status"] == "applied"
+    assert control["result"]["action"] == "reacquire_preboundary_role"
+    assert control["result"]["postcondition"] == "ownership_reacquired_before_send"
+    assert ledger.get(original["request_id"]) is None
+    assert state["task_id"] == original["task_id"]
+    assert state["team"] == original["team"]
+    assert hop["hop_id"] == original["hop_id"]
+    assert hop["request_id"] == original["request_id"]
+    assert hop["turn"] == original["turn"]
+    assert hop["prompt"] == original["prompt"]
+    assert hop["prompt_sha256"] == original["prompt_sha256"]
+    assert state["roles"]["PLAN"]["conversation_generation"] == original["generation"]
+    assert state["roles"]["PLAN"]["bootstrap_source_donor"] == original["donor"]
+
+    asyncio.run(worker._sending(state, hop, actions))
+
+    sent = ledger.get(original["request_id"])
+    assert sent is not None
+    assert sent.status is RequestStatus.SENT
+    assert sent.attempts == 1
+    assert client.send_calls == 1
+    assert hop["state"] == "sent"
 
 
 
@@ -2117,6 +2423,564 @@ def _backend_long_user_graph(user_message_id: str, prompt: str):
     }
 
 
+def _prepare_provisional_canonical_sending(tmp_path: Path, *, task_id: str):
+    store, state, worker, path, hop, ledger, binding, baseline = _prepare_sending_record(
+        tmp_path, task_id=task_id
+    )
+    provisional_url = "https://chatgpt.com/c/WEB:provisional-sending"
+    ledger.update(
+        hop["request_id"],
+        baseline=baseline,
+        session_id_before="WEB:provisional-sending",
+        error="SendRecoveryError: acceptance observation was interrupted",
+    )
+    state["roles"]["PLAN"].update(
+        page_url=provisional_url,
+        online=True,
+        status="active",
+        last_error=None,
+    )
+    hop["conversation_url"] = provisional_url
+    state = store.save(path, state)
+    state = _queue_blocked_resume(
+        store,
+        state,
+        code="durable_send_ambiguous",
+        reason="same bound page canonicalized after markerless Send",
+    )
+    return store, state, worker, path, _active_hop(state), ledger, binding, baseline
+
+
+def _backend_fresh_user_graph(user_message_id: str, prompt: str):
+    def node(message_id, role, text, *, parent=None, children=(), recipient="all"):
+        return {
+            "id": message_id,
+            "message": {
+                "id": message_id,
+                "author": {"role": role},
+                "recipient": recipient,
+                "content": {"content_type": "text", "parts": [text]},
+            },
+            "parent": parent,
+            "children": list(children),
+        }
+
+    return {
+        "current_node": "a-final",
+        "mapping": {
+            "client-created-root": {
+                "id": "client-created-root",
+                "message": None,
+                "parent": None,
+                "children": [user_message_id],
+            },
+            user_message_id: node(
+                user_message_id,
+                "user",
+                prompt,
+                parent="client-created-root",
+                children=("a-call",),
+            ),
+            "a-call": node(
+                "a-call",
+                "assistant",
+                "call",
+                parent=user_message_id,
+                children=("tool",),
+                recipient="web.run",
+            ),
+            "tool": node(
+                "tool",
+                "tool",
+                "result",
+                parent="a-call",
+                children=("u-internal",),
+                recipient="assistant",
+            ),
+            "u-internal": node(
+                "u-internal",
+                "user",
+                "continue",
+                parent="tool",
+                children=("a-final",),
+            ),
+            "a-final": node("a-final", "assistant", "done", parent="u-internal"),
+        },
+    }
+
+
+def _backend_donor_user_graph(
+    donor_assistant_id: str,
+    accepted_user_id: str,
+    accepted_prompt: str,
+    *,
+    donor_on_branch: bool = True,
+    second_human_after_anchor: bool = False,
+):
+    def node(message_id, role, text, *, parent=None, children=(), recipient="all"):
+        return {
+            "id": message_id,
+            "message": {
+                "id": message_id,
+                "author": {"role": role},
+                "recipient": recipient,
+                "content": {"content_type": "text", "parts": [text]},
+            },
+            "parent": parent,
+            "children": list(children),
+        }
+
+    branch_donor = donor_assistant_id if donor_on_branch else "33333333-3333-4333-8333-333333333333"
+    mapping = {
+        "client-created-root": {
+            "id": "client-created-root",
+            "message": None,
+            "parent": None,
+            "children": ["u-inherited"],
+        },
+        "u-inherited": node(
+            "u-inherited",
+            "user",
+            "inherited bootstrap request",
+            parent="client-created-root",
+            children=(branch_donor,),
+        ),
+        branch_donor: node(
+            branch_donor,
+            "assistant",
+            "inherited bootstrap answer",
+            parent="u-inherited",
+            children=(accepted_user_id,),
+        ),
+        accepted_user_id: node(
+            accepted_user_id,
+            "user",
+            accepted_prompt,
+            parent=branch_donor,
+            children=("a-final",),
+        ),
+        "a-final": node(
+            "a-final",
+            "assistant",
+            "done",
+            parent=accepted_user_id,
+        ),
+    }
+    current_node = "a-final"
+    if not donor_on_branch:
+        mapping[donor_assistant_id] = node(
+            donor_assistant_id,
+            "assistant",
+            "off-branch donor",
+            parent="u-off-branch",
+        )
+    if second_human_after_anchor:
+        mapping["a-final"]["children"] = ["u-followup"]
+        mapping["u-followup"] = node(
+            "u-followup",
+            "user",
+            "manual follow-up",
+            parent="a-final",
+        )
+        current_node = "u-followup"
+    return {"current_node": current_node, "mapping": mapping}
+
+
+def test_provisional_sending_bootstrap_donor_anchor_excludes_only_proven_inherited_history(
+    tmp_path: Path,
+):
+    _store, state, worker, _path, hop, ledger, binding, baseline = (
+        _prepare_provisional_canonical_sending(
+            tmp_path, task_id="task-resume-provisional-donor-accepted"
+        )
+    )
+    assert not baseline.message_ids
+    assert not baseline.user_message_ids
+    donor = {
+        "conversation_id": "11111111-1111-4111-8111-111111111111",
+        "assistant_message_id": "22222222-2222-4222-8222-222222222222",
+    }
+    state["roles"]["PLAN"]["bootstrap_source_donor"] = dict(donor)
+    conversation_id = "77777777-7777-4777-8777-777777777777"
+    canonical_url = f"https://chatgpt.com/c/{conversation_id}"
+    accepted_user = "88888888-8888-4888-8888-888888888888"
+    backend_prompt = hop["prompt"].replace(" ", "\u00a0", 1)
+    snapshot = SimpleNamespace(
+        page_id=binding.page_id,
+        page_role=binding.role,
+        page_task_id=state["task_id"],
+        page_team=state["team"],
+        composer_text="",
+        attachment_markers=(),
+        blocking_dialogs=(),
+        messages=(),
+        send_enabled=False,
+        stop_visible=False,
+        session_id=conversation_id,
+        url=canonical_url,
+        conversation_url=canonical_url,
+    )
+
+    class Client:
+        def __init__(self):
+            self.binding = binding
+
+        async def assert_ownership(self):
+            return snapshot
+
+        async def send(self, *_args, **_kwargs):
+            raise AssertionError("donor-proven accepted SENDING must never replay Send")
+
+    client = Client()
+
+    class Actions:
+        def __init__(self):
+            self.backend_calls = []
+            self.reopen_calls = 0
+            self.branch_calls = 0
+
+        async def locate_owned(self, _state, _role):
+            return AcquiredRole(client, binding.page_id, canonical_url, False, False)
+
+        async def backend_conversation(self, observed_conversation_id):
+            self.backend_calls.append(observed_conversation_id)
+            return _backend_donor_user_graph(
+                donor["assistant_message_id"], accepted_user, backend_prompt
+            )
+
+        async def reopen(self, *_args, **_kwargs):
+            self.reopen_calls += 1
+            raise AssertionError("donor-proven accepted SENDING must not reopen")
+
+        async def branch_from_anchor(self, *_args, **_kwargs):
+            self.branch_calls += 1
+            raise AssertionError("donor-proven accepted SENDING must not branch")
+
+    actions = Actions()
+    control = state["controls"][-1]
+    asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
+
+    current = ledger.get(hop["request_id"])
+    assert control["status"] == "applied"
+    assert current is not None and current.status is RequestStatus.SENT
+    assert current.attempts == 1
+    receipt = SendReceipt.from_dict(current.receipt)
+    assert receipt.user_message_id == accepted_user
+    assert receipt.conversation_id == conversation_id
+    assert hop["state"] == "waiting"
+    assert actions.backend_calls == [conversation_id]
+    assert actions.reopen_calls == 0
+    assert actions.branch_calls == 0
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "donor_missing",
+        "donor_wrong_branch",
+        "malformed_donor",
+        "changed_prompt",
+        "second_human_after_anchor",
+    ],
+)
+def test_provisional_sending_bootstrap_donor_provenance_remains_fail_closed(
+    tmp_path: Path,
+    mode: str,
+):
+    case_dir = tmp_path / mode
+    case_dir.mkdir()
+    _store, state, worker, _path, hop, ledger, binding, _baseline = (
+        _prepare_provisional_canonical_sending(
+            case_dir, task_id=f"task-resume-provisional-donor-{mode}"
+        )
+    )
+    donor = {
+        "conversation_id": "11111111-1111-4111-8111-111111111111",
+        "assistant_message_id": "22222222-2222-4222-8222-222222222222",
+    }
+    if mode == "donor_missing":
+        donor["assistant_message_id"] = "44444444-4444-4444-8444-444444444444"
+    state["roles"]["PLAN"]["bootstrap_source_donor"] = (
+        {"assistant_message_id": donor["assistant_message_id"]}
+        if mode == "malformed_donor"
+        else dict(donor)
+    )
+    conversation_id = "99999999-9999-4999-8999-999999999999"
+    canonical_url = f"https://chatgpt.com/c/{conversation_id}"
+    snapshot = SimpleNamespace(
+        page_id=binding.page_id,
+        page_role=binding.role,
+        page_task_id=state["task_id"],
+        page_team=state["team"],
+        composer_text="",
+        attachment_markers=(),
+        blocking_dialogs=(),
+        messages=(),
+        send_enabled=False,
+        stop_visible=False,
+        session_id=conversation_id,
+        url=canonical_url,
+        conversation_url=canonical_url,
+    )
+
+    class Client:
+        def __init__(self):
+            self.binding = binding
+
+        async def assert_ownership(self):
+            return snapshot
+
+        async def send(self, *_args, **_kwargs):
+            raise AssertionError("ambiguous donor SENDING must never replay Send")
+
+    client = Client()
+
+    class Actions:
+        async def locate_owned(self, _state, _role):
+            return AcquiredRole(client, binding.page_id, canonical_url, False, False)
+
+        async def backend_conversation(self, _observed_conversation_id):
+            prompt = hop["prompt"]
+            if mode == "changed_prompt":
+                prompt += " changed"
+            graph_donor = donor["assistant_message_id"]
+            if mode == "donor_missing":
+                graph_donor = "55555555-5555-4555-8555-555555555555"
+            return _backend_donor_user_graph(
+                graph_donor,
+                "88888888-8888-4888-8888-888888888888",
+                prompt,
+                donor_on_branch=(mode != "donor_wrong_branch"),
+                second_human_after_anchor=(mode == "second_human_after_anchor"),
+            )
+
+    control = state["controls"][-1]
+    asyncio.run(worker._recover_resume_sending(state, hop, control, Actions()))
+
+    current = ledger.get(hop["request_id"])
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "sending_provenance_ambiguous"
+    assert current is not None and current.status is RequestStatus.SENDING
+    assert current.attempts == 1
+    assert current.receipt is None
+
+
+def test_provisional_sending_same_page_canonical_backend_acceptance_is_consumed_without_send(
+    tmp_path: Path,
+):
+    _store, state, worker, _path, hop, ledger, binding, baseline = (
+        _prepare_provisional_canonical_sending(
+            tmp_path, task_id="task-resume-provisional-canonical-accepted"
+        )
+    )
+    conversation_id = "77777777-7777-4777-8777-777777777777"
+    canonical_url = f"https://chatgpt.com/c/{conversation_id}"
+    accepted_user = "88888888-8888-4888-8888-888888888888"
+    backend_prompt = hop["prompt"].replace(" ", "\u00a0", 1)
+    snapshot = SimpleNamespace(
+        page_id=binding.page_id,
+        page_role=binding.role,
+        page_task_id=state["task_id"],
+        page_team=state["team"],
+        composer_text="",
+        attachment_markers=(),
+        blocking_dialogs=(),
+        messages=(),
+        send_enabled=False,
+        stop_visible=True,
+        session_id=conversation_id,
+        url=canonical_url,
+        conversation_url=canonical_url,
+    )
+
+    class Client:
+        def __init__(self):
+            self.binding = binding
+            self.send_calls = 0
+
+        async def assert_ownership(self):
+            return snapshot
+
+        async def send(self, *_args, **_kwargs):
+            self.send_calls += 1
+            raise AssertionError("accepted provisional SENDING must never replay Send")
+
+    client = Client()
+
+    class Actions:
+        def __init__(self):
+            self.locate_calls = 0
+            self.backend_calls = []
+            self.reopen_calls = 0
+            self.branch_calls = 0
+
+        async def locate_owned(self, _state, _role):
+            self.locate_calls += 1
+            return AcquiredRole(client, binding.page_id, canonical_url, False, False)
+
+        async def backend_conversation(self, observed_conversation_id):
+            self.backend_calls.append(observed_conversation_id)
+            return _backend_fresh_user_graph(accepted_user, backend_prompt)
+
+        async def reopen(self, *_args, **_kwargs):
+            self.reopen_calls += 1
+            raise AssertionError("accepted provisional SENDING must not reopen")
+
+        async def branch_from_anchor(self, *_args, **_kwargs):
+            self.branch_calls += 1
+            raise AssertionError("accepted provisional SENDING must not branch/New Chat")
+
+    actions = Actions()
+    control = state["controls"][-1]
+    asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
+
+    current = ledger.get(hop["request_id"])
+    assert actions.locate_calls == 1
+    assert actions.backend_calls == [conversation_id]
+    assert actions.reopen_calls == 0
+    assert actions.branch_calls == 0
+    assert client.send_calls == 0
+    assert control["status"] == "applied"
+    assert control["result"]["action"] == "observe_progress"
+    assert current is not None
+    assert current.status is RequestStatus.SENT
+    assert current.attempts == 1
+    receipt = SendReceipt.from_dict(current.receipt)
+    assert receipt.binding == binding
+    assert receipt.baseline == baseline
+    assert receipt.session_id_before == "WEB:provisional-sending"
+    assert receipt.user_message_id == accepted_user
+    assert receipt.conversation_id == conversation_id
+    assert hop["state"] == "waiting"
+    assert hop["conversation_url"] == canonical_url
+    assert state["roles"]["PLAN"]["page_url"] == canonical_url
+    assert state["roles"]["PLAN"]["page_id"] == binding.page_id
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["canonical_mismatch", "changed_prompt", "multiple_humans", "missing_provenance"],
+)
+def test_provisional_sending_without_unique_same_page_backend_provenance_fails_closed(
+    tmp_path: Path,
+    mode: str,
+):
+    case_dir = tmp_path / mode
+    case_dir.mkdir()
+    _store, state, worker, _path, hop, ledger, binding, _baseline = (
+        _prepare_provisional_canonical_sending(
+            case_dir, task_id=f"task-resume-provisional-{mode}"
+        )
+    )
+    conversation_id = "99999999-9999-4999-8999-999999999999"
+    canonical_url = f"https://chatgpt.com/c/{conversation_id}"
+    snapshot_url = canonical_url
+    snapshot_session = conversation_id
+    if mode == "canonical_mismatch":
+        snapshot_session = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        snapshot_url = f"https://chatgpt.com/c/{snapshot_session}"
+    snapshot = SimpleNamespace(
+        page_id=binding.page_id,
+        page_role=binding.role,
+        page_task_id=state["task_id"],
+        page_team=state["team"],
+        composer_text=hop["prompt"],
+        attachment_markers=(),
+        blocking_dialogs=(),
+        messages=(),
+        send_enabled=True,
+        stop_visible=False,
+        session_id=snapshot_session,
+        url=snapshot_url,
+        conversation_url=snapshot_url,
+    )
+
+    class Client:
+        def __init__(self):
+            self.binding = binding
+            self.send_calls = 0
+
+        async def assert_ownership(self):
+            return snapshot
+
+        async def send(self, *_args, **_kwargs):
+            self.send_calls += 1
+            raise AssertionError("unproven provisional SENDING must never replay Send")
+
+    client = Client()
+
+    class Actions:
+        def __init__(self):
+            self.backend_calls = []
+            self.reopen_calls = 0
+            self.branch_calls = 0
+
+        async def locate_owned(self, _state, _role):
+            return AcquiredRole(client, binding.page_id, canonical_url, False, False)
+
+        async def backend_conversation(self, observed_conversation_id):
+            self.backend_calls.append(observed_conversation_id)
+            if mode == "missing_provenance":
+                raise worker_module.BackendNotReadyError(
+                    "exact new user message is not materialized yet"
+                )
+            backend_prompt = hop["prompt"]
+            if mode == "changed_prompt":
+                backend_prompt += " changed"
+            graph = _backend_fresh_user_graph("u-accepted", backend_prompt)
+            if mode == "multiple_humans":
+                graph["mapping"]["u-accepted"]["children"] = ["a-followup"]
+                graph["mapping"]["a-followup"] = {
+                    "id": "a-followup",
+                    "message": {
+                        "id": "a-followup",
+                        "author": {"role": "assistant"},
+                        "recipient": "all",
+                        "content": {"content_type": "text", "parts": ["answer"]},
+                    },
+                    "parent": "u-accepted",
+                    "children": ["u-followup"],
+                }
+                graph["mapping"]["u-followup"] = {
+                    "id": "u-followup",
+                    "message": {
+                        "id": "u-followup",
+                        "author": {"role": "user"},
+                        "recipient": "all",
+                        "content": {"content_type": "text", "parts": ["manual follow-up"]},
+                    },
+                    "parent": "a-followup",
+                    "children": [],
+                }
+                graph["current_node"] = "u-followup"
+            return graph
+
+        async def reopen(self, *_args, **_kwargs):
+            self.reopen_calls += 1
+            raise AssertionError("unproven provisional SENDING must not reopen")
+
+        async def branch_from_anchor(self, *_args, **_kwargs):
+            self.branch_calls += 1
+            raise AssertionError("unproven provisional SENDING must not branch/New Chat")
+
+    actions = Actions()
+    control = state["controls"][-1]
+    asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
+
+    current = ledger.get(hop["request_id"])
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "sending_provenance_ambiguous"
+    assert client.send_calls == 0
+    assert actions.reopen_calls == 0
+    assert actions.branch_calls == 0
+    assert current is not None
+    assert current.status is RequestStatus.SENDING
+    assert current.attempts == 1
+    assert current.receipt is None
+    assert hop["conversation_url"] == "https://chatgpt.com/c/WEB:provisional-sending"
+    assert state["roles"]["PLAN"]["page_url"] == "https://chatgpt.com/c/WEB:provisional-sending"
+
+
 def test_lost_sending_page_without_positive_proof_stays_ambiguous_without_tab_churn(
     tmp_path: Path,
 ):
@@ -2236,6 +3100,143 @@ def test_lost_sending_backend_proves_acceptance_before_page_acquisition(tmp_path
     assert receipt.user_message_id == accepted_user
     assert receipt.conversation_id == conversation_id
     assert hop["state"] == "waiting"
+
+
+def test_lost_sending_empty_baseline_recovers_unique_exact_prompt_without_page_acquisition(
+    tmp_path: Path,
+):
+    store, state, worker, path, hop, ledger, binding, _baseline = _prepare_sending_record(
+        tmp_path, task_id="task-resume-empty-baseline-accepted"
+    )
+    conversation_id = "55555555-5555-4555-8555-555555555555"
+    accepted_user = "66666666-6666-4666-8666-666666666666"
+    ledger.update(
+        hop["request_id"],
+        session_id_before=conversation_id,
+        error="SendRecoveryError: acceptance observation was interrupted",
+    )
+    state["roles"]["PLAN"].update(
+        page_url=f"https://chatgpt.com/c/{conversation_id}",
+        online=False,
+        status="offline",
+        last_error="page_missing",
+    )
+    hop["conversation_url"] = f"https://chatgpt.com/c/{conversation_id}"
+    state = store.save(path, state)
+    state = _queue_blocked_resume(
+        store,
+        state,
+        code="sending_provenance_ambiguous",
+        reason="empty persisted baseline after accepted Send",
+    )
+    hop = _active_hop(state)
+
+    class Actions:
+        def __init__(self):
+            self.locate_calls = 0
+
+        async def backend_conversation(self, observed_conversation_id):
+            assert observed_conversation_id == conversation_id
+            return _backend_long_user_graph(accepted_user, hop["prompt"].replace(" ", "\u00a0", 1))
+
+        async def locate_owned(self, *_args, **_kwargs):
+            self.locate_calls += 1
+            raise AssertionError("unique backend prompt proof must be consumed before page acquisition")
+
+    actions = Actions()
+    control = state["controls"][-1]
+    asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
+
+    current = ledger.get(hop["request_id"])
+    assert actions.locate_calls == 0
+    assert control["status"] == "applied"
+    assert current is not None and current.status is RequestStatus.SENT
+    assert current.attempts == 1
+    receipt = SendReceipt.from_dict(current.receipt)
+    assert receipt.binding == binding
+    assert not receipt.baseline.message_ids
+    assert receipt.user_message_id == accepted_user
+    assert receipt.conversation_id == conversation_id
+    assert hop["state"] == "waiting"
+
+
+def test_lost_sending_empty_baseline_duplicate_exact_prompt_stays_ambiguous(
+    tmp_path: Path,
+):
+    store, state, worker, path, hop, ledger, _binding, _baseline = _prepare_sending_record(
+        tmp_path, task_id="task-resume-empty-baseline-duplicate"
+    )
+    conversation_id = "77777777-7777-4777-8777-777777777777"
+    accepted_user = "88888888-8888-4888-8888-888888888888"
+    ledger.update(hop["request_id"], session_id_before=conversation_id)
+    state["roles"]["PLAN"]["page_url"] = f"https://chatgpt.com/c/{conversation_id}"
+    hop["conversation_url"] = f"https://chatgpt.com/c/{conversation_id}"
+    state = store.save(path, state)
+    state = _queue_blocked_resume(
+        store,
+        state,
+        code="sending_provenance_ambiguous",
+        reason="empty persisted baseline after accepted Send",
+    )
+    hop = _active_hop(state)
+
+    class Actions:
+        async def backend_conversation(self, observed_conversation_id):
+            assert observed_conversation_id == conversation_id
+            graph = _backend_long_user_graph(accepted_user, hop["prompt"])
+            graph["mapping"]["u-base"]["message"]["content"]["parts"] = [hop["prompt"]]
+            return graph
+
+        async def locate_owned(self, *_args, **_kwargs):
+            return None
+
+    control = state["controls"][-1]
+    asyncio.run(worker._recover_resume_sending(state, hop, control, Actions()))
+
+    current = ledger.get(hop["request_id"])
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "sending_provenance_ambiguous"
+    assert current is not None and current.status is RequestStatus.SENDING
+    assert current.attempts == 1
+    assert current.receipt is None
+
+
+def test_lost_sending_empty_baseline_requires_same_durable_binding(tmp_path: Path):
+    store, state, worker, path, hop, ledger, _binding, _baseline = _prepare_sending_record(
+        tmp_path, task_id="task-resume-empty-baseline-binding-mismatch"
+    )
+    conversation_id = "99999999-9999-4999-8999-999999999999"
+    ledger.update(hop["request_id"], session_id_before=conversation_id)
+    state["roles"]["PLAN"].update(
+        page_id="different-page",
+        page_url=f"https://chatgpt.com/c/{conversation_id}",
+    )
+    hop["conversation_url"] = f"https://chatgpt.com/c/{conversation_id}"
+    state = store.save(path, state)
+    state = _queue_blocked_resume(
+        store,
+        state,
+        code="sending_provenance_ambiguous",
+        reason="empty persisted baseline after accepted Send",
+    )
+    hop = _active_hop(state)
+
+    class Actions:
+        async def backend_conversation(self, *_args, **_kwargs):
+            raise AssertionError("binding mismatch must fail before backend acceptance")
+
+        async def locate_owned(self, *_args, **_kwargs):
+            return None
+
+    control = state["controls"][-1]
+    asyncio.run(worker._recover_resume_sending(state, hop, control, Actions()))
+
+    current = ledger.get(hop["request_id"])
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "sending_provenance_ambiguous"
+    assert current is not None and current.status is RequestStatus.SENDING
+    assert current.attempts == 1
+    assert current.receipt is None
 
 
 def test_lost_sending_atomic_nonacceptance_rebinds_same_request_and_sends_once(
@@ -2414,16 +3415,14 @@ def test_lost_sending_bounded_continuation_failure_is_not_replayed(
             }
             return AcquiredRole(client, replacement_binding.page_id, snapshot.url, True, True)
 
-        async def cleanup_rate_limited_chatgpt_pages(self):
-            return {"targeted": 1, "closed": 1, "cleared": 0, "errors": []}
-
     actions = Actions()
     monkeypatch.setattr(worker, "_publish_heartbeat", lambda *args, **kwargs: None)
     first_control = state["controls"][-1]
     asyncio.run(worker._recover_resume_sending(state, hop, first_control, actions))
     first_record = ledger.get(hop["request_id"])
-    assert first_control["result"]["reason_code"] == "rate_limit_cooldown"
+    assert first_control["result"]["reason_code"] == "send_acceptance_ambiguous"
     assert worker._rate_limit_cooldown["state"] == "active"
+    assert client.send_calls == 1
     assert first_record is not None
     assert first_record.status is RequestStatus.SENDING
     assert first_record.attempts == 1
@@ -2488,43 +3487,6 @@ def test_crossed_durable_receipt_blocks_nonacceptance_replacement(tmp_path: Path
     assert current.status is RequestStatus.SENDING
     assert current.attempts == 1
     assert current.receipt == crossed.to_dict()
-
-
-def test_lost_sending_atomic_nonacceptance_obeys_global_rate_limit_before_acquisition(
-    tmp_path: Path,
-):
-    _store, state, worker, _path, hop, ledger, _donor, _binding, _baseline = (
-        _prepare_lost_sending_record(
-            tmp_path,
-            task_id="task-resume-lost-sending-rate-limit",
-            error=(
-                "ComposerConflictError: composer changed or became unavailable "
-                "inside the atomic send boundary"
-            ),
-        )
-    )
-    worker._rate_limit_cooldown = {
-        "state": "active",
-        "release_not_before": "2999-01-01T00:00:00+00:00",
-        "post_release_acquisition": "pending",
-    }
-
-    class Actions:
-        async def locate_owned(self, *_args, **_kwargs):
-            raise AssertionError("active rate limit must block before tab inspection/acquisition")
-
-        async def branch_from_anchor(self, *_args, **_kwargs):
-            raise AssertionError("active rate limit must block replacement acquisition")
-
-    control = state["controls"][-1]
-    asyncio.run(worker._recover_resume_sending(state, hop, control, Actions()))
-
-    current = ledger.get(hop["request_id"])
-    assert control["result"]["reason_code"] == "rate_limit_cooldown"
-    assert state["block_code"] == "rate_limit_cooldown"
-    assert current is not None
-    assert current.status is RequestStatus.SENDING
-    assert current.attempts == 1
 
 
 def test_exact_owned_sending_draft_is_accepted_once(tmp_path: Path, monkeypatch):
@@ -2903,3 +3865,378 @@ def test_interrupted_paused_resume_does_not_rearm_self_route_streak_after_reload
     assert RequestLedger(source["ledger_path"]).peek(
         "task-self-route-paused-interrupted-hop4"
     ) is None
+
+
+def _accepted_identity_graph(user_message_id: str, prompt: str):
+    return {
+        "current_node": user_message_id,
+        "mapping": {
+            user_message_id: {
+                "id": user_message_id,
+                "parent": None,
+                "children": [],
+                "message": {
+                    "id": user_message_id,
+                    "author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": [prompt]},
+                },
+            }
+        },
+    }
+
+
+def test_resume_accepted_root_discovers_exact_backend_identity_without_replay(
+    tmp_path: Path, monkeypatch
+):
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-accepted-root-discovery"
+    )
+    hop["conversation_url"] = "https://chatgpt.com/"
+    state["roles"]["PLAN"]["page_url"] = "https://chatgpt.com/"
+    state = store.save(path, state)
+    exact_id = "11111111-1111-4111-8111-111111111111"
+    false_id = "22222222-2222-4222-8222-222222222222"
+    calls = {"search": 0, "graph": [], "status": 0, "dom": 0}
+
+    class Actions:
+        async def backend_search_conversations(self, query, *, max_candidates=25):
+            assert query == state["task_id"]
+            assert max_candidates == 25
+            calls["search"] += 1
+            return [false_id, exact_id]
+
+        async def backend_conversation(self, conversation_id):
+            calls["graph"].append(conversation_id)
+            if conversation_id == false_id:
+                return _accepted_identity_graph("unrelated-user", receipt.prompt)
+            assert conversation_id == exact_id
+            return _accepted_identity_graph(receipt.user_message_id, receipt.prompt)
+
+        async def backend_stream_status(self, conversation_id):
+            assert conversation_id == exact_id
+            calls["status"] += 1
+            return {"status": "IS_STREAMING"}
+
+        async def locate_owned(self, *_args, **_kwargs):
+            calls["dom"] += 1
+            raise AssertionError("accepted-root discovery must not inspect or rebind a tab")
+
+        async def reopen(self, *_args, **_kwargs):
+            calls["dom"] += 1
+            raise AssertionError("accepted-root discovery must not reopen or resend")
+
+    _queue_blocked_resume(store, state, code="role_offline", reason="browser page lost")
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
+
+    recovered = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    active = _active_hop(recovered)
+    record = RequestLedger(active["ledger_path"]).get(active["request_id"])
+    control = recovered["controls"][-1]
+    assert calls == {"search": 1, "graph": [false_id, exact_id], "status": 1, "dom": 0}
+    assert recovered["status"] == "RUNNING"
+    assert control["status"] == "applied"
+    assert control["result"]["action"] == "rearm_backend_wait"
+    assert active["receipt"]["conversation_id"] == exact_id
+    assert active["conversation_url"] == f"https://chatgpt.com/c/{exact_id}"
+    assert recovered["roles"]["PLAN"]["page_url"] == f"https://chatgpt.com/c/{exact_id}"
+    assert record is not None and record.status is RequestStatus.SENT
+    assert record.attempts == 1
+    assert record.receipt["conversation_id"] == exact_id
+
+
+def test_resume_accepted_root_with_message_id_only_discovers_without_reopen(
+    tmp_path: Path, monkeypatch
+):
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-accepted-root-message-id-only"
+    )
+    receipt = replace(receipt, user_turn_id=None)
+    RequestLedger(hop["ledger_path"]).update(hop["request_id"], receipt=receipt.to_dict())
+    hop["receipt"] = receipt.to_dict()
+    hop["conversation_url"] = "https://chatgpt.com/"
+    state["roles"]["PLAN"]["page_url"] = "https://chatgpt.com/"
+    state = store.save(path, state)
+    exact_id = "33333333-3333-4333-8333-333333333333"
+    calls = {"search": 0, "reopen": 0}
+
+    class Actions:
+        async def backend_search_conversations(self, query, *, max_candidates=25):
+            assert query == state["task_id"]
+            calls["search"] += 1
+            return [exact_id]
+
+        async def backend_conversation(self, conversation_id):
+            assert conversation_id == exact_id
+            return _accepted_identity_graph(receipt.user_message_id, receipt.prompt)
+
+        async def backend_stream_status(self, conversation_id):
+            assert conversation_id == exact_id
+            return {"status": "IS_STREAMING"}
+
+        async def locate_owned(self, *_args, **_kwargs):
+            raise AssertionError("message-id-only accepted recovery must stay backend-first")
+
+        async def reopen(self, *_args, **_kwargs):
+            calls["reopen"] += 1
+            raise AssertionError("message-id-only accepted recovery must not exact-reopen root")
+
+    _queue_blocked_resume(store, state, code="role_offline", reason="browser page lost")
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
+
+    recovered = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    active = _active_hop(recovered)
+    record = RequestLedger(active["ledger_path"]).get(active["request_id"])
+    assert calls == {"search": 1, "reopen": 0}
+    assert recovered["status"] == "RUNNING"
+    assert active["receipt"]["conversation_id"] == exact_id
+    assert active["receipt"]["user_turn_id"] is None
+    assert record is not None and record.status is RequestStatus.SENT
+    assert record.attempts == 1
+    assert record.receipt["conversation_id"] == exact_id
+    assert record.receipt["user_turn_id"] is None
+
+
+def test_resume_accepted_root_unresolved_blocks_before_exact_reopen(
+    tmp_path: Path, monkeypatch
+):
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-accepted-root-unresolved"
+    )
+    hop["conversation_url"] = "https://chatgpt.com/"
+    state["roles"]["PLAN"]["page_url"] = "https://chatgpt.com/c/unrelated-existing"
+    state = store.save(path, state)
+    calls = {"search": 0, "dom": 0}
+
+    class Actions:
+        async def backend_search_conversations(self, query, *, max_candidates=25):
+            assert query == state["task_id"]
+            calls["search"] += 1
+            return []
+
+        async def backend_conversation(self, *_args, **_kwargs):
+            raise AssertionError("zero search candidates must not fetch a graph")
+
+        async def locate_owned(self, *_args, **_kwargs):
+            calls["dom"] += 1
+            raise AssertionError("unresolved accepted identity must not bind an unrelated tab")
+
+        async def reopen(self, *_args, **_kwargs):
+            calls["dom"] += 1
+            raise AssertionError("unresolved accepted identity must not enter root exact-reopen loop")
+
+    _queue_blocked_resume(store, state, code="role_offline", reason="browser page lost")
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
+
+    recovered = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    active = _active_hop(recovered)
+    record = RequestLedger(active["ledger_path"]).get(active["request_id"])
+    control = recovered["controls"][-1]
+    assert calls == {"search": 1, "dom": 0}
+    assert recovered["status"] == "BLOCKED"
+    assert recovered["block_code"] == "accepted_conversation_identity_unresolved"
+    assert "exact conversation" not in recovered["block_reason"].lower()
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "accepted_conversation_identity_unresolved"
+    assert active["state"] == "waiting"
+    assert active["receipt"]["conversation_id"] is None
+    assert record is not None and record.status is RequestStatus.SENT
+    assert record.attempts == 1
+    assert record.receipt["conversation_id"] is None
+
+
+@pytest.mark.parametrize("failure_mode", ["multiple", "backend_unavailable"])
+def test_resume_accepted_root_ambiguous_or_unavailable_never_rebinds(
+    tmp_path: Path, monkeypatch, failure_mode: str
+):
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id=f"task-accepted-root-{failure_mode}"
+    )
+    hop["conversation_url"] = "https://chatgpt.com/"
+    state["roles"]["PLAN"]["page_url"] = "https://chatgpt.com/c/unrelated-existing"
+    state = store.save(path, state)
+    calls = {"search": 0, "graph": 0, "dom": 0}
+
+    class Actions:
+        async def backend_search_conversations(self, _query, *, max_candidates=25):
+            calls["search"] += 1
+            if failure_mode == "backend_unavailable":
+                raise worker_module.BackendUnavailableError(503, "conversation_search")
+            return [
+                "11111111-1111-4111-8111-111111111111",
+                "22222222-2222-4222-8222-222222222222",
+            ]
+
+        async def backend_conversation(self, _conversation_id):
+            calls["graph"] += 1
+            return _accepted_identity_graph(receipt.user_message_id, receipt.prompt)
+
+        async def locate_owned(self, *_args, **_kwargs):
+            calls["dom"] += 1
+            raise AssertionError("ambiguous accepted identity must not rebind DOM ownership")
+
+        async def reopen(self, *_args, **_kwargs):
+            calls["dom"] += 1
+            raise AssertionError("ambiguous accepted identity must not reopen or resend")
+
+    _queue_blocked_resume(store, state, code="role_offline", reason="browser page lost")
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
+
+    recovered = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    active = _active_hop(recovered)
+    record = RequestLedger(active["ledger_path"]).get(active["request_id"])
+    assert calls["search"] == 1
+    assert calls["graph"] == (2 if failure_mode == "multiple" else 0)
+    assert calls["dom"] == 0
+    assert recovered["status"] == "BLOCKED"
+    assert recovered["block_code"] == "accepted_conversation_identity_unresolved"
+    assert active["receipt"]["conversation_id"] is None
+    assert record is not None and record.status is RequestStatus.SENT
+    assert record.attempts == 1
+    assert record.receipt["conversation_id"] is None
+
+
+def test_route_plan_explicitly_reconciles_only_unresolved_accepted_send(tmp_path: Path):
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-accepted-root-route-plan"
+    )
+    receipt = replace(receipt, user_turn_id=None)
+    RequestLedger(hop["ledger_path"]).update(hop["request_id"], receipt=receipt.to_dict())
+    hop["receipt"] = receipt.to_dict()
+    hop["conversation_url"] = "https://chatgpt.com/"
+    state["roles"]["PLAN"]["page_url"] = "https://chatgpt.com/"
+    state.update(
+        status="BLOCKED",
+        kanban_column="BLOCKED",
+        block_code="accepted_conversation_identity_unresolved",
+        block_retryable=False,
+        block_reason="accepted conversation identity could not be verified",
+        active_action="blocked",
+    )
+    state = store.save(path, state)
+    queued = store.request_control(
+        path,
+        "route_plan",
+        role="PLAN",
+        reason="reconcile accepted orphan without replay",
+        external_command_id="accepted-root-route-plan-once",
+    )
+    old_record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
+
+    assert asyncio.run(worker._apply_control(queued, FakeActions(), path)) is True
+
+    control = queued["controls"][-1]
+    old_hop = next(item for item in queued["hops"] if item["hop_id"] == hop["hop_id"])
+    child = _active_hop(queued)
+    preserved = RequestLedger(old_hop["ledger_path"]).get(old_hop["request_id"])
+    assert control["status"] == "applied"
+    assert old_hop["state"] == "abandoned"
+    assert old_hop["receipt"] == receipt.to_dict()
+    assert child["kind"] == "accepted_send_reconciliation"
+    assert child["target_role"] == "PLAN"
+    assert child["state"] == "pre_send"
+    assert child["request_id"] != old_hop["request_id"]
+    assert "must not be replayed" in child["handoff"]
+    assert "must not be repeated" in child["handoff"]
+    assert old_record is not None and preserved is not None
+    assert preserved.status is RequestStatus.SENT
+    assert preserved.attempts == old_record.attempts == 1
+    assert preserved.receipt == old_record.receipt
+    assert queued["block_code"] is None
+
+
+def test_btm_like_reconciliation_plan_can_terminalize_from_durable_evidence_without_external_mutation(
+    tmp_path: Path
+):
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-btm-like-accepted-root"
+    )
+    prior_report = ".plan/alpha/alpha-review_turn1_task-btm-like-accepted-root.md"
+    prior_path = tmp_path / prior_report
+    prior_path.parent.mkdir(parents=True, exist_ok=True)
+    prior_path.write_text(
+        "Durable business evidence: project 2331913 applied exactly once; requests 19->20.",
+        encoding="utf-8",
+    )
+    state["reports"] = [{"path": prior_report}]
+    hop["conversation_url"] = "https://chatgpt.com/"
+    state["roles"]["PLAN"]["page_url"] = "https://chatgpt.com/"
+    state.update(
+        status="BLOCKED",
+        kanban_column="BLOCKED",
+        block_code="accepted_conversation_identity_unresolved",
+        block_retryable=False,
+        block_reason="accepted conversation identity could not be verified",
+        active_action="blocked",
+    )
+    state = store.save(path, state)
+    queued = store.request_control(
+        path,
+        "route_plan",
+        role="PLAN",
+        reason="reconcile bookkeeping only",
+        external_command_id="btm-like-route-plan-once",
+    )
+    external_mutations: list[str] = []
+
+    assert asyncio.run(worker._apply_control(queued, FakeActions(), path)) is True
+    child = _active_hop(queued)
+    old_hop = next(item for item in queued["hops"] if item["hop_id"] == hop["hop_id"])
+    assert prior_report in child["handoff"]
+    assert "must not be repeated" in child["handoff"]
+
+    asyncio.run(worker._pre_send(queued, child, FakeActions()))
+    report_relative = (
+        f".plan/{queued['team']}/{child['physical_role']}_turn{child['turn']}_"
+        f"{queued['task_id']}.md"
+    )
+    report = tmp_path / report_relative
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(
+        "Reconciled from durable REVIEW/tracker evidence only; external_mutations=0.",
+        encoding="utf-8",
+    )
+    child["response"] = json.dumps({"route": "DONE", "handoff": report_relative})
+    child["state"] = "responded"
+    worker._responded(queued, child)
+
+    preserved = RequestLedger(old_hop["ledger_path"]).get(old_hop["request_id"])
+    assert queued["status"] == "DONE"
+    assert queued["terminal_state"] == "DONE"
+    assert external_mutations == []
+    assert preserved is not None and preserved.status is RequestStatus.SENT
+    assert preserved.attempts == 1
+    assert preserved.receipt == receipt.to_dict()
+
+
+def test_route_plan_does_not_bypass_other_accepted_inflight_wait(tmp_path: Path):
+    store, state, worker, path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-accepted-root-route-plan-guard"
+    )
+    state.update(
+        status="BLOCKED",
+        kanban_column="BLOCKED",
+        block_code="role_offline",
+        block_retryable=False,
+        block_reason="ordinary accepted wait",
+        active_action="blocked",
+    )
+    state = store.save(path, state)
+    queued = store.request_control(
+        path,
+        "route_plan",
+        role="PLAN",
+        reason="must remain rejected",
+        external_command_id="accepted-root-route-plan-guard",
+    )
+    before_hops = len(queued["hops"])
+
+    assert asyncio.run(worker._apply_control(queued, FakeActions(), path)) is True
+
+    assert queued["controls"][-1]["status"] == "rejected"
+    assert queued["status"] == "BLOCKED"
+    assert queued["active_hop_id"] == hop["hop_id"]
+    assert len(queued["hops"]) == before_hops

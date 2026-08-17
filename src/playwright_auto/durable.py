@@ -450,6 +450,58 @@ class RequestLedger:
             data["records"][request_id] = record.to_dict()
             return record
 
+    def enrich_receipt_conversation_id(
+        self,
+        request_id: str,
+        *,
+        accepted_receipt: SendReceipt,
+        conversation_id: str,
+    ) -> DurableRequestRecord:
+        """Atomically add only a proven conversation ID to one accepted SENT receipt."""
+        if (
+            not isinstance(conversation_id, str)
+            or not conversation_id
+            or len(conversation_id) > 512
+            or any(ord(char) < 32 or ord(char) == 127 for char in conversation_id)
+        ):
+            raise DurableRequestError("conversation identity must be a bounded printable string")
+        with self._locked() as data:
+            value = data["records"].get(request_id)
+            if not value:
+                raise KeyError(request_id)
+            record = DurableRequestRecord.from_dict(value)
+            if (
+                record.status is not RequestStatus.SENT
+                or record.attempts < 1
+                or record.accepted_at is None
+                or not isinstance(record.receipt, Mapping)
+            ):
+                raise DurableRequestError(
+                    "conversation identity enrichment requires an accepted SENT request"
+                )
+            current = SendReceipt.from_dict(record.receipt)
+            accepted_base = accepted_receipt.to_dict()
+            current_base = current.to_dict()
+            accepted_base["conversation_id"] = None
+            current_base["conversation_id"] = None
+            if current_base != accepted_base:
+                raise DurableRequestError(
+                    "durable accepted receipt changed before conversation identity enrichment"
+                )
+            if current.conversation_id not in {None, conversation_id}:
+                raise DurableRequestError(
+                    "durable accepted receipt already has a different conversation identity"
+                )
+            if current.conversation_id is None:
+                enriched = replace(current, conversation_id=conversation_id)
+                record = replace(
+                    record,
+                    updated_at=time.time(),
+                    receipt=enriched.to_dict(),
+                )
+                data["records"][request_id] = record.to_dict()
+            return record
+
 
 def classify_recovery_state(
     record: DurableRequestRecord, snapshot: ChatGPTSnapshot

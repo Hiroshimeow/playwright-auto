@@ -116,22 +116,32 @@ class SuccessExecutor:
         }
 
 
-def test_clean_ready_raises_known_rate_limit_instead_of_waiting_or_mutating():
+def test_clean_ready_dismisses_known_rate_limit_and_continues_existing_tab(monkeypatch):
     limited = snapshot(
         dialogs=(
             "Too many requests You’re making requests too quickly. "
             "We’ve temporarily limited access. Got it",
         )
     )
+    clean = snapshot()
     page = ChatGPTPage(object(), timeout_ms=100)
+    snapshots = iter((limited, clean))
+    dismiss_calls = []
 
     async def owned():
-        return limited
+        return next(snapshots)
+
+    async def dismiss(_page, *, timeout_ms):
+        dismiss_calls.append(timeout_ms)
+        return "Got it"
 
     page.assert_ownership = owned
+    monkeypatch.setattr("playwright_auto.chatgpt.dismiss_rate_limit_dialog", dismiss)
 
-    with pytest.raises(RateLimitBlockedError, match="rate limit"):
-        asyncio.run(page.wait_until_clean_ready(timeout_ms=100))
+    result = asyncio.run(page.wait_until_clean_ready(timeout_ms=100, poll_ms=1))
+
+    assert result is clean
+    assert dismiss_calls == [100]
 
 
 def test_rate_limit_dialog_is_classified_without_auto_accepting_unknown_dialog():
@@ -149,6 +159,19 @@ def test_rate_limit_dialog_is_classified_without_auto_accepting_unknown_dialog()
     assert rate_limit_dialogs(unknown) == ()
     with pytest.raises(UnsafePageStateError, match="blocking dialog"):
         ChatGPTPage._assert_interaction_safe(unknown)
+
+
+def test_known_rate_limit_visible_recognizes_conversation_history_modal_testid():
+    class Page:
+        async def evaluate(self, _script, payload):
+            if not isinstance(payload, list) or len(payload) != 2:
+                return False
+            _markers, testids = payload
+            return "modal-conversation-history-rate-limit" in testids
+
+    page = ChatGPTPage(Page(), timeout_ms=100)
+
+    assert asyncio.run(page.known_rate_limit_visible()) is True
 
 
 def test_executor_recovers_known_rate_limit_then_reuses_same_durable_block(monkeypatch):

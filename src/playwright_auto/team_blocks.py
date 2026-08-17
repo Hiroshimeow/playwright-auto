@@ -59,7 +59,7 @@ class DurableTeamRoleExecutor:
         active_reload_after_ms: int | None = 120_000,
         max_attempts: int = 2,
         min_request_interval_seconds: float = 4.0,
-        rate_limit_cooldown_seconds: float = 60.0,
+        rate_limit_cooldown_seconds: float = 300.0,
         rate_limit_retries: int = 3,
     ) -> None:
         self.ledger_path = Path(ledger_path)
@@ -187,7 +187,7 @@ class TeamConversationBlock(WorkflowBlock[ChatGPTWorkspace]):
         if len(set(names)) != len(names):
             raise ValueError("team round names must be unique")
         self.executor = executor or DurableTeamRoleExecutor()
-        default_cooldown = getattr(self.executor, "rate_limit_cooldown_seconds", 60.0)
+        default_cooldown = getattr(self.executor, "rate_limit_cooldown_seconds", 300.0)
         default_retries = getattr(self.executor, "rate_limit_retries", 3)
         self.rate_limit_cooldown_seconds = float(
             default_cooldown if rate_limit_cooldown_seconds is None else rate_limit_cooldown_seconds

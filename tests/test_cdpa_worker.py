@@ -1124,6 +1124,91 @@ def test_normal_cdpa_send_keeps_transport_identity_out_of_actual_payload(tmp_pat
 
 
 
+def test_reused_cdpa_role_waits_for_hydrated_history_before_send(tmp_path: Path):
+    _, _, state, worker = setup_task(tmp_path, task_id="task-reused-history")
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    state["hops"].insert(
+        0,
+        {
+            "hop_id": 0,
+            "target_role": "PLAN",
+            "receipt": {"accepted_via": "user_message_identity"},
+        },
+    )
+    history = (
+        MessageSnapshot("user", "u-old", "t-old", "older prompt", ()),
+        MessageSnapshot("assistant", "a-old", "t-old", "older answer", ()),
+    )
+
+    class HydratingClient(RecordingCDPASendClient):
+        def __init__(self):
+            super().__init__(task_id=state["task_id"], team=state["team"])
+            self.prompt_reads = 0
+            self.require_history = []
+
+        async def assert_ownership(self):
+            if self.current.composer_text and not self.current.messages:
+                self.prompt_reads += 1
+                if self.prompt_reads >= 2:
+                    self.current = send_snapshot(
+                        text=self.current.composer_text,
+                        messages=history,
+                        state=ChatGPTState.DRAFT,
+                        task_id=state["task_id"],
+                        team=state["team"],
+                    )
+            return self.current
+
+        async def send(
+            self,
+            text,
+            *,
+            require_existing_conversation_baseline=False,
+            **kwargs,
+        ):
+            self.require_history.append(require_existing_conversation_baseline)
+            return await super().send(text, **kwargs)
+
+    client = HydratingClient()
+
+    asyncio.run(worker._sending(state, hop, RecordingCDPASendActions(client)))
+
+    record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
+    assert record is not None and record.baseline is not None
+    assert record.baseline.message_ids == frozenset({"u-old", "a-old"})
+    assert client.require_history == [True]
+    assert len(client.send_calls) == 1
+
+
+def test_reused_cdpa_role_persistent_empty_history_blocks_retryably_preboundary(
+    tmp_path: Path,
+):
+    _, _, state, worker = setup_task(tmp_path, task_id="task-reused-history-empty")
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    state["hops"].insert(
+        0,
+        {
+            "hop_id": 0,
+            "target_role": "PLAN",
+            "receipt": {"accepted_via": "user_message_identity"},
+        },
+    )
+    client = RecordingCDPASendClient(task_id=state["task_id"], team=state["team"])
+
+    asyncio.run(worker._sending(state, hop, RecordingCDPASendActions(client)))
+
+    record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "conversation_transcript_not_ready"
+    assert state["block_retryable"] is True
+    assert record is not None and record.status is RequestStatus.PROMPT_SET
+    assert record.attempts == 0
+    assert record.baseline is None
+    assert client.send_calls == []
+
+
 def test_path_only_report_routes_without_local_file_io(tmp_path: Path, monkeypatch):
     _, _, state, worker = setup_task(tmp_path)
     hop = _active_hop(state)
@@ -1376,37 +1461,6 @@ def test_resume_and_retry_controls_have_distinct_state_contracts(tmp_path: Path)
 
 
 
-
-
-@pytest.mark.parametrize("action", ["open_tab", "new_chat"])
-def test_active_rate_limit_gate_leaves_tab_opening_controls_queued(tmp_path: Path, action: str):
-    _, _, state, worker = setup_task(
-        tmp_path, task_id=f"task-rate-limit-control-{action}"
-    )
-    worker._rate_limit_cooldown = {
-        "state": "active",
-        "detected_at": "2026-08-09T00:00:00+00:00",
-        "release_not_before": "2999-01-01T00:00:00+00:00",
-    }
-    state["controls"] = [
-        {
-            "control_id": 1,
-            "action": action,
-            "role": "PLAN",
-            "reason": "must remain queued during cooldown",
-            "confirmed": False,
-            "status": "requested",
-            "requested_at": "2026-08-09T00:00:00+00:00",
-            "applied_at": None,
-            "result": None,
-        }
-    ]
-
-    applied = asyncio.run(worker._apply_control(state, SimpleNamespace()))
-
-    assert applied is False
-    assert state["controls"][0]["status"] == "requested"
-    assert state["controls"][0]["result"] is None
 
 
 def test_open_tab_recovers_presend_role_offline_and_sends_original_once(
@@ -1787,6 +1841,104 @@ def test_open_tab_rejects_conflicting_canonical_snapshot_after_ledger_reconcile(
     assert "canonical" in str(state["controls"][0]["result"]).lower()
     assert state["status"] == "BLOCKED"
     assert _active_hop(state)["conversation_url"] == provisional_url
+
+
+def test_advance_persists_ineffective_open_tab_before_later_requested_control(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _, store, state, worker = setup_task(tmp_path, task_id="task-btm-like-control-order")
+    path = Path(state["manifest_path"])
+    hop = _active_hop(state)
+    state.update(
+        status="BLOCKED",
+        kanban_column="BLOCKED",
+        block_code="role_offline",
+        block_retryable=False,
+        block_reason="recorded PLAN tab is offline",
+        active_action="blocked",
+    )
+    state["roles"]["PLAN"].update(
+        page_id="old-plan-page",
+        page_url="https://chatgpt.com/",
+        online=False,
+        status="pending",
+    )
+    hop["conversation_url"] = None
+    store.save(path, state)
+    worker.hydrate_runtime()
+
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-btm-like-open",
+        idempotency_key="btm-like-open",
+        kind="task_control",
+        task_id=state["task_id"],
+        expected_task_version=None,
+        payload={"action": "open_tab", "role": "PLAN", "reason": None},
+    )
+    assert worker.dispatch_command_once()["status"] == "running"
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-btm-like-restart",
+        idempotency_key="btm-like-restart",
+        kind="task_control",
+        task_id=state["task_id"],
+        expected_task_version=None,
+        payload={
+            "action": "restart_role",
+            "role": "PLAN",
+            "reason": "bookkeeping conversation only",
+        },
+    )
+    assert worker.dispatch_command_once()["status"] == "running"
+
+    requested = store.load(path)
+    assert [(item["action"], item["status"]) for item in requested["controls"][-2:]] == [
+        ("open_tab", "requested"),
+        ("restart_role", "requested"),
+    ]
+
+    class ControlActions:
+        async def restart(self, *_args, **_kwargs):
+            raise RoleOwnershipError("no exact conversation can be safely restarted")
+
+    monkeypatch.setattr(
+        worker_module,
+        "CDPATabActions",
+        lambda *_args, **_kwargs: ControlActions(),
+    )
+
+    result = asyncio.run(
+        worker.advance(
+            path,
+            SimpleNamespace(pages=[]),
+            scheduling_tasks=list(worker.registry.tasks_by_id.values()),
+        )
+    )
+
+    assert result is not None
+    saved = store.load(path)
+    open_control, restart_control = saved["controls"][-2:]
+    assert open_control["status"] == "ineffective"
+    assert open_control["command_state"] == "INEFFECTIVE"
+    assert "exact saved ChatGPT conversation URL" in str(open_control["result"])
+    assert restart_control["status"] == "requested"
+    assert restart_control["command_state"] == "PENDING"
+    assert worker.runtime_db.get_command("cmd-btm-like-open")["status"] == "failed"
+    assert worker.runtime_db.get_command("cmd-btm-like-restart")["status"] == "running"
+
+    second = asyncio.run(
+        worker.advance(
+            path,
+            SimpleNamespace(pages=[]),
+            scheduling_tasks=list(worker.registry.tasks_by_id.values()),
+        )
+    )
+
+    assert second is not None
+    final = store.load(path)
+    assert final["controls"][-1]["status"] == "rejected"
+    assert final["controls"][-1]["command_state"] == "REJECTED"
+    assert worker.runtime_db.get_command("cmd-btm-like-restart")["status"] == "failed"
 
 
 def test_blocked_task_does_not_advance_without_explicit_control(tmp_path: Path):
@@ -2466,7 +2618,7 @@ def test_terminal_graph_third_failure_enters_dom_fallback_and_wakes_source(tmp_p
     assert worker_module.parse_time(hop["wait"]["dom_fallback_ready_at"]) > datetime.now(timezone.utc)
 
 
-def test_complete_graph_not_ready_refreshes_once_then_blocks_without_replay(
+def test_complete_graph_not_ready_refreshes_once_then_polls_until_deadline_without_replay(
     tmp_path: Path,
 ):
     store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
@@ -2634,10 +2786,56 @@ def test_complete_graph_not_ready_refreshes_once_then_blocks_without_replay(
     ) < datetime.now(timezone.utc)
     asyncio.run(worker._waiting(state, hop, actions, path))
 
-    assert state["status"] == "BLOCKED"
-    assert state["block_code"] == "terminal_continuation_unresolved"
-    assert state["block_retryable"] is False
+    assert state["status"] == "RUNNING"
+    assert state["block_code"] is None
+    assert hop["wait"]["completion_mode"] == "status_recovery"
+    assert hop["wait"]["backend_fallback_category"] == "graph_not_ready"
+    assert "dom_fallback_ready_at" not in hop["wait"]
     assert hop["wait"]["last_refresh_result"]["status"] == "interrupted"
+    assert calls["refresh"] == 1
+    state = store.save(path, state)
+
+    for _ in range(3):
+        state = store.load(path)
+        hop = _active_hop(state)
+        past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        hop["wait"]["stream_status_next_poll_at"] = past
+        hop["wait"]["status_recovery_graph_next_at"] = past
+        state = store.save(path, state)
+        hop = _active_hop(state)
+        asyncio.run(worker._waiting(state, hop, actions, path))
+
+        assert state["status"] == "RUNNING"
+        assert state["block_code"] is None
+        assert hop["wait"]["completion_mode"] == "status_recovery"
+        assert hop["wait"]["backend_fallback_category"] == "graph_not_ready"
+        assert hop["wait"]["refresh_count"] == 1
+        assert "dom_fallback_ready_at" not in hop["wait"]
+
+    state = store.load(path)
+    hop = _active_hop(state)
+    past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    hop["wait"]["deadline_at"] = past
+    hop["wait"]["stream_status_next_poll_at"] = past
+    hop["wait"]["status_recovery_graph_next_at"] = past
+    state = store.save(path, state)
+    hop = _active_hop(state)
+    asyncio.run(worker._waiting(state, hop, actions, path))
+
+    assert state["status"] == "RUNNING"
+    assert hop["wait"]["completion_mode"] == "dom_fallback"
+    assert hop["wait"]["backend_fallback_category"] == "response_deadline"
+    assert hop["wait"]["refresh_count"] == 1
+
+    hop["wait"]["dom_fallback_ready_at"] = past
+    state = store.save(path, state)
+    hop = _active_hop(state)
+    asyncio.run(worker._waiting(state, hop, actions, path))
+
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "response_timeout"
+    assert state["block_retryable"] is False
+    assert hop["wait"]["refresh_count"] == 1
     assert calls["refresh"] == 1
     assert calls["send"] == calls["retry"] == calls["restart"] == calls["new_chat"] == 0
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
@@ -3981,6 +4179,292 @@ def test_runtime_worker_discovers_once_and_idle_cycles_do_not_scan(tmp_path: Pat
     assert recover_calls == 1
 
 
+def test_runtime_worker_stale_result_preserves_newer_requested_control_until_command_finishes(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _config, store, state, worker = setup_task(
+        tmp_path, task_id="task-runtime-stale-control"
+    )
+    path = Path(state["manifest_path"])
+    worker.hydrate_runtime()
+    assert worker.registry is not None
+    worker.registry.update_task(state, now=0.0)
+    advance_started = asyncio.Event()
+    release_advance = asyncio.Event()
+    original_advance = worker.advance
+    stale_result: dict[str, object] = {}
+
+    async def stale_advance(path_arg, _browser_context, *, scheduling_tasks=None):
+        assert scheduling_tasks is not None
+        stale = json.loads(json.dumps(store.load(path_arg)))
+        stale.update(
+            status="BLOCKED",
+            kanban_column="BLOCKED",
+            block_code="role_offline",
+            block_reason="stale browser-cycle result",
+        )
+        stale_result.clear()
+        stale_result.update(stale)
+        advance_started.set()
+        await release_advance.wait()
+        return stale
+
+    monkeypatch.setattr(worker, "advance", stale_advance)
+    monkeypatch.setattr(
+        worker_module,
+        "CDPATabActions",
+        lambda *_args, **_kwargs: FakeActions(),
+    )
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-runtime-stale-control",
+        idempotency_key="runtime-stale-control",
+        kind="task_control",
+        task_id=state["task_id"],
+        expected_task_version=None,
+        payload={"action": "stop", "reason": "prove stale result cannot erase control"},
+    )
+
+    async def scenario():
+        cycle = asyncio.create_task(worker.run_once(SimpleNamespace(pages=[])))
+        await asyncio.wait_for(advance_started.wait(), timeout=1.0)
+        delivered = worker.dispatch_command_once()
+        assert delivered is not None and delivered["status"] == "running"
+        requested = store.load(path)
+        assert requested["controls"][-1]["status"] == "requested"
+        assert requested["updated_at"] != stale_result["updated_at"]
+
+        release_advance.set()
+        await cycle
+
+        current = worker.registry.tasks_by_id[state["task_id"]]
+        assert current["updated_at"] == requested["updated_at"]
+        assert current["controls"][-1]["status"] == "requested"
+        assert state["task_id"] in worker.registry.due_task_ids(time.time() + 1.0)
+
+        terminal = await original_advance(
+            path,
+            SimpleNamespace(pages=[]),
+            scheduling_tasks=list(worker.registry.tasks_by_id.values()),
+        )
+        assert terminal is not None
+        assert terminal["controls"][-1]["status"] == "applied"
+        command = worker.runtime_db.get_command("cmd-runtime-stale-control")
+        assert command is not None and command["status"] == "applied"
+
+    asyncio.run(scenario())
+
+
+def test_runtime_worker_consumes_new_requested_control_during_unrelated_slow_cycle(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _config, store, slow, worker = setup_task(
+        tmp_path, task_id="task-runtime-slow-cycle"
+    )
+    slow_path = Path(slow["manifest_path"])
+    target = store.create_task(
+        "blocked target",
+        requested_team="target-team",
+        task_id="task-runtime-live-control",
+    )
+    target_path = Path(target["manifest_path"])
+    target["status"] = "BLOCKED"
+    target["kanban_column"] = "BLOCKED"
+    target["block_code"] = "role_offline"
+    target["block_retryable"] = False
+    target["block_reason"] = "owned target PLAN tab is offline"
+    target["roles"]["PLAN"].update(
+        page_id="target-plan-page",
+        page_url="https://chatgpt.com/c/target-plan",
+        online=False,
+        status="offline",
+        last_error="page_missing",
+    )
+    target = store.save(target_path, target)
+
+    worker.hydrate_runtime()
+    assert worker.registry is not None
+    worker.registry._due_at[slow["task_id"]] = time.time() - 1.0
+    assert target["task_id"] not in worker.registry.due_task_ids(time.time())
+
+    slow_started = asyncio.Event()
+    target_started = asyncio.Event()
+    release_slow = asyncio.Event()
+    original_advance = worker.advance
+    reopen_calls = 0
+
+    async def mixed_advance(path, browser_context, *, scheduling_tasks=None):
+        resolved = Path(path).resolve()
+        if resolved == slow_path.resolve():
+            slow_started.set()
+            await release_slow.wait()
+            return store.load(path)
+        if resolved == target_path.resolve():
+            assert target["task_id"] in worker.registry.due_task_ids(time.time())
+            target_started.set()
+        return await original_advance(
+            path,
+            browser_context,
+            scheduling_tasks=scheduling_tasks,
+        )
+
+    class ControlActions(FakeActions):
+        async def reopen(
+            self,
+            _state,
+            _role,
+            *,
+            require_clean_ready=True,
+            foreground=True,
+        ):
+            nonlocal reopen_calls
+            reopen_calls += 1
+            assert foreground is True
+            return AcquiredRole(
+                client=SimpleNamespace(),
+                page_id="target-plan-page",
+                url="https://chatgpt.com/c/target-plan",
+                created=False,
+                new_chat=False,
+            )
+
+    monkeypatch.setattr(worker, "advance", mixed_advance)
+    monkeypatch.setattr(
+        worker_module,
+        "CDPATabActions",
+        lambda *_args, **_kwargs: ControlActions(),
+    )
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-runtime-live-control",
+        idempotency_key="runtime-live-control",
+        kind="task_control",
+        task_id=target["task_id"],
+        expected_task_version=None,
+        payload={
+            "action": "open_tab",
+            "role": "PLAN",
+            "reason": "recover exact blocked role",
+        },
+    )
+
+    async def scenario():
+        cycle = asyncio.create_task(worker.run_once(SimpleNamespace(pages=[])))
+        await asyncio.wait_for(slow_started.wait(), timeout=1.0)
+
+        delivered = worker.dispatch_command_once()
+        assert delivered is not None and delivered["status"] == "running"
+        requested = store.load(target_path)
+        assert requested["controls"][-1]["status"] == "requested"
+
+        await asyncio.wait_for(target_started.wait(), timeout=1.5)
+        for _ in range(20):
+            command = worker.runtime_db.get_command("cmd-runtime-live-control")
+            if command is not None and command["status"] != "running":
+                break
+            await asyncio.sleep(0.05)
+        assert command is not None and command["status"] == "applied"
+        applied = store.load(target_path)
+        assert applied["controls"][-1]["status"] == "applied"
+        assert reopen_calls == 1
+        assert cycle.done() is False
+
+        release_slow.set()
+        await asyncio.wait_for(cycle, timeout=1.0)
+
+    asyncio.run(scenario())
+
+
+def test_runtime_worker_inventory_timeout_does_not_starve_requested_control(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _config, store, state, worker = setup_task(
+        tmp_path, task_id="task-runtime-inventory-stall"
+    )
+    path = Path(state["manifest_path"])
+    store.update(
+        path,
+        lambda current: worker._block(
+            current,
+            "owned PLAN tab is offline",
+            code="role_offline",
+            retryable=False,
+        ),
+    )
+    worker.hydrate_runtime()
+    previous_projection = {
+        "connected": True,
+        "page_count": 1,
+        "pages": [{"page_id": "previous-page", "url": "https://chatgpt.com/"}],
+    }
+    worker._browser_projection = previous_projection
+    worker._last_browser_inventory_at = 0.0
+    worker._last_browser_page_count = 1
+    inventory_started = asyncio.Event()
+    inventory_cancelled = asyncio.Event()
+    release_inventory = asyncio.Event()
+    inventory_calls = 0
+
+    async def hung_inventory(*_args, **_kwargs):
+        nonlocal inventory_calls
+        inventory_calls += 1
+        inventory_started.set()
+        try:
+            await release_inventory.wait()
+        except asyncio.CancelledError:
+            inventory_cancelled.set()
+            await release_inventory.wait()
+            raise
+
+    monkeypatch.setattr(worker_module, "build_browser_projection", hung_inventory)
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-runtime-inventory-stall",
+        idempotency_key="runtime-inventory-stall",
+        kind="task_control",
+        task_id=state["task_id"],
+        expected_task_version=None,
+        payload={"action": "stop", "reason": "prove inventory cannot starve controls"},
+    )
+    delivered = worker.dispatch_command_once()
+    assert delivered is not None and delivered["status"] == "running"
+    requested = store.load(path)
+    assert requested["controls"][-1]["status"] == "requested"
+
+    async def scenario():
+        cycle = asyncio.create_task(worker.run_once(SimpleNamespace(pages=[])))
+        await asyncio.wait_for(inventory_started.wait(), timeout=1.0)
+        done, _pending = await asyncio.wait({cycle}, timeout=2.2)
+        first_cycle_bounded = cycle in done
+
+        second_cycle_bounded = False
+        second_cycle = None
+        if first_cycle_bounded:
+            second_cycle = asyncio.create_task(worker.run_once(SimpleNamespace(pages=[])))
+            done, _pending = await asyncio.wait({second_cycle}, timeout=0.8)
+            second_cycle_bounded = second_cycle in done
+
+        release_inventory.set()
+        await asyncio.wait_for(cycle, timeout=1.0)
+        if second_cycle is not None:
+            await asyncio.wait_for(second_cycle, timeout=1.0)
+        await asyncio.sleep(0)
+        return first_cycle_bounded, second_cycle_bounded
+
+    first_cycle_bounded, second_cycle_bounded = asyncio.run(scenario())
+
+    assert first_cycle_bounded is True
+    assert second_cycle_bounded is True
+    assert inventory_calls == 1
+    assert inventory_cancelled.is_set() is False
+    assert getattr(worker, "_browser_inventory_task", None) is None
+    command = worker.runtime_db.get_command("cmd-runtime-inventory-stall")
+    assert command is not None and command["status"] == "applied"
+    applied = store.load(path)
+    assert applied["controls"][-1]["status"] == "applied"
+    assert worker._browser_projection == previous_projection
+
+
 def test_heartbeat_ticker_keeps_long_advance_online_without_task_mutation(
     tmp_path: Path, monkeypatch
 ):
@@ -4577,6 +5061,8 @@ def test_waiting_reconciles_conversation_id_from_exact_ledger_before_backend_wai
     assert hop["receipt"]["conversation_id"] == "conversation-1"
 
 
+
+
 def test_expired_waiting_with_canonical_ledger_checks_backend_before_dom_fallback(tmp_path: Path):
     from dataclasses import replace
 
@@ -4905,143 +5391,6 @@ def test_first_allocation_keeps_catalog_primary_before_task_backup(tmp_path: Pat
     assert state["roles"]["PLAN"]["context_source"] == "bootstrap_donor"
 
 
-def test_post_release_first_failed_branch_does_not_fan_out_to_ui_or_donor_two(tmp_path: Path):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    donors = [
-        {
-            "conversation_id": "11111111-1111-4111-8111-111111111111",
-            "assistant_message_id": "22222222-2222-4222-8222-222222222222",
-        },
-        {
-            "conversation_id": "33333333-3333-4333-8333-333333333333",
-            "assistant_message_id": "44444444-4444-4444-8444-444444444444",
-        },
-    ]
-    catalog = BootstrapCatalog(tmp_path)
-    record = catalog.upsert(donor_pool_record(donors=donors))
-    store = TaskStore(config)
-    state = store.create_task(
-        "one acquisition after cooldown",
-        requested_team="post-release-one-shot",
-        task_id="task-post-release-one-shot",
-        bootstrap=record,
-    )
-    worker = CDPAWorker(config, store=store)
-    worker.runtime_db.ensure_schema()
-    worker._rate_limit_cooldown = {
-        "state": "released",
-        "detected_at": "2026-08-09T00:00:00+00:00",
-        "release_not_before": "2026-08-09T00:01:00+00:00",
-        "released_at": "2026-08-09T00:01:00+00:00",
-        "post_release_acquisition": "pending",
-    }
-
-    class Actions(FakeActions):
-        def __init__(self):
-            super().__init__()
-            self.branches = []
-
-        async def locate_owned(self, _state, _role):
-            return None
-
-        async def backend_conversation(self, conversation_id):
-            donor = next(item for item in donors if item["conversation_id"] == conversation_id)
-            return _bootstrap_graph(donor["assistant_message_id"])
-
-        async def branch_from_anchor(
-            self, _state, _role, *, source_conversation_id, assistant_message_id
-        ):
-            self.branches.append((source_conversation_id, assistant_message_id))
-            raise BranchBootstrapError("first post-release acquisition failed")
-
-    actions = Actions()
-    acquired = asyncio.run(worker._acquire_workflow_role(state, "PLAN", actions))
-
-    assert acquired is None
-    assert actions.branches == [
-        (donors[0]["conversation_id"], donors[0]["assistant_message_id"])
-    ]
-    assert worker._rate_limit_cooldown["post_release_acquisition"] == "consumed"
-    assert state["active_action"] == "bootstrap_retry"
-
-
-def test_post_release_acquisition_is_profile_wide_single_inflight_lease(tmp_path: Path):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    catalog = BootstrapCatalog(tmp_path)
-    record = catalog.upsert(donor_pool_record())
-    store = TaskStore(config)
-    state_a = store.create_task(
-        "post release A",
-        requested_team="post-release-a",
-        task_id="task-post-release-a",
-        bootstrap=record,
-    )
-    state_b = store.create_task(
-        "post release B",
-        requested_team="post-release-b",
-        task_id="task-post-release-b",
-        bootstrap=record,
-    )
-    worker = CDPAWorker(config, store=store)
-    worker.runtime_db.ensure_schema()
-    worker._rate_limit_cooldown = {
-        "state": "released",
-        "detected_at": "2026-08-09T00:00:00+00:00",
-        "release_not_before": "2026-08-09T00:01:00+00:00",
-        "released_at": "2026-08-09T00:01:00+00:00",
-        "post_release_acquisition": "pending",
-    }
-    first_started = asyncio.Event()
-    release_first = asyncio.Event()
-
-    class Actions(FakeActions):
-        def __init__(self):
-            super().__init__()
-            self.branch_calls = []
-
-        async def locate_owned(self, _state, _role):
-            return None
-
-        async def backend_conversation(self, _conversation_id):
-            return _bootstrap_graph(record["donors"][0]["assistant_message_id"])
-
-        async def branch_from_anchor(
-            self, state, role, *, source_conversation_id, assistant_message_id
-        ):
-            self.branch_calls.append(state["task_id"])
-            if len(self.branch_calls) == 1:
-                first_started.set()
-                await release_first.wait()
-            return AcquiredRole(
-                client=SimpleNamespace(),
-                page_id=f"branch-{state['task_id']}",
-                url=f"https://chatgpt.com/c/{state['task_id']}",
-                created=True,
-                new_chat=True,
-            )
-
-    actions = Actions()
-
-    async def scenario():
-        first = asyncio.create_task(
-            worker._acquire_workflow_role(state_a, "PLAN", actions)
-        )
-        await asyncio.wait_for(first_started.wait(), timeout=1.0)
-        second = asyncio.create_task(
-            worker._acquire_workflow_role(state_b, "PLAN", actions)
-        )
-        await asyncio.sleep(0)
-        release_first.set()
-        return await asyncio.gather(first, second)
-
-    first_result, second_result = asyncio.run(scenario())
-
-    assert first_result is not None
-    assert second_result is None
-    assert actions.branch_calls == [state_a["task_id"]]
-    assert worker._rate_limit_cooldown["post_release_acquisition"] == "consumed"
-
-
 def test_active_rate_limit_gate_blocks_ui_bootstrap_before_new_page(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
@@ -5169,13 +5518,15 @@ def test_active_rate_limit_gate_blocks_prewarm_before_global_role_acquisition(tm
     }
 
     class Actions(FakeActions):
-        async def acquire_global_role(self, _physical_role):
-            pytest.fail("cooldown must block global role acquisition before opening a tab")
+        async def acquire_global_role(self, physical_role, *, allow_create=True):
+            assert physical_role == "BOOTSTRAP"
+            assert allow_create is False
+            raise RoleOwnershipError("global role has no open tab")
 
     updated = asyncio.run(worker._regenerate_bootstrap_donor(state, record, Actions()))
 
     assert updated is None
-    assert state["active_action"] == "bootstrap_regenerate"
+    assert state["active_action"] == "rate_limit_cooldown"
 
 
 def test_prewarm_regenerates_donor_through_shared_send_gate(tmp_path: Path, monkeypatch):
@@ -5212,7 +5563,8 @@ def test_prewarm_regenerates_donor_through_shared_send_gate(tmp_path: Path, monk
             )
 
     class Actions(FakeActions):
-        async def acquire_global_role(self, physical_role):
+        async def acquire_global_role(self, physical_role, *, allow_create=True):
+            assert allow_create is True
             calls.append(("acquire_global_role", physical_role))
             return AcquiredRole(
                 client=Client(),
@@ -5583,3 +5935,57 @@ def test_operational_hop_decision_neither_counts_nor_resets_self_route_streak(
     assert state["status"] == "BLOCKED"
     assert state["block_code"] == "consecutive_self_route_limit"
     assert state["active_hop_id"] == third_normal["hop_id"]
+
+
+@pytest.mark.parametrize("action", ["open_tab", "new_chat"])
+def test_rate_limit_defers_only_missing_tab_control(tmp_path: Path, action: str):
+    _, _, state, worker = setup_task(
+        tmp_path, task_id=f"task-rate-limit-missing-{action}"
+    )
+    worker._rate_limit_cooldown = {
+        "state": "active",
+        "detected_at": "2026-08-17T00:00:00+00:00",
+        "release_not_before": "2999-01-01T00:00:00+00:00",
+    }
+    state["controls"] = [{
+        "control_id": 1, "action": action, "role": "PLAN",
+        "reason": "new tab is paused", "confirmed": False,
+        "status": "requested", "requested_at": "2026-08-17T00:00:00+00:00",
+        "applied_at": None, "result": None,
+    }]
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            return None
+        async def reopen(self, *_args, **_kwargs):
+            raise AssertionError("cooldown must not reopen/create a missing tab")
+        async def new_chat(self, *_args, **_kwargs):
+            raise AssertionError("cooldown must not create a missing tab")
+
+    assert asyncio.run(worker._apply_control(state, Actions())) is True
+    control = state["controls"][0]
+    assert control["status"] == "applied"
+    assert control["result"] == {"deferred": True, "reason": "rate_limit_cooldown"}
+    assert state["active_action"] == "rate_limit_cooldown"
+
+
+def test_active_rate_limit_blocks_ui_bootstrap_new_page_only(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_task(
+        "block only new UI page", requested_team="ui-gated", task_id="task-ui-gated",
+        bootstrap=donor_pool_record(),
+    )
+    worker = CDPAWorker(config, store=store)
+    worker._rate_limit_cooldown = {
+        "state": "active",
+        "detected_at": "2026-08-17T00:00:00+00:00",
+        "release_not_before": "2999-01-01T00:00:00+00:00",
+    }
+    donor = donor_pool_record()["donors"][0]
+    class Actions:
+        browser_context = SimpleNamespace(
+            new_page=lambda: pytest.fail("cooldown must block new_page")
+        )
+    with pytest.raises(RateLimitBlockedError, match="cooldown"):
+        asyncio.run(worker._branch_from_bootstrap_ui(state, "PLAN", Actions(), donor))

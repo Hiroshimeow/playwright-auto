@@ -448,6 +448,119 @@ def test_backend_auth_token_is_reused_across_page_wrappers_for_one_context():
     asyncio.run(run())
 
 
+def test_backend_search_conversations_paginates_deduplicates_and_fails_closed_at_limit():
+    import asyncio
+    from playwright_auto.chatgpt import backend_search_conversations
+    from playwright_auto.chatgpt_graph import BackendSchemaError
+
+    class Response:
+        status = 200
+        def __init__(self, payload): self.payload = payload
+        async def json(self): return self.payload
+
+    class Requests:
+        def __init__(self, payloads):
+            self.calls = []
+            self.payloads = list(payloads)
+        async def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            if url.endswith("/api/auth/session"):
+                return Response({"accessToken": "token"})
+            return Response(self.payloads.pop(0))
+
+    class Context:
+        def __init__(self, payloads): self.request = Requests(payloads)
+
+    async def paginated():
+        context = Context([
+            {
+                "items": [
+                    {"conversation_id": "conversation-1"},
+                    {"conversation_id": "conversation-2"},
+                ],
+                "cursor": "next cursor",
+            },
+            {
+                "items": [
+                    {"conversation_id": "conversation-2"},
+                    {"conversation_id": "conversation-3"},
+                ],
+                "cursor": None,
+            },
+        ])
+        assert await backend_search_conversations(
+            context, "task id/+", max_candidates=4
+        ) == ["conversation-1", "conversation-2", "conversation-3"]
+        urls = [url for url, _kwargs in context.request.calls if "/conversations/search" in url]
+        assert urls[0].endswith("query=task%20id%2F%2B")
+        assert urls[1].endswith("query=task%20id%2F%2B&cursor=next%20cursor")
+    asyncio.run(paginated())
+
+    async def truncated():
+        context = Context([
+            {
+                "items": [
+                    {"conversation_id": "conversation-1"},
+                    {"conversation_id": "conversation-2"},
+                ],
+                "cursor": "more",
+            }
+        ])
+        with pytest.raises(BackendSchemaError, match="bounded candidate limit"):
+            await backend_search_conversations(context, "task-id", max_candidates=2)
+    asyncio.run(truncated())
+
+    async def bad_item():
+        context = Context([{"items": [{"bad": True}], "cursor": None}])
+        with pytest.raises(BackendSchemaError, match="unknown item shape"):
+            await backend_search_conversations(context, "task-id")
+    asyncio.run(bad_item())
+
+    async def repeated_cursor():
+        class RepeatingRequests:
+            def __init__(self):
+                self.search_calls = 0
+
+            async def get(self, url, **_kwargs):
+                await asyncio.sleep(0)
+                if url.endswith("/api/auth/session"):
+                    return Response({"accessToken": "token"})
+                self.search_calls += 1
+                return Response({
+                    "items": [{"conversation_id": "conversation-1"}],
+                    "cursor": "same-cursor",
+                })
+
+        context = type("Context", (), {"request": RepeatingRequests()})()
+        with pytest.raises(BackendSchemaError, match="pagination cursor repeated"):
+            await asyncio.wait_for(
+                backend_search_conversations(context, "task-id", max_candidates=4),
+                timeout=0.2,
+            )
+        assert context.request.search_calls == 2
+    asyncio.run(repeated_cursor())
+
+    async def changing_cursor_without_progress():
+        class ChangingRequests:
+            def __init__(self):
+                self.search_calls = 0
+
+            async def get(self, url, **_kwargs):
+                if url.endswith("/api/auth/session"):
+                    return Response({"accessToken": "token"})
+                self.search_calls += 1
+                return Response({
+                    "items": [{"conversation_id": "conversation-1"}],
+                    "cursor": f"cursor-{self.search_calls}",
+                })
+
+        context = type("Context", (), {"request": ChangingRequests()})()
+        with pytest.raises(BackendSchemaError, match="bounded page limit"):
+            await backend_search_conversations(context, "task-id", max_candidates=3)
+        assert context.request.search_calls == 3
+    asyncio.run(changing_cursor_without_progress())
+
+
 def test_backend_conversation_validates_graph_shape():
     import asyncio
     from playwright_auto.chatgpt import ChatGPTPage

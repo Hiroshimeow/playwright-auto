@@ -6,6 +6,10 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 PROFILE_DIR="${PLAYWRIGHT_PROFILE_DIR:-$HOME/Workspace/playwright-profile}"
 DEFAULT_URL="${PLAYWRIGHT_DEFAULT_URL:-https://chatgpt.com/}"
 CHROMIUM_BIN="${CHROMIUM_BIN:-}"
+# Keep system/Tailscale routing untouched. Only Chromium uses the local WARP
+# SOCKS proxy; sensitive/working destinations remain direct.
+PROXY_SERVER="${PLAYWRIGHT_PROXY_SERVER:-socks5://127.0.0.1:40000}"
+PROXY_BYPASS_LIST="${PLAYWRIGHT_PROXY_BYPASS_LIST:-localhost;127.0.0.1;[::1];100.64.0.0/10;192.168.0.0/16;*.ts.net;*.hcu-lab.me;chatgpt.com;*.chatgpt.com;openai.com;*.openai.com;*.oaistatic.com;*.oaiusercontent.com;ashbyhq.com;*.ashbyhq.com;google.com;*.google.com;*.googleusercontent.com;*.gstatic.com}"
 
 if [[ -z "$CHROMIUM_BIN" ]]; then
   for candidate in chromium chromium-browser google-chrome google-chrome-stable; do
@@ -52,6 +56,8 @@ exec "$CHROMIUM_BIN" \
   --no-first-run \
   --no-default-browser-check \
   --disable-dev-shm-usage \
+  --proxy-server="$PROXY_SERVER" \
+  --proxy-bypass-list="$PROXY_BYPASS_LIST" \
   --force-dark-mode \
   --blink-settings=preferredColorScheme=0 \
   about:blank

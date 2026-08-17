@@ -1618,6 +1618,167 @@ class TaskStore(IndependentAgentStoreMixin):
             catalog["entries"][key] = entry
             self._write_catalog_unlocked(catalog)
 
+    @staticmethod
+    def _clock_datetime(value: object) -> datetime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @classmethod
+    def _legacy_running_clock(
+        cls,
+        state: Mapping[str, Any],
+        *,
+        start_at: object,
+        now: datetime,
+    ) -> tuple[float, str | None]:
+        start = cls._clock_datetime(start_at)
+        if start is None:
+            return 0.0, None
+        elapsed = 0.0
+        running_since = start
+        running = True
+        controls: list[tuple[datetime, str]] = []
+        for item in state.get("controls") or []:
+            if not isinstance(item, Mapping):
+                continue
+            action = str(item.get("action") or "").strip().lower()
+            if action not in {"pause", "resume"}:
+                continue
+            applied = cls._clock_datetime(item.get("applied_at"))
+            if applied is None or applied < start or applied > now:
+                continue
+            controls.append((applied, action))
+        for applied, action in sorted(controls):
+            if action == "pause" and running:
+                elapsed += max(0.0, (applied - running_since).total_seconds())
+                running_since = applied
+                running = False
+            elif action == "resume" and not running:
+                running_since = applied
+                running = True
+
+        status = str(state.get("status") or "").upper()
+        if running and status != "RUNNING":
+            boundary = None
+            if status == "BLOCKED":
+                boundary = cls._clock_datetime(state.get("blocked_at"))
+            elif status == "WAITING":
+                waiting = state.get("waiting")
+                if isinstance(waiting, Mapping):
+                    boundary = cls._clock_datetime(waiting.get("since"))
+            if boundary is None:
+                boundary = cls._clock_datetime(state.get("updated_at")) or now
+            boundary = min(max(boundary, running_since), now)
+            elapsed += max(0.0, (boundary - running_since).total_seconds())
+            running = False
+        if running:
+            return elapsed, running_since.isoformat()
+        return elapsed, None
+
+    @classmethod
+    def _apply_running_clocks(
+        cls,
+        original: Mapping[str, Any],
+        candidate: dict[str, Any],
+        *,
+        at: str,
+    ) -> None:
+        now = cls._clock_datetime(at) or datetime.now(timezone.utc)
+        before_status = str(original.get("status") or "").upper()
+        after_status = str(candidate.get("status") or "").upper()
+
+        if "running_elapsed_seconds" in original or "running_since" in original:
+            elapsed = max(0.0, float(original.get("running_elapsed_seconds") or 0.0))
+            since = cls._clock_datetime(original.get("running_since"))
+        else:
+            elapsed, legacy_since = cls._legacy_running_clock(
+                original, start_at=original.get("started_at"), now=now
+            )
+            since = cls._clock_datetime(legacy_since)
+
+        if before_status == "RUNNING" and after_status != "RUNNING":
+            if since is not None:
+                elapsed += max(0.0, (now - since).total_seconds())
+            since = None
+        elif before_status != "RUNNING" and after_status == "RUNNING":
+            since = now
+        elif after_status != "RUNNING":
+            since = None
+        candidate["running_elapsed_seconds"] = round(elapsed, 6)
+        candidate["running_since"] = since.isoformat() if since is not None else None
+
+        before_identity = (
+            f"{str(original.get('active_role') or '').upper()}:{original.get('active_hop_id')}"
+            if original.get("active_role") and original.get("active_hop_id") is not None
+            else None
+        )
+        after_identity = (
+            f"{str(candidate.get('active_role') or '').upper()}:{candidate.get('active_hop_id')}"
+            if candidate.get("active_role") and candidate.get("active_hop_id") is not None
+            else None
+        )
+
+        def hop_created(state: Mapping[str, Any], hop_id: object) -> object:
+            for hop in state.get("hops") or []:
+                if not isinstance(hop, Mapping) or hop.get("hop_id") != hop_id:
+                    continue
+                timestamps = hop.get("timestamps")
+                if isinstance(timestamps, Mapping):
+                    return timestamps.get("created_at")
+            return None
+
+        if after_identity is None:
+            candidate["active_role_running_identity"] = None
+            candidate["active_role_running_elapsed_seconds"] = 0.0
+            candidate["active_role_running_since"] = None
+            return
+
+        stored_identity = str(original.get("active_role_running_identity") or "") or None
+        if stored_identity == before_identity:
+            role_elapsed = max(
+                0.0, float(original.get("active_role_running_elapsed_seconds") or 0.0)
+            )
+            role_since = cls._clock_datetime(original.get("active_role_running_since"))
+        else:
+            role_elapsed, legacy_role_since = cls._legacy_running_clock(
+                original,
+                start_at=hop_created(original, original.get("active_hop_id")),
+                now=now,
+            )
+            role_since = cls._clock_datetime(legacy_role_since)
+
+        if after_identity != before_identity:
+            role_elapsed = 0.0
+            if after_status == "RUNNING":
+                created = cls._clock_datetime(
+                    hop_created(candidate, candidate.get("active_hop_id"))
+                )
+                role_since = max(created or now, now if before_status != "RUNNING" else created or now)
+            else:
+                role_since = None
+        elif before_status == "RUNNING" and after_status != "RUNNING":
+            if role_since is not None:
+                role_elapsed += max(0.0, (now - role_since).total_seconds())
+            role_since = None
+        elif before_status != "RUNNING" and after_status == "RUNNING":
+            role_since = now
+        elif after_status != "RUNNING":
+            role_since = None
+
+        candidate["active_role_running_identity"] = after_identity
+        candidate["active_role_running_elapsed_seconds"] = round(role_elapsed, 6)
+        candidate["active_role_running_since"] = (
+            role_since.isoformat() if role_since is not None else None
+        )
+
     def _mutate_manifest(
         self,
         target: Path,
@@ -1651,9 +1812,11 @@ class TaskStore(IndependentAgentStoreMixin):
                     )
                 before_status = str(original.get("status") or "").upper()
                 after_status = str(candidate.get("status") or "").upper()
+                transition_at = utc_now()
+                self._apply_running_clocks(original, candidate, at=transition_at)
                 if after_status == "BLOCKED":
                     if before_status != "BLOCKED":
-                        candidate["blocked_at"] = utc_now()
+                        candidate["blocked_at"] = transition_at
                     elif not candidate.get("blocked_at"):
                         candidate["blocked_at"] = str(
                             original.get("updated_at") or utc_now()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,7 +14,13 @@ from playwright_auto.cdpa_config import load_cdpa_config
 from playwright_auto.cdpa_projection import build_task_projection
 from playwright_auto.cdpa_store import TaskStore
 from playwright_auto.cdpa_worker import CDPAWorker, _active_hop
-from playwright_auto.chatgpt import RateLimitBlockedError, UnsafePageStateError
+from playwright_auto.chatgpt import (
+    MessageBaseline,
+    PageBinding,
+    RateLimitBlockedError,
+    SendReceipt,
+    UnsafePageStateError,
+)
 from playwright_auto.dashboard_api import DashboardAPI
 from playwright_auto.durable import RequestLedger, RequestStatus
 
@@ -29,6 +35,7 @@ class _RateClient:
 
     async def dismiss_known_rate_limit(self, *, timeout_ms=None):
         self.dismiss_calls += 1
+        self.visible = False
         return "Got it"
 
     async def known_rate_limit_visible(self) -> bool:
@@ -46,11 +53,6 @@ class _RateActions:
     def __init__(self, client: _RateClient) -> None:
         self.client = client
         self.acquire_calls = 0
-        self.cleanup_calls = 0
-
-    async def cleanup_rate_limited_chatgpt_pages(self):
-        self.cleanup_calls += 1
-        return {"targeted": 3, "closed": 3, "cleared": 2, "errors": []}
 
     async def locate_owned(self, state, role):
         record = state["roles"][role]
@@ -145,88 +147,6 @@ def test_reload_catalog_command_fails_when_hydration_is_still_incomplete(
     assert "reload catalog is incomplete" in result["error"]
 
 
-def test_shared_rate_limit_cooldown_coalesces_cleanup_and_enforces_60s_minimum(
-    tmp_path: Path, monkeypatch
-):
-    _config, _store, state, worker = _setup(tmp_path)
-    state["roles"]["PLAN"].update(
-        page_id="page-plan", page_url="https://chatgpt.com/c/rate-limit"
-    )
-    client = _RateClient()
-    actions = _RateActions(client)
-    worker.rate_limit_cooldown_seconds = 0.5
-
-    async def enter_twice():
-        await asyncio.gather(
-            worker._enter_rate_limit_cooldown(
-                state, actions, RateLimitBlockedError("Too many requests")
-            ),
-            worker._enter_rate_limit_cooldown(
-                state, actions, RateLimitBlockedError("Too many requests")
-            ),
-        )
-
-    asyncio.run(enter_twice())
-
-    assert actions.cleanup_calls == 1
-    assert client.dismiss_calls == 0
-    assert worker._rate_limit_gate_active() is True
-    snapshot = worker.runtime_db.get_snapshot("worker")
-    cooldown = snapshot["payload"]["rate_limit_cooldown"]
-    assert cooldown["state"] == "active"
-    detected = datetime.fromisoformat(cooldown["detected_at"])
-    release = datetime.fromisoformat(cooldown["release_not_before"])
-    assert (release - detected).total_seconds() >= 60.0
-    assert cooldown["cleanup"]["closed"] == 3
-    monkeypatch.setattr(
-        "playwright_auto.cdpa_worker.canonical_independent_events",
-        lambda *_args, **_kwargs: pytest.fail("agent triggers must not be inspected during cooldown"),
-    )
-    worker.registry = SimpleNamespace(tasks_by_id={}, paths_by_id={})
-    assert worker._activate_independent_agents() == set()
-
-
-def test_restored_post_release_inflight_lease_returns_to_pending(tmp_path: Path):
-    config, store, _state, worker = _setup(tmp_path)
-    worker.runtime_db.put_snapshot(
-        "worker",
-        {
-            "rate_limit_cooldown": {
-                "state": "released",
-                "detected_at": "2026-08-09T00:00:00+00:00",
-                "release_not_before": "2026-08-09T00:01:00+00:00",
-                "released_at": "2026-08-09T00:01:00+00:00",
-                "post_release_acquisition": "in_progress",
-            }
-        },
-    )
-    restarted = CDPAWorker(config, store=store)
-
-    restarted._restore_rate_limit_cooldown()
-
-    assert restarted._rate_limit_cooldown is not None
-    assert restarted._rate_limit_cooldown["state"] == "released"
-    assert restarted._rate_limit_cooldown["post_release_acquisition"] == "pending"
-
-
-def test_rate_limit_release_uses_timestamp_without_browser_probe(tmp_path: Path):
-    _config, _store, _state, worker = _setup(tmp_path)
-    worker.registry = SimpleNamespace(tasks_by_id={}, paths_by_id={})
-    worker._rate_limit_cooldown = {
-        "state": "active",
-        "detected_at": "2000-01-01T00:00:00+00:00",
-        "release_not_before": "2000-01-01T00:01:00+00:00",
-        "cleanup": {"targeted": 0, "closed": 0, "cleared": 0, "errors": []},
-    }
-    browser_context = SimpleNamespace(pages=[])
-
-    released = asyncio.run(worker._refresh_rate_limit_cooldown(browser_context))
-
-    assert released is True
-    assert worker._rate_limit_cooldown["state"] == "released"
-    assert worker._rate_limit_cooldown["post_release_acquisition"] == "pending"
-
-
 def _prepare_sending(state: dict, *, page_id: str) -> dict:
     role = str(state["active_role"] or "PLAN")
     state["roles"][role].update(
@@ -270,41 +190,103 @@ def _begin_sent_record(state: dict, hop: dict) -> dict:
 
 
 
-def test_active_cooldown_preserves_existing_sent_ledger_without_browser_send_path(
-    tmp_path: Path, monkeypatch
+
+
+
+
+
+
+def test_active_cooldown_waiting_hop_continues_real_backend_reconciliation_without_browser_mutation(
+    tmp_path: Path,
 ):
-    _config, _store, state, worker = _setup(tmp_path)
-    hop = _prepare_sending(state, page_id="page-accepted")
-    cached = _begin_sent_record(state, hop)
+    _config, store, state, worker = _setup(tmp_path)
+    hop = _prepare_sending(state, page_id="page-waiting")
+    baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
+    receipt = SendReceipt(
+        prompt=hop["prompt"],
+        prompt_sha256=hop["prompt_sha256"],
+        binding=PageBinding("page-waiting", hop["physical_role"]),
+        baseline=baseline,
+        attempts=1,
+        accepted_via="user_message_identity",
+        session_id_before="rate-limit-session",
+        user_message_id="rate-limit-user",
+        user_turn_id="rate-limit-turn",
+        conversation_id="rate-limit-conversation",
+    )
+    ledger = RequestLedger(hop["ledger_path"])
+    record = ledger.begin(
+        role=str(hop["physical_role"]),
+        prompt=str(hop["prompt"]),
+        request_id=str(hop["request_id"]),
+        render_request_marker=False,
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=receipt.binding,
+        baseline=baseline,
+        session_id_before=receipt.session_id_before,
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENT,
+        accepted_at=1.0,
+        receipt=receipt.to_dict(),
+    )
+    hop["receipt"] = receipt.to_dict()
+    hop["conversation_url"] = "https://chatgpt.com/c/rate-limit-conversation"
+    hop["state"] = "waiting"
+    hop["timestamps"]["sent_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=10)
+    ).isoformat()
+    hop["wait"]["stream_status_next_poll_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    state["roles"]["PLAN"]["page_url"] = hop["conversation_url"]
+    state["status"] = "RUNNING"
+    state["kanban_column"] = "PLANNING"
+    state["active_action"] = "wait_response"
+    state = store.save(state["manifest_path"], state)
+    hop = _active_hop(state)
     worker._rate_limit_cooldown = {
         "state": "active",
-        "detected_at": "2026-07-27T00:00:00+00:00",
+        "detected_at": "2026-08-17T00:00:00+00:00",
         "release_not_before": "2999-01-01T00:00:00+00:00",
     }
-    calls = 0
+    calls = {"backend_status": 0, "browser": 0}
 
-    class CachedSendBlock:
-        def __init__(self, *_args, **_kwargs):
-            pass
+    class Actions:
+        async def backend_stream_status(self, conversation_id):
+            assert conversation_id == "rate-limit-conversation"
+            calls["backend_status"] += 1
+            return {"status": "IS_STREAMING"}
 
-        async def run(self, _context):
-            nonlocal calls
-            calls += 1
-            return cached
+        async def backend_conversation(self, *_args, **_kwargs):
+            raise AssertionError("streaming status must not fetch the full graph")
 
-    monkeypatch.setattr(worker_module, "DurableSendBlock", CachedSendBlock)
+        async def locate_owned(self, *_args, **_kwargs):
+            calls["browser"] += 1
+            raise AssertionError("cooldown reconciliation must not inspect browser ownership")
 
-    actions = _RateActions(_RateClient())
-    asyncio.run(worker._sending(state, hop, actions))
+        async def reopen(self, *_args, **_kwargs):
+            calls["browser"] += 1
+            raise AssertionError("cooldown reconciliation must not reopen a tab")
 
-    assert calls == 0
-    assert actions.acquire_calls == 0
-    assert hop["state"] == "sending"
-    assert state["active_action"] == "rate_limit_cooldown_reconcile"
+        async def wake(self, *_args, **_kwargs):
+            calls["browser"] += 1
+            raise AssertionError("cooldown reconciliation must not wake a tab")
+
+    asyncio.run(worker._waiting(state, hop, Actions(), Path(state["manifest_path"])))
+
+    assert calls == {"backend_status": 1, "browser": 0}
+    assert hop["state"] == "waiting"
     assert state.get("block_code") is None
-    persisted = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
-    assert persisted is not None and persisted.status is RequestStatus.SENT
-    assert persisted.attempts == cached["record"]["attempts"]
+    persisted = ledger.get(hop["request_id"])
+    assert persisted is not None
+    assert persisted.status is RequestStatus.SENT
+    assert persisted.attempts == 1
 
 
 
@@ -447,3 +429,70 @@ def _independent_task(
         "options": {"report_mode": "file"},
         "depends_on_task_ids": [],
     }
+
+
+def test_rate_limit_is_only_a_new_tab_quiet_timer(tmp_path: Path):
+    _config, _store, state, worker = _setup(tmp_path)
+    actions = _RateActions(_RateClient())
+    worker.rate_limit_cooldown_seconds = 300.0
+
+    asyncio.run(
+        worker._enter_rate_limit_cooldown(
+            state, actions, RateLimitBlockedError("Too many requests")
+        )
+    )
+
+    cooldown = worker._rate_limit_cooldown
+    assert cooldown is not None
+    detected = datetime.fromisoformat(cooldown["detected_at"])
+    release = datetime.fromisoformat(cooldown["release_not_before"])
+    assert (release - detected).total_seconds() == 300.0
+    assert set(cooldown) == {
+        "state", "detected_at", "release_not_before", "reason",
+        "profile", "detector_task_id", "detector_role",
+    }
+    assert actions.client.dismiss_calls == 0
+
+
+def test_existing_owned_tab_runs_and_dismisses_modal_during_quiet_timer(tmp_path: Path):
+    _config, _store, state, worker = _setup(tmp_path)
+    state["roles"]["PLAN"].update(
+        page_id="page-plan",
+        page_url="https://chatgpt.com/c/rate-limit",
+        online=True,
+    )
+    worker._rate_limit_cooldown = {
+        "state": "active",
+        "detected_at": "2026-08-17T00:00:00+00:00",
+        "release_not_before": "2999-01-01T00:00:00+00:00",
+    }
+    actions = _RateActions(_RateClient(visible=True))
+
+    acquired = asyncio.run(worker._owned_or_block(state, "PLAN", actions))
+
+    assert acquired is not None
+    assert actions.client.dismiss_calls == 1
+    assert actions.client.visible is False
+    assert worker._rate_limit_gate_active() is True
+    assert state["status"] != "BLOCKED"
+    assert state.get("block_code") is None
+
+
+
+
+def test_expired_rate_limit_snapshot_restores_as_clear(tmp_path: Path):
+    config, store, _state, worker = _setup(tmp_path)
+    worker.runtime_db.put_snapshot(
+        "worker",
+        {
+            "rate_limit_cooldown": {
+                "state": "active",
+                "detected_at": "2000-01-01T00:00:00+00:00",
+                "release_not_before": "2000-01-01T00:05:00+00:00",
+            }
+        },
+    )
+    restarted = CDPAWorker(config, store=store)
+    restarted._restore_rate_limit_cooldown()
+    assert restarted._rate_limit_cooldown is None
+    assert restarted._rate_limit_gate_active() is False

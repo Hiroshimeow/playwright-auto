@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -6,6 +7,7 @@ import pytest
 from playwright_auto.chatgpt import (
     ChatGPTSnapshot,
     ChatGPTState,
+    ConversationTranscriptNotReadyError,
     MessageBaseline,
     MessageSnapshot,
     PageBinding,
@@ -23,7 +25,7 @@ from playwright_auto.durable import (
 )
 from playwright_auto.durable_blocks import DurableSendBlock
 from playwright_auto.upload import UploadReceipt, collect_file_identities
-from playwright_auto.workflow import Workflow
+from playwright_auto.workflow import Workflow, WorkflowExecutionError
 
 
 def snapshot(
@@ -154,6 +156,75 @@ def run_block(block, client, variables=None):
     return asyncio.run(
         Workflow("durable", [block]).run(client, variables or {})
     )
+
+
+def test_reused_conversation_waits_for_hydrated_baseline_before_sending(tmp_path):
+    history = (
+        MessageSnapshot("user", "u-old", "t-old", "older prompt", ()),
+        MessageSnapshot("assistant", "a-old", "t-old", "older answer", ()),
+    )
+
+    class HydratingClient(FakeDurableClient):
+        def __init__(self):
+            super().__init__()
+            self.prompt_reads = 0
+
+        async def assert_ownership(self):
+            if self.current.composer_text and not self.current.messages:
+                self.prompt_reads += 1
+                if self.prompt_reads >= 2:
+                    self.current = snapshot(
+                        text=self.current.composer_text,
+                        messages=history,
+                        state=ChatGPTState.DRAFT,
+                    )
+            return self.current
+
+    ledger_path = tmp_path / "ledger.json"
+    client = HydratingClient()
+    block = DurableSendBlock(
+        "next prompt",
+        ledger_path=ledger_path,
+        wait_for_response=False,
+        require_existing_conversation_baseline=True,
+    )
+
+    run = run_block(block, client)
+    output = run.context.results["durable_send"]
+
+    record = RequestLedger(ledger_path).get(output["record"]["request_id"])
+    assert record is not None
+    assert record.attempts == 1
+    assert record.baseline is not None
+    assert record.baseline.message_ids == frozenset({"u-old", "a-old"})
+    assert len(client.send_calls) == 1
+
+
+def test_reused_conversation_persistent_empty_baseline_stays_preboundary(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    client = FakeDurableClient()
+    block = DurableSendBlock(
+        "next prompt",
+        ledger_path=ledger_path,
+        wait_for_response=False,
+        require_existing_conversation_baseline=True,
+    )
+
+    with pytest.raises(WorkflowExecutionError) as captured:
+        run_block(block, client)
+    assert isinstance(captured.value.cause, ConversationTranscriptNotReadyError)
+    assert "transcript" in str(captured.value.cause)
+    assert "hydrated" in str(captured.value.cause)
+
+    raw = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert len(raw["records"]) == 1
+    request_id = next(iter(raw["records"]))
+    record = RequestLedger(ledger_path).get(request_id)
+    assert record is not None
+    assert record.status is RequestStatus.PROMPT_SET
+    assert record.attempts == 0
+    assert record.baseline is None
+    assert client.send_calls == []
 
 
 def test_ledger_begin_is_stable_for_same_normalized_request(tmp_path):

@@ -20,6 +20,7 @@ from .chatgpt import (
     action_delay,
     action_delay_multiplier,
     backend_conversation as read_backend_conversation,
+    backend_search_conversations as read_backend_search_conversations,
     backend_stream_status as read_backend_stream_status,
     clear_composer,
     random_delay,
@@ -127,65 +128,12 @@ class CDPATabActions:
     async def backend_conversation(self, conversation_id: str) -> dict[str, Any]:
         return await read_backend_conversation(self.browser_context, conversation_id)
 
-    async def cleanup_rate_limited_chatgpt_pages(self) -> dict[str, Any]:
-        pages = [
-            page
-            for page in tuple(self.browser_context.pages)
-            if not page.is_closed() and self._supported(page)
-        ]
-        result: dict[str, Any] = {
-            "targeted": len(pages),
-            "closed": 0,
-            "cleared": 0,
-            "errors": [],
-        }
-        timeout = round(self.config.workspace_timeout_seconds * 1000)
-        for page in pages:
-            try:
-                client = ChatGPTPage(page, timeout_ms=timeout)
-                snapshot = await client.snapshot()
-                if snapshot.composer_text.strip():
-                    await clear_composer(page, timeout_ms=timeout)
-                    post = await client.snapshot()
-                    if post.composer_text.strip():
-                        raise ComposerConflictError(
-                            "rate-limit cleanup composer did not become empty"
-                        )
-                    await asyncio.sleep(0.1)
-                    stable = await client.snapshot()
-                    if stable.composer_text.strip():
-                        raise ComposerConflictError(
-                            "rate-limit cleanup composer rehydrated"
-                        )
-                    result["cleared"] += 1
-            except Exception as exc:
-                result["errors"].append(
-                    {
-                        "url": str(getattr(page, "url", ""))[:500],
-                        "error": f"{type(exc).__name__}: {exc}"[:500],
-                    }
-                )
-            finally:
-                if not page.is_closed():
-                    try:
-                        await page.close()
-                    except Exception as exc:
-                        result["errors"].append(
-                            {
-                                "url": str(getattr(page, "url", ""))[:500],
-                                "error": f"close failed: {type(exc).__name__}: {exc}"[:500],
-                            }
-                        )
-                if page.is_closed():
-                    result["closed"] += 1
-                else:
-                    result["errors"].append(
-                        {
-                            "url": str(getattr(page, "url", ""))[:500],
-                            "error": "ChatGPT page remained open after rate-limit cleanup",
-                        }
-                    )
-        return result
+    async def backend_search_conversations(
+        self, query: str, *, max_candidates: int = 25
+    ) -> list[str]:
+        return await read_backend_search_conversations(
+            self.browser_context, query, max_candidates=max_candidates
+        )
 
     async def _set_page_active(self, page: Any) -> None:
         try:
@@ -284,8 +232,10 @@ class CDPATabActions:
             return []
         return []
 
-    async def acquire_global_role(self, physical_role: str) -> AcquiredRole:
-        """Reuse exactly one role-only tab or lazily open it without task ownership."""
+    async def acquire_global_role(
+        self, physical_role: str, *, allow_create: bool = True
+    ) -> AcquiredRole:
+        """Reuse exactly one role-only tab; optionally create it when absent."""
         physical = str(physical_role).strip().upper()
         matches: list[tuple[ChatGPTPage, Any]] = []
         for page in self.browser_context.pages:
@@ -322,6 +272,8 @@ class CDPATabActions:
                 created=False,
                 new_chat=False,
             )
+        if not allow_create:
+            raise RoleOwnershipError(f"global role {physical!r} has no open tab")
         await random_delay(action_delay_multiplier("open_tab"))
         workspace = ChatGPTWorkspace()
         client = await workspace.open_role(

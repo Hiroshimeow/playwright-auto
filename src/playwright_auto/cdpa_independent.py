@@ -762,11 +762,15 @@ def canonical_independent_events(
                 )
                 if same_target_ready and another_target_ready:
                     events.append(event)
-        if settings["task_done"]:
+        completion_team_matches = (
+            not settings["teams"]
+            or str(source.get("team") or "") in settings["teams"]
+        )
+        if settings["task_done"] and completion_team_matches:
             event = _task_done_event(source)
             if event is not None:
                 events.append(event)
-        if settings["role_completed"]:
+        if settings["role_completed"] and completion_team_matches:
             events.extend(_role_events(source, settings["role_completed"]))
         if (
             settings["teams"]
