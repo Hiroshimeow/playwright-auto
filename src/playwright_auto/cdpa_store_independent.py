@@ -12,6 +12,7 @@ from .cdpa_independent import (
     INDEPENDENT_ROLE,
     TASK_MODE_INDEPENDENT,
     canonical_independent_events,
+    daily_trigger_watermark,
     independent_cycle_limit_reached,
     is_independent_task,
     normalize_agent_name,
@@ -114,6 +115,15 @@ class IndependentAgentStoreMixin:
             inherited_watermarks["last_interval_slot"] = int(
                 datetime.now(timezone.utc).timestamp()
                 // (int(trigger_settings["interval_minutes"]) * 60)
+            )
+        if inherited_watermarks.get("last_daily_date") is not None:
+            inherited_watermarks["last_daily_date"] = str(
+                inherited_watermarks["last_daily_date"]
+            )
+        elif trigger_settings.get("daily_at") is not None:
+            created_at = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            inherited_watermarks["last_daily_date"] = daily_trigger_watermark(
+                trigger_settings, now=created_at
             )
         role = {
             "logical_role": INDEPENDENT_ROLE,
@@ -563,12 +573,14 @@ class IndependentAgentStoreMixin:
                 previous_settings = validate_trigger_settings(
                     previous["independent"].get("trigger_settings")
                 )
-                if (
-                    previous_settings["interval_minutes"]
-                    != settings["interval_minutes"]
-                    and inherited_watermarks is not None
-                ):
-                    inherited_watermarks.pop("last_interval_slot", None)
+                if inherited_watermarks is not None:
+                    if (
+                        previous_settings["interval_minutes"]
+                        != settings["interval_minutes"]
+                    ):
+                        inherited_watermarks.pop("last_interval_slot", None)
+                    if previous_settings["daily_at"] != settings["daily_at"]:
+                        inherited_watermarks.pop("last_daily_date", None)
             state = self._initial_independent_state(
                 agent_name=display,
                 agent_key=agent_key,
@@ -896,7 +908,11 @@ class IndependentAgentStoreMixin:
         )
         if not preserve_enabled and disposition == "COMPLETED":
             settings = validate_trigger_settings(independent.get("trigger_settings"))
-            recurring = settings["recovery"] or settings["interval_minutes"] is not None
+            recurring = (
+                settings["recovery"]
+                or settings["interval_minutes"] is not None
+                or settings["daily_at"] is not None
+            )
             independent["enabled"] = bool(independent.get("enabled")) and recurring
         independent.update(
             active_event=None,
@@ -1377,6 +1393,7 @@ class IndependentAgentStoreMixin:
                         independent.get("trigger_settings")
                     )
                     previous_interval = previous_settings["interval_minutes"]
+                    previous_daily = previous_settings["daily_at"]
                     independent["trigger_settings"] = normalized_settings
                     next_interval = normalized_settings["interval_minutes"]
                     if next_interval is None:
@@ -1390,6 +1407,15 @@ class IndependentAgentStoreMixin:
                             datetime.now(timezone.utc).timestamp()
                             // (int(next_interval) * 60)
                         )
+                    next_daily = normalized_settings["daily_at"]
+                    if next_daily is None:
+                        independent.setdefault("watermarks", {}).pop(
+                            "last_daily_date", None
+                        )
+                    elif next_daily != previous_daily:
+                        independent.setdefault("watermarks", {})[
+                            "last_daily_date"
+                        ] = daily_trigger_watermark(normalized_settings)
                 if normalized_max_cycles is not None:
                     previous_max_cycles = normalize_max_cycles(
                         independent.get("max_cycles"), default=0

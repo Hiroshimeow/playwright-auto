@@ -36,6 +36,7 @@ def test_independent_agent_is_one_waiting_task_with_one_agent_role(tmp_path: Pat
     assert state["independent"]["trigger_settings"] == {
         "recovery": False,
         "interval_minutes": None,
+        "daily_at": None,
         "task_done": False,
         "role_completed": [],
         "teams": [],

@@ -8,6 +8,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .cdpa_safety import sanitize_text
 from .cdpa_team import normalize_team_base, validate_exact_team
@@ -31,6 +32,7 @@ MAX_TRIGGER_LEARNING_BYTES = 8_192
 _TRIGGER_LEARNING_FILES = {
     "recovery": "learning_recovery.md",
     "interval": "learning_interval.md",
+    "daily": "learning_interval.md",
     "check_all": "learning_interval.md",
     "task_done": "learning_task_done.md",
     "role_completed": "learning_role_completed.md",
@@ -78,6 +80,7 @@ _ALLOWED_TRIGGER_KEYS = frozenset(
     {
         "recovery",
         "interval_minutes",
+        "daily_at",
         "task_done",
         "role_completed",
         "teams",
@@ -166,6 +169,41 @@ def _string_list(
     return result
 
 
+def _normalize_daily_at(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("daily_at must be an object or null")
+    unknown = set(value) - {"time", "timezone"}
+    if unknown:
+        raise ValueError(f"unknown daily_at settings: {sorted(unknown)!r}")
+    clock = str(value.get("time") or "").strip()
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", clock):
+        raise ValueError("daily_at time must use HH:MM 24-hour format")
+    zone = str(value.get("timezone") or "").strip()
+    if not zone:
+        raise ValueError("daily_at timezone must not be empty")
+    try:
+        ZoneInfo(zone)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"daily_at timezone is unknown: {zone!r}") from exc
+    return {"time": clock, "timezone": zone}
+
+
+def daily_trigger_watermark(
+    settings: Mapping[str, Any], *, now: datetime | None = None
+) -> str | None:
+    daily = validate_trigger_settings(settings)["daily_at"]
+    if daily is None:
+        return None
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    local = current.astimezone(ZoneInfo(daily["timezone"]))
+    hour, minute = (int(part) for part in daily["time"].split(":"))
+    scheduled = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    day = local.date() if local >= scheduled else local.date() - timedelta(days=1)
+    return day.isoformat()
+
+
 def validate_trigger_settings(value: Any) -> dict[str, Any]:
     raw = {} if value is None else value
     if not isinstance(raw, Mapping):
@@ -210,6 +248,7 @@ def validate_trigger_settings(value: Any) -> dict[str, Any]:
     return {
         "recovery": bool(raw.get("recovery")),
         "interval_minutes": interval,
+        "daily_at": _normalize_daily_at(raw.get("daily_at")),
         "task_done": bool(raw.get("task_done")),
         "role_completed": roles,
         "teams": teams,
@@ -789,6 +828,29 @@ def canonical_independent_events(
                         "occurred_at": updated,
                         "target_team": source.get("team"),
                         "target_task_id": task_id,
+                    }
+                )
+            )
+    daily = settings["daily_at"]
+    if daily is not None:
+        local = current.astimezone(ZoneInfo(daily["timezone"]))
+        hour, minute = (int(part) for part in daily["time"].split(":"))
+        scheduled_local = local.replace(
+            hour=hour, minute=minute, second=0, microsecond=0
+        )
+        local_date = local.date().isoformat()
+        last_date = str(watermarks.get("last_daily_date") or "")
+        if local >= scheduled_local and local_date > last_date:
+            events.append(
+                normalize_event(
+                    {
+                        "event_key": (
+                            f"daily:{own_key}:{local_date}:"
+                            f"{daily['time']}:{daily['timezone']}"
+                        ),
+                        "trigger_type": "daily",
+                        "occurred_at": scheduled_local.astimezone(timezone.utc).isoformat(),
+                        "check_count": local.date().toordinal(),
                     }
                 )
             )

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime
+
+import pytest
 
 from playwright_auto.cdpa_independent import (
     canonical_independent_events,
@@ -172,6 +175,42 @@ def test_operator_stop_and_self_failure_do_not_create_recovery_events():
 
 
 
+
+
+def test_daily_at_emits_once_at_local_wall_clock_boundary():
+    current = agent(name="Daily Improve", recovery=False)
+    current["independent"]["trigger_settings"] = validate_trigger_settings(
+        {"daily_at": {"time": "03:00", "timezone": "Asia/Tokyo"}}
+    )
+    current["independent"]["watermarks"]["last_daily_date"] = "2026-08-30"
+
+    before = canonical_independent_events(
+        current,
+        [current],
+        now=datetime.fromisoformat("2026-08-30T17:59:59+00:00"),
+    )
+    due = canonical_independent_events(
+        current,
+        [current],
+        now=datetime.fromisoformat("2026-08-30T18:00:00+00:00"),
+    )
+
+    assert before == []
+    assert len(due) == 1
+    assert due[0]["trigger_type"] == "daily"
+    assert due[0]["occurred_at"] == "2026-08-30T18:00:00+00:00"
+    assert due[0]["event_key"].startswith("daily:daily improve:2026-08-31:")
+
+
+def test_daily_at_validation_rejects_bad_time_and_timezone():
+    with pytest.raises(ValueError, match="daily_at time"):
+        validate_trigger_settings(
+            {"daily_at": {"time": "25:00", "timezone": "Asia/Tokyo"}}
+        )
+    with pytest.raises(ValueError, match="daily_at timezone"):
+        validate_trigger_settings(
+            {"daily_at": {"time": "03:00", "timezone": "Not/AZone"}}
+        )
 
 
 def test_check_all_interval_emits_full_review_trigger():
