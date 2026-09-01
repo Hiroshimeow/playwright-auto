@@ -4328,7 +4328,17 @@ class CDPAWorker:
         self._start_wait_budget_from_sent(hop)
         self._reconcile_hop_conversation_identity(state, hop)
         receipt = SendReceipt.from_dict(hop["receipt"])
-        if not receipt.conversation_id or not receipt.user_message_id:
+        settings = (
+            self.runtime_db.get_snapshot("settings")
+            if self.runtime_db.path.exists()
+            else None
+        )
+        dom_only = (
+            isinstance(settings, Mapping)
+            and isinstance(settings.get("payload"), Mapping)
+            and settings["payload"].get("dom_only") is True
+        )
+        if dom_only or not receipt.conversation_id or not receipt.user_message_id:
             await self._waiting_dom(
                 state,
                 hop,
@@ -5322,13 +5332,24 @@ class CDPAWorker:
         self._start_wait_budget_from_sent(hop)
         self._reconcile_hop_conversation_identity(state, hop)
         receipt = SendReceipt.from_dict(hop["receipt"])
+        settings = (
+            self.runtime_db.get_snapshot("settings")
+            if self.runtime_db.path.exists()
+            else None
+        )
+        dom_only = (
+            isinstance(settings, Mapping)
+            and isinstance(settings.get("payload"), Mapping)
+            and settings["payload"].get("dom_only") is True
+        )
         role = str(hop.get("target_role") or "").upper()
         recorded_recovery_url = (
             hop.get("conversation_url")
             or state.get("roles", {}).get(role, {}).get("page_url")
         )
         if (
-            receipt.conversation_id is None
+            not dom_only
+            and receipt.conversation_id is None
             and conversation_identity(recorded_recovery_url) is None
             and receipt.attempts > 0
             and receipt.user_message_id
@@ -5353,7 +5374,7 @@ class CDPAWorker:
                     ),
                 )
                 return
-        if receipt.conversation_id and receipt.user_message_id:
+        if not dom_only and receipt.conversation_id and receipt.user_message_id:
             try:
                 backend_outcome, _fallback_category = await self._waiting_backend_step(
                     state,

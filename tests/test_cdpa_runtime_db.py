@@ -51,6 +51,23 @@ def test_schema_has_exactly_three_tables_and_required_pragmas(tmp_path: Path):
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
 
+    version = db.put_snapshot("settings", {"dom_only": True})
+    assert version == 1
+    assert db.get_snapshot("settings") == {
+        "name": "settings",
+        "version": 1,
+        "updated_at": db.get_snapshot("settings")["updated_at"],
+        "payload": {"dom_only": True},
+    }
+
+    with db.connection() as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        assert tables == {"runtime_snapshot", "task_projection", "command_queue"}
 
 
 

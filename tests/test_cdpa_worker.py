@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -2136,6 +2137,7 @@ def test_backend_primary_is_streaming_uses_status_cadence_without_dom_or_graph(t
         tmp_path, task_id="task-stream-primary"
     )
     state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
+    worker.runtime_db.ensure_schema()
     calls = {"status": 0, "graph": 0, "dom": 0, "source": 0}
 
     class Actions:
@@ -2157,13 +2159,49 @@ def test_backend_primary_is_streaming_uses_status_cadence_without_dom_or_graph(t
             raise AssertionError("healthy stream-status polling must not reopen source")
 
     actions = Actions()
+    identity_before = (
+        hop["hop_id"],
+        hop["request_id"],
+        json.dumps(hop["receipt"], sort_keys=True),
+        state["active_hop_id"],
+    )
+
     asyncio.run(worker._waiting(state, hop, actions, path))
+    assert calls == {"status": 1, "graph": 0, "dom": 0, "source": 0}
+
+    worker.runtime_db.put_snapshot("settings", {"dom_only": False})
+    hop["wait"]["stream_status_next_poll_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    asyncio.run(worker._waiting(state, hop, actions, path))
+    assert calls == {"status": 2, "graph": 0, "dom": 0, "source": 0}
+
+    worker._waiting_dom = AsyncMock()
+    worker.runtime_db.put_snapshot("settings", {"dom_only": True})
+    hop["wait"]["stream_status_next_poll_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    asyncio.run(worker._waiting(state, hop, actions, path))
+    worker._waiting_dom.assert_awaited_once()
+    assert calls == {"status": 2, "graph": 0, "dom": 0, "source": 0}
+
+    worker.runtime_db.put_snapshot("settings", {"dom_only": False})
+    hop["wait"]["stream_status_next_poll_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
     asyncio.run(worker._waiting(state, hop, actions, path))
 
-    assert calls == {"status": 1, "graph": 0, "dom": 0, "source": 0}
+    assert calls == {"status": 3, "graph": 0, "dom": 0, "source": 0}
+    assert worker._waiting_dom.await_count == 1
+    assert (
+        hop["hop_id"],
+        hop["request_id"],
+        json.dumps(hop["receipt"], sort_keys=True),
+        state["active_hop_id"],
+    ) == identity_before
     assert hop["state"] == "waiting"
     assert hop["wait"]["completion_mode"] == "stream_status"
-    assert hop["wait"]["stream_status_poll_count"] == 1
+    assert hop["wait"]["stream_status_poll_count"] == 3
 
 
 def test_is_streaming_does_not_reopen_missing_source_while_backend_is_healthy(tmp_path: Path):
@@ -4977,6 +5015,7 @@ def test_resume_reconciles_canonical_ledger_before_exact_page_validation(tmp_pat
     _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-resume-stale-web"
     )
+    worker.runtime_db.ensure_schema()
     provisional_url = "https://chatgpt.com/c/WEB:stale-resume"
     canonical_id = "canonical-resume"
     canonical_url = f"https://chatgpt.com/c/{canonical_id}"
@@ -5018,6 +5057,79 @@ def test_resume_reconciles_canonical_ledger_before_exact_page_validation(tmp_pat
     assert hop["receipt"]["conversation_id"] == canonical_id
     assert hop["conversation_url"] == canonical_url
     assert state["roles"]["PLAN"]["page_url"] == canonical_url
+    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
+
+    worker.runtime_db.put_snapshot("settings", {"dom_only": True})
+    control = {
+        "control_id": 2,
+        "action": "resume",
+        "role": "PLAN",
+        "status": "recovering",
+        "result": {"before": None},
+    }
+    current_receipt = SendReceipt.from_dict(hop["receipt"])
+    accepted_user = MessageSnapshot(
+        "user",
+        current_receipt.user_message_id or "accepted-user",
+        current_receipt.user_turn_id or "accepted-turn",
+        current_receipt.prompt,
+        (),
+    )
+    snapshot = replace(
+        send_snapshot(
+            messages=(accepted_user,),
+            state=ChatGPTState.RESPONDING,
+            task_id=state["task_id"],
+            team=state["team"],
+        ),
+        stop_visible=True,
+    )
+    client = SimpleNamespace(
+        assert_ownership=AsyncMock(return_value=snapshot),
+        wait_for_response=AsyncMock(side_effect=TimeoutError()),
+    )
+    acquired = AcquiredRole(
+        client,
+        current_receipt.binding.page_id,
+        canonical_url,
+        False,
+        False,
+    )
+    on_actions = SimpleNamespace(
+        backend_stream_status=AsyncMock(
+            side_effect=AssertionError("DOM-only Resume must not call stream_status")
+        ),
+        backend_conversation=AsyncMock(
+            side_effect=AssertionError("DOM-only Resume must not fetch conversation graph")
+        ),
+        locate_owned=AsyncMock(return_value=acquired),
+        reopen=AsyncMock(
+            side_effect=AssertionError("exact owned DOM Resume must not reopen source")
+        ),
+        send=AsyncMock(side_effect=AssertionError("Resume must not resend")),
+        restart=AsyncMock(side_effect=AssertionError("Resume must not restart")),
+        acquire=AsyncMock(side_effect=AssertionError("Resume must not create a continuation")),
+    )
+    worker._discover_accepted_conversation_identity = AsyncMock(
+        side_effect=AssertionError("DOM-only Resume must not perform backend identity search")
+    )
+
+    asyncio.run(worker._recover_resume_waiting(state, hop, control, on_actions))
+
+    assert seen == [canonical_id]
+    assert on_actions.backend_stream_status.await_count == 0
+    assert on_actions.backend_conversation.await_count == 0
+    assert worker._discover_accepted_conversation_identity.await_count == 0
+    assert on_actions.locate_owned.await_count == 1
+    assert client.wait_for_response.await_count == 1
+    assert on_actions.reopen.await_count == 0
+    assert on_actions.send.await_count == 0
+    assert on_actions.restart.await_count == 0
+    assert on_actions.acquire.await_count == 0
+    assert control["status"] == "applied"
+    assert control["result"]["action"] == "observe_progress"
+    assert control["result"]["postcondition"] == "generation_progress"
+    assert hop["receipt"]["conversation_id"] == canonical_id
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
 
 
