@@ -9,6 +9,7 @@ from playwright_auto.cdpa_response import (
     start_wait_budget,
 )
 from playwright_auto.chatgpt import (
+    ChatGPTPage,
     ChatGPTSnapshot,
     ChatGPTState,
     MessageBaseline,
@@ -61,6 +62,10 @@ def _activity_snapshot(
 
 
 def test_response_activity_signature_is_canonical_across_probe_representations():
+    assert ChatGPTPage._adaptive_wait_seconds(5000, 0) == 5.0
+    assert ChatGPTPage._adaptive_wait_seconds(5000, 4) == 7.5
+    assert ChatGPTPage._adaptive_wait_seconds(5000, 5) == 10.0
+
     full_text = "prefix-" + ("x" * 600)
     baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
     lightweight = _activity_snapshot(

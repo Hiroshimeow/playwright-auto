@@ -3159,9 +3159,12 @@ def test_waiting_recovers_prior_terminal_only_from_proven_foreign_durable_reques
 
 
 def test_waiting_requires_valid_route_report_and_two_samples_before_hop_response(tmp_path: Path):
+    from dataclasses import replace
+
     store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-valid-gate"
     )
+    worker.config = replace(worker.config, response_poll_ms=5000)
     report = tmp_path / ".plan" / "alpha" / "alpha-plan_turn1_task-valid-gate.md"
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text("valid report", encoding="utf-8")
@@ -3210,6 +3213,8 @@ def test_waiting_requires_valid_route_report_and_two_samples_before_hop_response
     asyncio.run(worker._waiting(state, hop, Actions(), path))
 
     assert client.kwargs["minimum_samples"] == 2
+    assert client.kwargs["poll_ms"] == 5000
+    assert client.kwargs["timeout_ms"] >= 11_000
     assert client.kwargs["invalid_grace_ms"] >= 1_000
     assert hop["state"] == "responded"
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).status is RequestStatus.SENT

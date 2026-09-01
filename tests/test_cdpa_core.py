@@ -160,6 +160,10 @@ def test_config_loads_root_json_compatible_yaml_and_validates_defaults(tmp_path:
     assert config.response_timeout_seconds == 7200
     assert config.response_refresh_after_seconds == 1200
     assert config.response_stream_status_terminal_settle_seconds == 5.0
+    packaged_root = tmp_path / "packaged-default"
+    packaged_root.mkdir()
+    packaged_config = load_cdpa_config(None, repository_root=packaged_root)
+    assert packaged_config.response_poll_ms == 5000
     assert config.rate_limit_quiet_seconds == 300.0
     assert config.dashboard_url == "http://127.0.0.1:9224"
 

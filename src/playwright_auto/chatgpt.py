@@ -4477,7 +4477,10 @@ class ChatGPTPage:
         base = poll_ms / 1000
         if unchanged_ticks < 4:
             return base
-        return min(0.5, base * min(5.0, 1.0 + (unchanged_ticks - 3) * 0.5))
+        return min(
+            max(0.5, base * 2.0),
+            base * min(5.0, 1.0 + (unchanged_ticks - 3) * 0.5),
+        )
 
     async def wait_for_response(
         self,

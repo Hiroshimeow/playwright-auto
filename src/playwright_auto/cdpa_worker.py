@@ -4662,7 +4662,14 @@ class CDPAWorker:
         try:
             response = await acquired.client.wait_for_response(
                 receipt,
-                timeout_ms=min(3_000, remaining),
+                timeout_ms=min(
+                    max(
+                        3_000,
+                        self.config.response_stable_ms
+                        + (2 * self.config.response_poll_ms),
+                    ),
+                    remaining,
+                ),
                 stable_ms=self.config.response_stable_ms,
                 poll_ms=self.config.response_poll_ms,
                 active_reload_after_ms=None,
