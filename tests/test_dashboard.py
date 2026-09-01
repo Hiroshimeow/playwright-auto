@@ -334,6 +334,7 @@ def test_frontend_assets_are_local_modular_and_suspend_hidden_polling():
     api = (ASSET_ROOT / "api.js").read_text(encoding="utf-8")
     polling = (ASSET_ROOT / "polling.js").read_text(encoding="utf-8")
     store = (ASSET_ROOT / "store.js").read_text(encoding="utf-8")
+    runtime = (ASSET_ROOT / "views" / "runtime.js").read_text(encoding="utf-8")
     all_assets = "\n".join(
         path.read_text(encoding="utf-8")
         for path in [DASHBOARD_HTML_PATH, *ASSET_ROOT.rglob("*.js"), ASSET_ROOT / "dashboard.css"]
@@ -355,6 +356,15 @@ def test_frontend_assets_are_local_modular_and_suspend_hidden_polling():
     assert "loadTaskDetail" in app
     assert "loadHistory" in app
     assert "loadTimeline" in app
+    assert 'data-dom-only' in html
+    assert "DOM only" in html
+    assert "runtime.settings?.dom_only" in runtime
+    assert 'dataset.pending !== "true"' in runtime
+    assert '"/api/runtime/settings"' in app
+    assert 'method: "POST"' in app
+    assert "response.data.settings" in app
+    assert "previousDomOnly" in app
+    assert "toast(error.message)" in app
 
 
 
@@ -448,7 +458,7 @@ def test_notify_frontend_contract_reuses_secondary_report_path_and_preserves_his
     assert 'if (current.drawer === "history") renderHistory(roots.secondaryContent, current);' in app
     assert 'if (current.drawer === "notify") renderNotify(roots.secondaryContent, current);' in app
     assert 'if (view === "notify") delete roots.secondaryContent.dataset.secondaryView;' in app
-    assert '/assets/app.js?v=20260812-notify-v2' in html
+    assert '/assets/app.js?v=20260901-dom-only' in html
     assert './views/notify.js?v=20260812-notify-v2' in app
     assert 'data-notify-task-id' in notify
     assert 'workflowReportModel(detail, detail.active_role)' in notify

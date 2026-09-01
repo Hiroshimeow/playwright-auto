@@ -1471,6 +1471,8 @@ def test_open_tab_recovers_presend_role_offline_and_sends_original_once(
         tmp_path, task_id="task-open-tab-presend-recovery"
     )
     path = Path(state["manifest_path"])
+    worker.runtime_db.ensure_schema()
+    worker.runtime_db.put_snapshot("settings", {"dom_only": True})
     hop = _active_hop(state)
     original_hop_id = hop["hop_id"]
     original_request_id = hop["request_id"]
@@ -1569,6 +1571,7 @@ def test_open_tab_recovers_presend_role_offline_and_sends_original_once(
                 attempts=1,
                 accepted_via="user_message_identity",
                 session_id_before="owned-plan",
+                conversation_id="owned-plan",
                 user_message_id="user-1",
                 user_turn_id="turn-1",
             )
@@ -1609,8 +1612,14 @@ def test_open_tab_recovers_presend_role_offline_and_sends_original_once(
     assert len(sent_prompts) == 1
 
     waiting = asyncio.run(worker.advance(path, context))
-    assert _active_hop(waiting)["state"] == "waiting"
-    assert _active_hop(waiting)["request_id"] == original_request_id
+    waiting_hop = _active_hop(waiting)
+    assert waiting_hop["state"] == "waiting"
+    assert waiting_hop["request_id"] == original_request_id
+    assert len(sent_prompts) == 1
+
+    worker._waiting_dom = AsyncMock()
+    asyncio.run(worker._waiting(waiting, waiting_hop, actions, path))
+    worker._waiting_dom.assert_awaited_once()
     assert len(sent_prompts) == 1
 
 
@@ -2177,12 +2186,16 @@ def test_backend_primary_is_streaming_uses_status_cadence_without_dom_or_graph(t
     assert calls == {"status": 2, "graph": 0, "dom": 0, "source": 0}
 
     worker._waiting_dom = AsyncMock()
+    state["task_mode"] = "independent"
+    hop["kind"] = "independent_job"
     worker.runtime_db.put_snapshot("settings", {"dom_only": True})
     hop["wait"]["stream_status_next_poll_at"] = (
         datetime.now(timezone.utc) - timedelta(seconds=1)
     ).isoformat()
     asyncio.run(worker._waiting(state, hop, actions, path))
     worker._waiting_dom.assert_awaited_once()
+    assert state["task_mode"] == "independent"
+    assert hop["kind"] == "independent_job"
     assert calls == {"status": 2, "graph": 0, "dom": 0, "source": 0}
 
     worker.runtime_db.put_snapshot("settings", {"dom_only": False})

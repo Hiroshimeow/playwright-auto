@@ -14,7 +14,9 @@
       <span class="brand-copy"><strong>CDPA</strong><small>Control Center</small></span>
     </a>
 
-    <div id="service-status" class="service-strip" aria-live="polite"></div>
+    <div id="service-status" class="service-strip" aria-live="polite">
+      <label class="service-chip"><input type="checkbox" data-dom-only disabled> DOM only</label>
+    </div>
 
     <nav class="header-actions" aria-label="Dashboard actions">
       <button type="button" class="button primary" data-open-create>Create task</button>
@@ -301,6 +303,6 @@
   <datalist id="workflow-task-team-options"></datalist>
 
   <div id="toast" class="toast" hidden role="status"></div>
-  <script type="module" src="/assets/app.js?v=20260817-temporary-chat"></script>
+  <script type="module" src="/assets/app.js?v=20260901-dom-only"></script>
 </body>
 </html>

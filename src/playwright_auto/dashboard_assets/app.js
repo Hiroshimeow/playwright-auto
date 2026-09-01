@@ -8,7 +8,7 @@ import {renderBoard, refreshElapsed} from "./views/board.js";
 import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260809-compact-ui-v2";
 import {renderHistory} from "./views/history.js";
 import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20260812-notify-v2";
-import {renderRuntime} from "./views/runtime.js?v=20260728-system-status-1";
+import {renderRuntime} from "./views/runtime.js?v=20260901-dom-only";
 import {
   applyReuseRoleSelection, renderCreateActions, renderResume, renderWorkflowAgentOptions,
   selectedDependencyIds, selectedResumeTeams, updateResumeButton,
@@ -1201,7 +1201,29 @@ roots.secondaryDialog.addEventListener("close", () => {
   if (state.drawer && overlayName() !== "drawer") commit(current => { current.drawer = null; });
 });
 
-document.addEventListener("click", event => {
+document.addEventListener("click", async event => {
+  const domOnlyToggle = event.target.closest("[data-dom-only]");
+  if (domOnlyToggle) {
+    const previousDomOnly = state.runtime?.settings?.dom_only === true;
+    domOnlyToggle.dataset.pending = "true";
+    domOnlyToggle.disabled = true;
+    try {
+      const response = await client.request("runtime-settings", "/api/runtime/settings", {
+        method: "POST",
+        body: JSON.stringify({dom_only: domOnlyToggle.checked}),
+      });
+      state.runtime = {...(state.runtime || {}), settings: response.data.settings};
+    } catch (error) {
+      domOnlyToggle.checked = typeof state.runtime?.settings?.dom_only === "boolean"
+        ? state.runtime.settings.dom_only
+        : previousDomOnly;
+      toast(error.message);
+    } finally {
+      delete domOnlyToggle.dataset.pending;
+      renderRuntime(roots.services, state);
+    }
+    return;
+  }
   if (event.target.closest("[data-open-create]")) openCreate();
   if (event.target.closest("[data-close-create]")) closeCreate();
   if (event.target.closest("[data-open-agent]")) {
