@@ -954,11 +954,19 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
         if path == "/api/state":
             worker = db.get_snapshot("worker")
             browser = db.get_snapshot("browser")
+            settings = db.get_snapshot("settings")
             self._json(
                 200,
                 {
                     "worker": (worker or {}).get("payload") or {},
                     "browser": (browser or {}).get("payload") or {},
+                    "settings": {
+                        "dom_only": (
+                            isinstance(settings, Mapping)
+                            and isinstance(settings.get("payload"), Mapping)
+                            and settings["payload"].get("dom_only") is True
+                        )
+                    },
                     **app.worker_health(),
                 },
             )
@@ -1035,6 +1043,16 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
         raw = self._body()
         key = self.headers.get("Idempotency-Key", "")
         task_id: str | None = None
+        if path == "/api/runtime/settings":
+            if set(raw) != {"dom_only"} or type(raw.get("dom_only")) is not bool:
+                raise APIError(
+                    400,
+                    "invalid_request",
+                    "runtime settings require exactly one boolean dom_only",
+                )
+            app.db.put_snapshot("settings", {"dom_only": raw["dom_only"]})
+            self._json(200, {"settings": {"dom_only": raw["dom_only"]}})
+            return
         if path == "/api/tasks":
             payload = app.normalize_create(raw)
             command = app.enqueue(

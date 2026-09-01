@@ -352,7 +352,7 @@ def test_remove_parent_api_requires_version_and_queues_exact_relationship(tmp_pa
 
 
 def test_board_etag_304_and_worker_offline_last_known_good(tmp_path: Path):
-    _config, _db, server, thread = start_api(tmp_path)
+    config, db, server, thread = start_api(tmp_path)
     try:
         status, headers, body = request(server, "GET", "/api/tasks")
         assert status == 200
@@ -362,6 +362,69 @@ def test_board_etag_304_and_worker_offline_last_known_good(tmp_path: Path):
         assert "control_repository" not in payload["catalog"]
         assert str(tmp_path) not in body.decode()
         etag = headers["ETag"]
+        task_version = db.get_task_version("task-a")
+        board_generation = db.get_board()["generation"]
+        with db.connection() as connection:
+            command_count = connection.execute("SELECT COUNT(*) FROM command_queue").fetchone()[0]
+
+        status, _headers, body = request(server, "GET", "/api/state")
+        assert status == 200
+        assert json.loads(body)["settings"] == {"dom_only": False}
+
+        status, _headers, body = request(
+            server, "POST", "/api/runtime/settings", body={"dom_only": True}
+        )
+        assert status == 200
+        assert json.loads(body) == {"settings": {"dom_only": True}}
+        status, _headers, body = request(server, "GET", "/api/state")
+        assert status == 200
+        assert json.loads(body)["settings"] == {"dom_only": True}
+
+        status, _headers, body = request(
+            server, "POST", "/api/runtime/settings", body={"dom_only": False}
+        )
+        assert status == 200
+        assert json.loads(body) == {"settings": {"dom_only": False}}
+        status, _headers, body = request(server, "GET", "/api/state")
+        assert status == 200
+        assert json.loads(body)["settings"] == {"dom_only": False}
+
+        for invalid in (
+            {},
+            {"dom_only": True, "extra": False},
+            {"dom_only": 0},
+            {"dom_only": 1},
+            {"dom_only": "true"},
+            {"dom_only": None},
+            {"dom_only": []},
+            {"dom_only": {}},
+        ):
+            status, _headers, body = request(
+                server, "POST", "/api/runtime/settings", body=invalid
+            )
+            assert status == 400
+            assert json.loads(body)["error"]["code"] == "invalid_request"
+
+        status, _headers, body = request(
+            server, "POST", "/api/runtime/settings", body={"dom_only": True}
+        )
+        assert status == 200
+        assert json.loads(body) == {"settings": {"dom_only": True}}
+        assert db.get_task_version("task-a") == task_version
+        assert db.get_board()["generation"] == board_generation
+        with db.connection() as connection:
+            assert connection.execute("SELECT COUNT(*) FROM command_queue").fetchone()[0] == command_count
+
+        server.shutdown()
+        thread.join(timeout=5)
+        db = RuntimeDB(config.runtime_database)
+        db.ensure_schema()
+        server = create_server(config, host="127.0.0.1", port=0, db=db)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        status, _headers, body = request(server, "GET", "/api/state")
+        assert status == 200
+        assert json.loads(body)["settings"] == {"dom_only": True}
 
         status, _headers, body = request(
             server, "GET", "/api/tasks", headers={"If-None-Match": etag}
