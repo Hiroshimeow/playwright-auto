@@ -1,7 +1,10 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
+import time
 
 import pytest
 
+import playwright_auto.chatgpt as chatgpt_module
 from playwright_auto.cdpa_response import (
     begin_refresh,
     observe_response_activity,
@@ -14,6 +17,8 @@ from playwright_auto.chatgpt import (
     ChatGPTState,
     MessageBaseline,
     MessageSnapshot,
+    PageBinding,
+    SendReceipt,
     classify_chatgpt_state,
     extract_session_id,
     recent_assistant_messages,
@@ -412,6 +417,101 @@ def test_backend_reader_classifies_transport_timeout_as_unavailable():
             await client.backend_conversation("conversation-1")
         assert captured.value.status_code == 0
         assert captured.value.category == "conversation"
+
+    asyncio.run(run())
+
+
+def _wait_receipt() -> SendReceipt:
+    return SendReceipt(
+        prompt="probe",
+        prompt_sha256="probe-sha",
+        binding=PageBinding(page_id="page-plan", role="PLAN"),
+        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+        attempts=1,
+        accepted_via="test",
+        session_id_before=None,
+    )
+
+
+def test_snapshot_bounds_never_returning_full_evaluate():
+    class Page:
+        async def evaluate(self, *_args, **_kwargs):
+            await asyncio.Event().wait()
+
+    async def run():
+        client = ChatGPTPage(Page(), timeout_ms=30)
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(client.snapshot(), timeout=0.2)
+        assert time.monotonic() - started < 0.12
+
+    asyncio.run(run())
+
+
+def test_assert_ownership_bounds_role_indicator_evaluate(monkeypatch):
+    snapshot = _activity_snapshot(activity_text="", activity_length=0)
+
+    class Page:
+        async def add_init_script(self, **_kwargs):
+            return None
+
+        async def evaluate(self, *_args, **_kwargs):
+            await asyncio.Event().wait()
+
+    async def fake_snapshot(_page):
+        return snapshot
+
+    monkeypatch.setattr(chatgpt_module, "inspect_chatgpt_page", fake_snapshot)
+
+    async def run():
+        client = ChatGPTPage(Page(), timeout_ms=30)
+        client.binding = PageBinding(snapshot.page_id or "", snapshot.page_role or "")
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(client.assert_ownership(), timeout=0.2)
+        assert time.monotonic() - started < 0.12
+
+    asyncio.run(run())
+
+
+def test_wait_snapshot_bounds_never_returning_sparse_probe():
+    class Page:
+        url = "https://chatgpt.com/c/test"
+
+        async def evaluate(self, *_args, **_kwargs):
+            await asyncio.Event().wait()
+
+    async def run():
+        client = ChatGPTPage(Page(), timeout_ms=30)
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(client.wait_snapshot(_wait_receipt()), timeout=0.2)
+        assert time.monotonic() - started < 0.12
+
+    asyncio.run(run())
+
+
+def test_wait_snapshot_sparse_error_and_full_fallback_share_one_timeout_budget():
+    class Page:
+        url = "https://chatgpt.com/c/test"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def evaluate(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("Page.evaluate: Target crashed")
+            await asyncio.Event().wait()
+
+    async def run():
+        page = Page()
+        client = ChatGPTPage(page, timeout_ms=30)
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(client.wait_snapshot(_wait_receipt()), timeout=0.2)
+        assert time.monotonic() - started < 0.12
+        assert page.calls == 2
 
     asyncio.run(run())
 

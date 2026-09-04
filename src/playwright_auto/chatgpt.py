@@ -3012,7 +3012,10 @@ class ChatGPTPage:
             yield
 
     async def snapshot(self) -> ChatGPTSnapshot:
-        return await inspect_chatgpt_page(self.page)
+        return await asyncio.wait_for(
+            inspect_chatgpt_page(self.page),
+            timeout=max(self.timeout_ms, 1) / 1000,
+        )
 
     @property
     def wait_metrics(self) -> dict[str, Any]:
@@ -3143,6 +3146,24 @@ class ChatGPTPage:
         probe_wait_ms: int = 0,
         safety_interval_ms: int = 600_000,
     ) -> ChatGPTSnapshot:
+        return await asyncio.wait_for(
+            self._wait_snapshot_within_budget(
+                receipt,
+                force_full=force_full,
+                probe_wait_ms=probe_wait_ms,
+                safety_interval_ms=safety_interval_ms,
+            ),
+            timeout=max(self.timeout_ms, 1) / 1000,
+        )
+
+    async def _wait_snapshot_within_budget(
+        self,
+        receipt: SendReceipt,
+        *,
+        force_full: bool = False,
+        probe_wait_ms: int = 0,
+        safety_interval_ms: int = 600_000,
+    ) -> ChatGPTSnapshot:
         key = self._wait_key(receipt)
         if key != self._wait_receipt_key:
             self.invalidate_wait_cache()
@@ -3216,6 +3237,20 @@ class ChatGPTPage:
         return self._snapshot_from_probe(self._wait_snapshot_cache, probe)
 
     async def assert_ownership(
+        self,
+        snapshot: ChatGPTSnapshot | None = None,
+        *,
+        require_binding: bool = True,
+    ) -> ChatGPTSnapshot:
+        return await asyncio.wait_for(
+            self._assert_ownership_within_budget(
+                snapshot,
+                require_binding=require_binding,
+            ),
+            timeout=max(self.timeout_ms, 1) / 1000,
+        )
+
+    async def _assert_ownership_within_budget(
         self,
         snapshot: ChatGPTSnapshot | None = None,
         *,

@@ -31,6 +31,23 @@ from .workspace import ChatGPTWorkspace
 
 _CHATGPT_HOSTS = frozenset({"chatgpt.com", "www.chatgpt.com"})
 _NEW_BRANCH_ENDPOINT = "https://chatgpt.com/backend-api/conversation/new_branch"
+_TRANSIENT_PAGE_LIFECYCLE_MARKERS = (
+    "target crashed",
+    "execution context was destroyed",
+    "execution context destroyed",
+    "cannot find context with specified id",
+    "navigation interrupted",
+    "navigation was interrupted",
+    "target closed",
+    "page has been closed",
+)
+
+
+def is_transient_page_lifecycle_error(exc: BaseException) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in _TRANSIENT_PAGE_LIFECYCLE_MARKERS)
 
 
 def _reopenable_conversation_identity(value: Any) -> str | None:
@@ -935,18 +952,131 @@ class CDPATabActions:
             new_chat=True,
         )
 
-    async def refresh(self, acquired: AcquiredRole) -> None:
-        await acquired.client.assert_ownership()
-        await action_delay(
-            acquired.client.page,
-            "refresh",
-            action_delay_multiplier("refresh"),
-        )
-        await refresh_page(
-            acquired.client.page,
-            timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
-        )
-        await acquired.client.assert_ownership()
+    async def refresh(
+        self,
+        acquired: AcquiredRole,
+        *,
+        manifest: Mapping[str, Any] | None = None,
+        logical_role: str | None = None,
+        recover: bool = False,
+        skip_precheck: bool = False,
+    ) -> AcquiredRole:
+        timeout = max(float(self.config.workspace_timeout_seconds), 0.001)
+        if skip_precheck and not recover:
+            raise RoleOwnershipError("precheck bypass is only valid for recovery refresh")
+        async with asyncio.timeout(timeout):
+            target = acquired
+            expected = None
+            if recover:
+                if manifest is None or logical_role is None:
+                    raise RoleOwnershipError(
+                        "recovery refresh requires exact manifest role ownership"
+                    )
+                expected = self._recovery_refresh_expected(
+                    target, manifest, logical_role
+                )
+            precheck = None
+            if skip_precheck:
+                target = await self._recovery_refresh_target(
+                    acquired, manifest, logical_role
+                )
+                expected = self._recovery_refresh_expected(
+                    target, manifest, logical_role
+                )
+            else:
+                try:
+                    precheck = await target.client.assert_ownership()
+                except Exception as exc:
+                    if not recover or not is_transient_page_lifecycle_error(exc):
+                        raise
+                    target = await self._recovery_refresh_target(
+                        acquired, manifest, logical_role
+                    )
+                    expected = self._recovery_refresh_expected(
+                        target, manifest, logical_role
+                    )
+                if expected is not None and precheck is not None:
+                    self._assert_recovery_snapshot(precheck, expected)
+
+            await action_delay(
+                target.client.page,
+                "refresh",
+                action_delay_multiplier("refresh"),
+            )
+            await refresh_page(
+                target.client.page,
+                timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
+            )
+            snapshot = await target.client.assert_ownership()
+            if expected is not None:
+                self._assert_recovery_snapshot(snapshot, expected)
+            return target
+
+    @staticmethod
+    def _recovery_refresh_expected(
+        acquired: AcquiredRole,
+        manifest: Mapping[str, Any],
+        logical_role: str,
+    ) -> tuple[str, str, str, str]:
+        role = str(logical_role).upper()
+        roles = manifest.get("roles")
+        record = roles.get(role) if isinstance(roles, Mapping) else None
+        if not isinstance(record, Mapping):
+            raise RoleOwnershipError(f"recovery role {role!r} is not present in manifest")
+        page_id = str(record.get("page_id") or "").strip()
+        physical = str(record.get("physical_role") or "").strip()
+        task_id = str(manifest.get("task_id") or "").strip()
+        team = str(manifest.get("team") or "").strip()
+        binding = getattr(acquired.client, "binding", None)
+        if (
+            not page_id
+            or not physical
+            or not task_id
+            or not team
+            or acquired.page_id != page_id
+            or binding is None
+            or str(getattr(binding, "page_id", "")) != page_id
+            or str(getattr(binding, "role", "")) != physical
+        ):
+            raise RoleOwnershipError(
+                "recovery refresh durable/in-memory binding does not match exact role page"
+            )
+        return page_id, physical, task_id, team
+
+    @staticmethod
+    def _assert_recovery_snapshot(
+        snapshot: Any,
+        expected: tuple[str, str, str, str],
+    ) -> None:
+        page_id, physical, task_id, team = expected
+        if (
+            str(getattr(snapshot, "page_id", "") or "") != page_id
+            or str(getattr(snapshot, "page_role", "") or "") != physical
+            or str(getattr(snapshot, "page_task_id", "") or "") != task_id
+            or str(getattr(snapshot, "page_team", "") or "") != team
+        ):
+            raise RoleOwnershipError(
+                "recovery refresh post-reload ownership did not match exact page/role/task/team"
+            )
+
+    async def _recovery_refresh_target(
+        self,
+        acquired: AcquiredRole,
+        manifest: Mapping[str, Any],
+        logical_role: str,
+    ) -> AcquiredRole:
+        expected = self._recovery_refresh_expected(acquired, manifest, logical_role)
+        page = acquired.client.page
+        is_closed = getattr(page, "is_closed", None)
+        if not callable(is_closed) or not is_closed():
+            return acquired
+        reacquired = await self.locate_owned_metadata(manifest, logical_role)
+        if reacquired is None:
+            raise RoleOwnershipError("closed recovery target could not be reacquired exactly")
+        self._recovery_refresh_expected(reacquired, manifest, logical_role)
+        if reacquired.page_id != expected[0]:
+            raise RoleOwnershipError("closed recovery target page id changed during reacquire")
+        return reacquired
 
     async def stop_if_active(self, acquired: AcquiredRole) -> bool:
         snapshot = await acquired.client.assert_ownership()

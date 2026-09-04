@@ -106,7 +106,8 @@ def conversation_identity(value: Any) -> str | None:
         path = urlparse(str(value or "")).path.rstrip("/")
     except ValueError:
         return None
-    return path if path.startswith("/c/") and len(path) > 3 else None
+    match = re.search(r"(?:^|/)c/([^/]+)$", path)
+    return f"/c/{match.group(1)}" if match else None
 
 
 def _active_hop(state: Mapping[str, Any]) -> Mapping[str, Any] | None:

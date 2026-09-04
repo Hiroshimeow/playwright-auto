@@ -8,9 +8,18 @@ from playwright_auto.cdpa_commands import (
     RepairRequest,
     WorkerCommand,
     command_snapshot,
+    conversation_identity,
     normalize_root_cause_key,
     validate_worker_command,
 )
+
+
+def test_project_scoped_conversation_url_keeps_same_identity():
+    conversation_id = "6a98244f-76a4-83ee-b33c-98629b0644ae"
+    assert conversation_identity(f"https://chatgpt.com/c/{conversation_id}") == f"/c/{conversation_id}"
+    assert conversation_identity(
+        f"https://chatgpt.com/g/g-p-project/c/{conversation_id}"
+    ) == f"/c/{conversation_id}"
 
 
 def state() -> dict:

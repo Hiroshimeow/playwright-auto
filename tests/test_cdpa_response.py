@@ -34,6 +34,17 @@ def test_wait_budget_is_fixed_across_refreshes():
     assert wait["deadline_at"] == deadline
     assert not refresh_due(wait, refresh_after_seconds=1200, now=start + timedelta(minutes=39))
     assert refresh_due(wait, refresh_after_seconds=1200, now=start + timedelta(minutes=40))
+    begin_refresh(wait, now=start + timedelta(minutes=40))
+    finish_refresh(wait, now=start + timedelta(minutes=40, seconds=5))
+    assert wait["refresh_count"] == 2
+    assert observe_response_activity(
+        wait,
+        signature="later-activity",
+        length=10,
+        now=start + timedelta(minutes=45),
+    )
+    assert not refresh_due(wait, refresh_after_seconds=1200, now=start + timedelta(minutes=64))
+    assert refresh_due(wait, refresh_after_seconds=1200, now=start + timedelta(minutes=65))
     assert remaining_timeout_ms(wait, now=start + timedelta(hours=1)) == 3_600_000
 
 

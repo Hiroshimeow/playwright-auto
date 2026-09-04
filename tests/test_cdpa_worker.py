@@ -28,6 +28,7 @@ from playwright_auto.cdpa_routes import RouteContractError
 from playwright_auto.cdpa_store import TaskStore, utc_now
 from playwright_auto.cdpa_worker import CDPAWorker, _active_hop, _report_mode
 from playwright_auto.chatgpt import (
+    ChatGPTPage,
     ChatGPTSnapshot,
     ChatGPTState,
     ComposerConflictError,
@@ -2752,9 +2753,13 @@ def test_complete_graph_not_ready_refreshes_once_then_polls_until_deadline_witho
             assert exact is acquired
             calls["wake"] += 1
 
-        async def refresh(self, exact):
+        async def refresh(self, exact, **kwargs):
             assert exact is acquired
+            assert kwargs["manifest"] is state
+            assert kwargs["logical_role"] == "PLAN"
+            assert kwargs["recover"] is True
             calls["refresh"] += 1
+            return exact
 
         async def send(self, *_args, **_kwargs):
             calls["send"] += 1
@@ -2976,6 +2981,162 @@ def test_unresolved_complete_accepts_terminal_continuation_before_final_block(
     assert hop["state"] == "responded"
     assert hop["response"] == response.text
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
+
+
+def _mark_completed_refresh(hop: dict, *, seconds_ago: int) -> None:
+    finished = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+    hop["wait"]["refresh_count"] = int(hop["wait"].get("refresh_count") or 0) + 1
+    hop["wait"]["last_refresh_at"] = finished.isoformat()
+    hop["wait"]["last_refresh_result"] = {
+        "status": "completed",
+        "finished_at": finished.isoformat(),
+    }
+
+
+def test_post_refresh_one_minute_checks_response_even_while_stop_is_visible(tmp_path: Path):
+    from dataclasses import replace
+
+    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-post-refresh-one-minute"
+    )
+    _mark_completed_refresh(hop, seconds_ago=61)
+    snapshot = replace(
+        send_snapshot(task_id=state["task_id"], team=state["team"]),
+        stop_visible=True,
+    )
+
+    class Client:
+        binding = receipt.binding
+
+        async def wait_snapshot(self, _receipt, **_kwargs):
+            return snapshot
+
+    acquired = AcquiredRole(
+        Client(), receipt.binding.page_id, "https://chatgpt.com/c/post-refresh-one", False, False
+    )
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            return acquired
+
+    worker._final_dom_response_reconciliation = AsyncMock(return_value=True)
+
+    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
+
+    worker._final_dom_response_reconciliation.assert_awaited_once()
+
+
+def test_post_refresh_two_minutes_stop_visible_checks_response_then_keeps_waiting(tmp_path: Path):
+    from dataclasses import replace
+
+    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-post-refresh-two-minute-stop"
+    )
+    _mark_completed_refresh(hop, seconds_ago=121)
+    snapshot = replace(
+        send_snapshot(task_id=state["task_id"], team=state["team"]),
+        stop_visible=True,
+    )
+
+    class Client:
+        binding = receipt.binding
+
+        async def wait_snapshot(self, _receipt, **_kwargs):
+            return snapshot
+
+    acquired = AcquiredRole(
+        Client(), receipt.binding.page_id, "https://chatgpt.com/c/post-refresh-two-stop", False, False
+    )
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            return acquired
+
+    worker._final_dom_response_reconciliation = AsyncMock(return_value=False)
+
+    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
+
+    worker._final_dom_response_reconciliation.assert_awaited_once()
+    assert state["active_hop_id"] == hop["hop_id"]
+    assert state["active_action"] == "wait_response"
+    assert hop["state"] == "waiting"
+
+
+def test_post_refresh_two_minutes_without_stop_reroutes_same_role_once(tmp_path: Path):
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-post-refresh-two-minute-reroute"
+    )
+    _mark_completed_refresh(hop, seconds_ago=121)
+    original_hop_id = hop["hop_id"]
+    original_handoff = hop["handoff"]
+    original_turn = hop["turn"]
+    snapshot = send_snapshot(task_id=state["task_id"], team=state["team"])
+
+    class Client:
+        binding = receipt.binding
+
+        async def wait_snapshot(self, _receipt, **_kwargs):
+            return snapshot
+
+    acquired = AcquiredRole(
+        Client(), receipt.binding.page_id, "https://chatgpt.com/c/post-refresh-two-reroute", False, False
+    )
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            return acquired
+
+    worker._final_dom_response_reconciliation = AsyncMock(return_value=False)
+
+    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
+
+    child = _active_hop(state)
+    record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
+    assert hop["hop_id"] == original_hop_id
+    assert hop["state"] == "abandoned"
+    assert record.status is RequestStatus.FAILED_FINAL
+    assert child["hop_id"] == original_hop_id + 1
+    assert child["parent_hop_id"] == original_hop_id
+    assert child["kind"] == "stall_reroute"
+    assert child["target_role"] == hop["target_role"]
+    assert child["turn"] == original_turn
+    assert child["handoff"] == original_handoff
+    assert child["stall_reroute_attempt"] == 1
+    assert child["state"] == "pre_send"
+    saved = store.save(path, state)
+    assert _active_hop(saved)["kind"] == "stall_reroute"
+
+
+def test_post_refresh_stall_after_three_reroutes_blocks_without_fourth_send(tmp_path: Path):
+    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-post-refresh-reroute-exhausted"
+    )
+    _mark_completed_refresh(hop, seconds_ago=121)
+    hop["stall_reroute_attempt"] = 3
+    snapshot = send_snapshot(task_id=state["task_id"], team=state["team"])
+
+    class Client:
+        binding = receipt.binding
+
+        async def wait_snapshot(self, _receipt, **_kwargs):
+            return snapshot
+
+    acquired = AcquiredRole(
+        Client(), receipt.binding.page_id, "https://chatgpt.com/c/post-refresh-exhausted", False, False
+    )
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            return acquired
+
+    worker._final_dom_response_reconciliation = AsyncMock(return_value=False)
+
+    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
+
+    assert len(state["hops"]) == 1
+    assert state["active_hop_id"] == hop["hop_id"]
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "stall_reroute_exhausted"
 
 
 def test_normal_wait_routes_path_only_response_without_repair(tmp_path: Path):
@@ -4235,6 +4396,76 @@ def test_runtime_worker_discovers_once_and_idle_cycles_do_not_scan(tmp_path: Pat
     assert recover_calls == 1
 
 
+def test_runtime_worker_hung_dom_probe_revisits_expired_second_task_past_bound(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config, store, first, worker = setup_task(tmp_path, task_id="task-runtime-hung-dom-a")
+    second = store.create_task(
+        "second task",
+        requested_team="beta",
+        task_id="task-runtime-hung-dom-b",
+    )
+    worker.hydrate_runtime()
+    assert worker.registry is not None
+    worker.registry.update_task(first, now=0.0)
+    worker.registry.update_task(second, now=0.0)
+
+    class HangingPage:
+        url = "https://chatgpt.com/c/hung"
+
+        async def evaluate(self, *_args, **_kwargs):
+            await asyncio.Event().wait()
+
+    timeout_seconds = 0.03
+    hung_client = ChatGPTPage(HangingPage(), timeout_ms=int(timeout_seconds * 1000))
+    receipt = SendReceipt(
+        prompt="probe",
+        prompt_sha256="probe-sha",
+        binding=PageBinding("page-plan", "PLAN"),
+        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+        attempts=1,
+        accepted_via="test",
+        session_id_before=None,
+    )
+    calls = {first["task_id"]: 0, second["task_id"]: 0}
+    reconciliations = 0
+    second_deadline = time.monotonic() + timeout_seconds / 2
+
+    async def bounded_advance(path, _browser_context, *, scheduling_tasks=None):
+        nonlocal reconciliations
+        assert scheduling_tasks is not None
+        state = store.load(path)
+        task_id = state["task_id"]
+        calls[task_id] += 1
+        if task_id == first["task_id"]:
+            with pytest.raises(TimeoutError):
+                await hung_client.wait_snapshot(receipt)
+        elif calls[task_id] >= 2 and time.monotonic() >= second_deadline:
+            reconciliations += 1
+        return state
+
+    class InertMaintainers:
+        async def advance(self, _tasks, _browser_context):
+            return False
+
+    monkeypatch.setattr(worker, "advance", bounded_advance)
+    worker.maintainers = InertMaintainers()
+    started = time.monotonic()
+
+    async def scenario():
+        await worker.run_once(SimpleNamespace(pages=[]))
+        await worker.run_once(SimpleNamespace(pages=[]))
+
+    asyncio.run(scenario())
+    elapsed = time.monotonic() - started
+    bound = 2 * timeout_seconds + 2 * worker_module.MINIMUM_DEADLINE_SECONDS
+
+    assert calls[second["task_id"]] >= 2
+    assert reconciliations == 1
+    assert elapsed < bound
+
+
 def test_runtime_worker_stale_result_preserves_newer_requested_control_until_command_finishes(
     tmp_path: Path,
     monkeypatch,
@@ -5025,6 +5256,614 @@ def test_change_goal_keeps_current_prompt_and_updates_first_later_hop(tmp_path: 
         later["prompt"].removeprefix("alpha · role: dev\n")
     )
     assert later_envelope["goal"] == "Replacement for later roles"
+
+
+def test_dom_wait_transient_target_crash_runs_bounded_recovery_refresh(tmp_path: Path):
+    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-dom-target-crash"
+    )
+    refresh_calls = []
+
+    class Client:
+        binding = receipt.binding
+        page = SimpleNamespace()
+
+        async def wait_snapshot(self, _receipt, **_kwargs):
+            raise RuntimeError("Page.evaluate: Target crashed")
+
+    acquired = AcquiredRole(
+        Client(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
+    )
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            return acquired
+
+        async def refresh(self, target, **kwargs):
+            refresh_calls.append((target, kwargs))
+            return target
+
+    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
+
+    assert hop["state"] == "waiting"
+    assert state["status"] == "RUNNING"
+    assert state["active_action"] == "wait_response"
+    assert hop["wait"]["refresh_count"] == 1
+    assert hop["wait"]["last_refresh_result"]["status"] == "completed"
+    assert hop["wait"]["last_refresh_result"]["reason"] == "dom_observation_recovery"
+    assert len(refresh_calls) == 1
+    assert refresh_calls[0][1]["manifest"] is state
+    assert refresh_calls[0][1]["logical_role"] == "PLAN"
+    assert refresh_calls[0][1]["recover"] is True
+    assert refresh_calls[0][1]["skip_precheck"] is True
+
+
+def test_dom_periodic_refresh_target_crash_stays_resumable_without_replay(
+    tmp_path: Path,
+):
+    from dataclasses import replace
+
+    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-dom-refresh-target-crash"
+    )
+    worker.config = replace(worker.config, response_refresh_after_seconds=0.0)
+    worker._final_response_reconciliation = AsyncMock(return_value=False)
+    accepted_user = MessageSnapshot(
+        "user",
+        receipt.user_message_id or "u1",
+        receipt.user_turn_id or "t1",
+        receipt.prompt,
+        (),
+    )
+    snapshot = send_snapshot(
+        messages=(accepted_user,),
+        state=ChatGPTState.WAITING_PROMPT,
+        task_id=state["task_id"],
+        team=state["team"],
+    )
+
+    class Client:
+        binding = receipt.binding
+        page = SimpleNamespace()
+
+        async def wait_snapshot(self, _receipt, **_kwargs):
+            return snapshot
+
+        async def wait_for_response(self, *_args, **_kwargs):
+            raise AssertionError("transient refresh failure must return to worker loop")
+
+    acquired = AcquiredRole(
+        Client(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
+    )
+    calls = {"refresh": 0, "send": 0, "retry": 0}
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            return acquired
+
+        async def refresh(self, *_args, **_kwargs):
+            calls["refresh"] += 1
+            raise RuntimeError("Page.evaluate: Target crashed")
+
+        async def send(self, *_args, **_kwargs):
+            calls["send"] += 1
+            raise AssertionError("recovery must not Send")
+
+        async def retry(self, *_args, **_kwargs):
+            calls["retry"] += 1
+            raise AssertionError("recovery must not Retry")
+
+    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
+
+    assert calls == {"refresh": 1, "send": 0, "retry": 0}
+    assert state["status"] == "RUNNING"
+    assert state["active_action"] == "wait_response"
+    assert hop["state"] == "waiting"
+    assert hop["wait"]["refresh_count"] == 1
+    assert hop["wait"]["last_refresh_result"]["status"] == "failed"
+    assert "Target crashed" in hop["wait"]["last_refresh_result"]["error"]
+
+
+def test_dom_wait_expired_transient_observation_reconciles_despite_recent_recovery(
+    tmp_path: Path,
+):
+    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-dom-expired-transient"
+    )
+    hop["wait"]["deadline_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    hop["wait"]["last_refresh_at"] = datetime.now(timezone.utc).isoformat()
+    hop["wait"]["last_refresh_result"] = {
+        "status": "completed",
+        "reason": "dom_observation_recovery",
+    }
+
+    class Client:
+        binding = receipt.binding
+        page = SimpleNamespace()
+
+        async def wait_snapshot(self, _receipt, **_kwargs):
+            raise RuntimeError("Page.evaluate: Target crashed")
+
+    acquired = AcquiredRole(
+        Client(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
+    )
+    calls = {"refresh": 0, "send": 0, "retry": 0}
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            return acquired
+
+        async def refresh(self, *_args, **_kwargs):
+            calls["refresh"] += 1
+            raise AssertionError("recent recovery must suppress another reload")
+
+        async def send(self, *_args, **_kwargs):
+            calls["send"] += 1
+            raise AssertionError("deadline reconciliation must not Send")
+
+        async def retry(self, *_args, **_kwargs):
+            calls["retry"] += 1
+            raise AssertionError("deadline reconciliation must not Retry")
+
+    worker._final_response_reconciliation = AsyncMock(return_value=False)
+    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
+
+    worker._final_response_reconciliation.assert_awaited_once()
+    assert calls == {"refresh": 0, "send": 0, "retry": 0}
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "response_timeout"
+
+
+def test_dom_wait_expired_recent_recovery_final_lifecycle_error_stays_resumable(
+    tmp_path: Path,
+):
+    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-dom-expired-recent-final-lifecycle"
+    )
+    hop["wait"]["deadline_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    hop["wait"]["last_refresh_at"] = datetime.now(timezone.utc).isoformat()
+    hop["wait"]["last_refresh_result"] = {
+        "status": "completed",
+        "reason": "dom_observation_recovery",
+    }
+    calls = {"snapshot": 0, "final": 0, "refresh": 0}
+
+    class Client:
+        binding = receipt.binding
+        page = SimpleNamespace()
+
+        async def wait_snapshot(self, _receipt, **_kwargs):
+            calls["snapshot"] += 1
+            raise RuntimeError("Page.evaluate: Target crashed")
+
+        async def wait_for_response(self, *_args, **_kwargs):
+            calls["final"] += 1
+            raise RuntimeError("Page.evaluate: Target crashed")
+
+    acquired = AcquiredRole(
+        Client(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
+    )
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            return acquired
+
+        async def refresh(self, *_args, **_kwargs):
+            calls["refresh"] += 1
+            raise AssertionError("recent recovery must suppress another reload")
+
+    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
+
+    assert calls == {"snapshot": 1, "final": 1, "refresh": 0}
+    assert state["status"] == "RUNNING"
+    assert state["block_code"] is None
+    assert hop["state"] == "waiting"
+
+
+def test_dom_wait_expired_closed_target_reconciles_on_reacquired_exact_page(tmp_path: Path):
+    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-dom-expired-reacquired"
+    )
+    hop["wait"]["deadline_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    calls = {"refresh": 0, "old_wait": 0, "new_wait": 0, "send": 0, "retry": 0}
+
+    class OldClient:
+        binding = receipt.binding
+        page = SimpleNamespace()
+
+        async def wait_snapshot(self, _receipt, **_kwargs):
+            raise RuntimeError("Page has been closed")
+
+        async def wait_for_response(self, *_args, **_kwargs):
+            calls["old_wait"] += 1
+            raise RuntimeError("Page has been closed")
+
+    class ReacquiredClient:
+        binding = receipt.binding
+        page = SimpleNamespace()
+
+        async def wait_for_response(self, *_args, **_kwargs):
+            calls["new_wait"] += 1
+            raise TimeoutError("no terminal response after exact reacquire")
+
+    old_acquired = AcquiredRole(
+        OldClient(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
+    )
+    reacquired = AcquiredRole(
+        ReacquiredClient(),
+        receipt.binding.page_id,
+        "https://chatgpt.com/c/test",
+        False,
+        False,
+    )
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            return old_acquired
+
+        async def refresh(self, target, **kwargs):
+            assert target is old_acquired
+            assert kwargs["recover"] is True
+            assert kwargs["skip_precheck"] is True
+            calls["refresh"] += 1
+            return reacquired
+
+        async def send(self, *_args, **_kwargs):
+            calls["send"] += 1
+            raise AssertionError("recovery must not Send")
+
+        async def retry(self, *_args, **_kwargs):
+            calls["retry"] += 1
+            raise AssertionError("recovery must not Retry")
+
+    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
+
+    assert calls == {
+        "refresh": 1,
+        "old_wait": 0,
+        "new_wait": 1,
+        "send": 0,
+        "retry": 0,
+    }
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "response_timeout"
+
+
+def test_dom_wait_expired_transient_refresh_failure_does_not_reconcile_stale_target(
+    tmp_path: Path,
+):
+    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-dom-expired-refresh-failure"
+    )
+    hop["wait"]["deadline_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    calls = {"snapshot": 0, "refresh": 0, "final": 0, "send": 0, "retry": 0}
+
+    class Client:
+        binding = receipt.binding
+        page = SimpleNamespace()
+
+        async def wait_snapshot(self, _receipt, **_kwargs):
+            calls["snapshot"] += 1
+            raise RuntimeError("Page.evaluate: Target crashed")
+
+        async def wait_for_response(self, *_args, **_kwargs):
+            calls["final"] += 1
+            raise RuntimeError("Page.evaluate: Target crashed")
+
+    acquired = AcquiredRole(
+        Client(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
+    )
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            return acquired
+
+        async def refresh(self, target, **kwargs):
+            assert target is acquired
+            assert kwargs["recover"] is True
+            assert kwargs["skip_precheck"] is True
+            calls["refresh"] += 1
+            raise RuntimeError("Page.reload: Target crashed")
+
+        async def send(self, *_args, **_kwargs):
+            calls["send"] += 1
+            raise AssertionError("recovery must not Send")
+
+        async def retry(self, *_args, **_kwargs):
+            calls["retry"] += 1
+            raise AssertionError("recovery must not Retry")
+
+    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
+
+    assert calls == {
+        "snapshot": 1,
+        "refresh": 1,
+        "final": 0,
+        "send": 0,
+        "retry": 0,
+    }
+    assert state["status"] == "RUNNING"
+    assert state["block_code"] is None
+    assert hop["state"] == "waiting"
+    assert hop["wait"]["last_refresh_result"]["status"] == "failed"
+    assert "Target crashed" in hop["wait"]["last_refresh_result"]["error"]
+
+
+def test_dom_wait_expired_clean_snapshot_final_lifecycle_error_stays_resumable(
+    tmp_path: Path,
+):
+    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-dom-expired-clean-final-lifecycle"
+    )
+    hop["wait"]["deadline_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    accepted_user = MessageSnapshot(
+        "user",
+        receipt.user_message_id or "u1",
+        receipt.user_turn_id or "t1",
+        receipt.prompt,
+        (),
+    )
+    snapshot = send_snapshot(
+        messages=(accepted_user,),
+        state=ChatGPTState.WAITING_PROMPT,
+        task_id=state["task_id"],
+        team=state["team"],
+    )
+    calls = {"snapshot": 0, "final": 0, "refresh": 0, "send": 0, "retry": 0}
+
+    class Client:
+        binding = receipt.binding
+        page = SimpleNamespace()
+
+        async def wait_snapshot(self, _receipt, **_kwargs):
+            calls["snapshot"] += 1
+            return snapshot
+
+        async def wait_for_response(self, *_args, **_kwargs):
+            calls["final"] += 1
+            raise RuntimeError("Page.evaluate: Target crashed")
+
+    acquired = AcquiredRole(
+        Client(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
+    )
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            return acquired
+
+        async def refresh(self, *_args, **_kwargs):
+            calls["refresh"] += 1
+            raise AssertionError("expired deadline must not reload after transient final reconciliation")
+
+        async def send(self, *_args, **_kwargs):
+            calls["send"] += 1
+            raise AssertionError("final reconciliation must not Send")
+
+        async def retry(self, *_args, **_kwargs):
+            calls["retry"] += 1
+            raise AssertionError("final reconciliation must not Retry")
+
+    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
+
+    assert calls == {
+        "snapshot": 1,
+        "final": 1,
+        "refresh": 0,
+        "send": 0,
+        "retry": 0,
+    }
+    assert state["status"] == "RUNNING"
+    assert state["block_code"] is None
+    assert hop["state"] == "waiting"
+    assert state["active_action"] == "wait_response"
+
+
+def test_dom_wait_expired_clean_snapshot_unrelated_final_error_is_not_swallowed(
+    tmp_path: Path,
+):
+    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-dom-expired-clean-final-unrelated"
+    )
+    hop["wait"]["deadline_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    accepted_user = MessageSnapshot(
+        "user",
+        receipt.user_message_id or "u1",
+        receipt.user_turn_id or "t1",
+        receipt.prompt,
+        (),
+    )
+    snapshot = send_snapshot(
+        messages=(accepted_user,),
+        state=ChatGPTState.WAITING_PROMPT,
+        task_id=state["task_id"],
+        team=state["team"],
+    )
+
+    class Client:
+        binding = receipt.binding
+        page = SimpleNamespace()
+
+        async def wait_snapshot(self, _receipt, **_kwargs):
+            return snapshot
+
+        async def wait_for_response(self, *_args, **_kwargs):
+            raise RuntimeError("selector parser exploded")
+
+    acquired = AcquiredRole(
+        Client(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
+    )
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            return acquired
+
+        async def refresh(self, *_args, **_kwargs):
+            raise AssertionError("unrelated final-reconciliation error must fail closed")
+
+    with pytest.raises(RuntimeError, match="selector parser exploded"):
+        asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
+
+
+def test_dom_wait_wait_timeout_then_final_lifecycle_error_stays_resumable(
+    tmp_path: Path,
+):
+    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-dom-wait-timeout-final-lifecycle"
+    )
+    hop["wait"]["deadline_at"] = (
+        datetime.now(timezone.utc) + timedelta(seconds=30)
+    ).isoformat()
+    accepted_user = MessageSnapshot(
+        "user",
+        receipt.user_message_id or "u1",
+        receipt.user_turn_id or "t1",
+        receipt.prompt,
+        (),
+    )
+    snapshot = send_snapshot(
+        messages=(accepted_user,),
+        state=ChatGPTState.WAITING_PROMPT,
+        task_id=state["task_id"],
+        team=state["team"],
+    )
+    calls = {"snapshot": 0, "wait": 0, "refresh": 0, "send": 0, "retry": 0}
+
+    class Client:
+        binding = receipt.binding
+        page = SimpleNamespace()
+
+        async def wait_snapshot(self, _receipt, **_kwargs):
+            calls["snapshot"] += 1
+            return snapshot
+
+        async def wait_for_response(self, *_args, **_kwargs):
+            calls["wait"] += 1
+            if calls["wait"] == 1:
+                hop["wait"]["deadline_at"] = (
+                    datetime.now(timezone.utc) - timedelta(seconds=1)
+                ).isoformat()
+                raise TimeoutError("poll reached deadline")
+            raise RuntimeError("Page.evaluate: Target crashed")
+
+    acquired = AcquiredRole(
+        Client(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
+    )
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            return acquired
+
+        async def refresh(self, *_args, **_kwargs):
+            calls["refresh"] += 1
+            raise AssertionError("normal wait-timeout path must not refresh here")
+
+        async def send(self, *_args, **_kwargs):
+            calls["send"] += 1
+            raise AssertionError("final reconciliation must not Send")
+
+        async def retry(self, *_args, **_kwargs):
+            calls["retry"] += 1
+            raise AssertionError("final reconciliation must not Retry")
+
+    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
+
+    assert calls == {
+        "snapshot": 1,
+        "wait": 2,
+        "refresh": 0,
+        "send": 0,
+        "retry": 0,
+    }
+    assert state["status"] == "RUNNING"
+    assert state["block_code"] is None
+    assert hop["state"] == "waiting"
+    assert state["active_action"] == "wait_response"
+
+
+def test_dom_wait_expired_deadline_performs_final_reconciliation(tmp_path: Path):
+    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-dom-expired-deadline"
+    )
+    hop["wait"]["deadline_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    accepted_user = MessageSnapshot(
+        "user",
+        receipt.user_message_id or "u1",
+        receipt.user_turn_id or "t1",
+        receipt.prompt,
+        (),
+    )
+    snapshot = send_snapshot(
+        messages=(accepted_user,),
+        state=ChatGPTState.WAITING_PROMPT,
+        task_id=state["task_id"],
+        team=state["team"],
+    )
+
+    class Client:
+        binding = receipt.binding
+        page = SimpleNamespace()
+
+        async def wait_snapshot(self, _receipt, **_kwargs):
+            return snapshot
+
+    acquired = AcquiredRole(
+        Client(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
+    )
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            return acquired
+
+        async def refresh(self, *_args, **_kwargs):
+            raise AssertionError("expired deadline must reconcile before refresh")
+
+    worker._final_response_reconciliation = AsyncMock(return_value=False)
+    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
+
+    worker._final_response_reconciliation.assert_awaited_once()
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "response_timeout"
+
+
+def test_dom_wait_unrelated_runtime_error_is_not_recovered(tmp_path: Path):
+    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-dom-unrelated-error"
+    )
+
+    class Client:
+        binding = receipt.binding
+        page = SimpleNamespace()
+
+        async def wait_snapshot(self, _receipt, **_kwargs):
+            raise RuntimeError("selector parser exploded")
+
+    acquired = AcquiredRole(
+        Client(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
+    )
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            return acquired
+
+        async def refresh(self, *_args, **_kwargs):
+            raise AssertionError("unrelated errors must not trigger recovery refresh")
+
+    with pytest.raises(RuntimeError, match="selector parser exploded"):
+        asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
 
 
 def test_resume_reconciles_canonical_ledger_before_exact_page_validation(tmp_path: Path):

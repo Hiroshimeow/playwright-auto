@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+import time
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -1116,6 +1119,187 @@ def test_automatic_refresh_uses_reload_only_and_never_retry_control(tmp_path, mo
     asyncio.run(actions.refresh(acquired))
 
     assert events == ["ownership", "delay", "reload", "ownership"]
+
+
+def test_recovery_refresh_can_reload_exact_bound_page_after_transient_precheck_failure(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    page = FakePage(page_id="page-plan", role="PLAN", team="new-team", task_id="task-1")
+    events = []
+
+    class Client:
+        def __init__(self):
+            self.page = page
+            self.binding = SimpleNamespace(page_id="page-plan", role="PLAN")
+            self.calls = 0
+
+        async def assert_ownership(self):
+            self.calls += 1
+            events.append(f"ownership-{self.calls}")
+            if self.calls == 1:
+                raise RuntimeError("Page.evaluate: Target crashed")
+            return page.snapshot_value
+
+    async def fake_delay(*_args, **_kwargs):
+        events.append("delay")
+
+    async def fake_refresh(target, *, timeout_ms):
+        assert target is page
+        assert timeout_ms > 0
+        events.append("reload")
+
+    monkeypatch.setattr(actions_module, "action_delay", fake_delay)
+    monkeypatch.setattr(actions_module, "refresh_page", fake_refresh)
+    actions = CDPATabActions(FakeContext([page]), config)
+    acquired = AcquiredRole(
+        client=Client(),
+        page_id="page-plan",
+        url=page.url,
+        created=False,
+        new_chat=False,
+    )
+
+    recovered = asyncio.run(
+        actions.refresh(
+            acquired,
+            manifest=manifest(page_id="page-plan"),
+            logical_role="PLAN",
+            recover=True,
+        )
+    )
+
+    assert recovered is acquired
+    assert events == ["ownership-1", "delay", "reload", "ownership-2"]
+
+
+def test_recovery_refresh_known_bad_observation_skips_precheck_with_one_budget(
+    tmp_path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    config = replace(config, workspace_timeout_seconds=0.03)
+    page = FakePage(page_id="page-plan", role="PLAN", team="new-team", task_id="task-1")
+    ownership_calls = 0
+
+    class Client:
+        def __init__(self):
+            self.page = page
+            self.binding = SimpleNamespace(page_id="page-plan", role="PLAN")
+
+        async def assert_ownership(self):
+            nonlocal ownership_calls
+            ownership_calls += 1
+            return page.snapshot_value
+
+    async def fake_delay(*_args, **_kwargs):
+        return None
+
+    async def hanging_refresh(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(actions_module, "action_delay", fake_delay)
+    monkeypatch.setattr(actions_module, "refresh_page", hanging_refresh)
+    actions = CDPATabActions(FakeContext([page]), config)
+    acquired = AcquiredRole(
+        client=Client(),
+        page_id="page-plan",
+        url=page.url,
+        created=False,
+        new_chat=False,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        asyncio.run(
+            actions.refresh(
+                acquired,
+                manifest=manifest(page_id="page-plan"),
+                logical_role="PLAN",
+                recover=True,
+                skip_precheck=True,
+            )
+        )
+
+    assert time.monotonic() - started < 0.12
+    assert ownership_calls == 0
+
+
+def test_recovery_refresh_refuses_durable_page_id_mismatch(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    page = FakePage(page_id="page-plan", role="PLAN", team="new-team", task_id="task-1")
+    reloads = []
+
+    class Client:
+        def __init__(self):
+            self.page = page
+            self.binding = SimpleNamespace(page_id="page-plan", role="PLAN")
+
+        async def assert_ownership(self):
+            raise RuntimeError("Execution context was destroyed")
+
+    async def fake_refresh(*_args, **_kwargs):
+        reloads.append(True)
+
+    monkeypatch.setattr(actions_module, "refresh_page", fake_refresh)
+    actions = CDPATabActions(FakeContext([page]), config)
+    acquired = AcquiredRole(
+        client=Client(),
+        page_id="page-plan",
+        url=page.url,
+        created=False,
+        new_chat=False,
+    )
+
+    with pytest.raises(RoleOwnershipError):
+        asyncio.run(
+            actions.refresh(
+                acquired,
+                manifest=manifest(page_id="foreign-page"),
+                logical_role="PLAN",
+                recover=True,
+            )
+        )
+
+    assert reloads == []
+
+
+def test_recovery_refresh_closed_target_requires_exact_reacquire(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    page = FakePage(page_id="page-plan", role="PLAN", team="new-team", task_id="task-1")
+    page.closed = True
+    reloads = []
+
+    class Client:
+        def __init__(self):
+            self.page = page
+            self.binding = SimpleNamespace(page_id="page-plan", role="PLAN")
+
+        async def assert_ownership(self):
+            raise RuntimeError("Target closed")
+
+    async def fake_refresh(*_args, **_kwargs):
+        reloads.append(True)
+
+    monkeypatch.setattr(actions_module, "refresh_page", fake_refresh)
+    actions = CDPATabActions(FakeContext([page]), config)
+    actions.locate_owned_metadata = AsyncMock(return_value=None)
+    acquired = AcquiredRole(
+        client=Client(),
+        page_id="page-plan",
+        url=page.url,
+        created=False,
+        new_chat=False,
+    )
+
+    with pytest.raises(RoleOwnershipError, match="could not be reacquired exactly"):
+        asyncio.run(
+            actions.refresh(
+                acquired,
+                manifest=manifest(page_id="page-plan"),
+                logical_role="PLAN",
+                recover=True,
+            )
+        )
+
+    assert reloads == []
 
 
 def test_matching_clients_skips_free_tabs_and_prefers_latest_terminal_team(tmp_path, monkeypatch):

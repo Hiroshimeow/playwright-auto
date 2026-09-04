@@ -23,6 +23,7 @@ from .cdpa_actions import (
     CDPATabActions,
     RoleOwnershipError,
     TeamCloseError,
+    is_transient_page_lifecycle_error,
 )
 from .cdpa_bootstraps import BootstrapCatalog, normalize_bootstrap_donor, normalize_bootstrap_record
 from .cdpa_commands import (
@@ -152,6 +153,9 @@ _STATUS_RECOVERY_GRAPH_SECONDS = 300.0
 _TERMINAL_GRAPH_RETRY_SECONDS = 120.0
 _TERMINAL_GRAPH_MAX_ATTEMPTS = 3
 _DOM_FALLBACK_SETTLE_SECONDS = 30.0
+_POST_REFRESH_RESPONSE_PROBE_SECONDS = 60.0
+_POST_REFRESH_REROUTE_SECONDS = 120.0
+_STALL_REROUTE_MAX_ATTEMPTS = 3
 _STREAM_STATUS_POLL_MIN_SECONDS = 10.0
 _STREAM_STATUS_POLL_MAX_SECONDS = 15.0
 _AUTOMATED_SEND_SPACING_SECONDS = 10.0
@@ -3781,6 +3785,147 @@ class CDPAWorker:
         self._record_response(state, hop, response)
         return True
 
+    async def _final_dom_response_reconciliation(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        acquired: AcquiredRole,
+        receipt: SendReceipt,
+        wait: dict[str, Any],
+    ) -> bool | None:
+        try:
+            return await self._final_response_reconciliation(
+                state, hop, acquired, receipt, wait
+            )
+        except Exception as exc:
+            if not is_transient_page_lifecycle_error(exc):
+                raise
+            hop["state"] = "waiting"
+            state["status"] = "RUNNING"
+            state["kanban_column"] = _column_for(str(hop["target_role"]))
+            state["active_action"] = "wait_response"
+            state["block_code"] = None
+            state["block_retryable"] = False
+            state["block_reason"] = None
+            return None
+
+    async def _recover_dom_observation_failure(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        actions: CDPATabActions,
+        acquired: AcquiredRole,
+        manifest_path: Path,
+        persistence_baseline: dict[str, Any],
+        exc: BaseException,
+        transport_baseline: dict[str, Any] | None,
+    ) -> AcquiredRole | None:
+        if not is_transient_page_lifecycle_error(exc):
+            return None
+        wait = hop["wait"]
+        last_result = wait.get("last_refresh_result")
+        last_refresh = parse_time(wait.get("last_refresh_at"))
+        if (
+            isinstance(last_result, Mapping)
+            and last_result.get("reason") == "dom_observation_recovery"
+            and last_refresh is not None
+            and (datetime.now(timezone.utc) - last_refresh).total_seconds()
+            < float(self.config.response_refresh_after_seconds)
+        ):
+            hop["state"] = "waiting"
+            state["status"] = "RUNNING"
+            state["kanban_column"] = _column_for(str(hop["target_role"]))
+            state["active_action"] = "wait_response"
+            return acquired
+
+        refresh_baseline = json.loads(
+            json.dumps(persistence_baseline, ensure_ascii=False, default=str)
+        )
+        begin_refresh(wait)
+        progress = wait.get("refresh_in_progress")
+        if isinstance(progress, dict):
+            progress["reason"] = "dom_observation_recovery"
+        self._persist_transport_result(manifest_path, refresh_baseline, state)
+        refresh_baseline = json.loads(
+            json.dumps(state, ensure_ascii=False, default=str)
+        )
+        recovered: AcquiredRole | None = None
+        try:
+            recovered = await actions.refresh(
+                acquired,
+                manifest=state,
+                logical_role=str(hop["target_role"]),
+                recover=True,
+                skip_precheck=True,
+            )
+        except RoleOwnershipError as refresh_exc:
+            finish_refresh(wait, error=sanitize_exception(refresh_exc))
+            self._persist_transport_result(manifest_path, refresh_baseline, state)
+            raise
+        except Exception as refresh_exc:
+            finish_refresh(wait, error=sanitize_exception(refresh_exc))
+            self._persist_transport_result(manifest_path, refresh_baseline, state)
+            if not is_transient_page_lifecycle_error(refresh_exc):
+                raise
+        else:
+            finish_refresh(wait)
+            saved = self._persist_transport_result(manifest_path, refresh_baseline, state)
+            if transport_baseline is not None:
+                state.clear()
+                state.update(saved)
+                transport_baseline.clear()
+                transport_baseline.update(
+                    json.loads(json.dumps(saved, ensure_ascii=False, default=str))
+                )
+                hop = _active_hop(state)
+                wait = hop["wait"]
+
+        hop["state"] = "waiting"
+        state["status"] = "RUNNING"
+        state["kanban_column"] = _column_for(str(hop["target_role"]))
+        state["active_action"] = "wait_response"
+        state["block_code"] = None
+        state["block_retryable"] = False
+        state["block_reason"] = None
+        return recovered
+
+    async def _waiting_dom_snapshot(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        actions: CDPATabActions,
+        acquired: AcquiredRole,
+        manifest_path: Path,
+        persistence_baseline: dict[str, Any],
+        receipt: SendReceipt,
+        *,
+        transport_baseline: dict[str, Any] | None,
+        force_full: bool = False,
+        probe_wait_ms: int = 0,
+    ) -> tuple[Any | None, AcquiredRole | None]:
+        try:
+            snapshot = await self._waiting_snapshot(
+                acquired.client,
+                receipt,
+                force_full=force_full,
+                probe_wait_ms=probe_wait_ms,
+            )
+            return snapshot, acquired
+        except Exception as exc:
+            recovered = await self._recover_dom_observation_failure(
+                state,
+                hop,
+                actions,
+                acquired,
+                manifest_path,
+                persistence_baseline,
+                exc,
+                transport_baseline,
+            )
+            if is_transient_page_lifecycle_error(exc):
+                return None, recovered
+            raise
+
     @staticmethod
     async def _waiting_snapshot(
         client: Any,
@@ -4455,11 +4600,35 @@ class CDPAWorker:
         self._start_wait_budget_from_sent(hop)
         self._reconcile_hop_conversation_identity(state, hop)
         receipt = SendReceipt.from_dict(hop["receipt"])
-        snapshot = await self._waiting_snapshot(
-            acquired.client,
+        snapshot, recovered = await self._waiting_dom_snapshot(
+            state,
+            hop,
+            actions,
+            acquired,
+            manifest_path,
+            persistence_baseline,
             receipt,
+            transport_baseline=transport_baseline,
             probe_wait_ms=12_000,
         )
+        if recovered is not None:
+            acquired = recovered
+        if snapshot is None:
+            hop = _active_hop(state)
+            wait = hop["wait"]
+            if recovered is not None and remaining_timeout_ms(wait) <= 0:
+                reconciled = await self._final_dom_response_reconciliation(
+                    state, hop, acquired, receipt, wait
+                )
+                if reconciled is None or reconciled:
+                    return
+                self._block(
+                    state,
+                    "response timeout budget exhausted after final response reconciliation",
+                    code="response_timeout",
+                    retryable=False,
+                )
+            return
         receipt = self._upgrade_legacy_receipt(
             state,
             hop,
@@ -4480,6 +4649,82 @@ class CDPAWorker:
             composer_empty=snapshot.composer_empty,
             manual_input_pending=snapshot.manual_input_pending,
         )
+        refresh_count = int(wait.get("refresh_count") or 0)
+        last_refresh_result = wait.get("last_refresh_result")
+        refresh_finished_at = (
+            parse_time(last_refresh_result.get("finished_at"))
+            if isinstance(last_refresh_result, Mapping)
+            and last_refresh_result.get("status") == "completed"
+            else None
+        )
+        if refresh_count > 0 and refresh_finished_at is not None:
+            refresh_age = (datetime.now(timezone.utc) - refresh_finished_at).total_seconds()
+            final_checked = int(wait.get("stall_final_refresh_count") or 0)
+            probe_checked = int(wait.get("stall_probe_refresh_count") or 0)
+            if refresh_count > final_checked and refresh_age >= _POST_REFRESH_REROUTE_SECONDS:
+                reconciled = await self._final_dom_response_reconciliation(
+                    state, hop, acquired, receipt, wait
+                )
+                if reconciled is None or reconciled:
+                    return
+                wait["stall_probe_refresh_count"] = refresh_count
+                wait["stall_final_refresh_count"] = refresh_count
+                latest, recovered = await self._waiting_dom_snapshot(
+                    state,
+                    hop,
+                    actions,
+                    acquired,
+                    manifest_path,
+                    persistence_baseline,
+                    receipt,
+                    transport_baseline=transport_baseline,
+                    force_full=True,
+                )
+                if recovered is not None:
+                    acquired = recovered
+                if latest is None:
+                    return
+                if latest.stop_visible:
+                    hop["state"] = "waiting"
+                    state["active_action"] = "wait_response"
+                    return
+                attempt = int(hop.get("stall_reroute_attempt") or 0)
+                if attempt >= _STALL_REROUTE_MAX_ATTEMPTS:
+                    self._block(
+                        state,
+                        "stalled response reroute exhausted after three attempts",
+                        code="stall_reroute_exhausted",
+                        retryable=False,
+                    )
+                    return
+                RequestLedger(str(hop["ledger_path"])).update(
+                    str(hop["request_id"]),
+                    status=RequestStatus.FAILED_FINAL,
+                    error="stalled response rerouted after refresh",
+                )
+                hop["state"] = "abandoned"
+                hop["abandon_reason"] = "stalled response rerouted after refresh"
+                hop.setdefault("timestamps", {})["abandoned_at"] = utc_now()
+                child = self._append_hop(
+                    state,
+                    source_role=str(hop["target_role"]),
+                    target_role=str(hop["target_role"]),
+                    handoff=str(hop["handoff"]),
+                    kind="stall_reroute",
+                    turn=int(hop["turn"]),
+                )
+                child["stall_reroute_attempt"] = attempt + 1
+                return
+            if (
+                refresh_count > probe_checked
+                and refresh_age >= _POST_REFRESH_RESPONSE_PROBE_SECONDS
+            ):
+                reconciled = await self._final_dom_response_reconciliation(
+                    state, hop, acquired, receipt, wait
+                )
+                if reconciled is None or reconciled:
+                    return
+                wait["stall_probe_refresh_count"] = refresh_count
         unresolved = wait.get("terminal_continuation_unresolved")
         unresolved_complete = (
             isinstance(unresolved, dict)
@@ -4501,9 +4746,10 @@ class CDPAWorker:
             and unresolved_block_ready_at is not None
             and datetime.now(timezone.utc) >= unresolved_block_ready_at
         ):
-            if await self._final_response_reconciliation(
+            reconciled = await self._final_dom_response_reconciliation(
                 state, hop, acquired, receipt, wait
-            ):
+            )
+            if reconciled is None or reconciled:
                 return
             if remaining_timeout_ms(wait) <= 0:
                 self._block(
@@ -4554,15 +4800,26 @@ class CDPAWorker:
                 and not snapshot.manual_input_pending
             )
         if remaining <= 0 or should_refresh:
-            if await self._final_response_reconciliation(
+            reconciled = await self._final_dom_response_reconciliation(
                 state, hop, acquired, receipt, wait
-            ):
+            )
+            if reconciled is None or reconciled:
                 return
-            snapshot = await self._waiting_snapshot(
-                acquired.client,
+            snapshot, recovered = await self._waiting_dom_snapshot(
+                state,
+                hop,
+                actions,
+                acquired,
+                manifest_path,
+                persistence_baseline,
                 receipt,
+                transport_baseline=transport_baseline,
                 force_full=True,
             )
+            if recovered is not None:
+                acquired = recovered
+            if snapshot is None:
+                return
             signature, length = response_activity_signature(snapshot, receipt.baseline)
             observe_response_activity(wait, signature=signature, length=length)
             wait["transport_ui_active"] = response_transport_ui_active(snapshot)
@@ -4616,11 +4873,37 @@ class CDPAWorker:
                 json.dumps(state, ensure_ascii=False, default=str)
             )
             try:
-                await actions.refresh(acquired)
-            except Exception as exc:
+                acquired = await actions.refresh(
+                    acquired,
+                    manifest=state,
+                    logical_role=role,
+                    recover=True,
+                )
+            except RoleOwnershipError as exc:
                 finish_refresh(wait, error=sanitize_exception(exc))
                 self._persist_transport_result(manifest_path, refresh_baseline, state)
                 raise
+            except Exception as exc:
+                finish_refresh(wait, error=sanitize_exception(exc))
+                saved = self._persist_transport_result(
+                    manifest_path, refresh_baseline, state
+                )
+                if not is_transient_page_lifecycle_error(exc):
+                    raise
+                if transport_baseline is not None:
+                    state.clear()
+                    state.update(saved)
+                    hop = _active_hop(state)
+                    wait = hop["wait"]
+                    transport_baseline.clear()
+                    transport_baseline.update(
+                        json.loads(json.dumps(saved, ensure_ascii=False, default=str))
+                    )
+                hop["state"] = "waiting"
+                state["status"] = "RUNNING"
+                state["kanban_column"] = _column_for(role)
+                state["active_action"] = "wait_response"
+                return
             finish_refresh(wait)
             refreshed_this_cycle = True
             saved = self._persist_transport_result(manifest_path, refresh_baseline, state)
@@ -4635,9 +4918,10 @@ class CDPAWorker:
                 )
         remaining = remaining_timeout_ms(wait)
         if remaining <= 0:
-            if await self._final_response_reconciliation(
+            reconciled = await self._final_dom_response_reconciliation(
                 state, hop, acquired, receipt, wait
-            ):
+            )
+            if reconciled is None or reconciled:
                 return
             self._block(
                 state,
@@ -4690,9 +4974,10 @@ class CDPAWorker:
             return
         except (TimeoutError, IncompleteResponseTimeoutError):
             if remaining_timeout_ms(wait) <= 0:
-                if await self._final_response_reconciliation(
+                reconciled = await self._final_dom_response_reconciliation(
                     state, hop, acquired, receipt, wait
-                ):
+                )
+                if reconciled is None or reconciled:
                     return
                 self._block(
                     state,
