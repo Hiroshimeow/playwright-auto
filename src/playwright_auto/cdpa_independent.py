@@ -785,7 +785,9 @@ def canonical_independent_events(
             if source_key == own_key or str(source.get("team") or "") == own_team:
                 continue
             continue
-        if settings["recovery"] and recovery_warmed:
+        source_team = str(source.get("team") or "")
+        dependency_team_matches = not settings["teams"] or source_team in settings["teams"]
+        if settings["recovery"] and recovery_warmed and dependency_team_matches:
             event = _recovery_event(source, occurrence_counts, now=current)
             if event is not None:
                 target_release = _parse_datetime(
@@ -803,19 +805,15 @@ def canonical_independent_events(
                 )
                 if same_target_ready and another_target_ready:
                     events.append(event)
-        completion_team_matches = (
-            not settings["teams"]
-            or str(source.get("team") or "") in settings["teams"]
-        )
-        if settings["task_done"] and completion_team_matches:
+        if settings["task_done"] and dependency_team_matches:
             event = _task_done_event(source)
             if event is not None:
                 events.append(event)
-        if settings["role_completed"] and completion_team_matches:
+        if settings["role_completed"] and dependency_team_matches:
             events.extend(_role_events(source, settings["role_completed"]))
         if (
             settings["teams"]
-            and str(source.get("team") or "") in settings["teams"]
+            and dependency_team_matches
             and str(source.get("status") or "").upper() in settings["states"]
         ):
             task_id = str(source.get("task_id") or "")

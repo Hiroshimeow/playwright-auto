@@ -475,7 +475,12 @@ def test_board_uses_operator_labels_run_task_and_restored_settings():
     assert "function configuredTriggerSettings(form, values)" in app
     assert app.count("configuredTriggerSettings(roots.agentForm, values)") == 1
     assert app.count("configuredTriggerSettings(roots.agentSettingsForm, values)") == 1
-    assert 'task_done: ["task_team"]' in app
+    assert 'name="dependency_team" multiple' in create_form
+    assert html.count('data-dependency-team-select') == 2
+    assert 'RUNNING, BLOCKED, or PAUSED teams' in html
+    assert 'values.getAll("dependency_team")' in app
+    assert '["RUNNING", "BLOCKED", "PAUSED"]' in app
+    assert 'task_done: []' in app
     assert 'mode: "Independent"' in app
     assert 'form.elements.temporary_chat.checked = true' in app
     assert 'temporary_chat: values.has("temporary_chat")' in app
@@ -487,5 +492,5 @@ def test_board_uses_operator_labels_run_task_and_restored_settings():
     assert 'body: {trigger_type: "manual", instruction}' in app
     assert '/api/independent-agents/${encodeURIComponent(taskId)}/reset' in app
     assert '.filter(item => !item.agent?.deleted_at)' in app
-    assert 'app.js?v=20260817-temporary-chat' in html
+    assert 'app.js?v=20260905-dependency-team' in html
     assert "new_chat_next_job" not in html[html.index('id="agent-settings-dialog"') :]

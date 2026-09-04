@@ -193,9 +193,12 @@
             <option value="recovery">Recovery</option>
           </select>
         </label>
+        <label>Dependency on team
+          <select name="dependency_team" multiple size="4" data-dependency-team-select></select>
+          <span class="form-help">Optional. Limits team-driven triggers to selected RUNNING, BLOCKED, or PAUSED teams.</span>
+        </label>
         <label>Max turns per job<input type="number" name="max_cycles" min="0" step="1" value="0" inputmode="numeric"><span class="form-help">0 means Unlimited.</span></label>
         <label data-trigger-field="interval">Interval minutes<input type="number" name="interval_minutes" min="20" step="1"></label>
-        <label data-trigger-field="task_team role_team state_team">Workflow task / team<input name="trigger_team" list="workflow-task-team-options" autocomplete="off"></label>
         <label data-trigger-field="role">Workflow agent<select name="trigger_role" data-workflow-agent-select></select></label>
         <label data-trigger-field="state">Workflow task state<input name="trigger_state" placeholder="BLOCKED" autocomplete="off"></label>
         <p class="form-help">Uses current workflow tasks and the existing Agent Catalog. New agents default to manual-only.</p>
@@ -267,14 +270,15 @@
                 <option value="recovery">Recovery</option>
               </select>
             </label>
+            <label>Dependency on team
+              <select name="dependency_team" multiple size="5" data-dependency-team-select></select>
+              <span class="form-help">Optional. Limits team-driven triggers to selected RUNNING, BLOCKED, or PAUSED teams.</span>
+            </label>
           </div>
           <p id="independent-settings-trigger-help" class="form-help">Runs only when started manually.</p>
           <div class="agent-settings-trigger-fields">
             <label data-trigger-field="interval" hidden>Interval minutes
               <input type="number" name="interval_minutes" min="20" step="1" inputmode="numeric">
-            </label>
-            <label data-trigger-field="task_team role_team state_team" hidden>Workflow task / team
-              <input name="trigger_team" list="workflow-task-team-options" placeholder="dashboard-team" autocomplete="off">
             </label>
             <label data-trigger-field="role" hidden>Workflow agent
               <select name="trigger_role" data-workflow-agent-select></select>
@@ -303,6 +307,6 @@
   <datalist id="workflow-task-team-options"></datalist>
 
   <div id="toast" class="toast" hidden role="status"></div>
-  <script type="module" src="/assets/app.js?v=20260901-dom-only"></script>
+  <script type="module" src="/assets/app.js?v=20260905-dependency-team"></script>
 </body>
 </html>

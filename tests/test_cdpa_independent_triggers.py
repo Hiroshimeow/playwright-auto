@@ -104,6 +104,39 @@ def test_two_blocked_teams_claim_oldest_first_and_do_not_duplicate_active_event(
     assert second["independent"]["active_event"]["target_task_id"] == "task-b"
 
 
+def test_recovery_respects_dependency_teams():
+    current_agent = agent()
+    current_agent["independent"]["trigger_settings"] = validate_trigger_settings(
+        {"recovery": True, "teams": ["wanted"]}
+    )
+    foreign = workflow(
+        "task-foreign",
+        team="foreign",
+        status="BLOCKED",
+        updated_at="2026-07-26T00:00:00+00:00",
+        block_code="role_offline",
+        block_reason="foreign-dev tab is offline",
+    )
+    wanted = workflow(
+        "task-wanted",
+        team="wanted",
+        status="BLOCKED",
+        updated_at="2026-07-26T00:01:00+00:00",
+        block_code="role_offline",
+        block_reason="wanted-dev tab is offline",
+    )
+
+    recovery = [
+        item
+        for item in canonical_independent_events(
+            current_agent, [foreign, wanted, current_agent]
+        )
+        if item["trigger_type"] == "recovery"
+    ]
+
+    assert [item["target_task_id"] for item in recovery] == ["task-wanted"]
+
+
 def test_recovery_requires_continuous_blocked_state():
     current_agent = agent()
     target = workflow(

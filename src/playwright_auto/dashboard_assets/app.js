@@ -86,25 +86,21 @@ function basicTriggerSettings(values) {
     interval_minutes: null,
     task_done: false,
     role_completed: [],
-    teams: [],
+    teams: values.getAll("dependency_team").map(value => String(value).trim()).filter(Boolean),
     states: [],
     check_all: false,
   };
   const type = String(values.get("trigger_type") || "manual");
-  const team = String(values.get("trigger_team") || "").trim();
   if (type === "interval") {
     const minutes = Number(values.get("interval_minutes"));
     settings.interval_minutes = Number.isFinite(minutes) ? minutes : null;
   } else if (type === "task_done") {
     settings.task_done = true;
-    if (team) settings.teams = [team];
   } else if (type === "role_completed") {
     const role = String(values.get("trigger_role") || "").trim().toUpperCase();
-    if (team) settings.teams = [team];
     if (role) settings.role_completed = [role];
   } else if (type === "task_state") {
     const taskState = String(values.get("trigger_state") || "").trim().toUpperCase();
-    if (team) settings.teams = [team];
     if (taskState) settings.states = [taskState];
   } else if (type === "check_all") {
     settings.check_all = true;
@@ -145,16 +141,14 @@ function configuredTriggerSettings(form, values) {
   }
   const merged = normalizedTriggerSettings(original);
   if (selectedType === "manual") return basic;
+  merged.teams = basic.teams;
   if (selectedType === "interval") merged.interval_minutes = basic.interval_minutes;
   else if (selectedType === "task_done") {
     merged.task_done = true;
-    merged.teams = basic.teams;
   } else if (selectedType === "role_completed") {
     merged.role_completed = basic.role_completed;
-    merged.teams = basic.teams;
   } else if (selectedType === "task_state") {
     merged.states = basic.states;
-    merged.teams = basic.teams;
   } else if (selectedType === "check_all") {
     merged.check_all = true;
     merged.interval_minutes = basic.interval_minutes;
@@ -175,9 +169,9 @@ function triggerTypeFromSettings(settings = {}) {
 
 const triggerFieldsByType = {
   interval: ["interval"],
-  task_done: ["task_team"],
-  role_completed: ["role_team", "role"],
-  task_state: ["state_team", "state"],
+  task_done: [],
+  role_completed: ["role"],
+  task_state: ["state"],
   check_all: ["interval"],
 };
 
@@ -276,8 +270,10 @@ function updateCreateSummary() {
 }
 
 function renderTriggerChoices(current) {
-  const activeWorkflowTasks = [...current.board.values()]
-    .filter(task => task.task_mode !== "independent" && ["WAITING", "RUNNING"].includes(task.status))
+  const workflowTasks = [...current.board.values()]
+    .filter(task => task.task_mode !== "independent");
+  const activeWorkflowTasks = workflowTasks
+    .filter(task => ["WAITING", "RUNNING"].includes(task.status))
     .sort((a, b) => String(a.team).localeCompare(String(b.team)));
   const taskSignature = JSON.stringify(activeWorkflowTasks.map(task => [
     task.team, task.task_id, task.status, task.task_title,
@@ -296,6 +292,29 @@ function renderTriggerChoices(current) {
     }
     roots.workflowTaskTeamOptions.replaceChildren(...options);
     roots.workflowTaskTeamOptions.dataset.signature = taskSignature;
+  }
+
+  const dependencyTasks = workflowTasks
+    .filter(task => ["RUNNING", "BLOCKED", "PAUSED"].includes(String(task.status || "").toUpperCase()))
+    .sort((a, b) => String(a.team).localeCompare(String(b.team)));
+  for (const select of document.querySelectorAll("[data-dependency-team-select]")) {
+    const selected = new Set([...select.selectedOptions].map(option => option.value));
+    const byTeam = new Map();
+    for (const task of dependencyTasks) {
+      const team = String(task.team || "").trim();
+      if (team && !byTeam.has(team)) byTeam.set(team, String(task.status || "").toUpperCase());
+    }
+    for (const team of selected) {
+      if (!byTeam.has(team)) {
+        const task = workflowTasks.find(item => String(item.team || "") === team);
+        byTeam.set(team, task ? `${String(task.status || "UNKNOWN").toUpperCase()} · saved` : "saved");
+      }
+    }
+    const signature = JSON.stringify([...byTeam.entries()]);
+    if (select.dataset.signature === signature) continue;
+    const options = [...byTeam.entries()].map(([team, status]) => new Option(`${team} · ${status}`, team, false, selected.has(team)));
+    select.replaceChildren(...options);
+    select.dataset.signature = signature;
   }
 
   const workflowAgents = (current.agents?.workflow || []).filter(agent => !agent.deleted_at);
@@ -369,7 +388,15 @@ function loadAgentEditor(value) {
     form.elements.trigger_type.value = triggerTypeFromSettings(settings);
     form.elements.max_cycles.value = Number.isFinite(Number(agent.max_cycles)) ? String(Number(agent.max_cycles)) : "0";
     form.elements.interval_minutes.value = settings.interval_minutes || "";
-    form.elements.trigger_team.value = (settings.teams || [])[0] || "";
+    const dependencySelect = form.elements.dependency_team;
+    for (const team of settings.teams || []) {
+      if (![...dependencySelect.options].some(option => option.value === team)) {
+        dependencySelect.add(new Option(`${team} · saved`, team));
+      }
+    }
+    for (const option of dependencySelect.options) {
+      option.selected = (settings.teams || []).includes(option.value);
+    }
     form.elements.trigger_role.value = (settings.role_completed || [])[0] || "";
     form.elements.trigger_state.value = (settings.states || [])[0] || "";
   } else {
@@ -454,7 +481,15 @@ function openAgentSettings(detail) {
   form.elements.max_cycles.value = Number.isFinite(Number(detail.agent?.max_cycles)) ? String(Number(detail.agent.max_cycles)) : "0";
   form.elements.trigger_type.value = triggerTypeFromSettings(settings);
   form.elements.interval_minutes.value = settings.interval_minutes || "";
-  form.elements.trigger_team.value = (settings.teams || [])[0] || "";
+  const dependencySelect = form.elements.dependency_team;
+  for (const team of settings.teams || []) {
+    if (![...dependencySelect.options].some(option => option.value === team)) {
+      dependencySelect.add(new Option(`${team} · saved`, team));
+    }
+  }
+  for (const option of dependencySelect.options) {
+    option.selected = (settings.teams || []).includes(option.value);
+  }
   form.elements.trigger_role.value = (settings.role_completed || [])[0] || "";
   form.elements.trigger_state.value = (settings.states || [])[0] || "RUNNING";
   rememberTriggerSettings(form, settings);
