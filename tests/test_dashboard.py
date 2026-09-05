@@ -458,7 +458,7 @@ def test_notify_frontend_contract_reuses_secondary_report_path_and_preserves_his
     assert 'if (current.drawer === "history") renderHistory(roots.secondaryContent, current);' in app
     assert 'if (current.drawer === "notify") renderNotify(roots.secondaryContent, current);' in app
     assert 'if (view === "notify") delete roots.secondaryContent.dataset.secondaryView;' in app
-    assert '/assets/app.js?v=20260901-dom-only' in html
+    assert '/assets/app.js?v=20260905-dependency-team-cards' in html
     assert './views/notify.js?v=20260812-notify-v2' in app
     assert 'data-notify-task-id' in notify
     assert 'workflowReportModel(detail, detail.active_role)' in notify
@@ -813,12 +813,15 @@ def test_create_task_role_selection_defaults_and_reuse_lock_are_explicit():
     assert 'input.disabled = locked || input.value === "PLAN"' in actions
 
 
-def test_parent_dependencies_render_exact_remove_actions_through_shared_command_path():
+def test_parent_dependencies_render_team_names_and_exact_remove_actions():
     app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
     detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
-    assert 'detail.depends_on_task_ids' in detail
-    assert '"Remove parent"' in detail
-    assert 'dataset.removeParent' in detail
+    assert 'const dependencies = detail.dependencies || []' in detail
+    assert 'if (!dependencies.length) return null' in detail
+    assert 'dependencies.length === 1 ? "Parent" : "Parents"' in detail
+    assert 'dependency.team || dependency.task_id' in detail
+    assert 'const remove = el("button", "Remove")' in detail
+    assert 'remove.dataset.removeParent = dependency.task_id' in detail
     assert '[data-remove-parent]' in app
     assert '/parents/${encodeURIComponent(parentTaskId)}/remove' in app
     assert 'kind: "remove_parent_dependency"' in app

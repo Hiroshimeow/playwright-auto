@@ -550,6 +550,42 @@ def test_projection_active_role_clock_uses_active_hop_creation_time(tmp_path: Pa
     assert projection.summary["active_role_running_elapsed_seconds"] is None
     assert projection.summary["active_role_running_since"] is None
 
+def test_projection_resolves_parent_dependency_team_names(tmp_path: Path):
+    raw = raw_task(tmp_path)
+    parent = raw_task(tmp_path)
+    parent["task_id"] = "parent-task-id"
+    parent["team"] = "human-readable-parent-team"
+    raw["depends_on_task_ids"] = ["parent-task-id"]
+
+    projection = build_task_projection(raw, tasks=[raw, parent])
+
+    assert projection.detail["dependencies"] == [
+        {"task_id": "parent-task-id", "team": "human-readable-parent-team"}
+    ]
+
+
+def test_projection_rewrites_waiting_dependency_ids_to_team_names(tmp_path: Path):
+    raw = raw_task(tmp_path)
+    raw.update(
+        status="WAITING",
+        waiting_code="dependency",
+        waiting_reason="Waiting for dependencies: parent-task-id",
+        waiting={"reason": "dependency", "since": raw["updated_at"]},
+    )
+    parent = raw_task(tmp_path)
+    parent["task_id"] = "parent-task-id"
+    parent["team"] = "human-readable-parent-team"
+
+    projection = build_task_projection(raw, tasks=[raw, parent])
+
+    assert projection.summary["waiting_reason"] == (
+        "Waiting for dependencies: human-readable-parent-team"
+    )
+    assert projection.summary["primary_problem"]["message"] == (
+        "Waiting for dependencies: human-readable-parent-team"
+    )
+
+
 def test_projection_summary_is_compact_and_deterministic(tmp_path: Path):
     raw = raw_task(tmp_path)
     first = build_task_projection(raw, tasks=[raw])

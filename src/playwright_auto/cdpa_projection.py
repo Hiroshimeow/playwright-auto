@@ -958,7 +958,16 @@ def build_task_projection(
         )
     maintenance_reports, maintenance_private = _maintenance_reports(raw)
     timeline = _timeline(raw)
+    public_waiting_reason = _public_text(raw.get("waiting_reason"), max_chars=500) or None
+    if public_waiting_reason:
+        for item in tasks:
+            dependency_task_id = str(item.get("task_id") or "")
+            dependency_team = str(item.get("team") or "")
+            if dependency_task_id and dependency_team and dependency_task_id in public_waiting_reason:
+                public_waiting_reason = public_waiting_reason.replace(dependency_task_id, dependency_team)
     problem = _problem(raw)
+    if problem is not None and str(problem.get("kind") or "") == "WAITING" and public_waiting_reason:
+        problem = {**problem, "message": public_waiting_reason}
     role_inputs, active_input = _role_inputs(raw)
     if independent is not None:
         role_inputs = {
@@ -1036,7 +1045,7 @@ def build_task_projection(
         "elapsed_end_at": elapsed_end_at,
         "availability": availability,
         "primary_problem": problem,
-        "waiting_reason": _public_text(raw.get("waiting_reason"), max_chars=500) or None,
+        "waiting_reason": public_waiting_reason,
         "block_code": raw.get("block_code"),
         "queue_position": queue.get("position"),
         "queue_length": queue.get("length"),
@@ -1194,6 +1203,23 @@ def build_task_projection(
         "independent_history": independent_history,
         "maintenance_reports": maintenance_reports,
         "depends_on_task_ids": [str(item) for item in raw.get("depends_on_task_ids") or []],
+        "dependencies": [
+            {
+                "task_id": dependency_id,
+                "team": str(dependency.get("team") or "") or dependency_id,
+            }
+            for dependency_id in [str(item) for item in raw.get("depends_on_task_ids") or []]
+            for dependency in [
+                next(
+                    (
+                        item
+                        for item in tasks
+                        if str(item.get("task_id") or "") == dependency_id
+                    ),
+                    {},
+                )
+            ]
+        ],
         "replaces_task_id": str(raw.get("replaces_task_id") or "") or None,
         "replacement_task_id": replacement_task_id,
         "immutable_history": bool(replacement_task_id),

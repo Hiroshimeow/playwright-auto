@@ -426,15 +426,17 @@ function workflowReports(detail, selectedRole, selectedReportUrl, reportBodies) 
 }
 
 function dependencySection(detail) {
+  const dependencies = detail.dependencies || [];
+  if (!dependencies.length) return null;
   const section = el("section", null, "detail-section");
-  section.append(el("h3", "Parents"));
+  section.append(el("h3", dependencies.length === 1 ? "Parent" : "Parents"));
   const list = el("div", null, "history-list");
-  for (const parentTaskId of detail.depends_on_task_ids || []) {
+  for (const dependency of dependencies) {
     const row = el("article", null, "history-card");
-    row.append(el("strong", parentTaskId));
-    const remove = el("button", "Remove parent");
+    row.append(el("strong", dependency.team || dependency.task_id));
+    const remove = el("button", "Remove");
     remove.type = "button";
-    remove.dataset.removeParent = parentTaskId;
+    remove.dataset.removeParent = dependency.task_id;
     remove.dataset.taskId = detail.task_id;
     remove.dataset.version = String(detail.version || 0);
     row.append(remove);
@@ -455,9 +457,8 @@ function workflowOverview(detail, timeline, selectedRole) {
     ["stop", "Stop"], ["clear_team", "Clear team"],
   ]) controls.append(button(action, label, detail));
   fragment.append(controls);
-  if ((detail.depends_on_task_ids || []).length) {
-    fragment.append(dependencySection(detail));
-  }
+  const dependencies = dependencySection(detail);
+  if (dependencies) fragment.append(dependencies);
 
   const taskSection = el("section", null, "detail-section task-goal-section");
   for (const block of taskGoalBlocks(detail)) {
