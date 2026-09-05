@@ -217,3 +217,96 @@ def test_packaged_entrypoint_uses_one_api_service_name():
     pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
     assert 'playwright-dashboard-api = "playwright_auto.dashboard_api:main"' in pyproject
     assert "cdpa-api =" not in pyproject
+
+
+def test_independent_cli_create_posts_dependency_teams(tmp_path: Path, monkeypatch):
+    posted = []
+    config = SimpleNamespace(
+        repository_root=tmp_path.resolve(),
+        dashboard_api_host="127.0.0.1",
+        dashboard_api_port=9225,
+        dashboard_url="http://127.0.0.1:9224",
+    )
+    monkeypatch.setattr(
+        cdpa_cli_module,
+        "load_cdpa_config",
+        lambda _path, *, repository_root: config,
+    )
+    monkeypatch.setattr(
+        cdpa_cli_module,
+        "_post",
+        lambda _config, path, payload, **_kwargs: posted.append((path, payload))
+        or {"command_id": "cmd-create", "status": "queued"},
+    )
+
+    assert cdpa_main([
+        "independent",
+        "create",
+        "--name",
+        "Scoped recovery",
+        "--system-prompt",
+        "Recover only configured teams.",
+        "--trigger",
+        "recovery",
+        "--dependency-team",
+        "team-a,team-b",
+        "--repository",
+        str(tmp_path),
+    ]) == 0
+
+    assert posted[0][0] == "/api/independent-agents"
+    assert posted[0][1]["trigger_settings"]["recovery"] is True
+    assert posted[0][1]["trigger_settings"]["teams"] == ["team-a", "team-b"]
+
+
+def test_independent_cli_config_merges_dependency_teams(tmp_path: Path, monkeypatch):
+    posted = []
+    config = SimpleNamespace(
+        repository_root=tmp_path.resolve(),
+        dashboard_api_host="127.0.0.1",
+        dashboard_api_port=9225,
+        dashboard_url="http://127.0.0.1:9224",
+    )
+    monkeypatch.setattr(
+        cdpa_cli_module,
+        "load_cdpa_config",
+        lambda _path, *, repository_root: config,
+    )
+    monkeypatch.setattr(
+        cdpa_cli_module,
+        "_read_json",
+        lambda _url, *, timeout: {
+            "agent": {
+                "trigger_settings": {
+                    "recovery": True,
+                    "interval_minutes": None,
+                    "daily_at": None,
+                    "task_done": False,
+                    "role_completed": [],
+                    "teams": ["old-team"],
+                    "states": [],
+                    "check_all": False,
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        cdpa_cli_module,
+        "_post",
+        lambda _config, path, payload, **_kwargs: posted.append((path, payload))
+        or {"command_id": "cmd-config", "task_id": "agent-scoped-g1", "status": "queued"},
+    )
+
+    assert cdpa_main([
+        "independent",
+        "config",
+        "agent-scoped-g1",
+        "--dependency-team",
+        "new-team",
+        "--repository",
+        str(tmp_path),
+    ]) == 0
+
+    assert posted[0][0] == "/api/independent-agents/agent-scoped-g1/settings"
+    assert posted[0][1]["trigger_settings"]["recovery"] is True
+    assert posted[0][1]["trigger_settings"]["teams"] == ["new-team"]

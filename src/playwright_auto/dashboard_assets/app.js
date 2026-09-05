@@ -269,6 +269,17 @@ function updateCreateSummary() {
   roots.createSummary.textContent = `${team} · ${roleCopy} · ${dependencyCopy}`;
 }
 
+function syncDependencyGroupToggles(container) {
+  for (const group of container.querySelectorAll("[data-dependency-state-group]")) {
+    const toggle = group.querySelector("[data-dependency-state-toggle]");
+    const inputs = [...group.querySelectorAll('input[name="dependency_team"]')];
+    if (!toggle) continue;
+    toggle.checked = inputs.length > 0 && inputs.every(input => input.checked);
+    toggle.indeterminate = inputs.some(input => input.checked) && !toggle.checked;
+    toggle.disabled = inputs.length === 0;
+  }
+}
+
 function renderTriggerChoices(current) {
   const workflowTasks = [...current.board.values()]
     .filter(task => task.task_mode !== "independent");
@@ -306,8 +317,10 @@ function renderTriggerChoices(current) {
       if (Number.isFinite(activityDelta) && activityDelta) return activityDelta;
       return String(a.team || "").localeCompare(String(b.team || ""));
     });
-  for (const select of document.querySelectorAll("[data-dependency-team-select]")) {
-    const selected = new Set([...select.selectedOptions].map(option => option.value));
+  for (const picker of document.querySelectorAll("[data-dependency-team-picker]")) {
+    const selected = new Set(
+      [...picker.querySelectorAll('input[name="dependency_team"]:checked')].map(input => input.value),
+    );
     const byTeam = new Map();
     for (const task of dependencyTasks) {
       const team = String(task.team || "").trim();
@@ -329,13 +342,61 @@ function renderTriggerChoices(current) {
     }
     const entries = [...byTeam.entries()];
     const signature = JSON.stringify(entries);
-    if (select.dataset.signature === signature) continue;
-    const options = entries.map(([team, meta]) => {
-      const activity = meta.updatedAt ? ` · ${meta.updatedAt}` : "";
-      return new Option(`${team} · ${meta.status}${activity}`, team, false, selected.has(team));
+    if (picker.dataset.signature === signature) continue;
+    const groups = ["RUNNING", "BLOCKED", "PAUSED"].map(status => {
+      const group = document.createElement("section");
+      group.className = "dependency-team-group";
+      group.dataset.dependencyStateGroup = status;
+
+      const header = document.createElement("label");
+      header.className = "dependency-team-group-header";
+      const toggle = document.createElement("input");
+      toggle.type = "checkbox";
+      toggle.dataset.dependencyStateToggle = status;
+      const title = document.createElement("strong");
+      title.textContent = status[0] + status.slice(1).toLowerCase();
+      header.append(toggle, title);
+
+      const row = document.createElement("div");
+      row.className = "dependency-team-group-row";
+      const matching = entries.filter(([, meta]) => meta.status === status);
+      for (const [team, meta] of matching) {
+        const label = document.createElement("label");
+        label.className = "dependency-team-option";
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.name = "dependency_team";
+        input.value = team;
+        input.checked = selected.has(team);
+        const body = document.createElement("span");
+        body.className = "dependency-team-copy";
+        const name = document.createElement("strong");
+        name.textContent = team;
+        const metaLine = document.createElement("span");
+        metaLine.className = "dependency-team-meta";
+        const activity = meta.updatedAt ? new Date(meta.updatedAt).toLocaleString() : "No recent activity";
+        metaLine.textContent = activity;
+        body.append(name, metaLine);
+        label.append(input, body);
+        row.append(label);
+      }
+      toggle.checked = matching.length > 0 && matching.every(([team]) => selected.has(team));
+      toggle.indeterminate = matching.some(([team]) => selected.has(team)) && !toggle.checked;
+      toggle.disabled = matching.length === 0;
+      group.append(header, row);
+      return group;
     });
-    select.replaceChildren(...options);
-    select.dataset.signature = signature;
+    const hiddenSelections = entries
+      .filter(([team, meta]) => selected.has(team) && !["RUNNING", "BLOCKED", "PAUSED"].includes(meta.status))
+      .map(([team]) => {
+        const input = document.createElement("input");
+        input.type = "hidden";
+        input.name = "dependency_team";
+        input.value = team;
+        return input;
+      });
+    picker.replaceChildren(...groups, ...hiddenSelections);
+    picker.dataset.signature = signature;
   }
 
   const workflowAgents = (current.agents?.workflow || []).filter(agent => !agent.deleted_at);
@@ -409,15 +470,10 @@ function loadAgentEditor(value) {
     form.elements.trigger_type.value = triggerTypeFromSettings(settings);
     form.elements.max_cycles.value = Number.isFinite(Number(agent.max_cycles)) ? String(Number(agent.max_cycles)) : "0";
     form.elements.interval_minutes.value = settings.interval_minutes || "";
-    const dependencySelect = form.elements.dependency_team;
-    for (const team of settings.teams || []) {
-      if (![...dependencySelect.options].some(option => option.value === team)) {
-        dependencySelect.add(new Option(`${team} · saved`, team));
-      }
+    for (const input of form.querySelectorAll('input[name="dependency_team"]')) {
+      input.checked = (settings.teams || []).includes(input.value);
     }
-    for (const option of dependencySelect.options) {
-      option.selected = (settings.teams || []).includes(option.value);
-    }
+    syncDependencyGroupToggles(form);
     form.elements.trigger_role.value = (settings.role_completed || [])[0] || "";
     form.elements.trigger_state.value = (settings.states || [])[0] || "";
   } else {
@@ -502,15 +558,10 @@ function openAgentSettings(detail) {
   form.elements.max_cycles.value = Number.isFinite(Number(detail.agent?.max_cycles)) ? String(Number(detail.agent.max_cycles)) : "0";
   form.elements.trigger_type.value = triggerTypeFromSettings(settings);
   form.elements.interval_minutes.value = settings.interval_minutes || "";
-  const dependencySelect = form.elements.dependency_team;
-  for (const team of settings.teams || []) {
-    if (![...dependencySelect.options].some(option => option.value === team)) {
-      dependencySelect.add(new Option(`${team} · saved`, team));
-    }
+  for (const input of form.querySelectorAll('input[name="dependency_team"]')) {
+    input.checked = (settings.teams || []).includes(input.value);
   }
-  for (const option of dependencySelect.options) {
-    option.selected = (settings.teams || []).includes(option.value);
-  }
+  syncDependencyGroupToggles(form);
   form.elements.trigger_role.value = (settings.role_completed || [])[0] || "";
   form.elements.trigger_state.value = (settings.states || [])[0] || "RUNNING";
   rememberTriggerSettings(form, settings);
@@ -1420,6 +1471,28 @@ roots.bootstrapSelect.addEventListener("change", () => {
 });
 roots.dependencyOptions.addEventListener("change", updateCreateSummary);
 roots.workflowAgentOptions.addEventListener("change", updateCreateSummary);
+
+document.addEventListener("change", event => {
+  const stateToggle = event.target.closest("[data-dependency-state-toggle]");
+  if (stateToggle) {
+    const group = stateToggle.closest("[data-dependency-state-group]");
+    for (const input of group?.querySelectorAll('input[name="dependency_team"]') || []) {
+      input.checked = stateToggle.checked;
+    }
+    stateToggle.indeterminate = false;
+    return;
+  }
+  const dependencyInput = event.target.closest('input[name="dependency_team"]');
+  if (dependencyInput) {
+    const group = dependencyInput.closest("[data-dependency-state-group]");
+    const toggle = group?.querySelector("[data-dependency-state-toggle]");
+    const inputs = [...(group?.querySelectorAll('input[name="dependency_team"]') || [])];
+    if (toggle && inputs.length) {
+      toggle.checked = inputs.every(input => input.checked);
+      toggle.indeterminate = inputs.some(input => input.checked) && !toggle.checked;
+    }
+  }
+});
 
 roots.agentSelect.addEventListener("change", () => loadAgentEditor(roots.agentSelect.value));
 roots.agentForm.elements.independent.addEventListener("change", updateBasicTriggerFields);

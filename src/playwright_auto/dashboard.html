@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>CDPA Control Center</title>
-  <link rel="stylesheet" href="/assets/dashboard.css?v=20260905-dependency-team-layout">
+  <link rel="stylesheet" href="/assets/dashboard.css?v=20260905-dependency-team-cards">
 </head>
 <body>
   <header class="app-header">
@@ -193,10 +193,11 @@
             <option value="recovery">Recovery</option>
           </select>
         </label>
-        <label>Dependency on team
-          <select name="dependency_team" multiple size="4" data-dependency-team-select></select>
+        <div class="dependency-team-field">
+          <span>Dependency on team</span>
+          <div class="dependency-team-picker" data-dependency-team-picker></div>
           <span class="form-help">Optional. Limits team-driven triggers to selected RUNNING, BLOCKED, or PAUSED teams.</span>
-        </label>
+        </div>
         <label>Max turns per job<input type="number" name="max_cycles" min="0" step="1" value="0" inputmode="numeric"><span class="form-help">0 means Unlimited.</span></label>
         <label data-trigger-field="interval">Interval minutes<input type="number" name="interval_minutes" min="20" step="1"></label>
         <label data-trigger-field="role">Workflow agent<select name="trigger_role" data-workflow-agent-select></select></label>
@@ -270,12 +271,13 @@
                 <option value="recovery">Recovery</option>
               </select>
             </label>
-            <label>Dependency on team
-              <select name="dependency_team" multiple size="7" data-dependency-team-select></select>
-              <span class="form-help">Optional. Limits team-driven triggers to selected RUNNING, BLOCKED, or PAUSED teams.</span>
-            </label>
           </div>
           <p id="independent-settings-trigger-help" class="form-help">Runs only when started manually.</p>
+          <div class="dependency-team-field">
+            <span>Dependency on team</span>
+            <div class="dependency-team-picker" data-dependency-team-picker></div>
+            <span class="form-help">Optional. Limits team-driven triggers to selected RUNNING, BLOCKED, or PAUSED teams.</span>
+          </div>
           <div class="agent-settings-trigger-fields">
             <label data-trigger-field="interval" hidden>Interval minutes
               <input type="number" name="interval_minutes" min="20" step="1" inputmode="numeric">
@@ -307,6 +309,6 @@
   <datalist id="workflow-task-team-options"></datalist>
 
   <div id="toast" class="toast" hidden role="status"></div>
-  <script type="module" src="/assets/app.js?v=20260905-dependency-team"></script>
+  <script type="module" src="/assets/app.js?v=20260905-dependency-team-cards"></script>
 </body>
 </html>

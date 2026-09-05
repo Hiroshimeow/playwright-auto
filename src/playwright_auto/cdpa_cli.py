@@ -147,6 +147,138 @@ def resume_task(
     )
 
 
+def _independent_trigger_settings(args: argparse.Namespace, *, base: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    settings = dict(base or {})
+    settings.setdefault("recovery", False)
+    settings.setdefault("interval_minutes", None)
+    settings.setdefault("daily_at", None)
+    settings.setdefault("task_done", False)
+    settings.setdefault("role_completed", [])
+    settings.setdefault("teams", [])
+    settings.setdefault("states", [])
+    settings.setdefault("check_all", False)
+
+    trigger = getattr(args, "trigger", None)
+    if trigger is not None:
+        settings.update(
+            recovery=False,
+            interval_minutes=None,
+            task_done=False,
+            role_completed=[],
+            states=[],
+            check_all=False,
+        )
+        if trigger == "recovery":
+            settings["recovery"] = True
+        elif trigger == "task-done":
+            settings["task_done"] = True
+        elif trigger == "role-completed":
+            role = str(getattr(args, "role", "") or "").strip().upper()
+            if not role:
+                raise ValueError("--role is required for --trigger role-completed")
+            settings["role_completed"] = [role]
+        elif trigger == "task-state":
+            state = str(getattr(args, "state", "") or "").strip().upper()
+            if not state:
+                raise ValueError("--state is required for --trigger task-state")
+            settings["states"] = [state]
+        elif trigger in {"interval", "check-all"}:
+            minutes = getattr(args, "interval_minutes", None)
+            if minutes is None:
+                raise ValueError(f"--interval-minutes is required for --trigger {trigger}")
+            settings["interval_minutes"] = int(minutes)
+            settings["check_all"] = trigger == "check-all"
+        elif trigger != "manual":
+            raise ValueError(f"unsupported independent trigger: {trigger}")
+
+    teams = parse_dependency_ids(getattr(args, "dependency_team", None))
+    if getattr(args, "clear_dependency_teams", False):
+        settings["teams"] = []
+    elif teams:
+        settings["teams"] = list(teams)
+    return settings
+
+
+def _independent_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="cdpa independent")
+    sub = parser.add_subparsers(dest="operation", required=True)
+
+    create = sub.add_parser("create", help="create an independent agent")
+    create.add_argument("--name", required=True)
+    create.add_argument("--system-prompt", required=True)
+    create.add_argument("--trigger", choices=("manual", "recovery", "task-done", "role-completed", "task-state", "interval", "check-all"), default="manual")
+    create.add_argument("--dependency-team", action="append", default=[], help="exact workflow team; repeat or comma-separate")
+    create.add_argument("--role")
+    create.add_argument("--state")
+    create.add_argument("--interval-minutes", type=int)
+    create.add_argument("--max-cycles", type=int, default=0)
+    create.add_argument("--persistent-chat", action="store_true", help="reuse chat instead of temporary chat")
+    create.add_argument("--repository", default=".")
+    create.add_argument("--config", default=None)
+
+    configure = sub.add_parser("config", help="update an existing independent agent")
+    configure.add_argument("task_id")
+    configure.add_argument("--dependency-team", action="append", default=[], help="replace dependency teams; repeat or comma-separate")
+    configure.add_argument("--clear-dependency-teams", action="store_true")
+    configure.add_argument("--trigger", choices=("manual", "recovery", "task-done", "role-completed", "task-state", "interval", "check-all"))
+    configure.add_argument("--role")
+    configure.add_argument("--state")
+    configure.add_argument("--interval-minutes", type=int)
+    configure.add_argument("--display-name")
+    configure.add_argument("--system-prompt")
+    configure.add_argument("--max-cycles", type=int)
+    configure.add_argument("--enable", action="store_true")
+    configure.add_argument("--disable", action="store_true")
+    configure.add_argument("--repository", default=".")
+    configure.add_argument("--config", default=None)
+    return parser
+
+
+def _run_independent_cli(raw: Sequence[str]) -> int:
+    args = _independent_parser().parse_args(list(raw))
+    repository = Path(args.repository).expanduser().resolve()
+    config = load_cdpa_config(args.config, repository_root=repository)
+    if args.operation == "create":
+        payload = {
+            "name": args.name,
+            "system_prompt": args.system_prompt,
+            "mode": "Independent",
+            "trigger_settings": _independent_trigger_settings(args),
+            "max_cycles": args.max_cycles,
+            "temporary_chat": not args.persistent_chat,
+        }
+        result = _post(config, "/api/independent-agents", payload, idempotency_key=str(uuid.uuid4()))
+    else:
+        if args.enable and args.disable:
+            raise ValueError("--enable and --disable are mutually exclusive")
+        detail = _read_json(f"{_api_base_url(config)}/api/tasks/{args.task_id}", timeout=10)
+        agent = detail.get("agent") if isinstance(detail.get("agent"), Mapping) else {}
+        current = agent.get("trigger_settings") if isinstance(agent.get("trigger_settings"), Mapping) else {}
+        payload: dict[str, Any] = {}
+        if args.trigger is not None or args.dependency_team or args.clear_dependency_teams:
+            payload["trigger_settings"] = _independent_trigger_settings(args, base=current)
+        if args.display_name is not None:
+            payload["display_name"] = args.display_name
+        if args.system_prompt is not None:
+            payload["system_prompt"] = args.system_prompt
+        if args.max_cycles is not None:
+            payload["max_cycles"] = args.max_cycles
+        if args.enable or args.disable:
+            payload["enabled"] = args.enable
+        if not payload:
+            raise ValueError("no independent agent setting was requested")
+        result = _post(
+            config,
+            f"/api/independent-agents/{args.task_id}/settings",
+            payload,
+            idempotency_key=str(uuid.uuid4()),
+        )
+    for key in ("command_id", "task_id", "status"):
+        if result.get(key) is not None:
+            print(f"{key}={result[key]}")
+    return 0
+
+
 def _runtime_commands(config: CDPAConfig) -> tuple[list[str], list[str], list[str]]:
     config_path = str(config.config_path)
     frontend = [
@@ -359,6 +491,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 repository=Path(args.repository).expanduser().resolve(),
                 config_path=args.config,
             )
+        if raw[0] == "independent":
+            return _run_independent_cli(raw[1:])
 
         args = build_parser().parse_args(raw)
         repository = (

@@ -476,15 +476,20 @@ def test_board_uses_operator_labels_run_task_and_restored_settings():
     assert "function configuredTriggerSettings(form, values)" in app
     assert app.count("configuredTriggerSettings(roots.agentForm, values)") == 1
     assert app.count("configuredTriggerSettings(roots.agentSettingsForm, values)") == 1
-    assert 'name="dependency_team" multiple' in create_form
-    assert html.count('data-dependency-team-select') == 2
+    assert html.count('data-dependency-team-picker') == 2
     assert 'RUNNING, BLOCKED, or PAUSED teams' in html
     assert 'values.getAll("dependency_team")' in app
     assert 'dependencyStatusRank = {RUNNING: 0, BLOCKED: 1, PAUSED: 2}' in app
     assert 'Date.parse(String(b.updated_at || "")) - Date.parse(String(a.updated_at || ""))' in app
     assert 'width: min(1120px, calc(100vw - 32px));' in css
-    assert 'minmax(420px, 1.6fr)' in css
-    assert 'multiple size="7" data-dependency-team-select' in html
+    assert 'grid-template-columns: minmax(0, 1fr) minmax(220px, 280px);' in css
+    assert 'grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));' in css
+    assert 'gap: 1mm;' in css
+    assert 'groups = ["RUNNING", "BLOCKED", "PAUSED"]' in app
+    assert 'data-dependency-state-toggle' in app
+    assert 'syncDependencyGroupToggles(form)' in app
+    assert 'input.name = "dependency_team"' in app
+    assert 'metaLine.className = "dependency-team-meta"' in app
     assert 'task_done: []' in app
     assert 'mode: "Independent"' in app
     assert 'form.elements.temporary_chat.checked = true' in app
@@ -497,6 +502,6 @@ def test_board_uses_operator_labels_run_task_and_restored_settings():
     assert 'body: {trigger_type: "manual", instruction}' in app
     assert '/api/independent-agents/${encodeURIComponent(taskId)}/reset' in app
     assert '.filter(item => !item.agent?.deleted_at)' in app
-    assert 'app.js?v=20260905-dependency-team' in html
-    assert 'dashboard.css?v=20260905-dependency-team-layout' in html
+    assert 'app.js?v=20260905-dependency-team-cards' in html
+    assert 'dashboard.css?v=20260905-dependency-team-cards' in html
     assert "new_chat_next_job" not in html[html.index('id="agent-settings-dialog"') :]

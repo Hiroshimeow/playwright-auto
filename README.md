@@ -181,6 +181,28 @@ Independent agents use the same manifest/task runtime but have one `AGENT` role 
 
 Built-in agents include Maintainers and Monitor. The runtime supports trigger-driven jobs, run-now jobs, bounded continuation cycles, repair creation, and exact-target controls. Recovery controls carry source task/event provenance and are rejected when the canonical event is stale.
 
+Independent agents can also be created and configured from the CLI, which is the preferred control surface for another agent or automation when the intended team scope is already known. Team dependencies are runtime trigger filters, not prompt hints: a team-driven event outside `trigger_settings.teams` is rejected before the independent job activates, avoiding a browser/model request that would only discover “no work” after reading the prompt. An empty team list means unrestricted team scope for team-driven triggers, so specify dependencies whenever an agent is intended to serve only particular teams.
+
+```bash
+# Create a Recovery agent scoped to two exact workflow teams.
+cdpa independent create \
+  --name "Scoped recovery" \
+  --system-prompt "Recover configured teams." \
+  --trigger recovery \
+  --dependency-team team-a \
+  --dependency-team team-b
+
+# Replace the dependency scope while preserving the current trigger settings.
+cdpa independent config <independent-task-id> \
+  --dependency-team team-x \
+  --dependency-team team-y
+
+# Intentionally restore unrestricted team scope.
+cdpa independent config <independent-task-id> --clear-dependency-teams
+```
+
+Run `cdpa independent create --help` or `cdpa independent config --help` for the complete trigger/configuration options.
+
 A recurring independent agent returns to `WAITING / waiting_trigger` after its job. Operator Pause/Stop/Restart/New Chat/Clear Team remains authoritative.
 
 ## Workflow agents
