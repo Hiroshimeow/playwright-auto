@@ -294,25 +294,46 @@ function renderTriggerChoices(current) {
     roots.workflowTaskTeamOptions.dataset.signature = taskSignature;
   }
 
+  const dependencyStatusRank = {RUNNING: 0, BLOCKED: 1, PAUSED: 2};
   const dependencyTasks = workflowTasks
-    .filter(task => ["RUNNING", "BLOCKED", "PAUSED"].includes(String(task.status || "").toUpperCase()))
-    .sort((a, b) => String(a.team).localeCompare(String(b.team)));
+    .filter(task => Object.hasOwn(dependencyStatusRank, String(task.status || "").toUpperCase()))
+    .sort((a, b) => {
+      const statusA = String(a.status || "").toUpperCase();
+      const statusB = String(b.status || "").toUpperCase();
+      const statusDelta = dependencyStatusRank[statusA] - dependencyStatusRank[statusB];
+      if (statusDelta) return statusDelta;
+      const activityDelta = Date.parse(String(b.updated_at || "")) - Date.parse(String(a.updated_at || ""));
+      if (Number.isFinite(activityDelta) && activityDelta) return activityDelta;
+      return String(a.team || "").localeCompare(String(b.team || ""));
+    });
   for (const select of document.querySelectorAll("[data-dependency-team-select]")) {
     const selected = new Set([...select.selectedOptions].map(option => option.value));
     const byTeam = new Map();
     for (const task of dependencyTasks) {
       const team = String(task.team || "").trim();
-      if (team && !byTeam.has(team)) byTeam.set(team, String(task.status || "").toUpperCase());
+      if (!team || byTeam.has(team)) continue;
+      byTeam.set(team, {
+        status: String(task.status || "").toUpperCase(),
+        updatedAt: String(task.updated_at || ""),
+      });
     }
     for (const team of selected) {
-      if (!byTeam.has(team)) {
-        const task = workflowTasks.find(item => String(item.team || "") === team);
-        byTeam.set(team, task ? `${String(task.status || "UNKNOWN").toUpperCase()} · saved` : "saved");
-      }
+      if (byTeam.has(team)) continue;
+      const task = workflowTasks
+        .filter(item => String(item.team || "") === team)
+        .sort((a, b) => Date.parse(String(b.updated_at || "")) - Date.parse(String(a.updated_at || "")))[0];
+      byTeam.set(team, {
+        status: task ? `${String(task.status || "UNKNOWN").toUpperCase()} · saved` : "saved",
+        updatedAt: String(task?.updated_at || ""),
+      });
     }
-    const signature = JSON.stringify([...byTeam.entries()]);
+    const entries = [...byTeam.entries()];
+    const signature = JSON.stringify(entries);
     if (select.dataset.signature === signature) continue;
-    const options = [...byTeam.entries()].map(([team, status]) => new Option(`${team} · ${status}`, team, false, selected.has(team)));
+    const options = entries.map(([team, meta]) => {
+      const activity = meta.updatedAt ? ` · ${meta.updatedAt}` : "";
+      return new Option(`${team} · ${meta.status}${activity}`, team, false, selected.has(team));
+    });
     select.replaceChildren(...options);
     select.dataset.signature = signature;
   }

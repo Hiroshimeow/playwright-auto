@@ -428,6 +428,7 @@ def test_temporary_completed_job_requests_immediate_close_and_next_trigger_is_fr
 def test_board_uses_operator_labels_run_task_and_restored_settings():
     html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
     app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
+    css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
     detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
     create_form = html[
         html.index('id="agent-form"') : html.index('id="agent-command-dialog"')
@@ -479,7 +480,11 @@ def test_board_uses_operator_labels_run_task_and_restored_settings():
     assert html.count('data-dependency-team-select') == 2
     assert 'RUNNING, BLOCKED, or PAUSED teams' in html
     assert 'values.getAll("dependency_team")' in app
-    assert '["RUNNING", "BLOCKED", "PAUSED"]' in app
+    assert 'dependencyStatusRank = {RUNNING: 0, BLOCKED: 1, PAUSED: 2}' in app
+    assert 'Date.parse(String(b.updated_at || "")) - Date.parse(String(a.updated_at || ""))' in app
+    assert 'width: min(1120px, calc(100vw - 32px));' in css
+    assert 'minmax(420px, 1.6fr)' in css
+    assert 'multiple size="7" data-dependency-team-select' in html
     assert 'task_done: []' in app
     assert 'mode: "Independent"' in app
     assert 'form.elements.temporary_chat.checked = true' in app
@@ -493,4 +498,5 @@ def test_board_uses_operator_labels_run_task_and_restored_settings():
     assert '/api/independent-agents/${encodeURIComponent(taskId)}/reset' in app
     assert '.filter(item => !item.agent?.deleted_at)' in app
     assert 'app.js?v=20260905-dependency-team' in html
+    assert 'dashboard.css?v=20260905-dependency-team-layout' in html
     assert "new_chat_next_job" not in html[html.index('id="agent-settings-dialog"') :]
