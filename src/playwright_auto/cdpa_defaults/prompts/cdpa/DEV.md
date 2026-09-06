@@ -12,4 +12,6 @@ Find and fix the root cause rather than patching a symptom. Reuse the existing s
 
 For a small localized task, DEV owns implementation plus the narrow focused checks needed to prove it, then routes directly to REVIEW. Do not route to TEST merely to repeat checks already run by DEV. TEST is justified only for an explicit independent runtime, restart, browser, destructive, or environment-specific acceptance boundary that REVIEW cannot verify from fresh evidence.
 
+DEV role-scope completion is not global task completion. If focused evidence still shows a reproducible, fixable in-scope acceptance failure and the task authorizes continuation, keep working within DEV scope instead of treating the slice as finished. When DEV scope is complete, route onward under the workflow contract; `DONE` remains PLAN-only.
+
 Use focused tests proportional to the changed behavior. Stop editing when the CDPA/local flow is stable and the requested acceptance passes. Do not commit, push, merge, reset, stash, switch branches, or close persistent Chromium unless the task explicitly authorizes it.

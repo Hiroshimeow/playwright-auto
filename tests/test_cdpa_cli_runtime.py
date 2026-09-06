@@ -98,6 +98,152 @@ def test_cli_no_longer_accepts_inline_report_flag():
         cdpa_cli_module.build_parser().parse_args(["task", "--inline-report"])
 
 
+@pytest.mark.parametrize(
+    "bootstrap_id",
+    ("g8-bootstrap", "thinkbook-bootstrap", "a5docker-bootstrap"),
+)
+def test_task_cli_forwards_explicit_bootstrap(
+    tmp_path: Path, monkeypatch, bootstrap_id: str
+):
+    captured = []
+    config = SimpleNamespace(
+        repository_root=tmp_path.resolve(),
+        dashboard_api_host="127.0.0.1",
+        dashboard_api_port=9225,
+        dashboard_url="http://127.0.0.1:9224",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cdpa_cli_module,
+        "load_cdpa_config",
+        lambda _path, *, repository_root: config,
+    )
+    monkeypatch.setattr(
+        cdpa_cli_module,
+        "submit_task",
+        lambda _config, **kwargs: captured.append(kwargs) or {"status": "queued"},
+    )
+
+    assert cdpa_main(["task", "--bootstrap", bootstrap_id]) == 0
+    assert len(captured) == 1
+    assert captured[0]["bootstrap_id"] == bootstrap_id
+
+
+def test_task_cli_fresh_forwards_explicit_null(tmp_path: Path, monkeypatch):
+    captured = []
+    config = SimpleNamespace(
+        repository_root=tmp_path.resolve(),
+        dashboard_api_host="127.0.0.1",
+        dashboard_api_port=9225,
+        dashboard_url="http://127.0.0.1:9224",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cdpa_cli_module,
+        "load_cdpa_config",
+        lambda _path, *, repository_root: config,
+    )
+    monkeypatch.setattr(
+        cdpa_cli_module,
+        "submit_task",
+        lambda _config, **kwargs: captured.append(kwargs) or {"status": "queued"},
+    )
+
+    assert cdpa_main(["task", "--fresh"]) == 0
+    assert captured[0]["bootstrap_id"] is None
+
+
+@pytest.mark.parametrize(
+    ("bootstrap_id", "expected"),
+    (("g8-bootstrap", "g8-bootstrap"), (None, None)),
+)
+def test_submit_task_forwards_explicit_bootstrap_selection(
+    tmp_path: Path, monkeypatch, bootstrap_id, expected
+):
+    payloads = []
+    config = SimpleNamespace(repository_root=tmp_path.resolve())
+    monkeypatch.setattr(
+        cdpa_cli_module,
+        "_post",
+        lambda _config, path, payload, **_kwargs: payloads.append((path, payload))
+        or {"status": "queued"},
+    )
+
+    cdpa_cli_module.submit_task(
+        config,
+        task="explicit bootstrap",
+        repository=None,
+        team=None,
+        new_roles=(),
+        new_all=False,
+        bootstrap_id=bootstrap_id,
+    )
+
+    assert payloads[0][0] == "/api/tasks"
+    assert payloads[0][1]["bootstrap_id"] == expected
+
+
+def test_submit_task_omits_bootstrap_when_cli_selection_is_omitted(
+    tmp_path: Path, monkeypatch
+):
+    payloads = []
+    config = SimpleNamespace(repository_root=tmp_path.resolve())
+    monkeypatch.setattr(
+        cdpa_cli_module,
+        "_post",
+        lambda _config, path, payload, **_kwargs: payloads.append((path, payload))
+        or {"status": "queued"},
+    )
+
+    cdpa_cli_module.submit_task(
+        config,
+        task="default bootstrap",
+        repository=None,
+        team=None,
+        new_roles=(),
+        new_all=False,
+    )
+
+    assert payloads[0][0] == "/api/tasks"
+    assert "bootstrap_id" not in payloads[0][1]
+
+
+def test_task_cli_bootstrap_and_fresh_are_mutually_exclusive():
+    with pytest.raises(SystemExit):
+        cdpa_cli_module.build_parser().parse_args(
+            ["task", "--bootstrap", "g8-bootstrap", "--fresh"]
+        )
+
+
+@pytest.mark.parametrize(
+    "selection",
+    (("--bootstrap", "g8-bootstrap"), ("--fresh",)),
+)
+def test_taskless_resume_rejects_bootstrap_change(
+    tmp_path: Path, monkeypatch, capsys, selection: tuple[str, ...]
+):
+    config = SimpleNamespace(
+        repository_root=tmp_path.resolve(),
+        dashboard_api_host="127.0.0.1",
+        dashboard_api_port=9225,
+        dashboard_url="http://127.0.0.1:9224",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cdpa_cli_module,
+        "load_cdpa_config",
+        lambda _path, *, repository_root: config,
+    )
+    monkeypatch.setattr(
+        cdpa_cli_module,
+        "resume_task",
+        lambda *_args, **_kwargs: pytest.fail("resume API must not be called"),
+    )
+
+    assert cdpa_main(["--team", "existing", *selection]) == 2
+    assert "--bootstrap and --fresh are invalid in taskless resume mode" in capsys.readouterr().err
+
+
 def test_cdpa_without_arguments_starts_three_service_runtime_for_current_repository(
     tmp_path: Path, monkeypatch
 ):

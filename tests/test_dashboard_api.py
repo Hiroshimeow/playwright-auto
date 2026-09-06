@@ -17,6 +17,11 @@ from playwright_auto.cdpa_runtime_db import RuntimeDB
 from playwright_auto.cdpa_store import TaskStore
 from playwright_auto.cdpa_worker import CDPAWorker
 from playwright_auto.dashboard_api import APIError, DashboardAPI, create_server
+from playwright_auto.observability import (
+    action_event_log_path,
+    append_action_event,
+    configure_action_event_log,
+)
 
 from test_cdpa_core import write_config
 from test_cdpa_independent_commands import fail_after
@@ -367,9 +372,26 @@ def test_board_etag_304_and_worker_offline_last_known_good(tmp_path: Path):
         with db.connection() as connection:
             command_count = connection.execute("SELECT COUNT(*) FROM command_queue").fetchone()[0]
 
+        old_action_log = action_event_log_path()
+        configure_action_event_log(tmp_path / "action-events.jsonl")
+        append_action_event(
+            "mcp_allow",
+            "complete",
+            page_url="https://chatgpt.com/c/11111111-1111-4111-8111-111111111111",
+            task_id="task-a",
+            detail="Allow mcp-g8 for this conversation",
+        )
         status, _headers, body = request(server, "GET", "/api/state")
         assert status == 200
-        assert json.loads(body)["settings"] == {"dom_only": False}
+        runtime_state = json.loads(body)
+        assert runtime_state["settings"] == {"dom_only": False}
+        assert runtime_state["auto_allow"] == {
+            "clicks": 1,
+            "by_tool": {"mcp-g8": 1},
+            "by_task": {"task-a": 1},
+            "latest_at": runtime_state["auto_allow"]["latest_at"],
+        }
+        configure_action_event_log(old_action_log)
 
         status, _headers, body = request(
             server, "POST", "/api/runtime/settings", body={"dom_only": True}
@@ -753,6 +775,7 @@ def test_independent_create_accepts_initial_triggers_and_preserves_idempotency(
         assert command["payload"]["trigger_settings"] == {
             "recovery": False,
             "interval_minutes": 20,
+            "daily_at": None,
             "task_done": True,
             "role_completed": ["DEV"],
             "teams": ["unused-team"],

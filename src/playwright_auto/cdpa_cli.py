@@ -17,6 +17,9 @@ from urllib.request import Request, urlopen
 from .cdpa_config import CDPAConfig, load_cdpa_config
 
 
+_BOOTSTRAP_UNSET = object()
+
+
 def parse_new_roles(value: str | None) -> tuple[str, ...]:
     if not value:
         return ()
@@ -109,6 +112,7 @@ def submit_task(
     reuse_team: str | None = None,
     depends_on_task_ids: Sequence[str] = (),
     upload_paths: Sequence[str | Path] = (),
+    bootstrap_id: str | None | object = _BOOTSTRAP_UNSET,
     idempotency_key: str | None = None,
 ) -> Mapping[str, Any]:
     payload = {
@@ -123,6 +127,8 @@ def submit_task(
     }
     if repository is not None:
         payload["repository"] = str(repository.expanduser().resolve())
+    if bootstrap_id is not _BOOTSTRAP_UNSET:
+        payload["bootstrap_id"] = bootstrap_id
     return _post(
         config,
         "/api/tasks",
@@ -436,6 +442,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--new", dest="new_roles", help="comma-separated roles reset lazily once")
     parser.add_argument("--new-all", action="store_true", help="reset every selected role lazily once")
     parser.add_argument("--team", default=None, help="new-task team base or exact team to resume")
+    bootstrap = parser.add_mutually_exclusive_group()
+    bootstrap.add_argument(
+        "--bootstrap",
+        dest="bootstrap_id",
+        default=_BOOTSTRAP_UNSET,
+        help="explicit bootstrap ID for a new task",
+    )
+    bootstrap.add_argument(
+        "--fresh",
+        dest="bootstrap_id",
+        action="store_const",
+        const=None,
+        help="start a new task with Fresh context instead of a bootstrap",
+    )
     parser.add_argument(
         "--reuse-team",
         default=None,
@@ -522,6 +542,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 upload_paths=tuple(
                     str(Path(path).expanduser().resolve()) for path in args.upload
                 ),
+                bootstrap_id=args.bootstrap_id,
             )
             mode = "created"
         else:
@@ -529,6 +550,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise ValueError("--reuse-team is invalid in taskless resume mode")
             if not args.team:
                 raise ValueError("taskless resume requires --team <exact-existing-team>")
+            if args.bootstrap_id is not _BOOTSTRAP_UNSET:
+                raise ValueError("--bootstrap and --fresh are invalid in taskless resume mode")
             if new_roles or args.new_all or dependencies or args.upload:
                 raise ValueError(
                     "--new, --new-all, --depends-on, and --upload are invalid in taskless resume mode"

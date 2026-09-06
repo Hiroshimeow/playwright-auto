@@ -1,0 +1,137 @@
+import asyncio
+
+import pytest
+from playwright.async_api import async_playwright
+
+from playwright_auto.chatgpt import (
+    ChatGPTPage,
+    MessageBaseline,
+    PageBinding,
+    SendReceipt,
+    inspect_chatgpt_wait_probe,
+    prompt_digest,
+)
+
+
+async def _with_page(body: str, callback):
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
+            executable_path="/snap/bin/chromium",
+            headless=True,
+        )
+        try:
+            page = await browser.new_page()
+            await page.set_content(body)
+            await page.evaluate(
+                """() => {
+                    window.name = '__PLAYWRIGHT_AUTO_BINDING__:' + JSON.stringify({
+                        role: 'DEV',
+                        pageId: 'page-1',
+                        taskId: 'task-1',
+                        team: 'team-1'
+                    });
+                }"""
+            )
+            return await callback(page)
+        finally:
+            await browser.close()
+
+
+def test_sparse_probe_detects_valid_mcp_allow_group_even_with_composer_present():
+    async def run(page):
+        probe = await inspect_chatgpt_wait_probe(page)
+        return probe
+
+    probe = asyncio.run(
+        _with_page(
+            """
+            <main>
+              <div contenteditable="true" role="textbox">draft</div>
+              <div id="permission-actions">
+                <button class="btn-primary" onclick="window.__mcpAllowClicks = (window.__mcpAllowClicks || 0) + 1"><span>Allow</span></button>
+                <button aria-label="Allow mcp-thinkbook for this conversation"></button>
+              </div>
+            </main>
+            """,
+            run,
+        )
+    )
+
+    assert probe.mcp_permission_allow_count == 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        """
+        <main>
+          <div><button class="btn-primary"><span>Allow</span></button></div>
+        </main>
+        """,
+        """
+        <main>
+          <div>
+            <button class="btn-primary"><span>Allow</span></button>
+            <button aria-label="Allow calendar access"></button>
+          </div>
+        </main>
+        """,
+        """
+        <main>
+          <div>
+            <button class="btn-primary"><span>Allow</span></button>
+            <button aria-label="Allow mcp-one for this conversation"></button>
+          </div>
+          <div>
+            <button class="btn-primary"><span>Allow</span></button>
+            <button aria-label="Allow mcp-two for this conversation"></button>
+          </div>
+        </main>
+        """,
+    ],
+)
+def test_sparse_probe_rejects_unrelated_or_ambiguous_allow(body):
+    async def run(page):
+        return await inspect_chatgpt_wait_probe(page)
+
+    probe = asyncio.run(_with_page(body, run))
+
+    assert probe.mcp_permission_allow_count != 1
+
+
+def test_wait_snapshot_auto_clicks_exact_mcp_allow_without_extra_poll_loop():
+    async def run(page):
+        client = ChatGPTPage(page, timeout_ms=5_000)
+        client.binding = PageBinding("page-1", "DEV")
+        receipt = SendReceipt(
+            prompt="probe",
+            prompt_sha256=prompt_digest("probe"),
+            binding=client.binding,
+            baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+            attempts=1,
+            accepted_via="exact_user_message",
+            session_id_before=None,
+            user_message_id="user-1",
+        )
+
+        await client.wait_snapshot(receipt)
+        click_count = await page.evaluate("window.__mcpAllowClicks || 0")
+        return click_count, client.wait_metrics["sparse_probes"]
+
+    click_count, sparse_probes = asyncio.run(
+        _with_page(
+            """
+            <main>
+              <div contenteditable="true" role="textbox"></div>
+              <div id="permission-actions">
+                <button class="btn-primary" onclick="window.__mcpAllowClicks = (window.__mcpAllowClicks || 0) + 1"><span>Allow</span></button>
+                <button aria-label="Allow mcp-thinkbook for this conversation"></button>
+              </div>
+            </main>
+            """,
+            run,
+        )
+    )
+
+    assert click_count == 1
+    assert sparse_probes == 1

@@ -12,4 +12,6 @@ Block only for a reproducible current CDPA/local-flow defect, data loss/corrupti
 
 Run the narrowest focused check that can prove or disprove each changed behavior. Reuse trustworthy fresh evidence when the relevant source has not changed. Normally perform at most one controlled reload/live check for each changed runtime boundary. Run a full suite, broad browser matrix, runtime benchmark, or destructive check only when the changed path or a concrete failure requires it.
 
+TEST role-scope completion is not global task completion. Route a reproducible, fixable in-scope acceptance failure to DEV; route a verified clean result to PLAN. Route `PAUSE` only for a concrete external/manual prerequisite no authorized in-task role can change. Final `DONE` remains PLAN-only.
+
 Stop when the required operational gates pass. Do not widen scope, invent requirements, exhaust combinatorial edge cases, or repeat an already-proven expensive boundary. Record unrelated robustness or product-hardening ideas as backlog. Do not edit implementation files.

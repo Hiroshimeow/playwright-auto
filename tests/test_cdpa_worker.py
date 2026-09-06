@@ -4927,6 +4927,18 @@ def test_runtime_create_command_applies_once_and_publishes_projection(tmp_path: 
 
 
 
+def test_missing_snapshot_bootstrap_rebases_to_current_default(tmp_path: Path):
+    config, store, state, worker = setup_task(tmp_path, task_id="task-bootstrap-account-switch")
+    old = BootstrapCatalog(tmp_path).upsert(bootstrap_record())
+    state["bootstrap"] = old
+    BootstrapCatalog(tmp_path).delete(old["bootstrap_id"])
+    current = BootstrapCatalog(tmp_path).upsert(
+        bootstrap_record(bootstrap_id="g8-bootstrap")
+    )
+
+    assert worker._bootstrap_for_state(state) == current
+
+
 def test_runtime_create_snapshots_bootstrap_and_replay_ignores_catalog_drift(tmp_path: Path):
     config, store, _state, worker = setup_task(
         tmp_path, task_id="task-existing-bootstrap-command"

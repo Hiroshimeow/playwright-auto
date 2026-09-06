@@ -25,7 +25,12 @@ from .cdpa_actions import (
     TeamCloseError,
     is_transient_page_lifecycle_error,
 )
-from .cdpa_bootstraps import BootstrapCatalog, normalize_bootstrap_donor, normalize_bootstrap_record
+from .cdpa_bootstraps import (
+    BootstrapCatalog,
+    normalize_bootstrap_donor,
+    normalize_bootstrap_record,
+    resolve_default_bootstrap_id,
+)
 from .cdpa_commands import (
     RepairRequest,
     WorkerCommand,
@@ -2563,9 +2568,13 @@ class CDPAWorker:
         bootstrap_id = str(snapshot.get("bootstrap_id") or "").strip()
         if not bootstrap_id:
             return None
-        current = BootstrapCatalog(self.config.repository_root).get(bootstrap_id)
-        if current is not None and current.get("enabled") is True:
-            return current
+        catalog = BootstrapCatalog(self.config.repository_root)
+        current = catalog.get(bootstrap_id)
+        if current is not None:
+            return current if current.get("enabled") is True else None
+        default_id = resolve_default_bootstrap_id(catalog)
+        if default_id is not None:
+            return catalog.get(default_id)
         try:
             normalized = normalize_bootstrap_record(snapshot)
         except ValueError:
@@ -3110,6 +3119,14 @@ class CDPAWorker:
             and independent.get("new_chat_deferred_task_id")
             != str(state.get("task_id") or "")
         ):
+            cooldown = self._rate_limit_cooldown
+            if (
+                isinstance(cooldown, Mapping)
+                and cooldown.get("state") == "released"
+                and cooldown.get("post_release_acquisition") == "in_progress"
+            ):
+                state["active_action"] = "rate_limit_cooldown"
+                return
             current = await actions.locate_owned(state, role)
             if current is None and self._rate_limit_gate_active():
                 state["active_action"] = "rate_limit_cooldown"
@@ -6010,13 +6027,11 @@ class CDPAWorker:
                     return
                 bootstrap = self._bootstrap_for_state(state)
                 if bootstrap is None and not isinstance(state.get("bootstrap"), Mapping):
-                    current_default = BootstrapCatalog(self.config.repository_root).get(
-                        "general-team-bootstrap"
-                    )
+                    catalog = BootstrapCatalog(self.config.repository_root)
+                    current_default_id = resolve_default_bootstrap_id(catalog)
                     bootstrap = (
-                        current_default
-                        if current_default is not None
-                        and current_default.get("enabled") is True
+                        catalog.get(current_default_id)
+                        if current_default_id is not None
                         else None
                     )
                 candidates = (

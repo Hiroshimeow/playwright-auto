@@ -125,6 +125,23 @@ def test_project_backend_schema_drift_fails_closed():
     asyncio.run(scenario())
 
 
+def test_clear_repository_projects_removes_account_scoped_mappings_only(tmp_path: Path):
+    store, _worker = make_worker(tmp_path)
+    repo_a = str((tmp_path / "a").resolve())
+    repo_b = str((tmp_path / "b").resolve())
+    store.set_repository_project(repo_a, "g-p-a")
+    store.set_repository_project(repo_b, "g-p-b")
+    before = json.loads(store.catalog_path.read_text())
+
+    removed = store.clear_repository_projects()
+
+    assert removed == 2
+    assert store.repository_projects() == {}
+    after = json.loads(store.catalog_path.read_text())
+    assert after["entries"] == before["entries"]
+    assert after["created_at"] == before["created_at"]
+
+
 def test_repository_project_catalog_round_trip_preserves_unrelated_keys(tmp_path: Path):
     store, _worker = make_worker(tmp_path)
     state = store.create_task("x", requested_team="alpha", task_id="task-a")

@@ -376,6 +376,19 @@ class TaskStore(IndependentAgentStoreMixin):
             catalog["repository_projects"] = projects
             self._write_catalog_unlocked(catalog)
 
+    def clear_repository_projects(self) -> int:
+        with exclusive_file_lock(self.allocation_lock):
+            catalog = self._load_catalog_unlocked(reconcile=False)
+            projects = catalog.get("repository_projects", {})
+            if not isinstance(projects, dict):
+                raise ValueError("CDPA catalog repository_projects must be an object")
+            removed = len(projects)
+            if not removed:
+                return 0
+            catalog["repository_projects"] = {}
+            self._write_catalog_unlocked(catalog)
+            return removed
+
     def _catalog_record_associates_team(
         self,
         key: str,
@@ -1810,6 +1823,8 @@ class TaskStore(IndependentAgentStoreMixin):
                     raise ValueError(
                         "dependency change requires an explicit dependency mutation"
                     )
+                if candidate == original:
+                    return original
                 before_status = str(original.get("status") or "").upper()
                 after_status = str(candidate.get("status") or "").upper()
                 transition_at = utc_now()

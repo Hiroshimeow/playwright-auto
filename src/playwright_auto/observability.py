@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,6 +60,47 @@ def append_action_event(
     finally:
         os.close(descriptor)
     return payload
+
+
+def mcp_allow_click_summary(path: str | Path | None = None) -> dict[str, Any]:
+    target = Path(path) if path is not None else _ACTION_EVENT_LOG
+    summary: dict[str, Any] = {
+        "clicks": 0,
+        "by_tool": {},
+        "by_task": {},
+        "latest_at": None,
+    }
+    if not target.exists():
+        return summary
+    tool_pattern = re.compile(r"\bAllow\s+(mcp-[A-Za-z0-9._-]+)\s+for this conversation\b", re.I)
+    for line in target.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        page_url = str(event.get("page_url") or "")
+        if (
+            event.get("action") != "mcp_allow"
+            or event.get("phase") != "complete"
+            or not page_url.startswith(("https://chatgpt.com/", "https://www.chatgpt.com/"))
+        ):
+            continue
+        summary["clicks"] += 1
+        detail = str(event.get("detail") or "")
+        match = tool_pattern.search(detail)
+        tool = match.group(1).lower() if match else "unknown"
+        summary["by_tool"][tool] = int(summary["by_tool"].get(tool, 0)) + 1
+        task_id = str(event.get("task_id") or "").strip()
+        if task_id:
+            summary["by_task"][task_id] = int(summary["by_task"].get(task_id, 0)) + 1
+        at = str(event.get("at") or "").strip()
+        if at:
+            summary["latest_at"] = at
+    summary["by_tool"] = dict(sorted(summary["by_tool"].items()))
+    summary["by_task"] = dict(sorted(summary["by_task"].items()))
+    return summary
 
 
 def read_recent_action_events(

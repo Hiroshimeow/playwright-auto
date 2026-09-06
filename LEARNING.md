@@ -43,6 +43,8 @@ Reusable lessons for CDPA teams. Read before starting a task. Add only evidence-
 
 ## Reports and state
 
+- When executable policy can resolve from repository-local overrides or packaged defaults, test every supported resolution mode at generation zero and assert every derived asset exists. Keep intentional overrides explicit; do not rely on an untested mirror convention.
+
 - Large role reports belong in independent Markdown files. Cross-role handoffs reference the exact source report path, while the worker keeps the exact next output path internal and exposes only the generic naming rule. Invalid route JSON is repaired in the same role at most three times before blocking.
 - Build agent prompts from one explicit physical-role allowlist: title, task ID, team, role, source role, turn, workspace, allowed logical routes, goal, and handoff. Do not serialize team rosters, manifests, or transport records; they leak redundant state and browser/controller metadata.
 - Prompt contract tests must inspect the final composer/send payload and persisted receipt, not only `PromptBuilder` output; a shared durable layer can otherwise append forbidden transport markers after prompt construction.

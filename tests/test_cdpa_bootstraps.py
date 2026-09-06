@@ -7,7 +7,11 @@ from pathlib import Path
 import pytest
 
 import playwright_auto.cdpa_bootstraps as bootstrap_module
-from playwright_auto.cdpa_bootstraps import BootstrapCatalog, normalize_bootstrap_record
+from playwright_auto.cdpa_bootstraps import (
+    BootstrapCatalog,
+    normalize_bootstrap_record,
+    resolve_default_bootstrap_id,
+)
 
 
 CONVERSATION_ID = "6a7454dd-2aa4-83e8-9531-18a1e82551d0"
@@ -38,6 +42,19 @@ def test_missing_catalog_is_empty_without_creating_file(tmp_path: Path):
     assert catalog.list() == []
     assert catalog.get("missing") is None
     assert not (tmp_path / ".runtime" / "cdpa-bootstraps.json").exists()
+
+
+def test_default_bootstrap_prefers_g8_and_keeps_legacy_fallback(tmp_path: Path):
+    catalog = BootstrapCatalog(tmp_path)
+    catalog.upsert(valid_record("general-team-bootstrap"))
+
+    assert resolve_default_bootstrap_id(catalog) == "general-team-bootstrap"
+
+    catalog.upsert(valid_record("g8-bootstrap", name="G8 bootstrap"))
+    assert resolve_default_bootstrap_id(catalog) == "g8-bootstrap"
+
+    catalog.disable("g8-bootstrap")
+    assert resolve_default_bootstrap_id(catalog) == "general-team-bootstrap"
 
 
 def test_normalize_legacy_bootstrap_record_migrates_to_unified_donor_defaults():

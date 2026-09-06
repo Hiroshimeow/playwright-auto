@@ -89,6 +89,7 @@ def test_create_independent_agent_command_is_idempotent(tmp_path: Path):
     assert agents[0]["independent"]["trigger_settings"] == {
         "recovery": False,
         "interval_minutes": None,
+        "daily_at": None,
         "task_done": True,
         "role_completed": [],
         "teams": ["unused-team"],
@@ -366,6 +367,7 @@ def test_dashboard_normalizes_independent_creation_completion_activation_repair_
         "trigger_settings": {
             "recovery": False,
             "interval_minutes": 20,
+            "daily_at": None,
             "task_done": False,
             "role_completed": ["DEV"],
             "teams": [],

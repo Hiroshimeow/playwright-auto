@@ -14,7 +14,11 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from .cdpa_bootstraps import BootstrapCatalog, normalize_bootstrap_record
+from .cdpa_bootstraps import (
+    BootstrapCatalog,
+    normalize_bootstrap_record,
+    resolve_default_bootstrap_id,
+)
 from .cdpa_commands import RepairRequest
 from .cdpa_config import CDPAConfig, declared_repository_from_task, load_cdpa_config
 from .cdpa_identity import generate_idempotent_task_id, validate_task_id
@@ -28,6 +32,7 @@ from .cdpa_independent import (
 )
 from .cdpa_routes import effective_report_mode
 from .cdpa_runtime_db import IdempotencyConflict, RuntimeDB, RuntimeDBError
+from .observability import mcp_allow_click_summary
 from .cdpa_workflow_agents import (
     normalize_workflow_display_name,
     ordered_system_routes,
@@ -181,8 +186,7 @@ class DashboardAPI:
         return value
 
     def _default_bootstrap_id(self) -> str | None:
-        record = BootstrapCatalog(self.config.repository_root).get("general-team-bootstrap")
-        return "general-team-bootstrap" if record and record.get("enabled") is True else None
+        return resolve_default_bootstrap_id(BootstrapCatalog(self.config.repository_root))
 
     def _active_workflow_routes(self) -> tuple[str, ...]:
         snapshot = self.db.get_snapshot("agents")
@@ -967,6 +971,7 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                             and settings["payload"].get("dom_only") is True
                         )
                     },
+                    "auto_allow": mcp_allow_click_summary(),
                     **app.worker_health(),
                 },
             )

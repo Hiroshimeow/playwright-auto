@@ -924,6 +924,7 @@ class WaitProbe:
     error_texts: tuple[str, ...]
     blocking_dialogs: tuple[str, ...]
     choice_prompt_labels: tuple[str, ...]
+    mcp_permission_allow_count: int
     last_user_message_id: str | None
     last_user_turn_id: str | None
     last_assistant_message_id: str | None
@@ -972,6 +973,7 @@ class WaitProbe:
             "error_texts": list(self.error_texts),
             "blocking_dialogs": list(self.blocking_dialogs),
             "choice_prompt_labels": list(self.choice_prompt_labels),
+            "mcp_permission_allow_count": self.mcp_permission_allow_count,
             "last_user_message_id": self.last_user_message_id,
             "last_user_turn_id": self.last_user_turn_id,
             "last_assistant_message_id": self.last_assistant_message_id,
@@ -1001,6 +1003,7 @@ class WaitProbe:
                 list(self.error_texts),
                 list(self.blocking_dialogs),
                 list(self.choice_prompt_labels),
+                self.mcp_permission_allow_count,
                 self.last_user_message_id,
                 self.last_user_turn_id,
                 self.last_assistant_message_id,
@@ -2078,6 +2081,97 @@ async def click_safe_choice_prompt(page: Any) -> str:
     return str(result.get("label") or "safe choice")
 
 
+async def click_mcp_permission_allow(
+    page: Any,
+    *,
+    expected_page_id: str,
+    expected_role: str,
+    expected_task_id: str | None,
+    expected_team: str | None,
+) -> str:
+    result = await page.evaluate(
+        r"""([expectedPageId, expectedRole, expectedTaskId, expectedTeam, roleKey, pageIdKey, taskIdKey, teamKey, windowNamePrefix]) => {
+          const visible = (element) => Boolean(
+            element && window.getComputedStyle(element).visibility !== 'hidden' &&
+            (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
+          );
+          const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+          const mcpConversationAllow = /^Allow mcp-[A-Za-z0-9._-]+ for this conversation$/i;
+          let pageRole = null;
+          let pageId = null;
+          let pageTaskId = null;
+          let pageTeam = null;
+          try {
+            pageRole = sessionStorage.getItem(roleKey);
+            pageId = sessionStorage.getItem(pageIdKey);
+            pageTaskId = sessionStorage.getItem(taskIdKey);
+            pageTeam = sessionStorage.getItem(teamKey);
+          } catch (_) {}
+          if (window.name?.startsWith(windowNamePrefix)) {
+            try {
+              const binding = JSON.parse(window.name.slice(windowNamePrefix.length));
+              pageRole = pageRole || binding.role || null;
+              pageId = pageId || binding.pageId || null;
+              pageTaskId = pageTaskId || binding.taskId || null;
+              pageTeam = pageTeam || binding.team || null;
+            } catch (_) {}
+          }
+          if (
+            pageId !== expectedPageId || pageRole !== expectedRole ||
+            (pageTaskId || null) !== (expectedTaskId || null) ||
+            (pageTeam || null) !== (expectedTeam || null)
+          ) {
+            return {ok: false, method: 'ownership_conflict'};
+          }
+          const candidates = [...document.querySelectorAll('button')]
+            .map((primary) => {
+              if (
+                !visible(primary) || primary.disabled ||
+                primary.getAttribute('aria-disabled') === 'true' ||
+                !primary.closest('main,[role="dialog"],[data-testid^="modal-"]')
+              ) return null;
+              const primaryLabel = normalize(primary.innerText || primary.textContent || primary.getAttribute('aria-label'));
+              if (primaryLabel !== 'Allow') return null;
+              const group = primary.parentElement;
+              if (!group) return null;
+              const permissionControls = [...group.querySelectorAll('button[aria-label]')]
+                .filter((button) =>
+                  button !== primary && visible(button) && !button.disabled &&
+                  button.getAttribute('aria-disabled') !== 'true' &&
+                  mcpConversationAllow.test(normalize(button.getAttribute('aria-label')))
+                );
+              return permissionControls.length === 1
+                ? {primary, permissionLabel: normalize(permissionControls[0].getAttribute('aria-label'))}
+                : null;
+            })
+            .filter(Boolean);
+          if (candidates.length !== 1) {
+            return {ok: false, method: 'permission_conflict', count: candidates.length};
+          }
+          candidates[0].primary.click();
+          return {ok: true, label: 'Allow', permission_label: candidates[0].permissionLabel};
+        }""",
+        [
+            expected_page_id,
+            expected_role,
+            expected_task_id,
+            expected_team,
+            ROLE_STORAGE_KEY,
+            PAGE_ID_STORAGE_KEY,
+            TASK_ID_STORAGE_KEY,
+            TEAM_STORAGE_KEY,
+            WINDOW_NAME_PREFIX,
+        ],
+    )
+    if not result.get("ok"):
+        if result.get("method") == "ownership_conflict":
+            raise PageOwnershipError("page ownership changed before MCP permission Allow click")
+        raise UnsafePageStateError("MCP permission Allow is missing or ambiguous")
+    detail = str(result.get("permission_label") or "MCP permission")
+    await record_page_action(page, "mcp_allow", "complete", detail=detail)
+    return str(result.get("label") or "Allow")
+
+
 async def send_prompt(
     page: Any, text: str, timeout_ms: int = 8_000, wait_for_stop: bool = True
 ) -> None:
@@ -2322,11 +2416,37 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             if ([textLabel, ariaLabel, testId].some((label) => negativeChoice.test(label))) return '';
             return [textLabel, ariaLabel].find((label) => positiveChoice.test(label)) || '';
           };
+          const normalizeLabel = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+          const mcpConversationAllow = /^Allow mcp-[A-Za-z0-9._-]+ for this conversation$/i;
+          const mcpPermissionGroups = [...document.querySelectorAll('button')]
+            .map((primary) => {
+              if (
+                !visible(primary) || primary.disabled ||
+                primary.getAttribute('aria-disabled') === 'true' ||
+                !primary.closest('main,[role="dialog"],[data-testid^="modal-"]')
+              ) return null;
+              const primaryLabel = normalizeLabel(primary.innerText || primary.textContent || primary.getAttribute('aria-label'));
+              if (primaryLabel !== 'Allow') return null;
+              const group = primary.parentElement;
+              if (!group) return null;
+              const permissionControls = [...group.querySelectorAll('button[aria-label]')]
+                .filter((button) =>
+                  button !== primary && visible(button) && !button.disabled &&
+                  button.getAttribute('aria-disabled') !== 'true' &&
+                  mcpConversationAllow.test(normalizeLabel(button.getAttribute('aria-label')))
+                );
+              return permissionControls.length === 1 ? {primary, permission: permissionControls[0]} : null;
+            })
+            .filter(Boolean);
+          const mcpPermissionControls = new Set(
+            mcpPermissionGroups.flatMap(({primary, permission}) => [primary, permission])
+          );
           const choices = composer ? [] : [...document.querySelectorAll('button,[role="button"]')]
             .filter((element) =>
               visible(element) && !element.disabled &&
               element.getAttribute('aria-disabled') !== 'true' &&
               !element.closest(overlaySelector) &&
+              !mcpPermissionControls.has(element) &&
               Boolean(element.closest('main,[role="dialog"],[data-testid^="modal-"]'))
             )
             .map(choiceLabel)
@@ -2370,6 +2490,7 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             error_texts: errors,
             blocking_dialogs: dialogs,
             choice_prompt_labels: [...new Set(choices)],
+            mcp_permission_allow_count: mcpPermissionGroups.length,
             last_user_message_id: userIdentity.messageId,
             last_user_turn_id: userIdentity.turnId,
             last_assistant_message_id: assistantIdentity.messageId,
@@ -2396,6 +2517,7 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             probe.error_texts,
             probe.blocking_dialogs,
             probe.choice_prompt_labels,
+            probe.mcp_permission_allow_count,
             probe.last_user_message_id,
             probe.last_user_turn_id,
             probe.last_assistant_message_id,
@@ -2417,6 +2539,7 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
               '[role="alert"]',
               '[role="dialog"]',
               '[data-testid^="modal-"]',
+              'button[aria-label^="Allow mcp-"]',
               '[data-filename]',
               '[data-file-name]',
             ].join(',');
@@ -2428,7 +2551,7 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
               if (mutation.type === 'attributes') {
                 return [
                   'data-streaming-response-status', 'data-message-id', 'data-turn-id',
-                  'contenteditable', 'aria-disabled', 'data-testid', 'role',
+                  'contenteditable', 'aria-disabled', 'aria-label', 'data-testid', 'role',
                   'data-filename', 'data-file-name',
                 ].includes(mutation.attributeName || '');
               }
@@ -2459,7 +2582,7 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
               attributes: true,
               attributeFilter: [
                 'data-streaming-response-status', 'data-message-id', 'data-turn-id',
-                'contenteditable', 'aria-disabled', 'data-testid', 'role',
+                'contenteditable', 'aria-disabled', 'aria-label', 'data-testid', 'role',
                 'data-filename', 'data-file-name',
               ],
             });
@@ -2523,6 +2646,7 @@ async def inspect_chatgpt_wait_probe(
         error_texts=tuple(str(value) for value in raw.get("error_texts") or ()),
         blocking_dialogs=tuple(str(value) for value in raw.get("blocking_dialogs") or ()),
         choice_prompt_labels=tuple(str(value) for value in raw.get("choice_prompt_labels") or ()),
+        mcp_permission_allow_count=max(0, int(raw.get("mcp_permission_allow_count") or 0)),
         last_user_message_id=(str(raw["last_user_message_id"]) if raw.get("last_user_message_id") else None),
         last_user_turn_id=(str(raw["last_user_turn_id"]) if raw.get("last_user_turn_id") else None),
         last_assistant_message_id=(str(raw["last_assistant_message_id"]) if raw.get("last_assistant_message_id") else None),
@@ -3182,6 +3306,9 @@ class ChatGPTPage:
             )
             self._wait_metrics["sparse_probes"] += 1
             self._assert_wait_probe_ownership(probe)
+            if probe.mcp_permission_allow_count == 1:
+                await self.approve_mcp_permission_allow(probe)
+                probe = replace(probe, mcp_permission_allow_count=0)
         except (AuthenticationRequiredError, PageOwnershipError):
             raise
         except Exception:
@@ -3217,6 +3344,7 @@ class ChatGPTPage:
                     error_texts=full.error_texts,
                     blocking_dialogs=full.blocking_dialogs,
                     choice_prompt_labels=full.choice_prompt_labels,
+                    mcp_permission_allow_count=0,
                     last_user_message_id=next((item.message_id for item in reversed(full.messages) if item.role == "user"), None),
                     last_user_turn_id=next((item.turn_id for item in reversed(full.messages) if item.role == "user"), None),
                     last_assistant_message_id=next((item.message_id for item in reversed(full.messages) if item.role == "assistant"), None),
@@ -3367,6 +3495,20 @@ class ChatGPTPage:
             if rate_limit_dialogs(confirmed):
                 raise RateLimitBlockedError("request rate limit remained after safe dismiss")
             return result
+
+    async def approve_mcp_permission_allow(self, probe: WaitProbe) -> str:
+        if probe.mcp_permission_allow_count != 1:
+            raise UnsafePageStateError("MCP permission Allow is missing or ambiguous")
+        async with self.mutation_guard():
+            self._assert_wait_probe_ownership(probe)
+            assert self.binding is not None
+            return await click_mcp_permission_allow(
+                self.page,
+                expected_page_id=self.binding.page_id,
+                expected_role=self.binding.role,
+                expected_task_id=probe.page_task_id,
+                expected_team=probe.page_team,
+            )
 
     async def resolve_choice_prompt(
         self, *, timeout_ms: int | None = None
