@@ -4488,6 +4488,7 @@ class ChatGPTPage:
         receipt: SendReceipt,
         *,
         allowed_connectors: Sequence[str],
+        expected_target_message_id: str | None = None,
     ) -> dict[str, str]:
         if receipt.user_message_id is None:
             raise UnsafePageStateError("MCP permission approval requires exact accepted user identity")
@@ -4502,6 +4503,7 @@ class ChatGPTPage:
             expected_user_message_id=receipt.user_message_id,
             allowed_connectors=allowed_connectors,
             dispatch=False,
+            expected_target_message_id=expected_target_message_id,
         )
 
     async def approve_mcp_permission_allow(

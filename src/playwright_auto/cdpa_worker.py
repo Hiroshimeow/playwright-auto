@@ -3979,11 +3979,17 @@ class CDPAWorker:
         if not all(callable(item) for item in (current_probe, inspect_allow, approve_allow)):
             return False
         allowed_connectors = _authorized_mcp_connectors(receipt.prompt)
+        passive_target_message_id = (
+            str(passive_action.get("target_message_id") or "").strip()
+            if isinstance(passive_action, Mapping)
+            else ""
+        )
         probe = await current_probe()
         offered = await inspect_allow(
             probe,
             receipt,
             allowed_connectors=allowed_connectors,
+            expected_target_message_id=passive_target_message_id or None,
         )
         target_message_id = str(offered.get("target_message_id") or "").strip()
         if not target_message_id:

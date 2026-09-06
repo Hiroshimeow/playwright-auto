@@ -320,8 +320,22 @@ def test_mcp_allow_interrupt_waits_five_seconds_then_dispatches_exact_react_acti
         async def current_wait_probe(self):
             return SimpleNamespace(page_task_id="task-listen-auto-allow")
 
-        async def inspect_mcp_permission_allow(self, probe, exact_receipt, *, allowed_connectors):
-            calls.append(("inspect", tuple(allowed_connectors), exact_receipt.prompt))
+        async def inspect_mcp_permission_allow(
+            self,
+            probe,
+            exact_receipt,
+            *,
+            allowed_connectors,
+            expected_target_message_id=None,
+        ):
+            calls.append(
+                (
+                    "inspect",
+                    tuple(allowed_connectors),
+                    exact_receipt.prompt,
+                    expected_target_message_id,
+                )
+            )
             return {"method": "offered", "target_message_id": "call-1", "remember_answer": "true"}
 
         async def approve_mcp_permission_allow(
@@ -340,7 +354,7 @@ def test_mcp_allow_interrupt_waits_five_seconds_then_dispatches_exact_react_acti
 
     assert handled is True
     assert calls == [
-        ("inspect", ("mcp-g8",), "use authorized mcp-g8 connector"),
+        ("inspect", ("mcp-g8",), "use authorized mcp-g8 connector", "call-1"),
         ("approve", ("mcp-g8",), "call-1"),
         ("cleared",),
     ]
