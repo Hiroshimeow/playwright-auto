@@ -168,6 +168,43 @@ def setup_task(
     return config, store, state, CDPAWorker(config, store=store)
 
 
+def test_ambient_page_automation_uses_workspace_timeout_config(tmp_path: Path, monkeypatch):
+    config, _store, _state, worker = setup_task(
+        tmp_path, task_id="task-ambient-timeout-config"
+    )
+    seen_timeouts = []
+
+    class Page:
+        url = "https://chatgpt.com/c/ambient"
+
+        def is_closed(self):
+            return False
+
+        async def evaluate(self, _script):
+            return worker_module.WINDOW_NAME_PREFIX + "{}"
+
+    class Client:
+        def __init__(self, _page, *, timeout_ms):
+            seen_timeouts.append(timeout_ms)
+
+        def install_ambient_observer(self):
+            return None
+
+        async def read_wait_probe(self):
+            return SimpleNamespace(stop_visible=False, last_assistant_message_id=None)
+
+        def ambient_permission_action(self):
+            return None
+
+        async def mcp_allow_visible(self):
+            return False
+
+    monkeypatch.setattr(worker_module, "ChatGPTPage", Client)
+    asyncio.run(worker._maintain_ambient_page_automation(SimpleNamespace(pages=[Page()])))
+
+    assert seen_timeouts == [min(15_000, round(config.workspace_timeout_seconds * 1000))]
+
+
 def test_worker_arms_passive_observer_with_exact_hop_generation_and_receipt(tmp_path: Path):
     _config, _store, state, worker = setup_task(
         tmp_path, task_id="task-passive-observer-wiring"

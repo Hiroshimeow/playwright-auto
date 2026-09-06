@@ -9350,7 +9350,10 @@ class CDPAWorker:
                 continue
             if not name.startswith(WINDOW_NAME_PREFIX):
                 continue
-            client = ChatGPTPage(page, timeout_ms=min(15_000, self.config.browser_timeout_ms))
+            client = ChatGPTPage(
+                page,
+                timeout_ms=min(15_000, round(self.config.workspace_timeout_seconds * 1000)),
+            )
             client.install_ambient_observer()
             try:
                 probe = await client.read_wait_probe()
