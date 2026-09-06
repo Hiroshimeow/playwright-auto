@@ -2649,6 +2649,9 @@ async def click_mcp_permission_allow(
             }
             return found;
           };
+          const laterUserTurnExists = messages.slice(acceptedIndex + 1).some(
+            (message) => message.getAttribute('data-message-author-role') === 'user'
+          );
           const candidates = [];
           for (const {node, connector} of permissionNodes) {
             let current = node;
@@ -2687,7 +2690,8 @@ async def click_mcp_permission_allow(
               const targetIndex = messages.findIndex(
                 (message) => message.getAttribute('data-message-id') === action.target_message_id
               );
-              if (targetIndex <= acceptedIndex) continue;
+              if (targetIndex >= 0 && targetIndex <= acceptedIndex) continue;
+              if (targetIndex < 0 && laterUserTurnExists) continue;
               if (expectedTargetMessageId && action.target_message_id !== expectedTargetMessageId) continue;
               candidates.push({connector, node, handler, action});
             }

@@ -8,6 +8,7 @@ from playwright_auto.chatgpt import (
     MessageBaseline,
     PageBinding,
     SendReceipt,
+    UnsafePageStateError,
     inspect_chatgpt_wait_probe,
     prompt_digest,
 )
@@ -238,6 +239,117 @@ def test_sparse_probe_distinguishes_hidden_permission_node_from_visible_offer():
 
     assert probe.mcp_permission_allow_count == 0
     assert probe.mcp_permission_node_count == 1
+
+
+def test_react_allow_accepts_unique_nontranscript_target_after_exact_last_user():
+    async def run(page):
+        client = ChatGPTPage(page, timeout_ms=5_000)
+        client.binding = PageBinding("page-1", "DEV")
+        receipt = SendReceipt(
+            prompt="Use @mcp-g8",
+            prompt_sha256=prompt_digest("Use @mcp-g8"),
+            binding=client.binding,
+            baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+            attempts=1,
+            accepted_via="exact_user_message",
+            session_id_before=None,
+            user_message_id="user-1",
+            conversation_id="conversation-1",
+        )
+        await page.evaluate(
+            """() => {
+              const permission = document.querySelector('#permission');
+              permission.__reactProps$fixture = {
+                onSelectOption: (_event, action) => { window.__mcpAction = action; },
+                options: [{
+                  action: {
+                    type: 'allow',
+                    target_message_id: 'tool-call-not-rendered',
+                    remember_answer: true,
+                  }
+                }],
+              };
+            }"""
+        )
+        probe = await client.current_wait_probe()
+        offered = await client.inspect_mcp_permission_allow(
+            probe, receipt, allowed_connectors=("mcp-g8",)
+        )
+        dispatched = await client.approve_mcp_permission_allow(
+            probe,
+            receipt,
+            allowed_connectors=("mcp-g8",),
+            expected_target_message_id=offered["target_message_id"],
+        )
+        return offered, dispatched, await page.evaluate("window.__mcpAction || null")
+
+    offered, dispatched, action = asyncio.run(
+        _with_page(
+            """
+            <main>
+              <section><div data-message-author-role="user" data-message-id="user-1">Use @mcp-g8</div></section>
+              <button id="permission" aria-label="Allow mcp-g8 for this conversation"></button>
+              <div contenteditable="true" role="textbox"></div>
+            </main>
+            """,
+            run,
+        )
+    )
+
+    assert offered["target_message_id"] == "tool-call-not-rendered"
+    assert dispatched["method"] == "react_handler"
+    assert action["target_message_id"] == "tool-call-not-rendered"
+
+
+def test_nontranscript_allow_target_rejects_when_newer_user_turn_exists():
+    async def run(page):
+        client = ChatGPTPage(page, timeout_ms=5_000)
+        client.binding = PageBinding("page-1", "DEV")
+        receipt = SendReceipt(
+            prompt="Use @mcp-g8",
+            prompt_sha256=prompt_digest("Use @mcp-g8"),
+            binding=client.binding,
+            baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+            attempts=1,
+            accepted_via="exact_user_message",
+            session_id_before=None,
+            user_message_id="user-1",
+            conversation_id="conversation-1",
+        )
+        await page.evaluate(
+            """() => {
+              const permission = document.querySelector('#permission');
+              permission.__reactProps$fixture = {
+                onSelectOption: () => { throw new Error('must not dispatch'); },
+                options: [{
+                  action: {
+                    type: 'allow',
+                    target_message_id: 'tool-call-not-rendered',
+                    remember_answer: true,
+                  }
+                }],
+              };
+            }"""
+        )
+        probe = await client.current_wait_probe()
+        with pytest.raises(UnsafePageStateError, match="permission_conflict"):
+            await client.inspect_mcp_permission_allow(
+                probe, receipt, allowed_connectors=("mcp-g8",)
+            )
+
+    asyncio.run(
+        _with_page(
+            """
+            <main>
+              <section><div data-message-author-role="user" data-message-id="user-1">Use @mcp-g8</div></section>
+              <section><div data-message-author-role="user" data-message-id="user-2">newer operator message</div></section>
+              <button id="permission" aria-label="Allow mcp-g8 for this conversation"></button>
+              <div contenteditable="true" role="textbox"></div>
+            </main>
+            """,
+            run,
+        )
+    )
 
 
 def test_expected_target_disambiguates_transient_react_allow_actions():
