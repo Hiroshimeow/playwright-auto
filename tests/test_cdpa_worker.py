@@ -205,6 +205,51 @@ def test_ambient_page_automation_uses_workspace_timeout_config(tmp_path: Path, m
     assert seen_timeouts == [min(15_000, round(config.workspace_timeout_seconds * 1000))]
 
 
+def test_ambient_page_automation_never_dispatches_registered_task(tmp_path: Path, monkeypatch):
+    _config, _store, _state, worker = setup_task(
+        tmp_path, task_id="task-ambient-single-owner"
+    )
+    worker.registry = SimpleNamespace(
+        tasks_by_id={"task-ambient-single-owner": {"status": "RUNNING"}}
+    )
+    calls = []
+
+    class Page:
+        url = "https://chatgpt.com/c/ambient"
+
+        def is_closed(self):
+            return False
+
+        async def evaluate(self, _script):
+            return worker_module.WINDOW_NAME_PREFIX + "{}"
+
+    class Client:
+        def __init__(self, _page, *, timeout_ms):
+            calls.append(("init", timeout_ms))
+
+        def install_ambient_observer(self):
+            calls.append(("listen",))
+
+        async def read_wait_probe(self):
+            return SimpleNamespace(
+                page_task_id="task-ambient-single-owner",
+                stop_visible=False,
+                last_assistant_message_id=None,
+            )
+
+        def ambient_permission_action(self):
+            raise AssertionError("ambient controller must not inspect registered task permission")
+
+        async def mcp_allow_visible(self):
+            raise AssertionError("ambient controller must not dispatch registered task permission")
+
+    monkeypatch.setattr(worker_module, "ChatGPTPage", Client)
+    asyncio.run(worker._maintain_ambient_page_automation(SimpleNamespace(pages=[Page()])))
+
+    assert calls[0][0] == "init"
+    assert calls[1] == ("listen",)
+
+
 def test_worker_arms_passive_observer_with_exact_hop_generation_and_receipt(tmp_path: Path):
     _config, _store, state, worker = setup_task(
         tmp_path, task_id="task-passive-observer-wiring"
@@ -244,14 +289,19 @@ def test_worker_arms_passive_observer_with_exact_hop_generation_and_receipt(tmp_
     ]
 
 
-def test_mcp_allow_interrupt_waits_five_seconds_then_clicks_listen_action(tmp_path: Path):
+def test_mcp_allow_interrupt_waits_five_seconds_then_dispatches_exact_react_action(tmp_path: Path):
     _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-listen-auto-allow"
+    )
+    receipt = replace(
+        receipt,
+        prompt="use authorized mcp-g8 connector",
+        prompt_sha256=prompt_digest("use authorized mcp-g8 connector"),
     )
     hop["wait"]["mcp_allow_seen_at"] = (
         datetime.now(timezone.utc) - timedelta(seconds=6)
     ).isoformat()
-    clicks = []
+    calls = []
 
     class Client:
         def passive_observation(self, **_kwargs):
@@ -267,12 +317,21 @@ def test_mcp_allow_interrupt_waits_five_seconds_then_clicks_listen_action(tmp_pa
         async def mcp_allow_visible(self):
             return False
 
-        async def auto_allow_mcp_permission(self, *, passive_action=None):
-            clicks.append(passive_action)
-            return {"method": "react_handler", "target_message_id": "call-1"}
+        async def current_wait_probe(self):
+            return SimpleNamespace(page_task_id="task-listen-auto-allow")
+
+        async def inspect_mcp_permission_allow(self, probe, exact_receipt, *, allowed_connectors):
+            calls.append(("inspect", tuple(allowed_connectors), exact_receipt.prompt))
+            return {"method": "offered", "target_message_id": "call-1", "remember_answer": "true"}
+
+        async def approve_mcp_permission_allow(
+            self, probe, exact_receipt, *, allowed_connectors, expected_target_message_id
+        ):
+            calls.append(("approve", tuple(allowed_connectors), expected_target_message_id))
+            return {"method": "react_handler", "target_message_id": expected_target_message_id}
 
         def clear_passive_permission_action(self):
-            clicks.append("cleared")
+            calls.append(("cleared",))
 
     snapshot = SimpleNamespace(stop_visible=False, messages=())
     handled = asyncio.run(
@@ -280,8 +339,11 @@ def test_mcp_allow_interrupt_waits_five_seconds_then_clicks_listen_action(tmp_pa
     )
 
     assert handled is True
-    assert clicks[0]["remember_answer"] is True
-    assert clicks[1] == "cleared"
+    assert calls == [
+        ("inspect", ("mcp-g8",), "use authorized mcp-g8 connector"),
+        ("approve", ("mcp-g8",), "call-1"),
+        ("cleared",),
+    ]
     assert hop["wait"]["mcp_allow_clicked_at"]
     assert state["active_action"] == "wait_mcp_allow_continuation"
 
@@ -316,6 +378,9 @@ def test_controller_stall_refreshes_after_ten_minutes_without_progress(tmp_path:
     refreshed = []
 
     class Client:
+        async def mcp_allow_visible(self):
+            return True
+
         async def refresh(self):
             refreshed.append(True)
 
@@ -359,6 +424,9 @@ def test_mcp_allow_interrupt_refreshes_once_when_post_click_state_does_not_progr
     refreshed = []
 
     class Client:
+        async def mcp_allow_visible(self):
+            return True
+
         async def refresh(self):
             refreshed.append(True)
 

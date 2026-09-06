@@ -3918,8 +3918,12 @@ class CDPAWorker:
         now = datetime.now(timezone.utc)
         clicked_at = parse_time(wait.get("mcp_allow_clicked_at"))
         if clicked_at is not None:
+            visible_reader = getattr(client, "mcp_allow_visible", None)
+            permission_still_visible = (
+                bool(await visible_reader()) if callable(visible_reader) else False
+            )
             progressed = bool(
-                snapshot.stop_visible
+                not permission_still_visible
                 or any(
                     message.role == "assistant"
                     and message.message_id not in receipt.baseline.message_ids
@@ -3969,11 +3973,29 @@ class CDPAWorker:
             state["active_action"] = "wait_mcp_allow_stable"
             return True
 
-        allow = getattr(client, "auto_allow_mcp_permission", None)
-        if not callable(allow):
+        current_probe = getattr(client, "current_wait_probe", None)
+        inspect_allow = getattr(client, "inspect_mcp_permission_allow", None)
+        approve_allow = getattr(client, "approve_mcp_permission_allow", None)
+        if not all(callable(item) for item in (current_probe, inspect_allow, approve_allow)):
             return False
-        dispatched = await allow(passive_action=passive_action)
-        if dispatched is None:
+        allowed_connectors = _authorized_mcp_connectors(receipt.prompt)
+        probe = await current_probe()
+        offered = await inspect_allow(
+            probe,
+            receipt,
+            allowed_connectors=allowed_connectors,
+        )
+        target_message_id = str(offered.get("target_message_id") or "").strip()
+        if not target_message_id:
+            state["active_action"] = "wait_mcp_allow_stable"
+            return True
+        dispatched = await approve_allow(
+            probe,
+            receipt,
+            allowed_connectors=allowed_connectors,
+            expected_target_message_id=target_message_id,
+        )
+        if str(dispatched.get("method") or "") != "react_handler":
             state["active_action"] = "wait_mcp_allow_stable"
             return True
         clear_passive = getattr(client, "clear_passive_permission_action", None)
@@ -9360,6 +9382,9 @@ class CDPAWorker:
             except Exception:
                 continue
             if "chatgpt.com" not in str(page.url):
+                continue
+            page_task_id = str(getattr(probe, "page_task_id", None) or "").strip()
+            if self.registry is not None and page_task_id in self.registry.tasks_by_id:
                 continue
 
             post_click = self._ambient_post_click.get(key)
