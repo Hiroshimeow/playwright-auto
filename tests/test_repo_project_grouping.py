@@ -288,8 +288,12 @@ def test_advance_persists_before_schedule_and_done_is_eligible(tmp_path: Path, m
     )
     hop["receipt"] = enriched.to_dict()
     hop["state"] = "responded"
+    report_relative = ".plan/alpha/alpha-plan_turn1_task-route.md"
+    report = Path(repository) / report_relative
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("# PLAN report\n\nRepository grouping complete.\n", encoding="utf-8")
     hop["response"] = json.dumps(
-        {"route": "DONE", "handoff": ".plan/alpha/alpha-plan_turn1_task-route.md"}
+        {"route": "DONE", "handoff": report_relative}
     )
     state = store.save(path, state)
     order = []

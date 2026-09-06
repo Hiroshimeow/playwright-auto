@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .cdpa_commands import workflow_control_matrix
 from .cdpa_config import CDPA_ROLES, declared_repository_from_task, remote_repository_from_task
 from .cdpa_dependencies import dependency_parent_ids
 from .cdpa_independent import independent_tags, is_independent_task
@@ -1224,6 +1225,11 @@ def build_task_projection(
         "replacement_task_id": replacement_task_id,
         "immutable_history": bool(replacement_task_id),
         "controls": _public_value([item for item in raw.get("controls") or [] if isinstance(item, Mapping)]),
+        **(
+            {"control_eligibility": _public_value(workflow_control_matrix(raw))}
+            if independent is None
+            else {}
+        ),
         "cleanup": _public_value(dict(raw.get("cleanup") or {})),
         "attachments": [
             {"name": str(item.get("name") or Path(str(item.get("path") or "")).name)}

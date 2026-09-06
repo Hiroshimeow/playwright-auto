@@ -61,6 +61,12 @@ def _prepare_pause_response(tmp_path: Path, *, task_id: str, role: str):
         receipt=receipt.to_dict(),
     )
     hop["receipt"] = receipt.to_dict()
+    report = tmp_path / str(hop["expected_report_path"])
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(
+        f"# {role} pause report\n\nExact resume condition is recorded for {task_id}.\n",
+        encoding="utf-8",
+    )
     hop["response"] = json.dumps(
         {"route": "PAUSE", "handoff": hop["expected_report_path"]}
     )

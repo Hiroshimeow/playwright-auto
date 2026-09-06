@@ -115,476 +115,164 @@ def test_resume_control_stays_recovering_until_verified_postcondition(tmp_path: 
 
 
 
-def test_resume_backend_complete_ignores_manual_composer_and_routes_without_source_tab(
-    tmp_path: Path, monkeypatch
-):
+def test_resume_preserves_manual_composer_and_never_uses_graph(tmp_path: Path):
     store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-resume-backend-complete"
+        tmp_path, task_id="task-resume-manual-composer"
     )
-    report_relative = ".plan/alpha/alpha-plan_turn1_task-resume-backend-complete.md"
-    report = tmp_path / report_relative
-    report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text("verified backend response", encoding="utf-8")
-    response_text = json.dumps({"route": "TEST", "handoff": report_relative})
-    canonical_id = "resume-backend-complete"
-    enriched = replace(receipt, conversation_id=canonical_id)
-    RequestLedger(hop["ledger_path"]).update(hop["request_id"], receipt=enriched.to_dict())
-    hop["receipt"] = enriched.to_dict()
-    hop["conversation_url"] = f"https://chatgpt.com/c/{canonical_id}"
+    canonical = replace(receipt, conversation_id="resume-manual")
+    RequestLedger(hop["ledger_path"]).update(hop["request_id"], receipt=canonical.to_dict())
+    hop["receipt"] = canonical.to_dict()
+    hop["conversation_url"] = "https://chatgpt.com/c/resume-manual"
     state["roles"]["PLAN"]["page_url"] = hop["conversation_url"]
-    hop["wait"]["deadline_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
-    hop["wait"]["stream_status_next_poll_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=1)
-    ).isoformat()
-    state = store.save(path, state)
-    hop = _active_hop(state)
-    calls = {"status": 0, "graph": 0, "tab": 0}
-    dirty_snapshot = _accepted_snapshot(enriched)
-    dirty_snapshot.composer_empty = False
-    dirty_snapshot.composer_text = "operator manual draft"
-    dirty_snapshot.manual_input_pending = True
-    dirty_snapshot.attachment_markers = ("manual.txt",)
-
-    class DirtyClient:
-        async def assert_ownership(self):
-            return dirty_snapshot
-
-    dirty_acquired = AcquiredRole(
-        DirtyClient(), enriched.binding.page_id, hop["conversation_url"], False, False
+    hop["wait"]["stream_status_next_poll_at"] = (datetime.now(timezone.utc) + timedelta(seconds=20)).isoformat()
+    base_snapshot = _accepted_snapshot(canonical)
+    snapshot = SimpleNamespace(
+        **{
+            **vars(base_snapshot),
+            "manual_input_pending": True,
+            "composer_empty": False,
+            "composer_text": "operator draft",
+        }
     )
-
-    class Actions:
-        async def backend_stream_status(self, conversation_id):
-            assert conversation_id == canonical_id
-            calls["status"] += 1
-            return {"status": "COMPLETE"}
-
-        async def backend_conversation(self, conversation_id):
-            assert conversation_id == canonical_id
-            calls["graph"] += 1
-            return _backend_graph(enriched.user_message_id, "a-resume-backend", response_text)
-
-        async def locate_owned_metadata(self, *_args, **_kwargs):
-            calls["tab"] += 1
-            raise AssertionError("backend-complete Resume must not inspect a source tab")
-
-        async def locate_owned(self, *_args, **_kwargs):
-            calls["tab"] += 1
-            return dirty_acquired
-
-        async def reopen(self, *_args, **_kwargs):
-            calls["tab"] += 1
-            raise AssertionError("backend-complete Resume must not reopen the accepted tab")
-
-        async def wake(self, *_args, **_kwargs):
-            calls["tab"] += 1
-            raise AssertionError("backend-complete Resume must not wake a source tab")
-
-    _queue_blocked_resume(store, state)
-    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
-
-    recovered = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
-
-    control = recovered["controls"][-1]
-    completed = recovered["hops"][0]
-    record = RequestLedger(completed["ledger_path"]).get(completed["request_id"])
-    assert calls == {"status": 1, "graph": 1, "tab": 0}
-    assert control["status"] == "applied"
-    assert control["result"]["outcome"] == "continued"
-    assert control["result"]["action"] == "consume_response"
-    assert control["result"]["postcondition"] == "hop_advanced"
-    assert completed["response"] == response_text
-    assert _active_hop(recovered)["target_role"] == "TEST"
-    assert record is not None
-    assert record.status is RequestStatus.COMPLETED
-    assert record.attempts == 1
-    assert dirty_snapshot.composer_text == "operator manual draft"
-    assert dirty_snapshot.attachment_markers == ("manual.txt",)
-
-
-def test_resume_backend_complete_force_follows_manual_steering_without_replay(
-    tmp_path: Path, monkeypatch
-):
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-resume-manual-steer"
-    )
-    report_relative = ".plan/alpha/alpha-plan_turn1_task-resume-manual-steer.md"
-    report = tmp_path / report_relative
-    report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text("manual steering accepted", encoding="utf-8")
-    response_text = json.dumps({"route": "TEST", "handoff": report_relative})
-    canonical_id = "resume-manual-steer"
-    enriched = replace(receipt, conversation_id=canonical_id)
-    RequestLedger(hop["ledger_path"]).update(hop["request_id"], receipt=enriched.to_dict())
-    hop["receipt"] = enriched.to_dict()
-    hop["conversation_url"] = f"https://chatgpt.com/c/{canonical_id}"
-    state["roles"]["PLAN"]["page_url"] = hop["conversation_url"]
-    state = store.save(path, state)
-    calls = {"status": 0, "graph": 0, "tab": 0}
-
-    graph = {
-        "current_node": "a-final",
-        "mapping": {
-            enriched.user_message_id: {
-                "id": enriched.user_message_id,
-                "parent": None,
-                "children": ["a-before"],
-                "message": {
-                    "id": enriched.user_message_id,
-                    "author": {"role": "user"},
-                    "content": {"content_type": "text", "parts": [enriched.prompt]},
-                },
-            },
-            "a-before": {
-                "id": "a-before",
-                "parent": enriched.user_message_id,
-                "children": ["u-steer"],
-                "message": {
-                    "id": "a-before",
-                    "author": {"role": "assistant"},
-                    "recipient": "all",
-                    "content": {"content_type": "text", "parts": ["holding"]},
-                },
-            },
-            "u-steer": {
-                "id": "u-steer",
-                "parent": "a-before",
-                "children": ["a-final"],
-                "message": {
-                    "id": "u-steer",
-                    "author": {"role": "user"},
-                    "content": {"content_type": "text", "parts": ["route test now"]},
-                },
-            },
-            "a-final": {
-                "id": "a-final",
-                "parent": "u-steer",
-                "children": [],
-                "message": {
-                    "id": "a-final",
-                    "author": {"role": "assistant"},
-                    "recipient": "all",
-                    "content": {"content_type": "text", "parts": [response_text]},
-                },
-            },
-        },
-    }
-
-    class Actions:
-        async def backend_stream_status(self, conversation_id):
-            assert conversation_id == canonical_id
-            calls["status"] += 1
-            return {"status": "COMPLETE"}
-
-        async def backend_conversation(self, conversation_id):
-            assert conversation_id == canonical_id
-            calls["graph"] += 1
-            return graph
-
-        async def locate_owned(self, *_args, **_kwargs):
-            calls["tab"] += 1
-            raise AssertionError("force Resume must not inspect source DOM")
-
-        async def reopen(self, *_args, **_kwargs):
-            calls["tab"] += 1
-            raise AssertionError("force Resume must not reopen source tab")
-
-    _queue_blocked_resume(store, state)
-    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
-
-    recovered = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
-
-    completed = recovered["hops"][0]
-    record = RequestLedger(completed["ledger_path"]).get(completed["request_id"] )
-    control = recovered["controls"][-1]
-    assert calls == {"status": 1, "graph": 1, "tab": 0}
-    assert control["status"] == "applied"
-    assert control["result"]["action"] == "consume_response"
-    assert completed["response"] == response_text
-    assert _active_hop(recovered)["target_role"] == "TEST"
-    assert record is not None
-    assert record.status is RequestStatus.COMPLETED
-    assert record.attempts == 1
-
-
-def test_resume_backend_complete_malformed_response_uses_existing_route_repair(
-    tmp_path: Path, monkeypatch
-):
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-resume-backend-malformed"
-    )
-    canonical_id = "resume-backend-malformed"
-    enriched = replace(receipt, conversation_id=canonical_id)
-    RequestLedger(hop["ledger_path"]).update(hop["request_id"], receipt=enriched.to_dict())
-    hop["receipt"] = enriched.to_dict()
-    hop["conversation_url"] = f"https://chatgpt.com/c/{canonical_id}"
-    state["roles"]["PLAN"]["page_url"] = hop["conversation_url"]
-    state = store.save(path, state)
-    calls = {"status": 0, "graph": 0, "tab": 0}
-
-    class Actions:
-        async def backend_stream_status(self, conversation_id):
-            assert conversation_id == canonical_id
-            calls["status"] += 1
-            return {"status": "COMPLETE"}
-
-        async def backend_conversation(self, conversation_id):
-            assert conversation_id == canonical_id
-            calls["graph"] += 1
-            return _backend_graph(enriched.user_message_id, "a-resume-malformed", "not json")
-
-        async def locate_owned(self, *_args, **_kwargs):
-            calls["tab"] += 1
-            raise AssertionError("backend-complete malformed Resume must not inspect a source tab")
-
-        async def reopen(self, *_args, **_kwargs):
-            calls["tab"] += 1
-            raise AssertionError("backend-complete malformed Resume must not reopen a source tab")
-
-    _queue_blocked_resume(store, state)
-    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
-
-    recovered = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
-
-    completed = recovered["hops"][0]
-    repair = _active_hop(recovered)
-    control = recovered["controls"][-1]
-    record = RequestLedger(completed["ledger_path"]).get(completed["request_id"])
-    assert calls == {"status": 1, "graph": 1, "tab": 0}
-    assert control["status"] == "applied"
-    assert control["result"]["action"] == "consume_response"
-    assert completed["response"] == "not json"
-    assert completed.get("validation_error")
-    assert repair["kind"] == "route_repair"
-    assert repair["target_role"] == "PLAN"
-    assert repair["turn"] == 1
-    assert repair["repair_attempt"] == 1
-    assert record is not None
-    assert record.status is RequestStatus.COMPLETED
-    assert record.attempts == 1
-
-
-def test_resume_backend_streaming_ignores_manual_composer_and_rearms_without_source_tab(
-    tmp_path: Path, monkeypatch
-):
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-resume-backend-streaming"
-    )
-    canonical_id = "resume-backend-streaming"
-    enriched = replace(receipt, conversation_id=canonical_id)
-    RequestLedger(hop["ledger_path"]).update(hop["request_id"], receipt=enriched.to_dict())
-    hop["receipt"] = enriched.to_dict()
-    hop["conversation_url"] = f"https://chatgpt.com/c/{canonical_id}"
-    state["roles"]["PLAN"]["page_url"] = hop["conversation_url"]
-    expired_at = datetime.now(timezone.utc) - timedelta(seconds=1)
-    hop["wait"]["deadline_at"] = expired_at.isoformat()
-    hop["wait"]["stream_status_next_poll_at"] = expired_at.isoformat()
-    state = store.save(path, state)
-    hop = _active_hop(state)
-    calls = {"status": 0, "tab": 0}
-    dirty_snapshot = _accepted_snapshot(enriched)
-    dirty_snapshot.composer_empty = False
-    dirty_snapshot.composer_text = "operator manual draft"
-    dirty_snapshot.manual_input_pending = True
-    dirty_snapshot.attachment_markers = ("manual.txt",)
-
-    class DirtyClient:
-        async def assert_ownership(self):
-            return dirty_snapshot
-
-    dirty_acquired = AcquiredRole(
-        DirtyClient(), enriched.binding.page_id, hop["conversation_url"], False, False
-    )
-
-    class Actions:
-        async def backend_stream_status(self, conversation_id):
-            assert conversation_id == canonical_id
-            calls["status"] += 1
-            return {"status": "IS_STREAMING"}
-
-        async def backend_conversation(self, *_args, **_kwargs):
-            raise AssertionError("IS_STREAMING Resume must not fetch the full graph")
-
-        async def locate_owned_metadata(self, *_args, **_kwargs):
-            calls["tab"] += 1
-            raise AssertionError("healthy backend Resume must not inspect source metadata")
-
-        async def locate_owned(self, *_args, **_kwargs):
-            calls["tab"] += 1
-            return dirty_acquired
-
-        async def reopen(self, *_args, **_kwargs):
-            calls["tab"] += 1
-            raise AssertionError("healthy backend Resume must not reopen a source tab")
-
-        async def wake(self, *_args, **_kwargs):
-            calls["tab"] += 1
-            raise AssertionError("healthy backend Resume must not wake a source tab")
-
-    _queue_blocked_resume(store, state)
-    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
-
-    recovered = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
-
-    active = _active_hop(recovered)
-    control = recovered["controls"][-1]
-    record = RequestLedger(active["ledger_path"]).get(active["request_id"])
-    assert calls == {"status": 1, "tab": 0}
-    assert control["status"] == "applied"
-    assert control["result"]["outcome"] == "continued"
-    assert control["result"]["action"] == "rearm_backend_wait"
-    assert control["result"]["postcondition"] == "backend_wait_rearmed"
-    assert recovered["status"] == "RUNNING"
-    assert recovered["active_action"] == "wait_response"
-    assert active["state"] == "waiting"
-    assert active["wait"]["completion_mode"] == "stream_status"
-    assert worker_module.parse_time(active["wait"]["deadline_at"]) > datetime.now(timezone.utc)
-    assert worker_module.parse_time(active["wait"]["stream_status_next_poll_at"]) > datetime.now(
-        timezone.utc
-    )
-    assert record is not None
-    assert record.status is RequestStatus.SENT
-    assert record.attempts == 1
-    assert dirty_snapshot.composer_text == "operator manual draft"
-    assert dirty_snapshot.attachment_markers == ("manual.txt",)
-
-
-
-
-
-
-def test_resume_backend_unavailable_dom_fallback_ignores_manual_composer_without_replay(
-    tmp_path: Path, monkeypatch
-):
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-resume-backend-unavailable"
-    )
-    report_relative = ".plan/alpha/alpha-plan_turn1_task-resume-backend-unavailable.md"
-    report = tmp_path / report_relative
-    report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text("verified DOM fallback response", encoding="utf-8")
-    response = MessageSnapshot(
-        "assistant",
-        "a-resume-dom-fallback",
-        "ta-resume-dom-fallback",
-        json.dumps({"route": "TEST", "handoff": report_relative}),
-        (),
-    )
-    canonical_id = "resume-backend-unavailable"
-    enriched = replace(receipt, conversation_id=canonical_id)
-    RequestLedger(hop["ledger_path"]).update(hop["request_id"], receipt=enriched.to_dict())
-    hop["receipt"] = enriched.to_dict()
-    hop["conversation_url"] = f"https://chatgpt.com/c/{canonical_id}"
-    state["roles"]["PLAN"]["page_url"] = hop["conversation_url"]
-    state = store.save(path, state)
-    hop = _active_hop(state)
-    snapshot = _accepted_snapshot(enriched, response=response)
-    snapshot.conversation_url = hop["conversation_url"]
-    snapshot.url = hop["conversation_url"]
-    snapshot.composer_empty = False
-    snapshot.composer_text = "operator manual draft"
-    snapshot.manual_input_pending = True
-    snapshot.attachment_markers = ("manual.txt",)
-    order = []
 
     class Client:
         async def assert_ownership(self):
             return snapshot
+        async def wait_for_response(self, *_args, **_kwargs):
+            raise AssertionError("manual composer must be reconciled before response consumption")
 
-        async def wait_for_response(self, _receipt, **kwargs):
-            order.append("dom_wait")
-            kwargs["candidate_validator"](response)
-            return response
-
-        async def retry_generation(self, *_args, **_kwargs):
-            raise AssertionError("accepted Resume fallback must not Retry or Regenerate")
-
-        async def send(self, *_args, **_kwargs):
-            raise AssertionError("accepted Resume fallback must not resend")
-
-    acquired = AcquiredRole(Client(), enriched.binding.page_id, hop["conversation_url"], False, False)
+    acquired = AcquiredRole(Client(), canonical.binding.page_id, hop["conversation_url"], False, False)
+    calls = {"status": 0, "graph": 0}
 
     class Actions:
-        async def backend_stream_status(self, conversation_id):
-            assert conversation_id == canonical_id
-            order.append("backend_status")
-            raise worker_module.BackendUnavailableError(0, "stream_status")
-
+        async def backend_stream_status(self, *_args, **_kwargs):
+            calls["status"] += 1
+            return {"status": "COMPLETE"}
         async def backend_conversation(self, *_args, **_kwargs):
-            raise AssertionError("status-unavailable Resume should enter exact DOM fallback")
-
-        async def locate_owned(self, _state, _role):
-            order.append("locate_exact")
+            calls["graph"] += 1
+            raise AssertionError("Resume must never fetch full conversation graph")
+        async def locate_owned(self, *_args, **_kwargs):
             return acquired
-
         async def reopen(self, *_args, **_kwargs):
-            raise AssertionError("existing exact fallback tab should be reused")
+            raise AssertionError("exact owned page should be reused")
 
-    _queue_blocked_resume(store, state)
-    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
+    control = {"control_id": 1, "action": "resume", "role": "PLAN", "status": "recovering", "result": {"before": None}}
+    asyncio.run(worker._recover_resume_waiting(state, hop, control, Actions()))
 
-    recovered = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
-
-    completed = recovered["hops"][0]
-    control = recovered["controls"][-1]
-    record = RequestLedger(completed["ledger_path"]).get(completed["request_id"])
-    assert order == ["backend_status", "locate_exact", "dom_wait"]
-    assert control["status"] == "applied"
-    assert control["result"]["action"] == "consume_response"
-    assert _active_hop(recovered)["target_role"] == "TEST"
-    assert record is not None
-    assert record.attempts == 1
-    assert record.status is RequestStatus.COMPLETED
-    assert snapshot.composer_text == "operator manual draft"
-    assert snapshot.attachment_markers == ("manual.txt",)
+    assert calls == {"status": 0, "graph": 0}
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "manual_composer_conflict"
+    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
 
 
-def test_resume_ambiguous_backend_evidence_fails_closed_before_dom(
-    tmp_path: Path, monkeypatch
-):
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-resume-backend-ambiguous"
+def test_resume_stream_status_rearms_exact_request_without_graph_or_replay(tmp_path: Path):
+    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-resume-streaming-local"
     )
-    canonical_id = "resume-backend-ambiguous"
-    enriched = replace(receipt, conversation_id=canonical_id)
-    RequestLedger(hop["ledger_path"]).update(hop["request_id"], receipt=enriched.to_dict())
-    hop["receipt"] = enriched.to_dict()
-    hop["conversation_url"] = f"https://chatgpt.com/c/{canonical_id}"
+    canonical = replace(receipt, conversation_id="resume-streaming")
+    RequestLedger(hop["ledger_path"]).update(hop["request_id"], receipt=canonical.to_dict())
+    hop["receipt"] = canonical.to_dict()
+    hop["conversation_url"] = "https://chatgpt.com/c/resume-streaming"
     state["roles"]["PLAN"]["page_url"] = hop["conversation_url"]
-    state = store.save(path, state)
-    hop = _active_hop(state)
+    hop["wait"]["stream_status_next_poll_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
     calls = {"status": 0, "graph": 0, "tab": 0}
 
     class Actions:
-        async def backend_stream_status(self, _conversation_id):
+        async def backend_stream_status(self, conversation_id):
+            assert conversation_id == "resume-streaming"
             calls["status"] += 1
-            return {"status": "COMPLETE"}
-
-        async def backend_conversation(self, _conversation_id):
+            return {"status": "IS_STREAMING"}
+        async def backend_conversation(self, *_args, **_kwargs):
             calls["graph"] += 1
-            raise worker_module.GraphIdentityError("ambiguous terminal branch")
-
+            raise AssertionError("streaming Resume must not fetch graph")
         async def locate_owned(self, *_args, **_kwargs):
             calls["tab"] += 1
-            raise AssertionError("ambiguous backend evidence must fail closed before DOM")
-
+            raise AssertionError("verified streaming status can rearm without tab mutation")
         async def reopen(self, *_args, **_kwargs):
+            raise AssertionError("Resume must not reopen while stream is verified active")
+
+    control = {"control_id": 1, "action": "resume", "role": "PLAN", "status": "recovering", "result": {"before": None}}
+    asyncio.run(worker._recover_resume_waiting(state, hop, control, Actions()))
+
+    assert calls == {"status": 1, "graph": 0, "tab": 0}
+    assert control["status"] == "applied"
+    assert control["result"]["action"] == "rearm_backend_wait"
+    assert control["result"]["postcondition"] == "backend_wait_rearmed"
+    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
+
+
+def test_resume_status_unavailable_falls_back_to_exact_local_progress_without_graph(tmp_path: Path):
+    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-resume-status-unavailable"
+    )
+    canonical = replace(receipt, conversation_id="resume-unavailable")
+    RequestLedger(hop["ledger_path"]).update(hop["request_id"], receipt=canonical.to_dict())
+    hop["receipt"] = canonical.to_dict()
+    hop["conversation_url"] = "https://chatgpt.com/c/resume-unavailable"
+    state["roles"]["PLAN"]["page_url"] = hop["conversation_url"]
+    hop["wait"]["stream_status_next_poll_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    base_snapshot = _accepted_snapshot(canonical)
+    snapshot = SimpleNamespace(**{**vars(base_snapshot), "stop_visible": True})
+
+    class Client:
+        async def assert_ownership(self):
+            return snapshot
+        async def wait_for_response(self, *_args, **_kwargs):
+            raise TimeoutError("still generating")
+
+    acquired = AcquiredRole(Client(), canonical.binding.page_id, hop["conversation_url"], False, False)
+    calls = {"graph": 0}
+
+    class Actions:
+        async def backend_stream_status(self, *_args, **_kwargs):
+            raise worker_module.BackendUnavailableError(503, "stream status unavailable")
+        async def backend_conversation(self, *_args, **_kwargs):
+            calls["graph"] += 1
+            raise AssertionError("status recovery must not fetch graph")
+        async def locate_owned(self, *_args, **_kwargs):
+            return acquired
+        async def reopen(self, *_args, **_kwargs):
+            raise AssertionError("exact local page is already owned")
+
+    control = {"control_id": 1, "action": "resume", "role": "PLAN", "status": "recovering", "result": {"before": None}}
+    asyncio.run(worker._recover_resume_waiting(state, hop, control, Actions()))
+
+    assert calls["graph"] == 0
+    assert control["status"] == "applied"
+    assert control["result"]["action"] == "observe_progress"
+    assert control["result"]["postcondition"] == "generation_progress"
+    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
+
+
+def test_resume_unknown_stream_status_fails_closed_before_dom_or_graph(tmp_path: Path):
+    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-resume-status-unknown"
+    )
+    canonical = replace(receipt, conversation_id="resume-unknown")
+    RequestLedger(hop["ledger_path"]).update(hop["request_id"], receipt=canonical.to_dict())
+    hop["receipt"] = canonical.to_dict()
+    hop["conversation_url"] = "https://chatgpt.com/c/resume-unknown"
+    state["roles"]["PLAN"]["page_url"] = hop["conversation_url"]
+    hop["wait"]["stream_status_next_poll_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    calls = {"graph": 0, "tab": 0}
+
+    class Actions:
+        async def backend_stream_status(self, *_args, **_kwargs):
+            return {"status": "MYSTERY"}
+        async def backend_conversation(self, *_args, **_kwargs):
+            calls["graph"] += 1
+            raise AssertionError("unknown status must never trigger graph")
+        async def locate_owned(self, *_args, **_kwargs):
             calls["tab"] += 1
-            raise AssertionError("ambiguous backend evidence must not reopen")
+            raise AssertionError("unknown status must fail closed before DOM mutation")
 
-    _queue_blocked_resume(store, state)
-    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
+    control = {"control_id": 1, "action": "resume", "role": "PLAN", "status": "recovering", "result": {"before": None}}
+    asyncio.run(worker._recover_resume_waiting(state, hop, control, Actions()))
 
-    recovered = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
-
-    control = recovered["controls"][-1]
-    record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
-    assert calls == {"status": 1, "graph": 1, "tab": 0}
+    assert calls == {"graph": 0, "tab": 0}
     assert control["status"] == "recovery_required"
     assert control["result"]["reason_code"] == "backend_evidence_ambiguous"
-    assert recovered["status"] == "BLOCKED"
-    assert record is not None
-    assert record.attempts == 1
+    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
 
 
 def test_resume_immutable_receipt_divergence_fails_before_backend_or_dom(
@@ -677,7 +365,7 @@ def test_resume_different_accepted_binding_fails_before_backend_or_rebind(
     assert record.attempts == 1
 
 
-def test_resume_routes_path_only_response_without_replay(tmp_path: Path, monkeypatch):
+def test_resume_routes_valid_local_report_response_without_replay(tmp_path: Path, monkeypatch):
     store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-resume-path-only"
     )
@@ -685,7 +373,11 @@ def test_resume_routes_path_only_response_without_replay(tmp_path: Path, monkeyp
     state["roles"]["PLAN"]["page_url"] = hop["conversation_url"]
     state = store.save(path, state)
     hop = _active_hop(state)
-    handoff = ".plan/windows-team/windows-plan_turn1_task-resume-path-only.md"
+    handoff = str(hop["expected_report_path"])
+    report = tmp_path / handoff
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report_bytes = b"# PLAN report\n\nResume evidence.\n"
+    report.write_bytes(report_bytes)
     response = MessageSnapshot(
         "assistant",
         "a-path-only",
@@ -751,8 +443,8 @@ def test_resume_routes_path_only_response_without_replay(tmp_path: Path, monkeyp
     assert completed.get("validation_error") is None
     assert completed["state"] == "routed"
     assert completed["report_path"] == handoff
-    assert completed["report_sha256"] is None
-    assert completed["report_size"] is None
+    assert completed["report_sha256"] == worker_module.hashlib.sha256(report_bytes).hexdigest()
+    assert completed["report_size"] == len(report_bytes)
     assert child["kind"] == "handoff"
     assert child["target_role"] == "TEST"
     assert child["parent_hop_id"] == completed["hop_id"]
@@ -1159,7 +851,7 @@ def test_resume_legacy_donorless_pristine_new_uses_one_current_default_bootstrap
 
     current = ledger.get(original["request_id"])
     role = state["roles"]["PLAN"]
-    assert actions.backend_calls == [donor["conversation_id"]]
+    assert actions.backend_calls == []
     assert actions.branch_calls == []
     assert ui_calls == [("PLAN", donor)]
     assert control["status"] == "applied"
@@ -1238,6 +930,266 @@ def test_resume_legacy_donorless_stops_on_bootstrap_safety_signal(
     assert current is not None
     assert current.status is RequestStatus.NEW
     assert current.attempts == 0
+
+
+def _prepare_operator_new_chat_pristine_sending(
+    tmp_path: Path, *, task_id: str, empty_ledger: bool = False
+):
+    store, state, worker, path, hop, ledger, donor = _prepare_legacy_donorless_pristine_new(
+        tmp_path, task_id=task_id
+    )
+    role = state["roles"]["PLAN"]
+    old_page_id = "WEB:operator-fresh-lost"
+    role.update(
+        conversation_generation=1,
+        page_id=old_page_id,
+        page_url="https://chatgpt.com/",
+        online=False,
+        status="offline",
+        last_error="page_missing",
+    )
+    before = {
+        "status": "BLOCKED",
+        "updated_at": "2026-09-05T12:46:03+00:00",
+        "active_hop_id": hop["hop_id"],
+        "active_role": "PLAN",
+        "active_request_id": hop["request_id"],
+        "hop_state": "pre_send",
+        "hop_turn": hop["turn"],
+        "handoff_sha256": worker_module._sha(str(hop["handoff"])),
+        "role": "PLAN",
+        "physical_role": hop["physical_role"],
+        "page_id": None,
+        "conversation_id": None,
+        "conversation_generation": 0,
+        "receipt_sha256": None,
+        "block_code": "resume_progress_unverified",
+    }
+    state["controls"] = [
+        {
+            "control_id": 1,
+            "action": "new_chat",
+            "role": "PLAN",
+            "reason": "Create the first exact PLAN conversation before Send.",
+            "confirmed": False,
+            "origin": "operator",
+            "command": {
+                "command_id": "cmd-operator-fresh",
+                "origin": "operator",
+                "action": "new_chat",
+                "reason": "Create the first exact PLAN conversation before Send.",
+                "task_id": state["task_id"],
+                "team": state["team"],
+                "repository": state["repository"],
+                "role": "PLAN",
+                "source_task_id": None,
+                "source_event_key": None,
+                "snapshot": before,
+            },
+            "command_state": "APPLIED",
+            "status": "applied",
+            "requested_at": "2026-09-05T12:46:03+00:00",
+            "applied_at": "2026-09-05T12:46:19+00:00",
+            "result": {"page_id": old_page_id, "new_chat": True},
+            "external_command_id": None,
+        }
+    ]
+    state = store.save(path, state)
+    state = _queue_blocked_resume(
+        store,
+        state,
+        code="preboundary_context_unrecoverable",
+        reason="lost operator fresh page before durable Send",
+    )
+    if empty_ledger:
+        ledger.path.write_text(
+            json.dumps({"version": RequestLedger.VERSION, "records": {}}),
+            encoding="utf-8",
+        )
+    return store, state, worker, path, _active_hop(state), ledger, donor
+
+
+@pytest.mark.parametrize("empty_ledger", [False, True])
+def test_resume_reacquires_proven_operator_new_chat_generation_one_before_send(
+    tmp_path: Path, monkeypatch, empty_ledger: bool
+):
+    _store, state, worker, _path, hop, ledger, donor = (
+        _prepare_operator_new_chat_pristine_sending(
+            tmp_path,
+            task_id=f"task-resume-operator-fresh-{int(empty_ledger)}",
+            empty_ledger=empty_ledger,
+        )
+    )
+    original = {
+        "task_id": state["task_id"],
+        "hop_id": hop["hop_id"],
+        "request_id": hop["request_id"],
+        "turn": hop["turn"],
+        "prompt": hop["prompt"],
+        "prompt_sha256": hop["prompt_sha256"],
+        "generation": state["roles"]["PLAN"]["conversation_generation"],
+    }
+    client = SimpleNamespace(send_calls=0)
+
+    class Actions:
+        def __init__(self):
+            self.backend_calls = []
+            self.restart_calls = []
+
+        async def locate_owned(self, _state, _role):
+            return None
+
+        async def backend_conversation(self, conversation_id):
+            self.backend_calls.append(conversation_id)
+            raise AssertionError("proven fresh-context recovery must not depend on a bootstrap donor")
+
+        async def restart(self, _state, role, *, known_automated_draft=None):
+            self.restart_calls.append((role, known_automated_draft))
+            return AcquiredRole(
+                client=client,
+                page_id="WEB:operator-fresh-recovered",
+                url="https://chatgpt.com/",
+                created=True,
+                new_chat=True,
+            )
+
+        async def branch_from_anchor(self, *_args, **_kwargs):
+            raise AssertionError("proven fresh-context recovery must not branch from a donor")
+
+    ui_calls = []
+
+    async def fresh_ui(_state, role, _actions, selected):
+        ui_calls.append((role, dict(selected)))
+        return AcquiredRole(
+            client=client,
+            page_id="WEB:operator-fresh-recovered",
+            url="https://chatgpt.com/",
+            created=True,
+            new_chat=True,
+        )
+
+    monkeypatch.setattr(worker, "_branch_from_bootstrap_ui", fresh_ui)
+    actions = Actions()
+    control = state["controls"][-1]
+    asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
+
+    assert actions.backend_calls == []
+    assert actions.restart_calls == [("PLAN", original["prompt"])]
+    assert ui_calls == []
+    assert client.send_calls == 0
+    assert control["status"] == "applied"
+    assert control["result"]["action"] == "reacquire_preboundary_role"
+    assert state["status"] == "RUNNING"
+    assert state["block_code"] is None
+    assert state["task_id"] == original["task_id"]
+    assert hop["hop_id"] == original["hop_id"]
+    assert hop["request_id"] == original["request_id"]
+    assert hop["turn"] == original["turn"]
+    assert hop["prompt"] == original["prompt"]
+    assert hop["prompt_sha256"] == original["prompt_sha256"]
+    assert state["roles"]["PLAN"]["conversation_generation"] == original["generation"]
+    current = ledger.get(original["request_id"])
+    if empty_ledger:
+        assert current is None
+    else:
+        assert current is not None
+        assert current.status is RequestStatus.NEW
+        assert current.attempts == 0
+
+
+def test_resume_operator_new_chat_provenance_mismatch_stays_fail_closed(tmp_path: Path):
+    _store, state, worker, _path, hop, ledger, _donor = (
+        _prepare_operator_new_chat_pristine_sending(
+            tmp_path, task_id="task-resume-operator-fresh-mismatch"
+        )
+    )
+    state["controls"][0]["command"]["snapshot"]["active_request_id"] = "other-request"
+
+    class Actions:
+        async def locate_owned(self, _state, _role):
+            return None
+
+        async def backend_conversation(self, *_args, **_kwargs):
+            raise AssertionError("mismatched provenance must not inspect bootstrap context")
+
+    control = state["controls"][-1]
+    asyncio.run(worker._recover_resume_sending(state, hop, control, Actions()))
+
+    current = ledger.get(hop["request_id"])
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "preboundary_context_unrecoverable"
+    assert current is not None
+    assert current.status is RequestStatus.NEW
+    assert current.attempts == 0
+
+
+def test_resume_operator_new_chat_with_crossed_durable_evidence_never_reacquires_fresh_context(
+    tmp_path: Path,
+):
+    _store, state, worker, _path, hop, ledger, _donor = (
+        _prepare_operator_new_chat_pristine_sending(
+            tmp_path, task_id="task-resume-operator-fresh-crossed"
+        )
+    )
+    ledger.update(
+        hop["request_id"],
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=PageBinding("WEB:crossed", hop["physical_role"]),
+        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+        session_id_before="WEB:crossed",
+    )
+
+    class Actions:
+        def __init__(self):
+            self.bootstrap_calls = 0
+
+        async def locate_owned(self, *_args, **_kwargs):
+            return None
+
+        async def backend_conversation(self, *_args, **_kwargs):
+            self.bootstrap_calls += 1
+            raise AssertionError("crossed durable evidence must not enter fresh-context bootstrap")
+
+    actions = Actions()
+    control = state["controls"][-1]
+    asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
+
+    assert actions.bootstrap_calls == 0
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "sending_provenance_ambiguous"
+
+
+def test_resume_operator_new_chat_with_attachments_never_transfers_preboundary_ownership(
+    tmp_path: Path,
+):
+    _store, state, worker, _path, hop, ledger, _donor = (
+        _prepare_operator_new_chat_pristine_sending(
+            tmp_path,
+            task_id="task-resume-operator-fresh-attachment",
+            empty_ledger=True,
+        )
+    )
+    state["attachments"] = [
+        {
+            "path": "/tmp/operator-owned.txt",
+            "name": "operator-owned.txt",
+            "size": 1,
+            "sha256": "0" * 64,
+            "mime_type": "text/plain",
+        }
+    ]
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            return None
+
+    control = state["controls"][-1]
+    asyncio.run(worker._recover_resume_sending(state, hop, control, Actions()))
+
+    assert ledger.get(hop["request_id"]) is None
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "preboundary_context_unrecoverable"
 
 
 @pytest.mark.parametrize(
@@ -1326,7 +1278,7 @@ def test_resume_legacy_donorless_failure_does_not_try_second_donor_or_bootstrap_
     asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
 
     record = ledger.get(hop["request_id"])
-    assert actions.backend_calls == [donor["conversation_id"]]
+    assert actions.backend_calls == []
     assert actions.branch_calls == []
     assert ui_calls == [("PLAN", donor)]
     assert control["status"] == "recovery_required"
@@ -2613,7 +2565,10 @@ def test_provisional_sending_bootstrap_donor_anchor_excludes_only_proven_inherit
         composer_text="",
         attachment_markers=(),
         blocking_dialogs=(),
-        messages=(),
+        messages=(
+            MessageSnapshot("assistant", donor["assistant_message_id"], "turn-donor", "bootstrap prefix", ()),
+            MessageSnapshot("user", accepted_user, "turn-user", backend_prompt, ()),
+        ),
         send_enabled=False,
         stop_visible=False,
         session_id=conversation_id,
@@ -2668,7 +2623,7 @@ def test_provisional_sending_bootstrap_donor_anchor_excludes_only_proven_inherit
     assert receipt.user_message_id == accepted_user
     assert receipt.conversation_id == conversation_id
     assert hop["state"] == "waiting"
-    assert actions.backend_calls == [conversation_id]
+    assert actions.backend_calls == []
     assert actions.reopen_calls == 0
     assert actions.branch_calls == 0
 
@@ -2785,7 +2740,9 @@ def test_provisional_sending_same_page_canonical_backend_acceptance_is_consumed_
         composer_text="",
         attachment_markers=(),
         blocking_dialogs=(),
-        messages=(),
+        messages=(
+            MessageSnapshot("user", accepted_user, "turn-user", backend_prompt, ()),
+        ),
         send_enabled=False,
         stop_visible=True,
         session_id=conversation_id,
@@ -2836,7 +2793,7 @@ def test_provisional_sending_same_page_canonical_backend_acceptance_is_consumed_
 
     current = ledger.get(hop["request_id"])
     assert actions.locate_calls == 1
-    assert actions.backend_calls == [conversation_id]
+    assert actions.backend_calls == []
     assert actions.reopen_calls == 0
     assert actions.branch_calls == 0
     assert client.send_calls == 0
@@ -3035,7 +2992,7 @@ def test_lost_sending_page_without_positive_proof_stays_ambiguous_without_tab_ch
     assert current.receipt is None
 
 
-def test_lost_sending_backend_proves_acceptance_before_page_acquisition(tmp_path: Path):
+def test_lost_sending_without_exact_page_fails_closed_without_graph_fetch(tmp_path: Path):
     store, state, worker, path, hop, ledger, binding, baseline = _prepare_sending_record(
         tmp_path, task_id="task-resume-backend-accepted"
     )
@@ -3076,33 +3033,29 @@ def test_lost_sending_backend_proves_acceptance_before_page_acquisition(tmp_path
 
         async def backend_conversation(self, observed_conversation_id):
             self.backend_calls.append(observed_conversation_id)
-            return _backend_long_user_graph(accepted_user, hop["prompt"])
+            raise AssertionError("lost SENDING recovery must not fetch conversation history")
 
         async def locate_owned(self, *_args, **_kwargs):
             self.locate_calls += 1
-            raise AssertionError("backend acceptance must be consumed before page acquisition")
+            return None
 
     actions = Actions()
     control = state["controls"][-1]
     asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
 
     current = ledger.get(hop["request_id"])
-    assert actions.backend_calls == [conversation_id]
-    assert actions.locate_calls == 0
-    assert control["status"] == "applied"
-    assert control["result"]["action"] == "observe_progress"
+    assert actions.backend_calls == []
+    assert actions.locate_calls == 1
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "sending_provenance_ambiguous"
     assert current is not None
-    assert current.status is RequestStatus.SENT
+    assert current.status is RequestStatus.SENDING
     assert current.attempts == 1
-    receipt = SendReceipt.from_dict(current.receipt)
-    assert receipt.binding == binding
-    assert receipt.baseline == baseline
-    assert receipt.user_message_id == accepted_user
-    assert receipt.conversation_id == conversation_id
-    assert hop["state"] == "waiting"
+    assert current.receipt is None
+    assert hop["state"] == "sending"
 
 
-def test_lost_sending_empty_baseline_recovers_unique_exact_prompt_without_page_acquisition(
+def test_lost_sending_empty_baseline_without_page_stays_ambiguous_without_graph_fetch(
     tmp_path: Path,
 ):
     store, state, worker, path, hop, ledger, binding, _baseline = _prepare_sending_record(
@@ -3135,29 +3088,25 @@ def test_lost_sending_empty_baseline_recovers_unique_exact_prompt_without_page_a
         def __init__(self):
             self.locate_calls = 0
 
-        async def backend_conversation(self, observed_conversation_id):
-            assert observed_conversation_id == conversation_id
-            return _backend_long_user_graph(accepted_user, hop["prompt"].replace(" ", "\u00a0", 1))
+        async def backend_conversation(self, _observed_conversation_id):
+            raise AssertionError("empty-baseline recovery must not fetch conversation history")
 
         async def locate_owned(self, *_args, **_kwargs):
             self.locate_calls += 1
-            raise AssertionError("unique backend prompt proof must be consumed before page acquisition")
+            return None
 
     actions = Actions()
     control = state["controls"][-1]
     asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
 
     current = ledger.get(hop["request_id"])
-    assert actions.locate_calls == 0
-    assert control["status"] == "applied"
-    assert current is not None and current.status is RequestStatus.SENT
+    assert actions.locate_calls == 1
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "sending_provenance_ambiguous"
+    assert current is not None and current.status is RequestStatus.SENDING
     assert current.attempts == 1
-    receipt = SendReceipt.from_dict(current.receipt)
-    assert receipt.binding == binding
-    assert not receipt.baseline.message_ids
-    assert receipt.user_message_id == accepted_user
-    assert receipt.conversation_id == conversation_id
-    assert hop["state"] == "waiting"
+    assert current.receipt is None
+    assert hop["state"] == "sending"
 
 
 def test_lost_sending_empty_baseline_duplicate_exact_prompt_stays_ambiguous(
@@ -3651,24 +3600,21 @@ def test_self_route_guard_rejects_bypass_controls_but_new_chat_does_not_release(
         store, state, worker, path, source = _guard_blocked_state(
             tmp_path, task_id=f"task-self-route-bypass-{action}"
         )
-        queued = store.request_control(
-            path,
-            action,
-            role="PLAN",
-            reason=f"attempt {action}",
-            external_command_id=f"guard-bypass-{action}",
-        )
-        before_hops = len(queued["hops"])
-        actions = FakeActions()
-        applied = asyncio.run(worker._apply_control(queued, actions, path))
-        assert applied is True
-        assert queued["controls"][-1]["status"] == "rejected"
-        assert queued["status"] == "BLOCKED"
-        assert queued["block_code"] == "consecutive_self_route_limit"
-        assert queued["active_hop_id"] == source["hop_id"]
-        assert len(queued["hops"]) == before_hops
-        if action == "restart_role":
-            assert actions.restart_roles == []
+        before_hops = len(state["hops"])
+        with pytest.raises(ValueError):
+            store.request_control(
+                path,
+                action,
+                role="PLAN",
+                reason=f"attempt {action}",
+                external_command_id=f"guard-bypass-{action}",
+            )
+        unchanged = store.load(path)
+        assert unchanged["status"] == "BLOCKED"
+        assert unchanged["block_code"] == "consecutive_self_route_limit"
+        assert unchanged["active_hop_id"] == source["hop_id"]
+        assert len(unchanged["hops"]) == before_hops
+        assert not unchanged.get("controls")
 
     store, state, worker, path, source = _guard_blocked_state(
         tmp_path, task_id="task-self-route-new-chat"
@@ -3885,218 +3831,122 @@ def _accepted_identity_graph(user_message_id: str, prompt: str):
     }
 
 
-def test_resume_accepted_root_discovers_exact_backend_identity_without_replay(
-    tmp_path: Path, monkeypatch
+def test_resume_accepted_root_canonicalizes_from_exact_owned_local_page_without_backend_search(
+    tmp_path: Path,
 ):
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-accepted-root-discovery"
+    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-resume-root-local"
     )
     hop["conversation_url"] = "https://chatgpt.com/"
     state["roles"]["PLAN"]["page_url"] = "https://chatgpt.com/"
-    state = store.save(path, state)
-    exact_id = "11111111-1111-4111-8111-111111111111"
-    false_id = "22222222-2222-4222-8222-222222222222"
-    calls = {"search": 0, "graph": [], "status": 0, "dom": 0}
+    snapshot = _accepted_snapshot(receipt)
+    snapshot.session_id = "local-canonical"
 
-    class Actions:
-        async def backend_search_conversations(self, query, *, max_candidates=25):
-            assert query == state["task_id"]
-            assert max_candidates == 25
-            calls["search"] += 1
-            return [false_id, exact_id]
+    class Client:
+        async def assert_ownership(self):
+            return snapshot
 
-        async def backend_conversation(self, conversation_id):
-            calls["graph"].append(conversation_id)
-            if conversation_id == false_id:
-                return _accepted_identity_graph("unrelated-user", receipt.prompt)
-            assert conversation_id == exact_id
-            return _accepted_identity_graph(receipt.user_message_id, receipt.prompt)
-
-        async def backend_stream_status(self, conversation_id):
-            assert conversation_id == exact_id
-            calls["status"] += 1
-            return {"status": "IS_STREAMING"}
-
-        async def locate_owned(self, *_args, **_kwargs):
-            calls["dom"] += 1
-            raise AssertionError("accepted-root discovery must not inspect or rebind a tab")
-
-        async def reopen(self, *_args, **_kwargs):
-            calls["dom"] += 1
-            raise AssertionError("accepted-root discovery must not reopen or resend")
-
-    _queue_blocked_resume(store, state, code="role_offline", reason="browser page lost")
-    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
-
-    recovered = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
-
-    active = _active_hop(recovered)
-    record = RequestLedger(active["ledger_path"]).get(active["request_id"])
-    control = recovered["controls"][-1]
-    assert calls == {"search": 1, "graph": [false_id, exact_id], "status": 1, "dom": 0}
-    assert recovered["status"] == "RUNNING"
-    assert control["status"] == "applied"
-    assert control["result"]["action"] == "rearm_backend_wait"
-    assert active["receipt"]["conversation_id"] == exact_id
-    assert active["conversation_url"] == f"https://chatgpt.com/c/{exact_id}"
-    assert recovered["roles"]["PLAN"]["page_url"] == f"https://chatgpt.com/c/{exact_id}"
-    assert record is not None and record.status is RequestStatus.SENT
-    assert record.attempts == 1
-    assert record.receipt["conversation_id"] == exact_id
-
-
-def test_resume_accepted_root_with_message_id_only_discovers_without_reopen(
-    tmp_path: Path, monkeypatch
-):
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-accepted-root-message-id-only"
+    acquired = AcquiredRole(
+        Client(), receipt.binding.page_id, "https://chatgpt.com/c/local-canonical", False, False
     )
-    receipt = replace(receipt, user_turn_id=None)
-    RequestLedger(hop["ledger_path"]).update(hop["request_id"], receipt=receipt.to_dict())
-    hop["receipt"] = receipt.to_dict()
-    hop["conversation_url"] = "https://chatgpt.com/"
-    state["roles"]["PLAN"]["page_url"] = "https://chatgpt.com/"
-    state = store.save(path, state)
-    exact_id = "33333333-3333-4333-8333-333333333333"
-    calls = {"search": 0, "reopen": 0}
+    calls = {"search": 0, "graph": 0}
 
     class Actions:
-        async def backend_search_conversations(self, query, *, max_candidates=25):
-            assert query == state["task_id"]
-            calls["search"] += 1
-            return [exact_id]
-
-        async def backend_conversation(self, conversation_id):
-            assert conversation_id == exact_id
-            return _accepted_identity_graph(receipt.user_message_id, receipt.prompt)
-
-        async def backend_stream_status(self, conversation_id):
-            assert conversation_id == exact_id
-            return {"status": "IS_STREAMING"}
-
         async def locate_owned(self, *_args, **_kwargs):
-            raise AssertionError("message-id-only accepted recovery must stay backend-first")
-
-        async def reopen(self, *_args, **_kwargs):
-            calls["reopen"] += 1
-            raise AssertionError("message-id-only accepted recovery must not exact-reopen root")
-
-    _queue_blocked_resume(store, state, code="role_offline", reason="browser page lost")
-    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
-
-    recovered = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
-
-    active = _active_hop(recovered)
-    record = RequestLedger(active["ledger_path"]).get(active["request_id"])
-    assert calls == {"search": 1, "reopen": 0}
-    assert recovered["status"] == "RUNNING"
-    assert active["receipt"]["conversation_id"] == exact_id
-    assert active["receipt"]["user_turn_id"] is None
-    assert record is not None and record.status is RequestStatus.SENT
-    assert record.attempts == 1
-    assert record.receipt["conversation_id"] == exact_id
-    assert record.receipt["user_turn_id"] is None
-
-
-def test_resume_accepted_root_unresolved_blocks_before_exact_reopen(
-    tmp_path: Path, monkeypatch
-):
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-accepted-root-unresolved"
-    )
-    hop["conversation_url"] = "https://chatgpt.com/"
-    state["roles"]["PLAN"]["page_url"] = "https://chatgpt.com/c/unrelated-existing"
-    state = store.save(path, state)
-    calls = {"search": 0, "dom": 0}
-
-    class Actions:
-        async def backend_search_conversations(self, query, *, max_candidates=25):
-            assert query == state["task_id"]
+            return acquired
+        async def backend_search_conversations(self, *_args, **_kwargs):
             calls["search"] += 1
-            return []
-
+            raise AssertionError("accepted identity recovery must not search backend history")
         async def backend_conversation(self, *_args, **_kwargs):
-            raise AssertionError("zero search candidates must not fetch a graph")
+            calls["graph"] += 1
+            raise AssertionError("accepted identity recovery must not fetch conversation graph")
 
-        async def locate_owned(self, *_args, **_kwargs):
-            calls["dom"] += 1
-            raise AssertionError("unresolved accepted identity must not bind an unrelated tab")
-
-        async def reopen(self, *_args, **_kwargs):
-            calls["dom"] += 1
-            raise AssertionError("unresolved accepted identity must not enter root exact-reopen loop")
-
-    _queue_blocked_resume(store, state, code="role_offline", reason="browser page lost")
-    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
-
-    recovered = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
-
-    active = _active_hop(recovered)
-    record = RequestLedger(active["ledger_path"]).get(active["request_id"])
-    control = recovered["controls"][-1]
-    assert calls == {"search": 1, "dom": 0}
-    assert recovered["status"] == "BLOCKED"
-    assert recovered["block_code"] == "accepted_conversation_identity_unresolved"
-    assert "exact conversation" not in recovered["block_reason"].lower()
-    assert control["status"] == "recovery_required"
-    assert control["result"]["reason_code"] == "accepted_conversation_identity_unresolved"
-    assert active["state"] == "waiting"
-    assert active["receipt"]["conversation_id"] is None
-    assert record is not None and record.status is RequestStatus.SENT
-    assert record.attempts == 1
-    assert record.receipt["conversation_id"] is None
-
-
-@pytest.mark.parametrize("failure_mode", ["multiple", "backend_unavailable"])
-def test_resume_accepted_root_ambiguous_or_unavailable_never_rebinds(
-    tmp_path: Path, monkeypatch, failure_mode: str
-):
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id=f"task-accepted-root-{failure_mode}"
+    enriched = asyncio.run(
+        worker._discover_accepted_conversation_identity(state, hop, Actions(), receipt)
     )
-    hop["conversation_url"] = "https://chatgpt.com/"
-    state["roles"]["PLAN"]["page_url"] = "https://chatgpt.com/c/unrelated-existing"
-    state = store.save(path, state)
-    calls = {"search": 0, "graph": 0, "dom": 0}
+
+    assert calls == {"search": 0, "graph": 0}
+    assert enriched.conversation_id == "local-canonical"
+    durable = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
+    assert durable is not None
+    assert durable.receipt["conversation_id"] == "local-canonical"
+    assert durable.attempts == 1
+
+
+def test_resume_accepted_root_message_id_only_uses_same_local_identity_proof(tmp_path: Path):
+    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-resume-root-message-only"
+    )
+    message_only = replace(receipt, user_turn_id=None)
+    RequestLedger(hop["ledger_path"]).update(hop["request_id"], receipt=message_only.to_dict())
+    hop["receipt"] = message_only.to_dict()
+    snapshot = _accepted_snapshot(message_only)
+    snapshot.session_id = "message-only-canonical"
+
+    class Client:
+        async def assert_ownership(self):
+            return snapshot
+
+    acquired = AcquiredRole(
+        Client(), message_only.binding.page_id, "https://chatgpt.com/c/message-only-canonical", False, False
+    )
 
     class Actions:
-        async def backend_search_conversations(self, _query, *, max_candidates=25):
-            calls["search"] += 1
-            if failure_mode == "backend_unavailable":
-                raise worker_module.BackendUnavailableError(503, "conversation_search")
-            return [
-                "11111111-1111-4111-8111-111111111111",
-                "22222222-2222-4222-8222-222222222222",
-            ]
-
-        async def backend_conversation(self, _conversation_id):
-            calls["graph"] += 1
-            return _accepted_identity_graph(receipt.user_message_id, receipt.prompt)
-
         async def locate_owned(self, *_args, **_kwargs):
-            calls["dom"] += 1
-            raise AssertionError("ambiguous accepted identity must not rebind DOM ownership")
+            return acquired
+        async def backend_search_conversations(self, *_args, **_kwargs):
+            raise AssertionError("message-only identity must not search backend history")
+        async def backend_conversation(self, *_args, **_kwargs):
+            raise AssertionError("message-only identity must not fetch graph")
 
-        async def reopen(self, *_args, **_kwargs):
-            calls["dom"] += 1
-            raise AssertionError("ambiguous accepted identity must not reopen or resend")
+    enriched = asyncio.run(
+        worker._discover_accepted_conversation_identity(state, hop, Actions(), message_only)
+    )
+    assert enriched.conversation_id == "message-only-canonical"
+    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
 
-    _queue_blocked_resume(store, state, code="role_offline", reason="browser page lost")
-    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
 
-    recovered = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+@pytest.mark.parametrize("failure", ["missing_page", "wrong_page", "unsaved_page"])
+def test_resume_accepted_root_unresolved_local_identity_never_rebinds_or_searches_backend(
+    tmp_path: Path, failure: str
+):
+    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id=f"task-resume-root-{failure}"
+    )
+    calls = {"search": 0, "graph": 0}
+    if failure == "missing_page":
+        acquired = None
+    else:
+        snapshot = _accepted_snapshot(receipt)
+        snapshot.session_id = None if failure == "unsaved_page" else "wrong-canonical"
 
-    active = _active_hop(recovered)
-    record = RequestLedger(active["ledger_path"]).get(active["request_id"])
-    assert calls["search"] == 1
-    assert calls["graph"] == (2 if failure_mode == "multiple" else 0)
-    assert calls["dom"] == 0
-    assert recovered["status"] == "BLOCKED"
-    assert recovered["block_code"] == "accepted_conversation_identity_unresolved"
-    assert active["receipt"]["conversation_id"] is None
-    assert record is not None and record.status is RequestStatus.SENT
-    assert record.attempts == 1
-    assert record.receipt["conversation_id"] is None
+        class Client:
+            async def assert_ownership(self):
+                return snapshot
+
+        page_id = "different-page" if failure == "wrong_page" else receipt.binding.page_id
+        acquired = AcquiredRole(Client(), page_id, "https://chatgpt.com/", False, False)
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            return acquired
+        async def backend_search_conversations(self, *_args, **_kwargs):
+            calls["search"] += 1
+            raise AssertionError("unresolved local identity must not search backend history")
+        async def backend_conversation(self, *_args, **_kwargs):
+            calls["graph"] += 1
+            raise AssertionError("unresolved local identity must not fetch graph")
+
+    with pytest.raises(worker_module.GraphIdentityError):
+        asyncio.run(
+            worker._discover_accepted_conversation_identity(state, hop, Actions(), receipt)
+        )
+
+    assert calls == {"search": 0, "graph": 0}
+    durable = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
+    assert durable is not None
+    assert durable.receipt.get("conversation_id") in (None, "")
+    assert durable.attempts == 1
 
 
 def test_route_plan_explicitly_reconciles_only_unresolved_accepted_send(tmp_path: Path):
@@ -4225,18 +4075,17 @@ def test_route_plan_does_not_bypass_other_accepted_inflight_wait(tmp_path: Path)
         active_action="blocked",
     )
     state = store.save(path, state)
-    queued = store.request_control(
-        path,
-        "route_plan",
-        role="PLAN",
-        reason="must remain rejected",
-        external_command_id="accepted-root-route-plan-guard",
-    )
-    before_hops = len(queued["hops"])
-
-    assert asyncio.run(worker._apply_control(queued, FakeActions(), path)) is True
-
-    assert queued["controls"][-1]["status"] == "rejected"
-    assert queued["status"] == "BLOCKED"
-    assert queued["active_hop_id"] == hop["hop_id"]
-    assert len(queued["hops"]) == before_hops
+    before_hops = len(state["hops"])
+    with pytest.raises(ValueError, match="PLAN is already the active role"):
+        store.request_control(
+            path,
+            "route_plan",
+            role="PLAN",
+            reason="must remain rejected",
+            external_command_id="accepted-root-route-plan-guard",
+        )
+    unchanged = store.load(path)
+    assert unchanged["status"] == "BLOCKED"
+    assert unchanged["active_hop_id"] == hop["hop_id"]
+    assert len(unchanged["hops"]) == before_hops
+    assert not unchanged.get("controls")

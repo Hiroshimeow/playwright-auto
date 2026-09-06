@@ -458,8 +458,8 @@ def test_notify_frontend_contract_reuses_secondary_report_path_and_preserves_his
     assert 'if (current.drawer === "history") renderHistory(roots.secondaryContent, current);' in app
     assert 'if (current.drawer === "notify") renderNotify(roots.secondaryContent, current);' in app
     assert 'if (view === "notify") delete roots.secondaryContent.dataset.secondaryView;' in app
-    assert '/assets/app.js?v=20260905-dependency-team-cards' in html
-    assert './views/notify.js?v=20260812-notify-v2' in app
+    assert '/assets/app.js?v=20260906-listen-controls-v1' in html
+    assert './views/notify.js?v=20260906-listen-controls-v1' in app
     assert 'data-notify-task-id' in notify
     assert 'workflowReportModel(detail, detail.active_role)' in notify
     assert 'reportBody(report, reportBodies)' in notify
@@ -653,6 +653,25 @@ def test_task_goal_blocks_dedupe_and_disclosure_state_contract_is_keyed():
     assert 'sameTask ? new Set' in detail
     assert 'querySelectorAll("details[data-disclosure-key][open]")' in detail
     assert 'details.open = openDisclosureKeys.has(details.dataset.disclosureKey)' in detail
+
+
+def test_runtime_dom_only_help_describes_both_true_modes_truthfully():
+    runtime = (ASSET_ROOT / "views" / "runtime.js").read_text(encoding="utf-8")
+    assert "DOM-only compatibility / rollback mode." in runtime
+    assert "Listen + DOM mode with sparse stream_status" in runtime
+    assert "no automation full-conversation graph reads" in runtime
+
+
+def test_workflow_controls_fail_closed_from_projected_eligibility_with_reason_tooltips():
+    detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
+    workflow = detail.split("function workflowOverview", 1)[1].split("function build", 1)[0]
+
+    assert "detail.control_eligibility?.[action]" in workflow
+    assert "eligible: false" in workflow
+    assert "disabled: eligibility.eligible !== true" in workflow
+    assert "reason: eligibility.reason || null" in workflow
+    assert "node.title = String(reason)" in detail
+    assert "node.dataset.disabledReason = String(reason)" in detail
 
 
 def test_task_controls_render_before_task_prompt():

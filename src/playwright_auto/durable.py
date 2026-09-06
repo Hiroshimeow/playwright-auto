@@ -203,6 +203,7 @@ class DurableRequestRecord:
     session_id_before: str | None = None
     receipt: dict[str, Any] | None = None
     upload_receipt: dict[str, Any] | None = None
+    approval: dict[str, Any] | None = None
     response: dict[str, Any] | None = None
     error: str | None = None
 
@@ -227,6 +228,7 @@ class DurableRequestRecord:
             "session_id_before": self.session_id_before,
             "receipt": self.receipt,
             "upload_receipt": self.upload_receipt,
+            "approval": self.approval,
             "response": self.response,
             "error": self.error,
         }
@@ -275,6 +277,7 @@ class DurableRequestRecord:
                 if value.get("upload_receipt")
                 else None
             ),
+            approval=(dict(value["approval"]) if value.get("approval") else None),
             response=(dict(value["response"]) if value.get("response") else None),
             error=(str(value["error"]) if value.get("error") else None),
         )
@@ -435,6 +438,7 @@ class RequestLedger:
                 "session_id_before",
                 "receipt",
                 "upload_receipt",
+                "approval",
                 "response",
                 "error",
             }

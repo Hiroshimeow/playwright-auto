@@ -17,6 +17,16 @@ This file is not a chronological incident log. Track one entry per stable root c
 
 ## Active problems
 
+### P-042 — Resume rejects a proven fresh generation-1 preboundary role after operator New Chat
+
+- **Status:** `RESOLVED`
+- **Priority:** `HIGH`
+- **Root cause:** `_recover_pristine_preboundary_sending()` permitted a lost donorless role only when `conversation_generation == 0`. A role that was provably fresh because the durable operator `new_chat` control created generation 1 before any durable Send evidence was therefore rejected as `preboundary_context_unrecoverable`, even when the exact RequestLedger was empty or pristine `NEW` with zero attempts and no binding, baseline, receipt, acceptance, or response evidence.
+- **Concrete evidence:** `screens-pi-sdk-migration` / `cdpa-idem-a7d0363b3887a5e0e3008113` reached PLAN hop 1 / request `cdpa-idem-a7d0363b3887a5e0e3008113-hop1` with an empty exact ledger, generation 1, no receipt/conversation identity, and an applied operator `new_chat` control whose immutable snapshot proves generation 0 / `pre_send` / no prior page or conversation identity for the same hop, request, turn, role, and handoff. The original page disappeared before Send, and the old donorless generation guard dead-ended Resume.
+- **Owner:** `cdpa-preboundary-newchat-recovery` / `cdpa-idem-9de92ce2ae014a4d81383805`.
+- **Correction:** the existing Resume recovery owner now admits only that narrow durable operator-New-Chat provenance, rejects mismatched/stale provenance and attachment-owned transfer, and keeps the RequestLedger pristine/crossed boundary classifier authoritative. A proven fresh context is reacquired through the existing targeted fresh-role primitive rather than bootstrap branching, without incrementing `conversation_generation`, changing task/hop/request/turn/prompt identity, or crossing Send inside the Resume control. Legacy generation-zero and recorded-bootstrap-donor paths remain unchanged.
+- **Verification:** focused generation-1 tests cover empty and pristine `NEW` ledgers plus unproven/mismatched provenance, crossed durable Send evidence, and attachments; the full Resume suite and durable/worker control suites are green. Live Resume control 10 on the original incident returned `continued` / `ownership_reacquired_before_send` with the same hop/request/turn, generation 1, and null receipt hash; normal worker continuation then crossed Send exactly once as the same request. Independent REVIEW passed the implementation boundary, and TEST reloaded the final source into the PM2 worker, proved healthy heartbeat/browser connectivity, reran the focused recovery set successfully, and confirmed the original ledger remained `COMPLETED` with `attempts=1` and no replay.
+
 ### P-041 — Resume UI bootstrap can erase known rate-limit classification before Send
 
 - **Status:** `RESOLVED`

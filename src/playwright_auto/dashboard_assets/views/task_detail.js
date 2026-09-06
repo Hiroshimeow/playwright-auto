@@ -5,7 +5,7 @@ function el(tag, value, className) {
   return node;
 }
 
-function button(action, label, task, {disabled = false, emphasized = false} = {}) {
+function button(action, label, task, {disabled = false, emphasized = false, reason = null} = {}) {
   const node = el("button", label);
   node.type = "button";
   node.dataset.control = action;
@@ -13,6 +13,10 @@ function button(action, label, task, {disabled = false, emphasized = false} = {}
   node.dataset.version = String(task.version || 0);
   node.dataset.renderDisabled = String(Boolean(disabled));
   node.disabled = Boolean(disabled);
+  if (reason) {
+    node.title = String(reason);
+    node.dataset.disabledReason = String(reason);
+  }
   if (emphasized) node.classList.add("control-emphasis");
   return node;
 }
@@ -455,7 +459,16 @@ function workflowOverview(detail, timeline, selectedRole) {
     ["restart_role", "Restart role"], ["new_chat", "New chat"],
     ["open_tab", "Open tab"], ["route_plan", "Route PLAN"],
     ["stop", "Stop"], ["clear_team", "Clear team"],
-  ]) controls.append(button(action, label, detail));
+  ]) {
+    const eligibility = detail.control_eligibility?.[action] || {
+      eligible: false,
+      reason: "Control eligibility is unavailable; refresh task state.",
+    };
+    controls.append(button(action, label, detail, {
+      disabled: eligibility.eligible !== true,
+      reason: eligibility.reason || null,
+    }));
+  }
   fragment.append(controls);
   const dependencies = dependencySection(detail);
   if (dependencies) fragment.append(dependencies);

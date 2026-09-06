@@ -5,10 +5,10 @@ import {
   detailCacheGet, detailCachePut, detailCacheInvalidate, pruneDetailCache,
 } from "./store.js";
 import {renderBoard, refreshElapsed} from "./views/board.js";
-import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260809-compact-ui-v2";
+import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260906-listen-controls-v1";
 import {renderHistory} from "./views/history.js";
-import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20260812-notify-v2";
-import {renderRuntime} from "./views/runtime.js?v=20260901-dom-only";
+import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20260906-listen-controls-v1";
+import {renderRuntime} from "./views/runtime.js?v=20260906-listen-controls-v1";
 import {
   applyReuseRoleSelection, renderCreateActions, renderResume, renderWorkflowAgentOptions,
   selectedDependencyIds, selectedResumeTeams, updateResumeButton,

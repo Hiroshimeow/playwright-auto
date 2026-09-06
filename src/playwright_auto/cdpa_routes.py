@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -270,6 +271,65 @@ def _validated_report_location(
         )
     return root, team_root, candidate
 
+
+
+def validate_file_report(
+    handoff: str,
+    *,
+    repository_root: str | Path,
+    plans_root: str | Path,
+    team: str,
+    physical_role: str,
+    turn: int,
+    task_id: str,
+) -> ReportEvidence:
+    """Validate and fingerprint one exact local workflow report artifact."""
+    root, team_root, target = _validated_report_location(
+        handoff,
+        repository_root=repository_root,
+        plans_root=plans_root,
+        team=team,
+        physical_role=physical_role,
+        turn=turn,
+        task_id=task_id,
+    )
+    if target.parent.resolve() != team_root:
+        raise RouteContractError("report path must not traverse symlinks")
+    if target.is_symlink():
+        raise RouteContractError("report path must not be a symlink")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(target, flags)
+    except FileNotFoundError as exc:
+        raise RouteContractError("report file is missing") from exc
+    except OSError as exc:
+        if target.is_symlink():
+            raise RouteContractError("report path must not be a symlink") from exc
+        raise RouteContractError("report file could not be opened safely") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise RouteContractError("report path must be a regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            data = handle.read()
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if not data:
+        raise RouteContractError("report file is empty")
+    if (
+        before.st_dev != after.st_dev
+        or before.st_ino != after.st_ino
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or len(data) != after.st_size
+    ):
+        raise RouteContractError("report file changed during validation")
+    return ReportEvidence(
+        _display_path(target, root),
+        hashlib.sha256(data).hexdigest(),
+        len(data),
+    )
 
 
 def materialize_inline_report(

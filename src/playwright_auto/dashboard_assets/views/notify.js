@@ -1,4 +1,4 @@
-import {reportBody, workflowReportModel} from "./task_detail.js?v=20260809-compact-ui-v2";
+import {reportBody, workflowReportModel} from "./task_detail.js?v=20260906-listen-controls-v1";
 
 const NOTIFY_STATUSES = new Set(["DONE", "BLOCKED", "PAUSED", "STOPPED"]);
 

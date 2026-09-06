@@ -162,6 +162,17 @@ def test_projection_splits_public_and_private_data(tmp_path: Path):
     assert projection.detail["active_input"]["logical_role"] == "DEV"
     assert projection.detail["active_input"]["hop_id"] == 2
     assert projection.detail["role_inputs"]["PLAN"]["handoff"].endswith("alpha-plan_turn1_task-a.md")
+    eligibility = projection.detail["control_eligibility"]
+    assert eligibility["pause"]["eligible"] is True
+    assert eligibility["resume"]["eligible"] is True
+    assert eligibility["retry"]["eligible"] is False
+    assert eligibility["restart_role"]["eligible"] is False
+    assert eligibility["new_chat"]["eligible"] is False
+    assert eligibility["open_tab"]["eligible"] is True
+    assert eligibility["route_plan"]["eligible"] is False
+    assert eligibility["stop"]["eligible"] is True
+    assert eligibility["clear_team"]["eligible"] is True
+    assert eligibility["restart_role"]["reason"]
     assert "/home/ayumi" not in public
     assert "secret-value" not in public
 

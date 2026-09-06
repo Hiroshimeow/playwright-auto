@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -165,6 +166,236 @@ def setup_task(
         repository=repository,
     )
     return config, store, state, CDPAWorker(config, store=store)
+
+
+def test_worker_arms_passive_observer_with_exact_hop_generation_and_receipt(tmp_path: Path):
+    _config, _store, state, worker = setup_task(
+        tmp_path, task_id="task-passive-observer-wiring"
+    )
+    hop = _active_hop(state)
+    state["roles"]["PLAN"]["conversation_generation"] = 7
+    receipt = SendReceipt(
+        prompt="prompt",
+        prompt_sha256=prompt_digest("prompt"),
+        binding=PageBinding("page-plan", "alpha-plan"),
+        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+        attempts=1,
+        accepted_via="user_message_identity",
+        session_id_before=None,
+        user_message_id="u-passive",
+        user_turn_id="t-passive",
+        conversation_id="conversation-passive",
+    )
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def arm_passive_observer(self, **kwargs):
+            self.calls.append(kwargs)
+
+    client = Client()
+    worker._arm_passive_request_observer(state, hop, client, receipt)
+
+    assert client.calls == [
+        {
+            "request_id": hop["request_id"],
+            "generation": 7,
+            "conversation_id": "conversation-passive",
+            "accepted_user_message_id": "u-passive",
+        }
+    ]
+
+
+def test_worker_hot_mode_switch_detaches_dom_only_and_rearms_listen_mode(tmp_path: Path):
+    _config, _store, state, worker = setup_task(
+        tmp_path, task_id="task-passive-mode-switch"
+    )
+    hop = _active_hop(state)
+    worker.runtime_db.ensure_schema()
+
+    class Client:
+        def __init__(self):
+            self.armed = 0
+            self.detached = 0
+
+        def arm_passive_observer(self, **_kwargs):
+            self.armed += 1
+
+        def detach_passive_observer(self):
+            self.detached += 1
+
+    client = Client()
+    worker.runtime_db.put_snapshot("settings", {"dom_only": True})
+    worker._arm_passive_request_observer(state, hop, client)
+    assert (client.armed, client.detached) == (0, 1)
+
+    worker.runtime_db.put_snapshot("settings", {"dom_only": False})
+    worker._arm_passive_request_observer(state, hop, client)
+    assert (client.armed, client.detached) == (1, 1)
+
+
+def test_waiting_dom_snapshot_uses_passive_wake_as_probe_window(tmp_path: Path):
+    _config, _store, state, worker = setup_task(
+        tmp_path, task_id="task-passive-wake"
+    )
+    hop = _active_hop(state)
+    state["roles"]["PLAN"]["conversation_generation"] = 3
+    receipt = SendReceipt(
+        prompt="prompt",
+        prompt_sha256=prompt_digest("prompt"),
+        binding=PageBinding("page-plan", "alpha-plan"),
+        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+        attempts=1,
+        accepted_via="user_message_identity",
+        session_id_before=None,
+        user_message_id="u-passive",
+        user_turn_id="t-passive",
+        conversation_id="conversation-passive",
+    )
+    calls = []
+
+    class Client:
+        async def wait_for_passive_observation(self, **kwargs):
+            calls.append(("passive", kwargs))
+            return True
+
+        async def wait_snapshot(self, _receipt, **kwargs):
+            calls.append(("snapshot", kwargs))
+            return SimpleNamespace()
+
+    acquired = AcquiredRole(Client(), "page-plan", "https://chatgpt.com/c/conversation-passive", False, False)
+    snapshot, recovered = asyncio.run(
+        worker._waiting_dom_snapshot(
+            state,
+            hop,
+            SimpleNamespace(),
+            acquired,
+            Path(state["manifest_path"]),
+            json.loads(json.dumps(state)),
+            receipt,
+            transport_baseline=None,
+            probe_wait_ms=12_000,
+        )
+    )
+
+    assert snapshot is not None
+    assert recovered is acquired
+    assert calls == [
+        (
+            "passive",
+            {"request_id": hop["request_id"], "generation": 3, "timeout_ms": 12_000},
+        ),
+        ("snapshot", {"force_full": True, "probe_wait_ms": 0}),
+    ]
+
+
+def test_waiting_dom_snapshot_preserves_probe_window_when_passive_not_applicable(tmp_path: Path):
+    _config, _store, state, worker = setup_task(
+        tmp_path, task_id="task-passive-not-applicable"
+    )
+    hop = _active_hop(state)
+    receipt = SendReceipt(
+        prompt="prompt",
+        prompt_sha256=prompt_digest("prompt"),
+        binding=PageBinding("page-plan", "alpha-plan"),
+        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+        attempts=1,
+        accepted_via="user_message_identity",
+        session_id_before=None,
+        user_message_id="u-passive",
+        user_turn_id="t-passive",
+        conversation_id="conversation-passive",
+    )
+    calls = []
+
+    class Client:
+        async def wait_for_passive_observation(self, **kwargs):
+            calls.append(("passive", kwargs))
+            return None
+
+        async def wait_snapshot(self, _receipt, **kwargs):
+            calls.append(("snapshot", kwargs))
+            return SimpleNamespace()
+
+    acquired = AcquiredRole(Client(), "page-plan", "https://chatgpt.com/c/conversation-passive", False, False)
+    snapshot, recovered = asyncio.run(
+        worker._waiting_dom_snapshot(
+            state,
+            hop,
+            SimpleNamespace(),
+            acquired,
+            Path(state["manifest_path"]),
+            json.loads(json.dumps(state)),
+            receipt,
+            transport_baseline=None,
+            probe_wait_ms=12_000,
+        )
+    )
+
+    assert snapshot is not None
+    assert recovered is acquired
+    assert calls == [
+        (
+            "passive",
+            {"request_id": hop["request_id"], "generation": 0, "timeout_ms": 12_000},
+        ),
+        ("snapshot", {"force_full": False, "probe_wait_ms": 12_000}),
+    ]
+
+
+def test_waiting_dom_snapshot_passive_timeout_consumes_probe_window_once(tmp_path: Path):
+    _config, _store, state, worker = setup_task(
+        tmp_path, task_id="task-passive-timeout"
+    )
+    hop = _active_hop(state)
+    receipt = SendReceipt(
+        prompt="prompt",
+        prompt_sha256=prompt_digest("prompt"),
+        binding=PageBinding("page-plan", "alpha-plan"),
+        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+        attempts=1,
+        accepted_via="user_message_identity",
+        session_id_before=None,
+        user_message_id="u-passive",
+        user_turn_id="t-passive",
+        conversation_id="conversation-passive",
+    )
+    calls = []
+
+    class Client:
+        async def wait_for_passive_observation(self, **kwargs):
+            calls.append(("passive", kwargs))
+            return False
+
+        async def wait_snapshot(self, _receipt, **kwargs):
+            calls.append(("snapshot", kwargs))
+            return SimpleNamespace()
+
+    acquired = AcquiredRole(Client(), "page-plan", "https://chatgpt.com/c/conversation-passive", False, False)
+    snapshot, recovered = asyncio.run(
+        worker._waiting_dom_snapshot(
+            state,
+            hop,
+            SimpleNamespace(),
+            acquired,
+            Path(state["manifest_path"]),
+            json.loads(json.dumps(state)),
+            receipt,
+            transport_baseline=None,
+            probe_wait_ms=12_000,
+        )
+    )
+
+    assert snapshot is not None
+    assert recovered is acquired
+    assert calls == [
+        (
+            "passive",
+            {"request_id": hop["request_id"], "generation": 0, "timeout_ms": 12_000},
+        ),
+        ("snapshot", {"force_full": False, "probe_wait_ms": 0}),
+    ]
 
 
 def bootstrap_record(*, bootstrap_id="general-team-bootstrap", enabled=True):
@@ -1211,34 +1442,57 @@ def test_reused_cdpa_role_persistent_empty_history_blocks_retryably_preboundary(
     assert client.send_calls == []
 
 
-def test_path_only_report_routes_without_local_file_io(tmp_path: Path, monkeypatch):
-    _, _, state, worker = setup_task(tmp_path)
-    hop = _active_hop(state)
-    asyncio.run(worker._pre_send(state, hop, FakeActions()))
-    handoff = ".plan/remote-team/remote-plan_turn1_task-a.md"
-    report_target = tmp_path / handoff
-    original_stat = Path.stat
-    original_read_bytes = Path.read_bytes
-    original_is_file = Path.is_file
+def test_missing_local_file_report_enters_route_repair_without_advancing(tmp_path: Path):
+    _store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-missing-local-report"
+    )
+    handoff = str(hop["expected_report_path"])
+    hop["response"] = json.dumps({"route": "DEV", "handoff": handoff})
+    hop["state"] = "responded"
 
-    def reject_report_stat(path, *args, **kwargs):
-        if path == report_target:
-            raise AssertionError("normal routing must not stat the report target")
-        return original_stat(path, *args, **kwargs)
+    worker._responded(state, hop)
 
-    def reject_report_read_bytes(path, *args, **kwargs):
-        if path == report_target:
-            raise AssertionError("normal routing must not read the report target")
-        return original_read_bytes(path, *args, **kwargs)
+    repair = _active_hop(state)
+    assert repair["kind"] == "route_repair"
+    assert repair["target_role"] == "PLAN"
+    assert "report" in repair["validation_error"].lower()
+    assert "missing" in repair["validation_error"].lower()
+    assert state["reports"] == []
+    assert not any(
+        item.get("target_role") == "DEV" and item.get("kind") == "handoff"
+        for item in state["hops"]
+    )
 
-    def reject_report_is_file(path, *args, **kwargs):
-        if path == report_target:
-            raise AssertionError("normal routing must not inspect report file type")
-        return original_is_file(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "stat", reject_report_stat)
-    monkeypatch.setattr(Path, "read_bytes", reject_report_read_bytes)
-    monkeypatch.setattr(Path, "is_file", reject_report_is_file)
+def test_empty_local_file_report_enters_route_repair_without_advancing(tmp_path: Path):
+    _store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-empty-local-report"
+    )
+    handoff = str(hop["expected_report_path"])
+    report = tmp_path / handoff
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_bytes(b"")
+    hop["response"] = json.dumps({"route": "DEV", "handoff": handoff})
+    hop["state"] = "responded"
+
+    worker._responded(state, hop)
+
+    repair = _active_hop(state)
+    assert repair["kind"] == "route_repair"
+    assert "report" in repair["validation_error"].lower()
+    assert "empty" in repair["validation_error"].lower()
+    assert state["reports"] == []
+
+
+def test_local_file_report_routes_once_with_hash_and_size_evidence(tmp_path: Path):
+    _store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-valid-local-report"
+    )
+    handoff = str(hop["expected_report_path"])
+    report = tmp_path / handoff
+    report.parent.mkdir(parents=True, exist_ok=True)
+    data = b"# DEV report\n\nVerified local artifact.\n"
+    report.write_bytes(data)
     hop["response"] = json.dumps({"route": "DEV", "handoff": handoff})
     hop["state"] = "responded"
 
@@ -1246,30 +1500,57 @@ def test_path_only_report_routes_without_local_file_io(tmp_path: Path, monkeypat
 
     child = _active_hop(state)
     assert hop["state"] == "routed"
+    assert hop["route"] == "DEV"
     assert hop["report_path"] == handoff
-    assert hop["report_sha256"] is None
-    assert hop["report_size"] is None
+    assert hop["report_sha256"] == worker_module.hashlib.sha256(data).hexdigest()
+    assert hop["report_size"] == len(data)
     assert child["target_role"] == "DEV"
-    assert child["state"] == "pre_send"
     assert child["handoff"] == handoff
-    assert state["active_role"] == "DEV"
-    assert state["roles"]["DEV"]["status"] == "pending"
-    assert state["reports"] == [
-        {
-            "report_id": 1,
-            "role": "PLAN",
-            "physical_role": hop["physical_role"],
-            "turn": hop["turn"],
-            "path": handoff,
-            "sha256": None,
-            "size": None,
-            "created_at": state["reports"][0]["created_at"],
-        }
-    ]
-    assert state["route_timeline"][-1]["report_path"] == handoff
+    assert state["reports"][-1]["sha256"] == hop["report_sha256"]
+    assert state["reports"][-1]["size"] == len(data)
 
 
+def test_mismatched_local_file_report_path_enters_route_repair(tmp_path: Path):
+    _store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-mismatched-local-report"
+    )
+    handoff = (
+        f".plan/{state['team']}/{hop['physical_role']}_turn{hop['turn']}_"
+        "wrong-task-id.md"
+    )
+    report = tmp_path / handoff
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("# wrong report\n", encoding="utf-8")
+    hop["response"] = json.dumps({"route": "DEV", "handoff": handoff})
+    hop["state"] = "responded"
 
+    worker._responded(state, hop)
+
+    repair = _active_hop(state)
+    assert repair["kind"] == "route_repair"
+    assert "expected role report" in repair["validation_error"].lower()
+    assert state["reports"] == []
+
+
+def test_symlink_local_file_report_enters_route_repair(tmp_path: Path):
+    _store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-symlink-local-report"
+    )
+    handoff = str(hop["expected_report_path"])
+    report = tmp_path / handoff
+    report.parent.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside-report.md"
+    outside.write_text("# outside\n", encoding="utf-8")
+    report.symlink_to(outside)
+    hop["response"] = json.dumps({"route": "DEV", "handoff": handoff})
+    hop["state"] = "responded"
+
+    worker._responded(state, hop)
+
+    repair = _active_hop(state)
+    assert repair["kind"] == "route_repair"
+    assert "symlink" in repair["validation_error"].lower()
+    assert state["reports"] == []
 
 
 
@@ -2142,759 +2423,330 @@ def _backend_graph(user_id: str, assistant_id: str, text: str):
     }
 
 
-def test_backend_primary_is_streaming_uses_status_cadence_without_dom_or_graph(tmp_path: Path):
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+def test_listen_dom_streaming_status_is_sparse_and_never_fetches_graph(tmp_path: Path):
+    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-stream-primary"
     )
-    state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
-    worker.runtime_db.ensure_schema()
-    calls = {"status": 0, "graph": 0, "dom": 0, "source": 0}
+    receipt = replace(receipt, conversation_id="conversation-1")
+    worker.config = replace(
+        worker.config, response_stream_status_terminal_settle_seconds=5.0
+    )
+    hop["receipt"] = receipt.to_dict()
+    hop["wait"]["stream_status_next_poll_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    calls = {"status": 0, "graph": 0}
 
     class Actions:
         async def backend_stream_status(self, conversation_id):
             assert conversation_id == "conversation-1"
             calls["status"] += 1
             return {"status": "IS_STREAMING"}
-        async def backend_conversation(self, _conversation_id):
-            calls["graph"] += 1
-            raise AssertionError("IS_STREAMING must not fetch full conversation")
-        async def locate_owned_metadata(self, *_args, **_kwargs):
-            calls["source"] += 1
-            raise AssertionError("healthy stream-status polling must not depend on source tab")
-        async def locate_owned(self, *_args, **_kwargs):
-            calls["source"] += 1
-            raise AssertionError("healthy stream-status polling must not inspect source DOM")
-        async def reopen(self, *_args, **_kwargs):
-            calls["source"] += 1
-            raise AssertionError("healthy stream-status polling must not reopen source")
-
-    actions = Actions()
-    identity_before = (
-        hop["hop_id"],
-        hop["request_id"],
-        json.dumps(hop["receipt"], sort_keys=True),
-        state["active_hop_id"],
-    )
-
-    asyncio.run(worker._waiting(state, hop, actions, path))
-    assert calls == {"status": 1, "graph": 0, "dom": 0, "source": 0}
-
-    worker.runtime_db.put_snapshot("settings", {"dom_only": False})
-    hop["wait"]["stream_status_next_poll_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=1)
-    ).isoformat()
-    asyncio.run(worker._waiting(state, hop, actions, path))
-    assert calls == {"status": 2, "graph": 0, "dom": 0, "source": 0}
-
-    worker._waiting_dom = AsyncMock()
-    state["task_mode"] = "independent"
-    hop["kind"] = "independent_job"
-    worker.runtime_db.put_snapshot("settings", {"dom_only": True})
-    hop["wait"]["stream_status_next_poll_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=1)
-    ).isoformat()
-    asyncio.run(worker._waiting(state, hop, actions, path))
-    worker._waiting_dom.assert_awaited_once()
-    assert state["task_mode"] == "independent"
-    assert hop["kind"] == "independent_job"
-    assert calls == {"status": 2, "graph": 0, "dom": 0, "source": 0}
-
-    worker.runtime_db.put_snapshot("settings", {"dom_only": False})
-    hop["wait"]["stream_status_next_poll_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=1)
-    ).isoformat()
-    asyncio.run(worker._waiting(state, hop, actions, path))
-
-    assert calls == {"status": 3, "graph": 0, "dom": 0, "source": 0}
-    assert worker._waiting_dom.await_count == 1
-    assert (
-        hop["hop_id"],
-        hop["request_id"],
-        json.dumps(hop["receipt"], sort_keys=True),
-        state["active_hop_id"],
-    ) == identity_before
-    assert hop["state"] == "waiting"
-    assert hop["wait"]["completion_mode"] == "stream_status"
-    assert hop["wait"]["stream_status_poll_count"] == 3
-
-
-def test_is_streaming_does_not_reopen_missing_source_while_backend_is_healthy(tmp_path: Path):
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-stream-source-reopen"
-    )
-    state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
-    calls = {"status": 0, "source": 0}
-
-    class Actions:
-        async def backend_stream_status(self, _conversation_id):
-            calls["status"] += 1
-            return {"status": "IS_STREAMING"}
         async def backend_conversation(self, *_args, **_kwargs):
-            raise AssertionError("IS_STREAMING must not fetch graph")
-        async def locate_owned_metadata(self, *_args, **_kwargs):
-            calls["source"] += 1
-            raise AssertionError("healthy backend wait must tolerate a closed source tab")
-        async def locate_owned(self, *_args, **_kwargs):
-            calls["source"] += 1
-            raise AssertionError("healthy backend wait must tolerate a closed source tab")
-        async def reopen(self, *_args, **_kwargs):
-            calls["source"] += 1
-            raise AssertionError("healthy backend wait must not reopen source")
+            calls["graph"] += 1
+            raise AssertionError("Listen + DOM must never fetch the full conversation graph")
 
-    asyncio.run(worker._waiting(state, hop, Actions(), path))
-
-    assert calls == {"status": 1, "source": 0}
-    assert hop["state"] == "waiting"
-    assert state["status"] != "BLOCKED"
-
-
-def test_backend_complete_waits_terminal_settle_before_one_graph_get(tmp_path: Path):
-    from dataclasses import replace
-
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-stream-terminal-settle"
+    persisted = []
+    outcome, reason = asyncio.run(
+        worker._waiting_backend_step(
+            state, hop, Actions(), receipt, persist_transport_state=lambda: persisted.append(True)
+        )
     )
+
+    assert (outcome, reason) == ("waiting", None)
+    assert calls == {"status": 1, "graph": 0}
+    assert hop["wait"]["stream_status_last_status"] == "IS_STREAMING"
+    next_poll = worker_module.parse_time(hop["wait"]["stream_status_next_poll_at"])
+    assert next_poll is not None
+    assert next_poll - datetime.now(timezone.utc) >= timedelta(seconds=29)
+    assert persisted
+
+
+def test_complete_status_settles_then_routes_to_local_dom_without_graph(tmp_path: Path):
+    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-complete-local"
+    )
+    receipt = replace(receipt, conversation_id="conversation-1")
     worker.config = replace(
         worker.config, response_stream_status_terminal_settle_seconds=5.0
     )
-    state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
-    calls = {"status": 0, "graph": 0}
-
-    class Actions:
-        async def backend_stream_status(self, _conversation_id):
-            calls["status"] += 1
-            return {"status": "COMPLETE"}
-        async def backend_conversation(self, _conversation_id):
-            calls["graph"] += 1
-            raise AssertionError("graph must wait for the terminal settle deadline")
-
-    actions = Actions()
-    asyncio.run(worker._waiting(state, hop, actions, path))
-    assert calls == {"status": 1, "graph": 0}
-    wait = hop["wait"]
-    seen_at = worker_module.parse_time(wait["terminal_complete_seen_at"])
-    ready_at = worker_module.parse_time(wait["terminal_graph_ready_at"])
-    assert ready_at is not None and seen_at is not None
-    assert 4.9 <= (ready_at - seen_at).total_seconds() <= 5.1
-    assert "terminal_graph_request_id" not in wait
-    persisted_wait = _active_hop(store.load(path))["wait"]
-    assert persisted_wait["terminal_graph_ready_at"] == wait["terminal_graph_ready_at"]
-
-    asyncio.run(worker._waiting(state, hop, actions, path))
-    assert calls == {"status": 1, "graph": 0}
-
-
-def test_backend_complete_persists_graph_guard_then_records_exact_response_without_source_reopen(tmp_path: Path):
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-stream-complete"
-    )
-    state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
-    report_relative = hop["expected_report_path"]
-    report = tmp_path / report_relative
-    report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text("backend terminal response", encoding="utf-8")
-    response_text = json.dumps({"route": "REVIEW", "handoff": report_relative})
-    calls = {"status": 0, "graph": 0, "locate": 0, "reopen": 0}
-
-    class Actions:
-        async def backend_stream_status(self, _conversation_id):
-            calls["status"] += 1
-            return {"status": "COMPLETE"}
-        async def backend_conversation(self, _conversation_id):
-            calls["graph"] += 1
-            persisted_wait = _active_hop(store.load(path))["wait"]
-            assert persisted_wait["terminal_graph_request_id"] == hop["request_id"]
-            return _backend_graph(receipt.user_message_id, "assistant-final", response_text)
-        async def locate_owned(self, *_args, **_kwargs):
-            calls["locate"] += 1
-            raise AssertionError("exact backend success must not inspect source")
-        async def reopen(self, *_args, **_kwargs):
-            calls["reopen"] += 1
-            raise AssertionError("exact backend success must not reopen source")
-
-    asyncio.run(worker._waiting(state, hop, Actions(), path))
-    assert calls == {"status": 1, "graph": 1, "locate": 0, "reopen": 0}
-    assert hop["state"] == "responded"
-    assert hop["response"] == response_text
-    assert hop["response_record"]["message_id"] == "assistant-final"
-    assert hop["response_record"]["turn_id"] is None
-
-    worker._responded(state, hop)
-    child = _active_hop(state)
-    assert child["target_role"] == "REVIEW"
-    assert child["state"] == "pre_send"
-
-    class TargetActions(FakeActions):
-        def __init__(self):
-            super().__init__()
-            self.acquired_roles = []
-        async def acquire(self, current, role):
-            self.acquired_roles.append(role)
-            return await super().acquire(current, role)
-
-    target_actions = TargetActions()
-    asyncio.run(worker._pre_send(state, child, target_actions))
-    assert target_actions.acquired_roles == ["REVIEW"]
-    assert child["state"] == "sending"
-
-
-def test_advance_complete_backend_result_survives_pregraph_guard_outer_persistence(
-    tmp_path: Path,
-    monkeypatch,
-):
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-stream-advance-complete"
-    )
-    state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
-    report_relative = hop["expected_report_path"]
-    report = tmp_path / report_relative
-    report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text("advance backend terminal response", encoding="utf-8")
-    response_text = json.dumps({"route": "REVIEW", "handoff": report_relative})
-
-    class Actions:
-        async def backend_stream_status(self, _conversation_id):
-            return {"status": "COMPLETE"}
-        async def backend_conversation(self, _conversation_id):
-            persisted_wait = _active_hop(store.load(path))["wait"]
-            assert persisted_wait["terminal_graph_request_id"] == hop["request_id"]
-            return _backend_graph(receipt.user_message_id, "assistant-advance", response_text)
-        async def locate_owned(self, *_args, **_kwargs):
-            raise AssertionError("backend success must not inspect source")
-        async def reopen(self, *_args, **_kwargs):
-            raise AssertionError("backend success must not reopen source")
-
-    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
-    saved = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
-    saved_hop = _active_hop(saved)
-
-    assert saved == store.load(path)
-    assert saved_hop["state"] == "responded"
-    assert saved_hop["response"] == response_text
-    assert saved_hop["wait"]["terminal_graph_request_id"] == saved_hop["request_id"]
-
-
-def test_complete_graph_not_ready_retries_after_two_minutes_without_source_wake(tmp_path: Path):
-    from playwright_auto.chatgpt_graph import BackendNotReadyError
-
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-stale-complete"
-    )
-    state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
-    calls = {"status": 0, "graph": 0, "source": 0}
-
-    class Actions:
-        async def backend_stream_status(self, _conversation_id):
-            calls["status"] += 1
-            return {"status": "COMPLETE"}
-        async def backend_conversation(self, _conversation_id):
-            calls["graph"] += 1
-            raise BackendNotReadyError("terminal assistant response is not materialized yet")
-        async def locate_owned_metadata(self, *_args, **_kwargs):
-            calls["source"] += 1
-            raise AssertionError("terminal graph retry must not inspect source")
-        async def locate_owned(self, *_args, **_kwargs):
-            calls["source"] += 1
-            raise AssertionError("terminal graph retry must not wake source")
-        async def reopen(self, *_args, **_kwargs):
-            calls["source"] += 1
-            raise AssertionError("terminal graph retry must not reopen source")
-        async def wake(self, *_args, **_kwargs):
-            calls["source"] += 1
-            raise AssertionError("terminal graph retry must not wake source")
-
-    actions = Actions()
-    asyncio.run(worker._waiting(state, hop, actions, path))
-
-    wait = hop["wait"]
-    assert calls == {"status": 1, "graph": 1, "source": 0}
-    assert wait["completion_mode"] == "terminal_graph_retry"
-    assert wait["backend_fallback_category"] == "graph_not_ready"
-    assert wait["terminal_graph_attempts"] == 1
-    retry_at = worker_module.parse_time(wait["terminal_graph_ready_at"])
-    assert retry_at is not None
-    assert 119 <= (retry_at - datetime.now(timezone.utc)).total_seconds() <= 121
-
-    asyncio.run(worker._waiting(state, hop, actions, path))
-    assert calls == {"status": 1, "graph": 1, "source": 0}
-
-
-@pytest.mark.parametrize(
-    ("error_factory", "expected_category"),
-    [
-        (lambda: worker_module.BackendUnavailableError(429, "conversation"), "graph_unavailable"),
-        (lambda: worker_module.BackendUnavailableError(0, "conversation"), "graph_unavailable"),
-        (lambda: worker_module.BackendAuthError("auth failed"), "graph_auth"),
-        (lambda: worker_module.BackendSchemaError("schema changed"), "graph_schema"),
-        (lambda: worker_module.GraphIdentityError("identity ambiguous"), "graph_identity"),
-    ],
-)
-def test_complete_graph_failure_classes_use_bounded_retry_without_source(
-    tmp_path: Path,
-    error_factory,
-    expected_category: str,
-):
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id=f"task-graph-retry-{expected_category}"
-    )
-    state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
-    calls = {"status": 0, "graph": 0, "source": 0}
-
-    class Actions:
-        async def backend_stream_status(self, _conversation_id):
-            calls["status"] += 1
-            return {"status": "COMPLETE"}
-        async def backend_conversation(self, _conversation_id):
-            calls["graph"] += 1
-            raise error_factory()
-        async def locate_owned_metadata(self, *_args, **_kwargs):
-            calls["source"] += 1
-            raise AssertionError("graph retry must not inspect source")
-        async def locate_owned(self, *_args, **_kwargs):
-            calls["source"] += 1
-            raise AssertionError("graph retry must not inspect source DOM")
-        async def reopen(self, *_args, **_kwargs):
-            calls["source"] += 1
-            raise AssertionError("graph retry must not reopen source")
-        async def wake(self, *_args, **_kwargs):
-            calls["source"] += 1
-            raise AssertionError("graph retry must not wake source")
-
-    asyncio.run(worker._waiting(state, hop, Actions(), path))
-    assert calls == {"status": 1, "graph": 1, "source": 0}
-    assert state["status"] != "BLOCKED"
-    assert hop["wait"]["backend_fallback_category"] == expected_category
-    assert hop["wait"]["completion_mode"] == "terminal_graph_retry"
-    assert hop["wait"]["terminal_graph_attempts"] == 1
-
-
-def test_interrupted_terminal_graph_attempt_resumes_bounded_retry(tmp_path: Path):
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-graph-marker-restart"
-    )
-    state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
-    hop["wait"].update(
-        completion_mode="terminal_graph_retry",
-        terminal_graph_request_id=hop["request_id"],
-        terminal_graph_attempted_at=utc_now(),
-        terminal_graph_attempts=1,
-        terminal_graph_ready_at=(datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat(),
-    )
-    state = store.save(path, state)
-    hop = _active_hop(state)
-    calls = {"status": 0, "graph": 0, "source": 0}
-
-    class Actions:
-        async def backend_stream_status(self, *_args, **_kwargs):
-            calls["status"] += 1
-            raise AssertionError("interrupted graph retry must not repoll status")
-        async def backend_conversation(self, *_args, **_kwargs):
-            calls["graph"] += 1
-            raise AssertionError("interrupted graph retry must wait for its next deadline")
-        async def locate_owned(self, *_args, **_kwargs):
-            calls["source"] += 1
-            raise AssertionError("interrupted graph retry must not inspect source")
-
-    asyncio.run(worker._waiting(state, hop, Actions(), path))
-    assert calls == {"status": 0, "graph": 0, "source": 0}
-    assert hop["wait"]["completion_mode"] == "terminal_graph_retry"
-    assert "terminal_graph_request_id" not in hop["wait"]
-    assert hop["wait"]["terminal_graph_attempts"] == 1
-
-
-def test_stream_status_failure_enters_recovery_without_dom_or_source(tmp_path: Path):
-    from playwright_auto.chatgpt_graph import BackendUnavailableError
-
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-status-recovery"
-    )
-    state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
-    calls = {"status": 0, "graph": 0, "source": 0}
-
-    class Actions:
-        async def backend_stream_status(self, *_args, **_kwargs):
-            calls["status"] += 1
-            raise BackendUnavailableError(429, "stream_status")
-        async def backend_conversation(self, *_args, **_kwargs):
-            calls["graph"] += 1
-            raise AssertionError("first status failure must wait five minutes before graph probe")
-        async def locate_owned(self, *_args, **_kwargs):
-            calls["source"] += 1
-            raise AssertionError("status recovery must not inspect source")
-        async def reopen(self, *_args, **_kwargs):
-            calls["source"] += 1
-            raise AssertionError("status recovery must not reopen source")
-        async def wake(self, *_args, **_kwargs):
-            calls["source"] += 1
-            raise AssertionError("status recovery must not wake source")
-
-    actions = Actions()
-    asyncio.run(worker._waiting(state, hop, actions, path))
-
-    wait = hop["wait"]
-    assert calls == {"status": 1, "graph": 0, "source": 0}
-    assert wait["completion_mode"] == "status_recovery"
-    assert wait["backend_fallback_category"] == "status_unavailable"
-    next_status = worker_module.parse_time(wait["stream_status_next_poll_at"])
-    next_graph = worker_module.parse_time(wait["status_recovery_graph_next_at"])
-    now = datetime.now(timezone.utc)
-    assert next_status is not None and 29 <= (next_status - now).total_seconds() <= 31
-    assert next_graph is not None and 299 <= (next_graph - now).total_seconds() <= 301
-
-    asyncio.run(worker._waiting(state, hop, actions, path))
-    assert calls == {"status": 1, "graph": 0, "source": 0}
-
-
-def test_status_recovery_returns_to_normal_randomized_poll_when_status_recovers(tmp_path: Path):
-    from playwright_auto.chatgpt_graph import BackendUnavailableError
-
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-status-recovers"
-    )
-    state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
-    replies = [BackendUnavailableError(429, "stream_status"), {"status": "IS_STREAMING"}]
-    calls = {"status": 0, "graph": 0}
-
-    class Actions:
-        async def backend_stream_status(self, *_args, **_kwargs):
-            calls["status"] += 1
-            reply = replies.pop(0)
-            if isinstance(reply, BaseException):
-                raise reply
-            return reply
-        async def backend_conversation(self, *_args, **_kwargs):
-            calls["graph"] += 1
-            raise AssertionError("recovered IS_STREAMING must not fetch graph")
-
-    actions = Actions()
-    asyncio.run(worker._waiting(state, hop, actions, path))
-    hop["wait"]["stream_status_next_poll_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
-    asyncio.run(worker._waiting(state, hop, actions, path))
-
-    wait = hop["wait"]
-    assert calls == {"status": 2, "graph": 0}
-    assert wait["completion_mode"] == "stream_status"
-    assert "status_recovery_graph_next_at" not in wait
-    next_status = worker_module.parse_time(wait["stream_status_next_poll_at"])
-    assert next_status is not None
-    assert 9 <= (next_status - datetime.now(timezone.utc)).total_seconds() <= 15
-
-
-def test_status_recovery_graph_probe_routes_after_five_minutes(tmp_path: Path):
-    from playwright_auto.chatgpt_graph import BackendUnavailableError
-
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-status-graph-route"
-    )
-    state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
-    report_relative = hop["expected_report_path"]
-    report = tmp_path / report_relative
-    report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text("status recovery graph response", encoding="utf-8")
-    response_text = json.dumps({"route": "REVIEW", "handoff": report_relative})
-    calls = {"status": 0, "graph": 0, "source": 0}
-
-    class Actions:
-        async def backend_stream_status(self, *_args, **_kwargs):
-            calls["status"] += 1
-            raise BackendUnavailableError(429, "stream_status")
-        async def backend_conversation(self, *_args, **_kwargs):
-            calls["graph"] += 1
-            return _backend_graph(receipt.user_message_id, "assistant-recovery", response_text)
-        async def locate_owned(self, *_args, **_kwargs):
-            calls["source"] += 1
-            raise AssertionError("successful recovery graph must not inspect source")
-        async def reopen(self, *_args, **_kwargs):
-            calls["source"] += 1
-            raise AssertionError("successful recovery graph must not reopen source")
-        async def wake(self, *_args, **_kwargs):
-            calls["source"] += 1
-            raise AssertionError("successful recovery graph must not wake source")
-
-    actions = Actions()
-    asyncio.run(worker._waiting(state, hop, actions, path))
-    hop["wait"]["status_recovery_graph_next_at"] = (
+    hop["receipt"] = receipt.to_dict()
+    hop["wait"]["stream_status_next_poll_at"] = (
         datetime.now(timezone.utc) - timedelta(seconds=1)
     ).isoformat()
-    state = store.save(path, state)
-    hop = _active_hop(state)
-    asyncio.run(worker._waiting(state, hop, actions, path))
-
-    assert calls == {"status": 1, "graph": 1, "source": 0}
-    assert hop["state"] == "responded"
-    assert hop["response"] == response_text
-
-
-def test_terminal_graph_third_failure_enters_dom_fallback_and_wakes_source(tmp_path: Path):
-    from playwright_auto.chatgpt_graph import BackendUnavailableError
-
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-terminal-graph-max"
-    )
-    state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
-    calls = {"status": 0, "graph": 0, "locate": 0, "wake": 0}
-    acquired = AcquiredRole(
-        SimpleNamespace(), receipt.binding.page_id, hop["conversation_url"], False, False
-    )
+    calls = {"status": 0, "graph": 0}
 
     class Actions:
-        async def backend_stream_status(self, *_args, **_kwargs):
+        async def backend_stream_status(self, _conversation_id):
             calls["status"] += 1
             return {"status": "COMPLETE"}
         async def backend_conversation(self, *_args, **_kwargs):
             calls["graph"] += 1
-            raise BackendUnavailableError(0, "conversation")
-        async def locate_owned_metadata(self, *_args, **_kwargs):
-            calls["locate"] += 1
-            return acquired
-        async def reopen(self, *_args, **kwargs):
-            raise AssertionError(f"existing source should be reused: {kwargs}")
-        async def wake(self, exact):
-            assert exact is acquired
-            calls["wake"] += 1
+            raise AssertionError("COMPLETE is only a local reconciliation trigger")
 
-    actions = Actions()
-    for attempt in range(3):
-        if attempt:
-            hop["wait"]["terminal_graph_ready_at"] = (
-                datetime.now(timezone.utc) - timedelta(seconds=1)
-            ).isoformat()
-        state = store.save(path, state)
-        hop = _active_hop(state)
-        asyncio.run(worker._waiting(state, hop, actions, path))
+    outcome, reason = asyncio.run(
+        worker._waiting_backend_step(
+            state, hop, Actions(), receipt, persist_transport_state=lambda: None
+        )
+    )
+    assert (outcome, reason) == ("waiting", None)
+    assert hop["wait"]["completion_mode"] == "terminal_local_settle"
+    assert calls == {"status": 1, "graph": 0}
 
-    assert calls == {"status": 1, "graph": 3, "locate": 1, "wake": 1}
-    assert hop["wait"]["terminal_graph_attempts"] == 3
-    assert hop["wait"]["completion_mode"] == "dom_fallback"
-    assert hop["wait"]["backend_fallback_category"] == "graph_unavailable"
-    assert worker_module.parse_time(hop["wait"]["dom_fallback_ready_at"]) > datetime.now(timezone.utc)
+    hop["wait"]["terminal_local_ready_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    outcome, reason = asyncio.run(
+        worker._waiting_backend_step(
+            state, hop, Actions(), receipt, persist_transport_state=lambda: None
+        )
+    )
+    assert (outcome, reason) == ("dom_reconcile", None)
+    assert calls == {"status": 1, "graph": 0}
 
 
-def test_complete_graph_not_ready_refreshes_once_then_polls_until_deadline_without_replay(
-    tmp_path: Path,
-):
+def test_stream_status_preserves_streaming_stop_requested_and_failure_types(tmp_path: Path):
+    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-status-types"
+    )
+    receipt = replace(receipt, conversation_id="conversation-1")
+    hop["receipt"] = receipt.to_dict()
+
+    class Actions:
+        def __init__(self, status):
+            self.status = status
+            self.released = []
+        async def backend_stream_status(self, _conversation_id):
+            return {"status": self.status}
+        def release_backend_stream_status(self, conversation_id):
+            self.released.append(conversation_id)
+
+    cases = (
+        ("IS_STREAMING", "waiting", None, False),
+        ("IS_STOP_REQUESTED", "stream_stopped", "stream_status_stop_requested", True),
+        ("FAILURE", "stream_failure", "stream_status_failure", True),
+    )
+    for status, expected, expected_reason, releases in cases:
+        hop["wait"]["completion_mode"] = "stream_status"
+        hop["wait"]["stream_status_next_poll_at"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat()
+        actions = Actions(status)
+        outcome, reason = asyncio.run(
+            worker._waiting_backend_step(
+                state, hop, actions, receipt, persist_transport_state=lambda: None
+            )
+        )
+        assert outcome == expected
+        assert reason == expected_reason
+        assert hop["wait"]["stream_status_last_status"] == status
+        assert actions.released == (["conversation-1"] if releases else [])
+        if status == "IS_STOP_REQUESTED":
+            assert hop["wait"]["completion_mode"] == "stop_requested_local_reconcile"
+            assert hop["wait"]["stop_requested_seen_at"]
+
+
+def test_stop_requested_local_reconcile_mode_does_not_poll_status_again(tmp_path: Path):
+    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-stop-requested-no-repoll"
+    )
+    receipt = replace(receipt, conversation_id="conversation-1")
+    hop["receipt"] = receipt.to_dict()
+    hop["wait"]["completion_mode"] = "stop_requested_local_reconcile"
+
+    class Actions:
+        async def backend_stream_status(self, *_args, **_kwargs):
+            raise AssertionError("stopped generation must not re-enter ordinary status polling")
+
+    outcome, reason = asyncio.run(
+        worker._waiting_backend_step(
+            state, hop, Actions(), receipt, persist_transport_state=lambda: None
+        )
+    )
+
+    assert (outcome, reason) == ("stream_stopped", "stream_status_stop_requested")
+
+
+def test_stop_requested_reconciles_valid_local_response_without_graph_or_replay(tmp_path: Path):
     store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-terminal-continuation-unresolved"
+        tmp_path, task_id="task-stop-requested-valid-response"
     )
+    conversation_id = "11111111-1111-4111-8111-111111111111"
     state, hop, receipt = _enable_backend_wait_identity(
-        store, state, path, hop, receipt
+        store, state, path, hop, receipt, conversation_id=conversation_id
     )
-    snapshot = send_snapshot(
-        messages=(
-            MessageSnapshot("user", receipt.user_message_id, receipt.user_turn_id, receipt.prompt, ()),
-        ),
-        state=ChatGPTState.WAITING_PROMPT,
-        task_id=state["task_id"],
-        team=state["team"],
+    report_relative = str(hop["expected_report_path"])
+    report = tmp_path / report_relative
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("stop requested local response", encoding="utf-8")
+    response = MessageSnapshot(
+        "assistant",
+        "a-stop-local",
+        "ta-stop-local",
+        json.dumps({"route": "TEST", "handoff": report_relative}),
+        (),
     )
-    snapshot = SimpleNamespace(
-        **{
-            **snapshot.__dict__,
-            "composer_empty": True,
-            "manual_input_pending": False,
-            "stop_visible": True,
-            "response_activity_text": "",
-            "response_activity_structure": "",
-            "response_activity_turn_id": None,
-            "response_activity_length": 0,
-        }
-    )
-    full_snapshot = SimpleNamespace(
-        **{**snapshot.__dict__, "stop_visible": False}
-    )
-    calls = {
-        "status": 0,
-        "graph": 0,
-        "locate": 0,
-        "wake": 0,
-        "refresh": 0,
-        "wait": 0,
-        "send": 0,
-        "retry": 0,
-        "restart": 0,
-        "new_chat": 0,
-    }
+    released = []
 
     class Client:
-        async def wait_snapshot(self, _receipt, **_kwargs):
-            return full_snapshot if _kwargs.get("force_full") else snapshot
-
-        async def wait_for_response(self, _receipt, **_kwargs):
-            calls["wait"] += 1
-            raise TimeoutError("no terminal assistant continuation")
+        async def wait_for_response(self, _receipt, **kwargs):
+            kwargs["candidate_validator"](response)
+            return response
 
     acquired = AcquiredRole(
-        Client(), receipt.binding.page_id, hop["conversation_url"], False, False
+        Client(), receipt.binding.page_id, f"https://chatgpt.com/c/{conversation_id}", False, False
     )
 
     class Actions:
-        async def backend_stream_status(self, *_args, **_kwargs):
-            calls["status"] += 1
-            return {"status": "COMPLETE"}
+        async def backend_stream_status(self, exact_conversation_id):
+            assert exact_conversation_id == conversation_id
+            return {"status": "IS_STOP_REQUESTED"}
+        def release_backend_stream_status(self, exact_conversation_id):
+            released.append(exact_conversation_id)
+        async def locate_owned(self, *_args, **_kwargs):
+            return acquired
+        async def reopen(self, *_args, **_kwargs):
+            raise AssertionError("exact stop reconciliation must not replace the accepted page")
+        async def backend_conversation(self, *_args, **_kwargs):
+            raise AssertionError("stop reconciliation must not fetch the full graph")
+        async def send(self, *_args, **_kwargs):
+            raise AssertionError("stop reconciliation must not replay Send")
 
+    asyncio.run(worker._waiting(state, hop, Actions(), path))
+
+    assert released == [conversation_id]
+    assert hop["wait"]["stream_status_last_status"] == "IS_STOP_REQUESTED"
+    assert hop["state"] == "responded"
+    assert hop["response"] == response.text
+    assert state["block_code"] is None
+    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
+
+
+def test_stop_requested_without_proven_local_finality_blocks_typed_without_replay(tmp_path: Path):
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-stop-requested-unresolved"
+    )
+    conversation_id = "22222222-2222-4222-8222-222222222222"
+    state, hop, receipt = _enable_backend_wait_identity(
+        store, state, path, hop, receipt, conversation_id=conversation_id
+    )
+    released = []
+
+    class Client:
+        async def wait_for_response(self, *_args, **_kwargs):
+            raise TimeoutError("no stable current-request final response")
+
+    acquired = AcquiredRole(
+        Client(), receipt.binding.page_id, f"https://chatgpt.com/c/{conversation_id}", False, False
+    )
+
+    class Actions:
+        async def backend_stream_status(self, exact_conversation_id):
+            assert exact_conversation_id == conversation_id
+            return {"status": "IS_STOP_REQUESTED"}
+        def release_backend_stream_status(self, exact_conversation_id):
+            released.append(exact_conversation_id)
+        async def locate_owned(self, *_args, **_kwargs):
+            return acquired
+        async def reopen(self, *_args, **_kwargs):
+            raise AssertionError("exact stop reconciliation must not replace the accepted page")
+        async def backend_conversation(self, *_args, **_kwargs):
+            raise AssertionError("stop reconciliation must not fetch the full graph")
+        async def send(self, *_args, **_kwargs):
+            raise AssertionError("stop reconciliation must not replay Send")
+
+    asyncio.run(worker._waiting(state, hop, Actions(), path))
+
+    assert released == [conversation_id]
+    assert hop["wait"]["stream_status_last_status"] == "IS_STOP_REQUESTED"
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "stream_status_stopped"
+    assert state["block_retryable"] is False
+    assert "Resume may reconcile the exact recorded tab" in state["block_reason"]
+    assert "do not Retry, Restart Role, New Chat, or resend" in state["block_reason"]
+    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
+
+
+def test_stream_status_error_uses_bounded_local_fallback_without_graph(tmp_path: Path):
+    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-status-recovery"
+    )
+    receipt = replace(receipt, conversation_id="conversation-1")
+    hop["receipt"] = receipt.to_dict()
+    hop["wait"]["stream_status_next_poll_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    calls = {"graph": 0}
+
+    class Actions:
+        async def backend_stream_status(self, _conversation_id):
+            raise worker_module.BackendUnavailableError(503, "stream_status")
         async def backend_conversation(self, *_args, **_kwargs):
             calls["graph"] += 1
-            raise worker_module.BackendNotReadyError(
-                "terminal assistant response is not materialized yet"
-            )
+            raise AssertionError("status recovery must not probe the conversation graph")
 
-        async def locate_owned_metadata(self, *_args, **_kwargs):
-            calls["locate"] += 1
-            return acquired
-
-        async def locate_owned(self, *_args, **_kwargs):
-            calls["locate"] += 1
-            return acquired
-
-        async def reopen(self, *_args, **_kwargs):
-            raise AssertionError("the exact owned page must remain bound")
-
-        async def wake(self, exact):
-            assert exact is acquired
-            calls["wake"] += 1
-
-        async def refresh(self, exact, **kwargs):
-            assert exact is acquired
-            assert kwargs["manifest"] is state
-            assert kwargs["logical_role"] == "PLAN"
-            assert kwargs["recover"] is True
-            calls["refresh"] += 1
-            return exact
-
-        async def send(self, *_args, **_kwargs):
-            calls["send"] += 1
-            raise AssertionError("recovery must not Send")
-
-        async def retry(self, *_args, **_kwargs):
-            calls["retry"] += 1
-            raise AssertionError("recovery must not Retry")
-
-        async def restart(self, *_args, **_kwargs):
-            calls["restart"] += 1
-            raise AssertionError("recovery must not Restart")
-
-        async def new_chat(self, *_args, **_kwargs):
-            calls["new_chat"] += 1
-            raise AssertionError("recovery must not open New Chat")
-
-    actions = Actions()
-    for attempt in range(3):
-        if attempt:
-            hop["wait"]["terminal_graph_ready_at"] = (
-                datetime.now(timezone.utc) - timedelta(seconds=1)
-            ).isoformat()
-        state = store.save(path, state)
-        hop = _active_hop(state)
-        asyncio.run(worker._waiting(state, hop, actions, path))
-
-    wait = hop["wait"]
-    assert wait["completion_mode"] == "dom_fallback"
-    assert wait["backend_fallback_category"] == "graph_not_ready"
-    assert wait["terminal_continuation_unresolved"]["request_id"] == hop["request_id"]
-    assert wait["terminal_continuation_unresolved"]["refresh_baseline"] == 0
-
-    # Reproduce the live CAS failure: the durable lightweight observation says
-    # the response is still active, while the forced-full snapshot used before
-    # refresh clears that UI-only signal in memory. The refresh journal must
-    # persist from the durable step baseline, not from the mutated RAM snapshot.
-    wait["continuous_responding_since"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=30)
-    ).isoformat()
-    state = store.save(path, state)
-    hop = _active_hop(state)
-    wait = hop["wait"]
-    wait["dom_fallback_ready_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=1)
-    ).isoformat()
-    asyncio.run(worker._waiting(state, hop, actions, path))
-
-    assert calls["refresh"] == 1
-    assert wait["refresh_count"] == 1
-    assert worker_module.parse_time(
-        wait["terminal_continuation_unresolved"]["block_ready_at"]
-    ) > datetime.now(timezone.utc)
-    assert state["status"] == "RUNNING"
-
-    state = store.load(path)
-    hop = _active_hop(state)
-    hop["wait"]["dom_fallback_ready_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=1)
-    ).isoformat()
-    hop["wait"]["terminal_continuation_unresolved"]["block_ready_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=1)
-    ).isoformat()
-    hop["wait"]["refresh_in_progress"] = {
-        "started_at": (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat(),
-        "status": "started",
-    }
-    state = store.save(path, state)
-    hop = _active_hop(state)
-    assert hop["wait"]["completion_mode"] == "dom_fallback"
-    assert hop["wait"]["refresh_count"] == 1
-    assert hop["wait"]["terminal_continuation_unresolved"][
-        "refresh_baseline"
-    ] == 0
-    assert worker_module.parse_time(hop["wait"]["dom_fallback_ready_at"]) < datetime.now(
-        timezone.utc
+    outcome, reason = asyncio.run(
+        worker._waiting_backend_step(
+            state, hop, Actions(), receipt, persist_transport_state=lambda: None
+        )
     )
-    assert worker_module.parse_time(
-        hop["wait"]["terminal_continuation_unresolved"]["block_ready_at"]
-    ) < datetime.now(timezone.utc)
-    asyncio.run(worker._waiting(state, hop, actions, path))
-
-    assert state["status"] == "RUNNING"
-    assert state["block_code"] is None
+    assert (outcome, reason) == ("waiting", None)
     assert hop["wait"]["completion_mode"] == "status_recovery"
-    assert hop["wait"]["backend_fallback_category"] == "graph_not_ready"
-    assert "dom_fallback_ready_at" not in hop["wait"]
-    assert hop["wait"]["last_refresh_result"]["status"] == "interrupted"
-    assert calls["refresh"] == 1
+    assert calls["graph"] == 0
+
+    hop["wait"]["deadline_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    hop["wait"]["stream_status_next_poll_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    outcome, reason = asyncio.run(
+        worker._waiting_backend_step(
+            state, hop, Actions(), receipt, persist_transport_state=lambda: None
+        )
+    )
+    assert outcome == "dom_fallback"
+    assert reason in {"response_deadline", "status_unavailable"}
+    assert calls["graph"] == 0
+
+
+def test_resume_shares_status_due_slot_instead_of_forcing_poll(tmp_path: Path):
+    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-resume-shared-status-slot"
+    )
+    receipt = replace(receipt, conversation_id="conversation-1")
+    hop["receipt"] = receipt.to_dict()
+    hop["wait"]["stream_status_next_poll_at"] = (
+        datetime.now(timezone.utc) + timedelta(seconds=20)
+    ).isoformat()
+
+    class Actions:
+        async def backend_stream_status(self, *_args, **_kwargs):
+            raise AssertionError("Resume must not create an extra status poll before the shared due time")
+
+    outcome, reason = asyncio.run(
+        worker._waiting_backend_step(
+            state, hop, Actions(), receipt, persist_transport_state=lambda: None, resume_recovery=True
+        )
+    )
+    assert (outcome, reason) == ("dom_reconcile", None)
+
+
+def test_waiting_terminal_local_settle_hands_off_to_existing_dom_path(tmp_path: Path):
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-terminal-dom-handoff"
+    )
+    state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
+    worker.runtime_db.ensure_schema()
+    worker.runtime_db.put_snapshot("settings", {"dom_only": False})
+    hop["wait"]["completion_mode"] = "terminal_local_settle"
+    hop["wait"]["terminal_local_ready_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
     state = store.save(path, state)
-
-    for _ in range(3):
-        state = store.load(path)
-        hop = _active_hop(state)
-        past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
-        hop["wait"]["stream_status_next_poll_at"] = past
-        hop["wait"]["status_recovery_graph_next_at"] = past
-        state = store.save(path, state)
-        hop = _active_hop(state)
-        asyncio.run(worker._waiting(state, hop, actions, path))
-
-        assert state["status"] == "RUNNING"
-        assert state["block_code"] is None
-        assert hop["wait"]["completion_mode"] == "status_recovery"
-        assert hop["wait"]["backend_fallback_category"] == "graph_not_ready"
-        assert hop["wait"]["refresh_count"] == 1
-        assert "dom_fallback_ready_at" not in hop["wait"]
-
-    state = store.load(path)
     hop = _active_hop(state)
-    past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
-    hop["wait"]["deadline_at"] = past
-    hop["wait"]["stream_status_next_poll_at"] = past
-    hop["wait"]["status_recovery_graph_next_at"] = past
-    state = store.save(path, state)
-    hop = _active_hop(state)
-    asyncio.run(worker._waiting(state, hop, actions, path))
+    worker._waiting_dom = AsyncMock()
 
-    assert state["status"] == "RUNNING"
-    assert hop["wait"]["completion_mode"] == "dom_fallback"
-    assert hop["wait"]["backend_fallback_category"] == "response_deadline"
-    assert hop["wait"]["refresh_count"] == 1
+    class Actions:
+        async def backend_conversation(self, *_args, **_kwargs):
+            raise AssertionError("terminal local handoff must not fetch graph")
 
-    hop["wait"]["dom_fallback_ready_at"] = past
-    state = store.save(path, state)
-    hop = _active_hop(state)
-    asyncio.run(worker._waiting(state, hop, actions, path))
-
-    assert state["status"] == "BLOCKED"
-    assert state["block_code"] == "response_timeout"
-    assert state["block_retryable"] is False
-    assert hop["wait"]["refresh_count"] == 1
-    assert calls["refresh"] == 1
-    assert calls["send"] == calls["retry"] == calls["restart"] == calls["new_chat"] == 0
-    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
+    asyncio.run(worker._waiting(state, hop, Actions(), path))
+    worker._waiting_dom.assert_awaited_once()
 
 
 def test_unresolved_complete_accepts_terminal_continuation_before_final_block(
@@ -3139,11 +2991,15 @@ def test_post_refresh_stall_after_three_reroutes_blocks_without_fourth_send(tmp_
     assert state["block_code"] == "stall_reroute_exhausted"
 
 
-def test_normal_wait_routes_path_only_response_without_repair(tmp_path: Path):
+def test_normal_wait_routes_valid_local_file_response_without_repair(tmp_path: Path):
     _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-normal-wait-path-only"
     )
-    handoff = ".plan/remote-team/remote-plan_turn1_task-normal-wait-path-only.md"
+    handoff = str(hop["expected_report_path"])
+    report = tmp_path / handoff
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report_bytes = b"# TEST report\n\nNormal wait evidence.\n"
+    report.write_bytes(report_bytes)
     response = MessageSnapshot(
         "assistant",
         "a-normal-path-only",
@@ -3189,8 +3045,8 @@ def test_normal_wait_routes_path_only_response_without_repair(tmp_path: Path):
     record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
     assert hop["state"] == "routed"
     assert hop["report_path"] == handoff
-    assert hop["report_sha256"] is None
-    assert hop["report_size"] is None
+    assert hop["report_sha256"] == worker_module.hashlib.sha256(report_bytes).hexdigest()
+    assert hop["report_size"] == len(report_bytes)
     assert child["kind"] == "handoff"
     assert child["target_role"] == "TEST"
     assert child["handoff"] == handoff
@@ -3200,7 +3056,7 @@ def test_normal_wait_routes_path_only_response_without_repair(tmp_path: Path):
     assert record.attempts == 1
 
 
-def test_waiting_recovers_prior_terminal_only_from_proven_foreign_durable_request(
+def test_waiting_with_foreign_durable_history_uses_local_reconciliation_not_graph(
     tmp_path: Path,
 ):
     store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
@@ -3210,109 +3066,22 @@ def test_waiting_recovers_prior_terminal_only_from_proven_foreign_durable_reques
     state, hop, receipt = _enable_backend_wait_identity(
         store, state, path, hop, receipt, conversation_id=conversation_id
     )
-    report_relative = ".plan/alpha/alpha-plan_turn1_task-historical-owner.md"
-    report_path = tmp_path / report_relative
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text("historical response", encoding="utf-8")
-    accepted_text = json.dumps({"route": "DEV", "handoff": report_relative})
-
-    foreign = store.create_task(
-        "foreign durable request",
-        requested_team="foreign-durable",
-        task_id="task-foreign-durable",
-    )
-    foreign_hop = _active_hop(foreign)
-    foreign_source = {
-        "task_id": foreign["task_id"],
-        "team": foreign["team"],
-        "hop_id": foreign_hop["hop_id"],
-        "manifest": foreign["manifest_path"],
-    }
-    foreign_ledger = RequestLedger(foreign_hop["ledger_path"])
-    foreign_record = foreign_ledger.begin(
-        role=foreign_hop["physical_role"],
-        prompt="foreign prompt",
-        source_context=foreign_source,
-        request_id=foreign_hop["request_id"],
-        render_request_marker=False,
-    )
-    foreign_ledger.update(
-        foreign_record.request_id,
-        status=RequestStatus.SENDING,
-        attempts=1,
-    )
-    foreign_receipt = {
-        "conversation_id": conversation_id,
-        "user_message_id": "u2",
-    }
-    foreign_ledger.update(
-        foreign_record.request_id,
-        status=RequestStatus.SENT,
-        accepted_at=2.0,
-        receipt=foreign_receipt,
-    )
-    foreign_hop["receipt"] = foreign_receipt
-    foreign_hop["state"] = "waiting"
-    store.save(Path(foreign["manifest_path"]), foreign)
-
-    graph = {
-        "current_node": "a2",
-        "mapping": {
-            "u1": {
-                "id": "u1",
-                "parent": None,
-                "message": {
-                    "id": "u1",
-                    "author": {"role": "user"},
-                    "content": {"content_type": "text", "parts": [receipt.prompt]},
-                },
-            },
-            "a1": {
-                "id": "a1",
-                "parent": "u1",
-                "message": {
-                    "id": "a1",
-                    "author": {"role": "assistant"},
-                    "recipient": "all",
-                    "content": {"content_type": "text", "parts": [accepted_text]},
-                },
-            },
-            "u2": {
-                "id": "u2",
-                "parent": "a1",
-                "message": {
-                    "id": "u2",
-                    "author": {"role": "user"},
-                    "content": {"content_type": "text", "parts": ["foreign prompt"]},
-                },
-            },
-            "a2": {
-                "id": "a2",
-                "parent": "u2",
-                "message": {
-                    "id": "a2",
-                    "author": {"role": "assistant"},
-                    "recipient": "all",
-                    "content": {"content_type": "text", "parts": ["foreign response"]},
-                },
-            },
-        },
-    }
+    worker.runtime_db.ensure_schema()
+    worker.runtime_db.put_snapshot("settings", {"dom_only": False})
+    hop["wait"]["completion_mode"] = "terminal_local_settle"
+    hop["wait"]["terminal_local_ready_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    state = store.save(path, state)
+    hop = _active_hop(state)
+    worker._waiting_dom = AsyncMock()
 
     class Actions:
-        async def backend_stream_status(self, observed_conversation_id):
-            assert observed_conversation_id == conversation_id
-            return {"status": "COMPLETE"}
-
-        async def backend_conversation(self, observed_conversation_id):
-            assert observed_conversation_id == conversation_id
-            return graph
+        async def backend_conversation(self, *_args, **_kwargs):
+            raise AssertionError("foreign history must not trigger an automation graph read")
 
     asyncio.run(worker._waiting(state, hop, Actions(), path))
-
-    assert hop["state"] == "responded"
-    assert hop["response"] == accepted_text
-    assert hop["message_identity"]["message_id"] == "a1"
+    worker._waiting_dom.assert_awaited_once()
     current = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
     assert current is not None
     assert current.attempts == 1
@@ -3912,7 +3681,7 @@ def test_accepted_legacy_inline_conflict_recovers_same_response_without_replay(
     assert next_hop["target_role"] == "DEV"
 
 
-def test_cross_workspace_file_report_routes_as_opaque_path(tmp_path: Path):
+def test_cross_workspace_local_file_report_requires_execution_repository_artifact(tmp_path: Path):
     execution_repository = tmp_path.parent / f"{tmp_path.name}-worker-execution"
     execution_repository.mkdir()
     store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
@@ -3921,7 +3690,11 @@ def test_cross_workspace_file_report_routes_as_opaque_path(tmp_path: Path):
         repository=execution_repository,
     )
     original_request_id = hop["request_id"]
-    handoff = ".plan/windows-team/windows-plan_turn1_task-cross-workspace-file.md"
+    handoff = str(hop["expected_report_path"])
+    report = execution_repository / handoff
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report_bytes = b"# PLAN report\n\nCross-workspace local evidence.\n"
+    report.write_bytes(report_bytes)
     response = MessageSnapshot(
         "assistant",
         "a-cross-workspace",
@@ -3961,7 +3734,7 @@ def test_cross_workspace_file_report_routes_as_opaque_path(tmp_path: Path):
 
     assert state["options"]["report_mode"] == "file"
     assert '"handoff":"INLINE"' not in hop["prompt"]
-    assert not (execution_repository / handoff).exists()
+    assert report.exists()
     assert not (tmp_path / handoff).exists()
     assert RequestLedger(hop["ledger_path"]).get(original_request_id).attempts == 1
 
@@ -3971,8 +3744,8 @@ def test_cross_workspace_file_report_routes_as_opaque_path(tmp_path: Path):
 
     child = _active_hop(state)
     assert hop["report_path"] == handoff
-    assert hop["report_size"] is None
-    assert hop["report_sha256"] is None
+    assert hop["report_size"] == len(report_bytes)
+    assert hop["report_sha256"] == worker_module.hashlib.sha256(report_bytes).hexdigest()
     assert child["target_role"] == "DEV"
     assert child["handoff"] == handoff
     assert hop["request_id"] == original_request_id
@@ -5901,6 +5674,33 @@ def test_resume_reconciles_canonical_ledger_before_exact_page_validation(tmp_pat
         "status": "recovering",
         "result": {"before": None},
     }
+    hop["wait"]["stream_status_next_poll_at"] = (
+        datetime.now(timezone.utc) + timedelta(seconds=20)
+    ).isoformat()
+    current_receipt = replace(receipt, conversation_id=canonical_id)
+    accepted_user = MessageSnapshot(
+        "user",
+        current_receipt.user_message_id or "accepted-user",
+        current_receipt.user_turn_id or "accepted-turn",
+        current_receipt.prompt,
+        (),
+    )
+    snapshot = replace(
+        send_snapshot(
+            messages=(accepted_user,),
+            state=ChatGPTState.RESPONDING,
+            task_id=state["task_id"],
+            team=state["team"],
+        ),
+        stop_visible=True,
+    )
+    client = SimpleNamespace(
+        assert_ownership=AsyncMock(return_value=snapshot),
+        wait_for_response=AsyncMock(side_effect=TimeoutError()),
+    )
+    acquired = AcquiredRole(
+        client, current_receipt.binding.page_id, canonical_url, False, False
+    )
     seen = []
 
     class Actions:
@@ -5909,20 +5709,20 @@ def test_resume_reconciles_canonical_ledger_before_exact_page_validation(tmp_pat
             return {"status": "IS_STREAMING"}
 
         async def backend_conversation(self, *_args, **_kwargs):
-            raise AssertionError("IS_STREAMING must not fetch graph")
+            raise AssertionError("Resume must not fetch the conversation graph")
 
         async def locate_owned(self, *_args, **_kwargs):
-            raise AssertionError("canonical backend Resume must not inspect source DOM")
+            return acquired
 
         async def reopen(self, *_args, **_kwargs):
-            raise AssertionError("canonical backend Resume must not reopen source")
+            raise AssertionError("exact owned Resume should not reopen source")
 
     asyncio.run(worker._recover_resume_waiting(state, hop, control, Actions()))
 
-    assert seen == [canonical_id]
+    assert seen == []
     assert control["status"] == "applied"
-    assert control["result"]["action"] == "rearm_backend_wait"
-    assert control["result"]["postcondition"] == "backend_wait_rearmed"
+    assert control["result"]["action"] == "observe_progress"
+    assert control["result"]["postcondition"] == "generation_progress"
     assert hop["receipt"]["conversation_id"] == canonical_id
     assert hop["conversation_url"] == canonical_url
     assert state["roles"]["PLAN"]["page_url"] == canonical_url
@@ -5985,7 +5785,7 @@ def test_resume_reconciles_canonical_ledger_before_exact_page_validation(tmp_pat
 
     asyncio.run(worker._recover_resume_waiting(state, hop, control, on_actions))
 
-    assert seen == [canonical_id]
+    assert seen == []
     assert on_actions.backend_stream_status.await_count == 0
     assert on_actions.backend_conversation.await_count == 0
     assert worker._discover_accepted_conversation_identity.await_count == 0
@@ -6044,56 +5844,38 @@ def test_waiting_reconciles_conversation_id_from_exact_ledger_before_backend_wai
 
 
 
-def test_expired_waiting_with_canonical_ledger_checks_backend_before_dom_fallback(tmp_path: Path):
-    from dataclasses import replace
-
+def test_expired_waiting_with_canonical_ledger_uses_status_then_local_reconciliation(tmp_path: Path):
     store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-expired-backend-first"
     )
-    report_relative = ".plan/alpha/alpha-plan_turn1_task-expired-backend-first.md"
-    report = tmp_path / report_relative
-    report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text("backend-first", encoding="utf-8")
     canonical_id = "expired-backend"
     enriched = replace(receipt, conversation_id=canonical_id)
     RequestLedger(hop["ledger_path"]).update(
         hop["request_id"], receipt=enriched.to_dict()
     )
-    hop["wait"]["deadline_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=1)
-    ).isoformat()
-    hop["wait"]["stream_status_next_poll_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=1)
-    ).isoformat()
-    store.save(path, state)
+    hop["receipt"] = enriched.to_dict()
+    worker.config = replace(
+        worker.config, response_stream_status_terminal_settle_seconds=5.0
+    )
+    hop["wait"]["deadline_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    hop["wait"]["stream_status_next_poll_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    state = store.save(path, state)
+    hop = _active_hop(state)
     calls = []
 
     class Actions:
         async def backend_stream_status(self, conversation_id):
             calls.append(("status", conversation_id))
             return {"status": "COMPLETE"}
-
         async def backend_conversation(self, conversation_id):
             calls.append(("graph", conversation_id))
-            return _backend_graph(
-                receipt.user_message_id,
-                "assistant-expired",
-                json.dumps({"route": "TEST", "handoff": report_relative}),
-            )
-
-        async def locate_owned(self, *_args, **_kwargs):
-            raise AssertionError("expired canonical backend path must run before DOM fallback")
-
-        async def reopen(self, *_args, **_kwargs):
-            raise AssertionError("expired canonical backend path must not reopen before backend check")
-
-        async def wake(self, *_args, **_kwargs):
-            raise AssertionError("expired canonical backend path must not wake before backend check")
+            raise AssertionError("deadline reconciliation must not fetch the full graph")
 
     asyncio.run(worker._waiting(state, hop, Actions(), path))
 
-    assert calls == [("status", canonical_id), ("graph", canonical_id)]
-    assert hop["state"] == "responded"
+    assert calls == [("status", canonical_id)]
+    assert hop["state"] == "waiting"
+    assert hop["wait"]["completion_mode"] == "terminal_local_settle"
     assert hop["receipt"]["conversation_id"] == canonical_id
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
 
@@ -6120,13 +5902,14 @@ def test_record_response_reconciles_late_conversation_id_and_conflict_fails_clos
     assert hop["state"] == "waiting"
 
 
-def test_worker_completion_is_stream_status_primary_with_dom_fallback_preserved():
+def test_worker_completion_is_stream_status_trigger_plus_local_dom_reconciliation():
     import inspect
 
     backend_source = inspect.getsource(CDPAWorker._waiting_backend_step)
     assert "backend_stream_status" in backend_source
-    assert "backend_conversation" in backend_source
-    assert "resolve_terminal_assistant" in backend_source
+    assert "backend_conversation" not in backend_source
+    assert "terminal_local_settle" in backend_source
+    assert "dom_reconcile" in backend_source
     assert ".wait_for_response(" not in backend_source
 
     waiting_source = inspect.getsource(CDPAWorker._waiting)
@@ -6282,10 +6065,10 @@ def _bootstrap_graph(assistant_id: str):
     }
 
 
-def test_stream_status_poll_delay_is_randomized_within_10_to_15_seconds(tmp_path: Path):
+def test_stream_status_poll_delay_is_randomized_at_or_above_30_seconds(tmp_path: Path):
     _, _, _, worker = setup_task(tmp_path, task_id="task-stream-jitter")
     samples = [worker._stream_status_poll_delay() for _ in range(100)]
-    assert all(10.0 <= value <= 15.0 for value in samples)
+    assert all(30.0 <= value <= 35.0 for value in samples)
     assert len({round(value, 4) for value in samples}) > 1
 
 
@@ -6426,7 +6209,7 @@ def test_transient_donor_backend_failure_retries_without_removing_or_blocking(tm
     assert catalog.get(record["bootstrap_id"])["donors"] == record["donors"]
 
 
-def test_source_only_bootstrap_materializes_first_donor_without_fresh_fallback(tmp_path: Path):
+def test_source_only_bootstrap_requires_local_materialization_without_graph_fetch(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     catalog = BootstrapCatalog(tmp_path)
     record = catalog.upsert(donor_pool_record(donors=[]))
@@ -6448,9 +6231,8 @@ def test_source_only_bootstrap_materializes_first_donor_without_fresh_fallback(t
         async def locate_owned(self, _state, _role):
             return None
 
-        async def backend_conversation(self, conversation_id):
-            assert conversation_id == record["source_conversation_id"]
-            return _bootstrap_graph(assistant_id)
+        async def backend_conversation(self, _conversation_id):
+            raise AssertionError("source-only bootstrap must not fetch conversation graph")
 
         async def branch_from_anchor(
             self, _state, role, *, source_conversation_id, assistant_message_id
@@ -6467,14 +6249,12 @@ def test_source_only_bootstrap_materializes_first_donor_without_fresh_fallback(t
     actions = Actions()
     acquired = asyncio.run(worker._acquire_workflow_role(state, "PLAN", actions))
 
-    assert acquired is not None
-    donor = {
-        "conversation_id": record["source_conversation_id"],
-        "assistant_message_id": assistant_id,
-    }
-    assert actions.branches == [(donor["conversation_id"], donor["assistant_message_id"])]
-    assert catalog.get(record["bootstrap_id"])["donors"] == [donor]
-    assert state["roles"]["PLAN"]["context_source"] == "bootstrap_donor"
+    assert acquired is None
+    assert actions.branches == []
+    assert catalog.get(record["bootstrap_id"])["donors"] == []
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "bootstrap_unavailable"
+    assert state["bootstrap_source_requires_local_materialization"] == record["source_conversation_id"]
 
 
 def test_active_rate_limit_gate_blocks_prewarm_before_global_role_acquisition(tmp_path: Path):
@@ -6630,7 +6410,7 @@ def test_exhausted_source_without_prewarm_blocks_without_fresh_fallback(tmp_path
     assert acquired is None
     assert state["status"] == "BLOCKED"
     assert state["block_code"] == "bootstrap_unavailable"
-    assert state["bootstrap_source_exhausted"] is True
+    assert state["bootstrap_source_requires_local_materialization"] == record["source_conversation_id"]
     assert "select another bootstrap" in state["block_reason"].lower()
 
 
@@ -6658,50 +6438,29 @@ def test_accepted_first_role_self_clones_child_local_bootstrap_donor(tmp_path: P
         "conversation_id": child_conversation,
         "user_message_id": accepted_user,
     }
-    graph = {
-        "current_node": role_response,
-        "mapping": {
-            inherited_assistant: {
-                "id": inherited_assistant,
-                "message": {
-                    "id": inherited_assistant,
-                    "author": {"role": "assistant"},
-                    "recipient": "all",
-                    "content": {"content_type": "text", "parts": ["bootstrap prefix"]},
-                },
-                "parent": None,
-                "children": [accepted_user],
-            },
-            accepted_user: {
-                "id": accepted_user,
-                "message": {
-                    "id": accepted_user,
-                    "author": {"role": "user"},
-                    "recipient": "all",
-                    "content": {"content_type": "text", "parts": ["PLAN prompt"]},
-                },
-                "parent": inherited_assistant,
-                "children": [role_response],
-            },
-            role_response: {
-                "id": role_response,
-                "message": {
-                    "id": role_response,
-                    "author": {"role": "assistant"},
-                    "recipient": "all",
-                    "content": {"content_type": "text", "parts": ["PLAN response"]},
-                },
-                "parent": accepted_user,
-                "children": [],
-            },
-        },
-    }
     worker = CDPAWorker(config, store=store)
+    snapshot = SimpleNamespace(
+        messages=(
+            MessageSnapshot("assistant", inherited_assistant, "turn-bootstrap", "bootstrap prefix", ()),
+            MessageSnapshot("user", accepted_user, "turn-user", "PLAN prompt", ()),
+            MessageSnapshot("assistant", role_response, "turn-response", "PLAN response", ()),
+        )
+    )
+    client = SimpleNamespace(assert_ownership=AsyncMock(return_value=snapshot))
+    acquired = AcquiredRole(
+        client=client,
+        page_id="page-alpha-plan",
+        url=f"https://chatgpt.com/c/{child_conversation}",
+        created=False,
+        new_chat=False,
+    )
 
     class Actions:
-        async def backend_conversation(self, conversation_id):
-            assert conversation_id == child_conversation
-            return graph
+        async def locate_owned(self, _state, _role):
+            return acquired
+
+        async def backend_conversation(self, _conversation_id):
+            raise AssertionError("bootstrap donor capture must use local transcript state")
 
     captured = asyncio.run(worker._capture_bootstrap_role_donor(state, hop, Actions()))
 
@@ -6759,6 +6518,10 @@ def _accept_self_route_guard_decision(worker, state, route: str):
         f".plan/{state['team']}/{hop['physical_role']}_turn{hop['turn']}_"
         f"{state['task_id']}.md"
     )
+    hop["expected_report_path"] = handoff
+    report = Path(str(state["repository"])) / handoff
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(f"# {hop['physical_role']} turn {hop['turn']} report\n", encoding="utf-8")
     hop["response"] = json.dumps({"route": route, "handoff": handoff})
     hop["state"] = "responded"
     worker._responded(state, hop)

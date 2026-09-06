@@ -502,6 +502,6 @@ def test_board_uses_operator_labels_run_task_and_restored_settings():
     assert 'body: {trigger_type: "manual", instruction}' in app
     assert '/api/independent-agents/${encodeURIComponent(taskId)}/reset' in app
     assert '.filter(item => !item.agent?.deleted_at)' in app
-    assert 'app.js?v=20260905-dependency-team-cards' in html
+    assert 'app.js?v=20260906-listen-controls-v1' in html
     assert 'dashboard.css?v=20260905-dependency-team-cards' in html
     assert "new_chat_next_job" not in html[html.index('id="agent-settings-dialog"') :]

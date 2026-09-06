@@ -16,7 +16,12 @@ from .cdpa_bootstraps import (
     normalize_bootstrap_record,
     normalize_legacy_bootstrap_record,
 )
-from .cdpa_commands import RepairRequest, WorkerCommand, command_snapshot
+from .cdpa_commands import (
+    RepairRequest,
+    WorkerCommand,
+    command_snapshot,
+    workflow_control_eligibility,
+)
 from .cdpa_config import CDPAConfig
 from .cdpa_dependencies import (
     DependencyReadiness,
@@ -4726,6 +4731,10 @@ class TaskStore(IndependentAgentStoreMixin):
                         }
                     )
             return state
+        if not is_independent_task(state):
+            eligibility = workflow_control_eligibility(state, "resume")
+            if not eligibility["eligible"]:
+                raise ValueError(str(eligibility["reason"] or "Resume is not eligible."))
         sequence = len(state.get("controls") or []) + 1
         state.setdefault("controls", []).append(
             {
@@ -5260,6 +5269,14 @@ class TaskStore(IndependentAgentStoreMixin):
             )
         normalized_origin = str(origin or "operator").strip().lower()
         normalized_reason = str(reason or "").strip() or None
+        if not is_independent_task(state):
+            eligibility = workflow_control_eligibility(
+                state,
+                action,
+                role=control_role,
+            )
+            if not eligibility["eligible"]:
+                raise ValueError(str(eligibility["reason"] or f"{action} is not eligible."))
         command_reason = normalized_reason or f"{action} requested"
         command = WorkerCommand.create(
             origin=normalized_origin,

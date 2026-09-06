@@ -603,6 +603,132 @@ class WorkerCommand:
         return command
 
 
+_WORKFLOW_CONTROL_ACTIONS = (
+    "pause",
+    "resume",
+    "retry",
+    "restart_role",
+    "new_chat",
+    "open_tab",
+    "route_plan",
+    "stop",
+    "clear_team",
+)
+_WORKFLOW_TERMINAL = frozenset({"DONE", "STOPPED"})
+_WORKFLOW_IN_FLIGHT = frozenset({"sending", "sent", "waiting"})
+
+
+def workflow_control_eligibility(
+    state: Mapping[str, Any],
+    action: str,
+    *,
+    role: str | None = None,
+) -> dict[str, Any]:
+    """Return the durable workflow control admission shared by store/worker/UI.
+
+    Browser-only predicates still refine this at execution time. This helper only
+    expresses facts present in the canonical manifest so dashboard enablement and
+    locked admission cannot contradict one another.
+    """
+    normalized_action = str(action or "").strip().lower()
+    if normalized_action not in _WORKFLOW_CONTROL_ACTIONS:
+        return {"eligible": False, "reason": "Unsupported workflow control."}
+    if isinstance(state.get("independent"), Mapping):
+        return {"eligible": False, "reason": "Workflow controls do not apply to independent agents."}
+
+    status = str(state.get("status") or "").upper()
+    active_role = str(state.get("active_role") or "").upper() or None
+    selected_role = str(role or active_role or "PLAN").upper()
+    roles = state.get("roles") if isinstance(state.get("roles"), Mapping) else {}
+    role_exists = selected_role in roles
+    hop: Mapping[str, Any] | None = None
+    active_hop_id = state.get("active_hop_id")
+    for item in state.get("hops") or ():
+        if isinstance(item, Mapping) and item.get("hop_id") == active_hop_id:
+            hop = item
+            break
+    hop_state = str((hop or {}).get("state") or "")
+    block_code = str(state.get("block_code") or "")
+    guard_blocked = status == "BLOCKED" and block_code == "consecutive_self_route_limit"
+
+    def yes() -> dict[str, Any]:
+        return {"eligible": True, "reason": None, "role": selected_role}
+
+    def no(reason: str) -> dict[str, Any]:
+        return {"eligible": False, "reason": reason, "role": selected_role}
+
+    if normalized_action == "pause":
+        return yes() if status in {"INBOX", "RUNNING"} else no(
+            "Pause is available only for INBOX or RUNNING work."
+        )
+    if normalized_action == "resume":
+        if status in _WORKFLOW_TERMINAL:
+            return no("Terminal work cannot be resumed.")
+        if status == "WAITING" and str(state.get("waiting_code") or "") in {
+            "dependencies",
+            "dependency_waiting",
+        }:
+            return no("Resume cannot bypass unfinished dependencies.")
+        if hop is None:
+            return no("Resume requires an active durable hop.")
+        return yes()
+    if normalized_action == "retry":
+        if status != "BLOCKED":
+            return no("Retry hop is available only for BLOCKED work.")
+        if not bool(state.get("block_retryable")):
+            return no("This block is not retryable; use its stated recovery action.")
+        return yes()
+    if normalized_action in {"restart_role", "new_chat"}:
+        if status in _WORKFLOW_TERMINAL:
+            return no("Terminal work cannot replace its role context.")
+        if not role_exists:
+            return no("The selected workflow role does not exist for this task.")
+        if guard_blocked and normalized_action == "restart_role":
+            return no("Restart role cannot bypass the consecutive self-route guard; Resume is required.")
+        if hop_state in _WORKFLOW_IN_FLIGHT:
+            return no("This control cannot cross an in-flight or accepted Send boundary; use Resume.")
+        return yes()
+    if normalized_action == "open_tab":
+        if status in _WORKFLOW_TERMINAL:
+            return no("Terminal work has no active role tab to recover.")
+        if not role_exists:
+            return no("The selected workflow role does not exist for this task.")
+        return yes()
+    if normalized_action == "route_plan":
+        if status in _WORKFLOW_TERMINAL:
+            return no("Terminal work cannot route to PLAN.")
+        if hop is None:
+            return no("Route PLAN requires an active durable hop.")
+        unresolved_accepted = (
+            status == "BLOCKED"
+            and block_code == "accepted_conversation_identity_unresolved"
+            and hop_state == "waiting"
+        )
+        if unresolved_accepted:
+            return yes()
+        if active_role == "PLAN":
+            return no("PLAN is already the active role.")
+        if guard_blocked:
+            return no("Route PLAN cannot bypass the consecutive self-route guard; Resume is required.")
+        if hop_state in _WORKFLOW_IN_FLIGHT:
+            return no("Route PLAN cannot abandon an in-flight Send; use Resume.")
+        return yes()
+    if normalized_action == "stop":
+        return no("Stop is invalid for terminal work.") if status in _WORKFLOW_TERMINAL else yes()
+    if normalized_action == "clear_team":
+        # The actual control still requires confirmation before destructive
+        # nonterminal cleanup and exact-owner browser preflight.
+        return yes()
+    return no("Unsupported workflow control.")
+
+
+def workflow_control_matrix(state: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        action: workflow_control_eligibility(state, action)
+        for action in _WORKFLOW_CONTROL_ACTIONS
+    }
+
+
 def validate_worker_command(command: WorkerCommand, state: Mapping[str, Any]) -> None:
     if str(state.get("task_id") or "") != command.task_id:
         raise ValueError("worker command task identity is stale")

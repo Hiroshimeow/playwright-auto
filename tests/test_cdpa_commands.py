@@ -11,6 +11,7 @@ from playwright_auto.cdpa_commands import (
     conversation_identity,
     normalize_root_cause_key,
     validate_worker_command,
+    workflow_control_matrix,
 )
 
 
@@ -76,6 +77,40 @@ def test_worker_command_is_frozen_and_round_trips_complete_snapshot():
     assert WorkerCommand.from_dict(command.to_dict()) == command
     with pytest.raises(FrozenInstanceError):
         command.action = "resume"  # type: ignore[misc]
+
+
+def test_workflow_control_matrix_projects_positive_and_negative_durable_admission():
+    current = state()
+    current["status"] = "RUNNING"
+    current["hops"][0]["state"] = "waiting"
+    matrix = workflow_control_matrix(current)
+
+    assert tuple(matrix) == (
+        "pause", "resume", "retry", "restart_role", "new_chat",
+        "open_tab", "route_plan", "stop", "clear_team",
+    )
+    assert matrix["pause"]["eligible"] is True
+    assert matrix["resume"]["eligible"] is True
+    assert matrix["retry"]["eligible"] is False
+    assert matrix["restart_role"]["eligible"] is False
+    assert "Send boundary" in matrix["restart_role"]["reason"]
+    assert matrix["new_chat"]["eligible"] is False
+    assert matrix["open_tab"]["eligible"] is True
+    assert matrix["route_plan"]["eligible"] is False
+    assert matrix["stop"]["eligible"] is True
+    assert matrix["clear_team"]["eligible"] is True
+
+    current["status"] = "BLOCKED"
+    current["block_retryable"] = True
+    current["block_code"] = "retryable_failure"
+    assert workflow_control_matrix(current)["retry"]["eligible"] is True
+
+    current["status"] = "DONE"
+    terminal = workflow_control_matrix(current)
+    assert terminal["pause"]["eligible"] is False
+    assert terminal["resume"]["eligible"] is False
+    assert terminal["stop"]["eligible"] is False
+    assert terminal["clear_team"]["eligible"] is True
 
 
 def test_worker_command_rejects_stale_hop_conversation_and_receipt():

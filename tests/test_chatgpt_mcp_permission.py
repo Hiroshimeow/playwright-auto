@@ -99,7 +99,7 @@ def test_sparse_probe_rejects_unrelated_or_ambiguous_allow(body):
     assert probe.mcp_permission_allow_count != 1
 
 
-def test_wait_snapshot_auto_clicks_exact_mcp_allow_without_extra_poll_loop():
+def test_wait_snapshot_observes_mcp_allow_without_dispatching_it():
     async def run(page):
         client = ChatGPTPage(page, timeout_ms=5_000)
         client.binding = PageBinding("page-1", "DEV")
@@ -116,9 +116,15 @@ def test_wait_snapshot_auto_clicks_exact_mcp_allow_without_extra_poll_loop():
 
         await client.wait_snapshot(receipt)
         click_count = await page.evaluate("window.__mcpAllowClicks || 0")
-        return click_count, client.wait_metrics["sparse_probes"]
+        probe = await client.current_wait_probe()
+        return (
+            click_count,
+            client.wait_metrics["sparse_probes"],
+            probe.mcp_permission_allow_count,
+            probe.mcp_permission_node_count,
+        )
 
-    click_count, sparse_probes = asyncio.run(
+    click_count, sparse_probes, visible_count, node_count = asyncio.run(
         _with_page(
             """
             <main>
@@ -133,5 +139,108 @@ def test_wait_snapshot_auto_clicks_exact_mcp_allow_without_extra_poll_loop():
         )
     )
 
-    assert click_count == 1
+    assert click_count == 0
     assert sparse_probes == 1
+    assert visible_count == 1
+    assert node_count == 1
+
+
+def test_sparse_probe_distinguishes_hidden_permission_node_from_visible_offer():
+    async def run(page):
+        return await inspect_chatgpt_wait_probe(page)
+
+    probe = asyncio.run(
+        _with_page(
+            """
+            <main>
+              <div contenteditable="true" role="textbox"></div>
+              <div style="display:none">
+                <button><span>Allow</span></button>
+                <button aria-label="Allow mcp-g8 for this conversation"></button>
+              </div>
+            </main>
+            """,
+            run,
+        )
+    )
+
+    assert probe.mcp_permission_allow_count == 0
+    assert probe.mcp_permission_node_count == 1
+
+
+def test_offered_react_allow_is_inspected_then_dispatched_without_click():
+    async def run(page):
+        client = ChatGPTPage(page, timeout_ms=5_000)
+        client.binding = PageBinding("page-1", "DEV")
+        receipt = SendReceipt(
+            prompt="Use @mcp-g8",
+            prompt_sha256=prompt_digest("Use @mcp-g8"),
+            binding=client.binding,
+            baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+            attempts=1,
+            accepted_via="exact_user_message",
+            session_id_before=None,
+            user_message_id="user-1",
+            conversation_id="conversation-1",
+        )
+        await page.evaluate(
+            """() => {
+              const permission = document.querySelector('#permission');
+              permission.__reactProps$fixture = {
+                onSelectOption: (_event, action) => {
+                  window.__mcpAction = action;
+                },
+                options: [{
+                  action: {
+                    type: 'allow',
+                    target_message_id: 'assistant-1',
+                    remember_answer: true,
+                  }
+                }],
+              };
+            }"""
+        )
+        probe = await client.current_wait_probe()
+        offered = await client.inspect_mcp_permission_allow(
+            probe, receipt, allowed_connectors=("mcp-g8",)
+        )
+        dispatched = await client.approve_mcp_permission_allow(
+            probe,
+            receipt,
+            allowed_connectors=("mcp-g8",),
+            expected_target_message_id=offered["target_message_id"],
+        )
+        action = await page.evaluate("window.__mcpAction || null")
+        click_count = await page.evaluate("window.__mcpAllowClicks || 0")
+        return offered, dispatched, action, click_count
+
+    offered, dispatched, action, click_count = asyncio.run(
+        _with_page(
+            """
+            <main>
+              <section data-turn-id="turn-user"><div data-message-author-role="user" data-message-id="user-1">Use @mcp-g8</div></section>
+              <section data-turn-id="turn-assistant"><div data-message-author-role="assistant" data-message-id="assistant-1">approval</div></section>
+              <div style="display:none">
+                <button id="primary" onclick="window.__mcpAllowClicks = (window.__mcpAllowClicks || 0) + 1"><span>Allow</span></button>
+                <button id="permission" aria-label="Allow mcp-g8 for this conversation"></button>
+              </div>
+              <div contenteditable="true" role="textbox"></div>
+            </main>
+            """,
+            run,
+        )
+    )
+
+    assert offered == {
+        "method": "offered",
+        "connector": "mcp-g8",
+        "target_message_id": "assistant-1",
+        "remember_answer": "true",
+    }
+    assert dispatched["method"] == "react_handler"
+    assert action == {
+        "type": "allow",
+        "target_message_id": "assistant-1",
+        "remember_answer": True,
+    }
+    assert click_count == 0

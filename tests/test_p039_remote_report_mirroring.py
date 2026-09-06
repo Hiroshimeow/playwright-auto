@@ -152,53 +152,77 @@ def test_resolve_completed_file_write_requires_unique_completed_exact_write():
         )
 
 
-def test_normal_backend_completion_captures_remote_report_before_route_validation(tmp_path: Path):
+def test_passively_observed_completion_captures_remote_report_before_route_validation(tmp_path: Path):
     _config, state, worker = setup_remote_task(tmp_path)
     hop = _active_hop(state)
     report = "normal completion bytes\n"
     route = json.dumps({"route": "DEV", "handoff": hop["expected_report_path"]}, separators=(",", ":"))
     graph = report_graph(remote_path=expected_remote_path(hop), content=report)
     graph["mapping"]["final"]["message"]["content"]["parts"] = [route]
-    now = datetime.now(timezone.utc)
-    hop["wait"].update(
-        {
-            "completion_mode": "terminal_graph_retry",
-            "terminal_graph_ready_at": (now - timedelta(seconds=1)).isoformat(),
-            "deadline_at": (now + timedelta(seconds=60)).isoformat(),
-        }
+
+    worker._capture_remote_report_mirror(
+        state,
+        hop,
+        graph,
+        accepted_user_message_id="u1",
+        terminal_assistant_message_id="final",
+        response_text=route,
     )
+    hop["response"] = route
+    hop["response_sha256"] = hashlib.sha256(route.encode("utf-8")).hexdigest()
+    hop["state"] = "responded"
+
+    worker._responded(state, hop)
+
+    assert hop["state"] == "routed"
+    assert hop["route"] == "DEV"
+    assert Path(hop["mirrored_report_path"]).read_bytes() == report.encode("utf-8")
+    assert hop["report_sha256"] == hashlib.sha256(report.encode("utf-8")).hexdigest()
+    assert hop["validation_error"] is None
+
+
+def test_passive_observation_can_materialize_exact_remote_report_without_graph_request(tmp_path: Path):
+    _config, state, worker = setup_remote_task(tmp_path)
+    hop = _active_hop(state)
+    report = "# passive remote report\n\nExact bytes.\n"
+    route = json.dumps(
+        {"route": "DEV", "handoff": hop["expected_report_path"]},
+        separators=(",", ":"),
+    )
+    graph = report_graph(remote_path=expected_remote_path(hop), content=report)
+    graph["mapping"]["final"]["message"]["content"]["parts"] = [route]
     receipt = SendReceipt(
-        prompt="remote completion",
-        prompt_sha256=prompt_digest("remote completion"),
+        prompt="remote passive completion",
+        prompt_sha256=prompt_digest("remote passive completion"),
         binding=PageBinding("page-PLAN", "PLAN"),
         baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
         attempts=1,
         accepted_via="user_message_identity",
-        session_id_before="WEB:before",
+        session_id_before=None,
         user_message_id="u1",
         user_turn_id="u1",
-        conversation_id="conversation-remote",
+        conversation_id="conversation-passive-remote",
+    )
+    response = SimpleNamespace(message_id="final", text=route)
+
+    class Client:
+        def passive_observation(self, **kwargs):
+            assert kwargs == {"request_id": hop["request_id"], "generation": 0}
+            return {
+                "coverage": "complete",
+                "observed_user_message_id": "u1",
+                "conversation_id": "conversation-passive-remote",
+                "graph": graph,
+            }
+
+    acquired = SimpleNamespace(client=Client())
+    worker._capture_passive_remote_report_if_available(
+        state, hop, acquired, receipt, response
     )
 
-    class BackendActions:
-        async def backend_conversation(self, conversation_id):
-            assert conversation_id == "conversation-remote"
-            return graph
-
-    outcome, fallback = asyncio.run(
-        worker._waiting_backend_step(
-            state,
-            hop,
-            BackendActions(),
-            receipt,
-            persist_transport_state=lambda: None,
-        )
-    )
-
-    assert (outcome, fallback) == ("responded", None)
-    assert hop["state"] == "responded"
-    assert Path(hop["mirrored_report_path"]).read_bytes() == report.encode("utf-8")
-    assert hop["validation_error"] is None
+    mirrored = Path(hop["mirrored_report_path"])
+    assert mirrored.read_bytes() == report.encode("utf-8")
+    assert hop["mirrored_report_sha256"] == hashlib.sha256(report.encode("utf-8")).hexdigest()
 
 
 def test_remote_report_mirror_is_central_durable_and_served_after_remote_source_is_absent(tmp_path: Path):

@@ -1,0 +1,20 @@
+# CDPA Listen + DOM, Verified Resume and Operator Controls — Execution Prompt
+
+Repository/runtime: `/home/ayumi/Workspace/git_project/playwright-auto` on mcp-g8. Bootstrap: `g8-bootstrap`. Persistent Chromium: `127.0.0.1:9222`. Dashboard/API: `9224/9225`. ThinkBook is secondary compatibility evidence only.
+
+Execute the implementation and acceptance plan in `docs/superpowers/plans/2026-09-06-cdpa-listen-resume-controls-acceptance.md` through the existing `cdpa/dashboard -> TaskStore -> CDPAWorker` path. Preserve all unrelated dirty work and the accepted preboundary New Chat recovery changes. Do not commit/push/reset/stash/switch/merge unless separately authorized.
+
+Primary behavioral contract:
+
+1. Replace all automation-originated full conversation graph/history reads with passive observation of browser-native ChatGPT traffic plus existing DOM response/provenance/stability logic. `stream_status` is the only active ChatGPT status request and must be shared per exact conversation at no more than one poll per 30 seconds, honoring existing cooldown/backoff.
+2. `dom_only=true` remains meaningful rollback mode. `dom_only=false` means Listen + DOM + stream_status. Hot switching must not reset durable identity, resend, duplicate observers or accept stale generation events.
+3. Treat stream `COMPLETE` only as reconciliation trigger. Preserve typed failure/stop statuses. Pending or unknown approval takes precedence over routing.
+4. For an authorized connector on the exact owned task, invoke only the server-offered conversation-scoped allow split action with exact target and `remember_answer=true` through the already-loaded client handler. No visible click, forced visibility, coordinates, direct approval POST or fabricated permission. Persist a durable approval attempt boundary and never duplicate an ambiguous dispatch after crash/reconnect.
+5. Resume is verified durable continuation, never task recreation or blind resend. Unify task-card Resume, exact-team form/API/CLI, worker restart, CDP reconnect, tab reopen, Pause release, self-route guard and dependency WAITING on shared recovery predicates. Command delivery/HTTP success is not completion.
+6. Audit/fix and prove the real dashboard behavior for Pause, Resume, Retry hop, Restart role, New chat, Open tab, Route PLAN, Stop and Clear team. Project one canonical eligibility/reason policy from locked admission into the UI. Correct refusals are PASS; enabled no-ops are failures.
+7. Run TDD/focused tests, full repository regression, source/deployment identity verification and comparable performance samples. Any automation full-graph request, duplicate send/approval/route, listener leak or unexplained regression is a failure.
+8. After the final tested build is loaded, create exactly three fresh `cdpa-listen-uat-*` freelance workflows from canonical old **requirements only**, never old operational identity/receipts/conversations/permissions. One must complete uninterrupted multi-role review/test flow, one must prove Pause/Resume + exact-team CLI Resume without drift, and one must prove safe tab-loss/reopen + CDP/worker reconnect/Resume without accepted-send replay. No external application/bid/message/purchase/KYC/interview submission.
+9. Old-account PAUSED/WAITING/BLOCKED teams are read-only. Do not mutate, control or reassociate them. Do not touch `llm-wiki-migration-audit`.
+10. Continue autonomously through the smallest DEV/TEST/REVIEW follow-ups until the full acceptance matrix in the plan passes. PLAN alone closes DONE. PAUSE only for a precise external prerequisite no authorized in-task role can change.
+
+Final PLAN report must be compact Vietnamese user-facing output with: result, behavior-level changes, decisive verification totals/runtime evidence, exact user action (`Không` if none), meaningful limits only, delivery only if relevant, and one bounded Learning disposition. Do not claim universal future 100% reliability; completion means 100% of the explicit acceptance matrix passed with zero observed unaddressed anomaly.

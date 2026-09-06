@@ -19,9 +19,8 @@ from .chatgpt import (
     RateLimitBlockedError,
     action_delay,
     action_delay_multiplier,
-    backend_conversation as read_backend_conversation,
-    backend_search_conversations as read_backend_search_conversations,
     backend_stream_status as read_backend_stream_status,
+    release_backend_stream_status as release_read_backend_stream_status,
     clear_composer,
     random_delay,
     rate_limit_dialogs,
@@ -142,15 +141,8 @@ class CDPATabActions:
     async def backend_stream_status(self, conversation_id: str) -> dict[str, Any]:
         return await read_backend_stream_status(self.browser_context, conversation_id)
 
-    async def backend_conversation(self, conversation_id: str) -> dict[str, Any]:
-        return await read_backend_conversation(self.browser_context, conversation_id)
-
-    async def backend_search_conversations(
-        self, query: str, *, max_candidates: int = 25
-    ) -> list[str]:
-        return await read_backend_search_conversations(
-            self.browser_context, query, max_candidates=max_candidates
-        )
+    def release_backend_stream_status(self, conversation_id: str) -> None:
+        release_read_backend_stream_status(self.browser_context, conversation_id)
 
     async def _set_page_active(self, page: Any) -> None:
         try:

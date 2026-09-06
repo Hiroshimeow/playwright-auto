@@ -37,6 +37,7 @@ from .cdpa_commands import (
     command_snapshot,
     conversation_identity,
     validate_worker_command,
+    workflow_control_eligibility,
 )
 from .cdpa_config import CDPAConfig, load_cdpa_config, remote_repository_from_task
 from .cdpa_browser_projection import build_browser_projection
@@ -79,6 +80,7 @@ from .cdpa_routes import (
     expected_report_relative,
     materialize_inline_report,
     parse_role_response,
+    validate_file_report,
 )
 from .cdpa_store import (
     TaskStore,
@@ -161,8 +163,8 @@ _DOM_FALLBACK_SETTLE_SECONDS = 30.0
 _POST_REFRESH_RESPONSE_PROBE_SECONDS = 60.0
 _POST_REFRESH_REROUTE_SECONDS = 120.0
 _STALL_REROUTE_MAX_ATTEMPTS = 3
-_STREAM_STATUS_POLL_MIN_SECONDS = 10.0
-_STREAM_STATUS_POLL_MAX_SECONDS = 15.0
+_STREAM_STATUS_POLL_MIN_SECONDS = 30.0
+_STREAM_STATUS_POLL_MAX_SECONDS = 35.0
 _AUTOMATED_SEND_SPACING_SECONDS = 10.0
 _SENDING_CONTINUATION_STARTED = "bounded continuation started after proven atomic non-acceptance"
 _PROVEN_ATOMIC_NONACCEPTANCE_ERRORS = (
@@ -309,6 +311,17 @@ def _column_for(role: str) -> str:
 
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _authorized_mcp_connectors(rendered_prompt: str) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                match.lower()
+                for match in re.findall(r"\bmcp-[A-Za-z0-9._-]+\b", str(rendered_prompt or ""))
+            }
+        )
+    )
 
 
 def _report_mode(state: Mapping[str, Any]) -> str:
@@ -1650,6 +1663,12 @@ class CDPAWorker:
                 control["command_state"] = "RUNNING"
             hop = _active_hop(state) if state.get("active_hop_id") is not None else None
             hop_state = str(hop.get("state") or "") if hop else ""
+            if not is_independent_task(state):
+                eligibility = workflow_control_eligibility(state, action, role=role)
+                if not eligibility["eligible"]:
+                    raise RuntimeError(
+                        str(eligibility["reason"] or f"{action} is not eligible")
+                    )
             if is_independent_task(state):
                 if action == "open_tab":
                     result = await self._apply_independent_control(
@@ -1670,6 +1689,12 @@ class CDPAWorker:
                 state["status"] = "PAUSED"
                 state["kanban_column"] = "PAUSED"
                 state["pause_reason"] = control.get("reason") or "manual pause"
+                result = {
+                    "outcome": "applied",
+                    "action": "pause",
+                    "postcondition": "task_paused",
+                    "reason": state["pause_reason"],
+                }
             elif action == "resume":
                 status = str(state.get("status") or "").upper()
                 if status in TERMINAL:
@@ -1840,6 +1865,13 @@ class CDPAWorker:
                 state["block_retryable"] = False
                 state["block_reason"] = None
                 state["active_action"] = "retrying"
+                result = {
+                    "outcome": "applied",
+                    "action": "retry",
+                    "postcondition": "retry_rearmed",
+                    "hop_id": hop.get("hop_id") if hop is not None else None,
+                    "repair_attempt": hop.get("repair_attempt") if hop is not None else None,
+                }
             elif action == "stop":
                 if state.get("status") in TERMINAL:
                     raise RuntimeError("Stop is invalid for a terminal task")
@@ -2633,34 +2665,11 @@ class CDPAWorker:
         source_id = str(bootstrap.get("source_conversation_id") or "").strip()
         if not source_id or state.get("bootstrap_source_exhausted") is True:
             return dict(bootstrap), False
-        try:
-            graph = await actions.backend_conversation(source_id)
-            assistant = resolve_latest_terminal_assistant(graph)
-        except BackendUnavailableError as exc:
-            if exc.status_code in {404, 410}:
-                state["bootstrap_source_exhausted"] = True
-                return dict(bootstrap), False
-            state["active_action"] = "bootstrap_retry"
-            return dict(bootstrap), True
-        except BackendNotReadyError:
-            state["active_action"] = "bootstrap_retry"
-            return dict(bootstrap), True
-        except BackendError:
-            state["active_action"] = "bootstrap_retry"
-            return dict(bootstrap), True
-
-        donor = normalize_bootstrap_donor(
-            {
-                "conversation_id": source_id,
-                "assistant_message_id": assistant.message_id,
-            }
-        )
-        updated = BootstrapCatalog(self.config.repository_root).add_donor(
-            str(bootstrap["bootstrap_id"]), donor
-        )
-        state["bootstrap"] = updated
-        state["bootstrap_source_materialized"] = donor
-        return updated, False
+        # A source conversation ID alone is no longer actively fetched. Bootstrap
+        # materialization must come from an already-recorded donor or a normal
+        # browser-owned/local transcript path; otherwise fail closed below.
+        state["bootstrap_source_requires_local_materialization"] = source_id
+        return dict(bootstrap), False
 
     async def _regenerate_bootstrap_donor(
         self,
@@ -2993,41 +3002,16 @@ class CDPAWorker:
             state["active_action"] = "rate_limit_cooldown"
             return None
 
-        catalog = BootstrapCatalog(self.config.repository_root)
         saw_transient = False
         for donor in self._bootstrap_donor_candidates(state, bootstrap):
-            try:
-                graph = await actions.backend_conversation(donor["conversation_id"])
-                resolve_bootstrap_donor(graph, donor["assistant_message_id"])
-            except BackendUnavailableError as exc:
-                if exc.status_code in {404, 410}:
-                    updated = catalog.remove_donor(str(bootstrap["bootstrap_id"]), donor)
-                    state["bootstrap"] = updated
-                    bootstrap = updated
-                    self._remove_task_donor(state, donor)
-                    if donor["conversation_id"] == str(
-                        bootstrap.get("source_conversation_id") or ""
-                    ):
-                        state["bootstrap_source_exhausted"] = True
-                    continue
+            # The branch operation and its local/UI fallback validate the recorded
+            # donor at the actual browser boundary; do not preflight with a graph GET.
+            branch_from_anchor = getattr(actions, "branch_from_anchor", None)
+            if not callable(branch_from_anchor):
                 saw_transient = True
                 continue
-            except GraphIdentityError:
-                updated = catalog.remove_donor(str(bootstrap["bootstrap_id"]), donor)
-                state["bootstrap"] = updated
-                bootstrap = updated
-                self._remove_task_donor(state, donor)
-                if donor["conversation_id"] == str(
-                    bootstrap.get("source_conversation_id") or ""
-                ):
-                    state["bootstrap_source_exhausted"] = True
-                continue
-            except BackendError:
-                saw_transient = True
-                continue
-
             try:
-                acquired = await actions.branch_from_anchor(
+                acquired = await branch_from_anchor(
                     state,
                     role,
                     source_conversation_id=donor["conversation_id"],
@@ -3300,6 +3284,7 @@ class CDPAWorker:
             and bool(item.get("receipt"))
             for item in state.get("hops") or []
         )
+        self._arm_passive_request_observer(state, hop, acquired.client)
         block = DurableSendBlock(
             str(hop["prompt"]),
             ledger_path=hop["ledger_path"],
@@ -3385,6 +3370,16 @@ class CDPAWorker:
         hop["conversation_url"] = post_send.conversation_url or str(post_send.url)
         hop["receipt"] = output["receipt"]
         self._canonicalize_receipt_conversation_url(state, hop)
+        try:
+            observer_receipt = SendReceipt.from_dict(hop["receipt"])
+        except (KeyError, TypeError, ValueError):
+            observer_receipt = None
+        self._arm_passive_request_observer(
+            state,
+            hop,
+            acquired.client,
+            observer_receipt,
+        )
         hop["rendered_prompt_sha256"] = output["receipt"]["prompt_sha256"]
         hop["state"] = "sent"
         if files:
@@ -3455,6 +3450,97 @@ class CDPAWorker:
                 json.loads(json.dumps(state, ensure_ascii=False, default=str))
             )
         return upgraded
+
+    def _arm_passive_request_observer(
+        self,
+        state: Mapping[str, Any],
+        hop: Mapping[str, Any],
+        client: Any,
+        receipt: SendReceipt | None = None,
+    ) -> None:
+        settings = (
+            self.runtime_db.get_snapshot("settings")
+            if self.runtime_db.path.exists()
+            else None
+        )
+        dom_only = (
+            isinstance(settings, Mapping)
+            and isinstance(settings.get("payload"), Mapping)
+            and settings["payload"].get("dom_only") is True
+        )
+        if dom_only:
+            detach = getattr(client, "detach_passive_observer", None)
+            if callable(detach):
+                detach()
+            return
+        arm = getattr(client, "arm_passive_observer", None)
+        if not callable(arm):
+            return
+        role = str(hop.get("target_role") or "").upper()
+        role_record = (state.get("roles") or {}).get(role)
+        generation = (
+            int(role_record.get("conversation_generation") or 0)
+            if isinstance(role_record, Mapping)
+            else 0
+        )
+        arm(
+            request_id=str(hop.get("request_id") or ""),
+            generation=generation,
+            conversation_id=(receipt.conversation_id if receipt is not None else None),
+            accepted_user_message_id=(
+                receipt.user_message_id if receipt is not None else None
+            ),
+        )
+
+    @staticmethod
+    def _release_stream_status_slot(owner: Any, receipt: SendReceipt) -> None:
+        conversation_id = str(receipt.conversation_id or "").strip()
+        if not conversation_id:
+            return
+        release = getattr(owner, "release_backend_stream_status", None)
+        if callable(release):
+            release(conversation_id)
+
+    def _capture_passive_remote_report_if_available(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        acquired: AcquiredRole,
+        receipt: SendReceipt,
+        response: MessageSnapshot,
+    ) -> None:
+        if remote_repository_from_task(str(state.get("task_text") or "")) is None:
+            return
+        observe = getattr(acquired.client, "passive_observation", None)
+        if not callable(observe):
+            return
+        role_record = (state.get("roles") or {}).get(str(hop.get("target_role") or ""))
+        generation = (
+            int(role_record.get("conversation_generation") or 0)
+            if isinstance(role_record, Mapping)
+            else 0
+        )
+        evidence = observe(
+            request_id=str(hop.get("request_id") or ""),
+            generation=generation,
+        )
+        if not isinstance(evidence, Mapping) or evidence.get("coverage") != "complete":
+            return
+        graph = evidence.get("graph")
+        if not isinstance(graph, Mapping) or not receipt.user_message_id or not response.message_id:
+            return
+        if evidence.get("observed_user_message_id") != receipt.user_message_id:
+            return
+        if receipt.conversation_id and evidence.get("conversation_id") != receipt.conversation_id:
+            return
+        self._capture_remote_report_mirror(
+            state,
+            hop,
+            graph,
+            accepted_user_message_id=receipt.user_message_id,
+            terminal_assistant_message_id=response.message_id,
+            response_text=response.text,
+        )
 
     def _capture_remote_report_mirror(
         self,
@@ -3613,6 +3699,7 @@ class CDPAWorker:
         actions: CDPATabActions,
         receipt: SendReceipt,
     ) -> SendReceipt:
+        """Canonicalize an accepted conversation only from exact owned local state."""
         if receipt.conversation_id:
             return receipt
         if receipt.attempts < 1 or not receipt.user_message_id:
@@ -3621,8 +3708,7 @@ class CDPAWorker:
             )
         ledger_path = str(hop.get("ledger_path") or "").strip()
         request_id = str(hop.get("request_id") or "").strip()
-        task_id = str(state.get("task_id") or "").strip()
-        if not ledger_path or not request_id or not task_id:
+        if not ledger_path or not request_id:
             raise DurableRequestError(
                 "accepted conversation discovery is missing durable request context"
             )
@@ -3647,35 +3733,33 @@ class CDPAWorker:
             raise DurableRequestError(
                 "accepted conversation discovery found immutable receipt divergence"
             )
-        candidates = await actions.backend_search_conversations(
-            task_id, max_candidates=25
-        )
-        verified: list[str] = []
-        for conversation_id in candidates:
-            graph = await actions.backend_conversation(conversation_id)
-            try:
-                resolve_exact_user_message(
-                    graph,
-                    receipt.user_message_id,
-                    record.rendered_prompt,
-                )
-            except GraphIdentityError:
-                continue
-            verified.append(conversation_id)
-            if len(verified) > 1:
-                break
-        if len(verified) != 1:
+
+        role = str(hop.get("target_role") or "")
+        acquired = await actions.locate_owned(state, role)
+        if acquired is None or str(acquired.page_id) != str(receipt.binding.page_id):
             raise GraphIdentityError(
-                "accepted conversation identity could not be uniquely verified from backend search"
+                "accepted conversation identity is unknown because the exact owned page is unavailable"
+            )
+        snapshot = await acquired.client.assert_ownership()
+        if snapshot.page_id != receipt.binding.page_id or not receipt_user_message_seen(
+            snapshot.messages, receipt
+        ):
+            raise GraphIdentityError(
+                "accepted conversation identity is unknown because exact local user provenance is absent"
+            )
+        conversation_id = str(snapshot.session_id or "").strip()
+        if not conversation_id:
+            raise GraphIdentityError(
+                "accepted conversation identity is unknown because the owned page is not a saved conversation"
             )
         ledger.enrich_receipt_conversation_id(
             request_id,
             accepted_receipt=receipt,
-            conversation_id=verified[0],
+            conversation_id=conversation_id,
         )
         self._reconcile_hop_conversation_identity(state, hop)
         enriched = SendReceipt.from_dict(hop["receipt"])
-        if enriched.conversation_id != verified[0]:
+        if enriched.conversation_id != conversation_id:
             raise DurableRequestError(
                 "accepted conversation identity was not durably canonicalized"
             )
@@ -3745,6 +3829,191 @@ class CDPAWorker:
             error=None,
         )
 
+    async def _mcp_approval_gate(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        acquired: AcquiredRole,
+        receipt: SendReceipt,
+        wait: dict[str, Any],
+    ) -> bool:
+        """Return True while approval/continuation must block response routing."""
+        probe_reader = getattr(acquired.client, "current_wait_probe", None)
+        if not callable(probe_reader):
+            return False
+        probe = await probe_reader()
+        ledger_path = str(hop.get("ledger_path") or "").strip()
+        request_id = str(hop.get("request_id") or "").strip()
+        if not ledger_path or not request_id:
+            if probe.mcp_permission_node_count:
+                self._block(
+                    state,
+                    "MCP approval exists but the exact durable request ledger is unavailable",
+                    code="approval_provenance_missing",
+                    retryable=False,
+                )
+                return True
+            return False
+        ledger = RequestLedger(ledger_path)
+        record = ledger.get(request_id)
+        if record is None:
+            if probe.mcp_permission_node_count:
+                self._block(
+                    state,
+                    "MCP approval exists but the exact durable request record is unavailable",
+                    code="approval_provenance_missing",
+                    retryable=False,
+                )
+                return True
+            return False
+
+        approval = dict(record.approval) if isinstance(record.approval, Mapping) else None
+        if approval is not None:
+            approval_state = str(approval.get("state") or "")
+            target_message_id = str(approval.get("target_message_id") or "")
+            if approval_state == "confirmed":
+                return False
+            if approval_state in {"dispatched", "dispatched_unknown"}:
+                continuation_started = bool(
+                    probe.mcp_permission_node_count == 0
+                    and (
+                        probe.stop_visible
+                        or probe.transport_active
+                        or (
+                            probe.last_assistant_message_id
+                            and probe.last_assistant_message_id != target_message_id
+                        )
+                    )
+                )
+                if continuation_started:
+                    approval["state"] = "confirmed"
+                    approval["confirmed_at"] = utc_now()
+                    approval["confirmation"] = "local_continuation_progress"
+                    ledger.update(request_id, approval=approval)
+                    wait.pop("approval_continuation", None)
+                    acquired.client.invalidate_wait_cache()
+                    return False
+                state["active_action"] = "wait_approval_continuation"
+                return True
+            if approval_state == "failed":
+                self._block(
+                    state,
+                    str(approval.get("reason") or "MCP permission dispatch failed"),
+                    code="approval_dispatch_failed",
+                    retryable=False,
+                )
+                return True
+            # A durable pre-dispatch boundary without a proven dispatch result is
+            # ambiguous after interruption; never invoke the action a second time.
+            if approval_state == "pending":
+                approval["state"] = "dispatched_unknown"
+                approval["updated_at"] = utc_now()
+                ledger.update(request_id, approval=approval)
+                state["active_action"] = "wait_approval_continuation"
+                return True
+
+        if probe.mcp_permission_node_count == 0:
+            return False
+        allowed_connectors = _authorized_mcp_connectors(record.rendered_prompt)
+        if not allowed_connectors:
+            self._block(
+                state,
+                "MCP approval is present but this exact request contains no connector authorization",
+                code="approval_not_authorized",
+                retryable=False,
+            )
+            return True
+        try:
+            offer = await acquired.client.inspect_mcp_permission_allow(
+                probe,
+                receipt,
+                allowed_connectors=allowed_connectors,
+            )
+        except UnsafePageStateError as exc:
+            self._block(
+                state,
+                sanitize_exception(exc),
+                code="approval_state_unknown",
+                retryable=False,
+            )
+            return True
+
+        target_message_id = str(offer.get("target_message_id") or "")
+        connector = str(offer.get("connector") or "").lower()
+        if not target_message_id or connector not in allowed_connectors:
+            self._block(
+                state,
+                "MCP approval offer did not preserve exact connector/target provenance",
+                code="approval_state_unknown",
+                retryable=False,
+            )
+            return True
+
+        before = await acquired.client.assert_ownership()
+        recovery_baseline = capture_response_recovery_baseline(
+            before.messages, receipt.baseline
+        )
+        approval = {
+            "state": "pending",
+            "connector": connector,
+            "target_message_id": target_message_id,
+            "remember_answer": True,
+            "request_id": request_id,
+            "conversation_id": receipt.conversation_id,
+            "page_id": receipt.binding.page_id,
+            "inspected_at": utc_now(),
+        }
+        ledger.update(request_id, approval=approval)
+        # Cross the durable dispatch boundary before invoking loaded client code.
+        approval["state"] = "dispatched_unknown"
+        approval["dispatched_at"] = utc_now()
+        ledger.update(request_id, approval=approval)
+        try:
+            dispatched = await acquired.client.approve_mcp_permission_allow(
+                probe,
+                receipt,
+                allowed_connectors=allowed_connectors,
+                expected_target_message_id=target_message_id,
+            )
+        except Exception as exc:
+            approval["reason"] = sanitize_exception(exc)
+            approval["updated_at"] = utc_now()
+            ledger.update(request_id, approval=approval)
+            self._block(
+                state,
+                "MCP permission dispatch outcome is unknown; exact action will not be replayed",
+                code="approval_dispatch_unknown",
+                retryable=False,
+            )
+            return True
+        if (
+            dispatched.get("method") != "react_handler"
+            or dispatched.get("target_message_id") != target_message_id
+            or dispatched.get("connector", "").lower() != connector
+            or dispatched.get("remember_answer") != "true"
+        ):
+            self._block(
+                state,
+                "MCP permission handler returned mismatched dispatch provenance",
+                code="approval_dispatch_unknown",
+                retryable=False,
+            )
+            return True
+        approval["state"] = "dispatched"
+        approval["acknowledged_at"] = utc_now()
+        ledger.update(request_id, approval=approval)
+        wait["recovery_baseline"] = merge_response_recovery_baselines(
+            wait.get("recovery_baseline"), recovery_baseline
+        )
+        wait["approval_continuation"] = {
+            "target_message_id": target_message_id,
+            "connector": connector,
+            "dispatched_at": approval["dispatched_at"],
+        }
+        acquired.client.invalidate_wait_cache()
+        state["active_action"] = "wait_approval_continuation"
+        return True
+
     async def _final_response_reconciliation(
         self,
         state: dict[str, Any],
@@ -3753,6 +4022,9 @@ class CDPAWorker:
         receipt: SendReceipt,
         wait: dict[str, Any],
     ) -> bool:
+        if await self._mcp_approval_gate(state, hop, acquired, receipt, wait):
+            return True
+
         def validate_candidate(response: MessageSnapshot) -> None:
             self._validate_response_candidate(state, hop, response)
 
@@ -3781,6 +4053,7 @@ class CDPAWorker:
                 exc.candidate,
                 validation_error=str(exc.validation_error),
             )
+            self._release_stream_status_slot(acquired.client, receipt)
             return True
         except (TimeoutError, IncompleteResponseTimeoutError):
             return False
@@ -3799,7 +4072,11 @@ class CDPAWorker:
             return True
         wait["recovery_baseline"] = None
         await self._flush_hop_conversation_identity(state, hop)
+        self._capture_passive_remote_report_if_available(
+            state, hop, acquired, receipt, response
+        )
         self._record_response(state, hop, response)
+        self._release_stream_status_slot(acquired.client, receipt)
         return True
 
     async def _final_dom_response_reconciliation(
@@ -3921,6 +4198,23 @@ class CDPAWorker:
         probe_wait_ms: int = 0,
     ) -> tuple[Any | None, AcquiredRole | None]:
         try:
+            wait_passive = getattr(acquired.client, "wait_for_passive_observation", None)
+            role_record = (state.get("roles") or {}).get(str(hop.get("target_role") or ""))
+            generation = (
+                int(role_record.get("conversation_generation") or 0)
+                if isinstance(role_record, Mapping)
+                else 0
+            )
+            if callable(wait_passive) and probe_wait_ms > 0:
+                passive_result = await wait_passive(
+                    request_id=str(hop.get("request_id") or ""),
+                    generation=generation,
+                    timeout_ms=probe_wait_ms,
+                )
+                if passive_result is not None:
+                    probe_wait_ms = 0
+                    if passive_result:
+                        force_full = True
             snapshot = await self._waiting_snapshot(
                 acquired.client,
                 receipt,
@@ -4174,15 +4468,38 @@ class CDPAWorker:
         ):
             return False
         try:
-            graph = await actions.backend_conversation(conversation_id)
-            inherited = resolve_inherited_assistant(graph, user_message_id)
+            acquired = await actions.locate_owned(state, role)
+            if acquired is None:
+                return False
+            snapshot = await acquired.client.assert_ownership()
+            messages = tuple(getattr(snapshot, "messages", ()) or ())
+            user_index = next(
+                (
+                    index
+                    for index, message in enumerate(messages)
+                    if message.role == "user" and message.message_id == user_message_id
+                ),
+                None,
+            )
+            if user_index is None:
+                return False
+            inherited = next(
+                (
+                    message
+                    for message in reversed(messages[:user_index])
+                    if message.role == "assistant" and message.message_id
+                ),
+                None,
+            )
+            if inherited is None:
+                return False
             donor = normalize_bootstrap_donor(
                 {
                     "conversation_id": conversation_id,
                     "assistant_message_id": inherited.message_id,
                 }
             )
-        except BackendError:
+        except (PageOwnershipError, RoleOwnershipError, ValueError):
             return False
         updated = BootstrapCatalog(self.config.repository_root).add_donor(
             str(bootstrap["bootstrap_id"]), donor
@@ -4205,279 +4522,103 @@ class CDPAWorker:
         persist_transport_state: Callable[[], None],
         resume_recovery: bool = False,
     ) -> tuple[str, str | None]:
+        """Use stream_status only as a sparse trigger, then reconcile locally.
+
+        This path intentionally performs no active full-conversation graph read.
+        Browser-originated response traffic and the existing bounded DOM reader are
+        the content sources; stream_status supplies only typed generation state.
+        """
         wait = hop["wait"]
         now = datetime.now(timezone.utc)
+        deadline_expired = remaining_timeout_ms(wait, now=now) <= 0
         mode = str(wait.get("completion_mode") or "stream_status")
-        request_id = str(hop["request_id"])
 
-        if resume_recovery and mode == "dom_fallback":
+        if mode == "terminal_local_settle":
+            ready_at = parse_time(wait.get("terminal_local_ready_at"))
+            if ready_at is not None and now < ready_at:
+                return "waiting", None
+            return "dom_reconcile", None
+        if mode == "stop_requested_local_reconcile":
+            return "stream_stopped", "stream_status_stop_requested"
+
+        if mode not in {"stream_status", "status_recovery"}:
             mode = "stream_status"
             wait["completion_mode"] = mode
-            wait.pop("dom_fallback_ready_at", None)
-            wait["stream_status_next_poll_at"] = now.isoformat()
 
-        if wait.get("terminal_graph_request_id") == request_id:
-            wait.pop("terminal_graph_request_id", None)
-            attempts = max(1, int(wait.get("terminal_graph_attempts") or 0))
-            wait["terminal_graph_attempts"] = attempts
-            wait["completion_mode"] = "terminal_graph_retry"
-            if parse_time(wait.get("terminal_graph_ready_at")) is None:
-                wait["terminal_graph_ready_at"] = (
-                    now + timedelta(seconds=_TERMINAL_GRAPH_RETRY_SECONDS)
-                ).isoformat()
-            if attempts >= _TERMINAL_GRAPH_MAX_ATTEMPTS:
-                return "dom_fallback", "graph_attempt_interrupted"
-            if not resume_recovery:
-                return "waiting", None
-            mode = "terminal_graph_retry"
+        next_poll = parse_time(wait.get("stream_status_next_poll_at"))
+        if next_poll is None:
+            sent_at = parse_time((hop.get("timestamps") or {}).get("sent_at")) or now
+            next_poll = sent_at + timedelta(seconds=self._stream_status_poll_delay())
+            wait["stream_status_next_poll_at"] = next_poll.isoformat()
 
-        deadline_expired = remaining_timeout_ms(wait, now=now) <= 0
-        unresolved = wait.get("terminal_continuation_unresolved")
-        terminal_continuation_recovery = bool(
-            isinstance(unresolved, Mapping)
-            and unresolved.get("request_id") == request_id
-            and int(wait.get("refresh_count") or 0)
-            > int(unresolved.get("refresh_baseline") or 0)
-        )
+        if resume_recovery and next_poll > now:
+            # Resume shares the same durable due-time slot. It may reconcile DOM
+            # immediately, but it does not create an extra status poll inside the
+            # per-conversation minimum interval.
+            return "dom_reconcile", None
 
-        graph_mode: str | None = None
-        if mode == "terminal_graph_retry":
-            graph_ready_at = parse_time(wait.get("terminal_graph_ready_at"))
-            if (
-                graph_ready_at is not None
-                and now < graph_ready_at
-                and not deadline_expired
-                and not resume_recovery
-            ):
-                return "waiting", None
-            graph_mode = "terminal"
-        else:
-            if mode not in {"stream_status", "status_recovery"}:
-                mode = "stream_status"
-            wait["completion_mode"] = mode
-            next_poll = parse_time(wait.get("stream_status_next_poll_at"))
-            if next_poll is None:
-                if mode == "status_recovery":
-                    next_poll = now
-                else:
-                    sent_at = (
-                        parse_time((hop.get("timestamps") or {}).get("sent_at"))
-                        or now
-                    )
-                    next_poll = sent_at + timedelta(
-                        seconds=self._stream_status_poll_delay()
-                    )
-                wait["stream_status_next_poll_at"] = next_poll.isoformat()
-            if resume_recovery or (deadline_expired and now < next_poll):
-                next_poll = now
-                wait["stream_status_next_poll_at"] = now.isoformat()
-
-            if now >= next_poll:
-                wait["stream_status_last_poll_at"] = now.isoformat()
-                wait["stream_status_poll_count"] = (
-                    int(wait.get("stream_status_poll_count") or 0) + 1
-                )
-                try:
-                    status_payload = await actions.backend_stream_status(
-                        receipt.conversation_id
-                    )
-                    status = status_payload.get("status")
-                    if status not in {"IS_STREAMING", "COMPLETE"}:
-                        raise BackendSchemaError(
-                            "stream_status response has unknown status"
-                        )
-                except BackendError as exc:
-                    if resume_recovery and isinstance(exc, BackendSchemaError):
-                        raise
-                    mode = "status_recovery"
-                    wait["completion_mode"] = mode
-                    wait["backend_fallback_category"] = (
-                        self._backend_failure_category(exc, prefix="status")
-                    )
-                    wait["stream_status_next_poll_at"] = (
-                        now + timedelta(seconds=_STREAM_STATUS_RECOVERY_SECONDS)
-                    ).isoformat()
-                    if parse_time(wait.get("status_recovery_graph_next_at")) is None:
-                        wait["status_recovery_graph_next_at"] = (
-                            now + timedelta(seconds=_STATUS_RECOVERY_GRAPH_SECONDS)
-                        ).isoformat()
-                    persist_transport_state()
-                    if deadline_expired or resume_recovery:
-                        category = (
-                            str(wait["backend_fallback_category"])
-                            if resume_recovery
-                            else "response_deadline"
-                        )
-                        return "dom_fallback", category
-                else:
-                    if status == "IS_STREAMING":
-                        wait["completion_mode"] = "stream_status"
-                        wait["stream_status_next_poll_at"] = (
-                            now
-                            + timedelta(seconds=self._stream_status_poll_delay())
-                        ).isoformat()
-                        for key in (
-                            "backend_fallback_category",
-                            "status_recovery_graph_next_at",
-                            "terminal_complete_seen_at",
-                            "terminal_graph_ready_at",
-                            "terminal_graph_attempts",
-                            "terminal_graph_request_id",
-                            "terminal_graph_attempted_at",
-                        ):
-                            wait.pop(key, None)
-                        if deadline_expired:
-                            if resume_recovery:
-                                wait["deadline_at"] = (
-                                    now
-                                    + timedelta(seconds=self.config.response_timeout_seconds)
-                                ).isoformat()
-                                persist_transport_state()
-                            else:
-                                return "dom_fallback", "response_deadline"
-                        return "waiting", None
-
-                    if terminal_continuation_recovery and mode == "status_recovery":
-                        wait["completion_mode"] = "status_recovery"
-                        wait["backend_fallback_category"] = "graph_not_ready"
-                        wait["stream_status_next_poll_at"] = (
-                            now + timedelta(seconds=_STREAM_STATUS_RECOVERY_SECONDS)
-                        ).isoformat()
-                        if deadline_expired:
-                            persist_transport_state()
-                            return "dom_fallback", "response_deadline"
-                    else:
-                        wait["completion_mode"] = "terminal_graph_retry"
-                        wait["terminal_complete_seen_at"] = now.isoformat()
-                        wait["terminal_graph_attempts"] = 0
-                        wait.pop("terminal_graph_request_id", None)
-                        wait.pop("status_recovery_graph_next_at", None)
-                        settle_seconds = (
-                            0.0
-                            if resume_recovery
-                            else float(
-                                self.config.response_stream_status_terminal_settle_seconds
-                            )
-                        )
-                        wait["terminal_graph_ready_at"] = (
-                            now + timedelta(seconds=settle_seconds)
-                        ).isoformat()
-                        persist_transport_state()
-                        if settle_seconds > 0:
-                            return "waiting", None
-                        graph_mode = "terminal"
-
-            if graph_mode is None and mode == "status_recovery":
-                graph_ready_at = parse_time(wait.get("status_recovery_graph_next_at"))
-                if graph_ready_at is None:
-                    wait["status_recovery_graph_next_at"] = (
-                        now + timedelta(seconds=_STATUS_RECOVERY_GRAPH_SECONDS)
-                    ).isoformat()
-                    return "waiting", None
-                if now < graph_ready_at and not resume_recovery:
-                    return "waiting", None
-                wait["status_recovery_graph_next_at"] = (
-                    now + timedelta(seconds=_STATUS_RECOVERY_GRAPH_SECONDS)
-                ).isoformat()
-                persist_transport_state()
-                graph_mode = "recovery"
-            elif graph_mode is None:
-                return "waiting", None
-
-        if graph_mode == "terminal":
-            attempts = int(wait.get("terminal_graph_attempts") or 0) + 1
-            wait["terminal_graph_attempts"] = attempts
-            wait["terminal_graph_request_id"] = request_id
-            wait["terminal_graph_attempted_at"] = now.isoformat()
-            wait["terminal_graph_ready_at"] = (
-                now + timedelta(seconds=_TERMINAL_GRAPH_RETRY_SECONDS)
-            ).isoformat()
-            persist_transport_state()
-
-        try:
-            graph = await actions.backend_conversation(receipt.conversation_id)
-            if resume_recovery:
-                resolved = resolve_terminal_assistant(
-                    graph,
-                    receipt.user_message_id,
-                    proven_later_human_message_ids=(
-                        self._proven_foreign_durable_user_message_ids(
-                            state,
-                            hop,
-                            receipt.conversation_id,
-                        )
-                    ),
-                    allow_manual_steering=True,
-                    allow_detached_branch=True,
-                )
-            else:
-                try:
-                    resolved = resolve_terminal_assistant(graph, receipt.user_message_id)
-                except GraphIdentityError:
-                    proven_later_humans = self._proven_foreign_durable_user_message_ids(
-                        state,
-                        hop,
-                        receipt.conversation_id,
-                    )
-                    if not proven_later_humans:
-                        raise
-                    resolved = resolve_terminal_assistant(
-                        graph,
-                        receipt.user_message_id,
-                        proven_later_human_message_ids=proven_later_humans,
-                    )
-        except BackendError as exc:
-            if resume_recovery and isinstance(exc, (GraphIdentityError, BackendSchemaError)):
-                raise
-            wait["backend_fallback_category"] = self._backend_failure_category(
-                exc, prefix="graph"
-            )
-            if deadline_expired or resume_recovery:
-                wait.pop("terminal_graph_request_id", None)
-                category = (
-                    str(wait["backend_fallback_category"])
-                    if resume_recovery
-                    else "response_deadline"
-                )
-                return "dom_fallback", category
-            if graph_mode == "terminal":
-                wait.pop("terminal_graph_request_id", None)
-                attempts = int(wait.get("terminal_graph_attempts") or 0)
-                if attempts >= _TERMINAL_GRAPH_MAX_ATTEMPTS:
-                    return "dom_fallback", str(wait["backend_fallback_category"])
-                wait["completion_mode"] = "terminal_graph_retry"
-            else:
-                wait["completion_mode"] = "status_recovery"
-            persist_transport_state()
+        if now < next_poll:
+            if deadline_expired:
+                return "dom_fallback", "response_deadline"
             return "waiting", None
 
-        response = MessageSnapshot(
-            role="assistant",
-            message_id=resolved.message_id,
-            turn_id=None,
-            text=resolved.text,
-            actions=(),
-        )
-        validation_error: str | None = None
+        wait["stream_status_last_poll_at"] = now.isoformat()
+        wait["stream_status_poll_count"] = int(wait.get("stream_status_poll_count") or 0) + 1
+        wait["stream_status_next_poll_at"] = (
+            now + timedelta(seconds=self._stream_status_poll_delay())
+        ).isoformat()
         try:
-            self._validate_response_candidate(state, hop, response)
-            self._capture_remote_report_mirror(
-                state,
-                hop,
-                graph,
-                accepted_user_message_id=receipt.user_message_id,
-                terminal_assistant_message_id=resolved.message_id,
-                response_text=resolved.text,
-            )
-        except Exception as exc:
-            validation_error = sanitize_exception(exc)
-        self._record_response(
-            state,
-            hop,
-            response,
-            validation_error=validation_error,
-        )
-        return "responded", None
+            status_payload = await actions.backend_stream_status(receipt.conversation_id)
+            status = str(status_payload.get("status") or "")
+            if status not in {"IS_STREAMING", "COMPLETE", "FAILURE", "IS_STOP_REQUESTED"}:
+                raise BackendSchemaError("stream_status response has unknown status")
+        except BackendError as exc:
+            if resume_recovery and isinstance(exc, BackendSchemaError):
+                raise
+            wait["completion_mode"] = "status_recovery"
+            wait["backend_fallback_category"] = self._backend_failure_category(exc, prefix="status")
+            persist_transport_state()
+            if deadline_expired or resume_recovery:
+                return "dom_fallback", str(wait["backend_fallback_category"])
+            return "waiting", None
+
+        wait["stream_status_last_status"] = status
+        wait.pop("backend_fallback_category", None)
+        if status == "FAILURE":
+            self._release_stream_status_slot(actions, receipt)
+            persist_transport_state()
+            return "stream_failure", "stream_status_failure"
+        if status == "IS_STOP_REQUESTED":
+            wait["completion_mode"] = "stop_requested_local_reconcile"
+            wait["stop_requested_seen_at"] = now.isoformat()
+            self._release_stream_status_slot(actions, receipt)
+            persist_transport_state()
+            return "stream_stopped", "stream_status_stop_requested"
+        if status == "IS_STREAMING":
+            wait["completion_mode"] = "stream_status"
+            persist_transport_state()
+            if deadline_expired:
+                return "dom_fallback", "response_deadline"
+            return "waiting", None
+
+        settle_seconds = float(self.config.response_stream_status_terminal_settle_seconds)
+        wait["completion_mode"] = "terminal_local_settle"
+        wait["terminal_complete_seen_at"] = now.isoformat()
+        wait["terminal_local_ready_at"] = (
+            now + timedelta(seconds=max(0.0, settle_seconds))
+        ).isoformat()
+        for key in (
+            "status_recovery_graph_next_at",
+            "terminal_graph_ready_at",
+            "terminal_graph_attempts",
+            "terminal_graph_request_id",
+            "terminal_graph_attempted_at",
+        ):
+            wait.pop(key, None)
+        persist_transport_state()
+        if settle_seconds <= 0:
+            return "dom_reconcile", None
+        return "waiting", None
 
     async def _waiting(
         self,
@@ -4510,7 +4651,8 @@ class CDPAWorker:
             )
             return
 
-        await self._capture_bootstrap_role_donor(state, hop, actions)
+        # Bootstrap donor preservation is reconciled from local transcript state;
+        # waiting never fetches a conversation graph merely to populate a donor.
         wait = hop["wait"]
         now = datetime.now(timezone.utc)
         backend_before = copy.deepcopy(state)
@@ -4584,6 +4726,49 @@ class CDPAWorker:
             receipt,
             persist_transport_state=persist_transport_state,
         )
+        if outcome == "dom_reconcile":
+            await self._waiting_dom(
+                state,
+                hop,
+                actions,
+                manifest_path,
+                transport_baseline,
+            )
+            return
+        if outcome == "stream_failure":
+            self._block(
+                state,
+                "ChatGPT stream_status reported FAILURE for the exact owned conversation",
+                code="stream_status_failure",
+                retryable=True,
+            )
+            persist_transport_state()
+            return
+        if outcome == "stream_stopped":
+            acquired = await self._ensure_backend_wait_source(state, hop, actions, receipt)
+            if acquired is None:
+                persist_transport_state()
+                return
+            self._arm_passive_request_observer(state, hop, acquired.client, receipt)
+            reconciled = await self._final_dom_response_reconciliation(
+                state, hop, acquired, receipt, hop["wait"]
+            )
+            if reconciled is None or reconciled:
+                persist_transport_state()
+                return
+            self._block(
+                state,
+                (
+                    "ChatGPT stream_status reported IS_STOP_REQUESTED for the exact owned "
+                    "conversation, but no stable current-request response or authorized "
+                    "approval continuation could be proven locally. Resume may reconcile "
+                    "the exact recorded tab; do not Retry, Restart Role, New Chat, or resend."
+                ),
+                code="stream_status_stopped",
+                retryable=False,
+            )
+            persist_transport_state()
+            return
         if outcome == "dom_fallback":
             await self._begin_backend_dom_fallback(
                 state,
@@ -4617,6 +4802,7 @@ class CDPAWorker:
         self._start_wait_budget_from_sent(hop)
         self._reconcile_hop_conversation_identity(state, hop)
         receipt = SendReceipt.from_dict(hop["receipt"])
+        self._arm_passive_request_observer(state, hop, acquired.client, receipt)
         snapshot, recovered = await self._waiting_dom_snapshot(
             state,
             hop,
@@ -4630,6 +4816,7 @@ class CDPAWorker:
         )
         if recovered is not None:
             acquired = recovered
+            self._arm_passive_request_observer(state, hop, acquired.client, receipt)
         if snapshot is None:
             hop = _active_hop(state)
             wait = hop["wait"]
@@ -4988,6 +5175,7 @@ class CDPAWorker:
                 exc.candidate,
                 validation_error=str(exc.validation_error),
             )
+            self._release_stream_status_slot(acquired.client, receipt)
             return
         except (TimeoutError, IncompleteResponseTimeoutError):
             if remaining_timeout_ms(wait) <= 0:
@@ -5022,6 +5210,7 @@ class CDPAWorker:
         wait["recovery_baseline"] = None
         await self._flush_hop_conversation_identity(state, hop)
         self._record_response(state, hop, response)
+        self._release_stream_status_slot(acquired.client, receipt)
 
     def _route_unresolved_accepted_to_plan(
         self,
@@ -5342,11 +5531,28 @@ class CDPAWorker:
                     f"route {decision.route!r} is not selected for this task"
                 )
             if parsed.inline_report is None:
+                expected_handoff = str(hop.get("expected_report_path") or "").strip()
+                if decision.handoff != expected_handoff:
+                    raise RouteContractError(
+                        "report handoff must exactly match the expected role report"
+                    )
                 routed_handoff = decision.handoff
                 if remote_repository_from_task(str(state.get("task_text") or "")) is None:
+                    report_repository, report_plans_root = _workflow_report_roots(
+                        self.config, state
+                    )
+                    evidence = validate_file_report(
+                        decision.handoff,
+                        repository_root=report_repository,
+                        plans_root=report_plans_root,
+                        team=str(state["team"]),
+                        physical_role=str(hop["physical_role"]),
+                        turn=int(hop["turn"]),
+                        task_id=str(state["task_id"]),
+                    )
                     report_path = decision.handoff
-                    report_sha256 = None
-                    report_size = None
+                    report_sha256 = evidence.sha256
+                    report_size = evidence.size
                 else:
                     report_path, report_sha256, report_size = self._validated_remote_report_mirror(
                         state,
@@ -5790,6 +5996,16 @@ class CDPAWorker:
                 next_safe_action="Resolve the visible dialog, then Resume again.",
             )
             return
+        if bool(getattr(snapshot, "manual_input_pending", False)):
+            self._require_resume_recovery(
+                state,
+                control,
+                action="none",
+                reason_code="manual_composer_conflict",
+                reason="Resume found operator-owned composer content on the exact accepted request tab.",
+                next_safe_action="Preserve the manual draft; reconcile or clear it explicitly before Resume.",
+            )
+            return
         if not receipt_user_message_seen(snapshot.messages, receipt):
             self._require_resume_recovery(
                 state,
@@ -5835,6 +6051,7 @@ class CDPAWorker:
                 response,
                 validation_error=response_validation_error,
             )
+            self._release_stream_status_slot(acquired.client, receipt)
             self._finish_resume_control(
                 state,
                 control,
@@ -5982,6 +6199,87 @@ class CDPAWorker:
             and record.rendered_prompt == record.prompt
         )
 
+    def _proven_operator_new_chat_preboundary_context(
+        self,
+        state: Mapping[str, Any],
+        hop: Mapping[str, Any],
+        role: str,
+    ) -> bool:
+        role_record = (state.get("roles") or {}).get(role)
+        if not isinstance(role_record, Mapping):
+            return False
+        if role_record.get("conversation_generation") != 1:
+            return False
+        current_page_id = str(role_record.get("page_id") or "").strip()
+        if not current_page_id:
+            return False
+        if any(
+            _recoverable_conversation_identity(value) is not None
+            for value in (hop.get("conversation_url"), role_record.get("page_url"))
+        ):
+            return False
+        if hop.get("receipt") is not None or hop.get("message_identity") is not None:
+            return False
+        expected_handoff_sha = _sha(str(hop.get("handoff") or ""))
+        controls = state.get("controls") or ()
+        if not isinstance(controls, (list, tuple)):
+            return False
+        matches: list[int] = []
+        for index, candidate in enumerate(controls):
+            if not isinstance(candidate, Mapping):
+                continue
+            if (
+                candidate.get("action") != "new_chat"
+                or str(candidate.get("role") or "").upper() != role
+                or str(candidate.get("origin") or "").lower() != "operator"
+                or candidate.get("status") != "applied"
+                or candidate.get("command_state") != "APPLIED"
+            ):
+                continue
+            command = candidate.get("command")
+            result = candidate.get("result")
+            if not isinstance(command, Mapping) or not isinstance(result, Mapping):
+                continue
+            snapshot = command.get("snapshot")
+            if not isinstance(snapshot, Mapping):
+                continue
+            if (
+                command.get("action") != "new_chat"
+                or str(command.get("origin") or "").lower() != "operator"
+                or command.get("task_id") != state.get("task_id")
+                or command.get("team") != state.get("team")
+                or str(command.get("role") or "").upper() != role
+                or result.get("new_chat") is not True
+                or str(result.get("page_id") or "") != current_page_id
+                or snapshot.get("active_hop_id") != hop.get("hop_id")
+                or snapshot.get("active_request_id") != hop.get("request_id")
+                or str(snapshot.get("active_role") or "").upper() != role
+                or str(snapshot.get("role") or "").upper() != role
+                or snapshot.get("physical_role") != hop.get("physical_role")
+                or snapshot.get("hop_state") != "pre_send"
+                or snapshot.get("hop_turn") != hop.get("turn")
+                or snapshot.get("handoff_sha256") != expected_handoff_sha
+                or snapshot.get("conversation_generation") != 0
+                or snapshot.get("page_id") is not None
+                or snapshot.get("conversation_id") is not None
+                or snapshot.get("receipt_sha256") is not None
+            ):
+                continue
+            matches.append(index)
+        if len(matches) != 1:
+            return False
+        matched_index = matches[0]
+        for candidate in controls[matched_index + 1 :]:
+            if not isinstance(candidate, Mapping):
+                continue
+            if (
+                str(candidate.get("role") or "").upper() == role
+                and candidate.get("action") in {"new_chat", "restart_role"}
+                and candidate.get("status") == "applied"
+            ):
+                return False
+        return True
+
     async def _recover_pristine_preboundary_sending(
         self,
         state: dict[str, Any],
@@ -5995,7 +6293,18 @@ class CDPAWorker:
         acquired = await actions.locate_owned(state, role)
         action = "confirm_preboundary_role"
         postcondition = "ownership_confirmed_before_send"
+        proven_operator_fresh = False
         if acquired is None:
+            if state.get("attachments"):
+                self._require_resume_recovery(
+                    state,
+                    control,
+                    action="none",
+                    reason_code="preboundary_context_unrecoverable",
+                    reason="The lost pristine pre-boundary role owns attachments and cannot transfer to a replacement page.",
+                    next_safe_action="Restore the exact attachment-owning pre-send page before Resume.",
+                )
+                return
             exact_donor = role_record.get("context_source") == "bootstrap_donor"
             if exact_donor:
                 try:
@@ -6011,10 +6320,13 @@ class CDPAWorker:
                     )
                     return
             else:
+                proven_operator_fresh = self._proven_operator_new_chat_preboundary_context(
+                    state, hop, role
+                )
                 if (
                     role_record.get("context_source") not in {None, ""}
                     or role_record.get("bootstrap_source_donor") is not None
-                    or generation != 0
+                    or (generation != 0 and not proven_operator_fresh)
                 ):
                     self._require_resume_recovery(
                         state,
@@ -6025,45 +6337,36 @@ class CDPAWorker:
                         next_safe_action="Restore the exact recorded pre-send context before Resume.",
                     )
                     return
-                bootstrap = self._bootstrap_for_state(state)
-                if bootstrap is None and not isinstance(state.get("bootstrap"), Mapping):
-                    catalog = BootstrapCatalog(self.config.repository_root)
-                    current_default_id = resolve_default_bootstrap_id(catalog)
-                    bootstrap = (
-                        catalog.get(current_default_id)
-                        if current_default_id is not None
-                        else None
+                if not proven_operator_fresh:
+                    bootstrap = self._bootstrap_for_state(state)
+                    if bootstrap is None and not isinstance(state.get("bootstrap"), Mapping):
+                        catalog = BootstrapCatalog(self.config.repository_root)
+                        current_default_id = resolve_default_bootstrap_id(catalog)
+                        bootstrap = (
+                            catalog.get(current_default_id)
+                            if current_default_id is not None
+                            else None
+                        )
+                    candidates = (
+                        self._bootstrap_donor_candidates(state, bootstrap)
+                        if bootstrap is not None
+                        else []
                     )
-                candidates = (
-                    self._bootstrap_donor_candidates(state, bootstrap)
-                    if bootstrap is not None
-                    else []
-                )
-                if not candidates:
-                    self._require_resume_recovery(
-                        state,
-                        control,
-                        action="none",
-                        reason_code="preboundary_context_unrecoverable",
-                        reason="The lost pristine pre-boundary role has no current bootstrap donor available.",
-                        next_safe_action="Restore an enabled bootstrap donor before Resume.",
-                    )
-                    return
-                donor = candidates[0]
-                try:
-                    graph = await actions.backend_conversation(donor["conversation_id"])
-                    resolve_bootstrap_donor(graph, donor["assistant_message_id"])
-                except Exception as exc:
-                    self._require_resume_recovery(
-                        state,
-                        control,
-                        action="reacquire_preboundary_role",
-                        reason_code="preboundary_context_unrecoverable",
-                        reason=sanitize_exception(exc),
-                        next_safe_action="Restore the current bootstrap donor before Resume.",
-                    )
-                    return
-            use_ui_branch = not exact_donor
+                    if not candidates:
+                        self._require_resume_recovery(
+                            state,
+                            control,
+                            action="none",
+                            reason_code="preboundary_context_unrecoverable",
+                            reason="The lost pristine pre-boundary role has no current bootstrap donor available.",
+                            next_safe_action="Restore an enabled bootstrap donor before Resume.",
+                        )
+                        return
+                    donor = candidates[0]
+                    # The recorded donor is validated only when the browser performs
+                    # the bounded branch/reacquire operation below. Resume must not
+                    # fetch a full conversation graph as a preflight.
+            use_ui_branch = not exact_donor and not proven_operator_fresh
             if self._rate_limit_gate_active():
                 state["active_action"] = "rate_limit_cooldown"
                 self._finish_resume_control(
@@ -6076,6 +6379,46 @@ class CDPAWorker:
                     postcondition="tab_open_deferred",
                 )
                 return
+            if proven_operator_fresh:
+                try:
+                    acquired = await actions.restart(
+                        state,
+                        role,
+                        known_automated_draft=str(hop.get("prompt") or ""),
+                    )
+                except RateLimitBlockedError as exc:
+                    await self._enter_rate_limit_cooldown(state, actions, exc)
+                    self._apply_rate_limit_to_state(state, hop)
+                    self._finish_resume_control(
+                        state,
+                        control,
+                        outcome="continued",
+                        action="defer_tab_open",
+                        reason_code=None,
+                        reason="New tab creation is paused for the request-rate-limit cooldown.",
+                        postcondition="tab_open_deferred",
+                    )
+                    return
+                except (ComposerConflictError, ManualInputPendingError) as exc:
+                    self._require_resume_recovery(
+                        state,
+                        control,
+                        action="reacquire_preboundary_role",
+                        reason_code="manual_composer_conflict",
+                        reason=sanitize_exception(exc),
+                        next_safe_action="Resolve the manual composer or attachments before Resume.",
+                    )
+                    return
+                except Exception as exc:
+                    self._require_resume_recovery(
+                        state,
+                        control,
+                        action="reacquire_preboundary_role",
+                        reason_code="preboundary_context_unrecoverable",
+                        reason=sanitize_exception(exc),
+                        next_safe_action="Restore or reacquire the proven fresh pre-send role before Resume.",
+                    )
+                    return
             if exact_donor:
                 try:
                     acquired = await actions.branch_from_anchor(
@@ -6304,6 +6647,7 @@ class CDPAWorker:
             session_id_before=getattr(snapshot, "session_id", None),
             error=_SENDING_CONTINUATION_STARTED,
         )
+        self._arm_passive_request_observer(state, hop, acquired.client)
         try:
             receipt = await self._run_automated_send(
                 lambda: acquired.client.send(
@@ -6349,6 +6693,7 @@ class CDPAWorker:
                 next_safe_action="Inspect durable/backend provenance; do not send again.",
             )
             return
+        self._arm_passive_request_observer(state, hop, acquired.client, receipt)
         self._record_resume_send_acceptance(state, hop, ledger, record, receipt)
         self._finish_resume_control(
             state,
@@ -6635,95 +6980,9 @@ class CDPAWorker:
         session_id = str(record.session_id_before or "").strip()
         provisional_session = session_id.startswith("WEB:")
         role = str(hop["target_role"])
-        role_record = state["roles"][role]
-        role_url = role_record.get("page_url")
-        backend_ids = {
-            identity
-            for value in (hop.get("conversation_url"), role_url)
-            if (identity := _recoverable_conversation_identity(value)) is not None
-        }
-        backend_conversation = getattr(actions, "backend_conversation", None)
-        if (
-            session_id
-            and not provisional_session
-            and backend_ids == {f"/c/{session_id}"}
-            and callable(backend_conversation)
-        ):
-            empty_baseline = not (
-                record.baseline.message_ids
-                or record.baseline.turn_ids
-                or record.baseline.assistant_turn_ids
-                or record.baseline.user_message_ids
-            )
-            if empty_baseline and str(role_record.get("page_id") or "") != str(
-                record.binding.page_id
-            ):
-                self._require_resume_recovery(
-                    state,
-                    control,
-                    action="none",
-                    reason_code="sending_provenance_ambiguous",
-                    reason=(
-                        "The damaged empty-baseline SENDING record no longer retains "
-                        "the exact durable page binding."
-                    ),
-                    next_safe_action="Restore exact durable binding provenance; do not resend.",
-                )
-                return
-            try:
-                graph = await backend_conversation(session_id)
-                if empty_baseline:
-                    accepted_id = resolve_unique_exact_user_message(
-                        graph,
-                        record.rendered_prompt,
-                    )
-                else:
-                    accepted_id = resolve_exact_new_user_message(
-                        graph,
-                        record.rendered_prompt,
-                        excluded_message_ids=(
-                            frozenset(record.baseline.message_ids)
-                            | frozenset(record.baseline.user_message_ids)
-                        ),
-                    )
-            except GraphIdentityError as exc:
-                self._require_resume_recovery(
-                    state,
-                    control,
-                    action="none",
-                    reason_code="sending_provenance_ambiguous",
-                    reason=sanitize_exception(exc),
-                    next_safe_action="Resolve the conflicting backend user turn; do not resend.",
-                )
-                return
-            except BackendError as exc:
-                if empty_baseline:
-                    self._require_resume_recovery(
-                        state,
-                        control,
-                        action="none",
-                        reason_code="sending_provenance_ambiguous",
-                        reason=sanitize_exception(exc),
-                        next_safe_action="Restore unique exact backend prompt provenance; do not resend.",
-                    )
-                    return
-                pass
-            else:
-                accept_proven(
-                    SendReceipt(
-                        prompt=record.rendered_prompt,
-                        prompt_sha256=_sha(record.rendered_prompt),
-                        binding=record.binding,
-                        baseline=record.baseline,
-                        attempts=max(1, int(record.attempts or 0)),
-                        accepted_via="user_message_identity",
-                        session_id_before=record.session_id_before,
-                        user_message_id=accepted_id,
-                        conversation_id=session_id,
-                    ),
-                    "Backend transcript provenance proves SENDING acceptance; no Send was replayed.",
-                )
-                return
+        # Recovery never fetches full conversation history to infer whether a
+        # SENDING boundary crossed. The exact owned page/durable record below is
+        # the only admissible acceptance evidence; ambiguity remains fail-closed.
 
         acquired: AcquiredRole | None = None
         owned_lookup_performed = False
@@ -6786,46 +7045,43 @@ class CDPAWorker:
                     for value in live_values
                     if (identity := _recoverable_conversation_identity(value)) is not None
                 }
-                if len(live_backend_ids) != 1 or not callable(backend_conversation):
+                if len(live_backend_ids) != 1:
                     self._require_resume_recovery(
                         state,
                         control,
                         action="none",
                         reason_code="sending_provenance_ambiguous",
                         reason=(
-                            "The exact provisional SENDING page has no unique canonical backend identity "
+                            "The exact provisional SENDING page has no unique canonical local identity "
                             "with positive acceptance provenance."
                         ),
-                        next_safe_action="Preserve the exact page/request and restore unique backend provenance; do not resend.",
+                        next_safe_action="Preserve the exact page/request and restore unique local provenance; do not resend.",
                     )
                     return
                 canonical_identity = next(iter(live_backend_ids))
                 canonical_conversation_id = canonical_identity.rsplit("/", 1)[-1]
-                try:
-                    graph = await backend_conversation(canonical_conversation_id)
-                    excluded_message_ids = (
-                        frozenset(record.baseline.message_ids)
-                        | frozenset(record.baseline.user_message_ids)
-                    )
-                    if not excluded_message_ids:
-                        source_donor = state["roles"][role].get("bootstrap_source_donor")
-                        if source_donor is not None:
-                            donor = normalize_bootstrap_donor(source_donor)
-                            resolve_bootstrap_donor(graph, donor["assistant_message_id"])
-                            excluded_message_ids = frozenset({donor["assistant_message_id"]})
-                    accepted_id = resolve_exact_new_user_message(
-                        graph,
-                        record.rendered_prompt,
-                        excluded_message_ids=excluded_message_ids,
-                    )
-                except (BackendError, ValueError) as exc:
+                accepted_user = unique_new_user_message(snapshot.messages, record.baseline)
+                if accepted_user is None or not visible_text_matches(
+                    accepted_user.text, record.rendered_prompt
+                ):
                     self._require_resume_recovery(
                         state,
                         control,
                         action="none",
                         reason_code="sending_provenance_ambiguous",
-                        reason=sanitize_exception(exc),
-                        next_safe_action="Preserve the exact canonicalized page and resolve backend acceptance provenance; do not resend.",
+                        reason="The exact provisional page does not prove one matching post-baseline user turn.",
+                        next_safe_action="Preserve the exact canonicalized page and request; do not resend.",
+                    )
+                    return
+                accepted_id = str(accepted_user.message_id or "").strip()
+                if not accepted_id:
+                    self._require_resume_recovery(
+                        state,
+                        control,
+                        action="none",
+                        reason_code="sending_provenance_ambiguous",
+                        reason="The matching local user turn lacks an exact message identity.",
+                        next_safe_action="Preserve the exact page/request and restore message provenance; do not resend.",
                     )
                     return
                 accept_proven(
@@ -6840,7 +7096,7 @@ class CDPAWorker:
                         user_message_id=accepted_id,
                         conversation_id=canonical_conversation_id,
                     ),
-                    "Same-page canonical backend provenance proves provisional SENDING acceptance; no Send was replayed.",
+                    "Same-page canonical local provenance proves provisional SENDING acceptance; no Send was replayed.",
                 )
                 return
 
