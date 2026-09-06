@@ -435,12 +435,13 @@ def test_repair_release_rearms_stale_terminal_wait_and_consumes_materialized_bac
 
     actions = Actions()
     asyncio.run(worker._waiting(state, hop, actions, path))
+    hop = _active_hop(state)
 
     assert state["status"] == "RUNNING"
     assert hop["state"] == "responded"
     assert hop["response"] == response_text
-    assert hop["wait"]["completion_mode"] == "terminal_local_settle"
-    assert calls == {"status": 1, "graph": 0, "locate": 1, "send": 0, "retry": 0, "restart": 0, "new_chat": 0}
+    assert hop["wait"]["completion_mode"] == "controller_recovery"
+    assert calls == {"status": 0, "graph": 0, "locate": 1, "send": 0, "retry": 0, "restart": 0, "new_chat": 0}
     assert state["repair_wait"]["transport_rearmed_request_id"] == hop["request_id"]
     record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
     assert record is not None and record.attempts == 1 and record.receipt == before_record.receipt
@@ -492,10 +493,11 @@ def test_repair_release_rearms_once_when_terminal_continuation_is_still_missing(
 
     actions = Actions()
     asyncio.run(worker._waiting(state, hop, actions, path))
+    hop = _active_hop(state)
 
     assert state["status"] == "RUNNING"
     assert hop["state"] == "waiting"
-    assert hop["wait"]["completion_mode"] == "terminal_local_settle"
+    assert hop["wait"]["completion_mode"] == "controller_recovery"
     assert "terminal_graph_attempts" not in hop["wait"]
     assert hop["wait"]["terminal_continuation_unresolved"]["request_id"] == hop["request_id"]
     assert hop["wait"]["terminal_continuation_unresolved"]["refresh_baseline"] == 0
@@ -503,14 +505,14 @@ def test_repair_release_rearms_once_when_terminal_continuation_is_still_missing(
     assert worker_module.parse_time(hop["wait"]["deadline_at"]) > datetime.now(timezone.utc)
     first_rearm = state["repair_wait"]["transport_rearmed_at"]
     assert state["repair_wait"]["transport_rearmed_request_id"] == hop["request_id"]
-    assert calls == {"status": 1, "graph": 0, "locate": 1, "send": 0, "retry": 0, "restart": 0, "new_chat": 0}
+    assert calls == {"status": 0, "graph": 0, "locate": 1, "send": 0, "retry": 0, "restart": 0, "new_chat": 0}
 
     state = store.load(path)
     hop = _active_hop(state)
     asyncio.run(worker._waiting(state, hop, actions, path))
 
     assert state["repair_wait"]["transport_rearmed_at"] == first_rearm
-    assert calls == {"status": 1, "graph": 0, "locate": 2, "send": 0, "retry": 0, "restart": 0, "new_chat": 0}
+    assert calls == {"status": 0, "graph": 0, "locate": 2, "send": 0, "retry": 0, "restart": 0, "new_chat": 0}
     record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
     assert record is not None and record.attempts == 1 and record.receipt == before_record.receipt
     assert not any(control["action"] == "resume" for control in state["controls"])

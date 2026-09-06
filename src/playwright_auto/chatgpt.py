@@ -279,6 +279,8 @@ class TaskBindingError(ChatGPTAutomationError):
 _PAGE_WORKFLOW_LOCKS: weakref.WeakKeyDictionary[Any, asyncio.Lock] = weakref.WeakKeyDictionary()
 _PAGE_MUTATION_LOCKS: weakref.WeakKeyDictionary[Any, asyncio.Lock] = weakref.WeakKeyDictionary()
 _PAGE_WAIT_STATES: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
+_PAGE_WAIT_PROBE_INIT: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
+_PAGE_AMBIENT_OBSERVATION_STATES: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
 _PAGE_PASSIVE_OBSERVATION_STATES: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
 _BACKEND_CONTEXT_STATES: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
 _STREAM_STATUS_CACHE_LIMIT = 32
@@ -317,6 +319,25 @@ def _page_wait_state(page: Any) -> dict[str, Any]:
     return state
 
 
+def _page_ambient_observation_state(page: Any) -> dict[str, Any]:
+    state: dict[str, Any] = {"listener": None, "permission_action": None, "tasks": set()}
+    try:
+        existing = _PAGE_AMBIENT_OBSERVATION_STATES.get(page)
+        if existing is not None:
+            return existing
+        _PAGE_AMBIENT_OBSERVATION_STATES[page] = state
+        return state
+    except TypeError:
+        existing = getattr(page, "_playwright_auto_ambient_observation_state", None)
+        if isinstance(existing, dict):
+            return existing
+        try:
+            setattr(page, "_playwright_auto_ambient_observation_state", state)
+        except Exception:
+            pass
+        return state
+
+
 def _page_passive_observation_state(page: Any) -> dict[str, Any]:
     state: dict[str, Any] = {
         "listener": None,
@@ -324,6 +345,7 @@ def _page_passive_observation_state(page: Any) -> dict[str, Any]:
         "scope": None,
         "scope_revision": 0,
         "latest": None,
+        "permission_action": None,
         "wake_event": None,
         "tasks": set(),
         "event_count": 0,
@@ -854,6 +876,83 @@ def _observed_linear_graph(
     }
 
 
+def _mcp_permission_action_from_message(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    metadata = value.get("metadata")
+    jit = metadata.get("jit_plugin_data") if isinstance(metadata, Mapping) else None
+    from_server = jit.get("from_server") if isinstance(jit, Mapping) else None
+    body = from_server.get("body") if isinstance(from_server, Mapping) else None
+    actions = body.get("actions") if isinstance(body, Mapping) else None
+    if not isinstance(actions, list):
+        return None
+    fallback = None
+    for item in actions[:16]:
+        if not isinstance(item, Mapping) or str(item.get("type") or "").lower() != "allow":
+            continue
+        allow = item.get("allow")
+        target = _safe_identity_string(allow.get("target_message_id") if isinstance(allow, Mapping) else None)
+        if target and fallback is None:
+            fallback = {"type": "allow", "target_message_id": target, "remember_answer": False, "label": "Allow"}
+        for option in item.get("split_action_options") or ():
+            if not isinstance(option, Mapping):
+                continue
+            action = option.get("action")
+            if not isinstance(action, Mapping) or str(action.get("type") or "").lower() != "allow":
+                continue
+            option_target = _safe_identity_string(action.get("target_message_id"))
+            if not option_target:
+                continue
+            candidate = {
+                "type": "allow",
+                "target_message_id": option_target,
+                "remember_answer": bool(action.get("remember_answer")),
+                "label": str(option.get("label") or "Allow").strip()[:256] or "Allow",
+            }
+            if candidate["remember_answer"]:
+                return candidate
+            if fallback is None:
+                fallback = candidate
+    return fallback
+
+
+def _mcp_permission_action_from_frontend_body(body: bytes | str) -> dict[str, Any] | None:
+    if isinstance(body, bytes):
+        try:
+            text = body.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    elif isinstance(body, str):
+        text = body
+    else:
+        return None
+    fallback = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("data:"):
+            continue
+        payload = stripped[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            decoded = json.loads(payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        messages = []
+        if isinstance(decoded, Mapping) and isinstance(decoded.get("message"), Mapping):
+            messages = [decoded["message"]]
+        elif isinstance(decoded, Mapping) and isinstance(decoded.get("messages"), list):
+            messages = decoded["messages"]
+        for message in messages:
+            action = _mcp_permission_action_from_message(message)
+            if action is None:
+                continue
+            if action.get("remember_answer") is True:
+                return action
+            fallback = action
+    return fallback
+
+
 def _reduce_frontend_conversation_observation_body(
     body: bytes | str, observed_user_message_id: str
 ) -> dict[str, Any] | None:
@@ -871,6 +970,7 @@ def _reduce_frontend_conversation_observation_body(
         return None
     conversation_ids: set[str] = set()
     observed_messages: list[Any] = []
+    permission_action: dict[str, Any] | None = None
     saw_done = False
     for line in text.splitlines():
         stripped = line.strip()
@@ -891,9 +991,14 @@ def _reduce_frontend_conversation_observation_body(
             return None
         if isinstance(decoded, Mapping):
             if isinstance(decoded.get("message"), Mapping):
-                observed_messages.append(decoded["message"])
+                message = decoded["message"]
+                observed_messages.append(message)
+                permission_action = _mcp_permission_action_from_message(message) or permission_action
             elif isinstance(decoded.get("messages"), list):
-                observed_messages.extend(decoded["messages"])
+                messages = decoded["messages"]
+                observed_messages.extend(messages)
+                for message in messages:
+                    permission_action = _mcp_permission_action_from_message(message) or permission_action
         if len(observed_messages) > _PASSIVE_OBSERVATION_MAX_MESSAGES:
             return None
     if len(conversation_ids) != 1:
@@ -905,13 +1010,16 @@ def _reduce_frontend_conversation_observation_body(
     )
     if graph is None:
         return None
-    return {
+    result = {
         "source": "frontend_sse",
         "coverage": "complete" if saw_done and len(graph["mapping"]) > 1 else "partial",
         "observed_user_message_id": user_message_id,
         "conversation_id": next(iter(conversation_ids)),
         "graph": graph,
     }
+    if permission_action is not None:
+        result["permission_action"] = permission_action
+    return result
 
 
 def _reduce_paged_conversation_body(
@@ -1219,6 +1327,7 @@ class WaitProbe:
     response_activity_length: int
     response_activity_tail: str
     response_activity_turn_id: str | None
+    retry_visible: bool = False
 
     @property
     def composer_empty(self) -> bool:
@@ -1269,6 +1378,7 @@ class WaitProbe:
             "response_activity_length": self.response_activity_length,
             "response_activity_tail": self.response_activity_tail,
             "response_activity_turn_id": self.response_activity_turn_id,
+            "retry_visible": self.retry_visible,
         }
 
     @property
@@ -2368,6 +2478,84 @@ async def click_safe_choice_prompt(page: Any) -> str:
     return str(result.get("label") or "safe choice")
 
 
+async def click_preferred_mcp_allow(
+    page: Any,
+    *,
+    passive_action: Mapping[str, Any] | None = None,
+) -> dict[str, str] | None:
+    """Dispatch the current MCP Allow with minimal friction."""
+    result = await page.evaluate(
+        r"""async (passiveAction) => {
+          const visible = (e) => Boolean(e && getComputedStyle(e).visibility !== 'hidden' &&
+            (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+          const norm = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+          const target = passiveAction?.type === 'allow' ? String(passiveAction.target_message_id || '') : '';
+          const roots = [...document.querySelectorAll('button[aria-label^="Allow mcp-"], [data-message-id]')];
+          for (const root of roots) {
+            let node = root, fiber = null, handler = null, handlerKind = null;
+            const containers = [];
+            for (let i = 0; node && i < 10; i += 1, node = node.parentElement) {
+              const pk = Object.keys(node).find(k => k.startsWith('__reactProps'));
+              const fk = Object.keys(node).find(k => k.startsWith('__reactFiber'));
+              if (pk) containers.push(node[pk]);
+              if (!fiber && fk) fiber = node[fk];
+            }
+            for (let i = 0; fiber && i < 40; i += 1, fiber = fiber.return) {
+              containers.push(fiber.memoizedProps, fiber.pendingProps);
+            }
+            for (const props of containers) {
+              if (!props || typeof props !== 'object') continue;
+              if (typeof props.onSelectOption === 'function') {
+                handler = props.onSelectOption; handlerKind = 'select'; break;
+              }
+              if (!handler && typeof props.handleUserAction === 'function') {
+                handler = props.handleUserAction; handlerKind = 'user_action';
+              }
+            }
+            if (!handler) continue;
+            const seen = new Set(), found = [];
+            const walk = (value, depth = 0) => {
+              if (!value || typeof value !== 'object' || seen.has(value) || depth > 5) return;
+              seen.add(value);
+              if (value.type === 'allow' && typeof value.target_message_id === 'string') found.push(value);
+              if (value.action?.type === 'allow' && typeof value.action.target_message_id === 'string') found.push(value.action);
+              for (const child of Object.values(value)) walk(child, depth + 1);
+            };
+            for (const props of containers) walk(props);
+            if (passiveAction?.type === 'allow') found.push(passiveAction);
+            const candidates = found.filter(a => !target || a.target_message_id === target)
+              .sort((a,b) => Number(b.remember_answer === true) - Number(a.remember_answer === true));
+            if (!candidates.length) continue;
+            const chosen = candidates[0];
+            if (handlerKind === 'user_action') {
+              await handler(chosen);
+            } else {
+              await handler({preventDefault(){}, stopPropagation(){}, currentTarget:root, target:root}, chosen);
+            }
+            return {method:'react_handler', target_message_id:chosen.target_message_id,
+              remember_answer:chosen.remember_answer === true ? 'true' : 'false'};
+          }
+          const conversation = [...document.querySelectorAll('button[aria-label^="Allow mcp-"]')]
+            .find(e => visible(e) && !e.disabled && e.getAttribute('aria-disabled') !== 'true');
+          if (conversation) { conversation.click(); return {method:'dom_click_conversation', target_message_id:'', remember_answer:'true'}; }
+          const plain = [...document.querySelectorAll('button')]
+            .find(e => visible(e) && !e.disabled && e.getAttribute('aria-disabled') !== 'true' && norm(e.innerText || e.textContent) === 'Allow');
+          if (plain) { plain.click(); return {method:'dom_click', target_message_id:'', remember_answer:'false'}; }
+          return null;
+        }""",
+        dict(passive_action) if isinstance(passive_action, Mapping) else None,
+    )
+    if not isinstance(result, Mapping):
+        return None
+    detail = f"{result.get('method')}:{result.get('target_message_id') or ''}"
+    await record_page_action(page, "mcp_allow", "complete", detail=detail)
+    return {
+        "method": str(result.get("method") or ""),
+        "target_message_id": str(result.get("target_message_id") or ""),
+        "remember_answer": str(result.get("remember_answer") or "false"),
+    }
+
+
 async def click_mcp_permission_allow(
     page: Any,
     *,
@@ -2790,6 +2978,7 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
           const composer = firstVisible('[contenteditable="true"][role="textbox"]');
           const composerRoot = composer?.closest('form') || composer?.closest('[data-testid="composer"]') || null;
           const stop = firstVisible('button[data-testid="stop-button"], button[aria-label*="Stop"]');
+          const retry = firstVisible('[data-testid="regenerate-thread-error-button"]');
           const activeResponse = latest('[data-streaming-response-status]');
           const lastUser = latest('[data-message-author-role="user"][data-message-id]');
           const lastAssistant = latest('[data-message-author-role="assistant"][data-message-id]');
@@ -2883,6 +3072,7 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             composer_text: boundedText(composer, 512),
             attachment_count: attachmentCount,
             stop_visible: Boolean(stop),
+            retry_visible: Boolean(retry),
             transport_active: Boolean(activeResponse),
             error_texts: errors,
             blocking_dialogs: dialogs,
@@ -2911,6 +3101,7 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             probe.composer_text,
             probe.attachment_count,
             probe.stop_visible,
+            probe.retry_visible,
             probe.transport_active,
             probe.error_texts,
             probe.blocking_dialogs,
@@ -2932,6 +3123,7 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             const relevantSelector = [
               'button[data-testid="stop-button"]',
               'button[aria-label*="Stop"]',
+              '[data-testid="regenerate-thread-error-button"]',
               '[data-streaming-response-status]',
               '[data-message-author-role][data-message-id]',
               '[contenteditable="true"][role="textbox"]',
@@ -2992,6 +3184,21 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             }, Math.max(0, Number(timeoutMs) || 0));
             check();
           });
+          if (!window.__PLAYWRIGHT_AUTO_DOM_OBSERVER__) {
+            window.__PLAYWRIGHT_AUTO_DOM_VERSION__ = Number(window.__PLAYWRIGHT_AUTO_DOM_VERSION__ || 0);
+            window.__PLAYWRIGHT_AUTO_DOM_OBSERVER__ = new MutationObserver(() => {
+              window.__PLAYWRIGHT_AUTO_DOM_VERSION__ += 1;
+            });
+            window.__PLAYWRIGHT_AUTO_DOM_OBSERVER__.observe(document.documentElement || document, {
+              subtree: true,
+              childList: true,
+              attributes: true,
+              attributeFilter: [
+                'data-streaming-response-status', 'data-message-id', 'data-turn-id',
+                'contenteditable', 'aria-disabled', 'aria-label', 'data-testid', 'role',
+              ],
+            });
+          }
           return true;
         }"""
 
@@ -3004,6 +3211,12 @@ async def inspect_chatgpt_wait_probe(
     wait_ms: int = 0,
 ) -> WaitProbe:
     """Read bounded wait-state evidence without walking or serializing the transcript."""
+    if hasattr(page, "add_init_script") and not _PAGE_WAIT_PROBE_INIT.get(page, False):
+        args = [ROLE_STORAGE_KEY, PAGE_ID_STORAGE_KEY, TASK_ID_STORAGE_KEY, TEAM_STORAGE_KEY, WINDOW_NAME_PREFIX]
+        await page.add_init_script(
+            script=f"({_WAIT_PROBE_INSTALL_SCRIPT})({json.dumps(args, ensure_ascii=False)});"
+        )
+        _PAGE_WAIT_PROBE_INIT[page] = True
     use_wait = bool(
         previous_transition_signature and previous_probe is not None and wait_ms > 0
     )
@@ -3056,6 +3269,7 @@ async def inspect_chatgpt_wait_probe(
         response_activity_length=max(0, int(raw.get("response_activity_length") or 0)),
         response_activity_tail=str(raw.get("response_activity_tail") or ""),
         response_activity_turn_id=(str(raw["response_activity_turn_id"]) if raw.get("response_activity_turn_id") else None),
+        retry_visible=bool(raw.get("retry_visible")),
     )
 
 
@@ -3486,9 +3700,45 @@ class ChatGPTPage:
         state["scope_revision"] = int(state.get("scope_revision") or 0) + 1
         state["scope"] = None
         state["latest"] = None
+        state["permission_action"] = None
         state["wake_event"] = None
         if isinstance(old_wake, asyncio.Event):
             old_wake.set()
+
+    def install_ambient_observer(self) -> None:
+        """Attach one page-lifetime listener for MCP permission actions."""
+        state = _page_ambient_observation_state(self.page)
+        if state.get("listener") is not None:
+            return
+        page = self.page
+
+        async def reduce_permission(response: Any) -> None:
+            try:
+                action = _mcp_permission_action_from_frontend_body(await response.body())
+                if isinstance(action, Mapping):
+                    state["permission_action"] = dict(action)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return
+
+        def on_response(response: Any) -> None:
+            if not _matches_frontend_conversation_response(response):
+                return
+            task = asyncio.create_task(reduce_permission(response))
+            tasks = state.setdefault("tasks", set())
+            tasks.add(task)
+            task.add_done_callback(lambda done: tasks.discard(done))
+
+        state["listener"] = on_response
+        page.on("response", on_response)
+
+    def ambient_permission_action(self) -> dict[str, Any] | None:
+        action = _page_ambient_observation_state(self.page).get("permission_action")
+        return dict(action) if isinstance(action, Mapping) else None
+
+    def clear_ambient_permission_action(self) -> None:
+        _page_ambient_observation_state(self.page)["permission_action"] = None
 
     def arm_passive_observer(
         self,
@@ -3539,6 +3789,7 @@ class ChatGPTPage:
         )
         if not retained_latest:
             state["latest"] = None
+            state["permission_action"] = None
         if scope_changed:
             state["scope_revision"] = int(state.get("scope_revision") or 0) + 1
             state["wake_event"] = asyncio.Event()
@@ -3616,6 +3867,8 @@ class ChatGPTPage:
                     "generation": scope_key[1],
                     "observed_at": time.monotonic(),
                 }
+                if isinstance(evidence.get("permission_action"), Mapping):
+                    state["permission_action"] = dict(evidence["permission_action"])
                 state["event_count"] = int(state.get("event_count") or 0) + 1
                 wake_event = state.get("wake_event")
                 if isinstance(wake_event, asyncio.Event):
@@ -3694,9 +3947,16 @@ class ChatGPTPage:
             scope.get("generation"),
         ) != (str(request_id), int(generation)):
             return {"coverage": "unknown", "event_count": int(state.get("event_count") or 0)}
+        permission_action = state.get("permission_action")
         if not isinstance(latest, Mapping) or not _passive_evidence_matches_scope(latest, scope):
-            return {"coverage": "unknown", "event_count": int(state.get("event_count") or 0)}
-        return {**dict(latest), "event_count": int(state.get("event_count") or 0)}
+            result = {"coverage": "unknown", "event_count": int(state.get("event_count") or 0)}
+            if isinstance(permission_action, Mapping):
+                result["permission_action"] = dict(permission_action)
+            return result
+        result = {**dict(latest), "event_count": int(state.get("event_count") or 0)}
+        if isinstance(permission_action, Mapping):
+            result["permission_action"] = dict(permission_action)
+        return result
 
     async def wait_for_passive_observation(
         self,
@@ -3745,6 +4005,9 @@ class ChatGPTPage:
         expected_conversation = _safe_identity_string(current_scope.get("conversation_id"))
         expected_user = _safe_identity_string(current_scope.get("accepted_user_message_id"))
         return bool(expected_conversation and expected_user)
+
+    def clear_passive_permission_action(self) -> None:
+        _page_passive_observation_state(self.page)["permission_action"] = None
 
     def detach_passive_observer(self) -> None:
         self._remove_passive_observer()
@@ -4181,10 +4444,43 @@ class ChatGPTPage:
                 raise RateLimitBlockedError("request rate limit remained after safe dismiss")
             return result
 
+    async def read_wait_probe(self) -> WaitProbe:
+        return await inspect_chatgpt_wait_probe(self.page)
+
     async def current_wait_probe(self) -> WaitProbe:
-        probe = await inspect_chatgpt_wait_probe(self.page)
+        probe = await self.read_wait_probe()
         self._assert_wait_probe_ownership(probe)
         return probe
+
+    async def mcp_allow_visible(self) -> bool:
+        return bool(
+            await self.page.evaluate(
+                r"""() => {
+                  const visible = (e) => Boolean(e && getComputedStyle(e).visibility !== 'hidden' &&
+                    (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+                  const norm = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+                  return [...document.querySelectorAll('button')].some((button) =>
+                    visible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true' &&
+                    (norm(button.innerText || button.textContent) === 'Allow' ||
+                     /^Allow mcp-[A-Za-z0-9._-]+ for this conversation$/i.test(norm(button.getAttribute('aria-label'))))
+                  );
+                }"""
+            )
+        )
+
+    async def auto_allow_mcp_permission(
+        self,
+        *,
+        passive_action: Mapping[str, Any] | None = None,
+    ) -> dict[str, str] | None:
+        async with self.mutation_guard():
+            result = await click_preferred_mcp_allow(
+                self.page,
+                passive_action=passive_action,
+            )
+            if result is not None:
+                self.invalidate_wait_cache()
+            return result
 
     async def inspect_mcp_permission_allow(
         self,

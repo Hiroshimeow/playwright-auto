@@ -221,7 +221,9 @@ class PromptBuilder:
             "turn": int(turn),
         }
         return (
-            "CDPA_ROUTE_REPAIR\n"
+            "CDPA_FORMAT_REPAIR\n"
+            "Continue from this state. Do not repeat the task or prior tool actions. "
+            "Return the required route JSON using the existing work/report.\n\n"
             + json.dumps(identity, ensure_ascii=False, indent=2)
             + f"\n\nValidation error: {error}\n\n"
             + f"Report naming rule: {self.naming_rule()}\n\n"

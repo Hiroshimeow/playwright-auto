@@ -90,6 +90,7 @@ from .cdpa_store import (
     utc_now,
 )
 from .cdpa_team import cleanup_eligible, has_other_nonterminal_team_work
+from .role_indicator import WINDOW_NAME_PREFIX
 from .cdpa_workflow_agents import task_workflow_definitions
 from .chatgpt import (
     ChatGPTAutomationError,
@@ -165,6 +166,10 @@ _POST_REFRESH_REROUTE_SECONDS = 120.0
 _STALL_REROUTE_MAX_ATTEMPTS = 3
 _STREAM_STATUS_POLL_MIN_SECONDS = 30.0
 _STREAM_STATUS_POLL_MAX_SECONDS = 35.0
+_DOM_WAIT_PROBE_MS = 5_000
+_MCP_ALLOW_STABLE_SECONDS = 5.0
+_MCP_ALLOW_POST_CLICK_SECONDS = 5.0
+_CONTROLLER_STALL_REFRESH_SECONDS = 600.0
 _AUTOMATED_SEND_SPACING_SECONDS = 10.0
 _SENDING_CONTINUATION_STARTED = "bounded continuation started after proven atomic non-acceptance"
 _PROVEN_ATOMIC_NONACCEPTANCE_ERRORS = (
@@ -392,6 +397,8 @@ class CDPAWorker:
         self._rate_limit_lock = asyncio.Lock()
         self._send_gate_lock = asyncio.Lock()
         self._last_automated_send_at: float | None = None
+        self._ambient_allow_seen: dict[int, float] = {}
+        self._ambient_post_click: dict[int, tuple[float, str | None]] = {}
         self._bootstrap_prepare_lock = asyncio.Lock()
         self._repository_project_lock = asyncio.Lock()
         self._repository_project_tasks: set[asyncio.Task[Any]] = set()
@@ -3451,6 +3458,18 @@ class CDPAWorker:
             )
         return upgraded
 
+    def _dom_only_enabled(self) -> bool:
+        settings = (
+            self.runtime_db.get_snapshot("settings")
+            if self.runtime_db.path.exists()
+            else None
+        )
+        return bool(
+            isinstance(settings, Mapping)
+            and isinstance(settings.get("payload"), Mapping)
+            and settings["payload"].get("dom_only") is True
+        )
+
     def _arm_passive_request_observer(
         self,
         state: Mapping[str, Any],
@@ -3458,21 +3477,6 @@ class CDPAWorker:
         client: Any,
         receipt: SendReceipt | None = None,
     ) -> None:
-        settings = (
-            self.runtime_db.get_snapshot("settings")
-            if self.runtime_db.path.exists()
-            else None
-        )
-        dom_only = (
-            isinstance(settings, Mapping)
-            and isinstance(settings.get("payload"), Mapping)
-            and settings["payload"].get("dom_only") is True
-        )
-        if dom_only:
-            detach = getattr(client, "detach_passive_observer", None)
-            if callable(detach):
-                detach()
-            return
         arm = getattr(client, "arm_passive_observer", None)
         if not callable(arm):
             return
@@ -3828,6 +3832,158 @@ class CDPAWorker:
             response=dict(response),
             error=None,
         )
+
+    async def _refresh_stalled_controller_state(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        client: Any,
+        snapshot: Any,
+        receipt: SendReceipt,
+    ) -> bool:
+        wait = hop["wait"]
+        has_new_assistant = any(
+            message.role == "assistant" and message.message_id not in receipt.baseline.message_ids
+            for message in snapshot.messages
+        )
+        if bool(getattr(snapshot, "retry_visible", False)):
+            current = "RETRY"
+        elif snapshot.stop_visible or bool(getattr(snapshot, "response_activity_turn_id", None)):
+            current = "STOP"
+        elif has_new_assistant:
+            current = "RESPONSE"
+        else:
+            current = "IDLE"
+        now = datetime.now(timezone.utc)
+        previous = str(wait.get("controller_state") or "")
+        since = parse_time(wait.get("controller_state_since"))
+        if previous != current or since is None:
+            wait["controller_state"] = current
+            wait["controller_state_since"] = now.isoformat()
+            return False
+        if current not in {"STOP", "IDLE"}:
+            return False
+        if (now - since).total_seconds() < _CONTROLLER_STALL_REFRESH_SECONDS:
+            return False
+        await client.refresh()
+        wait["controller_state_since"] = now.isoformat()
+        wait["controller_last_refresh_at"] = now.isoformat()
+        state["active_action"] = "wait_response"
+        return True
+
+    async def _one_shot_stream_status(
+        self,
+        actions: Any,
+        receipt: SendReceipt,
+    ) -> str | None:
+        conversation_id = str(receipt.conversation_id or "").strip()
+        reader = getattr(actions, "backend_stream_status", None)
+        if not conversation_id or not callable(reader):
+            return None
+        try:
+            payload = await reader(conversation_id)
+        except (BackendError, OSError, TimeoutError):
+            return None
+        if not isinstance(payload, Mapping):
+            return None
+        status = str(payload.get("status") or "").strip().upper()
+        return status or None
+
+    def _queue_format_repair(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        response: MessageSnapshot | None,
+        error: BaseException,
+    ) -> None:
+        candidate = response or MessageSnapshot("assistant", "", None, "", ())
+        self._record_response(
+            state,
+            hop,
+            candidate,
+            validation_error=str(error),
+        )
+        self._repair_route(state, hop, error)
+
+    async def _mcp_allow_interrupt(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        client: Any,
+        receipt: SendReceipt,
+        snapshot: Any,
+    ) -> bool:
+        """Handle MCP Allow before ordinary response-state processing."""
+        wait = hop["wait"]
+        now = datetime.now(timezone.utc)
+        clicked_at = parse_time(wait.get("mcp_allow_clicked_at"))
+        if clicked_at is not None:
+            progressed = bool(
+                snapshot.stop_visible
+                or any(
+                    message.role == "assistant"
+                    and message.message_id not in receipt.baseline.message_ids
+                    for message in snapshot.messages
+                )
+            )
+            if progressed:
+                wait.pop("mcp_allow_clicked_at", None)
+                wait.pop("mcp_allow_post_click_refreshed", None)
+                return False
+            if (now - clicked_at).total_seconds() < _MCP_ALLOW_POST_CLICK_SECONDS:
+                state["active_action"] = "wait_mcp_allow_continuation"
+                return True
+            if not wait.get("mcp_allow_post_click_refreshed"):
+                await client.refresh()
+                wait["mcp_allow_post_click_refreshed"] = True
+                wait.pop("mcp_allow_clicked_at", None)
+                state["active_action"] = "wait_response"
+                return True
+            wait.pop("mcp_allow_clicked_at", None)
+            wait.pop("mcp_allow_post_click_refreshed", None)
+
+        passive_action = None
+        if not self._dom_only_enabled():
+            reader = getattr(client, "passive_observation", None)
+            role_record = (state.get("roles") or {}).get(str(hop.get("target_role") or ""))
+            generation = int(role_record.get("conversation_generation") or 0) if isinstance(role_record, Mapping) else 0
+            if callable(reader):
+                evidence = reader(
+                    request_id=str(hop.get("request_id") or ""),
+                    generation=generation,
+                )
+                if isinstance(evidence, Mapping) and isinstance(evidence.get("permission_action"), Mapping):
+                    passive_action = dict(evidence["permission_action"])
+        visible_reader = getattr(client, "mcp_allow_visible", None)
+        visible = bool(await visible_reader()) if callable(visible_reader) else False
+        if not visible and passive_action is None:
+            wait.pop("mcp_allow_seen_at", None)
+            return False
+
+        seen_at = parse_time(wait.get("mcp_allow_seen_at"))
+        if seen_at is None:
+            wait["mcp_allow_seen_at"] = now.isoformat()
+            state["active_action"] = "wait_mcp_allow_stable"
+            return True
+        if (now - seen_at).total_seconds() < _MCP_ALLOW_STABLE_SECONDS:
+            state["active_action"] = "wait_mcp_allow_stable"
+            return True
+
+        allow = getattr(client, "auto_allow_mcp_permission", None)
+        if not callable(allow):
+            return False
+        dispatched = await allow(passive_action=passive_action)
+        if dispatched is None:
+            state["active_action"] = "wait_mcp_allow_stable"
+            return True
+        clear_passive = getattr(client, "clear_passive_permission_action", None)
+        if callable(clear_passive):
+            clear_passive()
+        wait.pop("mcp_allow_seen_at", None)
+        wait["mcp_allow_clicked_at"] = now.isoformat()
+        wait["mcp_allow_post_click_refreshed"] = False
+        state["active_action"] = "wait_mcp_allow_continuation"
+        return True
 
     async def _mcp_approval_gate(
         self,
@@ -4205,7 +4361,7 @@ class CDPAWorker:
                 if isinstance(role_record, Mapping)
                 else 0
             )
-            if callable(wait_passive) and probe_wait_ms > 0:
+            if not self._dom_only_enabled() and callable(wait_passive) and probe_wait_ms > 0:
                 passive_result = await wait_passive(
                     request_id=str(hop.get("request_id") or ""),
                     generation=generation,
@@ -4620,6 +4776,54 @@ class CDPAWorker:
             return "dom_reconcile", None
         return "waiting", None
 
+    def _rearm_released_terminal_wait(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+    ) -> bool:
+        wait = hop["wait"]
+        repair_wait = state.get("repair_wait")
+        unresolved = wait.get("terminal_continuation_unresolved")
+        if not (
+            isinstance(repair_wait, dict)
+            and repair_wait.get("state") == "RELEASED"
+            and repair_wait.get("original_block_code") == "terminal_continuation_unresolved"
+            and repair_wait.get("preserved_hop_id") == hop.get("hop_id")
+            and repair_wait.get("preserved_request_id") == hop.get("request_id")
+            and repair_wait.get("transport_rearmed_request_id") != hop.get("request_id")
+            and isinstance(unresolved, Mapping)
+            and unresolved.get("request_id") == str(hop["request_id"])
+        ):
+            return False
+        now = datetime.now(timezone.utc)
+        recover_incomplete_refresh(wait)
+        repair_wait["transport_rearmed_request_id"] = str(hop["request_id"])
+        repair_wait["transport_rearmed_at"] = now.isoformat()
+        wait["completion_mode"] = "controller_recovery"
+        wait["deadline_at"] = (
+            now + timedelta(seconds=self.config.response_timeout_seconds)
+        ).isoformat()
+        for key in (
+            "dom_fallback_ready_at",
+            "status_recovery_graph_next_at",
+            "stream_status_next_poll_at",
+            "terminal_complete_seen_at",
+            "terminal_graph_ready_at",
+            "terminal_graph_attempts",
+            "terminal_graph_request_id",
+            "terminal_graph_attempted_at",
+            "controller_state",
+            "controller_state_since",
+        ):
+            wait.pop(key, None)
+        state["status"] = "RUNNING"
+        state["kanban_column"] = _column_for(str(hop["target_role"]))
+        state["active_action"] = "wait_response"
+        state["block_code"] = None
+        state["block_retryable"] = False
+        state["block_reason"] = None
+        return True
+
     async def _waiting(
         self,
         state: dict[str, Any],
@@ -4630,155 +4834,19 @@ class CDPAWorker:
     ) -> None:
         self._start_wait_budget_from_sent(hop)
         self._reconcile_hop_conversation_identity(state, hop)
-        receipt = SendReceipt.from_dict(hop["receipt"])
-        settings = (
-            self.runtime_db.get_snapshot("settings")
-            if self.runtime_db.path.exists()
-            else None
-        )
-        dom_only = (
-            isinstance(settings, Mapping)
-            and isinstance(settings.get("payload"), Mapping)
-            and settings["payload"].get("dom_only") is True
-        )
-        if dom_only or not receipt.conversation_id or not receipt.user_message_id:
-            await self._waiting_dom(
-                state,
-                hop,
-                actions,
-                manifest_path,
-                transport_baseline,
-            )
-            return
-
-        # Bootstrap donor preservation is reconciled from local transcript state;
-        # waiting never fetches a conversation graph merely to populate a donor.
-        wait = hop["wait"]
-        now = datetime.now(timezone.utc)
-        backend_before = copy.deepcopy(state)
-        persistence_baseline = (
-            transport_baseline if transport_baseline is not None else backend_before
-        )
-
-        def persist_transport_state() -> None:
-            nonlocal persistence_baseline
-            saved = self._persist_transport_result(
-                manifest_path, persistence_baseline, state
-            )
-            state["updated_at"] = saved["updated_at"]
-            persistence_baseline = copy.deepcopy(state)
-
-        repair_wait = state.get("repair_wait")
-        unresolved = wait.get("terminal_continuation_unresolved")
-        repair_release_rearm = (
-            isinstance(repair_wait, dict)
-            and repair_wait.get("state") == "RELEASED"
-            and repair_wait.get("original_block_code")
-            == "terminal_continuation_unresolved"
-            and repair_wait.get("preserved_hop_id") == hop.get("hop_id")
-            and repair_wait.get("preserved_request_id") == hop.get("request_id")
-            and repair_wait.get("transport_rearmed_request_id")
-            != hop.get("request_id")
-            and str(wait.get("completion_mode") or "") == "dom_fallback"
-            and wait.get("backend_fallback_category") == "graph_not_ready"
-            and isinstance(unresolved, Mapping)
-            and unresolved.get("request_id") == str(hop["request_id"])
-        )
-        if repair_release_rearm:
-            recover_incomplete_refresh(wait)
-            repair_wait["transport_rearmed_request_id"] = str(hop["request_id"])
-            repair_wait["transport_rearmed_at"] = now.isoformat()
-            wait["completion_mode"] = "status_recovery"
-            wait["backend_fallback_category"] = "graph_not_ready"
-            wait["stream_status_next_poll_at"] = now.isoformat()
-            wait["status_recovery_graph_next_at"] = now.isoformat()
-            wait["deadline_at"] = (
-                now + timedelta(seconds=self.config.response_timeout_seconds)
-            ).isoformat()
-            for key in (
-                "dom_fallback_ready_at",
-                "terminal_complete_seen_at",
-                "terminal_graph_ready_at",
-                "terminal_graph_attempts",
-                "terminal_graph_request_id",
-                "terminal_graph_attempted_at",
-            ):
-                wait.pop(key, None)
-            persist_transport_state()
-
-        if str(wait.get("completion_mode") or "stream_status") == "dom_fallback":
-            ready_at = parse_time(wait.get("dom_fallback_ready_at"))
-            if ready_at is not None and now < ready_at:
-                return
-            await self._waiting_dom(
-                state,
-                hop,
-                actions,
-                manifest_path,
-                transport_baseline,
-            )
-            return
-
-        outcome, fallback_category = await self._waiting_backend_step(
+        before_rearm = json.loads(json.dumps(state, ensure_ascii=False, default=str))
+        if self._rearm_released_terminal_wait(state, hop):
+            saved = self._persist_transport_result(manifest_path, before_rearm, state)
+            state.clear()
+            state.update(saved)
+            hop = _active_hop(state)
+        await self._waiting_dom(
             state,
             hop,
             actions,
-            receipt,
-            persist_transport_state=persist_transport_state,
+            manifest_path,
+            transport_baseline,
         )
-        if outcome == "dom_reconcile":
-            await self._waiting_dom(
-                state,
-                hop,
-                actions,
-                manifest_path,
-                transport_baseline,
-            )
-            return
-        if outcome == "stream_failure":
-            self._block(
-                state,
-                "ChatGPT stream_status reported FAILURE for the exact owned conversation",
-                code="stream_status_failure",
-                retryable=True,
-            )
-            persist_transport_state()
-            return
-        if outcome == "stream_stopped":
-            acquired = await self._ensure_backend_wait_source(state, hop, actions, receipt)
-            if acquired is None:
-                persist_transport_state()
-                return
-            self._arm_passive_request_observer(state, hop, acquired.client, receipt)
-            reconciled = await self._final_dom_response_reconciliation(
-                state, hop, acquired, receipt, hop["wait"]
-            )
-            if reconciled is None or reconciled:
-                persist_transport_state()
-                return
-            self._block(
-                state,
-                (
-                    "ChatGPT stream_status reported IS_STOP_REQUESTED for the exact owned "
-                    "conversation, but no stable current-request response or authorized "
-                    "approval continuation could be proven locally. Resume may reconcile "
-                    "the exact recorded tab; do not Retry, Restart Role, New Chat, or resend."
-                ),
-                code="stream_status_stopped",
-                retryable=False,
-            )
-            persist_transport_state()
-            return
-        if outcome == "dom_fallback":
-            await self._begin_backend_dom_fallback(
-                state,
-                hop,
-                actions,
-                receipt,
-                category=str(fallback_category or "backend_unavailable"),
-                now=datetime.now(timezone.utc),
-            )
-            persist_transport_state()
 
     async def _waiting_dom(
         self,
@@ -4812,7 +4880,7 @@ class CDPAWorker:
             persistence_baseline,
             receipt,
             transport_baseline=transport_baseline,
-            probe_wait_ms=12_000,
+            probe_wait_ms=_DOM_WAIT_PROBE_MS,
         )
         if recovered is not None:
             acquired = recovered
@@ -4842,6 +4910,20 @@ class CDPAWorker:
             persistence_baseline,
         )
         if receipt is None:
+            return
+        if await self._mcp_allow_interrupt(state, hop, acquired.client, receipt, snapshot):
+            return
+        if bool(getattr(snapshot, "retry_visible", False)):
+            self._queue_format_repair(
+                state,
+                hop,
+                None,
+                RouteContractError("ChatGPT Retry UI is visible; continue from the existing state"),
+            )
+            return
+        if await self._refresh_stalled_controller_state(
+            state, hop, acquired.client, snapshot, receipt
+        ):
             return
         signature, length = response_activity_signature(snapshot, receipt.baseline)
         observe_response_activity(wait, signature=signature, length=length)
@@ -4963,15 +5045,10 @@ class CDPAWorker:
                     retryable=False,
                 )
                 return
-            now = datetime.now(timezone.utc)
-            wait["completion_mode"] = "status_recovery"
+            wait["completion_mode"] = "controller_recovery"
             wait["backend_fallback_category"] = "graph_not_ready"
-            wait["stream_status_next_poll_at"] = (
-                now + timedelta(seconds=_STREAM_STATUS_RECOVERY_SECONDS)
-            ).isoformat()
-            wait["status_recovery_graph_next_at"] = (
-                now + timedelta(seconds=_STATUS_RECOVERY_GRAPH_SECONDS)
-            ).isoformat()
+            wait.pop("stream_status_next_poll_at", None)
+            wait.pop("status_recovery_graph_next_at", None)
             wait.pop("dom_fallback_ready_at", None)
             for key in (
                 "terminal_complete_seen_at",
@@ -5127,6 +5204,17 @@ class CDPAWorker:
             )
             if reconciled is None or reconciled:
                 return
+            terminal_status = await self._one_shot_stream_status(actions, receipt)
+            if terminal_status in {"COMPLETE", "FAILURE", "IS_STOP_REQUESTED"}:
+                self._queue_format_repair(
+                    state,
+                    hop,
+                    None,
+                    RouteContractError(
+                        f"terminal timeout with stream_status={terminal_status}; continue from current state"
+                    ),
+                )
+                return
             self._block(
                 state,
                 "response timeout budget exhausted after final response reconciliation",
@@ -5169,12 +5257,12 @@ class CDPAWorker:
         except StableMalformedResponseError as exc:
             wait["recovery_baseline"] = None
             await self._flush_hop_conversation_identity(state, hop)
-            self._record_response(
-                state,
-                hop,
-                exc.candidate,
-                validation_error=str(exc.validation_error),
-            )
+            if not wait.get("format_repair_refresh_used"):
+                await acquired.client.refresh()
+                wait["format_repair_refresh_used"] = True
+                state["active_action"] = "wait_response"
+                return
+            self._queue_format_repair(state, hop, exc.candidate, exc.validation_error)
             self._release_stream_status_slot(acquired.client, receipt)
             return
         except (TimeoutError, IncompleteResponseTimeoutError):
@@ -5183,6 +5271,17 @@ class CDPAWorker:
                     state, hop, acquired, receipt, wait
                 )
                 if reconciled is None or reconciled:
+                    return
+                terminal_status = await self._one_shot_stream_status(actions, receipt)
+                if terminal_status in {"COMPLETE", "FAILURE", "IS_STOP_REQUESTED"}:
+                    self._queue_format_repair(
+                        state,
+                        hop,
+                        None,
+                        RouteContractError(
+                            f"terminal timeout with stream_status={terminal_status}; continue from current state"
+                        ),
+                    )
                     return
                 self._block(
                     state,
@@ -9235,6 +9334,71 @@ class CDPAWorker:
             self.runtime_db.upsert_task_projections(projections)
             self._publish_dashboard_actions()
 
+    async def _maintain_ambient_page_automation(self, browser_context: Any) -> None:
+        """Keep DOM/Listen automation alive on every open page with CDPA history."""
+        now = time.monotonic()
+        live_keys: set[int] = set()
+        dom_only = self._dom_only_enabled()
+        for page in tuple(browser_context.pages):
+            if page.is_closed():
+                continue
+            key = id(page)
+            live_keys.add(key)
+            try:
+                name = str(await page.evaluate("() => window.name || ''"))
+            except Exception:
+                continue
+            if not name.startswith(WINDOW_NAME_PREFIX):
+                continue
+            client = ChatGPTPage(page, timeout_ms=min(15_000, self.config.browser_timeout_ms))
+            client.install_ambient_observer()
+            try:
+                probe = await client.read_wait_probe()
+            except Exception:
+                continue
+            if "chatgpt.com" not in str(page.url):
+                continue
+
+            post_click = self._ambient_post_click.get(key)
+            if post_click is not None:
+                clicked_at, previous_assistant = post_click
+                if now - clicked_at < _MCP_ALLOW_POST_CLICK_SECONDS:
+                    continue
+                progressed = bool(
+                    probe.stop_visible
+                    or (
+                        probe.last_assistant_message_id
+                        and probe.last_assistant_message_id != previous_assistant
+                    )
+                )
+                if not progressed:
+                    await client.refresh()
+                self._ambient_post_click.pop(key, None)
+                continue
+
+            passive_action = None if dom_only else client.ambient_permission_action()
+            try:
+                visible = await client.mcp_allow_visible()
+            except Exception:
+                visible = False
+            if not visible and passive_action is None:
+                self._ambient_allow_seen.pop(key, None)
+                continue
+            first_seen = self._ambient_allow_seen.setdefault(key, now)
+            if now - first_seen < _MCP_ALLOW_STABLE_SECONDS:
+                continue
+            result = await client.auto_allow_mcp_permission(passive_action=passive_action)
+            if result is None:
+                continue
+            client.clear_ambient_permission_action()
+            self._ambient_allow_seen.pop(key, None)
+            self._ambient_post_click[key] = (now, probe.last_assistant_message_id)
+
+        for mapping in (self._ambient_allow_seen, self._ambient_post_click):
+            for key in tuple(mapping):
+                if key not in live_keys:
+                    mapping.pop(key, None)
+
     async def run_once(self, browser_context: Any) -> list[dict[str, Any] | None]:
         hydrated_now = False
         if self.registry is None and not self.runtime_degraded:
@@ -9245,6 +9409,7 @@ class CDPAWorker:
             return []
         self._browser_cycle_active = True
         try:
+            await self._maintain_ambient_page_automation(browser_context)
             await self._publish_browser_inventory(browser_context)
             await self._refresh_rate_limit_cooldown(browser_context)
             self._activate_independent_agents()

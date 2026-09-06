@@ -391,6 +391,195 @@ def test_frontend_identity_observer_can_be_taken_before_late_response():
     asyncio.run(scenario())
 
 
+def test_passive_observation_surfaces_jit_mcp_allow_action_from_sse():
+    user = {
+        "conversation_id": "c1",
+        "message": {
+            "id": "u1",
+            "author": {"role": "user"},
+            "recipient": "all",
+            "content": {"content_type": "text", "parts": ["task"]},
+        },
+    }
+    permission = {
+        "conversation_id": "c1",
+        "message": {
+            "id": "tool1",
+            "author": {"role": "tool"},
+            "recipient": "assistant",
+            "content": {"content_type": "text", "parts": [""]},
+            "metadata": {
+                "jit_plugin_data": {
+                    "from_server": {
+                        "body": {
+                            "domain": "call_tool",
+                            "actions": [
+                                {"name": "deny", "type": "deny", "deny": {"target_message_id": "call1"}},
+                                {
+                                    "name": "allow",
+                                    "type": "allow",
+                                    "style": "primary",
+                                    "allow": {"target_message_id": "call1"},
+                                    "split_action_options": [
+                                        {
+                                            "label": "Allow mcp-g8 for this conversation",
+                                            "action": {
+                                                "type": "allow",
+                                                "target_message_id": "call1",
+                                                "remember_answer": True,
+                                            },
+                                        }
+                                    ],
+                                },
+                            ],
+                        }
+                    }
+                }
+            },
+        },
+    }
+    body = "\n".join(
+        [f"data: {json.dumps(user)}", f"data: {json.dumps(permission)}", "data: [DONE]"]
+    )
+
+    evidence = chatgpt_module._reduce_frontend_conversation_observation_body(body, "u1")
+
+    assert evidence is not None
+    assert evidence["permission_action"] == {
+        "type": "allow",
+        "target_message_id": "call1",
+        "remember_answer": True,
+        "label": "Allow mcp-g8 for this conversation",
+    }
+
+
+def test_wait_probe_installs_persistent_init_script_once_per_page():
+    class Page:
+        url = "https://chatgpt.com/c/c1"
+
+        def __init__(self):
+            self.installed = False
+            self.init_scripts = []
+
+        async def add_init_script(self, *, script):
+            self.init_scripts.append(script)
+
+        async def evaluate(self, script, arg=None):
+            if script == chatgpt_module._WAIT_PROBE_INSTALL_SCRIPT:
+                self.installed = True
+                return True
+            if script == chatgpt_module._WAIT_PROBE_READ_SCRIPT:
+                if not self.installed:
+                    return None
+                return {
+                    "url": self.url,
+                    "page_role": "alpha-plan",
+                    "page_id": "page-1",
+                    "page_task_id": "task-1",
+                    "page_team": "alpha",
+                    "requires_login": False,
+                    "composer_present": True,
+                    "composer_text": "",
+                    "attachment_count": 0,
+                    "stop_visible": False,
+                    "transport_active": False,
+                    "error_texts": [],
+                    "blocking_dialogs": [],
+                    "choice_prompt_labels": [],
+                    "mcp_permission_allow_count": 0,
+                    "mcp_permission_node_count": 0,
+                    "last_user_message_id": "u1",
+                    "last_user_turn_id": "t1",
+                    "last_assistant_message_id": None,
+                    "last_assistant_turn_id": None,
+                    "assistant_text_length": 0,
+                    "assistant_text_tail": "",
+                    "response_activity_length": 0,
+                    "response_activity_tail": "",
+                    "response_activity_turn_id": None,
+                }
+            raise AssertionError(f"unexpected script: {script!r}")
+
+    page = Page()
+    asyncio.run(chatgpt_module.inspect_chatgpt_wait_probe(page))
+    asyncio.run(chatgpt_module.inspect_chatgpt_wait_probe(page))
+
+    assert len(page.init_scripts) == 1
+    assert "__PLAYWRIGHT_AUTO_WAIT_PROBE__" in page.init_scripts[0]
+
+
+def test_ambient_observer_attaches_once_and_captures_permission_without_active_scope():
+    class Page:
+        def __init__(self):
+            self.listeners = {"response": []}
+
+        def on(self, event, callback):
+            self.listeners.setdefault(event, []).append(callback)
+
+    class Request:
+        method = "POST"
+        post_data_json = {"messages": [{"id": "u1", "author": {"role": "user"}}]}
+
+    class Response:
+        request = Request()
+        url = "https://chatgpt.com/backend-api/f/conversation"
+
+        async def body(self):
+            payload = {
+                "conversation_id": "c1",
+                "message": {
+                    "id": "tool1",
+                    "author": {"role": "tool"},
+                    "recipient": "assistant",
+                    "content": {"content_type": "text", "parts": [""]},
+                    "metadata": {
+                        "jit_plugin_data": {
+                            "from_server": {
+                                "body": {
+                                    "actions": [
+                                        {
+                                            "type": "allow",
+                                            "allow": {"target_message_id": "call1"},
+                                            "split_action_options": [
+                                                {
+                                                    "label": "Allow mcp-g8 for this conversation",
+                                                    "action": {
+                                                        "type": "allow",
+                                                        "target_message_id": "call1",
+                                                        "remember_answer": True,
+                                                    },
+                                                }
+                                            ],
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                },
+            }
+            return f"data: {json.dumps(payload)}\ndata: [DONE]\n".encode()
+
+    async def scenario():
+        page = Page()
+        first = chatgpt_module.ChatGPTPage(page)
+        second = chatgpt_module.ChatGPTPage(page)
+        first.install_ambient_observer()
+        second.install_ambient_observer()
+        assert len(page.listeners["response"]) == 1
+        page.listeners["response"][0](Response())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert second.ambient_permission_action() == {
+            "type": "allow",
+            "target_message_id": "call1",
+            "remember_answer": True,
+            "label": "Allow mcp-g8 for this conversation",
+        }
+
+    asyncio.run(scenario())
+
+
 def test_passive_observer_attaches_once_reduces_natural_payloads_and_cleans_up():
     class Page:
         def __init__(self):

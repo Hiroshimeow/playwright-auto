@@ -37,6 +37,78 @@ async def _with_page(body: str, callback):
             await browser.close()
 
 
+def test_auto_allow_uses_listen_action_without_dom_permission_button():
+    async def run(page):
+        client = ChatGPTPage(page, timeout_ms=5_000)
+        await page.evaluate(
+            """() => {
+              const node = document.querySelector('[data-message-id="tool-1"]');
+              node.__reactProps$test = {
+                onSelectOption: (_event, action) => { window.__mcpAction = action; },
+                options: [{
+                  action: {
+                    type: 'allow',
+                    target_message_id: 'call-1',
+                    remember_answer: true,
+                  }
+                }],
+              };
+            }"""
+        )
+        result = await client.auto_allow_mcp_permission(
+            passive_action={
+                "type": "allow",
+                "target_message_id": "call-1",
+                "remember_answer": True,
+                "label": "Allow mcp-g8 for this conversation",
+            }
+        )
+        return result, await page.evaluate("window.__mcpAction || null")
+
+    result, action = asyncio.run(
+        _with_page(
+            """
+            <main>
+              <div data-message-id="tool-1">tool approval payload</div>
+              <div contenteditable="true" role="textbox"></div>
+            </main>
+            """,
+            run,
+        )
+    )
+
+    assert result["method"] == "react_handler"
+    assert result["target_message_id"] == "call-1"
+    assert result["remember_answer"] == "true"
+    assert action == {
+        "type": "allow",
+        "target_message_id": "call-1",
+        "remember_answer": True,
+    }
+
+
+def test_auto_allow_falls_back_to_plain_visible_allow_button():
+    async def run(page):
+        client = ChatGPTPage(page, timeout_ms=5_000)
+        result = await client.auto_allow_mcp_permission()
+        return result, await page.evaluate("window.__mcpAllowClicks || 0")
+
+    result, clicks = asyncio.run(
+        _with_page(
+            """
+            <main>
+              <button onclick="window.__mcpAllowClicks = (window.__mcpAllowClicks || 0) + 1">Allow</button>
+              <div contenteditable="true" role="textbox"></div>
+            </main>
+            """,
+            run,
+        )
+    )
+
+    assert result["method"] == "dom_click"
+    assert clicks == 1
+
+
 def test_sparse_probe_detects_valid_mcp_allow_group_even_with_composer_present():
     async def run(page):
         probe = await inspect_chatgpt_wait_probe(page)

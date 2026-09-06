@@ -196,7 +196,7 @@ def _begin_sent_record(state: dict, hop: dict) -> dict:
 
 
 
-def test_active_cooldown_waiting_hop_continues_real_backend_reconciliation_without_browser_mutation(
+def test_active_cooldown_waiting_hop_continues_local_dom_reconciliation_without_backend_poll(
     tmp_path: Path,
 ):
     _config, store, state, worker = _setup(tmp_path)
@@ -255,32 +255,22 @@ def test_active_cooldown_waiting_hop_continues_real_backend_reconciliation_witho
         "detected_at": "2026-08-17T00:00:00+00:00",
         "release_not_before": "2999-01-01T00:00:00+00:00",
     }
-    calls = {"backend_status": 0, "browser": 0}
+    calls = {"backend_status": 0, "dom": 0}
+
+    async def local_dom(*_args, **_kwargs):
+        calls["dom"] += 1
+
+    worker._waiting_dom = local_dom
 
     class Actions:
         async def backend_stream_status(self, conversation_id):
             assert conversation_id == "rate-limit-conversation"
             calls["backend_status"] += 1
-            return {"status": "IS_STREAMING"}
-
-        async def backend_conversation(self, *_args, **_kwargs):
-            raise AssertionError("streaming status must not fetch the full graph")
-
-        async def locate_owned(self, *_args, **_kwargs):
-            calls["browser"] += 1
-            raise AssertionError("cooldown reconciliation must not inspect browser ownership")
-
-        async def reopen(self, *_args, **_kwargs):
-            calls["browser"] += 1
-            raise AssertionError("cooldown reconciliation must not reopen a tab")
-
-        async def wake(self, *_args, **_kwargs):
-            calls["browser"] += 1
-            raise AssertionError("cooldown reconciliation must not wake a tab")
+            raise AssertionError("normal cooldown waiting must not poll stream_status")
 
     asyncio.run(worker._waiting(state, hop, Actions(), Path(state["manifest_path"])))
 
-    assert calls == {"backend_status": 1, "browser": 0}
+    assert calls == {"backend_status": 0, "dom": 1}
     assert hop["state"] == "waiting"
     assert state.get("block_code") is None
     persisted = ledger.get(hop["request_id"])
