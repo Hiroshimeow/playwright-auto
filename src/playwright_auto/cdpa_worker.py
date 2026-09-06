@@ -6144,6 +6144,24 @@ class CDPAWorker:
             )
             return
 
+        self._arm_passive_request_observer(state, hop, acquired.client, receipt)
+        if await self._mcp_allow_interrupt(state, hop, acquired.client, receipt, snapshot):
+            state["status"] = "RUNNING"
+            state["kanban_column"] = _column_for(str(hop["target_role"]))
+            state["block_code"] = None
+            state["block_retryable"] = False
+            state["block_reason"] = None
+            self._finish_resume_control(
+                state,
+                control,
+                outcome="continued",
+                action="resume_permission_controller",
+                reason_code=None,
+                reason="The exact accepted request has a pending MCP permission handled by the shared DOM/Listen controller.",
+                postcondition="permission_controller_active",
+            )
+            return
+
         response: MessageSnapshot | None = None
         response_validation_error: str | None = None
         try:

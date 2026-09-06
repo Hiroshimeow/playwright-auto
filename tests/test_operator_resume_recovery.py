@@ -93,6 +93,61 @@ def _accepted_snapshot(receipt: SendReceipt, *, response: MessageSnapshot | None
     )
 
 
+def test_resume_pending_mcp_permission_hands_back_to_shared_controller(tmp_path: Path):
+    store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-resume-mcp-permission"
+    )
+    hop["conversation_url"] = "https://chatgpt.com/c/resume-mcp"
+    state["roles"]["PLAN"]["page_url"] = hop["conversation_url"]
+    snapshot = _accepted_snapshot(receipt)
+    calls = []
+
+    class Client:
+        async def assert_ownership(self):
+            return snapshot
+
+        async def wait_for_response(self, *_args, **_kwargs):
+            raise AssertionError("pending MCP permission must return to the shared controller first")
+
+    acquired = AcquiredRole(
+        Client(), receipt.binding.page_id, hop["conversation_url"], False, False
+    )
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            return acquired
+
+        async def reopen(self, *_args, **_kwargs):
+            raise AssertionError("exact owned page should be reused")
+
+        async def backend_stream_status(self, *_args, **_kwargs):
+            raise AssertionError("resume permission handoff must not require backend status")
+
+    async def permission_interrupt(_state, _hop, _client, _receipt, _snapshot):
+        calls.append("permission")
+        _state["active_action"] = "wait_mcp_allow_stable"
+        return True
+
+    worker._mcp_allow_interrupt = permission_interrupt
+    control = {
+        "control_id": 1,
+        "action": "resume",
+        "role": "PLAN",
+        "status": "recovering",
+        "result": {"before": None},
+    }
+    asyncio.run(worker._recover_resume_waiting(state, hop, control, Actions()))
+
+    assert calls == ["permission"]
+    assert state["status"] == "RUNNING"
+    assert state["active_action"] == "wait_mcp_allow_stable"
+    assert state["block_code"] is None
+    assert control["status"] == "applied"
+    assert control["result"]["action"] == "resume_permission_controller"
+    assert control["result"]["postcondition"] == "permission_controller_active"
+    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
+
+
 def test_resume_control_stays_recovering_until_verified_postcondition(tmp_path: Path):
     _config, store, state, worker = setup_task(tmp_path, task_id="task-resume-recovering")
     path = Path(state["manifest_path"])
