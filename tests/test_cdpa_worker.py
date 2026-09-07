@@ -6928,7 +6928,7 @@ def test_active_mcp_allow_falls_back_to_plain_visible_allow(tmp_path: Path):
     assert state["active_action"] == "wait_mcp_allow_continuation"
 
 
-def test_mcp_allow_disappearance_without_continuation_refreshes_after_five_seconds(tmp_path: Path):
+def test_mcp_allow_disappearance_without_continuation_does_not_refresh_after_five_seconds(tmp_path: Path):
     _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-allow-disappear-refresh"
     )
@@ -6955,8 +6955,9 @@ def test_mcp_allow_disappearance_without_continuation_refreshes_after_five_secon
         worker._mcp_allow_interrupt(state, hop, Client(), receipt, snapshot)
     )
 
-    assert handled is True
-    assert refreshed == [True]
+    assert handled is False
+    assert refreshed == []
+    assert "mcp_allow_clicked_at" not in hop["wait"]
     assert state["active_action"] == "wait_response"
 
 
