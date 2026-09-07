@@ -7176,14 +7176,14 @@ def test_ambient_old_tab_dom_only_visible_allow_is_clicked_without_passive_event
             return worker_module.WINDOW_NAME_PREFIX + json.dumps({
                 "taskId": task_id,
                 "pageId": "page-history-dom",
-                "role": "PLAN",
+                "role": "cdpa-history-dom-plan",
             })
 
     page = Page()
 
     class Client:
         def __init__(self, _page, *, timeout_ms):
-            pass
+            self.binding = None
 
         def install_ambient_observer(self):
             pass
@@ -7192,7 +7192,7 @@ def test_ambient_old_tab_dom_only_visible_allow_is_clicked_without_passive_event
             return SimpleNamespace(
                 page_task_id=task_id,
                 page_id="page-history-dom",
-                page_role="PLAN",
+                page_role="cdpa-history-dom-plan",
                 stop_visible=False,
                 last_assistant_message_id=None,
                 mcp_permission_allow_count=1,
@@ -7202,6 +7202,7 @@ def test_ambient_old_tab_dom_only_visible_allow_is_clicked_without_passive_event
             return None
 
         async def auto_allow_mcp_permission(self, *, passive_action=None):
+            assert self.binding == PageBinding("page-history-dom", "cdpa-history-dom-plan")
             calls.append(passive_action)
             return {"method": "dom_click", "target_message_id": "", "remember_answer": "false"}
 
@@ -7213,3 +7214,56 @@ def test_ambient_old_tab_dom_only_visible_allow_is_clicked_without_passive_event
     asyncio.run(worker._maintain_ambient_page_automation(SimpleNamespace(pages=[page])))
 
     assert calls == [None]
+
+
+def test_ambient_page_local_ownership_error_does_not_reconnect_worker(tmp_path: Path, monkeypatch):
+    _config, _store, _state, worker = setup_task(
+        tmp_path, task_id="task-ambient-local-ownership-error"
+    )
+    task_id = "task-ambient-local-ownership-error"
+    worker.registry = SimpleNamespace(tasks_by_id={task_id: {"status": "DONE"}})
+
+    class Page:
+        url = "https://chatgpt.com/c/ambient-local-error"
+
+        def is_closed(self):
+            return False
+
+        async def evaluate(self, _script):
+            return worker_module.WINDOW_NAME_PREFIX + json.dumps({
+                "taskId": task_id,
+                "pageId": "page-local-error",
+                "role": "cdpa-local-error-plan",
+            })
+
+    page = Page()
+
+    class Client:
+        def __init__(self, _page, *, timeout_ms):
+            self.binding = None
+
+        def install_ambient_observer(self):
+            pass
+
+        async def read_wait_probe(self):
+            return SimpleNamespace(
+                page_task_id=task_id,
+                page_id="page-local-error",
+                page_role="cdpa-local-error-plan",
+                stop_visible=False,
+                last_assistant_message_id=None,
+                mcp_permission_allow_count=0,
+            )
+
+        def ambient_permission_action(self):
+            return None
+
+        async def refresh(self):
+            raise PageOwnershipError("stale historical page binding")
+
+    monkeypatch.setattr(worker_module, "ChatGPTPage", Client)
+    worker._ambient_post_click[id(page)] = (time.monotonic() - 6, None)
+
+    asyncio.run(worker._maintain_ambient_page_automation(SimpleNamespace(pages=[page])))
+
+    assert id(page) not in worker._ambient_post_click

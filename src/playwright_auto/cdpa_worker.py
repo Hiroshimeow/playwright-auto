@@ -113,6 +113,7 @@ from .chatgpt import (
     merge_response_recovery_baselines,
     RateLimitBlockedError,
     MessageSnapshot,
+    PageBinding,
     receipt_user_message_seen,
     response_activity_signature,
     response_transport_ui_active,
@@ -9231,7 +9232,16 @@ class CDPAWorker:
                 page,
                 timeout_ms=min(15_000, round(self.config.workspace_timeout_seconds * 1000)),
             )
-            client.install_ambient_observer()
+            bound_page_id = str(binding.get("pageId") or "").strip()
+            bound_role = str(binding.get("role") or "").strip()
+            if bound_page_id and bound_role:
+                client.binding = PageBinding(bound_page_id, bound_role)
+            try:
+                client.install_ambient_observer()
+            except Exception as exc:
+                if is_cdp_disconnect(exc):
+                    raise
+                continue
             if "chatgpt.com" not in str(page.url):
                 continue
             if self._ambient_page_has_active_controller(binding):
@@ -9271,7 +9281,13 @@ class CDPAWorker:
                     )
                 )
                 if not progressed:
-                    await client.refresh()
+                    try:
+                        await client.refresh()
+                    except Exception as exc:
+                        self._ambient_post_click.pop(key, None)
+                        if is_cdp_disconnect(exc):
+                            raise
+                        continue
                 self._ambient_post_click.pop(key, None)
                 continue
 
@@ -9291,7 +9307,13 @@ class CDPAWorker:
             if passive_action is None and not visible:
                 self._ambient_allow_seen.pop(key, None)
                 continue
-            result = await client.auto_allow_mcp_permission(passive_action=passive_action)
+            try:
+                result = await client.auto_allow_mcp_permission(passive_action=passive_action)
+            except Exception as exc:
+                self._ambient_allow_seen.pop(key, None)
+                if is_cdp_disconnect(exc):
+                    raise
+                continue
             if result is None:
                 continue
             client.clear_ambient_permission_action()
