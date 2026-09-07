@@ -20,7 +20,11 @@ from playwright_auto.dashboard_api import APIError, DashboardAPI, create_server
 from playwright_auto.observability import (
     action_event_log_path,
     append_action_event,
+    append_live_event,
     configure_action_event_log,
+    configure_live_event_log,
+    live_event_log_path,
+    live_event_logging_enabled,
 )
 
 from test_cdpa_core import write_config
@@ -352,6 +356,49 @@ def test_remove_parent_api_requires_version_and_queues_exact_relationship(tmp_pa
             assert status == 400
             assert json.loads(body)["error"]["code"] == "invalid_request"
     finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_task_live_endpoint_filters_semantic_events_by_role(tmp_path: Path):
+    config, db, server, thread = start_api(tmp_path)
+    old_live_log = live_event_log_path()
+    old_live_enabled = live_event_logging_enabled()
+    configure_live_event_log(tmp_path / ".runtime" / "live-events.jsonl")
+    try:
+        append_live_event(
+            "DOM",
+            "wait_probe",
+            page_url="https://chatgpt.com/c/one",
+            page_id="page-plan",
+            role="PLAN",
+            task_id="task-a",
+            team="alpha",
+            changes={"stop_visible": {"from": False, "to": True}},
+        )
+        append_live_event(
+            "CTRL",
+            "state_transition",
+            role="DEV",
+            task_id="task-a",
+            team="alpha",
+            values={"active_action": "wait_response"},
+        )
+        status, headers, body = request(
+            server,
+            "GET",
+            "/api/tasks/task-a/live?limit=10&role=PLAN",
+        )
+        assert status == 200
+        assert headers["Cache-Control"] == "no-store"
+        payload = json.loads(body)
+        assert payload["task_id"] == "task-a"
+        assert payload["role"] == "PLAN"
+        assert len(payload["items"]) == 1
+        assert payload["items"][0]["source"] == "DOM"
+        assert payload["items"][0]["team"] == "alpha"
+    finally:
+        configure_live_event_log(old_live_log, enabled=old_live_enabled)
         server.shutdown()
         thread.join(timeout=5)
 

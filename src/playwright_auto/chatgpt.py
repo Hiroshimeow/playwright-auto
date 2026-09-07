@@ -21,7 +21,7 @@ from .chatgpt_graph import (
     normalize_visible_text,
     visible_text_matches,
 )
-from .observability import record_page_action
+from .observability import append_live_event, record_page_action
 from .role_indicator import WINDOW_NAME_PREFIX, ensure_role_indicator
 
 ROLE_STORAGE_KEY = "playwright-auto:role"
@@ -1417,6 +1417,30 @@ class WaitProbe:
             ensure_ascii=False,
             separators=(",", ":"),
         )
+
+
+def _wait_probe_live_values(probe: WaitProbe) -> dict[str, Any]:
+    return {
+        "requires_login": probe.requires_login,
+        "composer_present": probe.composer_present,
+        "composer_nonempty": bool(probe.composer_text.strip()),
+        "attachment_count": probe.attachment_count,
+        "stop_visible": probe.stop_visible,
+        "transport_active": probe.transport_active,
+        "retry_visible": probe.retry_visible,
+        "error_texts": list(probe.error_texts),
+        "blocking_dialogs": list(probe.blocking_dialogs),
+        "choice_prompt_labels": list(probe.choice_prompt_labels),
+        "mcp_permission_allow_count": probe.mcp_permission_allow_count,
+        "mcp_permission_node_count": probe.mcp_permission_node_count,
+        "last_user_message_id": probe.last_user_message_id,
+        "last_user_turn_id": probe.last_user_turn_id,
+        "last_assistant_message_id": probe.last_assistant_message_id,
+        "last_assistant_turn_id": probe.last_assistant_turn_id,
+        "assistant_text_length": probe.assistant_text_length,
+        "response_activity_length": probe.response_activity_length,
+        "response_activity_turn_id": probe.response_activity_turn_id,
+    }
 
 
 @dataclass(frozen=True)
@@ -3793,6 +3817,8 @@ class ChatGPTPage:
         generation: int,
         conversation_id: str | None = None,
         accepted_user_message_id: str | None = None,
+        task_id: str | None = None,
+        team: str | None = None,
     ) -> None:
         self.install_ambient_observer()
         exact_request = _safe_identity_string(request_id)
@@ -3816,6 +3842,8 @@ class ChatGPTPage:
         scope = {
             "request_id": exact_request,
             "generation": int(generation),
+            "task_id": str(task_id or "").strip() or None,
+            "team": str(team or "").strip() or None,
             "conversation_id": (
                 exact_conversation
                 if exact_conversation is not None
@@ -3941,6 +3969,29 @@ class ChatGPTPage:
                 if isinstance(evidence.get("permission_action"), Mapping):
                     state["permission_action"] = dict(evidence["permission_action"])
                 state["event_count"] = int(state.get("event_count") or 0) + 1
+                binding = self.binding
+                append_live_event(
+                    "LISTEN",
+                    "response_observation",
+                    page_url=str(getattr(page, "url", "") or ""),
+                    page_id=(binding.page_id if binding is not None else None),
+                    role=(binding.role if binding is not None else None),
+                    task_id=str(current_scope.get("task_id") or "") or None,
+                    team=str(current_scope.get("team") or "") or None,
+                    request_id=scope_key[0],
+                    generation=scope_key[1],
+                    values={
+                        "coverage": evidence.get("coverage"),
+                        "conversation_id": evidence.get("conversation_id"),
+                        "observed_user_message_id": evidence.get("observed_user_message_id"),
+                        "event_count": state["event_count"],
+                        "permission_action": (
+                            dict(evidence["permission_action"])
+                            if isinstance(evidence.get("permission_action"), Mapping)
+                            else None
+                        ),
+                    },
+                )
                 wake_event = state.get("wake_event")
                 if isinstance(wake_event, asyncio.Event):
                     wake_event.set()
@@ -4324,19 +4375,44 @@ class ChatGPTPage:
             self.invalidate_wait_cache()
             self._wait_receipt_key = key
             force_full = True
+        previous_probe = self._wait_probe
         try:
             probe = await inspect_chatgpt_wait_probe(
                 self.page,
                 previous_transition_signature=(
-                    self._wait_probe.transition_signature
-                    if self._wait_probe is not None
+                    previous_probe.transition_signature
+                    if previous_probe is not None
                     else None
                 ),
-                previous_probe=self._wait_probe,
+                previous_probe=previous_probe,
                 wait_ms=max(0, int(probe_wait_ms)),
             )
             self._wait_metrics["sparse_probes"] += 1
             self._assert_wait_probe_ownership(probe)
+            values = _wait_probe_live_values(probe)
+            previous_values = (
+                _wait_probe_live_values(previous_probe)
+                if previous_probe is not None
+                else {}
+            )
+            changes = {
+                field: {"from": previous_values.get(field), "to": value}
+                for field, value in values.items()
+                if previous_probe is None or previous_values.get(field) != value
+            }
+            if changes:
+                append_live_event(
+                    "DOM",
+                    "wait_probe",
+                    page_url=probe.url,
+                    page_id=probe.page_id,
+                    role=probe.page_role,
+                    task_id=probe.page_task_id,
+                    team=probe.page_team,
+                    changes=changes,
+                    values=values,
+                    detail=("initial probe" if previous_probe is None else None),
+                )
         except (AuthenticationRequiredError, PageOwnershipError):
             raise
         except Exception:

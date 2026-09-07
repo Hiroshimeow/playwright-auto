@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -32,7 +33,7 @@ from .cdpa_independent import (
 )
 from .cdpa_routes import effective_report_mode
 from .cdpa_runtime_db import IdempotencyConflict, RuntimeDB, RuntimeDBError
-from .observability import mcp_allow_click_summary
+from .observability import mcp_allow_click_summary, read_recent_live_events
 from .cdpa_workflow_agents import (
     normalize_workflow_display_name,
     ordered_system_routes,
@@ -82,6 +83,7 @@ class DashboardAPI:
         db: RuntimeDB | None = None,
     ) -> None:
         self.config = config
+        self.live_event_log = config.repository_root / ".runtime" / "live-events.jsonl"
         self.db = db or RuntimeDB(config.runtime_database)
         self.db.ensure_schema()
         self._system_lock = threading.Lock()
@@ -1023,6 +1025,26 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
             items = timeline[start : start + limit]
             next_cursor = _cursor_encode(str(start + limit)) if start + limit < len(timeline) else None
             self._json(200, {"items": items, "next_cursor": next_cursor})
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "tasks"] and parts[3] == "live":
+            task_id = validate_task_id(parts[2])
+            if db.get_task_version(task_id) is None:
+                raise APIError(404, "task_not_found", "task does not exist")
+            limit = self._limit(query, default=100)
+            role = str(query.get("role", [""])[0] or "").strip().upper() or None
+            if role is not None and not re.fullmatch(r"[A-Z][A-Z0-9_-]{0,63}", role):
+                raise APIError(400, "invalid_role", "role is invalid")
+            items = read_recent_live_events(
+                app.live_event_log,
+                limit=limit,
+                task_id=task_id,
+                role=role,
+            )
+            self._json(
+                200,
+                {"task_id": task_id, "role": role, "items": items},
+                headers={"Cache-Control": "no-store"},
+            )
             return
         if len(parts) == 4 and parts[:2] == ["api", "reports"]:
             body = app.report_bytes(parts[2], parts[3], maintenance=False)

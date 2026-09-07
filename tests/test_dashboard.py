@@ -458,7 +458,7 @@ def test_notify_frontend_contract_reuses_secondary_report_path_and_preserves_his
     assert 'if (current.drawer === "history") renderHistory(roots.secondaryContent, current);' in app
     assert 'if (current.drawer === "notify") renderNotify(roots.secondaryContent, current);' in app
     assert 'if (view === "notify") delete roots.secondaryContent.dataset.secondaryView;' in app
-    assert '/assets/app.js?v=20260906-listen-controls-v1' in html
+    assert '/assets/app.js?v=20260907-live-audit-nav-v2' in html
     assert './views/notify.js?v=20260906-listen-controls-v1' in app
     assert 'data-notify-task-id' in notify
     assert 'workflowReportModel(detail, detail.active_role)' in notify
@@ -493,7 +493,7 @@ def test_commands_are_a_full_height_board_lane_without_changing_command_semantic
     board_open = html.index('<div id="board" class="board-grid"')
     board_close = html.index("</div>", board_open)
     commands_at = html.index('<aside id="commands"')
-    workspace_at = html.index('<section class="task-workspace"')
+    workspace_at = html.index('<section id="task-workspace" class="task-workspace"')
     command_lane = css.split(".lane.command-lane {", 1)[1].split("}", 1)[0]
 
     assert board_open < commands_at < board_close < workspace_at
@@ -655,6 +655,39 @@ def test_task_goal_blocks_dedupe_and_disclosure_state_contract_is_keyed():
     assert 'details.open = openDisclosureKeys.has(details.dataset.disclosureKey)' in detail
 
 
+def test_dashboard_exposes_role_urls_live_audit_and_page_level_quick_navigation():
+    html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+    app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
+    detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
+    css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
+
+    assert 'class="page-rail"' in html
+    assert 'data-page-jump="task-board"' in html
+    for target in ("overview", "roles", "live", "timeline", "reports"):
+        assert f'data-task-jump="{target}"' in html
+    assert 'id="task-board"' in html
+    assert 'id="task-workspace"' in html
+    assert 'scrollIntoView({behavior: "smooth", block: "start"})' in app
+    assert '[["overview", "Overview"], ["live", "Live audit"], ["reports", `Reports ${model.coverage}`]]' in detail
+    assert 'copy.dataset.copyRoleUrl = role.chat_url' in detail
+    assert 'open.href = role.chat_url' in detail
+    assert 'id: "task-roles"' in detail
+    assert 'id: "task-live"' in detail
+    assert 'id: "task-timeline"' in detail
+    assert 'id: "task-reports"' in detail
+    assert 'for (const source of ["DOM", "LISTEN", "CTRL", "ACTION"])' in detail
+    assert 'current.liveEventsByScope.set(scope, response.data.items || [])' in app
+    assert '.page-rail {' in css
+    assert '.live-event-list {' in css
+    assert '.role-url-actions {' in css
+    assert 'grid-template-columns: 184px minmax(0, 1fr);' in css
+    assert '.task-workspace {\n  display: block;' in css
+    assert 'const inputSection = el("details", null, "role-input-section role-input-disclosure")' in detail
+    assert 'inputSection.dataset.disclosureKey = `role-input-${inputRole}`' in detail
+    assert 'section.className = "detail-section detail-card bootstrap-context-card"' in app
+    assert 'disclosure.className = "bootstrap-context-disclosure"' in app
+
+
 def test_runtime_dom_only_help_describes_both_true_modes_truthfully():
     runtime = (ASSET_ROOT / "views" / "runtime.js").read_text(encoding="utf-8")
     assert "DOM-only compatibility / rollback mode." in runtime
@@ -679,7 +712,7 @@ def test_task_controls_render_before_task_prompt():
     workflow = detail.split("function workflowOverview", 1)[1].split("function build", 1)[0]
     independent = detail.split("function independentOverview", 1)[1].split("function independentHistory", 1)[0]
 
-    assert workflow.index("fragment.append(controls);") < workflow.index("fragment.append(taskSection);")
+    assert workflow.index("fragment.append(operations);") < workflow.index("fragment.append(taskSection);")
     assert independent.index("fragment.append(independentControls(detail));") < independent.index("fragment.append(section);")
 
 

@@ -91,6 +91,7 @@ from .cdpa_store import (
 )
 from .cdpa_team import cleanup_eligible, has_other_nonterminal_team_work
 from .role_indicator import WINDOW_NAME_PREFIX
+from .observability import append_live_event, configure_live_event_log
 from .cdpa_workflow_agents import task_workflow_definitions
 from .chatgpt import (
     ChatGPTAutomationError,
@@ -376,6 +377,7 @@ def _remote_report_path(remote_repository: str, expected_report_path: str) -> st
 class CDPAWorker:
     def __init__(self, config: CDPAConfig, *, store: TaskStore | None = None) -> None:
         self.config = config
+        configure_live_event_log(config.repository_root / ".runtime" / "live-events.jsonl")
         configure_action_delays(
             config.delay_minimum_seconds,
             config.delay_maximum_seconds,
@@ -1285,6 +1287,68 @@ class CDPAWorker:
             raise ValueError(f"task changed at {path}; reload before applying control")
         return json.loads(json.dumps(after, ensure_ascii=False, default=str))
 
+    def _record_controller_live_transition(
+        self,
+        before: Mapping[str, Any],
+        after: Mapping[str, Any],
+    ) -> None:
+        def hop_for(value: Mapping[str, Any]) -> Mapping[str, Any]:
+            active = value.get("active_hop_id")
+            return next(
+                (
+                    item
+                    for item in value.get("hops") or ()
+                    if isinstance(item, Mapping) and item.get("hop_id") == active
+                ),
+                {},
+            )
+
+        before_hop = hop_for(before)
+        after_hop = hop_for(after)
+        before_values = {
+            "status": before.get("status"),
+            "active_role": before.get("active_role"),
+            "active_action": before.get("active_action"),
+            "block_code": before.get("block_code"),
+            "waiting_reason": before.get("waiting_reason"),
+            "hop_id": before.get("active_hop_id"),
+            "hop_state": before_hop.get("state"),
+        }
+        values = {
+            "status": after.get("status"),
+            "active_role": after.get("active_role"),
+            "active_action": after.get("active_action"),
+            "block_code": after.get("block_code"),
+            "waiting_reason": after.get("waiting_reason"),
+            "hop_id": after.get("active_hop_id"),
+            "hop_state": after_hop.get("state"),
+        }
+        changes = {
+            field: {"from": before_values.get(field), "to": value}
+            for field, value in values.items()
+            if before_values.get(field) != value
+        }
+        if not changes:
+            return
+        role = str(after.get("active_role") or before.get("active_role") or "").upper()
+        role_record = (after.get("roles") or {}).get(role)
+        if not isinstance(role_record, Mapping):
+            role_record = (before.get("roles") or {}).get(role)
+        role_record = role_record if isinstance(role_record, Mapping) else {}
+        append_live_event(
+            "CTRL",
+            "state_transition",
+            page_url=str(role_record.get("page_url") or ""),
+            page_id=str(role_record.get("page_id") or "") or None,
+            role=role or None,
+            task_id=str(after.get("task_id") or before.get("task_id") or "") or None,
+            team=str(after.get("team") or before.get("team") or "") or None,
+            request_id=str(after_hop.get("request_id") or before_hop.get("request_id") or "") or None,
+            generation=int(role_record.get("conversation_generation") or 0),
+            changes=changes,
+            values=values,
+        )
+
     def _persist_control_result(
         self,
         manifest_path: Path,
@@ -1362,6 +1426,7 @@ class CDPAWorker:
             return current
 
         saved = self.store.update(manifest_path, merge)
+        self._record_controller_live_transition(before, saved)
         self._remember_manifest(manifest_path, saved)
         return saved
 
@@ -1402,6 +1467,7 @@ class CDPAWorker:
             return current
 
         saved = self.store.update(manifest_path, merge)
+        self._record_controller_live_transition(before, saved)
         self._remember_manifest(manifest_path, saved)
         return saved
 
@@ -3497,6 +3563,8 @@ class CDPAWorker:
             accepted_user_message_id=(
                 receipt.user_message_id if receipt is not None else None
             ),
+            task_id=str(state.get("task_id") or "") or None,
+            team=str(state.get("team") or "") or None,
         )
 
     @staticmethod

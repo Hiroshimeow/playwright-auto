@@ -142,34 +142,76 @@ function tags(values) {
   return list;
 }
 
+function detailCard(title, {id = null, className = ""} = {}) {
+  const section = el("section", null, `detail-section detail-card${className ? ` ${className}` : ""}`);
+  if (id) section.id = id;
+  if (title) section.append(el("h3", title));
+  return section;
+}
+
 function rolesSection(detail, selectedRole) {
-  const roles = el("section", null, "detail-section");
-  roles.append(el("h3", "Roles / tabs"));
+  const roles = detailCard("Roles / tabs", {id: "task-roles", className: "roles-card"});
   const roleList = el("div", null, "role-list");
   for (const role of detail.roles || []) {
-    const row = el("button", null, `role-row${role.logical_role === selectedRole ? " selected" : ""}`);
-    row.type = "button";
-    row.dataset.roleSelect = role.logical_role;
-    row.dataset.taskId = detail.task_id;
-    row.append(el("strong", role.logical_role), el("span", role.physical_role));
+    const row = el("article", null, `role-row${role.logical_role === selectedRole ? " selected" : ""}`);
+    const select = el("button", null, "role-select");
+    select.type = "button";
+    select.dataset.roleSelect = role.logical_role;
+    select.dataset.taskId = detail.task_id;
+    const identity = el("span", null, "role-identity");
+    identity.append(el("strong", role.logical_role), el("span", role.physical_role, "role-physical"));
     const availability = role.online == null ? "unknown" : role.online ? "online" : "offline";
-    row.append(el("span", availability, availability));
+    select.append(identity, el("span", availability, `role-availability ${availability}`));
+    row.append(select);
+
+    const urlArea = el("div", null, "role-url-area");
+    if (role.chat_url) {
+      const url = el("code", role.chat_url, "role-url");
+      url.title = role.chat_url;
+      const actions = el("div", null, "role-url-actions");
+      const open = el("a", "Open ↗", "role-url-action");
+      open.href = role.chat_url;
+      open.target = "_blank";
+      open.rel = "noopener";
+      const copy = el("button", "Copy URL", "role-url-action");
+      copy.type = "button";
+      copy.dataset.copyRoleUrl = role.chat_url;
+      copy.dataset.taskId = detail.task_id;
+      copy.dataset.role = role.logical_role;
+      actions.append(open, copy);
+      urlArea.append(url, actions);
+    } else {
+      urlArea.append(el("span", "No conversation URL yet", "muted role-url-empty"));
+    }
+    row.append(urlArea);
     roleList.append(row);
   }
   roles.append(roleList);
 
   const input = selectedInput(detail, selectedRole);
-  const inputSection = el("div", null, "role-input-section");
-  inputSection.append(el("h3", `${input?.logical_role || selectedRole || detail.active_role || "Role"} input / handoff`));
-  if (input?.input) inputSection.append(el("pre", input.input, "role-input"));
-  else inputSection.append(el("p", "No input is available for this role.", "muted"));
-  if (input?.handoff) inputSection.append(el("p", `Handoff: ${input.handoff}`, "handoff-label"));
+  const inputRole = input?.logical_role || selectedRole || detail.active_role || "Role";
+  const inputSection = el("details", null, "role-input-section role-input-disclosure");
+  inputSection.dataset.disclosureKey = `role-input-${inputRole}`;
+  const inputSummary = el("summary", null, "role-input-summary");
+  const inputSummaryText = input?.input
+    ? `${String(input.input).length.toLocaleString()} chars${input?.handoff ? " · handoff available" : ""}`
+    : "No input available";
+  inputSummary.append(
+    el("strong", `${inputRole} input / handoff`),
+    el("span", inputSummaryText, "muted"),
+  );
+  inputSection.append(inputSummary);
+  const inputBody = el("div", null, "role-input-body");
+  if (input?.input) inputBody.append(el("pre", input.input, "role-input"));
+  else inputBody.append(el("p", "No input is available for this role.", "muted"));
+  if (input?.handoff) inputBody.append(el("p", `Handoff: ${input.handoff}`, "handoff-label"));
+  inputSection.append(inputBody);
   roles.append(inputSection);
   return roles;
 }
 
 function timelineSection(detail, timeline) {
-  const section = el("section", null, "detail-section");
+  const section = detailCard("", {id: "task-timeline", className: "timeline-card"});
   const title = el("div", null, "section-inline");
   title.append(el("h3", "Timeline"));
   if (detail.timeline_total > timeline.length) {
@@ -366,7 +408,7 @@ function workflowTabs(detail, selectedTab) {
   const tabs = detailTabs(
     detail,
     selectedTab,
-    [["overview", "Overview"], ["reports", `Reports ${model.coverage}`]],
+    [["overview", "Overview"], ["live", "Live audit"], ["reports", `Reports ${model.coverage}`]],
     "Workflow task detail",
   );
   tabs.classList.add("workflow-detail-tabs");
@@ -374,7 +416,7 @@ function workflowTabs(detail, selectedTab) {
 }
 
 function workflowReports(detail, selectedRole, selectedReportUrl, reportBodies) {
-  const section = el("section", null, "detail-section workflow-reports");
+  const section = detailCard("Reports", {id: "task-reports", className: "workflow-reports"});
   const model = workflowReportModel(detail, selectedRole, selectedReportUrl);
   const layout = el("div", null, "workflow-report-layout");
   const navigator = el("div", null, "report-role-nav");
@@ -432,7 +474,7 @@ function workflowReports(detail, selectedRole, selectedReportUrl, reportBodies) 
 function dependencySection(detail) {
   const dependencies = detail.dependencies || [];
   if (!dependencies.length) return null;
-  const section = el("section", null, "detail-section");
+  const section = detailCard("", {className: "dependencies-card"});
   section.append(el("h3", dependencies.length === 1 ? "Parent" : "Parents"));
   const list = el("div", null, "history-list");
   for (const dependency of dependencies) {
@@ -450,8 +492,99 @@ function dependencySection(detail) {
   return section;
 }
 
+function liveValue(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function workflowLive(detail, selectedRole, liveState = {}) {
+  const section = detailCard("Live audit", {id: "task-live", className: "live-audit"});
+  const role = selectedRole || detail.active_role || null;
+  const selected = (detail.roles || []).find(item => item.logical_role === role) || null;
+  const header = el("div", null, "live-audit-head");
+  const identity = el("div", null, "live-audit-identity");
+  identity.append(el("strong", role || "All roles"));
+  identity.append(el("span", selected?.chat_url || "No conversation URL", "muted"));
+  header.append(identity);
+  if (selected?.chat_url) {
+    const actions = el("div", null, "role-url-actions");
+    const open = el("a", "Open ↗", "role-url-action");
+    open.href = selected.chat_url;
+    open.target = "_blank";
+    open.rel = "noopener";
+    const copy = el("button", "Copy URL", "role-url-action");
+    copy.type = "button";
+    copy.dataset.copyRoleUrl = selected.chat_url;
+    copy.dataset.taskId = detail.task_id;
+    copy.dataset.role = role || "";
+    actions.append(open, copy);
+    header.append(actions);
+  }
+  section.append(header);
+
+  if (liveState.status === "loading" && !(liveState.items || []).length) {
+    section.append(el("p", "Loading live telemetry…", "muted"));
+    return section;
+  }
+  if (liveState.error) {
+    section.append(el("p", `Live telemetry unavailable: ${liveState.error}`, "live-error"));
+  }
+  const items = [...(liveState.items || [])].reverse();
+  if (!items.length) {
+    section.append(el("p", "No semantic DOM / Listen / controller events have been captured for this role yet.", "muted"));
+    return section;
+  }
+  const legend = el("div", null, "live-legend");
+  for (const source of ["DOM", "LISTEN", "CTRL", "ACTION"]) legend.append(el("span", source, `live-source source-${source.toLowerCase()}`));
+  section.append(legend);
+  const list = el("div", null, "live-event-list");
+  for (const event of items) {
+    const card = el("article", null, "live-event");
+    const top = el("div", null, "live-event-head");
+    const time = el("time", timelineTime(event.at));
+    if (event.at) {
+      time.dateTime = event.at;
+      time.title = event.at;
+      time.dataset.timeAt = event.at;
+    }
+    top.append(
+      time,
+      el("span", event.source || "EVENT", `live-source source-${String(event.source || "event").toLowerCase()}`),
+      el("strong", event.kind || "event"),
+    );
+    card.append(top);
+    const changes = event.changes && typeof event.changes === "object" ? Object.entries(event.changes) : [];
+    if (changes.length) {
+      const grid = el("dl", null, "live-change-grid");
+      for (const [field, change] of changes) {
+        grid.append(
+          el("dt", field),
+          el("dd", `${liveValue(change?.from)} → ${liveValue(change?.to)}`),
+        );
+      }
+      card.append(grid);
+    } else if (event.values && Object.keys(event.values).length) {
+      const grid = el("dl", null, "live-change-grid live-values-grid");
+      for (const [field, value] of Object.entries(event.values)) {
+        if (value === null || value === undefined || value === "") continue;
+        grid.append(el("dt", field), el("dd", liveValue(value)));
+      }
+      card.append(grid);
+    }
+    const meta = [event.team, event.task_id, event.role, event.page_id, event.request_id]
+      .filter(Boolean).join(" · ");
+    if (meta) card.append(el("p", meta, "live-event-meta"));
+    if (event.detail) card.append(el("p", event.detail, "live-event-detail"));
+    list.append(card);
+  }
+  section.append(list);
+  return section;
+}
+
 function workflowOverview(detail, timeline, selectedRole) {
   const fragment = document.createDocumentFragment();
+  const operations = detailCard("Operations", {id: "task-overview", className: "operations-card"});
   const controls = el("div", null, "control-grid");
   if (detail.status === "RUNNING") controls.append(changeGoalButton(detail));
   for (const [action, label] of [
@@ -469,11 +602,12 @@ function workflowOverview(detail, timeline, selectedRole) {
       reason: eligibility.reason || null,
     }));
   }
-  fragment.append(controls);
+  operations.append(controls);
+  fragment.append(operations);
   const dependencies = dependencySection(detail);
   if (dependencies) fragment.append(dependencies);
 
-  const taskSection = el("section", null, "detail-section task-goal-section");
+  const taskSection = detailCard("Task / goal", {className: "task-goal-section"});
   for (const block of taskGoalBlocks(detail)) {
     const details = el("details", null, "task-disclosure");
     details.dataset.disclosureKey = block.key;
@@ -517,7 +651,7 @@ function workflowOverview(detail, timeline, selectedRole) {
   return fragment;
 }
 
-function build(detail, timeline, selectedRole, selectedTab, selectedReportUrl, reportBodies) {
+function build(detail, timeline, selectedRole, selectedTab, selectedReportUrl, reportBodies, liveState) {
   const fragment = document.createDocumentFragment();
   const agent = detail.task_mode === "independent" ? (detail.agent || {}) : null;
   const displayTitle = agent
@@ -531,13 +665,15 @@ function build(detail, timeline, selectedRole, selectedTab, selectedReportUrl, r
   fragment.append(head);
 
   if (!agent) {
-    const tab = ["overview", "reports"].includes(selectedTab) ? selectedTab : "overview";
+    const tab = ["overview", "live", "reports"].includes(selectedTab) ? selectedTab : "overview";
     fragment.append(workflowTabs(detail, tab));
     const panel = el("div", null, "independent-tab-panel");
     panel.setAttribute("role", "tabpanel");
     panel.append(tab === "reports"
       ? workflowReports(detail, selectedRole, selectedReportUrl, reportBodies)
-      : workflowOverview(detail, timeline, selectedRole));
+      : tab === "live"
+        ? workflowLive(detail, selectedRole, liveState)
+        : workflowOverview(detail, timeline, selectedRole));
     fragment.append(panel);
     return fragment;
   }
@@ -584,6 +720,7 @@ export function renderTaskDetail(
   selectedReportUrl = null,
   reportBodies = new Map(),
   reportRevision = 0,
+  liveState = {},
 ) {
   if (!detail || detail.task_id !== selectedTaskId) {
     const signature = JSON.stringify(["unavailable", selectedTaskId, status, error]);
@@ -598,7 +735,7 @@ export function renderTaskDetail(
   }
   const signature = JSON.stringify([
     detail.projection_sha256, detail.version, timeline, selectedRole,
-    selectedTab, reportRevision,
+    selectedTab, reportRevision, liveState,
   ]);
   if (root.dataset.signature === signature) return;
   const sameTask = root.dataset.taskId === selectedTaskId;
@@ -607,7 +744,7 @@ export function renderTaskDetail(
   if (sameTask && selection && !selection.isCollapsed && root.contains(selection.anchorNode)) {
     root._pendingRender = () => renderTaskDetail(
       root, detail, timeline, selectedRole, selectedTaskId, status, error,
-      selectedTab, selectedReportUrl, reportBodies, reportRevision,
+      selectedTab, selectedReportUrl, reportBodies, reportRevision, liveState,
     );
     return;
   }
@@ -615,7 +752,7 @@ export function renderTaskDetail(
     [...root.querySelectorAll("details[data-disclosure-key][open]")].map(details => details.dataset.disclosureKey),
   ) : new Set();
   const scroll = root.scrollTop;
-  root.replaceChildren(build(detail, timeline, selectedRole, selectedTab, selectedReportUrl, reportBodies));
+  root.replaceChildren(build(detail, timeline, selectedRole, selectedTab, selectedReportUrl, reportBodies, liveState));
   for (const details of root.querySelectorAll("details[data-disclosure-key]")) {
     details.open = openDisclosureKeys.has(details.dataset.disclosureKey);
   }

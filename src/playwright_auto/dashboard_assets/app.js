@@ -5,7 +5,7 @@ import {
   detailCacheGet, detailCachePut, detailCacheInvalidate, pruneDetailCache,
 } from "./store.js";
 import {renderBoard, refreshElapsed} from "./views/board.js";
-import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260906-listen-controls-v1";
+import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260907-live-audit-nav-v2";
 import {renderHistory} from "./views/history.js";
 import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20260906-listen-controls-v1";
 import {renderRuntime} from "./views/runtime.js?v=20260906-listen-controls-v1";
@@ -17,6 +17,7 @@ import {
 const roots = {
   board: document.querySelector("#board"),
   detail: document.querySelector("#task-detail"),
+  taskRail: document.querySelector("[data-task-rail]"),
   commands: document.querySelector("#commands"),
   services: document.querySelector("#service-status"),
   catalog: document.querySelector("#catalog-health"),
@@ -581,6 +582,35 @@ function selectedRole(current) {
   return current.selectedRoleByTask.get(taskId) || current.selectedDetail?.active_role || null;
 }
 
+function selectedDetailTab(current) {
+  return current.selectedIndependentTabByTask.get(current.selectedTaskId) || "overview";
+}
+
+function liveScopeKey(taskId, role) {
+  return `${taskId}:${role || "all"}`;
+}
+
+function selectedLiveState(current) {
+  const taskId = current.selectedTaskId;
+  if (!taskId) return {};
+  const scope = liveScopeKey(taskId, selectedRole(current));
+  return {
+    items: current.liveEventsByScope.get(scope) || [],
+    status: current.liveEventsStatusByScope.get(scope) || "idle",
+    error: current.liveEventsErrorByScope.get(scope) || null,
+  };
+}
+
+function renderPageRail(current) {
+  if (!roots.taskRail) return;
+  roots.taskRail.hidden = !current.selectedTaskId;
+  const tab = selectedDetailTab(current);
+  for (const node of document.querySelectorAll("[data-task-jump]")) {
+    const target = node.dataset.taskJump;
+    node.classList.toggle("active", target === tab);
+  }
+}
+
 function commandPresentation(command) {
   const result = command.result || {};
   if (result.reason_code === "stale_worker") {
@@ -676,12 +706,23 @@ function renderBootstrapContext(detail) {
   }
   const signature = JSON.stringify(context);
   if (existing?.dataset.signature === signature) return;
+  const wasOpen = Boolean(existing?.querySelector("details")?.open);
   const section = existing || document.createElement("section");
   section.dataset.bootstrapContext = "";
   section.dataset.signature = signature;
-  section.className = "detail-section";
+  section.className = "detail-section detail-card bootstrap-context-card";
+  const disclosure = document.createElement("details");
+  disclosure.className = "bootstrap-context-disclosure";
+  disclosure.open = wasOpen;
+  const summary = document.createElement("summary");
   const title = document.createElement("strong");
   title.textContent = `Context · ${context.name || "Fresh context"}`;
+  const hint = document.createElement("span");
+  hint.className = "muted";
+  hint.textContent = context.bootstrap_id ? `Bootstrap ${context.bootstrap_id}` : "Fresh context";
+  summary.append(title, hint);
+  const body = document.createElement("div");
+  body.className = "bootstrap-context-body";
   const meta = document.createElement("p");
   meta.textContent = context.bootstrap_id ? `Bootstrap ${context.bootstrap_id}` : "Fresh context";
   const roles = document.createElement("p");
@@ -689,7 +730,9 @@ function renderBootstrapContext(detail) {
     const fallback = value?.fallback && value.fallback !== "none" ? ` · ${value.fallback}` : "";
     return `${role}: ${value?.source || "pending"}${fallback}`;
   }).join(" · ");
-  section.replaceChildren(title, meta, roles);
+  body.append(meta, roles);
+  disclosure.append(summary, body);
+  section.replaceChildren(disclosure);
   if (!existing) roots.detail.append(section);
 }
 
@@ -703,11 +746,13 @@ function render(current) {
     current.selectedTaskId,
     current.selectedDetailStatus,
     current.selectedDetailError,
-    current.selectedIndependentTabByTask.get(current.selectedTaskId) || "overview",
+    selectedDetailTab(current),
     selectedReportByTask.get(current.selectedTaskId) || null,
     reportBodies,
     current.agentReportsRevision,
+    selectedLiveState(current),
   );
+  renderPageRail(current);
   renderBootstrapContext(current.selectedDetail);
   renderCommands(current);
   renderRuntime(roots.services, current);
@@ -807,6 +852,7 @@ function applyDetail(taskId, detail) {
     }
   });
   if (state.selectedIndependentTabByTask.get(taskId) === "reports") loadReports(detail);
+  if (state.selectedIndependentTabByTask.get(taskId) === "live") loadLiveAudit();
   return true;
 }
 
@@ -863,6 +909,40 @@ export async function loadTaskDetail(taskId, {force = false} = {}) {
   } catch (error) {
     failDetailLoad(taskId, error.message);
     toast(error.message);
+    return null;
+  }
+}
+
+export async function loadLiveAudit() {
+  const taskId = state.selectedTaskId;
+  const detail = state.selectedDetail;
+  if (!taskId || !detail || detail.task_mode === "independent" || selectedDetailTab(state) !== "live") return null;
+  const role = selectedRole(state);
+  const suffix = role ? `?limit=100&role=${encodeURIComponent(role)}` : "?limit=100";
+  const scope = liveScopeKey(taskId, role);
+  const key = `live:${scope}`;
+  if (!state.liveEventsByScope.has(scope)) {
+    commit(current => {
+      current.liveEventsStatusByScope.set(scope, "loading");
+      current.liveEventsErrorByScope.delete(scope);
+    });
+  }
+  try {
+    const response = await client.request(key, `/api/tasks/${encodeURIComponent(taskId)}/live${suffix}`);
+    if (state.selectedTaskId !== taskId || selectedDetailTab(state) !== "live") return response.data;
+    commit(current => {
+      current.liveEventsByScope.set(scope, response.data.items || []);
+      current.liveEventsStatusByScope.set(scope, "ready");
+      current.liveEventsErrorByScope.delete(scope);
+    });
+    return response.data;
+  } catch (error) {
+    if (state.selectedTaskId === taskId) {
+      commit(current => {
+        current.liveEventsStatusByScope.set(scope, "error");
+        current.liveEventsErrorByScope.set(scope, error.message);
+      });
+    }
     return null;
   }
 }
@@ -1044,7 +1124,7 @@ async function queueCommand({kind, taskId = "runtime", endpoint, body, label}) {
 }
 
 async function refresh() {
-  await Promise.all([loadBoard(), loadRuntime(), fetchAgents(), pollCommands()]);
+  await Promise.all([loadBoard(), loadRuntime(), fetchAgents(), pollCommands(), loadLiveAudit()]);
 }
 
 function overlayName() {
@@ -1167,7 +1247,7 @@ roots.detail.addEventListener("scroll", () => {
   scheduleViewSave();
 }, {passive: true});
 
-roots.detail.addEventListener("click", event => {
+roots.detail.addEventListener("click", async event => {
   const removeParent = event.target.closest("[data-remove-parent]");
   if (removeParent) {
     const taskId = removeParent.dataset.taskId;
@@ -1194,6 +1274,7 @@ roots.detail.addEventListener("click", event => {
     const tab = detailTab.dataset.detailTab;
     commit(current => { current.selectedIndependentTabByTask.set(taskId, tab); });
     if (tab === "reports") loadReports(state.selectedDetail);
+    if (tab === "live") loadLiveAudit();
     return;
   }
   const independent = event.target.closest("[data-independent-action]");
@@ -1218,6 +1299,16 @@ roots.detail.addEventListener("click", event => {
     }
     return;
   }
+  const copyRoleUrl = event.target.closest("[data-copy-role-url]");
+  if (copyRoleUrl) {
+    try {
+      await navigator.clipboard.writeText(copyRoleUrl.dataset.copyRoleUrl);
+      toast(`Copied ${copyRoleUrl.dataset.role || "role"} URL`);
+    } catch (error) {
+      toast(`Copy failed: ${error.message}`);
+    }
+    return;
+  }
   const report = event.target.closest("[data-report-select]");
   if (report) {
     const taskId = report.dataset.taskId;
@@ -1232,6 +1323,7 @@ roots.detail.addEventListener("click", event => {
   if (role) {
     selectedReportByTask.delete(role.dataset.taskId);
     commit(current => { current.selectedRoleByTask.set(role.dataset.taskId, role.dataset.roleSelect); });
+    if (selectedDetailTab(state) === "live") loadLiveAudit();
     return;
   }
   const control = event.target.closest("[data-control]");
@@ -1309,6 +1401,27 @@ roots.secondaryDialog.addEventListener("close", () => {
 });
 
 document.addEventListener("click", async event => {
+  const pageJump = event.target.closest("[data-page-jump]");
+  if (pageJump) {
+    document.getElementById(pageJump.dataset.pageJump)?.scrollIntoView({behavior: "smooth", block: "start"});
+    return;
+  }
+  const taskJump = event.target.closest("[data-task-jump]");
+  if (taskJump && state.selectedTaskId) {
+    const target = taskJump.dataset.taskJump;
+    const tab = target === "live" ? "live" : target === "reports" ? "reports" : "overview";
+    commit(current => { current.selectedIndependentTabByTask.set(current.selectedTaskId, tab); });
+    if (tab === "reports") loadReports(state.selectedDetail);
+    if (tab === "live") loadLiveAudit();
+    requestAnimationFrame(() => {
+      const id = target === "roles" ? "task-roles"
+        : target === "timeline" ? "task-timeline"
+          : target === "live" ? "task-live"
+            : target === "reports" ? "task-reports" : "task-overview";
+      document.getElementById(id)?.scrollIntoView({behavior: "smooth", block: "start"});
+    });
+    return;
+  }
   const domOnlyToggle = event.target.closest("[data-dom-only]");
   if (domOnlyToggle) {
     const previousDomOnly = state.runtime?.settings?.dom_only === true;

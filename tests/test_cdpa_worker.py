@@ -296,6 +296,8 @@ def test_worker_arms_passive_observer_with_exact_hop_generation_and_receipt(tmp_
             "generation": 7,
             "conversation_id": "conversation-passive",
             "accepted_user_message_id": "u-passive",
+            "task_id": "task-passive-observer-wiring",
+            "team": "alpha",
         }
     ]
 

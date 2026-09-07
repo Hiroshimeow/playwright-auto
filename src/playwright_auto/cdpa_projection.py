@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from urllib.parse import urlsplit, urlunsplit
 
 from .cdpa_commands import workflow_control_matrix
 from .cdpa_config import CDPA_ROLES, declared_repository_from_task, remote_repository_from_task
@@ -54,6 +55,13 @@ def _public_role(value: object) -> str | None:
         return upper
     tail = re.split(r"[-_:]", text)[-1].upper()
     return tail if tail in PUBLIC_ROLES else None
+
+
+def _public_chat_url(value: object) -> str | None:
+    parsed = urlsplit(str(value or "").strip())
+    if parsed.scheme != "https" or parsed.hostname not in {"chatgpt.com", "www.chatgpt.com"}:
+        return None
+    return urlunsplit(("https", "chatgpt.com", parsed.path or "/", "", ""))
 
 
 _PRIVATE_IDENTITY_KEYS = frozenset(
@@ -139,10 +147,14 @@ def _private_identity_values(value: object) -> tuple[str, ...]:
 
 def _redact_private_identities(value: object, identities: Sequence[str]) -> Any:
     if isinstance(value, Mapping):
-        return {
-            str(key): _redact_private_identities(item, identities)
-            for key, item in value.items()
-        }
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            public_key = str(key)
+            if public_key == "chat_url":
+                result[public_key] = _public_chat_url(item)
+            else:
+                result[public_key] = _redact_private_identities(item, identities)
+        return result
     if isinstance(value, (list, tuple)):
         return [_redact_private_identities(item, identities) for item in value]
     if isinstance(value, str):
@@ -234,6 +246,9 @@ def _roles(
                 "status": str(value.get("status") or "unknown"),
                 "turn": int(value.get("turn") or 0),
                 "online": online,
+                "chat_url": _public_chat_url(
+                    (page or {}).get("url") or value.get("page_url")
+                ),
                 "last_error": sanitize_text(value.get("last_error"), max_chars=500) or None,
                 "last_activity_at": value.get("last_activity_at"),
             }

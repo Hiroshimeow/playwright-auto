@@ -162,6 +162,8 @@ def test_projection_splits_public_and_private_data(tmp_path: Path):
     assert projection.detail["active_input"]["logical_role"] == "DEV"
     assert projection.detail["active_input"]["hop_id"] == 2
     assert projection.detail["role_inputs"]["PLAN"]["handoff"].endswith("alpha-plan_turn1_task-a.md")
+    assert projection.detail["roles"][0]["chat_url"] == "https://chatgpt.com/c/abc"
+    assert "token=secret" not in projection.detail["roles"][0]["chat_url"]
     eligibility = projection.detail["control_eligibility"]
     assert eligibility["pause"]["eligible"] is True
     assert eligibility["resume"]["eligible"] is True
@@ -175,6 +177,20 @@ def test_projection_splits_public_and_private_data(tmp_path: Path):
     assert eligibility["restart_role"]["reason"]
     assert "/home/ayumi" not in public
     assert "secret-value" not in public
+
+
+def test_projection_exposes_only_canonical_chat_url_even_when_it_matches_private_page_url(tmp_path: Path):
+    task = raw_task(tmp_path)
+    exact = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111"
+    task["roles"]["DEV"]["page_url"] = exact
+
+    projection = build_task_projection(task, tasks=[task])
+
+    role = projection.detail["roles"][0]
+    assert role["chat_url"] == exact
+    public = json.dumps({"summary": projection.summary, "detail": projection.detail})
+    assert '"page_url"' not in public
+    assert '"conversation_url"' not in public
 
 
 def test_projection_hydrates_missing_file_report_evidence_inside_task_team_root(tmp_path: Path):

@@ -13,6 +13,11 @@ from uuid import uuid4
 _ACTION_EVENT_LOG = Path(
     os.environ.get("PLAYWRIGHT_AUTO_ACTION_LOG", ".runtime/action-events.jsonl")
 )
+_LIVE_EVENT_LOG = Path(
+    os.environ.get("PLAYWRIGHT_AUTO_LIVE_LOG", ".runtime/live-events.jsonl")
+)
+_LIVE_EVENT_MAX_BYTES = 4 * 1024 * 1024
+_LIVE_EVENT_ENABLED = bool(os.environ.get("PLAYWRIGHT_AUTO_LIVE_LOG"))
 
 
 def configure_action_event_log(path: str | Path) -> Path:
@@ -23,6 +28,123 @@ def configure_action_event_log(path: str | Path) -> Path:
 
 def action_event_log_path() -> Path:
     return _ACTION_EVENT_LOG
+
+
+def configure_live_event_log(path: str | Path, *, enabled: bool = True) -> Path:
+    global _LIVE_EVENT_LOG, _LIVE_EVENT_ENABLED
+    _LIVE_EVENT_LOG = Path(path)
+    _LIVE_EVENT_ENABLED = bool(enabled)
+    return _LIVE_EVENT_LOG
+
+
+def live_event_log_path() -> Path:
+    return _LIVE_EVENT_LOG
+
+
+def live_event_logging_enabled() -> bool:
+    return _LIVE_EVENT_ENABLED
+
+
+def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        os.write(descriptor, encoded)
+    finally:
+        os.close(descriptor)
+
+
+def _trim_live_log(path: Path, *, max_bytes: int = _LIVE_EVENT_MAX_BYTES) -> None:
+    try:
+        if path.stat().st_size <= max_bytes:
+            return
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return
+    keep = data[-(max_bytes // 2) :]
+    newline = keep.find(b"\n")
+    if newline >= 0:
+        keep = keep[newline + 1 :]
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(keep)
+    os.replace(temporary, path)
+
+
+def append_live_event(
+    source: str,
+    kind: str,
+    *,
+    page_url: str = "",
+    page_id: str | None = None,
+    role: str | None = None,
+    task_id: str | None = None,
+    team: str | None = None,
+    request_id: str | None = None,
+    generation: int | None = None,
+    changes: dict[str, Any] | None = None,
+    values: dict[str, Any] | None = None,
+    detail: str | None = None,
+) -> dict[str, Any]:
+    now = time.time()
+    payload: dict[str, Any] = {
+        "event_id": f"live-{uuid4().hex}",
+        "at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        "at_epoch": now,
+        "pid": os.getpid(),
+        "source": str(source).upper(),
+        "kind": str(kind),
+        "page_url": str(page_url or ""),
+        "page_id": page_id,
+        "role": role,
+        "task_id": task_id,
+        "team": team,
+        "request_id": request_id,
+        "generation": generation,
+        "changes": dict(changes or {}),
+        "values": dict(values or {}),
+        "detail": detail,
+    }
+    if _LIVE_EVENT_ENABLED:
+        _append_jsonl(_LIVE_EVENT_LOG, payload)
+        _trim_live_log(_LIVE_EVENT_LOG)
+    return payload
+
+
+def read_recent_live_events(
+    path: str | Path | None = None,
+    *,
+    limit: int = 200,
+    task_id: str | None = None,
+    role: str | None = None,
+) -> list[dict[str, Any]]:
+    if limit < 1 or limit > 1000:
+        raise ValueError("limit must be between 1 and 1000")
+    target = Path(path) if path is not None else _LIVE_EVENT_LOG
+    if not target.exists():
+        return []
+    expected_task = str(task_id or "").strip()
+    expected_role = str(role or "").strip().upper()
+    events: list[dict[str, Any]] = []
+    for line_number, line in enumerate(
+        target.read_text(encoding="utf-8", errors="replace").splitlines(), start=1
+    ):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, dict):
+            continue
+        if expected_task and str(value.get("task_id") or "") != expected_task:
+            continue
+        if expected_role and str(value.get("role") or "").upper() != expected_role:
+            continue
+        if not str(value.get("event_id") or "").strip():
+            value["event_id"] = (
+                f"legacy-live-{line_number}-{hashlib.sha256(line.encode('utf-8')).hexdigest()[:16]}"
+            )
+        events.append(value)
+    return events[-limit:]
 
 
 def append_action_event(
@@ -51,14 +173,7 @@ def append_action_event(
         "delay_seconds": delay_seconds,
         "detail": detail,
     }
-    path = _ACTION_EVENT_LOG
-    path.parent.mkdir(parents=True, exist_ok=True)
-    encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
-    descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-    try:
-        os.write(descriptor, encoded)
-    finally:
-        os.close(descriptor)
+    _append_jsonl(_ACTION_EVENT_LOG, payload)
     return payload
 
 
@@ -145,19 +260,37 @@ async def record_page_action(
               page_id: sessionStorage.getItem('playwright-auto:page-id'),
               role: sessionStorage.getItem('playwright-auto:role'),
               task_id: sessionStorage.getItem('playwright-auto:task-id'),
+              team: sessionStorage.getItem('playwright-auto:team'),
             })"""
         )
     except Exception:
         metadata = {}
     if not isinstance(metadata, dict):
         metadata = {}
-    return append_action_event(
+    page_url = str(getattr(page, "url", "") or "")
+    event = append_action_event(
         action,
         phase,
-        page_url=str(getattr(page, "url", "") or ""),
+        page_url=page_url,
         page_id=metadata.get("page_id"),
         role=metadata.get("role"),
         task_id=metadata.get("task_id"),
         delay_seconds=delay_seconds,
         detail=detail,
     )
+    append_live_event(
+        "ACTION",
+        f"{action}:{phase}",
+        page_url=page_url,
+        page_id=metadata.get("page_id"),
+        role=metadata.get("role"),
+        task_id=metadata.get("task_id"),
+        team=metadata.get("team"),
+        values={
+            "action": str(action),
+            "phase": str(phase),
+            **({"delay_seconds": delay_seconds} if delay_seconds is not None else {}),
+        },
+        detail=detail,
+    )
+    return event
