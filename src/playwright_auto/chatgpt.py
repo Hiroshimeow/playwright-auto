@@ -320,7 +320,14 @@ def _page_wait_state(page: Any) -> dict[str, Any]:
 
 
 def _page_ambient_observation_state(page: Any) -> dict[str, Any]:
-    state: dict[str, Any] = {"listener": None, "permission_action": None, "tasks": set()}
+    state: dict[str, Any] = {
+        "listener": None,
+        "navigation_listener": None,
+        "navigation_epoch": 0,
+        "permission_action": None,
+        "permission_page_url": None,
+        "tasks": set(),
+    }
     try:
         existing = _PAGE_AMBIENT_OBSERVATION_STATES.get(page)
         if existing is not None:
@@ -2616,7 +2623,6 @@ async def click_mcp_permission_allow(
           const acceptedIndex = messages.findIndex(
             (node) => node.getAttribute('data-message-id') === expectedUserMessageId
           );
-          if (acceptedIndex < 0) return {ok: false, method: 'accepted_user_missing'};
 
           const permissionPattern = /^Allow (mcp-[A-Za-z0-9._-]+) for this conversation$/i;
           const permissionNodes = [...document.querySelectorAll('button[aria-label]')]
@@ -2649,7 +2655,7 @@ async def click_mcp_permission_allow(
             }
             return found;
           };
-          const laterUserTurnExists = messages.slice(acceptedIndex + 1).some(
+          const laterUserTurnExists = acceptedIndex >= 0 && messages.slice(acceptedIndex + 1).some(
             (message) => message.getAttribute('data-message-author-role') === 'user'
           );
           const candidates = [];
@@ -2690,7 +2696,7 @@ async def click_mcp_permission_allow(
               const targetIndex = messages.findIndex(
                 (message) => message.getAttribute('data-message-id') === action.target_message_id
               );
-              if (targetIndex >= 0 && targetIndex <= acceptedIndex) continue;
+              if (acceptedIndex >= 0 && targetIndex >= 0 && targetIndex <= acceptedIndex) continue;
               if (targetIndex < 0 && laterUserTurnExists) continue;
               if (expectedTargetMessageId && action.target_message_id !== expectedTargetMessageId) continue;
               candidates.push({connector, node, handler, action});
@@ -3713,15 +3719,37 @@ class ChatGPTPage:
     def install_ambient_observer(self) -> None:
         """Attach one page-lifetime listener for MCP permission actions."""
         state = _page_ambient_observation_state(self.page)
-        if state.get("listener") is not None:
-            return
         page = self.page
 
-        async def reduce_permission(response: Any) -> None:
+        if state.get("navigation_listener") is None:
+            def on_navigation(frame: Any) -> None:
+                main_frame = getattr(page, "main_frame", None)
+                if main_frame is not None and frame is not main_frame:
+                    return
+                state["navigation_epoch"] = int(state.get("navigation_epoch") or 0) + 1
+                state["permission_action"] = None
+                state["permission_page_url"] = None
+
+            state["navigation_listener"] = on_navigation
+            try:
+                page.on("framenavigated", on_navigation)
+            except Exception:
+                state["navigation_listener"] = None
+
+        # An upgraded active-scope listener also feeds ambient permission state.
+        if _page_passive_observation_state(page).get("listener") is not None:
+            return
+        if state.get("listener") is not None:
+            return
+
+        async def reduce_permission(response: Any, *, navigation_epoch: int) -> None:
             try:
                 action = _mcp_permission_action_from_frontend_body(await response.body())
+                if int(state.get("navigation_epoch") or 0) != navigation_epoch:
+                    return
                 if isinstance(action, Mapping):
                     state["permission_action"] = dict(action)
+                    state["permission_page_url"] = str(getattr(page, "url", "") or "")
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -3730,7 +3758,11 @@ class ChatGPTPage:
         def on_response(response: Any) -> None:
             if not _matches_frontend_conversation_response(response):
                 return
-            task = asyncio.create_task(reduce_permission(response))
+            task = asyncio.create_task(
+                reduce_permission(
+                    response, navigation_epoch=int(state.get("navigation_epoch") or 0)
+                )
+            )
             tasks = state.setdefault("tasks", set())
             tasks.add(task)
             task.add_done_callback(lambda done: tasks.discard(done))
@@ -3739,11 +3771,20 @@ class ChatGPTPage:
         page.on("response", on_response)
 
     def ambient_permission_action(self) -> dict[str, Any] | None:
-        action = _page_ambient_observation_state(self.page).get("permission_action")
+        state = _page_ambient_observation_state(self.page)
+        action = state.get("permission_action")
+        captured_url = str(state.get("permission_page_url") or "")
+        current_url = str(getattr(self.page, "url", "") or "")
+        if isinstance(action, Mapping) and captured_url and current_url and captured_url != current_url:
+            state["permission_action"] = None
+            state["permission_page_url"] = None
+            return None
         return dict(action) if isinstance(action, Mapping) else None
 
     def clear_ambient_permission_action(self) -> None:
-        _page_ambient_observation_state(self.page)["permission_action"] = None
+        state = _page_ambient_observation_state(self.page)
+        state["permission_action"] = None
+        state["permission_page_url"] = None
 
     def arm_passive_observer(
         self,
@@ -3753,6 +3794,7 @@ class ChatGPTPage:
         conversation_id: str | None = None,
         accepted_user_message_id: str | None = None,
     ) -> None:
+        self.install_ambient_observer()
         exact_request = _safe_identity_string(request_id)
         if exact_request is None:
             raise ValueError("passive observer request ID must be bounded and printable")
@@ -3807,6 +3849,30 @@ class ChatGPTPage:
             return
 
         page = self.page
+        ambient_state = _page_ambient_observation_state(page)
+        ambient_listener = ambient_state.get("listener")
+        if ambient_listener is not None:
+            try:
+                page.remove_listener("response", ambient_listener)
+            except Exception:
+                try:
+                    page.off("response", ambient_listener)
+                except Exception:
+                    pass
+            ambient_state["listener"] = None
+
+        async def reduce_ambient_permission(response: Any, *, navigation_epoch: int) -> None:
+            try:
+                action = _mcp_permission_action_from_frontend_body(await response.body())
+                if int(ambient_state.get("navigation_epoch") or 0) != navigation_epoch:
+                    return
+                if isinstance(action, Mapping):
+                    ambient_state["permission_action"] = dict(action)
+                    ambient_state["permission_page_url"] = str(getattr(page, "url", "") or "")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return
 
         async def reduce_response(
             response: Any,
@@ -3884,6 +3950,16 @@ class ChatGPTPage:
                 return
 
         def on_response(response: Any) -> None:
+            if _matches_frontend_conversation_response(response):
+                ambient_task = asyncio.create_task(
+                    reduce_ambient_permission(
+                        response,
+                        navigation_epoch=int(ambient_state.get("navigation_epoch") or 0),
+                    )
+                )
+                ambient_tasks = ambient_state.setdefault("tasks", set())
+                ambient_tasks.add(ambient_task)
+                ambient_task.add_done_callback(lambda done: ambient_tasks.discard(done))
             current_scope = state.get("scope")
             if not isinstance(current_scope, Mapping):
                 return

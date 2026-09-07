@@ -210,7 +210,14 @@ def test_ambient_page_automation_never_dispatches_registered_task(tmp_path: Path
         tmp_path, task_id="task-ambient-single-owner"
     )
     worker.registry = SimpleNamespace(
-        tasks_by_id={"task-ambient-single-owner": {"status": "RUNNING"}}
+        tasks_by_id={
+            "task-ambient-single-owner": {
+                "status": "RUNNING",
+                "active_hop_id": 1,
+                "hops": [{"hop_id": 1, "target_role": "PLAN", "state": "waiting"}],
+                "roles": {"PLAN": {"page_id": "page-active"}},
+            }
+        }
     )
     calls = []
 
@@ -221,7 +228,11 @@ def test_ambient_page_automation_never_dispatches_registered_task(tmp_path: Path
             return False
 
         async def evaluate(self, _script):
-            return worker_module.WINDOW_NAME_PREFIX + "{}"
+            return worker_module.WINDOW_NAME_PREFIX + json.dumps({
+                "taskId": "task-ambient-single-owner",
+                "pageId": "page-active",
+                "role": "cdpa-ambient-single-owner-plan",
+            })
 
     class Client:
         def __init__(self, _page, *, timeout_ms):
@@ -302,47 +313,27 @@ def test_mcp_allow_interrupt_waits_five_seconds_then_dispatches_exact_react_acti
         datetime.now(timezone.utc) - timedelta(seconds=6)
     ).isoformat()
     calls = []
+    passive_action = {
+        "type": "allow",
+        "target_message_id": "call-1",
+        "remember_answer": True,
+        "label": "Allow mcp-g8 for this conversation",
+    }
 
     class Client:
         def passive_observation(self, **_kwargs):
-            return {
-                "permission_action": {
-                    "type": "allow",
-                    "target_message_id": "call-1",
-                    "remember_answer": True,
-                    "label": "Allow mcp-g8 for this conversation",
-                }
-            }
+            return {"permission_action": passive_action}
 
         async def mcp_allow_visible(self):
             return False
 
-        async def current_wait_probe(self):
-            return SimpleNamespace(page_task_id="task-listen-auto-allow")
-
-        async def inspect_mcp_permission_allow(
-            self,
-            probe,
-            exact_receipt,
-            *,
-            allowed_connectors,
-            expected_target_message_id=None,
-        ):
-            calls.append(
-                (
-                    "inspect",
-                    tuple(allowed_connectors),
-                    exact_receipt.prompt,
-                    expected_target_message_id,
-                )
-            )
-            return {"method": "offered", "target_message_id": "call-1", "remember_answer": "true"}
-
-        async def approve_mcp_permission_allow(
-            self, probe, exact_receipt, *, allowed_connectors, expected_target_message_id
-        ):
-            calls.append(("approve", tuple(allowed_connectors), expected_target_message_id))
-            return {"method": "react_handler", "target_message_id": expected_target_message_id}
+        async def auto_allow_mcp_permission(self, *, passive_action=None):
+            calls.append(("allow", passive_action))
+            return {
+                "method": "react_handler",
+                "target_message_id": "call-1",
+                "remember_answer": "true",
+            }
 
         def clear_passive_permission_action(self):
             calls.append(("cleared",))
@@ -353,11 +344,7 @@ def test_mcp_allow_interrupt_waits_five_seconds_then_dispatches_exact_react_acti
     )
 
     assert handled is True
-    assert calls == [
-        ("inspect", ("mcp-g8",), "use authorized mcp-g8 connector", "call-1"),
-        ("approve", ("mcp-g8",), "call-1"),
-        ("cleared",),
-    ]
+    assert calls == [("allow", passive_action), ("cleared",)]
     assert hop["wait"]["mcp_allow_clicked_at"]
     assert state["active_action"] == "wait_mcp_allow_continuation"
 
@@ -3136,14 +3123,13 @@ def test_post_refresh_two_minutes_stop_visible_checks_response_then_keeps_waitin
     assert hop["state"] == "waiting"
 
 
-def test_post_refresh_two_minutes_without_stop_reroutes_same_role_once(tmp_path: Path):
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-post-refresh-two-minute-reroute"
+def test_post_refresh_two_minutes_without_stop_never_replays_accepted_request(tmp_path: Path):
+    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-post-refresh-no-replay"
     )
     _mark_completed_refresh(hop, seconds_ago=121)
     original_hop_id = hop["hop_id"]
-    original_handoff = hop["handoff"]
-    original_turn = hop["turn"]
+    original_request_id = hop["request_id"]
     snapshot = send_snapshot(task_id=state["task_id"], team=state["team"])
 
     class Client:
@@ -3153,7 +3139,7 @@ def test_post_refresh_two_minutes_without_stop_reroutes_same_role_once(tmp_path:
             return snapshot
 
     acquired = AcquiredRole(
-        Client(), receipt.binding.page_id, "https://chatgpt.com/c/post-refresh-two-reroute", False, False
+        Client(), receipt.binding.page_id, "https://chatgpt.com/c/post-refresh-no-replay", False, False
     )
 
     class Actions:
@@ -3164,29 +3150,21 @@ def test_post_refresh_two_minutes_without_stop_reroutes_same_role_once(tmp_path:
 
     asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
 
-    child = _active_hop(state)
-    record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
-    assert hop["hop_id"] == original_hop_id
-    assert hop["state"] == "abandoned"
-    assert record.status is RequestStatus.FAILED_FINAL
-    assert child["hop_id"] == original_hop_id + 1
-    assert child["parent_hop_id"] == original_hop_id
-    assert child["kind"] == "stall_reroute"
-    assert child["target_role"] == hop["target_role"]
-    assert child["turn"] == original_turn
-    assert child["handoff"] == original_handoff
-    assert child["stall_reroute_attempt"] == 1
-    assert child["state"] == "pre_send"
-    saved = store.save(path, state)
-    assert _active_hop(saved)["kind"] == "stall_reroute"
+    record = RequestLedger(hop["ledger_path"]).get(original_request_id)
+    assert len(state["hops"]) == 1
+    assert state["active_hop_id"] == original_hop_id
+    assert hop["state"] == "waiting"
+    assert record.status is RequestStatus.SENT
+    assert state["active_action"] == "wait_response"
 
 
-def test_post_refresh_stall_after_three_reroutes_blocks_without_fourth_send(tmp_path: Path):
+def test_post_refresh_legacy_reroute_marker_still_never_creates_another_send(tmp_path: Path):
     _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-post-refresh-reroute-exhausted"
+        tmp_path, task_id="task-post-refresh-legacy-marker-no-replay"
     )
     _mark_completed_refresh(hop, seconds_ago=121)
     hop["stall_reroute_attempt"] = 3
+    original_request_id = hop["request_id"]
     snapshot = send_snapshot(task_id=state["task_id"], team=state["team"])
 
     class Client:
@@ -3196,7 +3174,7 @@ def test_post_refresh_stall_after_three_reroutes_blocks_without_fourth_send(tmp_
             return snapshot
 
     acquired = AcquiredRole(
-        Client(), receipt.binding.page_id, "https://chatgpt.com/c/post-refresh-exhausted", False, False
+        Client(), receipt.binding.page_id, "https://chatgpt.com/c/post-refresh-legacy", False, False
     )
 
     class Actions:
@@ -3207,10 +3185,12 @@ def test_post_refresh_stall_after_three_reroutes_blocks_without_fourth_send(tmp_
 
     asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
 
+    record = RequestLedger(hop["ledger_path"]).get(original_request_id)
     assert len(state["hops"]) == 1
+    assert state["status"] == "RUNNING"
     assert state["active_hop_id"] == hop["hop_id"]
-    assert state["status"] == "BLOCKED"
-    assert state["block_code"] == "stall_reroute_exhausted"
+    assert hop["state"] == "waiting"
+    assert record.status is RequestStatus.SENT
 
 
 def test_normal_wait_routes_valid_local_file_response_without_repair(tmp_path: Path):
@@ -6913,3 +6893,323 @@ def test_active_rate_limit_blocks_ui_bootstrap_new_page_only(tmp_path: Path):
         )
     with pytest.raises(RateLimitBlockedError, match="cooldown"):
         asyncio.run(worker._branch_from_bootstrap_ui(state, "PLAN", Actions(), donor))
+
+
+def test_active_mcp_allow_falls_back_to_plain_visible_allow(tmp_path: Path):
+    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-active-plain-allow"
+    )
+    hop["wait"]["mcp_allow_seen_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=6)
+    ).isoformat()
+    calls = []
+
+    class Client:
+        def passive_observation(self, **_kwargs):
+            return {"coverage": "unknown"}
+
+        async def mcp_allow_visible(self):
+            return True
+
+        async def auto_allow_mcp_permission(self, *, passive_action=None):
+            calls.append(passive_action)
+            return {"method": "dom_click", "target_message_id": "", "remember_answer": "false"}
+
+    snapshot = SimpleNamespace(stop_visible=False, messages=())
+    handled = asyncio.run(
+        worker._mcp_allow_interrupt(state, hop, Client(), receipt, snapshot)
+    )
+
+    assert handled is True
+    assert calls == [None]
+    assert hop["wait"].get("mcp_allow_clicked_at")
+    assert state["active_action"] == "wait_mcp_allow_continuation"
+
+
+def test_mcp_allow_disappearance_without_continuation_refreshes_after_five_seconds(tmp_path: Path):
+    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-allow-disappear-refresh"
+    )
+    hop["wait"]["mcp_allow_clicked_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=6)
+    ).isoformat()
+    refreshed = []
+
+    class Client:
+        async def mcp_allow_visible(self):
+            return False
+
+        async def refresh(self):
+            refreshed.append(True)
+
+    snapshot = SimpleNamespace(
+        stop_visible=False,
+        messages=(),
+        response_activity_turn_id=None,
+        response_activity_length=0,
+        response_activity_text="",
+    )
+    handled = asyncio.run(
+        worker._mcp_allow_interrupt(state, hop, Client(), receipt, snapshot)
+    )
+
+    assert handled is True
+    assert refreshed == [True]
+    assert state["active_action"] == "wait_response"
+
+
+def test_mcp_allow_stop_after_dispatch_is_real_continuation_progress(tmp_path: Path):
+    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-allow-stop-progress"
+    )
+    hop["wait"]["mcp_allow_clicked_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=6)
+    ).isoformat()
+    refreshed = []
+
+    class Client:
+        async def mcp_allow_visible(self):
+            return False
+
+        async def refresh(self):
+            refreshed.append(True)
+
+    snapshot = SimpleNamespace(
+        stop_visible=True,
+        messages=(),
+        response_activity_turn_id=None,
+        response_activity_length=0,
+        response_activity_text="",
+    )
+    handled = asyncio.run(
+        worker._mcp_allow_interrupt(state, hop, Client(), receipt, snapshot)
+    )
+
+    assert handled is False
+    assert refreshed == []
+    assert "mcp_allow_clicked_at" not in hop["wait"]
+
+
+def test_stale_response_state_refreshes_after_ten_minutes_without_activity(tmp_path: Path):
+    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-stale-response-refresh"
+    )
+    old = datetime.now(timezone.utc) - timedelta(seconds=601)
+    hop["wait"]["controller_state"] = "RESPONSE"
+    hop["wait"]["controller_state_since"] = old.isoformat()
+    hop["wait"]["activity_changed_at"] = old.isoformat()
+    refreshed = []
+
+    class Client:
+        async def refresh(self):
+            refreshed.append(True)
+
+    snapshot = SimpleNamespace(
+        retry_visible=False,
+        stop_visible=False,
+        response_activity_turn_id=None,
+        messages=(MessageSnapshot("assistant", "a-stale", None, "partial", ()),),
+    )
+    handled = asyncio.run(
+        worker._refresh_stalled_controller_state(state, hop, Client(), snapshot, receipt)
+    )
+
+    assert handled is True
+    assert refreshed == [True]
+
+
+def test_recent_response_activity_prevents_ten_minute_refresh_even_if_stop_stays_visible(tmp_path: Path):
+    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-recent-activity-no-refresh"
+    )
+    hop["wait"]["controller_state"] = "STOP"
+    hop["wait"]["controller_state_since"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=601)
+    ).isoformat()
+    hop["wait"]["activity_changed_at"] = datetime.now(timezone.utc).isoformat()
+    refreshed = []
+
+    class Client:
+        async def refresh(self):
+            refreshed.append(True)
+
+    snapshot = SimpleNamespace(
+        retry_visible=False,
+        stop_visible=True,
+        response_activity_turn_id="streaming-turn",
+        messages=(),
+    )
+    handled = asyncio.run(
+        worker._refresh_stalled_controller_state(state, hop, Client(), snapshot, receipt)
+    )
+
+    assert handled is False
+    assert refreshed == []
+
+
+@pytest.mark.parametrize("status", ["DONE", "STOPPED", "PAUSED", "BLOCKED"])
+def test_ambient_old_registered_tabs_keep_auto_allow(status: str, tmp_path: Path, monkeypatch):
+    _config, _store, _state, worker = setup_task(
+        tmp_path, task_id=f"task-ambient-history-{status.lower()}"
+    )
+    task_id = f"task-ambient-history-{status.lower()}"
+    worker.registry = SimpleNamespace(tasks_by_id={task_id: {"status": status}})
+    calls = []
+
+    class Page:
+        url = "https://chatgpt.com/c/ambient-history"
+
+        def is_closed(self):
+            return False
+
+        async def evaluate(self, _script):
+            return worker_module.WINDOW_NAME_PREFIX + json.dumps({"taskId": task_id})
+
+    page = Page()
+
+    class Client:
+        def __init__(self, _page, *, timeout_ms):
+            self.page = _page
+
+        def install_ambient_observer(self):
+            calls.append("listen")
+
+        async def read_wait_probe(self):
+            return SimpleNamespace(
+                page_task_id=task_id,
+                page_id="page-history",
+                page_role="PLAN",
+                stop_visible=False,
+                last_assistant_message_id=None,
+            )
+
+        def ambient_permission_action(self):
+            return {
+                "type": "allow",
+                "target_message_id": "history-call",
+                "remember_answer": True,
+                "label": "Allow mcp-g8 for this conversation",
+            }
+
+        async def mcp_allow_visible(self):
+            return False
+
+        async def auto_allow_mcp_permission(self, *, passive_action=None):
+            calls.append(("allow", passive_action["target_message_id"]))
+            return {"method": "react_handler", "target_message_id": passive_action["target_message_id"]}
+
+        def clear_ambient_permission_action(self):
+            calls.append("clear")
+
+    monkeypatch.setattr(worker_module, "ChatGPTPage", Client)
+    worker._ambient_allow_seen[id(page)] = time.monotonic() - 6
+    asyncio.run(worker._maintain_ambient_page_automation(SimpleNamespace(pages=[page])))
+
+    assert ("allow", "history-call") in calls
+    assert "clear" in calls
+
+
+def test_ambient_dom_fallback_is_sparse_not_command_loop_rate(tmp_path: Path, monkeypatch):
+    _config, _store, _state, worker = setup_task(
+        tmp_path, task_id="task-ambient-sparse"
+    )
+    calls = []
+
+    class Page:
+        url = "https://chatgpt.com/c/ambient-sparse"
+
+        def is_closed(self):
+            return False
+
+        async def evaluate(self, _script):
+            calls.append("binding")
+            return worker_module.WINDOW_NAME_PREFIX + "{}"
+
+    page = Page()
+
+    class Client:
+        def __init__(self, _page, *, timeout_ms):
+            pass
+
+        def install_ambient_observer(self):
+            calls.append("listen")
+
+        async def read_wait_probe(self):
+            calls.append("probe")
+            return SimpleNamespace(
+                page_task_id=None,
+                page_id=None,
+                page_role=None,
+                stop_visible=False,
+                last_assistant_message_id=None,
+            )
+
+        def ambient_permission_action(self):
+            return None
+
+        async def mcp_allow_visible(self):
+            return False
+
+    monkeypatch.setattr(worker_module, "ChatGPTPage", Client)
+    context = SimpleNamespace(pages=[page])
+    asyncio.run(worker._maintain_ambient_page_automation(context))
+    asyncio.run(worker._maintain_ambient_page_automation(context))
+
+    assert calls.count("probe") == 1
+
+
+def test_ambient_old_tab_dom_only_visible_allow_is_clicked_without_passive_event(tmp_path: Path, monkeypatch):
+    _config, _store, _state, worker = setup_task(
+        tmp_path, task_id="task-ambient-history-dom-allow"
+    )
+    task_id = "task-ambient-history-dom-allow"
+    worker.registry = SimpleNamespace(tasks_by_id={task_id: {"status": "DONE"}})
+    calls = []
+
+    class Page:
+        url = "https://chatgpt.com/c/ambient-history-dom"
+
+        def is_closed(self):
+            return False
+
+        async def evaluate(self, _script):
+            return worker_module.WINDOW_NAME_PREFIX + json.dumps({
+                "taskId": task_id,
+                "pageId": "page-history-dom",
+                "role": "PLAN",
+            })
+
+    page = Page()
+
+    class Client:
+        def __init__(self, _page, *, timeout_ms):
+            pass
+
+        def install_ambient_observer(self):
+            pass
+
+        async def read_wait_probe(self):
+            return SimpleNamespace(
+                page_task_id=task_id,
+                page_id="page-history-dom",
+                page_role="PLAN",
+                stop_visible=False,
+                last_assistant_message_id=None,
+                mcp_permission_allow_count=1,
+            )
+
+        def ambient_permission_action(self):
+            return None
+
+        async def auto_allow_mcp_permission(self, *, passive_action=None):
+            calls.append(passive_action)
+            return {"method": "dom_click", "target_message_id": "", "remember_answer": "false"}
+
+        def clear_ambient_permission_action(self):
+            pass
+
+    monkeypatch.setattr(worker_module, "ChatGPTPage", Client)
+    worker._ambient_allow_seen[id(page)] = time.monotonic() - 6
+    asyncio.run(worker._maintain_ambient_page_automation(SimpleNamespace(pages=[page])))
+
+    assert calls == [None]

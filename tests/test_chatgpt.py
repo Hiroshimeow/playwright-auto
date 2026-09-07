@@ -1202,3 +1202,168 @@ def test_full_conversation_graph_request_surfaces_are_removed():
     assert not hasattr(cg.ChatGPTPage, "backend_conversation")
     assert not hasattr(CDPATabActions, "backend_conversation")
     assert not hasattr(CDPATabActions, "backend_search_conversations")
+
+
+def test_ambient_permission_evidence_is_invalidated_on_main_frame_navigation():
+    class Request:
+        method = "POST"
+        post_data_json = {"messages": [{"id": "u-nav", "author": {"role": "user"}}]}
+
+    class Response:
+        request = Request()
+        url = "https://chatgpt.com/backend-api/f/conversation"
+
+        async def body(self):
+            payload = {
+                "conversation_id": "c-nav",
+                "message": {
+                    "id": "tool-nav",
+                    "author": {"role": "tool"},
+                    "recipient": "assistant",
+                    "content": {"content_type": "text", "parts": [""]},
+                    "metadata": {
+                        "jit_plugin_data": {
+                            "from_server": {
+                                "body": {
+                                    "actions": [{
+                                        "type": "allow",
+                                        "allow": {"target_message_id": "call-nav"},
+                                        "split_action_options": [{
+                                            "label": "Allow mcp-g8 for this conversation",
+                                            "action": {
+                                                "type": "allow",
+                                                "target_message_id": "call-nav",
+                                                "remember_answer": True,
+                                            },
+                                        }],
+                                    }]
+                                }
+                            }
+                        }
+                    },
+                },
+            }
+            return f"data: {json.dumps(payload)}\ndata: [DONE]\n".encode()
+
+    class Page:
+        def __init__(self):
+            self.listeners = {}
+            self.main_frame = object()
+
+        def on(self, event, callback):
+            self.listeners.setdefault(event, []).append(callback)
+
+        def remove_listener(self, event, callback):
+            if callback in self.listeners.get(event, []):
+                self.listeners[event].remove(callback)
+
+    async def scenario():
+        page = Page()
+        client = chatgpt_module.ChatGPTPage(page)
+        client.install_ambient_observer()
+        page.listeners["response"][0](Response())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert client.ambient_permission_action()["target_message_id"] == "call-nav"
+        assert "framenavigated" in page.listeners
+        page.listeners["framenavigated"][0](page.main_frame)
+        assert client.ambient_permission_action() is None
+
+    asyncio.run(scenario())
+
+
+def test_ambient_and_active_passive_scope_share_one_physical_response_listener():
+    class Page:
+        def __init__(self):
+            self.listeners = {}
+            self.main_frame = object()
+
+        def on(self, event, callback):
+            self.listeners.setdefault(event, []).append(callback)
+
+        def remove_listener(self, event, callback):
+            if callback in self.listeners.get(event, []):
+                self.listeners[event].remove(callback)
+
+        def off(self, event, callback):
+            self.remove_listener(event, callback)
+
+    page = Page()
+    client = chatgpt_module.ChatGPTPage(page)
+    client.install_ambient_observer()
+    client.arm_passive_observer(
+        request_id="req-1",
+        generation=0,
+        conversation_id="conversation-1",
+        accepted_user_message_id="user-1",
+    )
+
+    assert len(page.listeners.get("response", [])) == 1
+
+
+def test_ambient_permission_evidence_is_rejected_when_page_url_changes_without_frame_event():
+    class Request:
+        method = "POST"
+        post_data_json = {"messages": [{"id": "u-url", "author": {"role": "user"}}]}
+
+    class Response:
+        request = Request()
+        url = "https://chatgpt.com/backend-api/f/conversation"
+
+        async def body(self):
+            payload = {
+                "conversation_id": "c-url",
+                "message": {
+                    "id": "tool-url",
+                    "author": {"role": "tool"},
+                    "recipient": "assistant",
+                    "content": {"content_type": "text", "parts": [""]},
+                    "metadata": {
+                        "jit_plugin_data": {
+                            "from_server": {
+                                "body": {
+                                    "actions": [{
+                                        "type": "allow",
+                                        "allow": {"target_message_id": "call-url"},
+                                        "split_action_options": [{
+                                            "label": "Allow mcp-g8 for this conversation",
+                                            "action": {
+                                                "type": "allow",
+                                                "target_message_id": "call-url",
+                                                "remember_answer": True,
+                                            },
+                                        }],
+                                    }]
+                                }
+                            }
+                        }
+                    },
+                },
+            }
+            return f"data: {json.dumps(payload)}\ndata: [DONE]\n".encode()
+
+    class Page:
+        def __init__(self):
+            self.listeners = {}
+            self.main_frame = object()
+            self.url = "https://chatgpt.com/c/a"
+
+        def on(self, event, callback):
+            self.listeners.setdefault(event, []).append(callback)
+
+        def remove_listener(self, event, callback):
+            if callback in self.listeners.get(event, []):
+                self.listeners[event].remove(callback)
+
+    async def scenario():
+        page = Page()
+        client = chatgpt_module.ChatGPTPage(page)
+        client.install_ambient_observer()
+        page.listeners["response"][0](Response())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert client.ambient_permission_action()["target_message_id"] == "call-url"
+        page.url = "https://chatgpt.com/c/b"
+        assert client.ambient_permission_action() is None
+
+    asyncio.run(scenario())

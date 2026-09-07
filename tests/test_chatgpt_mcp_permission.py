@@ -557,3 +557,55 @@ def test_offered_react_allow_is_inspected_then_dispatched_without_click():
         "remember_answer": True,
     }
     assert click_count == 0
+
+
+def test_react_allow_does_not_require_accepted_user_node_to_be_rendered():
+    async def run(page):
+        client = ChatGPTPage(page, timeout_ms=5_000)
+        client.binding = PageBinding("page-1", "DEV")
+        receipt = SendReceipt(
+            prompt="Use @mcp-g8",
+            prompt_sha256=prompt_digest("Use @mcp-g8"),
+            binding=client.binding,
+            baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+            attempts=1,
+            accepted_via="exact_user_message",
+            session_id_before=None,
+            user_message_id="user-not-mounted",
+            conversation_id="conversation-1",
+        )
+        await page.evaluate(
+            """() => {
+              const permission = document.querySelector('#permission');
+              permission.__reactProps$fixture = {
+                onSelectOption: (_event, action) => { window.__mcpAction = action; },
+                options: [{
+                  action: {
+                    type: 'allow',
+                    target_message_id: 'tool-call-not-rendered',
+                    remember_answer: true,
+                  }
+                }],
+              };
+            }"""
+        )
+        probe = await client.current_wait_probe()
+        offered = await client.inspect_mcp_permission_allow(
+            probe, receipt, allowed_connectors=("mcp-g8",)
+        )
+        return offered
+
+    offered = asyncio.run(
+        _with_page(
+            """
+            <main>
+              <button id="permission" aria-label="Allow mcp-g8 for this conversation"></button>
+              <div contenteditable="true" role="textbox"></div>
+            </main>
+            """,
+            run,
+        )
+    )
+
+    assert offered["target_message_id"] == "tool-call-not-rendered"
+    assert offered["remember_answer"] == "true"

@@ -162,12 +162,12 @@ _TERMINAL_GRAPH_RETRY_SECONDS = 120.0
 _TERMINAL_GRAPH_MAX_ATTEMPTS = 3
 _DOM_FALLBACK_SETTLE_SECONDS = 30.0
 _POST_REFRESH_RESPONSE_PROBE_SECONDS = 60.0
-_POST_REFRESH_REROUTE_SECONDS = 120.0
-_STALL_REROUTE_MAX_ATTEMPTS = 3
+_POST_REFRESH_FINAL_RECONCILE_SECONDS = 120.0
 _STREAM_STATUS_POLL_MIN_SECONDS = 30.0
 _STREAM_STATUS_POLL_MAX_SECONDS = 35.0
 _DOM_WAIT_PROBE_MS = 5_000
 _MCP_ALLOW_STABLE_SECONDS = 5.0
+_AMBIENT_DOM_FALLBACK_SECONDS = 5.0
 _MCP_ALLOW_POST_CLICK_SECONDS = 5.0
 _CONTROLLER_STALL_REFRESH_SECONDS = 600.0
 _AUTOMATED_SEND_SPACING_SECONDS = 10.0
@@ -399,6 +399,8 @@ class CDPAWorker:
         self._last_automated_send_at: float | None = None
         self._ambient_allow_seen: dict[int, float] = {}
         self._ambient_post_click: dict[int, tuple[float, str | None]] = {}
+        self._ambient_next_probe_at: dict[int, float] = {}
+        self._ambient_binding_cache: dict[int, dict[str, Any] | None] = {}
         self._bootstrap_prepare_lock = asyncio.Lock()
         self._repository_project_lock = asyncio.Lock()
         self._repository_project_tasks: set[asyncio.Task[Any]] = set()
@@ -3856,17 +3858,27 @@ class CDPAWorker:
             current = "IDLE"
         now = datetime.now(timezone.utc)
         previous = str(wait.get("controller_state") or "")
-        since = parse_time(wait.get("controller_state_since"))
-        if previous != current or since is None:
+        state_since = parse_time(wait.get("controller_state_since"))
+        activity_changed_at = parse_time(wait.get("activity_changed_at"))
+        progress_at = parse_time(wait.get("controller_progress_at"))
+        if activity_changed_at is not None and (progress_at is None or activity_changed_at > progress_at):
+            progress_at = activity_changed_at
+            wait["controller_progress_at"] = activity_changed_at.isoformat()
+        if previous != current or state_since is None:
             wait["controller_state"] = current
             wait["controller_state_since"] = now.isoformat()
+            wait["controller_progress_at"] = now.isoformat()
             return False
-        if current not in {"STOP", "IDLE"}:
+        if progress_at is None:
+            progress_at = state_since
+            wait["controller_progress_at"] = progress_at.isoformat()
+        if current == "RETRY":
             return False
-        if (now - since).total_seconds() < _CONTROLLER_STALL_REFRESH_SECONDS:
+        if (now - progress_at).total_seconds() < _CONTROLLER_STALL_REFRESH_SECONDS:
             return False
         await client.refresh()
         wait["controller_state_since"] = now.isoformat()
+        wait["controller_progress_at"] = now.isoformat()
         wait["controller_last_refresh_at"] = now.isoformat()
         state["active_action"] = "wait_response"
         return True
@@ -3918,21 +3930,20 @@ class CDPAWorker:
         now = datetime.now(timezone.utc)
         clicked_at = parse_time(wait.get("mcp_allow_clicked_at"))
         if clicked_at is not None:
-            visible_reader = getattr(client, "mcp_allow_visible", None)
-            permission_still_visible = (
-                bool(await visible_reader()) if callable(visible_reader) else False
-            )
+            signature, length = response_activity_signature(snapshot, receipt.baseline)
+            previous_signature = str(wait.get("mcp_allow_activity_signature") or "")
+            previous_length = int(wait.get("mcp_allow_activity_length") or 0)
             progressed = bool(
-                not permission_still_visible
-                or any(
-                    message.role == "assistant"
-                    and message.message_id not in receipt.baseline.message_ids
-                    for message in snapshot.messages
-                )
+                snapshot.stop_visible
+                or length > previous_length
+                or (previous_signature and signature != previous_signature)
             )
             if progressed:
                 wait.pop("mcp_allow_clicked_at", None)
                 wait.pop("mcp_allow_post_click_refreshed", None)
+                wait.pop("mcp_allow_activity_signature", None)
+                wait.pop("mcp_allow_activity_length", None)
+                wait["controller_progress_at"] = now.isoformat()
                 return False
             if (now - clicked_at).total_seconds() < _MCP_ALLOW_POST_CLICK_SECONDS:
                 state["active_action"] = "wait_mcp_allow_continuation"
@@ -3941,10 +3952,15 @@ class CDPAWorker:
                 await client.refresh()
                 wait["mcp_allow_post_click_refreshed"] = True
                 wait.pop("mcp_allow_clicked_at", None)
+                wait.pop("mcp_allow_activity_signature", None)
+                wait.pop("mcp_allow_activity_length", None)
+                wait["controller_progress_at"] = now.isoformat()
                 state["active_action"] = "wait_response"
                 return True
             wait.pop("mcp_allow_clicked_at", None)
             wait.pop("mcp_allow_post_click_refreshed", None)
+            wait.pop("mcp_allow_activity_signature", None)
+            wait.pop("mcp_allow_activity_length", None)
 
         passive_action = None
         if not self._dom_only_enabled():
@@ -3973,229 +3989,24 @@ class CDPAWorker:
             state["active_action"] = "wait_mcp_allow_stable"
             return True
 
-        current_probe = getattr(client, "current_wait_probe", None)
-        inspect_allow = getattr(client, "inspect_mcp_permission_allow", None)
-        approve_allow = getattr(client, "approve_mcp_permission_allow", None)
-        if not all(callable(item) for item in (current_probe, inspect_allow, approve_allow)):
+        auto_allow = getattr(client, "auto_allow_mcp_permission", None)
+        if not callable(auto_allow):
             return False
-        allowed_connectors = _authorized_mcp_connectors(receipt.prompt)
-        passive_target_message_id = (
-            str(passive_action.get("target_message_id") or "").strip()
-            if isinstance(passive_action, Mapping)
-            else ""
-        )
-        probe = await current_probe()
-        offered = await inspect_allow(
-            probe,
-            receipt,
-            allowed_connectors=allowed_connectors,
-            expected_target_message_id=passive_target_message_id or None,
-        )
-        target_message_id = str(offered.get("target_message_id") or "").strip()
-        if not target_message_id:
-            state["active_action"] = "wait_mcp_allow_stable"
-            return True
-        dispatched = await approve_allow(
-            probe,
-            receipt,
-            allowed_connectors=allowed_connectors,
-            expected_target_message_id=target_message_id,
-        )
-        if str(dispatched.get("method") or "") != "react_handler":
+        dispatched = await auto_allow(passive_action=passive_action)
+        if not isinstance(dispatched, Mapping):
             state["active_action"] = "wait_mcp_allow_stable"
             return True
         clear_passive = getattr(client, "clear_passive_permission_action", None)
         if callable(clear_passive):
             clear_passive()
         wait.pop("mcp_allow_seen_at", None)
+        signature, length = response_activity_signature(snapshot, receipt.baseline)
         wait["mcp_allow_clicked_at"] = now.isoformat()
         wait["mcp_allow_post_click_refreshed"] = False
+        wait["mcp_allow_activity_signature"] = signature
+        wait["mcp_allow_activity_length"] = length
+        wait["controller_progress_at"] = now.isoformat()
         state["active_action"] = "wait_mcp_allow_continuation"
-        return True
-
-    async def _mcp_approval_gate(
-        self,
-        state: dict[str, Any],
-        hop: dict[str, Any],
-        acquired: AcquiredRole,
-        receipt: SendReceipt,
-        wait: dict[str, Any],
-    ) -> bool:
-        """Return True while approval/continuation must block response routing."""
-        probe_reader = getattr(acquired.client, "current_wait_probe", None)
-        if not callable(probe_reader):
-            return False
-        probe = await probe_reader()
-        ledger_path = str(hop.get("ledger_path") or "").strip()
-        request_id = str(hop.get("request_id") or "").strip()
-        if not ledger_path or not request_id:
-            if probe.mcp_permission_node_count:
-                self._block(
-                    state,
-                    "MCP approval exists but the exact durable request ledger is unavailable",
-                    code="approval_provenance_missing",
-                    retryable=False,
-                )
-                return True
-            return False
-        ledger = RequestLedger(ledger_path)
-        record = ledger.get(request_id)
-        if record is None:
-            if probe.mcp_permission_node_count:
-                self._block(
-                    state,
-                    "MCP approval exists but the exact durable request record is unavailable",
-                    code="approval_provenance_missing",
-                    retryable=False,
-                )
-                return True
-            return False
-
-        approval = dict(record.approval) if isinstance(record.approval, Mapping) else None
-        if approval is not None:
-            approval_state = str(approval.get("state") or "")
-            target_message_id = str(approval.get("target_message_id") or "")
-            if approval_state == "confirmed":
-                return False
-            if approval_state in {"dispatched", "dispatched_unknown"}:
-                continuation_started = bool(
-                    probe.mcp_permission_node_count == 0
-                    and (
-                        probe.stop_visible
-                        or probe.transport_active
-                        or (
-                            probe.last_assistant_message_id
-                            and probe.last_assistant_message_id != target_message_id
-                        )
-                    )
-                )
-                if continuation_started:
-                    approval["state"] = "confirmed"
-                    approval["confirmed_at"] = utc_now()
-                    approval["confirmation"] = "local_continuation_progress"
-                    ledger.update(request_id, approval=approval)
-                    wait.pop("approval_continuation", None)
-                    acquired.client.invalidate_wait_cache()
-                    return False
-                state["active_action"] = "wait_approval_continuation"
-                return True
-            if approval_state == "failed":
-                self._block(
-                    state,
-                    str(approval.get("reason") or "MCP permission dispatch failed"),
-                    code="approval_dispatch_failed",
-                    retryable=False,
-                )
-                return True
-            # A durable pre-dispatch boundary without a proven dispatch result is
-            # ambiguous after interruption; never invoke the action a second time.
-            if approval_state == "pending":
-                approval["state"] = "dispatched_unknown"
-                approval["updated_at"] = utc_now()
-                ledger.update(request_id, approval=approval)
-                state["active_action"] = "wait_approval_continuation"
-                return True
-
-        if probe.mcp_permission_node_count == 0:
-            return False
-        allowed_connectors = _authorized_mcp_connectors(record.rendered_prompt)
-        if not allowed_connectors:
-            self._block(
-                state,
-                "MCP approval is present but this exact request contains no connector authorization",
-                code="approval_not_authorized",
-                retryable=False,
-            )
-            return True
-        try:
-            offer = await acquired.client.inspect_mcp_permission_allow(
-                probe,
-                receipt,
-                allowed_connectors=allowed_connectors,
-            )
-        except UnsafePageStateError as exc:
-            self._block(
-                state,
-                sanitize_exception(exc),
-                code="approval_state_unknown",
-                retryable=False,
-            )
-            return True
-
-        target_message_id = str(offer.get("target_message_id") or "")
-        connector = str(offer.get("connector") or "").lower()
-        if not target_message_id or connector not in allowed_connectors:
-            self._block(
-                state,
-                "MCP approval offer did not preserve exact connector/target provenance",
-                code="approval_state_unknown",
-                retryable=False,
-            )
-            return True
-
-        before = await acquired.client.assert_ownership()
-        recovery_baseline = capture_response_recovery_baseline(
-            before.messages, receipt.baseline
-        )
-        approval = {
-            "state": "pending",
-            "connector": connector,
-            "target_message_id": target_message_id,
-            "remember_answer": True,
-            "request_id": request_id,
-            "conversation_id": receipt.conversation_id,
-            "page_id": receipt.binding.page_id,
-            "inspected_at": utc_now(),
-        }
-        ledger.update(request_id, approval=approval)
-        # Cross the durable dispatch boundary before invoking loaded client code.
-        approval["state"] = "dispatched_unknown"
-        approval["dispatched_at"] = utc_now()
-        ledger.update(request_id, approval=approval)
-        try:
-            dispatched = await acquired.client.approve_mcp_permission_allow(
-                probe,
-                receipt,
-                allowed_connectors=allowed_connectors,
-                expected_target_message_id=target_message_id,
-            )
-        except Exception as exc:
-            approval["reason"] = sanitize_exception(exc)
-            approval["updated_at"] = utc_now()
-            ledger.update(request_id, approval=approval)
-            self._block(
-                state,
-                "MCP permission dispatch outcome is unknown; exact action will not be replayed",
-                code="approval_dispatch_unknown",
-                retryable=False,
-            )
-            return True
-        if (
-            dispatched.get("method") != "react_handler"
-            or dispatched.get("target_message_id") != target_message_id
-            or dispatched.get("connector", "").lower() != connector
-            or dispatched.get("remember_answer") != "true"
-        ):
-            self._block(
-                state,
-                "MCP permission handler returned mismatched dispatch provenance",
-                code="approval_dispatch_unknown",
-                retryable=False,
-            )
-            return True
-        approval["state"] = "dispatched"
-        approval["acknowledged_at"] = utc_now()
-        ledger.update(request_id, approval=approval)
-        wait["recovery_baseline"] = merge_response_recovery_baselines(
-            wait.get("recovery_baseline"), recovery_baseline
-        )
-        wait["approval_continuation"] = {
-            "target_message_id": target_message_id,
-            "connector": connector,
-            "dispatched_at": approval["dispatched_at"],
-        }
-        acquired.client.invalidate_wait_cache()
-        state["active_action"] = "wait_approval_continuation"
         return True
 
     async def _final_response_reconciliation(
@@ -4206,9 +4017,6 @@ class CDPAWorker:
         receipt: SendReceipt,
         wait: dict[str, Any],
     ) -> bool:
-        if await self._mcp_approval_gate(state, hop, acquired, receipt, wait):
-            return True
-
         def validate_candidate(response: MessageSnapshot) -> None:
             self._validate_response_candidate(state, hop, response)
 
@@ -4949,12 +4757,12 @@ class CDPAWorker:
                 RouteContractError("ChatGPT Retry UI is visible; continue from the existing state"),
             )
             return
+        signature, length = response_activity_signature(snapshot, receipt.baseline)
+        observe_response_activity(wait, signature=signature, length=length)
         if await self._refresh_stalled_controller_state(
             state, hop, acquired.client, snapshot, receipt
         ):
             return
-        signature, length = response_activity_signature(snapshot, receipt.baseline)
-        observe_response_activity(wait, signature=signature, length=length)
         wait["transport_ui_active"] = response_transport_ui_active(snapshot)
         wait["last_stop_visible"] = bool(snapshot.stop_visible)
         observe_responding(
@@ -4975,7 +4783,7 @@ class CDPAWorker:
             refresh_age = (datetime.now(timezone.utc) - refresh_finished_at).total_seconds()
             final_checked = int(wait.get("stall_final_refresh_count") or 0)
             probe_checked = int(wait.get("stall_probe_refresh_count") or 0)
-            if refresh_count > final_checked and refresh_age >= _POST_REFRESH_REROUTE_SECONDS:
+            if refresh_count > final_checked and refresh_age >= _POST_REFRESH_FINAL_RECONCILE_SECONDS:
                 reconciled = await self._final_dom_response_reconciliation(
                     state, hop, acquired, receipt, wait
                 )
@@ -5002,32 +4810,8 @@ class CDPAWorker:
                     hop["state"] = "waiting"
                     state["active_action"] = "wait_response"
                     return
-                attempt = int(hop.get("stall_reroute_attempt") or 0)
-                if attempt >= _STALL_REROUTE_MAX_ATTEMPTS:
-                    self._block(
-                        state,
-                        "stalled response reroute exhausted after three attempts",
-                        code="stall_reroute_exhausted",
-                        retryable=False,
-                    )
-                    return
-                RequestLedger(str(hop["ledger_path"])).update(
-                    str(hop["request_id"]),
-                    status=RequestStatus.FAILED_FINAL,
-                    error="stalled response rerouted after refresh",
-                )
-                hop["state"] = "abandoned"
-                hop["abandon_reason"] = "stalled response rerouted after refresh"
-                hop.setdefault("timestamps", {})["abandoned_at"] = utc_now()
-                child = self._append_hop(
-                    state,
-                    source_role=str(hop["target_role"]),
-                    target_role=str(hop["target_role"]),
-                    handoff=str(hop["handoff"]),
-                    kind="stall_reroute",
-                    turn=int(hop["turn"]),
-                )
-                child["stall_reroute_attempt"] = attempt + 1
+                hop["state"] = "waiting"
+                state["active_action"] = "wait_response"
                 return
             if (
                 refresh_count > probe_checked
@@ -9380,8 +9164,41 @@ class CDPAWorker:
             self.runtime_db.upsert_task_projections(projections)
             self._publish_dashboard_actions()
 
+    def _ambient_page_has_active_controller(self, binding: Mapping[str, Any]) -> bool:
+        if self.registry is None:
+            return False
+        task_id = str(binding.get("taskId") or "").strip()
+        page_id = str(binding.get("pageId") or "").strip()
+        if not task_id or not page_id:
+            return False
+        task = self.registry.tasks_by_id.get(task_id)
+        if not isinstance(task, Mapping) or str(task.get("status") or "").upper() != "RUNNING":
+            return False
+        active_hop_id = task.get("active_hop_id")
+        active_hop = next(
+            (
+                item
+                for item in task.get("hops") or ()
+                if isinstance(item, Mapping) and item.get("hop_id") == active_hop_id
+            ),
+            None,
+        )
+        if not isinstance(active_hop, Mapping):
+            return False
+        logical_role = str(active_hop.get("target_role") or "").upper()
+        if not logical_role:
+            return False
+        role_record = (task.get("roles") or {}).get(logical_role)
+        return bool(
+            isinstance(role_record, Mapping)
+            and str(role_record.get("page_id") or "").strip() == page_id
+            and str(active_hop.get("state") or "") in {
+                "pre_send", "sending", "sent", "waiting", "responded"
+            }
+        )
+
     async def _maintain_ambient_page_automation(self, browser_context: Any) -> None:
-        """Keep DOM/Listen automation alive on every open page with CDPA history."""
+        """Keep page-lifetime Listen plus sparse DOM fallback on CDPA-history tabs."""
         now = time.monotonic()
         live_keys: set[int] = set()
         dom_only = self._dom_only_enabled()
@@ -9390,37 +9207,67 @@ class CDPAWorker:
                 continue
             key = id(page)
             live_keys.add(key)
-            try:
-                name = str(await page.evaluate("() => window.name || ''"))
-            except Exception:
+            due = now >= float(self._ambient_next_probe_at.get(key) or 0.0)
+            if key not in self._ambient_binding_cache or due:
+                try:
+                    name = str(await page.evaluate("() => window.name || ''"))
+                except Exception:
+                    self._ambient_next_probe_at[key] = now + _AMBIENT_DOM_FALLBACK_SECONDS
+                    continue
+                if not name.startswith(WINDOW_NAME_PREFIX):
+                    self._ambient_binding_cache[key] = None
+                    self._ambient_next_probe_at[key] = now + _AMBIENT_DOM_FALLBACK_SECONDS
+                    continue
+                try:
+                    binding = json.loads(name[len(WINDOW_NAME_PREFIX):])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    binding = {}
+                self._ambient_binding_cache[key] = dict(binding) if isinstance(binding, Mapping) else {}
+            binding = self._ambient_binding_cache.get(key)
+            if not isinstance(binding, Mapping):
                 continue
-            if not name.startswith(WINDOW_NAME_PREFIX):
-                continue
+
             client = ChatGPTPage(
                 page,
                 timeout_ms=min(15_000, round(self.config.workspace_timeout_seconds * 1000)),
             )
             client.install_ambient_observer()
-            try:
-                probe = await client.read_wait_probe()
-            except Exception:
-                continue
             if "chatgpt.com" not in str(page.url):
                 continue
-            page_task_id = str(getattr(probe, "page_task_id", None) or "").strip()
-            if self.registry is not None and page_task_id in self.registry.tasks_by_id:
+            if self._ambient_page_has_active_controller(binding):
                 continue
 
+            passive_action = None if dom_only else client.ambient_permission_action()
             post_click = self._ambient_post_click.get(key)
+            allow_seen = self._ambient_allow_seen.get(key)
+            force_probe = due or (
+                post_click is not None
+                and now - post_click[0] >= _MCP_ALLOW_POST_CLICK_SECONDS
+            ) or (
+                allow_seen is not None
+                and passive_action is None
+                and now - allow_seen >= _MCP_ALLOW_STABLE_SECONDS
+            )
+            probe = None
+            if force_probe:
+                try:
+                    probe = await client.read_wait_probe()
+                except Exception:
+                    self._ambient_next_probe_at[key] = now + _AMBIENT_DOM_FALLBACK_SECONDS
+                    continue
+                self._ambient_next_probe_at[key] = now + _AMBIENT_DOM_FALLBACK_SECONDS
+
             if post_click is not None:
                 clicked_at, previous_assistant = post_click
                 if now - clicked_at < _MCP_ALLOW_POST_CLICK_SECONDS:
                     continue
+                if probe is None:
+                    continue
                 progressed = bool(
-                    probe.stop_visible
+                    getattr(probe, "stop_visible", False)
                     or (
-                        probe.last_assistant_message_id
-                        and probe.last_assistant_message_id != previous_assistant
+                        getattr(probe, "last_assistant_message_id", None)
+                        and getattr(probe, "last_assistant_message_id", None) != previous_assistant
                     )
                 )
                 if not progressed:
@@ -9428,25 +9275,38 @@ class CDPAWorker:
                 self._ambient_post_click.pop(key, None)
                 continue
 
-            passive_action = None if dom_only else client.ambient_permission_action()
-            try:
-                visible = await client.mcp_allow_visible()
-            except Exception:
-                visible = False
+            visible = bool(
+                probe is not None
+                and int(getattr(probe, "mcp_permission_allow_count", 0) or 0) > 0
+            )
             if not visible and passive_action is None:
-                self._ambient_allow_seen.pop(key, None)
+                if probe is not None:
+                    self._ambient_allow_seen.pop(key, None)
                 continue
             first_seen = self._ambient_allow_seen.setdefault(key, now)
             if now - first_seen < _MCP_ALLOW_STABLE_SECONDS:
+                continue
+            # DOM-only rechecks the visible offer after the stability window. Hybrid can
+            # dispatch directly from the page-lifetime Listen action without another DOM read.
+            if passive_action is None and not visible:
+                self._ambient_allow_seen.pop(key, None)
                 continue
             result = await client.auto_allow_mcp_permission(passive_action=passive_action)
             if result is None:
                 continue
             client.clear_ambient_permission_action()
             self._ambient_allow_seen.pop(key, None)
-            self._ambient_post_click[key] = (now, probe.last_assistant_message_id)
+            previous_assistant = (
+                getattr(probe, "last_assistant_message_id", None) if probe is not None else None
+            )
+            self._ambient_post_click[key] = (now, previous_assistant)
 
-        for mapping in (self._ambient_allow_seen, self._ambient_post_click):
+        for mapping in (
+            self._ambient_allow_seen,
+            self._ambient_post_click,
+            self._ambient_next_probe_at,
+            self._ambient_binding_cache,
+        ):
             for key in tuple(mapping):
                 if key not in live_keys:
                     mapping.pop(key, None)
