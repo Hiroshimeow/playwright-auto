@@ -3999,15 +3999,6 @@ class CDPAWorker:
         now = datetime.now(timezone.utc)
         clicked_at = parse_time(wait.get("mcp_allow_clicked_at"))
         if clicked_at is not None:
-            visible_reader = getattr(client, "mcp_allow_visible", None)
-            if callable(visible_reader) and not bool(await visible_reader()):
-                wait.pop("mcp_allow_clicked_at", None)
-                wait.pop("mcp_allow_post_click_refreshed", None)
-                wait.pop("mcp_allow_activity_signature", None)
-                wait.pop("mcp_allow_activity_length", None)
-                wait["controller_progress_at"] = now.isoformat()
-                state["active_action"] = "wait_response"
-                return False
             signature, length = response_activity_signature(snapshot, receipt.baseline)
             previous_signature = str(wait.get("mcp_allow_activity_signature") or "")
             previous_length = int(wait.get("mcp_allow_activity_length") or 0)
