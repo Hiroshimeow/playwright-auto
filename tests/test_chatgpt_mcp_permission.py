@@ -3,6 +3,7 @@ import asyncio
 import pytest
 from playwright.async_api import async_playwright
 
+import playwright_auto.chatgpt as chatgpt_module
 from playwright_auto.chatgpt import (
     ChatGPTPage,
     MessageBaseline,
@@ -412,6 +413,72 @@ def test_expected_target_disambiguates_transient_react_allow_actions():
     assert offered["target_message_id"] == "assistant-new"
     assert dispatched["method"] == "react_handler"
     assert action["target_message_id"] == "assistant-new"
+
+
+def test_react_allow_records_complete_only_for_real_dispatch(monkeypatch):
+    events = []
+
+    async def record(_page, action, phase, *, detail=None, **_kwargs):
+        events.append((action, phase, detail))
+
+    monkeypatch.setattr(chatgpt_module, "record_page_action", record)
+
+    async def run(page):
+        client = ChatGPTPage(page, timeout_ms=5_000)
+        client.binding = PageBinding("page-1", "DEV")
+        receipt = SendReceipt(
+            prompt="Use @mcp-g8",
+            prompt_sha256=prompt_digest("Use @mcp-g8"),
+            binding=client.binding,
+            baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+            attempts=1,
+            accepted_via="exact_user_message",
+            session_id_before=None,
+            user_message_id="user-1",
+            conversation_id="conversation-1",
+        )
+        await page.evaluate(
+            """() => {
+              const permission = document.querySelector('#permission');
+              permission.__reactProps$fixture = {
+                onSelectOption: (_event, action) => { window.__mcpAction = action; },
+                options: [{
+                  action: {
+                    type: 'allow',
+                    target_message_id: 'tool-call-not-rendered',
+                    remember_answer: true,
+                  }
+                }],
+              };
+            }"""
+        )
+        probe = await client.current_wait_probe()
+        offered = await client.inspect_mcp_permission_allow(
+            probe, receipt, allowed_connectors=("mcp-g8",)
+        )
+        await client.approve_mcp_permission_allow(
+            probe,
+            receipt,
+            allowed_connectors=("mcp-g8",),
+            expected_target_message_id=offered["target_message_id"],
+        )
+
+    asyncio.run(
+        _with_page(
+            """
+            <main>
+              <section><div data-message-author-role="user" data-message-id="user-1">Use @mcp-g8</div></section>
+              <button id="permission" aria-label="Allow mcp-g8 for this conversation"></button>
+              <div contenteditable="true" role="textbox"></div>
+            </main>
+            """,
+            run,
+        )
+    )
+
+    assert events == [
+        ("mcp_allow", "complete", "mcp-g8:tool-call-not-rendered")
+    ]
 
 
 def test_offered_react_allow_is_inspected_then_dispatched_without_click():

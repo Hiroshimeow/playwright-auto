@@ -2750,7 +2750,8 @@ async def click_mcp_permission_allow(
             raise PageOwnershipError("page ownership changed before MCP permission dispatch")
         raise UnsafePageStateError(f"MCP permission Allow is not safely dispatchable: {method}")
     detail = f"{result.get('connector')}:{result.get('target_message_id')}"
-    await record_page_action(page, "mcp_allow", "complete", detail=detail)
+    if dispatch:
+        await record_page_action(page, "mcp_allow", "complete", detail=detail)
     return {
         "method": str(result.get("method") or "react_handler"),
         "connector": str(result.get("connector") or ""),
