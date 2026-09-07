@@ -609,3 +609,53 @@ def test_react_allow_does_not_require_accepted_user_node_to_be_rendered():
 
     assert offered["target_message_id"] == "tool-call-not-rendered"
     assert offered["remember_answer"] == "true"
+
+
+def test_preferred_mcp_allow_finds_remembered_react_action_at_depth_six():
+    async def run(page):
+        client = ChatGPTPage(page, timeout_ms=5_000)
+        await page.evaluate(
+            """() => {
+              const permission = document.querySelector('#permission');
+              permission.__reactProps$fixture = {
+                onSelectOption: (_event, action) => { window.__mcpAction = action; },
+                a: {b: {c: {d: {e: {f: {
+                  action: {
+                    type: 'allow',
+                    target_message_id: 'depth-six-call',
+                    remember_answer: true,
+                  }
+                }}}}}},
+              };
+              permission.addEventListener('click', () => {
+                window.__domAllowClicks = (window.__domAllowClicks || 0) + 1;
+              });
+            }"""
+        )
+        result = await client.auto_allow_mcp_permission()
+        return (
+            result,
+            await page.evaluate("window.__mcpAction || null"),
+            await page.evaluate("window.__domAllowClicks || 0"),
+        )
+
+    result, action, clicks = asyncio.run(
+        _with_page(
+            """
+            <main>
+              <button id="permission" aria-label="Allow mcp-g8 for this conversation"></button>
+            </main>
+            """,
+            run,
+        )
+    )
+
+    assert result["method"] == "react_handler"
+    assert result["target_message_id"] == "depth-six-call"
+    assert result["remember_answer"] == "true"
+    assert action == {
+        "type": "allow",
+        "target_message_id": "depth-six-call",
+        "remember_answer": True,
+    }
+    assert clicks == 0

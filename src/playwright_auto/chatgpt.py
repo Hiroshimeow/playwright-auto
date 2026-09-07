@@ -2522,7 +2522,7 @@ async def click_preferred_mcp_allow(
             if (!handler) continue;
             const seen = new Set(), found = [];
             const walk = (value, depth = 0) => {
-              if (!value || typeof value !== 'object' || seen.has(value) || depth > 5) return;
+              if (!value || typeof value !== 'object' || seen.has(value) || depth > 6) return;
               seen.add(value);
               if (value.type === 'allow' && typeof value.target_message_id === 'string') found.push(value);
               if (value.action?.type === 'allow' && typeof value.action.target_message_id === 'string') found.push(value.action);
