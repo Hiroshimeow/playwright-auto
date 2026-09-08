@@ -137,8 +137,10 @@ def read_recent_live_events(
             continue
         if expected_task and str(value.get("task_id") or "") != expected_task:
             continue
-        if expected_role and str(value.get("role") or "").upper() != expected_role:
-            continue
+        if expected_role:
+            event_role = str(value.get("role") or "").strip().upper()
+            if event_role != expected_role and not event_role.endswith(f"-{expected_role}"):
+                continue
         if not str(value.get("event_id") or "").strip():
             value["event_id"] = (
                 f"legacy-live-{line_number}-{hashlib.sha256(line.encode('utf-8')).hexdigest()[:16]}"

@@ -73,12 +73,19 @@ def test_live_event_log_filters_by_task_and_role(tmp_path: Path):
             "response_observation",
             page_url="https://chatgpt.com/c/two",
             page_id="page-2",
-            role="REVIEW",
+            role="alpha-review",
             task_id="task-1",
             team="alpha",
             request_id="req-2",
             generation=3,
             values={"coverage": "partial", "event_count": 2},
+        )
+        append_live_event(
+            "CTRL",
+            "state_transition",
+            task_id="task-1",
+            role="REVIEW",
+            values={"active_action": "validate_route"},
         )
         append_live_event(
             "CTRL",
@@ -93,8 +100,8 @@ def test_live_event_log_filters_by_task_and_role(tmp_path: Path):
         all_task = read_recent_live_events(task_id="task-1", limit=20)
 
         assert [item["source"] for item in dev] == ["DOM"]
-        assert [item["source"] for item in review] == ["LISTEN"]
-        assert [item["source"] for item in all_task] == ["DOM", "LISTEN"]
+        assert [item["source"] for item in review] == ["LISTEN", "CTRL"]
+        assert [item["source"] for item in all_task] == ["DOM", "LISTEN", "CTRL"]
         assert review[0]["request_id"] == "req-2"
         assert review[0]["generation"] == 3
         assert review[0]["team"] == "alpha"

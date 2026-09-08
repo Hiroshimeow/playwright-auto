@@ -238,7 +238,19 @@ class RoleController:
                     for key in ("mcp_allow_seen_at", "mcp_allow_seen_target", "mcp_allow_retry_at", "mcp_allow_dispatch_error"):
                         wait.pop(key, None)
                     return Decision(Action.WAIT, "mcp_allow_stale_cleared")
-                wait["mcp_allow_retry_at"] = (now + timedelta(seconds=5)).isoformat()
+                # A real permission node with no dispatchable handler gets one
+                # bounded attempt. Reuse the normal post-Allow window so that
+                # no UI progress becomes F5 after five seconds instead of an
+                # unbounded five-second redispatch loop.
+                for key in ("mcp_allow_seen_at", "mcp_allow_seen_target", "mcp_allow_retry_at"):
+                    wait.pop(key, None)
+                signature, length = allow.activity(snapshot)
+                wait.update(
+                    mcp_allow_clicked_at=now.isoformat(),
+                    mcp_allow_activity_signature=signature,
+                    mcp_allow_activity_length=length,
+                    controller_progress_at=now.isoformat(),
+                )
                 return Decision(Action.WAIT, "mcp_allow_handler_pending")
             for key in ("mcp_allow_seen_at", "mcp_allow_seen_target", "mcp_allow_retry_at", "mcp_allow_dispatch_error"):
                 wait.pop(key, None)

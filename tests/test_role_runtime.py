@@ -96,6 +96,34 @@ def test_failed_allow_with_no_dom_permission_clears_stale_network_evidence():
     assert "mcp_allow_retry_at" not in wait
 
 
+def test_failed_allow_with_real_dom_permission_refreshes_after_five_seconds():
+    current = snapshot(mcp_permission_node_count=1)
+    wait = {"mcp_allow_seen_at": NOW.isoformat(), "mcp_allow_seen_target": "target"}
+    permission = {"type": "allow", "target_message_id": "target", "remember_answer": True}
+
+    class Client:
+        async def auto_allow_mcp_permission(self, *, passive_action=None):
+            return None
+
+    result = asyncio.run(RoleController().browser_action(
+        Client(), current, wait, permission, Decision(Action.ALLOW, "mcp_allow_ready")
+    ))
+    assert result.action is Action.WAIT
+    assert result.reason == "mcp_allow_handler_pending"
+    clicked = datetime.fromisoformat(wait["mcp_allow_clicked_at"])
+    assert "mcp_allow_retry_at" not in wait
+
+    decision = RoleController().decide(
+        current,
+        wait,
+        receipt=receipt(),
+        permission=permission,
+        now=clicked + timedelta(seconds=5),
+    )
+    assert decision.action is Action.REFRESH
+    assert decision.reason == "mcp_allow_no_ui_progress"
+
+
 def test_operator_continuation_accepts_current_result_without_original_user():
     current = current_result()
     wait = {}
