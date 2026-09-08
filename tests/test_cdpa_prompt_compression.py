@@ -18,6 +18,7 @@ from test_cdpa_worker import (
     RecordingCDPASendActions,
     RecordingCDPASendClient,
     bootstrap_record,
+    ready_client,
 )
 
 
@@ -58,7 +59,7 @@ class BootstrapActions(FakeActions):
     ):
         self.branch_calls.append(role)
         return AcquiredRole(
-            client=object(),
+            client=ready_client(_state, role),
             page_id=f"branch-{role.lower()}",
             url=f"https://chatgpt.com/c/{role.lower()}-branch",
             created=True,

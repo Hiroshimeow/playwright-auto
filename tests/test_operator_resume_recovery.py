@@ -100,14 +100,30 @@ def test_resume_pending_mcp_permission_hands_back_to_shared_controller(tmp_path:
     hop["conversation_url"] = "https://chatgpt.com/c/resume-mcp"
     state["roles"]["PLAN"]["page_url"] = hop["conversation_url"]
     snapshot = _accepted_snapshot(receipt)
+    permission = {
+        "type": "allow",
+        "target_message_id": "resume-mcp-call",
+        "remember_answer": True,
+    }
+    hop["wait"].update(
+        mcp_allow_seen_at=(datetime.now(timezone.utc) - timedelta(seconds=6)).isoformat(),
+        mcp_allow_seen_target="resume-mcp-call",
+    )
     calls = []
 
     class Client:
-        async def assert_ownership(self):
+        async def wait_snapshot(self, _receipt, **_kwargs):
             return snapshot
 
-        async def wait_for_response(self, *_args, **_kwargs):
-            raise AssertionError("pending MCP permission must return to the shared controller first")
+        def page_observation(self):
+            return {"permission_action": permission}
+
+        async def auto_allow_mcp_permission(self, *, passive_action=None):
+            calls.append(("allow", passive_action["target_message_id"]))
+            return {"method": "react_handler", "target_message_id": passive_action["target_message_id"]}
+
+        def clear_permission_action(self):
+            calls.append(("clear",))
 
     acquired = AcquiredRole(
         Client(), receipt.binding.page_id, hop["conversation_url"], False, False
@@ -123,12 +139,6 @@ def test_resume_pending_mcp_permission_hands_back_to_shared_controller(tmp_path:
         async def backend_stream_status(self, *_args, **_kwargs):
             raise AssertionError("resume permission handoff must not require backend status")
 
-    async def permission_interrupt(_state, _hop, _client, _receipt, _snapshot):
-        calls.append("permission")
-        _state["active_action"] = "wait_mcp_allow_stable"
-        return True
-
-    worker._mcp_allow_interrupt = permission_interrupt
     control = {
         "control_id": 1,
         "action": "resume",
@@ -138,13 +148,13 @@ def test_resume_pending_mcp_permission_hands_back_to_shared_controller(tmp_path:
     }
     asyncio.run(worker._recover_resume_waiting(state, hop, control, Actions()))
 
-    assert calls == ["permission"]
+    assert calls == [("allow", "resume-mcp-call"), ("clear",)]
     assert state["status"] == "RUNNING"
-    assert state["active_action"] == "wait_mcp_allow_stable"
+    assert state["active_action"] == "wait_mcp_allow_continuation"
     assert state["block_code"] is None
     assert control["status"] == "applied"
-    assert control["result"]["action"] == "resume_permission_controller"
-    assert control["result"]["postcondition"] == "permission_controller_active"
+    assert control["result"]["action"] == "resume_role_controller"
+    assert control["result"]["postcondition"] == "observation_rearmed"
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
 
 
@@ -191,10 +201,11 @@ def test_resume_preserves_manual_composer_and_never_uses_graph(tmp_path: Path):
     )
 
     class Client:
-        async def assert_ownership(self):
+        async def wait_snapshot(self, _receipt, **_kwargs):
             return snapshot
-        async def wait_for_response(self, *_args, **_kwargs):
-            raise AssertionError("manual composer must be reconciled before response consumption")
+
+        async def refresh(self):
+            raise AssertionError("manual composer must never be destroyed by refresh")
 
     acquired = AcquiredRole(Client(), canonical.binding.page_id, hop["conversation_url"], False, False)
     calls = {"status": 0, "graph": 0}
@@ -215,8 +226,10 @@ def test_resume_preserves_manual_composer_and_never_uses_graph(tmp_path: Path):
     asyncio.run(worker._recover_resume_waiting(state, hop, control, Actions()))
 
     assert calls == {"status": 0, "graph": 0}
-    assert control["status"] == "recovery_required"
-    assert control["result"]["reason_code"] == "manual_composer_conflict"
+    assert hop["wait"]["manual_draft_present"] is True
+    assert control["status"] == "applied"
+    assert control["result"]["action"] == "resume_role_controller"
+    assert control["result"]["postcondition"] == "observation_rearmed"
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
 
 
@@ -230,29 +243,35 @@ def test_resume_stream_status_rearms_exact_request_without_graph_or_replay(tmp_p
     hop["conversation_url"] = "https://chatgpt.com/c/resume-streaming"
     state["roles"]["PLAN"]["page_url"] = hop["conversation_url"]
     hop["wait"]["stream_status_next_poll_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    snapshot = SimpleNamespace(**{**vars(_accepted_snapshot(canonical)), "stop_visible": True})
+
+    class Client:
+        async def wait_snapshot(self, _receipt, **_kwargs):
+            return snapshot
+
+    acquired = AcquiredRole(Client(), canonical.binding.page_id, hop["conversation_url"], False, False)
     calls = {"status": 0, "graph": 0, "tab": 0}
 
     class Actions:
-        async def backend_stream_status(self, conversation_id):
-            assert conversation_id == "resume-streaming"
+        async def backend_stream_status(self, *_args, **_kwargs):
             calls["status"] += 1
-            return {"status": "IS_STREAMING"}
+            raise AssertionError("Resume must observe the exact page before any timeout diagnostic")
         async def backend_conversation(self, *_args, **_kwargs):
             calls["graph"] += 1
             raise AssertionError("streaming Resume must not fetch graph")
         async def locate_owned(self, *_args, **_kwargs):
             calls["tab"] += 1
-            raise AssertionError("verified streaming status can rearm without tab mutation")
+            return acquired
         async def reopen(self, *_args, **_kwargs):
-            raise AssertionError("Resume must not reopen while stream is verified active")
+            raise AssertionError("Resume must not reopen while the exact page is owned")
 
     control = {"control_id": 1, "action": "resume", "role": "PLAN", "status": "recovering", "result": {"before": None}}
     asyncio.run(worker._recover_resume_waiting(state, hop, control, Actions()))
 
-    assert calls == {"status": 1, "graph": 0, "tab": 0}
+    assert calls == {"status": 0, "graph": 0, "tab": 1}
     assert control["status"] == "applied"
-    assert control["result"]["action"] == "rearm_backend_wait"
-    assert control["result"]["postcondition"] == "backend_wait_rearmed"
+    assert control["result"]["action"] == "resume_role_controller"
+    assert control["result"]["postcondition"] == "observation_rearmed"
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
 
 
@@ -270,17 +289,15 @@ def test_resume_status_unavailable_falls_back_to_exact_local_progress_without_gr
     snapshot = SimpleNamespace(**{**vars(base_snapshot), "stop_visible": True})
 
     class Client:
-        async def assert_ownership(self):
+        async def wait_snapshot(self, _receipt, **_kwargs):
             return snapshot
-        async def wait_for_response(self, *_args, **_kwargs):
-            raise TimeoutError("still generating")
 
     acquired = AcquiredRole(Client(), canonical.binding.page_id, hop["conversation_url"], False, False)
     calls = {"graph": 0}
 
     class Actions:
         async def backend_stream_status(self, *_args, **_kwargs):
-            raise worker_module.BackendUnavailableError(503, "stream status unavailable")
+            raise AssertionError("Resume must not depend on stream status before local observation")
         async def backend_conversation(self, *_args, **_kwargs):
             calls["graph"] += 1
             raise AssertionError("status recovery must not fetch graph")
@@ -294,8 +311,8 @@ def test_resume_status_unavailable_falls_back_to_exact_local_progress_without_gr
 
     assert calls["graph"] == 0
     assert control["status"] == "applied"
-    assert control["result"]["action"] == "observe_progress"
-    assert control["result"]["postcondition"] == "generation_progress"
+    assert control["result"]["action"] == "resume_role_controller"
+    assert control["result"]["postcondition"] == "observation_rearmed"
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
 
 
@@ -309,24 +326,33 @@ def test_resume_unknown_stream_status_fails_closed_before_dom_or_graph(tmp_path:
     hop["conversation_url"] = "https://chatgpt.com/c/resume-unknown"
     state["roles"]["PLAN"]["page_url"] = hop["conversation_url"]
     hop["wait"]["stream_status_next_poll_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
-    calls = {"graph": 0, "tab": 0}
+    snapshot = _accepted_snapshot(canonical)
+
+    class Client:
+        async def wait_snapshot(self, _receipt, **_kwargs):
+            return snapshot
+
+    acquired = AcquiredRole(Client(), canonical.binding.page_id, hop["conversation_url"], False, False)
+    calls = {"status": 0, "graph": 0, "tab": 0}
 
     class Actions:
         async def backend_stream_status(self, *_args, **_kwargs):
-            return {"status": "MYSTERY"}
+            calls["status"] += 1
+            raise AssertionError("Resume must not consult stream status before local observation")
         async def backend_conversation(self, *_args, **_kwargs):
             calls["graph"] += 1
-            raise AssertionError("unknown status must never trigger graph")
+            raise AssertionError("Resume must never trigger graph lookup")
         async def locate_owned(self, *_args, **_kwargs):
             calls["tab"] += 1
-            raise AssertionError("unknown status must fail closed before DOM mutation")
+            return acquired
 
     control = {"control_id": 1, "action": "resume", "role": "PLAN", "status": "recovering", "result": {"before": None}}
     asyncio.run(worker._recover_resume_waiting(state, hop, control, Actions()))
 
-    assert calls == {"graph": 0, "tab": 0}
-    assert control["status"] == "recovery_required"
-    assert control["result"]["reason_code"] == "backend_evidence_ambiguous"
+    assert calls == {"status": 0, "graph": 0, "tab": 1}
+    assert control["status"] == "applied"
+    assert control["result"]["action"] == "resume_role_controller"
+    assert control["result"]["postcondition"] == "observation_rearmed"
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
 
 
@@ -441,6 +467,13 @@ def test_resume_routes_valid_local_report_response_without_replay(tmp_path: Path
         (),
     )
     snapshot = _accepted_snapshot(receipt, response=response)
+    hop["wait"].update(
+        result_seen_key=worker_module.hashlib.sha256(response.text.encode()).hexdigest(),
+        result_seen_at=(datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat(),
+        result_samples=1,
+    )
+    state = store.save(path, state)
+    hop = _active_hop(state)
     original = {
         "task_id": state["task_id"],
         "team": state["team"],
@@ -458,12 +491,8 @@ def test_resume_routes_valid_local_report_response_without_replay(tmp_path: Path
             self.send_calls = 0
             self.retry_calls = 0
 
-        async def assert_ownership(self):
+        async def wait_snapshot(self, _receipt, **_kwargs):
             return snapshot
-
-        async def wait_for_response(self, _receipt, **kwargs):
-            kwargs["candidate_validator"](response)
-            return response
 
         async def send(self, *_args, **_kwargs):
             self.send_calls += 1
@@ -492,8 +521,8 @@ def test_resume_routes_valid_local_report_response_without_replay(tmp_path: Path
 
     assert control["status"] == "applied"
     assert control["result"]["outcome"] == "continued"
-    assert control["result"]["action"] == "consume_response"
-    assert control["result"]["postcondition"] == "hop_advanced"
+    assert control["result"]["action"] == "resume_role_controller"
+    assert control["result"]["postcondition"] == "response_consumed"
     assert completed["response"] == response.text
     assert completed.get("validation_error") is None
     assert completed["state"] == "routed"

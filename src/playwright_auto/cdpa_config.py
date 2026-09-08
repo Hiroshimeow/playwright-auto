@@ -307,7 +307,7 @@ def load_cdpa_config(
         workspace_timeout_seconds=float(_positive(browser.get("workspace_timeout_seconds", 15), "browser.workspace_timeout_seconds")),
         route_repair_attempts=int(_positive(repair.get("max_attempts", 3), "route_repair.max_attempts", integer=True)),
         response_timeout_seconds=float(_positive(response.get("timeout_seconds", 7200), "response.timeout_seconds")),
-        response_refresh_after_seconds=float(_positive(response.get("refresh_after_seconds", 1200), "response.refresh_after_seconds")),
+        response_refresh_after_seconds=float(_positive(response.get("refresh_after_seconds", 600), "response.refresh_after_seconds")),
         response_stream_status_terminal_settle_seconds=_bounded_float(
             response.get("stream_status_terminal_settle_seconds", 5.0),
             "response.stream_status_terminal_settle_seconds",

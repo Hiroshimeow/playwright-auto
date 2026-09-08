@@ -18,7 +18,7 @@ from playwright_auto.dashboard import ASSET_ROOT, DASHBOARD_HTML_PATH
 from playwright_auto.dashboard_api import DashboardAPI
 
 from test_cdpa_core import write_config
-from test_cdpa_worker import FakeActions
+from test_cdpa_worker import FakeActions, ready_client
 
 
 def setup_agent(tmp_path: Path, *, prompt: str = "Inspect the requested work."):
@@ -317,10 +317,10 @@ def test_completed_job_closes_after_one_minute_and_next_trigger_reopens_saved_ur
             self.required_clean_ready = require_clean_ready
             self.foreground = foreground
             self.events.append(("reopen", require_clean_ready, foreground))
+            client = ready_client(current, logical_role)
+            client.wait_until_clean_ready = self.wait_until_clean_ready
             return AcquiredRole(
-                client=SimpleNamespace(
-                    wait_until_clean_ready=self.wait_until_clean_ready
-                ),
+                client=client,
                 page_id=record["page_id"],
                 url=record["page_url"],
                 created=True,

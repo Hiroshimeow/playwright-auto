@@ -31,6 +31,7 @@ class _RateClient:
     def __init__(self, *, visible: bool = False) -> None:
         self.dismiss_calls = 0
         self.assert_calls = 0
+        self.wait_calls = 0
         self.visible = visible
 
     async def dismiss_known_rate_limit(self, *, timeout_ms=None):
@@ -46,6 +47,23 @@ class _RateClient:
         return SimpleNamespace(
             conversation_url="https://chatgpt.com/c/rate-limit",
             url="https://chatgpt.com/c/rate-limit",
+        )
+
+    async def wait_snapshot(self, _receipt, **_kwargs):
+        self.wait_calls += 1
+        return SimpleNamespace(
+            url="https://chatgpt.com/c/rate-limit-conversation",
+            stop_visible=False,
+            composer_present=True,
+            composer_editable=True,
+            composer_text="",
+            messages=(),
+            requires_login=False,
+            error_texts=(),
+            blocking_dialogs=(),
+            retry_visible=False,
+            mcp_permission_allow_count=0,
+            mcp_permission_node_count=0,
         )
 
 
@@ -255,22 +273,19 @@ def test_active_cooldown_waiting_hop_continues_local_dom_reconciliation_without_
         "detected_at": "2026-08-17T00:00:00+00:00",
         "release_not_before": "2999-01-01T00:00:00+00:00",
     }
-    calls = {"backend_status": 0, "dom": 0}
+    calls = {"backend_status": 0}
+    client = _RateClient()
 
-    async def local_dom(*_args, **_kwargs):
-        calls["dom"] += 1
-
-    worker._waiting_dom = local_dom
-
-    class Actions:
+    class Actions(_RateActions):
         async def backend_stream_status(self, conversation_id):
             assert conversation_id == "rate-limit-conversation"
             calls["backend_status"] += 1
             raise AssertionError("normal cooldown waiting must not poll stream_status")
 
-    asyncio.run(worker._waiting(state, hop, Actions(), Path(state["manifest_path"])))
+    asyncio.run(worker._waiting(state, hop, Actions(client), Path(state["manifest_path"])))
 
-    assert calls == {"backend_status": 0, "dom": 1}
+    assert calls == {"backend_status": 0}
+    assert client.wait_calls == 1
     assert hop["state"] == "waiting"
     assert state.get("block_code") is None
     persisted = ledger.get(hop["request_id"])

@@ -179,7 +179,7 @@ def test_post_reload_first_stale_snapshot_requires_confirmation(monkeypatch):
 
 
 
-def test_manual_composer_input_blocks_completion_and_recovery(monkeypatch):
+def test_manual_composer_input_never_triggers_recovery_reload(monkeypatch):
     snapshot = conversation("final response")
     snapshot = make_snapshot(
         messages=snapshot.messages,
@@ -189,16 +189,16 @@ def test_manual_composer_input_blocks_completion_and_recovery(monkeypatch):
     page = SequencePage([snapshot])
     install_sequence(monkeypatch, page)
 
-    with pytest.raises(ManualInputPendingError, match="manual composer"):
-        asyncio.run(
-            bind(page).wait_for_response(
-                receipt(),
-                timeout_ms=8,
-                stable_ms=0,
-                poll_ms=1,
-                active_reload_after_ms=1,
-            )
+    result = asyncio.run(
+        bind(page).wait_for_response(
+            receipt(),
+            timeout_ms=8,
+            stable_ms=0,
+            poll_ms=1,
+            active_reload_after_ms=1,
         )
+    )
+    assert result.text == "final response"
     assert page.reload_calls == 0
 
 

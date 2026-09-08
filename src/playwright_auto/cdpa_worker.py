@@ -62,6 +62,7 @@ from .cdpa_projection import (
 from .cdpa_runtime_db import RuntimeDB
 from .cdpa_runtime_registry import CDPARuntimeRegistry, MINIMUM_DEADLINE_SECONDS
 from .cdpa_prompts import PromptBuilder
+from .role_runtime import Action, Policy, RoleController
 from .cdpa_response import (
     begin_refresh,
     finish_refresh,
@@ -385,6 +386,10 @@ class CDPAWorker:
         )
         self.store = store or TaskStore(config)
         self.prompts = PromptBuilder(config)
+        self.role_controller = RoleController(Policy(
+            response_stable_seconds=config.response_stable_ms / 1000,
+            stalled_seconds=config.response_refresh_after_seconds,
+        ))
         self.runtime_db = RuntimeDB(config.runtime_database)
         self.registry: CDPARuntimeRegistry | None = None
         self.runtime_degraded = False
@@ -400,8 +405,7 @@ class CDPAWorker:
         self._rate_limit_lock = asyncio.Lock()
         self._send_gate_lock = asyncio.Lock()
         self._last_automated_send_at: float | None = None
-        self._ambient_allow_seen: dict[int, float] = {}
-        self._ambient_post_click: dict[int, tuple[float, str | None]] = {}
+        self._ambient_controller_states: dict[int, dict[str, Any]] = {}
         self._ambient_next_probe_at: dict[int, float] = {}
         self._ambient_binding_cache: dict[int, dict[str, Any] | None] = {}
         self._bootstrap_prepare_lock = asyncio.Lock()
@@ -2651,11 +2655,6 @@ class CDPAWorker:
                     return None
                 raise
 
-    @staticmethod
-    def _stream_status_poll_delay() -> float:
-        return random.uniform(
-            _STREAM_STATUS_POLL_MIN_SECONDS, _STREAM_STATUS_POLL_MAX_SECONDS
-        )
 
     async def _run_automated_send(self, operation: Callable[[], Any]) -> Any:
         async with self._send_gate_lock:
@@ -3200,6 +3199,11 @@ class CDPAWorker:
             if acquired is None:
                 return
         self._record_acquired(state, role, acquired)
+        preparation = await self.role_controller.run(
+            self, state, hop, acquired, actions, phase="pre_send", wait_ms=0,
+        )
+        if preparation.reason != "ready":
+            return
         role_record = state["roles"][role]
         generation = int(role_record.get("conversation_generation") or 0)
         if isinstance(independent, Mapping):
@@ -3475,57 +3479,6 @@ class CDPAWorker:
         self._start_wait_budget_from_sent(hop)
         state["active_action"] = "wait_response"
 
-    def _upgrade_legacy_receipt(
-        self,
-        state: dict[str, Any],
-        hop: dict[str, Any],
-        receipt: SendReceipt,
-        snapshot: Any,
-        manifest_path: Path,
-        persistence_baseline: dict[str, Any] | None = None,
-    ) -> SendReceipt | None:
-        if receipt.user_message_id or receipt.user_turn_id:
-            return receipt
-        accepted_user = unique_new_user_message(snapshot.messages, receipt.baseline)
-        if accepted_user is None:
-            self._block(
-                state,
-                "accepted user-message provenance is missing or ambiguous",
-                code="accepted_user_provenance_ambiguous",
-                retryable=False,
-            )
-            return None
-        upgraded = replace(
-            receipt,
-            accepted_via="user_message_identity",
-            user_message_id=accepted_user.message_id,
-            user_turn_id=accepted_user.turn_id,
-        )
-        ledger = RequestLedger(hop["ledger_path"])
-        record = ledger.get(str(hop["request_id"]))
-        if record is None:
-            raise RuntimeError("durable request disappeared while upgrading receipt")
-        baseline = json.loads(
-            json.dumps(
-                persistence_baseline if persistence_baseline is not None else state,
-                ensure_ascii=False,
-                default=str,
-            )
-        )
-        ledger.update(
-            record.request_id,
-            receipt=upgraded.to_dict(),
-            error=None,
-        )
-        hop["receipt"] = upgraded.to_dict()
-        saved = self._persist_transport_result(manifest_path, baseline, state)
-        state["updated_at"] = saved["updated_at"]
-        if persistence_baseline is not None:
-            persistence_baseline.clear()
-            persistence_baseline.update(
-                json.loads(json.dumps(state, ensure_ascii=False, default=str))
-            )
-        return upgraded
 
     def _dom_only_enabled(self) -> bool:
         settings = (
@@ -3904,53 +3857,6 @@ class CDPAWorker:
             error=None,
         )
 
-    async def _refresh_stalled_controller_state(
-        self,
-        state: dict[str, Any],
-        hop: dict[str, Any],
-        client: Any,
-        snapshot: Any,
-        receipt: SendReceipt,
-    ) -> bool:
-        wait = hop["wait"]
-        has_new_assistant = any(
-            message.role == "assistant" and message.message_id not in receipt.baseline.message_ids
-            for message in snapshot.messages
-        )
-        if bool(getattr(snapshot, "retry_visible", False)):
-            current = "RETRY"
-        elif snapshot.stop_visible or bool(getattr(snapshot, "response_activity_turn_id", None)):
-            current = "STOP"
-        elif has_new_assistant:
-            current = "RESPONSE"
-        else:
-            current = "IDLE"
-        now = datetime.now(timezone.utc)
-        previous = str(wait.get("controller_state") or "")
-        state_since = parse_time(wait.get("controller_state_since"))
-        activity_changed_at = parse_time(wait.get("activity_changed_at"))
-        progress_at = parse_time(wait.get("controller_progress_at"))
-        if activity_changed_at is not None and (progress_at is None or activity_changed_at > progress_at):
-            progress_at = activity_changed_at
-            wait["controller_progress_at"] = activity_changed_at.isoformat()
-        if previous != current or state_since is None:
-            wait["controller_state"] = current
-            wait["controller_state_since"] = now.isoformat()
-            wait["controller_progress_at"] = now.isoformat()
-            return False
-        if progress_at is None:
-            progress_at = state_since
-            wait["controller_progress_at"] = progress_at.isoformat()
-        if current == "RETRY":
-            return False
-        if (now - progress_at).total_seconds() < _CONTROLLER_STALL_REFRESH_SECONDS:
-            return False
-        await client.refresh()
-        wait["controller_state_since"] = now.isoformat()
-        wait["controller_progress_at"] = now.isoformat()
-        wait["controller_last_refresh_at"] = now.isoformat()
-        state["active_action"] = "wait_response"
-        return True
 
     async def _one_shot_stream_status(
         self,
@@ -3986,518 +3892,15 @@ class CDPAWorker:
         )
         self._repair_route(state, hop, error)
 
-    async def _mcp_allow_interrupt(
-        self,
-        state: dict[str, Any],
-        hop: dict[str, Any],
-        client: Any,
-        receipt: SendReceipt,
-        snapshot: Any,
-    ) -> bool:
-        """Handle MCP Allow before ordinary response-state processing."""
-        wait = hop["wait"]
-        now = datetime.now(timezone.utc)
-        clicked_at = parse_time(wait.get("mcp_allow_clicked_at"))
-        if clicked_at is not None:
-            signature, length = response_activity_signature(snapshot, receipt.baseline)
-            previous_signature = str(wait.get("mcp_allow_activity_signature") or "")
-            previous_length = int(wait.get("mcp_allow_activity_length") or 0)
-            progressed = bool(
-                snapshot.stop_visible
-                or length > previous_length
-                or (previous_signature and signature != previous_signature)
-            )
-            if progressed:
-                wait.pop("mcp_allow_clicked_at", None)
-                wait.pop("mcp_allow_post_click_refreshed", None)
-                wait.pop("mcp_allow_activity_signature", None)
-                wait.pop("mcp_allow_activity_length", None)
-                wait["controller_progress_at"] = now.isoformat()
-                return False
-            if (now - clicked_at).total_seconds() < _MCP_ALLOW_POST_CLICK_SECONDS:
-                state["active_action"] = "wait_mcp_allow_continuation"
-                return True
-            if not wait.get("mcp_allow_post_click_refreshed"):
-                await client.refresh()
-                wait["mcp_allow_post_click_refreshed"] = True
-                wait.pop("mcp_allow_clicked_at", None)
-                wait.pop("mcp_allow_activity_signature", None)
-                wait.pop("mcp_allow_activity_length", None)
-                wait["controller_progress_at"] = now.isoformat()
-                state["active_action"] = "wait_response"
-                return True
-            wait.pop("mcp_allow_clicked_at", None)
-            wait.pop("mcp_allow_post_click_refreshed", None)
-            wait.pop("mcp_allow_activity_signature", None)
-            wait.pop("mcp_allow_activity_length", None)
 
-        passive_action = None
-        if not self._dom_only_enabled():
-            reader = getattr(client, "passive_observation", None)
-            role_record = (state.get("roles") or {}).get(str(hop.get("target_role") or ""))
-            generation = int(role_record.get("conversation_generation") or 0) if isinstance(role_record, Mapping) else 0
-            if callable(reader):
-                evidence = reader(
-                    request_id=str(hop.get("request_id") or ""),
-                    generation=generation,
-                )
-                if isinstance(evidence, Mapping) and isinstance(evidence.get("permission_action"), Mapping):
-                    passive_action = dict(evidence["permission_action"])
-        visible_reader = getattr(client, "mcp_allow_visible", None)
-        visible = bool(await visible_reader()) if callable(visible_reader) else False
-        permission_present = bool(
-            visible
-            or int(getattr(snapshot, "mcp_permission_node_count", 0) or 0) > 0
-        )
-        if not permission_present and passive_action is None:
-            wait.pop("mcp_allow_seen_at", None)
-            return False
 
-        seen_at = parse_time(wait.get("mcp_allow_seen_at"))
-        if seen_at is None:
-            wait["mcp_allow_seen_at"] = now.isoformat()
-            state["active_action"] = "wait_mcp_allow_stable"
-            return True
-        if (now - seen_at).total_seconds() < _MCP_ALLOW_STABLE_SECONDS:
-            state["active_action"] = "wait_mcp_allow_stable"
-            return True
 
-        auto_allow = getattr(client, "auto_allow_mcp_permission", None)
-        if not callable(auto_allow):
-            return False
-        dispatched = await auto_allow(passive_action=passive_action)
-        if not isinstance(dispatched, Mapping):
-            state["active_action"] = "wait_mcp_allow_stable"
-            return True
-        clear_passive = getattr(client, "clear_passive_permission_action", None)
-        if callable(clear_passive):
-            clear_passive()
-        wait.pop("mcp_allow_seen_at", None)
-        signature, length = response_activity_signature(snapshot, receipt.baseline)
-        wait["mcp_allow_clicked_at"] = now.isoformat()
-        wait["mcp_allow_post_click_refreshed"] = False
-        wait["mcp_allow_activity_signature"] = signature
-        wait["mcp_allow_activity_length"] = length
-        wait["controller_progress_at"] = now.isoformat()
-        state["active_action"] = "wait_mcp_allow_continuation"
-        return True
 
-    async def _final_response_reconciliation(
-        self,
-        state: dict[str, Any],
-        hop: dict[str, Any],
-        acquired: AcquiredRole,
-        receipt: SendReceipt,
-        wait: dict[str, Any],
-    ) -> bool:
-        def validate_candidate(response: MessageSnapshot) -> None:
-            self._validate_response_candidate(state, hop, response)
 
-        try:
-            response = await acquired.client.wait_for_response(
-                receipt,
-                timeout_ms=max(
-                    1_000,
-                    self.config.response_stable_ms
-                    + (2 * self.config.response_poll_ms),
-                ),
-                stable_ms=self.config.response_stable_ms,
-                poll_ms=self.config.response_poll_ms,
-                active_reload_after_ms=None,
-                stale_response_baseline=wait.get("recovery_baseline"),
-                candidate_validator=validate_candidate,
-                minimum_samples=2,
-                invalid_grace_ms=max(1_000, self.config.response_stable_ms),
-            )
-        except StableMalformedResponseError as exc:
-            wait["recovery_baseline"] = None
-            await self._flush_hop_conversation_identity(state, hop)
-            self._record_response(
-                state,
-                hop,
-                exc.candidate,
-                validation_error=str(exc.validation_error),
-            )
-            self._release_stream_status_slot(acquired.client, receipt)
-            return True
-        except (TimeoutError, IncompleteResponseTimeoutError):
-            return False
-        except ManualInputPendingError as exc:
-            state["status"] = "PAUSED"
-            state["kanban_column"] = "PAUSED"
-            state["pause_reason"] = sanitize_text(exc, max_chars=2000)
-            return True
-        except ChoicePromptBlockedError as exc:
-            self._block(
-                state,
-                exc,
-                code="choice_prompt_blocked",
-                retryable=False,
-            )
-            return True
-        wait["recovery_baseline"] = None
-        await self._flush_hop_conversation_identity(state, hop)
-        self._capture_passive_remote_report_if_available(
-            state, hop, acquired, receipt, response
-        )
-        self._record_response(state, hop, response)
-        self._release_stream_status_slot(acquired.client, receipt)
-        return True
 
-    async def _final_dom_response_reconciliation(
-        self,
-        state: dict[str, Any],
-        hop: dict[str, Any],
-        acquired: AcquiredRole,
-        receipt: SendReceipt,
-        wait: dict[str, Any],
-    ) -> bool | None:
-        try:
-            return await self._final_response_reconciliation(
-                state, hop, acquired, receipt, wait
-            )
-        except Exception as exc:
-            if not is_transient_page_lifecycle_error(exc):
-                raise
-            hop["state"] = "waiting"
-            state["status"] = "RUNNING"
-            state["kanban_column"] = _column_for(str(hop["target_role"]))
-            state["active_action"] = "wait_response"
-            state["block_code"] = None
-            state["block_retryable"] = False
-            state["block_reason"] = None
-            return None
 
-    async def _recover_dom_observation_failure(
-        self,
-        state: dict[str, Any],
-        hop: dict[str, Any],
-        actions: CDPATabActions,
-        acquired: AcquiredRole,
-        manifest_path: Path,
-        persistence_baseline: dict[str, Any],
-        exc: BaseException,
-        transport_baseline: dict[str, Any] | None,
-    ) -> AcquiredRole | None:
-        if not is_transient_page_lifecycle_error(exc):
-            return None
-        wait = hop["wait"]
-        last_result = wait.get("last_refresh_result")
-        last_refresh = parse_time(wait.get("last_refresh_at"))
-        if (
-            isinstance(last_result, Mapping)
-            and last_result.get("reason") == "dom_observation_recovery"
-            and last_refresh is not None
-            and (datetime.now(timezone.utc) - last_refresh).total_seconds()
-            < float(self.config.response_refresh_after_seconds)
-        ):
-            hop["state"] = "waiting"
-            state["status"] = "RUNNING"
-            state["kanban_column"] = _column_for(str(hop["target_role"]))
-            state["active_action"] = "wait_response"
-            return acquired
 
-        refresh_baseline = json.loads(
-            json.dumps(persistence_baseline, ensure_ascii=False, default=str)
-        )
-        begin_refresh(wait)
-        progress = wait.get("refresh_in_progress")
-        if isinstance(progress, dict):
-            progress["reason"] = "dom_observation_recovery"
-        self._persist_transport_result(manifest_path, refresh_baseline, state)
-        refresh_baseline = json.loads(
-            json.dumps(state, ensure_ascii=False, default=str)
-        )
-        recovered: AcquiredRole | None = None
-        try:
-            recovered = await actions.refresh(
-                acquired,
-                manifest=state,
-                logical_role=str(hop["target_role"]),
-                recover=True,
-                skip_precheck=True,
-            )
-        except RoleOwnershipError as refresh_exc:
-            finish_refresh(wait, error=sanitize_exception(refresh_exc))
-            self._persist_transport_result(manifest_path, refresh_baseline, state)
-            raise
-        except Exception as refresh_exc:
-            finish_refresh(wait, error=sanitize_exception(refresh_exc))
-            self._persist_transport_result(manifest_path, refresh_baseline, state)
-            if not is_transient_page_lifecycle_error(refresh_exc):
-                raise
-        else:
-            finish_refresh(wait)
-            saved = self._persist_transport_result(manifest_path, refresh_baseline, state)
-            if transport_baseline is not None:
-                state.clear()
-                state.update(saved)
-                transport_baseline.clear()
-                transport_baseline.update(
-                    json.loads(json.dumps(saved, ensure_ascii=False, default=str))
-                )
-                hop = _active_hop(state)
-                wait = hop["wait"]
 
-        hop["state"] = "waiting"
-        state["status"] = "RUNNING"
-        state["kanban_column"] = _column_for(str(hop["target_role"]))
-        state["active_action"] = "wait_response"
-        state["block_code"] = None
-        state["block_retryable"] = False
-        state["block_reason"] = None
-        return recovered
-
-    async def _waiting_dom_snapshot(
-        self,
-        state: dict[str, Any],
-        hop: dict[str, Any],
-        actions: CDPATabActions,
-        acquired: AcquiredRole,
-        manifest_path: Path,
-        persistence_baseline: dict[str, Any],
-        receipt: SendReceipt,
-        *,
-        transport_baseline: dict[str, Any] | None,
-        force_full: bool = False,
-        probe_wait_ms: int = 0,
-    ) -> tuple[Any | None, AcquiredRole | None]:
-        try:
-            wait_passive = getattr(acquired.client, "wait_for_passive_observation", None)
-            role_record = (state.get("roles") or {}).get(str(hop.get("target_role") or ""))
-            generation = (
-                int(role_record.get("conversation_generation") or 0)
-                if isinstance(role_record, Mapping)
-                else 0
-            )
-            if not self._dom_only_enabled() and callable(wait_passive) and probe_wait_ms > 0:
-                passive_result = await wait_passive(
-                    request_id=str(hop.get("request_id") or ""),
-                    generation=generation,
-                    timeout_ms=probe_wait_ms,
-                )
-                if passive_result is not None:
-                    probe_wait_ms = 0
-                    if passive_result:
-                        force_full = True
-            snapshot = await self._waiting_snapshot(
-                acquired.client,
-                receipt,
-                force_full=force_full,
-                probe_wait_ms=probe_wait_ms,
-            )
-            return snapshot, acquired
-        except Exception as exc:
-            recovered = await self._recover_dom_observation_failure(
-                state,
-                hop,
-                actions,
-                acquired,
-                manifest_path,
-                persistence_baseline,
-                exc,
-                transport_baseline,
-            )
-            if is_transient_page_lifecycle_error(exc):
-                return None, recovered
-            raise
-
-    @staticmethod
-    async def _waiting_snapshot(
-        client: Any,
-        receipt: SendReceipt,
-        *,
-        force_full: bool = False,
-        probe_wait_ms: int = 0,
-    ) -> Any:
-        wait_snapshot = getattr(client, "wait_snapshot", None)
-        if callable(wait_snapshot):
-            parameters = inspect.signature(wait_snapshot).parameters.values()
-            accepts_probe_wait = any(
-                parameter.name == "probe_wait_ms"
-                or parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters
-            )
-            kwargs = {"force_full": force_full}
-            if accepts_probe_wait:
-                kwargs["probe_wait_ms"] = max(0, int(probe_wait_ms))
-            return await wait_snapshot(receipt, **kwargs)
-        return await client.assert_ownership()
-
-    def _proven_foreign_durable_user_message_ids(
-        self,
-        state: Mapping[str, Any],
-        hop: Mapping[str, Any],
-        conversation_id: str,
-    ) -> frozenset[str]:
-        current_task = str(state.get("task_id") or "")
-        current_request = str(hop.get("request_id") or "")
-        proven: set[str] = set()
-        for task in self.store.discover():
-            task_id = str(task.get("task_id") or "")
-            team = str(task.get("team") or "")
-            manifest = str(task.get("manifest_path") or "")
-            candidates = task.get("hops")
-            if not isinstance(candidates, list):
-                continue
-            for candidate in candidates:
-                if not isinstance(candidate, Mapping):
-                    continue
-                request_id = str(candidate.get("request_id") or "")
-                ledger_path = str(candidate.get("ledger_path") or "")
-                if not request_id or not ledger_path:
-                    continue
-                if task_id == current_task and request_id == current_request:
-                    continue
-                try:
-                    record = RequestLedger(ledger_path).peek(request_id)
-                except Exception:
-                    continue
-                if (
-                    record is None
-                    or record.status not in {RequestStatus.SENT, RequestStatus.COMPLETED}
-                    or record.attempts < 1
-                    or record.accepted_at is None
-                    or record.role != str(candidate.get("physical_role") or "")
-                ):
-                    continue
-                expected_source = {
-                    "task_id": task_id,
-                    "team": team,
-                    "hop_id": candidate.get("hop_id"),
-                    "manifest": manifest,
-                }
-                if record.source_context != expected_source:
-                    continue
-                durable_receipt = record.receipt
-                if not isinstance(durable_receipt, Mapping):
-                    continue
-                if str(durable_receipt.get("conversation_id") or "") != conversation_id:
-                    continue
-                user_message_id = str(
-                    durable_receipt.get("user_message_id") or ""
-                ).strip()
-                if not user_message_id:
-                    continue
-                manifest_receipt = candidate.get("receipt")
-                if isinstance(manifest_receipt, Mapping):
-                    manifest_user = str(
-                        manifest_receipt.get("user_message_id") or ""
-                    ).strip()
-                    manifest_conversation = str(
-                        manifest_receipt.get("conversation_id") or ""
-                    ).strip()
-                    if manifest_user and manifest_user != user_message_id:
-                        continue
-                    if manifest_conversation and manifest_conversation != conversation_id:
-                        continue
-                proven.add(user_message_id)
-        return frozenset(proven)
-
-    @staticmethod
-    def _backend_failure_category(error: BaseException, *, prefix: str) -> str:
-        if isinstance(error, BackendUnavailableError):
-            return f"{prefix}_unavailable"
-        if isinstance(error, BackendAuthError):
-            return f"{prefix}_auth"
-        if isinstance(error, BackendNotReadyError):
-            return f"{prefix}_not_ready"
-        if isinstance(error, GraphIdentityError):
-            return f"{prefix}_identity"
-        if isinstance(error, BackendSchemaError):
-            return f"{prefix}_schema"
-        return f"{prefix}_error"
-
-    async def _ensure_backend_wait_source(
-        self,
-        state: dict[str, Any],
-        hop: dict[str, Any],
-        actions: CDPATabActions,
-        receipt: SendReceipt,
-    ) -> AcquiredRole | None:
-        role = str(hop["target_role"])
-        conversation_id = str(receipt.conversation_id or "").strip()
-        expected_url = f"https://chatgpt.com/c/{conversation_id}"
-        expected_conversation = _recoverable_conversation_identity(expected_url)
-        hop["conversation_url"] = expected_url
-        state["roles"][role]["page_url"] = expected_url
-        try:
-            metadata_locator = getattr(actions, "locate_owned_metadata", None)
-            acquired = await (
-                metadata_locator(state, role)
-                if callable(metadata_locator)
-                else actions.locate_owned(state, role)
-            )
-            live_conversation = (
-                _recoverable_conversation_identity(acquired.url)
-                if acquired is not None
-                else None
-            )
-            if (
-                acquired is None
-                or live_conversation != expected_conversation
-                or str(acquired.page_id) != str(receipt.binding.page_id)
-            ):
-                if self._rate_limit_gate_active():
-                    state["active_action"] = "rate_limit_cooldown"
-                    return None
-                acquired = await actions.reopen(
-                    state,
-                    role,
-                    require_clean_ready=False,
-                    foreground=False,
-                )
-            await self._dismiss_known_rate_limit_on_existing(acquired)
-            if _recoverable_conversation_identity(acquired.url) != expected_conversation:
-                raise RoleOwnershipError(
-                    "backend completion fallback reopened a different conversation"
-                )
-            if str(acquired.page_id) != str(receipt.binding.page_id):
-                raise RoleOwnershipError(
-                    "backend completion fallback changed the in-flight page identity"
-                )
-        except Exception as exc:
-            self._block(
-                state,
-                exc,
-                code=_role_ownership_block_code(exc) or "role_ownership_ambiguous",
-                retryable=False,
-            )
-            return None
-        self._record_acquired(state, role, acquired)
-        return acquired
-
-    async def _begin_backend_dom_fallback(
-        self,
-        state: dict[str, Any],
-        hop: dict[str, Any],
-        actions: CDPATabActions,
-        receipt: SendReceipt,
-        *,
-        category: str,
-        now: datetime,
-    ) -> None:
-        wait = hop["wait"]
-        wait["completion_mode"] = "dom_fallback"
-        wait["backend_fallback_category"] = category
-        if category == "graph_not_ready":
-            unresolved = wait.get("terminal_continuation_unresolved")
-            if not isinstance(unresolved, Mapping) or unresolved.get("request_id") != str(
-                hop["request_id"]
-            ):
-                wait["terminal_continuation_unresolved"] = {
-                    "request_id": str(hop["request_id"]),
-                    "started_at": now.isoformat(),
-                    "refresh_baseline": int(wait.get("refresh_count") or 0),
-                    "block_ready_at": None,
-                }
-        acquired = await self._ensure_backend_wait_source(state, hop, actions, receipt)
-        if acquired is None:
-            return
-        await actions.wake(acquired)
-        wait["dom_fallback_ready_at"] = (
-            now + timedelta(seconds=_DOM_FALLBACK_SETTLE_SECONDS)
-        ).isoformat()
 
     async def _capture_bootstrap_role_donor(
         self,
@@ -4577,161 +3980,7 @@ class CDPAWorker:
         role_record["bootstrap_donor"] = donor
         return True
 
-    async def _waiting_backend_step(
-        self,
-        state: dict[str, Any],
-        hop: dict[str, Any],
-        actions: CDPATabActions,
-        receipt: SendReceipt,
-        *,
-        persist_transport_state: Callable[[], None],
-        resume_recovery: bool = False,
-    ) -> tuple[str, str | None]:
-        """Use stream_status only as a sparse trigger, then reconcile locally.
 
-        This path intentionally performs no active full-conversation graph read.
-        Browser-originated response traffic and the existing bounded DOM reader are
-        the content sources; stream_status supplies only typed generation state.
-        """
-        wait = hop["wait"]
-        now = datetime.now(timezone.utc)
-        deadline_expired = remaining_timeout_ms(wait, now=now) <= 0
-        mode = str(wait.get("completion_mode") or "stream_status")
-
-        if mode == "terminal_local_settle":
-            ready_at = parse_time(wait.get("terminal_local_ready_at"))
-            if ready_at is not None and now < ready_at:
-                return "waiting", None
-            return "dom_reconcile", None
-        if mode == "stop_requested_local_reconcile":
-            return "stream_stopped", "stream_status_stop_requested"
-
-        if mode not in {"stream_status", "status_recovery"}:
-            mode = "stream_status"
-            wait["completion_mode"] = mode
-
-        next_poll = parse_time(wait.get("stream_status_next_poll_at"))
-        if next_poll is None:
-            sent_at = parse_time((hop.get("timestamps") or {}).get("sent_at")) or now
-            next_poll = sent_at + timedelta(seconds=self._stream_status_poll_delay())
-            wait["stream_status_next_poll_at"] = next_poll.isoformat()
-
-        if resume_recovery and next_poll > now:
-            # Resume shares the same durable due-time slot. It may reconcile DOM
-            # immediately, but it does not create an extra status poll inside the
-            # per-conversation minimum interval.
-            return "dom_reconcile", None
-
-        if now < next_poll:
-            if deadline_expired:
-                return "dom_fallback", "response_deadline"
-            return "waiting", None
-
-        wait["stream_status_last_poll_at"] = now.isoformat()
-        wait["stream_status_poll_count"] = int(wait.get("stream_status_poll_count") or 0) + 1
-        wait["stream_status_next_poll_at"] = (
-            now + timedelta(seconds=self._stream_status_poll_delay())
-        ).isoformat()
-        try:
-            status_payload = await actions.backend_stream_status(receipt.conversation_id)
-            status = str(status_payload.get("status") or "")
-            if status not in {"IS_STREAMING", "COMPLETE", "FAILURE", "IS_STOP_REQUESTED"}:
-                raise BackendSchemaError("stream_status response has unknown status")
-        except BackendError as exc:
-            if resume_recovery and isinstance(exc, BackendSchemaError):
-                raise
-            wait["completion_mode"] = "status_recovery"
-            wait["backend_fallback_category"] = self._backend_failure_category(exc, prefix="status")
-            persist_transport_state()
-            if deadline_expired or resume_recovery:
-                return "dom_fallback", str(wait["backend_fallback_category"])
-            return "waiting", None
-
-        wait["stream_status_last_status"] = status
-        wait.pop("backend_fallback_category", None)
-        if status == "FAILURE":
-            self._release_stream_status_slot(actions, receipt)
-            persist_transport_state()
-            return "stream_failure", "stream_status_failure"
-        if status == "IS_STOP_REQUESTED":
-            wait["completion_mode"] = "stop_requested_local_reconcile"
-            wait["stop_requested_seen_at"] = now.isoformat()
-            self._release_stream_status_slot(actions, receipt)
-            persist_transport_state()
-            return "stream_stopped", "stream_status_stop_requested"
-        if status == "IS_STREAMING":
-            wait["completion_mode"] = "stream_status"
-            persist_transport_state()
-            if deadline_expired:
-                return "dom_fallback", "response_deadline"
-            return "waiting", None
-
-        settle_seconds = float(self.config.response_stream_status_terminal_settle_seconds)
-        wait["completion_mode"] = "terminal_local_settle"
-        wait["terminal_complete_seen_at"] = now.isoformat()
-        wait["terminal_local_ready_at"] = (
-            now + timedelta(seconds=max(0.0, settle_seconds))
-        ).isoformat()
-        for key in (
-            "status_recovery_graph_next_at",
-            "terminal_graph_ready_at",
-            "terminal_graph_attempts",
-            "terminal_graph_request_id",
-            "terminal_graph_attempted_at",
-        ):
-            wait.pop(key, None)
-        persist_transport_state()
-        if settle_seconds <= 0:
-            return "dom_reconcile", None
-        return "waiting", None
-
-    def _rearm_released_terminal_wait(
-        self,
-        state: dict[str, Any],
-        hop: dict[str, Any],
-    ) -> bool:
-        wait = hop["wait"]
-        repair_wait = state.get("repair_wait")
-        unresolved = wait.get("terminal_continuation_unresolved")
-        if not (
-            isinstance(repair_wait, dict)
-            and repair_wait.get("state") == "RELEASED"
-            and repair_wait.get("original_block_code") == "terminal_continuation_unresolved"
-            and repair_wait.get("preserved_hop_id") == hop.get("hop_id")
-            and repair_wait.get("preserved_request_id") == hop.get("request_id")
-            and repair_wait.get("transport_rearmed_request_id") != hop.get("request_id")
-            and isinstance(unresolved, Mapping)
-            and unresolved.get("request_id") == str(hop["request_id"])
-        ):
-            return False
-        now = datetime.now(timezone.utc)
-        recover_incomplete_refresh(wait)
-        repair_wait["transport_rearmed_request_id"] = str(hop["request_id"])
-        repair_wait["transport_rearmed_at"] = now.isoformat()
-        wait["completion_mode"] = "controller_recovery"
-        wait["deadline_at"] = (
-            now + timedelta(seconds=self.config.response_timeout_seconds)
-        ).isoformat()
-        for key in (
-            "dom_fallback_ready_at",
-            "status_recovery_graph_next_at",
-            "stream_status_next_poll_at",
-            "terminal_complete_seen_at",
-            "terminal_graph_ready_at",
-            "terminal_graph_attempts",
-            "terminal_graph_request_id",
-            "terminal_graph_attempted_at",
-            "controller_state",
-            "controller_state_since",
-        ):
-            wait.pop(key, None)
-        state["status"] = "RUNNING"
-        state["kanban_column"] = _column_for(str(hop["target_role"]))
-        state["active_action"] = "wait_response"
-        state["block_code"] = None
-        state["block_retryable"] = False
-        state["block_reason"] = None
-        return True
 
     async def _waiting(
         self,
@@ -4743,458 +3992,12 @@ class CDPAWorker:
     ) -> None:
         self._start_wait_budget_from_sent(hop)
         self._reconcile_hop_conversation_identity(state, hop)
-        before_rearm = json.loads(json.dumps(state, ensure_ascii=False, default=str))
-        if self._rearm_released_terminal_wait(state, hop):
-            saved = self._persist_transport_result(manifest_path, before_rearm, state)
-            state.clear()
-            state.update(saved)
-            hop = _active_hop(state)
-        await self._waiting_dom(
-            state,
-            hop,
-            actions,
-            manifest_path,
-            transport_baseline,
-        )
-
-    async def _waiting_dom(
-        self,
-        state: dict[str, Any],
-        hop: dict[str, Any],
-        actions: CDPATabActions,
-        manifest_path: Path,
-        transport_baseline: dict[str, Any] | None = None,
-    ) -> None:
-        role = str(hop["target_role"])
-        persistence_baseline = (
-            transport_baseline
-            if transport_baseline is not None
-            else json.loads(json.dumps(state, ensure_ascii=False, default=str))
-        )
-        acquired = await self._owned_or_block(state, role, actions)
+        acquired = await self._owned_or_block(state, str(hop["target_role"]), actions)
         if acquired is None:
             return
-        wait = hop["wait"]
-        recover_incomplete_refresh(wait)
-        self._start_wait_budget_from_sent(hop)
-        self._reconcile_hop_conversation_identity(state, hop)
-        receipt = SendReceipt.from_dict(hop["receipt"])
-        self._arm_passive_request_observer(state, hop, acquired.client, receipt)
-        snapshot, recovered = await self._waiting_dom_snapshot(
-            state,
-            hop,
-            actions,
-            acquired,
-            manifest_path,
-            persistence_baseline,
-            receipt,
-            transport_baseline=transport_baseline,
-            probe_wait_ms=_DOM_WAIT_PROBE_MS,
-        )
-        if recovered is not None:
-            acquired = recovered
-            self._arm_passive_request_observer(state, hop, acquired.client, receipt)
-        if snapshot is None:
-            hop = _active_hop(state)
-            wait = hop["wait"]
-            if recovered is not None and remaining_timeout_ms(wait) <= 0:
-                reconciled = await self._final_dom_response_reconciliation(
-                    state, hop, acquired, receipt, wait
-                )
-                if reconciled is None or reconciled:
-                    return
-                self._block(
-                    state,
-                    "response timeout budget exhausted after final response reconciliation",
-                    code="response_timeout",
-                    retryable=False,
-                )
-            return
-        receipt = self._upgrade_legacy_receipt(
-            state,
-            hop,
-            receipt,
-            snapshot,
-            manifest_path,
-            persistence_baseline,
-        )
-        if receipt is None:
-            return
-        if await self._mcp_allow_interrupt(state, hop, acquired.client, receipt, snapshot):
-            return
-        if bool(getattr(snapshot, "retry_visible", False)):
-            self._queue_format_repair(
-                state,
-                hop,
-                None,
-                RouteContractError("ChatGPT Retry UI is visible; continue from the existing state"),
-            )
-            return
-        signature, length = response_activity_signature(snapshot, receipt.baseline)
-        observe_response_activity(wait, signature=signature, length=length)
-        if await self._refresh_stalled_controller_state(
-            state, hop, acquired.client, snapshot, receipt
-        ):
-            return
-        wait["transport_ui_active"] = response_transport_ui_active(snapshot)
-        wait["last_stop_visible"] = bool(snapshot.stop_visible)
-        observe_responding(
-            wait,
-            stop_visible=snapshot.stop_visible,
-            composer_empty=snapshot.composer_empty,
-            manual_input_pending=snapshot.manual_input_pending,
-        )
-        refresh_count = int(wait.get("refresh_count") or 0)
-        last_refresh_result = wait.get("last_refresh_result")
-        refresh_finished_at = (
-            parse_time(last_refresh_result.get("finished_at"))
-            if isinstance(last_refresh_result, Mapping)
-            and last_refresh_result.get("status") == "completed"
-            else None
-        )
-        if refresh_count > 0 and refresh_finished_at is not None:
-            refresh_age = (datetime.now(timezone.utc) - refresh_finished_at).total_seconds()
-            final_checked = int(wait.get("stall_final_refresh_count") or 0)
-            probe_checked = int(wait.get("stall_probe_refresh_count") or 0)
-            if refresh_count > final_checked and refresh_age >= _POST_REFRESH_FINAL_RECONCILE_SECONDS:
-                reconciled = await self._final_dom_response_reconciliation(
-                    state, hop, acquired, receipt, wait
-                )
-                if reconciled is None or reconciled:
-                    return
-                wait["stall_probe_refresh_count"] = refresh_count
-                wait["stall_final_refresh_count"] = refresh_count
-                latest, recovered = await self._waiting_dom_snapshot(
-                    state,
-                    hop,
-                    actions,
-                    acquired,
-                    manifest_path,
-                    persistence_baseline,
-                    receipt,
-                    transport_baseline=transport_baseline,
-                    force_full=True,
-                )
-                if recovered is not None:
-                    acquired = recovered
-                if latest is None:
-                    return
-                if latest.stop_visible:
-                    hop["state"] = "waiting"
-                    state["active_action"] = "wait_response"
-                    return
-                hop["state"] = "waiting"
-                state["active_action"] = "wait_response"
-                return
-            if (
-                refresh_count > probe_checked
-                and refresh_age >= _POST_REFRESH_RESPONSE_PROBE_SECONDS
-            ):
-                reconciled = await self._final_dom_response_reconciliation(
-                    state, hop, acquired, receipt, wait
-                )
-                if reconciled is None or reconciled:
-                    return
-                wait["stall_probe_refresh_count"] = refresh_count
-        unresolved = wait.get("terminal_continuation_unresolved")
-        unresolved_complete = (
-            isinstance(unresolved, dict)
-            and wait.get("backend_fallback_category") == "graph_not_ready"
-            and unresolved.get("request_id") == str(hop["request_id"])
-        )
-        unresolved_refresh_used = bool(
-            unresolved_complete
-            and int(wait.get("refresh_count") or 0)
-            > int(unresolved.get("refresh_baseline") or 0)
-        )
-        unresolved_block_ready_at = (
-            parse_time(unresolved.get("block_ready_at"))
-            if unresolved_complete
-            else None
-        )
-        if (
-            unresolved_refresh_used
-            and unresolved_block_ready_at is not None
-            and datetime.now(timezone.utc) >= unresolved_block_ready_at
-        ):
-            reconciled = await self._final_dom_response_reconciliation(
-                state, hop, acquired, receipt, wait
-            )
-            if reconciled is None or reconciled:
-                return
-            if remaining_timeout_ms(wait) <= 0:
-                self._block(
-                    state,
-                    "response timeout budget exhausted after final response reconciliation",
-                    code="response_timeout",
-                    retryable=False,
-                )
-                return
-            wait["completion_mode"] = "controller_recovery"
-            wait["backend_fallback_category"] = "graph_not_ready"
-            wait.pop("stream_status_next_poll_at", None)
-            wait.pop("status_recovery_graph_next_at", None)
-            wait.pop("dom_fallback_ready_at", None)
-            for key in (
-                "terminal_complete_seen_at",
-                "terminal_graph_ready_at",
-                "terminal_graph_attempts",
-                "terminal_graph_request_id",
-                "terminal_graph_attempted_at",
-            ):
-                wait.pop(key, None)
-            hop["state"] = "waiting"
-            state["status"] = "RUNNING"
-            state["kanban_column"] = _column_for(role)
-            state["active_action"] = "wait_response"
-            state["block_code"] = None
-            state["block_retryable"] = False
-            state["block_reason"] = None
-            return
-        remaining = remaining_timeout_ms(wait)
-        refreshed_this_cycle = False
-        should_refresh = refresh_due(
-            wait,
-            refresh_after_seconds=self.config.response_refresh_after_seconds,
-            composer_empty=snapshot.composer_empty,
-            manual_input_pending=snapshot.manual_input_pending,
-        )
-        if unresolved_complete:
-            should_refresh = bool(
-                not unresolved_refresh_used
-                and snapshot.composer_empty
-                and not snapshot.manual_input_pending
-            )
-        if remaining <= 0 or should_refresh:
-            reconciled = await self._final_dom_response_reconciliation(
-                state, hop, acquired, receipt, wait
-            )
-            if reconciled is None or reconciled:
-                return
-            snapshot, recovered = await self._waiting_dom_snapshot(
-                state,
-                hop,
-                actions,
-                acquired,
-                manifest_path,
-                persistence_baseline,
-                receipt,
-                transport_baseline=transport_baseline,
-                force_full=True,
-            )
-            if recovered is not None:
-                acquired = recovered
-            if snapshot is None:
-                return
-            signature, length = response_activity_signature(snapshot, receipt.baseline)
-            observe_response_activity(wait, signature=signature, length=length)
-            wait["transport_ui_active"] = response_transport_ui_active(snapshot)
-            wait["last_stop_visible"] = bool(snapshot.stop_visible)
-            observe_responding(
-                wait,
-                stop_visible=snapshot.stop_visible,
-                composer_empty=snapshot.composer_empty,
-                manual_input_pending=snapshot.manual_input_pending,
-            )
-            remaining = remaining_timeout_ms(wait)
-            should_refresh = refresh_due(
-                wait,
-                refresh_after_seconds=self.config.response_refresh_after_seconds,
-                composer_empty=snapshot.composer_empty,
-                manual_input_pending=snapshot.manual_input_pending,
-            )
-            if unresolved_complete:
-                should_refresh = bool(
-                    not unresolved_refresh_used
-                    and snapshot.composer_empty
-                    and not snapshot.manual_input_pending
-                )
-            if remaining <= 0:
-                self._block(
-                    state,
-                    "response timeout budget exhausted after final response reconciliation",
-                    code="response_timeout",
-                    retryable=False,
-                )
-                return
-        if should_refresh:
-            refresh_baseline = json.loads(
-                json.dumps(persistence_baseline, ensure_ascii=False, default=str)
-            )
-            wait["recovery_baseline"] = merge_response_recovery_baselines(
-                wait.get("recovery_baseline"),
-                capture_response_recovery_baseline(
-                    snapshot.messages,
-                    receipt.baseline,
-                ),
-            )
-            if unresolved_complete:
-                unresolved["block_ready_at"] = (
-                    datetime.now(timezone.utc)
-                    + timedelta(seconds=_DOM_FALLBACK_SETTLE_SECONDS)
-                ).isoformat()
-            begin_refresh(wait)
-            self._persist_transport_result(manifest_path, refresh_baseline, state)
-            refresh_baseline = json.loads(
-                json.dumps(state, ensure_ascii=False, default=str)
-            )
-            try:
-                acquired = await actions.refresh(
-                    acquired,
-                    manifest=state,
-                    logical_role=role,
-                    recover=True,
-                )
-            except RoleOwnershipError as exc:
-                finish_refresh(wait, error=sanitize_exception(exc))
-                self._persist_transport_result(manifest_path, refresh_baseline, state)
-                raise
-            except Exception as exc:
-                finish_refresh(wait, error=sanitize_exception(exc))
-                saved = self._persist_transport_result(
-                    manifest_path, refresh_baseline, state
-                )
-                if not is_transient_page_lifecycle_error(exc):
-                    raise
-                if transport_baseline is not None:
-                    state.clear()
-                    state.update(saved)
-                    hop = _active_hop(state)
-                    wait = hop["wait"]
-                    transport_baseline.clear()
-                    transport_baseline.update(
-                        json.loads(json.dumps(saved, ensure_ascii=False, default=str))
-                    )
-                hop["state"] = "waiting"
-                state["status"] = "RUNNING"
-                state["kanban_column"] = _column_for(role)
-                state["active_action"] = "wait_response"
-                return
-            finish_refresh(wait)
-            refreshed_this_cycle = True
-            saved = self._persist_transport_result(manifest_path, refresh_baseline, state)
-            if transport_baseline is not None:
-                state.clear()
-                state.update(saved)
-                hop = _active_hop(state)
-                wait = hop["wait"]
-                transport_baseline.clear()
-                transport_baseline.update(
-                    json.loads(json.dumps(saved, ensure_ascii=False, default=str))
-                )
-        remaining = remaining_timeout_ms(wait)
-        if remaining <= 0:
-            reconciled = await self._final_dom_response_reconciliation(
-                state, hop, acquired, receipt, wait
-            )
-            if reconciled is None or reconciled:
-                return
-            terminal_status = await self._one_shot_stream_status(actions, receipt)
-            if terminal_status in {"COMPLETE", "FAILURE", "IS_STOP_REQUESTED"}:
-                self._queue_format_repair(
-                    state,
-                    hop,
-                    None,
-                    RouteContractError(
-                        f"terminal timeout with stream_status={terminal_status}; continue from current state"
-                    ),
-                )
-                return
-            self._block(
-                state,
-                "response timeout budget exhausted after final response reconciliation",
-                code="response_timeout",
-                retryable=False,
-            )
-            return
-        if int(wait.get("refresh_count") or 0) > 0 and not receipt.accepted_via.startswith("post_reload:"):
-            receipt = replace(receipt, accepted_via=f"post_reload:{receipt.accepted_via}")
-        if not refreshed_this_cycle and (
-            snapshot.stop_visible
-            or bool(getattr(snapshot, "response_activity_turn_id", None))
-        ):
-            hop["state"] = "waiting"
-            state["active_action"] = "wait_response"
-            return
+        await self.role_controller.run(self, state, hop, acquired, actions)
 
-        def validate_candidate(response: MessageSnapshot) -> None:
-            self._validate_response_candidate(state, hop, response)
 
-        try:
-            response = await acquired.client.wait_for_response(
-                receipt,
-                timeout_ms=min(
-                    max(
-                        3_000,
-                        self.config.response_stable_ms
-                        + (2 * self.config.response_poll_ms),
-                    ),
-                    remaining,
-                ),
-                stable_ms=self.config.response_stable_ms,
-                poll_ms=self.config.response_poll_ms,
-                active_reload_after_ms=None,
-                stale_response_baseline=wait.get("recovery_baseline"),
-                candidate_validator=validate_candidate,
-                minimum_samples=2,
-                invalid_grace_ms=max(1_000, self.config.response_stable_ms),
-            )
-        except StableMalformedResponseError as exc:
-            wait["recovery_baseline"] = None
-            await self._flush_hop_conversation_identity(state, hop)
-            if not wait.get("format_repair_refresh_used"):
-                await acquired.client.refresh()
-                wait["format_repair_refresh_used"] = True
-                state["active_action"] = "wait_response"
-                return
-            self._queue_format_repair(state, hop, exc.candidate, exc.validation_error)
-            self._release_stream_status_slot(acquired.client, receipt)
-            return
-        except (TimeoutError, IncompleteResponseTimeoutError):
-            if remaining_timeout_ms(wait) <= 0:
-                reconciled = await self._final_dom_response_reconciliation(
-                    state, hop, acquired, receipt, wait
-                )
-                if reconciled is None or reconciled:
-                    return
-                terminal_status = await self._one_shot_stream_status(actions, receipt)
-                if terminal_status in {"COMPLETE", "FAILURE", "IS_STOP_REQUESTED"}:
-                    self._queue_format_repair(
-                        state,
-                        hop,
-                        None,
-                        RouteContractError(
-                            f"terminal timeout with stream_status={terminal_status}; continue from current state"
-                        ),
-                    )
-                    return
-                self._block(
-                    state,
-                    "response timeout budget exhausted after final response reconciliation",
-                    code="response_timeout",
-                    retryable=False,
-                )
-            else:
-                hop["state"] = "waiting"
-                state["active_action"] = "wait_response"
-            return
-        except ManualInputPendingError as exc:
-            state["status"] = "PAUSED"
-            state["kanban_column"] = "PAUSED"
-            state["pause_reason"] = sanitize_text(exc, max_chars=2000)
-            return
-        except ChoicePromptBlockedError as exc:
-            self._block(
-                state,
-                exc,
-                code="choice_prompt_blocked",
-                retryable=False,
-            )
-            return
-        wait["recovery_baseline"] = None
-        await self._flush_hop_conversation_identity(state, hop)
-        self._record_response(state, hop, response)
-        self._release_stream_status_slot(acquired.client, receipt)
 
     def _route_unresolved_accepted_to_plan(
         self,
@@ -5810,304 +4613,54 @@ class CDPAWorker:
             )
         return acquired, reopened
 
-    async def _recover_resume_waiting(
-        self,
-        state: dict[str, Any],
-        hop: dict[str, Any],
-        control: dict[str, Any],
-        actions: CDPATabActions,
-    ) -> None:
-        receipt_value = hop.get("receipt")
-        if not isinstance(receipt_value, Mapping):
+    async def _recover_resume_waiting(self, state, hop, control, actions) -> None:
+        # Resume an accepted request by observing the saved conversation. A new
+        # operator prompt/Retry is valid; no original-user or backend proof is needed.
+        if not isinstance(hop.get("receipt"), Mapping):
             self._require_resume_recovery(
-                state,
-                control,
-                action="none",
-                reason_code="accepted_send_provenance_missing",
-                reason="Resume cannot verify an accepted request because its receipt is missing.",
-                next_safe_action="Restore the durable receipt before resuming this hop.",
+                state, control, action="none", reason_code="accepted_send_receipt_missing",
+                reason="The durable Send receipt is missing.",
+                next_safe_action="Restore the receipt; do not resend accepted work.",
             )
             return
         self._start_wait_budget_from_sent(hop)
         self._reconcile_hop_conversation_identity(state, hop)
-        receipt = SendReceipt.from_dict(hop["receipt"])
-        settings = (
-            self.runtime_db.get_snapshot("settings")
-            if self.runtime_db.path.exists()
-            else None
-        )
-        dom_only = (
-            isinstance(settings, Mapping)
-            and isinstance(settings.get("payload"), Mapping)
-            and settings["payload"].get("dom_only") is True
-        )
-        role = str(hop.get("target_role") or "").upper()
-        recorded_recovery_url = (
-            hop.get("conversation_url")
-            or state.get("roles", {}).get(role, {}).get("page_url")
-        )
-        if (
-            not dom_only
-            and receipt.conversation_id is None
-            and conversation_identity(recorded_recovery_url) is None
-            and receipt.attempts > 0
-            and receipt.user_message_id
-        ):
-            try:
-                receipt = await self._discover_accepted_conversation_identity(
-                    state, hop, actions, receipt
-                )
-            except (BackendError, DurableRequestError, KeyError, ValueError) as exc:
-                self._require_resume_recovery(
-                    state,
-                    control,
-                    action="none",
-                    reason_code="accepted_conversation_identity_unresolved",
-                    reason=(
-                        "Accepted request identity is unresolved after bounded backend "
-                        f"reconciliation: {sanitize_exception(exc)}"
-                    ),
-                    next_safe_action=(
-                        "Use Route PLAN only if durable side effects are already reconciled; "
-                        "do not Resume, Restart Role, New Chat, retry, or resend this accepted request."
-                    ),
-                )
-                return
-        if not dom_only and receipt.conversation_id and receipt.user_message_id:
-            try:
-                backend_outcome, _fallback_category = await self._waiting_backend_step(
-                    state,
-                    hop,
-                    actions,
-                    receipt,
-                    persist_transport_state=lambda: None,
-                    resume_recovery=True,
-                )
-            except (GraphIdentityError, BackendSchemaError) as exc:
-                self._require_resume_recovery(
-                    state,
-                    control,
-                    action="none",
-                    reason_code="backend_evidence_ambiguous",
-                    reason=sanitize_exception(exc),
-                    next_safe_action=(
-                        "Inspect the exact durable backend identity/evidence; do not reopen, "
-                        "rebind, retry, or resend this accepted request."
-                    ),
-                )
-                return
-            if backend_outcome == "responded":
-                old_hop_id = state.get("active_hop_id")
-                self._finish_resume_control(
-                    state,
-                    control,
-                    outcome="continued",
-                    action="consume_response",
-                    reason_code=None,
-                    reason="The exact backend terminal response was consumed without source-tab recovery.",
-                    postcondition=None,
-                )
-                self._responded(state, hop)
-                self._finish_resume_control(
-                    state,
-                    control,
-                    outcome="continued",
-                    action="consume_response",
-                    reason_code=None,
-                    reason="The exact backend terminal response was consumed without source-tab recovery.",
-                    postcondition=(
-                        "hop_advanced"
-                        if state.get("active_hop_id") != old_hop_id
-                        else "response_consumed"
-                    ),
-                )
-                return
-            if backend_outcome == "waiting":
-                state["status"] = "RUNNING"
-                state["kanban_column"] = _column_for(str(hop["target_role"]))
-                state["active_action"] = "wait_response"
-                state["block_code"] = None
-                state["block_retryable"] = False
-                state["block_reason"] = None
-                self._finish_resume_control(
-                    state,
-                    control,
-                    outcome="continued",
-                    action="rearm_backend_wait",
-                    reason_code=None,
-                    reason="The exact accepted request remains active in backend state.",
-                    postcondition="backend_wait_rearmed",
-                )
-                return
-
-        try:
-            acquired_result = await self._resume_exact_owned_role(
-                state,
-                hop,
-                actions,
-                expected_page_id=receipt.binding.page_id,
-            )
-            if acquired_result is None:
-                self._finish_resume_control(
-                    state,
-                    control,
-                    outcome="continued",
-                    action="defer_tab_open",
-                    reason_code=None,
-                    reason="New tab creation is paused for the request-rate-limit cooldown.",
-                    postcondition="tab_open_deferred",
-                )
-                return
-            acquired, reopened = acquired_result
-        except (RoleOwnershipError, PageOwnershipError) as exc:
+        wait = hop["wait"]
+        if remaining_timeout_ms(wait) <= 0:
+            wait["deadline_at"] = (datetime.now(timezone.utc) + timedelta(
+                seconds=self.config.response_timeout_seconds)).isoformat()
+            for key in ("timeout_refreshed", "timeout_status_checked", "timeout_status"):
+                wait.pop(key, None)
+        role = str(hop["target_role"])
+        acquired = await self._owned_or_block(state, role, actions)
+        if acquired is None:
             self._require_resume_recovery(
-                state,
-                control,
-                action="reopen_exact_tab",
-                reason_code="role_offline",
-                reason=sanitize_exception(exc),
-                next_safe_action="Open or rebind the exact recorded role tab, then Resume again.",
+                state, control, action="reopen_saved_tab",
+                reason_code=str(state.get("block_code") or "role_offline"),
+                reason=str(state.get("block_reason") or "Saved conversation is unavailable."),
+                next_safe_action="Restore the saved conversation, then Resume.",
             )
             return
-        snapshot = await acquired.client.assert_ownership()
-        if tuple(getattr(snapshot, "blocking_dialogs", ()) or ()):
+        decision = await self.role_controller.run(self, state, hop, acquired, actions, wait_ms=0)
+        if state.get("status") == "BLOCKED":
             self._require_resume_recovery(
-                state,
-                control,
-                action="none",
-                reason_code="blocking_dialog",
-                reason="Resume found a blocking dialog on the exact accepted request tab.",
-                next_safe_action="Resolve the visible dialog, then Resume again.",
+                state, control, action="observe_saved_tab",
+                reason_code=str(state.get("block_code") or "observation_blocked"),
+                reason=str(state.get("block_reason") or decision.reason),
+                next_safe_action="Resolve the displayed prerequisite, then Resume.",
             )
             return
-        if bool(getattr(snapshot, "manual_input_pending", False)):
-            self._require_resume_recovery(
-                state,
-                control,
-                action="none",
-                reason_code="manual_composer_conflict",
-                reason="Resume found operator-owned composer content on the exact accepted request tab.",
-                next_safe_action="Preserve the manual draft; reconcile or clear it explicitly before Resume.",
-            )
-            return
-        if not receipt_user_message_seen(snapshot.messages, receipt):
-            self._require_resume_recovery(
-                state,
-                control,
-                action="reopen_exact_tab" if reopened else "none",
-                reason_code="accepted_user_provenance_ambiguous",
-                reason="The exact accepted user turn is not present on the owned conversation.",
-                next_safe_action="Restore the exact recorded conversation; do not resend the prompt.",
-            )
-            return
-
-        self._arm_passive_request_observer(state, hop, acquired.client, receipt)
-        if await self._mcp_allow_interrupt(state, hop, acquired.client, receipt, snapshot):
-            state["status"] = "RUNNING"
-            state["kanban_column"] = _column_for(str(hop["target_role"]))
-            state["block_code"] = None
-            state["block_retryable"] = False
-            state["block_reason"] = None
-            self._finish_resume_control(
-                state,
-                control,
-                outcome="continued",
-                action="resume_permission_controller",
-                reason_code=None,
-                reason="The exact accepted request has a pending MCP permission handled by the shared DOM/Listen controller.",
-                postcondition="permission_controller_active",
-            )
-            return
-
-        response: MessageSnapshot | None = None
-        response_validation_error: str | None = None
-        try:
-            response = await acquired.client.wait_for_response(
-                receipt,
-                timeout_ms=max(
-                    1_000,
-                    self.config.response_stable_ms
-                    + (2 * self.config.response_poll_ms),
-                ),
-                stable_ms=self.config.response_stable_ms,
-                poll_ms=self.config.response_poll_ms,
-                active_reload_after_ms=None,
-                resolve_choice_prompt=False,
-                candidate_validator=lambda candidate: self._validate_response_candidate(
-                    state, hop, candidate
-                ),
-                minimum_samples=2,
-                invalid_grace_ms=max(1_000, self.config.response_stable_ms),
-            )
-        except StableMalformedResponseError as exc:
-            response = exc.candidate
-            response_validation_error = str(exc.validation_error)
-        except (TimeoutError, IncompleteResponseTimeoutError):
-            response = None
-        if response is not None:
-            old_hop_id = state.get("active_hop_id")
-            await self._flush_hop_conversation_identity(state, hop)
-            self._record_response(
-                state,
-                hop,
-                response,
-                validation_error=response_validation_error,
-            )
-            self._release_stream_status_slot(acquired.client, receipt)
-            self._finish_resume_control(
-                state,
-                control,
-                outcome="continued",
-                action="consume_response",
-                reason_code=None,
-                reason="A stable existing assistant response was consumed without another send.",
-                postcondition=None,
-            )
+        state["status"] = "RUNNING"
+        state["block_code"] = None
+        state["block_reason"] = None
+        state["block_retryable"] = False
+        state["kanban_column"] = _column_for(role)
+        if hop.get("state") == "responded":
             self._responded(state, hop)
-            self._finish_resume_control(
-                state,
-                control,
-                outcome="continued",
-                action="consume_response",
-                reason_code=None,
-                reason="A stable existing assistant response was consumed without another send.",
-                postcondition=(
-                    "hop_advanced"
-                    if state.get("active_hop_id") != old_hop_id
-                    else "response_consumed"
-                ),
-            )
-            return
-
-        signature, length = response_activity_signature(snapshot, receipt.baseline)
-        if bool(getattr(snapshot, "stop_visible", False)) or (
-            length > 0 and response_transport_ui_active(snapshot)
-        ):
-            wait = hop.setdefault("wait", {})
-            wait["activity_signature"] = signature
-            wait["activity_length"] = length
-            wait["activity_observed_at"] = utc_now()
-            state["status"] = "RUNNING"
-            state["kanban_column"] = _column_for(str(hop["target_role"]))
-            state["active_action"] = "wait_response"
-            self._finish_resume_control(
-                state,
-                control,
-                outcome="continued",
-                action="observe_progress",
-                reason_code=None,
-                reason="The accepted request has verified generation progress.",
-                postcondition="generation_progress",
-            )
-            return
-
-        self._require_resume_recovery(
-            state,
-            control,
-            action="reopen_exact_tab" if reopened else "none",
-            reason_code="resume_progress_unverified",
-            reason="Resume found no stable response or verified generation progress on the exact fallback conversation.",
-            next_safe_action="Inspect the exact accepted conversation; do not retry generation or resend the request.",
+        self._finish_resume_control(
+            state, control, outcome="continued", action="resume_role_controller",
+            reason_code=None, reason="The saved conversation is handled by the shared role controller.",
+            postcondition="response_consumed" if decision.action is Action.ACCEPT else "observation_rearmed",
         )
 
     def _is_pristine_preboundary_sending_record(
@@ -9271,139 +7824,67 @@ class CDPAWorker:
         )
 
     async def _maintain_ambient_page_automation(self, browser_context: Any) -> None:
-        """Keep page-lifetime Listen plus sparse DOM fallback on CDPA-history tabs."""
+        """Install once on CDPA-history pages; active/history consumers share evidence."""
+        from .role_runtime.page_observer import observer_for
+        from urllib.parse import urlparse
         now = time.monotonic()
-        live_keys: set[int] = set()
         dom_only = self._dom_only_enabled()
+        live = set()
+        known_urls = None
         for page in tuple(browser_context.pages):
             if page.is_closed():
                 continue
             key = id(page)
-            live_keys.add(key)
-            due = now >= float(self._ambient_next_probe_at.get(key) or 0.0)
+            live.add(key)
+            due = now >= self._ambient_next_probe_at.get(key, 0)
             if key not in self._ambient_binding_cache or due:
                 try:
                     name = str(await page.evaluate("() => window.name || ''"))
+                    binding = json.loads(name[len(WINDOW_NAME_PREFIX):]) if name.startswith(WINDOW_NAME_PREFIX) else None
                 except Exception:
-                    self._ambient_next_probe_at[key] = now + _AMBIENT_DOM_FALLBACK_SECONDS
-                    continue
-                if not name.startswith(WINDOW_NAME_PREFIX):
-                    self._ambient_binding_cache[key] = None
-                    self._ambient_next_probe_at[key] = now + _AMBIENT_DOM_FALLBACK_SECONDS
-                    continue
-                try:
-                    binding = json.loads(name[len(WINDOW_NAME_PREFIX):])
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    binding = {}
-                self._ambient_binding_cache[key] = dict(binding) if isinstance(binding, Mapping) else {}
+                    binding = None
+                if not isinstance(binding, Mapping) or not binding.get("role"):
+                    # A manually reopened historical conversation has a new Page and
+                    # no window.name. The existing registry supplies its URL/team mapping.
+                    if known_urls is None:
+                        known_urls = {}
+                        for task in (self.registry.tasks_by_id.values() if self.registry else ()):
+                            for record in (task.get("roles") or {}).values():
+                                url = str(record.get("page_url") or "")
+                                if url:
+                                    known_urls[url] = {"team": task.get("team"), "taskId": task.get("task_id"),
+                                                       "history_only": True}
+                    binding = known_urls.get(str(page.url))
+                self._ambient_binding_cache[key] = dict(binding) if isinstance(binding, Mapping) else None
             binding = self._ambient_binding_cache.get(key)
             if not isinstance(binding, Mapping):
+                self._ambient_next_probe_at[key] = now + 5
                 continue
-
-            client = ChatGPTPage(
-                page,
-                timeout_ms=min(15_000, round(self.config.workspace_timeout_seconds * 1000)),
-            )
-            bound_page_id = str(binding.get("pageId") or "").strip()
-            bound_role = str(binding.get("role") or "").strip()
-            if bound_page_id and bound_role:
-                client.binding = PageBinding(bound_page_id, bound_role)
+            client = ChatGPTPage(page, timeout_ms=min(15_000, round(self.config.workspace_timeout_seconds * 1000)))
+            if binding.get("pageId") and binding.get("role"):
+                client.binding = PageBinding(str(binding["pageId"]), str(binding["role"]))
             try:
-                client.install_ambient_observer()
+                await client.install_page_observer()
+                if urlparse(str(page.url)).hostname not in {"chatgpt.com", "www.chatgpt.com"}:
+                    continue
+                if self._ambient_page_has_active_controller(binding):
+                    continue
+                observer = observer_for(page)
+                if not due and not observer.dom_wake.is_set() and not (not dom_only and observer.network_wake.is_set()):
+                    continue
+                observer.dom_wake.clear()
+                if not dom_only:
+                    observer.network_wake.clear()
+                self._ambient_next_probe_at[key] = now + 5
+                wait = self._ambient_controller_states.setdefault(key, {})
+                await self.role_controller.maintain_history(client, wait, dom_only=dom_only)
             except Exception as exc:
                 if is_cdp_disconnect(exc):
                     raise
-                continue
-            if "chatgpt.com" not in str(page.url):
-                continue
-            if self._ambient_page_has_active_controller(binding):
-                continue
-
-            passive_action = None if dom_only else client.ambient_permission_action()
-            post_click = self._ambient_post_click.get(key)
-            allow_seen = self._ambient_allow_seen.get(key)
-            force_probe = due or (
-                post_click is not None
-                and now - post_click[0] >= _MCP_ALLOW_POST_CLICK_SECONDS
-            ) or (
-                allow_seen is not None
-                and passive_action is None
-                and now - allow_seen >= _MCP_ALLOW_STABLE_SECONDS
-            )
-            probe = None
-            if force_probe:
-                try:
-                    probe = await client.read_wait_probe()
-                except Exception:
-                    self._ambient_next_probe_at[key] = now + _AMBIENT_DOM_FALLBACK_SECONDS
-                    continue
-                self._ambient_next_probe_at[key] = now + _AMBIENT_DOM_FALLBACK_SECONDS
-
-            if post_click is not None:
-                clicked_at, previous_assistant = post_click
-                if now - clicked_at < _MCP_ALLOW_POST_CLICK_SECONDS:
-                    continue
-                if probe is None:
-                    continue
-                progressed = bool(
-                    getattr(probe, "stop_visible", False)
-                    or (
-                        getattr(probe, "last_assistant_message_id", None)
-                        and getattr(probe, "last_assistant_message_id", None) != previous_assistant
-                    )
-                )
-                if not progressed:
-                    try:
-                        await client.refresh()
-                    except Exception as exc:
-                        self._ambient_post_click.pop(key, None)
-                        if is_cdp_disconnect(exc):
-                            raise
-                        continue
-                self._ambient_post_click.pop(key, None)
-                continue
-
-            visible = bool(
-                probe is not None
-                and int(getattr(probe, "mcp_permission_allow_count", 0) or 0) > 0
-            )
-            if not visible and passive_action is None:
-                if probe is not None:
-                    self._ambient_allow_seen.pop(key, None)
-                continue
-            first_seen = self._ambient_allow_seen.setdefault(key, now)
-            if now - first_seen < _MCP_ALLOW_STABLE_SECONDS:
-                continue
-            # DOM-only rechecks the visible offer after the stability window. Hybrid can
-            # dispatch directly from the page-lifetime Listen action without another DOM read.
-            if passive_action is None and not visible:
-                self._ambient_allow_seen.pop(key, None)
-                continue
-            try:
-                result = await client.auto_allow_mcp_permission(passive_action=passive_action)
-            except Exception as exc:
-                self._ambient_allow_seen.pop(key, None)
-                if is_cdp_disconnect(exc):
-                    raise
-                continue
-            if result is None:
-                continue
-            client.clear_ambient_permission_action()
-            self._ambient_allow_seen.pop(key, None)
-            previous_assistant = (
-                getattr(probe, "last_assistant_message_id", None) if probe is not None else None
-            )
-            self._ambient_post_click[key] = (now, previous_assistant)
-
-        for mapping in (
-            self._ambient_allow_seen,
-            self._ambient_post_click,
-            self._ambient_next_probe_at,
-            self._ambient_binding_cache,
-        ):
-            for key in tuple(mapping):
-                if key not in live_keys:
-                    mapping.pop(key, None)
+                self._ambient_next_probe_at[key] = now + 5
+        for mapping in (self._ambient_controller_states, self._ambient_next_probe_at, self._ambient_binding_cache):
+            for key in set(mapping) - live:
+                mapping.pop(key, None)
 
     async def run_once(self, browser_context: Any) -> list[dict[str, Any] | None]:
         hydrated_now = False

@@ -16,7 +16,7 @@ from playwright_auto.cdpa_store import TaskStore
 from playwright_auto.cdpa_worker import CDPAWorker, _active_hop
 
 from test_cdpa_core import write_config
-from test_cdpa_worker import FakeActions
+from test_cdpa_worker import FakeActions, ready_client
 
 
 def setup_agent(tmp_path: Path):
@@ -157,7 +157,7 @@ def test_temporary_independent_continuation_reuses_current_owned_chat(tmp_path: 
         async def locate_owned(self, current, logical_role):
             record = current["roles"][logical_role]
             return AcquiredRole(
-                client=SimpleNamespace(),
+                client=ready_client(current, logical_role),
                 page_id=record["page_id"],
                 url=record["page_url"],
                 created=False,

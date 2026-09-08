@@ -79,6 +79,19 @@ def canonical_recovery_events(state: dict) -> list[dict]:
     ]
 
 
+def ready_client(state, role):
+    record = state["roles"][role]
+    current = ChatGPTSnapshot(
+        url="https://chatgpt.com/", session_id=None,
+        page_id=f"page-{record['physical_role']}", page_role=record['physical_role'],
+        page_task_id=state['task_id'], page_team=state['team'],
+        state=ChatGPTState.NEW_CHAT, requires_login=False, composer_present=True,
+        composer_editable=True, composer_text="", send_visible=True, send_enabled=True,
+        stop_visible=False, blocking_dialogs=(), attachment_markers=(), error_texts=(), messages=(),
+    )
+    return SimpleNamespace(assert_ownership=AsyncMock(return_value=current))
+
+
 class FakeActions:
     def __init__(self):
         self.restart_roles = []
@@ -91,7 +104,7 @@ class FakeActions:
     async def acquire(self, state, role):
         record = state["roles"][role]
         return AcquiredRole(
-            client=SimpleNamespace(),
+            client=ready_client(state, role),
             page_id=f"page-{record['physical_role']}",
             url="https://chatgpt.com/",
             created=record.get("page_id") is None,
@@ -102,7 +115,7 @@ class FakeActions:
         self.restart_roles.append(role)
         record = state["roles"][role]
         return AcquiredRole(
-            client=SimpleNamespace(),
+            client=ready_client(state, role),
             page_id=f"restarted-{record['physical_role']}",
             url="https://chatgpt.com/",
             created=True,
@@ -127,7 +140,7 @@ class FakeActions:
     async def new_chat(self, state, role):
         record = state["roles"][role]
         return AcquiredRole(
-            client=SimpleNamespace(),
+            client=ready_client(state, role),
             page_id=f"new-chat-{record['physical_role']}",
             url="https://chatgpt.com/",
             created=False,
@@ -181,23 +194,24 @@ def test_ambient_page_automation_uses_workspace_timeout_config(tmp_path: Path, m
             return False
 
         async def evaluate(self, _script):
-            return worker_module.WINDOW_NAME_PREFIX + "{}"
+            return worker_module.WINDOW_NAME_PREFIX + json.dumps({
+                "taskId": "task-ambient-timeout-config",
+                "pageId": "page-ambient",
+                "role": "alpha-plan",
+            })
 
     class Client:
         def __init__(self, _page, *, timeout_ms):
             seen_timeouts.append(timeout_ms)
 
-        def install_ambient_observer(self):
+        async def install_page_observer(self):
             return None
 
         async def read_wait_probe(self):
             return SimpleNamespace(stop_visible=False, last_assistant_message_id=None)
 
-        def ambient_permission_action(self):
-            return None
-
-        async def mcp_allow_visible(self):
-            return False
+        def page_observation(self):
+            return {}
 
     monkeypatch.setattr(worker_module, "ChatGPTPage", Client)
     asyncio.run(worker._maintain_ambient_page_automation(SimpleNamespace(pages=[Page()])))
@@ -238,21 +252,8 @@ def test_ambient_page_automation_never_dispatches_registered_task(tmp_path: Path
         def __init__(self, _page, *, timeout_ms):
             calls.append(("init", timeout_ms))
 
-        def install_ambient_observer(self):
+        async def install_page_observer(self):
             calls.append(("listen",))
-
-        async def read_wait_probe(self):
-            return SimpleNamespace(
-                page_task_id="task-ambient-single-owner",
-                stop_visible=False,
-                last_assistant_message_id=None,
-            )
-
-        def ambient_permission_action(self):
-            raise AssertionError("ambient controller must not inspect registered task permission")
-
-        async def mcp_allow_visible(self):
-            raise AssertionError("ambient controller must not dispatch registered task permission")
 
     monkeypatch.setattr(worker_module, "ChatGPTPage", Client)
     asyncio.run(worker._maintain_ambient_page_automation(SimpleNamespace(pages=[Page()])))
@@ -302,105 +303,6 @@ def test_worker_arms_passive_observer_with_exact_hop_generation_and_receipt(tmp_
     ]
 
 
-def test_mcp_allow_interrupt_waits_five_seconds_then_dispatches_exact_react_action(tmp_path: Path):
-    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-listen-auto-allow"
-    )
-    receipt = replace(
-        receipt,
-        prompt="use authorized mcp-g8 connector",
-        prompt_sha256=prompt_digest("use authorized mcp-g8 connector"),
-    )
-    hop["wait"]["mcp_allow_seen_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=6)
-    ).isoformat()
-    calls = []
-    passive_action = {
-        "type": "allow",
-        "target_message_id": "call-1",
-        "remember_answer": True,
-        "label": "Allow mcp-g8 for this conversation",
-    }
-
-    class Client:
-        def passive_observation(self, **_kwargs):
-            return {"permission_action": passive_action}
-
-        async def mcp_allow_visible(self):
-            return False
-
-        async def auto_allow_mcp_permission(self, *, passive_action=None):
-            calls.append(("allow", passive_action))
-            return {
-                "method": "react_handler",
-                "target_message_id": "call-1",
-                "remember_answer": "true",
-            }
-
-        def clear_passive_permission_action(self):
-            calls.append(("cleared",))
-
-    snapshot = SimpleNamespace(stop_visible=False, messages=())
-    handled = asyncio.run(
-        worker._mcp_allow_interrupt(state, hop, Client(), receipt, snapshot)
-    )
-
-    assert handled is True
-    assert calls == [("allow", passive_action), ("cleared",)]
-    assert hop["wait"]["mcp_allow_clicked_at"]
-    assert state["active_action"] == "wait_mcp_allow_continuation"
-
-
-def test_normal_wait_uses_dom_controller_without_stream_status(tmp_path: Path):
-    _store, state, worker, path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-dom-first-no-status"
-    )
-    calls = []
-
-    async def fake_dom(*_args, **_kwargs):
-        calls.append("dom")
-
-    worker._waiting_dom = fake_dom
-
-    class Actions:
-        async def backend_stream_status(self, *_args, **_kwargs):
-            raise AssertionError("normal wait must not poll stream_status")
-
-    asyncio.run(worker._waiting(state, hop, Actions(), path))
-    assert calls == ["dom"]
-
-
-def test_controller_stall_refreshes_after_ten_minutes_without_progress(tmp_path: Path):
-    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-controller-stall-refresh"
-    )
-    hop["wait"]["controller_state"] = "STOP"
-    hop["wait"]["controller_state_since"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=601)
-    ).isoformat()
-    refreshed = []
-
-    class Client:
-        async def mcp_allow_visible(self):
-            return True
-
-        async def refresh(self):
-            refreshed.append(True)
-
-    snapshot = SimpleNamespace(
-        retry_visible=False,
-        stop_visible=True,
-        response_activity_turn_id="turn-streaming",
-        messages=(),
-    )
-    handled = asyncio.run(
-        worker._refresh_stalled_controller_state(state, hop, Client(), snapshot, receipt)
-    )
-    assert handled is True
-    assert refreshed == [True]
-    assert hop["wait"]["controller_state"] == "STOP"
-
-
 def test_retry_ui_queues_format_repair_without_retry_click(tmp_path: Path):
     _store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-retry-format-repair"
@@ -415,33 +317,6 @@ def test_retry_ui_queues_format_repair_without_retry_click(tmp_path: Path):
     assert repair["kind"] == "route_repair"
     assert repair["target_role"] == hop["target_role"]
     assert repair["turn"] == hop["turn"]
-
-
-def test_mcp_allow_interrupt_refreshes_once_when_post_click_state_does_not_progress(tmp_path: Path):
-    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-allow-post-click-refresh"
-    )
-    hop["wait"]["mcp_allow_clicked_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=6)
-    ).isoformat()
-    refreshed = []
-
-    class Client:
-        async def mcp_allow_visible(self):
-            return True
-
-        async def refresh(self):
-            refreshed.append(True)
-
-    snapshot = SimpleNamespace(stop_visible=False, messages=())
-    handled = asyncio.run(
-        worker._mcp_allow_interrupt(state, hop, Client(), receipt, snapshot)
-    )
-
-    assert handled is True
-    assert refreshed == [True]
-    assert "mcp_allow_clicked_at" not in hop["wait"]
-    assert state["active_action"] == "wait_response"
 
 
 def test_worker_hot_mode_switch_keeps_listener_attached_in_dom_only(tmp_path: Path):
@@ -470,169 +345,6 @@ def test_worker_hot_mode_switch_keeps_listener_attached_in_dom_only(tmp_path: Pa
     worker.runtime_db.put_snapshot("settings", {"dom_only": False})
     worker._arm_passive_request_observer(state, hop, client)
     assert (client.armed, client.detached) == (2, 0)
-
-
-def test_waiting_dom_snapshot_uses_passive_wake_as_probe_window(tmp_path: Path):
-    _config, _store, state, worker = setup_task(
-        tmp_path, task_id="task-passive-wake"
-    )
-    hop = _active_hop(state)
-    state["roles"]["PLAN"]["conversation_generation"] = 3
-    receipt = SendReceipt(
-        prompt="prompt",
-        prompt_sha256=prompt_digest("prompt"),
-        binding=PageBinding("page-plan", "alpha-plan"),
-        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
-        attempts=1,
-        accepted_via="user_message_identity",
-        session_id_before=None,
-        user_message_id="u-passive",
-        user_turn_id="t-passive",
-        conversation_id="conversation-passive",
-    )
-    calls = []
-
-    class Client:
-        async def wait_for_passive_observation(self, **kwargs):
-            calls.append(("passive", kwargs))
-            return True
-
-        async def wait_snapshot(self, _receipt, **kwargs):
-            calls.append(("snapshot", kwargs))
-            return SimpleNamespace()
-
-    acquired = AcquiredRole(Client(), "page-plan", "https://chatgpt.com/c/conversation-passive", False, False)
-    snapshot, recovered = asyncio.run(
-        worker._waiting_dom_snapshot(
-            state,
-            hop,
-            SimpleNamespace(),
-            acquired,
-            Path(state["manifest_path"]),
-            json.loads(json.dumps(state)),
-            receipt,
-            transport_baseline=None,
-            probe_wait_ms=12_000,
-        )
-    )
-
-    assert snapshot is not None
-    assert recovered is acquired
-    assert calls == [
-        (
-            "passive",
-            {"request_id": hop["request_id"], "generation": 3, "timeout_ms": 12_000},
-        ),
-        ("snapshot", {"force_full": True, "probe_wait_ms": 0}),
-    ]
-
-
-def test_waiting_dom_snapshot_preserves_probe_window_when_passive_not_applicable(tmp_path: Path):
-    _config, _store, state, worker = setup_task(
-        tmp_path, task_id="task-passive-not-applicable"
-    )
-    hop = _active_hop(state)
-    receipt = SendReceipt(
-        prompt="prompt",
-        prompt_sha256=prompt_digest("prompt"),
-        binding=PageBinding("page-plan", "alpha-plan"),
-        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
-        attempts=1,
-        accepted_via="user_message_identity",
-        session_id_before=None,
-        user_message_id="u-passive",
-        user_turn_id="t-passive",
-        conversation_id="conversation-passive",
-    )
-    calls = []
-
-    class Client:
-        async def wait_for_passive_observation(self, **kwargs):
-            calls.append(("passive", kwargs))
-            return None
-
-        async def wait_snapshot(self, _receipt, **kwargs):
-            calls.append(("snapshot", kwargs))
-            return SimpleNamespace()
-
-    acquired = AcquiredRole(Client(), "page-plan", "https://chatgpt.com/c/conversation-passive", False, False)
-    snapshot, recovered = asyncio.run(
-        worker._waiting_dom_snapshot(
-            state,
-            hop,
-            SimpleNamespace(),
-            acquired,
-            Path(state["manifest_path"]),
-            json.loads(json.dumps(state)),
-            receipt,
-            transport_baseline=None,
-            probe_wait_ms=12_000,
-        )
-    )
-
-    assert snapshot is not None
-    assert recovered is acquired
-    assert calls == [
-        (
-            "passive",
-            {"request_id": hop["request_id"], "generation": 0, "timeout_ms": 12_000},
-        ),
-        ("snapshot", {"force_full": False, "probe_wait_ms": 12_000}),
-    ]
-
-
-def test_waiting_dom_snapshot_passive_timeout_consumes_probe_window_once(tmp_path: Path):
-    _config, _store, state, worker = setup_task(
-        tmp_path, task_id="task-passive-timeout"
-    )
-    hop = _active_hop(state)
-    receipt = SendReceipt(
-        prompt="prompt",
-        prompt_sha256=prompt_digest("prompt"),
-        binding=PageBinding("page-plan", "alpha-plan"),
-        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
-        attempts=1,
-        accepted_via="user_message_identity",
-        session_id_before=None,
-        user_message_id="u-passive",
-        user_turn_id="t-passive",
-        conversation_id="conversation-passive",
-    )
-    calls = []
-
-    class Client:
-        async def wait_for_passive_observation(self, **kwargs):
-            calls.append(("passive", kwargs))
-            return False
-
-        async def wait_snapshot(self, _receipt, **kwargs):
-            calls.append(("snapshot", kwargs))
-            return SimpleNamespace()
-
-    acquired = AcquiredRole(Client(), "page-plan", "https://chatgpt.com/c/conversation-passive", False, False)
-    snapshot, recovered = asyncio.run(
-        worker._waiting_dom_snapshot(
-            state,
-            hop,
-            SimpleNamespace(),
-            acquired,
-            Path(state["manifest_path"]),
-            json.loads(json.dumps(state)),
-            receipt,
-            transport_baseline=None,
-            probe_wait_ms=12_000,
-        )
-    )
-
-    assert snapshot is not None
-    assert recovered is acquired
-    assert calls == [
-        (
-            "passive",
-            {"request_id": hop["request_id"], "generation": 0, "timeout_ms": 12_000},
-        ),
-        ("snapshot", {"force_full": False, "probe_wait_ms": 0}),
-    ]
 
 
 def bootstrap_record(*, bootstrap_id="general-team-bootstrap", enabled=True):
@@ -966,7 +678,7 @@ def test_pre_send_first_role_uses_bootstrap_once_and_keeps_full_prompt(tmp_path:
         ):
             self.branch_calls.append((role, source_conversation_id, assistant_message_id))
             return AcquiredRole(
-                client=SimpleNamespace(),
+                client=ready_client(_state, role),
                 page_id=f"branch-{role.lower()}",
                 url=f"https://chatgpt.com/c/{role.lower()}-branch",
                 created=True,
@@ -1195,7 +907,7 @@ def test_pre_send_bootstrap_fallback_chain_is_pre_send_only(tmp_path: Path, monk
     async def ui_success(_state, role, _actions, donor):
         ui_calls.append((role, donor["conversation_id"], donor["assistant_message_id"]))
         return AcquiredRole(
-            client=SimpleNamespace(),
+            client=ready_client(_state, role),
             page_id="ui-branch-plan",
             url="https://chatgpt.com/c/ui-branch-plan",
             created=True,
@@ -2024,12 +1736,36 @@ def test_open_tab_recovers_presend_role_offline_and_sends_original_once(
     store.save(path, state)
     sent_prompts: list[str] = []
 
+    current = ChatGPTSnapshot(
+        url="https://chatgpt.com/c/owned-plan",
+        session_id="owned-plan",
+        page_id="recovered-page",
+        page_role=state["roles"]["PLAN"]["physical_role"],
+        page_task_id=state["task_id"],
+        page_team=state["team"],
+        state=ChatGPTState.WAITING_PROMPT,
+        requires_login=False,
+        composer_present=True,
+        composer_editable=True,
+        composer_text="",
+        send_visible=True,
+        send_enabled=True,
+        stop_visible=False,
+        blocking_dialogs=(),
+        attachment_markers=(),
+        error_texts=(),
+        messages=(),
+    )
+
     class RecoveryClient:
         async def assert_ownership(self):
-            return SimpleNamespace(
-                conversation_url="https://chatgpt.com/c/owned-plan",
-                url="https://chatgpt.com/c/owned-plan",
-            )
+            return current
+
+        async def wait_snapshot(self, _receipt, **_kwargs):
+            return current
+
+        def page_observation(self):
+            return {}
 
     client = RecoveryClient()
     acquired = AcquiredRole(
@@ -2136,9 +1872,8 @@ def test_open_tab_recovers_presend_role_offline_and_sends_original_once(
     assert waiting_hop["request_id"] == original_request_id
     assert len(sent_prompts) == 1
 
-    worker._waiting_dom = AsyncMock()
     asyncio.run(worker._waiting(waiting, waiting_hop, actions, path))
-    worker._waiting_dom.assert_awaited_once()
+    assert _active_hop(waiting)["state"] == "waiting"
     assert len(sent_prompts) == 1
 
 
@@ -2578,61 +2313,6 @@ def _enable_backend_wait_identity(store, state, path, hop, receipt, *, conversat
     return state, _active_hop(state), enriched
 
 
-def test_legacy_receipt_upgrade_advances_wait_persistence_baseline(tmp_path: Path):
-    from dataclasses import replace
-
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-legacy-receipt-persistence-baseline"
-    )
-    legacy = replace(
-        receipt,
-        accepted_via="legacy_send_receipt",
-        user_message_id=None,
-        user_turn_id=None,
-    )
-    RequestLedger(hop["ledger_path"]).update(
-        hop["request_id"], receipt=legacy.to_dict()
-    )
-    hop["receipt"] = legacy.to_dict()
-    state = store.save(path, state)
-    hop = _active_hop(state)
-    persistence_baseline = json.loads(json.dumps(state))
-
-    observed_at = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
-    hop["wait"]["continuous_responding_since"] = observed_at
-    snapshot = SimpleNamespace(
-        messages=(
-            MessageSnapshot(
-                "user",
-                "accepted-user-upgrade",
-                "accepted-turn-upgrade",
-                receipt.prompt,
-                (),
-            ),
-        )
-    )
-
-    upgraded = worker._upgrade_legacy_receipt(
-        state,
-        hop,
-        legacy,
-        snapshot,
-        path,
-        persistence_baseline,
-    )
-
-    assert upgraded is not None
-    assert upgraded.user_message_id == "accepted-user-upgrade"
-    assert upgraded.user_turn_id == "accepted-turn-upgrade"
-    persisted = store.load(path)
-    assert _active_hop(persisted)["wait"]["continuous_responding_since"] == observed_at
-    assert _active_hop(persisted)["receipt"]["user_message_id"] == "accepted-user-upgrade"
-
-    hop["wait"]["activity_length"] = 7
-    saved = worker._persist_transport_result(path, persistence_baseline, state)
-    assert _active_hop(saved)["wait"]["activity_length"] == 7
-
-
 def _backend_graph(user_id: str, assistant_id: str, text: str):
     return {
         "current_node": assistant_id,
@@ -2658,306 +2338,6 @@ def _backend_graph(user_id: str, assistant_id: str, text: str):
             },
         },
     }
-
-
-def test_listen_dom_streaming_status_is_sparse_and_never_fetches_graph(tmp_path: Path):
-    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-stream-primary"
-    )
-    receipt = replace(receipt, conversation_id="conversation-1")
-    worker.config = replace(
-        worker.config, response_stream_status_terminal_settle_seconds=5.0
-    )
-    hop["receipt"] = receipt.to_dict()
-    hop["wait"]["stream_status_next_poll_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=1)
-    ).isoformat()
-    calls = {"status": 0, "graph": 0}
-
-    class Actions:
-        async def backend_stream_status(self, conversation_id):
-            assert conversation_id == "conversation-1"
-            calls["status"] += 1
-            return {"status": "IS_STREAMING"}
-        async def backend_conversation(self, *_args, **_kwargs):
-            calls["graph"] += 1
-            raise AssertionError("Listen + DOM must never fetch the full conversation graph")
-
-    persisted = []
-    outcome, reason = asyncio.run(
-        worker._waiting_backend_step(
-            state, hop, Actions(), receipt, persist_transport_state=lambda: persisted.append(True)
-        )
-    )
-
-    assert (outcome, reason) == ("waiting", None)
-    assert calls == {"status": 1, "graph": 0}
-    assert hop["wait"]["stream_status_last_status"] == "IS_STREAMING"
-    next_poll = worker_module.parse_time(hop["wait"]["stream_status_next_poll_at"])
-    assert next_poll is not None
-    assert next_poll - datetime.now(timezone.utc) >= timedelta(seconds=29)
-    assert persisted
-
-
-def test_complete_status_settles_then_routes_to_local_dom_without_graph(tmp_path: Path):
-    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-complete-local"
-    )
-    receipt = replace(receipt, conversation_id="conversation-1")
-    worker.config = replace(
-        worker.config, response_stream_status_terminal_settle_seconds=5.0
-    )
-    hop["receipt"] = receipt.to_dict()
-    hop["wait"]["stream_status_next_poll_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=1)
-    ).isoformat()
-    calls = {"status": 0, "graph": 0}
-
-    class Actions:
-        async def backend_stream_status(self, _conversation_id):
-            calls["status"] += 1
-            return {"status": "COMPLETE"}
-        async def backend_conversation(self, *_args, **_kwargs):
-            calls["graph"] += 1
-            raise AssertionError("COMPLETE is only a local reconciliation trigger")
-
-    outcome, reason = asyncio.run(
-        worker._waiting_backend_step(
-            state, hop, Actions(), receipt, persist_transport_state=lambda: None
-        )
-    )
-    assert (outcome, reason) == ("waiting", None)
-    assert hop["wait"]["completion_mode"] == "terminal_local_settle"
-    assert calls == {"status": 1, "graph": 0}
-
-    hop["wait"]["terminal_local_ready_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=1)
-    ).isoformat()
-    outcome, reason = asyncio.run(
-        worker._waiting_backend_step(
-            state, hop, Actions(), receipt, persist_transport_state=lambda: None
-        )
-    )
-    assert (outcome, reason) == ("dom_reconcile", None)
-    assert calls == {"status": 1, "graph": 0}
-
-
-def test_stream_status_preserves_streaming_stop_requested_and_failure_types(tmp_path: Path):
-    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-status-types"
-    )
-    receipt = replace(receipt, conversation_id="conversation-1")
-    hop["receipt"] = receipt.to_dict()
-
-    class Actions:
-        def __init__(self, status):
-            self.status = status
-            self.released = []
-        async def backend_stream_status(self, _conversation_id):
-            return {"status": self.status}
-        def release_backend_stream_status(self, conversation_id):
-            self.released.append(conversation_id)
-
-    cases = (
-        ("IS_STREAMING", "waiting", None, False),
-        ("IS_STOP_REQUESTED", "stream_stopped", "stream_status_stop_requested", True),
-        ("FAILURE", "stream_failure", "stream_status_failure", True),
-    )
-    for status, expected, expected_reason, releases in cases:
-        hop["wait"]["completion_mode"] = "stream_status"
-        hop["wait"]["stream_status_next_poll_at"] = (
-            datetime.now(timezone.utc) - timedelta(seconds=1)
-        ).isoformat()
-        actions = Actions(status)
-        outcome, reason = asyncio.run(
-            worker._waiting_backend_step(
-                state, hop, actions, receipt, persist_transport_state=lambda: None
-            )
-        )
-        assert outcome == expected
-        assert reason == expected_reason
-        assert hop["wait"]["stream_status_last_status"] == status
-        assert actions.released == (["conversation-1"] if releases else [])
-        if status == "IS_STOP_REQUESTED":
-            assert hop["wait"]["completion_mode"] == "stop_requested_local_reconcile"
-            assert hop["wait"]["stop_requested_seen_at"]
-
-
-def test_stop_requested_local_reconcile_mode_does_not_poll_status_again(tmp_path: Path):
-    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-stop-requested-no-repoll"
-    )
-    receipt = replace(receipt, conversation_id="conversation-1")
-    hop["receipt"] = receipt.to_dict()
-    hop["wait"]["completion_mode"] = "stop_requested_local_reconcile"
-
-    class Actions:
-        async def backend_stream_status(self, *_args, **_kwargs):
-            raise AssertionError("stopped generation must not re-enter ordinary status polling")
-
-    outcome, reason = asyncio.run(
-        worker._waiting_backend_step(
-            state, hop, Actions(), receipt, persist_transport_state=lambda: None
-        )
-    )
-
-    assert (outcome, reason) == ("stream_stopped", "stream_status_stop_requested")
-
-
-def test_stop_requested_backend_helper_returns_local_reconcile_signal(tmp_path: Path):
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-stop-requested-valid-response"
-    )
-    conversation_id = "11111111-1111-4111-8111-111111111111"
-    state, hop, receipt = _enable_backend_wait_identity(
-        store, state, path, hop, receipt, conversation_id=conversation_id
-    )
-    released = []
-
-    class Actions:
-        async def backend_stream_status(self, exact_conversation_id):
-            assert exact_conversation_id == conversation_id
-            return {"status": "IS_STOP_REQUESTED"}
-
-        def release_backend_stream_status(self, exact_conversation_id):
-            released.append(exact_conversation_id)
-
-    outcome, reason = asyncio.run(
-        worker._waiting_backend_step(
-            state,
-            hop,
-            Actions(),
-            receipt,
-            persist_transport_state=lambda: None,
-        )
-    )
-
-    assert (outcome, reason) == ("stream_stopped", "stream_status_stop_requested")
-    assert released == [conversation_id]
-    assert hop["wait"]["stream_status_last_status"] == "IS_STOP_REQUESTED"
-    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
-
-
-def test_stop_requested_backend_helper_does_not_replay_or_fetch_graph(tmp_path: Path):
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-stop-requested-unresolved"
-    )
-    conversation_id = "22222222-2222-4222-8222-222222222222"
-    state, hop, receipt = _enable_backend_wait_identity(
-        store, state, path, hop, receipt, conversation_id=conversation_id
-    )
-    released = []
-
-    class Actions:
-        async def backend_stream_status(self, exact_conversation_id):
-            assert exact_conversation_id == conversation_id
-            return {"status": "IS_STOP_REQUESTED"}
-
-        def release_backend_stream_status(self, exact_conversation_id):
-            released.append(exact_conversation_id)
-
-        async def backend_conversation(self, *_args, **_kwargs):
-            raise AssertionError("stop helper must not fetch the full graph")
-
-        async def send(self, *_args, **_kwargs):
-            raise AssertionError("stop helper must not replay Send")
-
-    outcome, reason = asyncio.run(
-        worker._waiting_backend_step(
-            state,
-            hop,
-            Actions(),
-            receipt,
-            persist_transport_state=lambda: None,
-        )
-    )
-
-    assert (outcome, reason) == ("stream_stopped", "stream_status_stop_requested")
-    assert released == [conversation_id]
-    assert hop["wait"]["stream_status_last_status"] == "IS_STOP_REQUESTED"
-    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
-
-
-def test_stream_status_error_uses_bounded_local_fallback_without_graph(tmp_path: Path):
-    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-status-recovery"
-    )
-    receipt = replace(receipt, conversation_id="conversation-1")
-    hop["receipt"] = receipt.to_dict()
-    hop["wait"]["stream_status_next_poll_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=1)
-    ).isoformat()
-    calls = {"graph": 0}
-
-    class Actions:
-        async def backend_stream_status(self, _conversation_id):
-            raise worker_module.BackendUnavailableError(503, "stream_status")
-        async def backend_conversation(self, *_args, **_kwargs):
-            calls["graph"] += 1
-            raise AssertionError("status recovery must not probe the conversation graph")
-
-    outcome, reason = asyncio.run(
-        worker._waiting_backend_step(
-            state, hop, Actions(), receipt, persist_transport_state=lambda: None
-        )
-    )
-    assert (outcome, reason) == ("waiting", None)
-    assert hop["wait"]["completion_mode"] == "status_recovery"
-    assert calls["graph"] == 0
-
-    hop["wait"]["deadline_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
-    hop["wait"]["stream_status_next_poll_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
-    outcome, reason = asyncio.run(
-        worker._waiting_backend_step(
-            state, hop, Actions(), receipt, persist_transport_state=lambda: None
-        )
-    )
-    assert outcome == "dom_fallback"
-    assert reason in {"response_deadline", "status_unavailable"}
-    assert calls["graph"] == 0
-
-
-def test_resume_shares_status_due_slot_instead_of_forcing_poll(tmp_path: Path):
-    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-resume-shared-status-slot"
-    )
-    receipt = replace(receipt, conversation_id="conversation-1")
-    hop["receipt"] = receipt.to_dict()
-    hop["wait"]["stream_status_next_poll_at"] = (
-        datetime.now(timezone.utc) + timedelta(seconds=20)
-    ).isoformat()
-
-    class Actions:
-        async def backend_stream_status(self, *_args, **_kwargs):
-            raise AssertionError("Resume must not create an extra status poll before the shared due time")
-
-    outcome, reason = asyncio.run(
-        worker._waiting_backend_step(
-            state, hop, Actions(), receipt, persist_transport_state=lambda: None, resume_recovery=True
-        )
-    )
-    assert (outcome, reason) == ("dom_reconcile", None)
-
-
-def test_waiting_terminal_local_settle_hands_off_to_existing_dom_path(tmp_path: Path):
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-terminal-dom-handoff"
-    )
-    state, hop, receipt = _enable_backend_wait_identity(store, state, path, hop, receipt)
-    worker.runtime_db.ensure_schema()
-    worker.runtime_db.put_snapshot("settings", {"dom_only": False})
-    hop["wait"]["completion_mode"] = "terminal_local_settle"
-    hop["wait"]["terminal_local_ready_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
-    state = store.save(path, state)
-    hop = _active_hop(state)
-    worker._waiting_dom = AsyncMock()
-
-    class Actions:
-        async def backend_conversation(self, *_args, **_kwargs):
-            raise AssertionError("terminal local handoff must not fetch graph")
-
-    asyncio.run(worker._waiting(state, hop, Actions(), path))
-    worker._waiting_dom.assert_awaited_once()
 
 
 def test_unresolved_complete_accepts_terminal_continuation_before_final_block(
@@ -3002,13 +2382,17 @@ def test_unresolved_complete_accepts_terminal_continuation_before_final_block(
         }
     )
 
+    hop["wait"].update(
+        result_seen_key=worker_module.hashlib.sha256(response.text.encode()).hexdigest(),
+        result_seen_at=(datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat(),
+        result_samples=1,
+    )
+    state = store.save(path, state)
+    hop = _active_hop(state)
+
     class Client:
         async def wait_snapshot(self, _receipt, **_kwargs):
             return snapshot
-
-        async def wait_for_response(self, _receipt, **kwargs):
-            kwargs["candidate_validator"](response)
-            return response
 
     acquired = AcquiredRole(
         Client(), receipt.binding.page_id, hop["conversation_url"], False, False
@@ -3056,145 +2440,6 @@ def _mark_completed_refresh(hop: dict, *, seconds_ago: int) -> None:
     }
 
 
-def test_post_refresh_one_minute_checks_response_even_while_stop_is_visible(tmp_path: Path):
-    from dataclasses import replace
-
-    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-post-refresh-one-minute"
-    )
-    _mark_completed_refresh(hop, seconds_ago=61)
-    snapshot = replace(
-        send_snapshot(task_id=state["task_id"], team=state["team"]),
-        stop_visible=True,
-    )
-
-    class Client:
-        binding = receipt.binding
-
-        async def wait_snapshot(self, _receipt, **_kwargs):
-            return snapshot
-
-    acquired = AcquiredRole(
-        Client(), receipt.binding.page_id, "https://chatgpt.com/c/post-refresh-one", False, False
-    )
-
-    class Actions:
-        async def locate_owned(self, *_args, **_kwargs):
-            return acquired
-
-    worker._final_dom_response_reconciliation = AsyncMock(return_value=True)
-
-    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
-
-    worker._final_dom_response_reconciliation.assert_awaited_once()
-
-
-def test_post_refresh_two_minutes_stop_visible_checks_response_then_keeps_waiting(tmp_path: Path):
-    from dataclasses import replace
-
-    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-post-refresh-two-minute-stop"
-    )
-    _mark_completed_refresh(hop, seconds_ago=121)
-    snapshot = replace(
-        send_snapshot(task_id=state["task_id"], team=state["team"]),
-        stop_visible=True,
-    )
-
-    class Client:
-        binding = receipt.binding
-
-        async def wait_snapshot(self, _receipt, **_kwargs):
-            return snapshot
-
-    acquired = AcquiredRole(
-        Client(), receipt.binding.page_id, "https://chatgpt.com/c/post-refresh-two-stop", False, False
-    )
-
-    class Actions:
-        async def locate_owned(self, *_args, **_kwargs):
-            return acquired
-
-    worker._final_dom_response_reconciliation = AsyncMock(return_value=False)
-
-    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
-
-    worker._final_dom_response_reconciliation.assert_awaited_once()
-    assert state["active_hop_id"] == hop["hop_id"]
-    assert state["active_action"] == "wait_response"
-    assert hop["state"] == "waiting"
-
-
-def test_post_refresh_two_minutes_without_stop_never_replays_accepted_request(tmp_path: Path):
-    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-post-refresh-no-replay"
-    )
-    _mark_completed_refresh(hop, seconds_ago=121)
-    original_hop_id = hop["hop_id"]
-    original_request_id = hop["request_id"]
-    snapshot = send_snapshot(task_id=state["task_id"], team=state["team"])
-
-    class Client:
-        binding = receipt.binding
-
-        async def wait_snapshot(self, _receipt, **_kwargs):
-            return snapshot
-
-    acquired = AcquiredRole(
-        Client(), receipt.binding.page_id, "https://chatgpt.com/c/post-refresh-no-replay", False, False
-    )
-
-    class Actions:
-        async def locate_owned(self, *_args, **_kwargs):
-            return acquired
-
-    worker._final_dom_response_reconciliation = AsyncMock(return_value=False)
-
-    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
-
-    record = RequestLedger(hop["ledger_path"]).get(original_request_id)
-    assert len(state["hops"]) == 1
-    assert state["active_hop_id"] == original_hop_id
-    assert hop["state"] == "waiting"
-    assert record.status is RequestStatus.SENT
-    assert state["active_action"] == "wait_response"
-
-
-def test_post_refresh_legacy_reroute_marker_still_never_creates_another_send(tmp_path: Path):
-    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-post-refresh-legacy-marker-no-replay"
-    )
-    _mark_completed_refresh(hop, seconds_ago=121)
-    hop["stall_reroute_attempt"] = 3
-    original_request_id = hop["request_id"]
-    snapshot = send_snapshot(task_id=state["task_id"], team=state["team"])
-
-    class Client:
-        binding = receipt.binding
-
-        async def wait_snapshot(self, _receipt, **_kwargs):
-            return snapshot
-
-    acquired = AcquiredRole(
-        Client(), receipt.binding.page_id, "https://chatgpt.com/c/post-refresh-legacy", False, False
-    )
-
-    class Actions:
-        async def locate_owned(self, *_args, **_kwargs):
-            return acquired
-
-    worker._final_dom_response_reconciliation = AsyncMock(return_value=False)
-
-    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
-
-    record = RequestLedger(hop["ledger_path"]).get(original_request_id)
-    assert len(state["hops"]) == 1
-    assert state["status"] == "RUNNING"
-    assert state["active_hop_id"] == hop["hop_id"]
-    assert hop["state"] == "waiting"
-    assert record.status is RequestStatus.SENT
-
-
 def test_normal_wait_routes_valid_local_file_response_without_repair(tmp_path: Path):
     _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-normal-wait-path-only"
@@ -3211,23 +2456,21 @@ def test_normal_wait_routes_valid_local_file_response_without_repair(tmp_path: P
         json.dumps({"route": "TEST", "handoff": handoff}),
         (),
     )
-    snapshot = SimpleNamespace(
+    snapshot = send_snapshot(
+        messages=(MessageSnapshot("user", "u1", "t1", receipt.prompt, ()), response),
         state=ChatGPTState.WAITING_PROMPT,
-        stop_visible=False,
-        composer_empty=True,
-        manual_input_pending=False,
-        error_texts=(),
-        blocking_dialogs=(),
-        messages=(MessageSnapshot("user", "u1", "t1", receipt.prompt, ()),),
+        task_id=state["task_id"],
+        team=state["team"],
+    )
+    hop["wait"].update(
+        result_seen_key=worker_module.hashlib.sha256(response.text.encode()).hexdigest(),
+        result_seen_at=(datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat(),
+        result_samples=1,
     )
 
     class Client:
         async def wait_snapshot(self, _receipt, **_kwargs):
             return snapshot
-
-        async def wait_for_response(self, _receipt, **kwargs):
-            kwargs["candidate_validator"](response)
-            return response
 
     acquired = AcquiredRole(
         Client(), receipt.binding.page_id, "https://chatgpt.com/c/normal-path-only", False, False
@@ -3260,38 +2503,6 @@ def test_normal_wait_routes_valid_local_file_response_without_repair(tmp_path: P
     assert record.attempts == 1
 
 
-def test_waiting_with_foreign_durable_history_uses_local_reconciliation_not_graph(
-    tmp_path: Path,
-):
-    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-historical-owner"
-    )
-    conversation_id = "99999999-9999-4999-8999-999999999999"
-    state, hop, receipt = _enable_backend_wait_identity(
-        store, state, path, hop, receipt, conversation_id=conversation_id
-    )
-    worker.runtime_db.ensure_schema()
-    worker.runtime_db.put_snapshot("settings", {"dom_only": False})
-    hop["wait"]["completion_mode"] = "terminal_local_settle"
-    hop["wait"]["terminal_local_ready_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=1)
-    ).isoformat()
-    state = store.save(path, state)
-    hop = _active_hop(state)
-    worker._waiting_dom = AsyncMock()
-
-    class Actions:
-        async def backend_conversation(self, *_args, **_kwargs):
-            raise AssertionError("foreign history must not trigger an automation graph read")
-
-    asyncio.run(worker._waiting(state, hop, Actions(), path))
-    worker._waiting_dom.assert_awaited_once()
-    current = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
-    assert current is not None
-    assert current.attempts == 1
-    assert current.status is RequestStatus.SENT
-
-
 def test_waiting_requires_valid_route_report_and_two_samples_before_hop_response(tmp_path: Path):
     from dataclasses import replace
 
@@ -3309,27 +2520,16 @@ def test_waiting_requires_valid_route_report_and_two_samples_before_hop_response
         '{"route":"TEST","handoff":".plan/alpha/alpha-plan_turn1_task-valid-gate.md"}',
         (),
     )
-    snapshot = SimpleNamespace(
+    snapshot = send_snapshot(
+        messages=(MessageSnapshot("user", "u1", "t1", receipt.prompt, ()), response),
         state=ChatGPTState.WAITING_PROMPT,
-        stop_visible=False,
-        composer_empty=True,
-        manual_input_pending=False,
-        error_texts=(),
-        blocking_dialogs=(),
-        messages=(MessageSnapshot("user", "u1", "t1", receipt.prompt, ()),),
+        task_id=state["task_id"],
+        team=state["team"],
     )
 
     class Client:
-        def __init__(self):
-            self.kwargs = None
-
-        async def assert_ownership(self):
+        async def wait_snapshot(self, _receipt, **_kwargs):
             return snapshot
-
-        async def wait_for_response(self, _receipt, **kwargs):
-            self.kwargs = kwargs
-            kwargs["candidate_validator"](response)
-            return response
 
     client = Client()
     acquired = AcquiredRole(
@@ -3345,11 +2545,14 @@ def test_waiting_requires_valid_route_report_and_two_samples_before_hop_response
             return acquired
 
     asyncio.run(worker._waiting(state, hop, Actions(), path))
+    assert hop["state"] == "waiting"
+    assert hop["wait"]["result_samples"] == 1
+    hop["wait"]["result_seen_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=2)
+    ).isoformat()
+    asyncio.run(worker._waiting(state, hop, Actions(), path))
 
-    assert client.kwargs["minimum_samples"] == 2
-    assert client.kwargs["poll_ms"] == 5000
-    assert client.kwargs["timeout_ms"] >= 11_000
-    assert client.kwargs["invalid_grace_ms"] >= 1_000
+    assert hop["wait"]["result_samples"] == 2
     assert hop["state"] == "responded"
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).status is RequestStatus.SENT
 
@@ -3681,23 +2884,23 @@ def test_accepted_legacy_inline_hop_drains_once_to_execution_repo_then_file(
         _inline_response(route="DEV", body=body),
         (),
     )
-    snapshot = SimpleNamespace(
+    snapshot = send_snapshot(
+        messages=(MessageSnapshot("user", "u1", "t1", original_prompt, ()), response),
         state=ChatGPTState.WAITING_PROMPT,
-        stop_visible=False,
-        composer_empty=True,
-        manual_input_pending=False,
-        error_texts=(),
-        blocking_dialogs=(),
-        messages=(MessageSnapshot("user", "u1", "t1", original_prompt, ()),),
+        task_id=state["task_id"],
+        team=state["team"],
     )
+    hop["wait"].update(
+        result_seen_key=worker_module.hashlib.sha256(response.text.encode()).hexdigest(),
+        result_seen_at=(datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat(),
+        result_samples=1,
+    )
+    state = store.save(path, state)
+    hop = _active_hop(state)
 
     class Client:
-        async def assert_ownership(self):
+        async def wait_snapshot(self, _receipt, **_kwargs):
             return snapshot
-
-        async def wait_for_response(self, _receipt, **kwargs):
-            kwargs["candidate_validator"](response)
-            return response
 
     acquired = AcquiredRole(
         client=Client(),
@@ -3906,23 +3109,21 @@ def test_cross_workspace_local_file_report_requires_execution_repository_artifac
         json.dumps({"route": "DEV", "handoff": handoff}),
         (),
     )
-    snapshot = SimpleNamespace(
+    snapshot = send_snapshot(
+        messages=(MessageSnapshot("user", "u1", "t1", receipt.prompt, ()), response),
         state=ChatGPTState.WAITING_PROMPT,
-        stop_visible=False,
-        composer_empty=True,
-        manual_input_pending=False,
-        error_texts=(),
-        blocking_dialogs=(),
-        messages=(MessageSnapshot("user", "u1", "t1", receipt.prompt, ()),),
+        task_id=state["task_id"],
+        team=state["team"],
+    )
+    hop["wait"].update(
+        result_seen_key=worker_module.hashlib.sha256(response.text.encode()).hexdigest(),
+        result_seen_at=(datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat(),
+        result_samples=1,
     )
 
     class Client:
-        async def assert_ownership(self):
+        async def wait_snapshot(self, _receipt, **_kwargs):
             return snapshot
-
-        async def wait_for_response(self, _receipt, **kwargs):
-            kwargs["candidate_validator"](response)
-            return response
 
     acquired = AcquiredRole(
         client=Client(),
@@ -5247,614 +4448,6 @@ def test_change_goal_keeps_current_prompt_and_updates_first_later_hop(tmp_path: 
     assert later_envelope["goal"] == "Replacement for later roles"
 
 
-def test_dom_wait_transient_target_crash_runs_bounded_recovery_refresh(tmp_path: Path):
-    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-dom-target-crash"
-    )
-    refresh_calls = []
-
-    class Client:
-        binding = receipt.binding
-        page = SimpleNamespace()
-
-        async def wait_snapshot(self, _receipt, **_kwargs):
-            raise RuntimeError("Page.evaluate: Target crashed")
-
-    acquired = AcquiredRole(
-        Client(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
-    )
-
-    class Actions:
-        async def locate_owned(self, *_args, **_kwargs):
-            return acquired
-
-        async def refresh(self, target, **kwargs):
-            refresh_calls.append((target, kwargs))
-            return target
-
-    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
-
-    assert hop["state"] == "waiting"
-    assert state["status"] == "RUNNING"
-    assert state["active_action"] == "wait_response"
-    assert hop["wait"]["refresh_count"] == 1
-    assert hop["wait"]["last_refresh_result"]["status"] == "completed"
-    assert hop["wait"]["last_refresh_result"]["reason"] == "dom_observation_recovery"
-    assert len(refresh_calls) == 1
-    assert refresh_calls[0][1]["manifest"] is state
-    assert refresh_calls[0][1]["logical_role"] == "PLAN"
-    assert refresh_calls[0][1]["recover"] is True
-    assert refresh_calls[0][1]["skip_precheck"] is True
-
-
-def test_dom_periodic_refresh_target_crash_stays_resumable_without_replay(
-    tmp_path: Path,
-):
-    from dataclasses import replace
-
-    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-dom-refresh-target-crash"
-    )
-    worker.config = replace(worker.config, response_refresh_after_seconds=0.0)
-    worker._final_response_reconciliation = AsyncMock(return_value=False)
-    accepted_user = MessageSnapshot(
-        "user",
-        receipt.user_message_id or "u1",
-        receipt.user_turn_id or "t1",
-        receipt.prompt,
-        (),
-    )
-    snapshot = send_snapshot(
-        messages=(accepted_user,),
-        state=ChatGPTState.WAITING_PROMPT,
-        task_id=state["task_id"],
-        team=state["team"],
-    )
-
-    class Client:
-        binding = receipt.binding
-        page = SimpleNamespace()
-
-        async def wait_snapshot(self, _receipt, **_kwargs):
-            return snapshot
-
-        async def wait_for_response(self, *_args, **_kwargs):
-            raise AssertionError("transient refresh failure must return to worker loop")
-
-    acquired = AcquiredRole(
-        Client(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
-    )
-    calls = {"refresh": 0, "send": 0, "retry": 0}
-
-    class Actions:
-        async def locate_owned(self, *_args, **_kwargs):
-            return acquired
-
-        async def refresh(self, *_args, **_kwargs):
-            calls["refresh"] += 1
-            raise RuntimeError("Page.evaluate: Target crashed")
-
-        async def send(self, *_args, **_kwargs):
-            calls["send"] += 1
-            raise AssertionError("recovery must not Send")
-
-        async def retry(self, *_args, **_kwargs):
-            calls["retry"] += 1
-            raise AssertionError("recovery must not Retry")
-
-    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
-
-    assert calls == {"refresh": 1, "send": 0, "retry": 0}
-    assert state["status"] == "RUNNING"
-    assert state["active_action"] == "wait_response"
-    assert hop["state"] == "waiting"
-    assert hop["wait"]["refresh_count"] == 1
-    assert hop["wait"]["last_refresh_result"]["status"] == "failed"
-    assert "Target crashed" in hop["wait"]["last_refresh_result"]["error"]
-
-
-def test_dom_wait_expired_transient_observation_reconciles_despite_recent_recovery(
-    tmp_path: Path,
-):
-    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-dom-expired-transient"
-    )
-    hop["wait"]["deadline_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=1)
-    ).isoformat()
-    hop["wait"]["last_refresh_at"] = datetime.now(timezone.utc).isoformat()
-    hop["wait"]["last_refresh_result"] = {
-        "status": "completed",
-        "reason": "dom_observation_recovery",
-    }
-
-    class Client:
-        binding = receipt.binding
-        page = SimpleNamespace()
-
-        async def wait_snapshot(self, _receipt, **_kwargs):
-            raise RuntimeError("Page.evaluate: Target crashed")
-
-    acquired = AcquiredRole(
-        Client(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
-    )
-    calls = {"refresh": 0, "send": 0, "retry": 0}
-
-    class Actions:
-        async def locate_owned(self, *_args, **_kwargs):
-            return acquired
-
-        async def refresh(self, *_args, **_kwargs):
-            calls["refresh"] += 1
-            raise AssertionError("recent recovery must suppress another reload")
-
-        async def send(self, *_args, **_kwargs):
-            calls["send"] += 1
-            raise AssertionError("deadline reconciliation must not Send")
-
-        async def retry(self, *_args, **_kwargs):
-            calls["retry"] += 1
-            raise AssertionError("deadline reconciliation must not Retry")
-
-    worker._final_response_reconciliation = AsyncMock(return_value=False)
-    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
-
-    worker._final_response_reconciliation.assert_awaited_once()
-    assert calls == {"refresh": 0, "send": 0, "retry": 0}
-    assert state["status"] == "BLOCKED"
-    assert state["block_code"] == "response_timeout"
-
-
-def test_dom_wait_expired_recent_recovery_final_lifecycle_error_stays_resumable(
-    tmp_path: Path,
-):
-    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-dom-expired-recent-final-lifecycle"
-    )
-    hop["wait"]["deadline_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=1)
-    ).isoformat()
-    hop["wait"]["last_refresh_at"] = datetime.now(timezone.utc).isoformat()
-    hop["wait"]["last_refresh_result"] = {
-        "status": "completed",
-        "reason": "dom_observation_recovery",
-    }
-    calls = {"snapshot": 0, "final": 0, "refresh": 0}
-
-    class Client:
-        binding = receipt.binding
-        page = SimpleNamespace()
-
-        async def wait_snapshot(self, _receipt, **_kwargs):
-            calls["snapshot"] += 1
-            raise RuntimeError("Page.evaluate: Target crashed")
-
-        async def wait_for_response(self, *_args, **_kwargs):
-            calls["final"] += 1
-            raise RuntimeError("Page.evaluate: Target crashed")
-
-    acquired = AcquiredRole(
-        Client(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
-    )
-
-    class Actions:
-        async def locate_owned(self, *_args, **_kwargs):
-            return acquired
-
-        async def refresh(self, *_args, **_kwargs):
-            calls["refresh"] += 1
-            raise AssertionError("recent recovery must suppress another reload")
-
-    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
-
-    assert calls == {"snapshot": 1, "final": 1, "refresh": 0}
-    assert state["status"] == "RUNNING"
-    assert state["block_code"] is None
-    assert hop["state"] == "waiting"
-
-
-def test_dom_wait_expired_closed_target_reconciles_on_reacquired_exact_page(tmp_path: Path):
-    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-dom-expired-reacquired"
-    )
-    hop["wait"]["deadline_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=1)
-    ).isoformat()
-    calls = {"refresh": 0, "old_wait": 0, "new_wait": 0, "send": 0, "retry": 0}
-
-    class OldClient:
-        binding = receipt.binding
-        page = SimpleNamespace()
-
-        async def wait_snapshot(self, _receipt, **_kwargs):
-            raise RuntimeError("Page has been closed")
-
-        async def wait_for_response(self, *_args, **_kwargs):
-            calls["old_wait"] += 1
-            raise RuntimeError("Page has been closed")
-
-    class ReacquiredClient:
-        binding = receipt.binding
-        page = SimpleNamespace()
-
-        async def wait_for_response(self, *_args, **_kwargs):
-            calls["new_wait"] += 1
-            raise TimeoutError("no terminal response after exact reacquire")
-
-    old_acquired = AcquiredRole(
-        OldClient(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
-    )
-    reacquired = AcquiredRole(
-        ReacquiredClient(),
-        receipt.binding.page_id,
-        "https://chatgpt.com/c/test",
-        False,
-        False,
-    )
-
-    class Actions:
-        async def locate_owned(self, *_args, **_kwargs):
-            return old_acquired
-
-        async def refresh(self, target, **kwargs):
-            assert target is old_acquired
-            assert kwargs["recover"] is True
-            assert kwargs["skip_precheck"] is True
-            calls["refresh"] += 1
-            return reacquired
-
-        async def send(self, *_args, **_kwargs):
-            calls["send"] += 1
-            raise AssertionError("recovery must not Send")
-
-        async def retry(self, *_args, **_kwargs):
-            calls["retry"] += 1
-            raise AssertionError("recovery must not Retry")
-
-    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
-
-    assert calls == {
-        "refresh": 1,
-        "old_wait": 0,
-        "new_wait": 1,
-        "send": 0,
-        "retry": 0,
-    }
-    assert state["status"] == "BLOCKED"
-    assert state["block_code"] == "response_timeout"
-
-
-def test_dom_wait_expired_transient_refresh_failure_does_not_reconcile_stale_target(
-    tmp_path: Path,
-):
-    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-dom-expired-refresh-failure"
-    )
-    hop["wait"]["deadline_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=1)
-    ).isoformat()
-    calls = {"snapshot": 0, "refresh": 0, "final": 0, "send": 0, "retry": 0}
-
-    class Client:
-        binding = receipt.binding
-        page = SimpleNamespace()
-
-        async def wait_snapshot(self, _receipt, **_kwargs):
-            calls["snapshot"] += 1
-            raise RuntimeError("Page.evaluate: Target crashed")
-
-        async def wait_for_response(self, *_args, **_kwargs):
-            calls["final"] += 1
-            raise RuntimeError("Page.evaluate: Target crashed")
-
-    acquired = AcquiredRole(
-        Client(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
-    )
-
-    class Actions:
-        async def locate_owned(self, *_args, **_kwargs):
-            return acquired
-
-        async def refresh(self, target, **kwargs):
-            assert target is acquired
-            assert kwargs["recover"] is True
-            assert kwargs["skip_precheck"] is True
-            calls["refresh"] += 1
-            raise RuntimeError("Page.reload: Target crashed")
-
-        async def send(self, *_args, **_kwargs):
-            calls["send"] += 1
-            raise AssertionError("recovery must not Send")
-
-        async def retry(self, *_args, **_kwargs):
-            calls["retry"] += 1
-            raise AssertionError("recovery must not Retry")
-
-    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
-
-    assert calls == {
-        "snapshot": 1,
-        "refresh": 1,
-        "final": 0,
-        "send": 0,
-        "retry": 0,
-    }
-    assert state["status"] == "RUNNING"
-    assert state["block_code"] is None
-    assert hop["state"] == "waiting"
-    assert hop["wait"]["last_refresh_result"]["status"] == "failed"
-    assert "Target crashed" in hop["wait"]["last_refresh_result"]["error"]
-
-
-def test_dom_wait_expired_clean_snapshot_final_lifecycle_error_stays_resumable(
-    tmp_path: Path,
-):
-    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-dom-expired-clean-final-lifecycle"
-    )
-    hop["wait"]["deadline_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=1)
-    ).isoformat()
-    accepted_user = MessageSnapshot(
-        "user",
-        receipt.user_message_id or "u1",
-        receipt.user_turn_id or "t1",
-        receipt.prompt,
-        (),
-    )
-    snapshot = send_snapshot(
-        messages=(accepted_user,),
-        state=ChatGPTState.WAITING_PROMPT,
-        task_id=state["task_id"],
-        team=state["team"],
-    )
-    calls = {"snapshot": 0, "final": 0, "refresh": 0, "send": 0, "retry": 0}
-
-    class Client:
-        binding = receipt.binding
-        page = SimpleNamespace()
-
-        async def wait_snapshot(self, _receipt, **_kwargs):
-            calls["snapshot"] += 1
-            return snapshot
-
-        async def wait_for_response(self, *_args, **_kwargs):
-            calls["final"] += 1
-            raise RuntimeError("Page.evaluate: Target crashed")
-
-    acquired = AcquiredRole(
-        Client(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
-    )
-
-    class Actions:
-        async def locate_owned(self, *_args, **_kwargs):
-            return acquired
-
-        async def refresh(self, *_args, **_kwargs):
-            calls["refresh"] += 1
-            raise AssertionError("expired deadline must not reload after transient final reconciliation")
-
-        async def send(self, *_args, **_kwargs):
-            calls["send"] += 1
-            raise AssertionError("final reconciliation must not Send")
-
-        async def retry(self, *_args, **_kwargs):
-            calls["retry"] += 1
-            raise AssertionError("final reconciliation must not Retry")
-
-    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
-
-    assert calls == {
-        "snapshot": 1,
-        "final": 1,
-        "refresh": 0,
-        "send": 0,
-        "retry": 0,
-    }
-    assert state["status"] == "RUNNING"
-    assert state["block_code"] is None
-    assert hop["state"] == "waiting"
-    assert state["active_action"] == "wait_response"
-
-
-def test_dom_wait_expired_clean_snapshot_unrelated_final_error_is_not_swallowed(
-    tmp_path: Path,
-):
-    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-dom-expired-clean-final-unrelated"
-    )
-    hop["wait"]["deadline_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=1)
-    ).isoformat()
-    accepted_user = MessageSnapshot(
-        "user",
-        receipt.user_message_id or "u1",
-        receipt.user_turn_id or "t1",
-        receipt.prompt,
-        (),
-    )
-    snapshot = send_snapshot(
-        messages=(accepted_user,),
-        state=ChatGPTState.WAITING_PROMPT,
-        task_id=state["task_id"],
-        team=state["team"],
-    )
-
-    class Client:
-        binding = receipt.binding
-        page = SimpleNamespace()
-
-        async def wait_snapshot(self, _receipt, **_kwargs):
-            return snapshot
-
-        async def wait_for_response(self, *_args, **_kwargs):
-            raise RuntimeError("selector parser exploded")
-
-    acquired = AcquiredRole(
-        Client(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
-    )
-
-    class Actions:
-        async def locate_owned(self, *_args, **_kwargs):
-            return acquired
-
-        async def refresh(self, *_args, **_kwargs):
-            raise AssertionError("unrelated final-reconciliation error must fail closed")
-
-    with pytest.raises(RuntimeError, match="selector parser exploded"):
-        asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
-
-
-def test_dom_wait_wait_timeout_then_final_lifecycle_error_stays_resumable(
-    tmp_path: Path,
-):
-    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-dom-wait-timeout-final-lifecycle"
-    )
-    hop["wait"]["deadline_at"] = (
-        datetime.now(timezone.utc) + timedelta(seconds=30)
-    ).isoformat()
-    accepted_user = MessageSnapshot(
-        "user",
-        receipt.user_message_id or "u1",
-        receipt.user_turn_id or "t1",
-        receipt.prompt,
-        (),
-    )
-    snapshot = send_snapshot(
-        messages=(accepted_user,),
-        state=ChatGPTState.WAITING_PROMPT,
-        task_id=state["task_id"],
-        team=state["team"],
-    )
-    calls = {"snapshot": 0, "wait": 0, "refresh": 0, "send": 0, "retry": 0}
-
-    class Client:
-        binding = receipt.binding
-        page = SimpleNamespace()
-
-        async def wait_snapshot(self, _receipt, **_kwargs):
-            calls["snapshot"] += 1
-            return snapshot
-
-        async def wait_for_response(self, *_args, **_kwargs):
-            calls["wait"] += 1
-            if calls["wait"] == 1:
-                hop["wait"]["deadline_at"] = (
-                    datetime.now(timezone.utc) - timedelta(seconds=1)
-                ).isoformat()
-                raise TimeoutError("poll reached deadline")
-            raise RuntimeError("Page.evaluate: Target crashed")
-
-    acquired = AcquiredRole(
-        Client(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
-    )
-
-    class Actions:
-        async def locate_owned(self, *_args, **_kwargs):
-            return acquired
-
-        async def refresh(self, *_args, **_kwargs):
-            calls["refresh"] += 1
-            raise AssertionError("normal wait-timeout path must not refresh here")
-
-        async def send(self, *_args, **_kwargs):
-            calls["send"] += 1
-            raise AssertionError("final reconciliation must not Send")
-
-        async def retry(self, *_args, **_kwargs):
-            calls["retry"] += 1
-            raise AssertionError("final reconciliation must not Retry")
-
-    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
-
-    assert calls == {
-        "snapshot": 1,
-        "wait": 2,
-        "refresh": 0,
-        "send": 0,
-        "retry": 0,
-    }
-    assert state["status"] == "RUNNING"
-    assert state["block_code"] is None
-    assert hop["state"] == "waiting"
-    assert state["active_action"] == "wait_response"
-
-
-def test_dom_wait_expired_deadline_performs_final_reconciliation(tmp_path: Path):
-    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-dom-expired-deadline"
-    )
-    hop["wait"]["deadline_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=1)
-    ).isoformat()
-    accepted_user = MessageSnapshot(
-        "user",
-        receipt.user_message_id or "u1",
-        receipt.user_turn_id or "t1",
-        receipt.prompt,
-        (),
-    )
-    snapshot = send_snapshot(
-        messages=(accepted_user,),
-        state=ChatGPTState.WAITING_PROMPT,
-        task_id=state["task_id"],
-        team=state["team"],
-    )
-
-    class Client:
-        binding = receipt.binding
-        page = SimpleNamespace()
-
-        async def wait_snapshot(self, _receipt, **_kwargs):
-            return snapshot
-
-    acquired = AcquiredRole(
-        Client(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
-    )
-
-    class Actions:
-        async def locate_owned(self, *_args, **_kwargs):
-            return acquired
-
-        async def refresh(self, *_args, **_kwargs):
-            raise AssertionError("expired deadline must reconcile before refresh")
-
-    worker._final_response_reconciliation = AsyncMock(return_value=False)
-    asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
-
-    worker._final_response_reconciliation.assert_awaited_once()
-    assert state["status"] == "BLOCKED"
-    assert state["block_code"] == "response_timeout"
-
-
-def test_dom_wait_unrelated_runtime_error_is_not_recovered(tmp_path: Path):
-    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-dom-unrelated-error"
-    )
-
-    class Client:
-        binding = receipt.binding
-        page = SimpleNamespace()
-
-        async def wait_snapshot(self, _receipt, **_kwargs):
-            raise RuntimeError("selector parser exploded")
-
-    acquired = AcquiredRole(
-        Client(), receipt.binding.page_id, "https://chatgpt.com/c/test", False, False
-    )
-
-    class Actions:
-        async def locate_owned(self, *_args, **_kwargs):
-            return acquired
-
-        async def refresh(self, *_args, **_kwargs):
-            raise AssertionError("unrelated errors must not trigger recovery refresh")
-
-    with pytest.raises(RuntimeError, match="selector parser exploded"):
-        asyncio.run(worker._waiting_dom(state, hop, Actions(), path))
-
-
 def test_resume_reconciles_canonical_ledger_before_exact_page_validation(tmp_path: Path):
     from dataclasses import replace
 
@@ -5899,8 +4492,7 @@ def test_resume_reconciles_canonical_ledger_before_exact_page_validation(tmp_pat
         stop_visible=True,
     )
     client = SimpleNamespace(
-        assert_ownership=AsyncMock(return_value=snapshot),
-        wait_for_response=AsyncMock(side_effect=TimeoutError()),
+        wait_snapshot=AsyncMock(return_value=snapshot),
     )
     acquired = AcquiredRole(
         client, current_receipt.binding.page_id, canonical_url, False, False
@@ -5925,8 +4517,8 @@ def test_resume_reconciles_canonical_ledger_before_exact_page_validation(tmp_pat
 
     assert seen == []
     assert control["status"] == "applied"
-    assert control["result"]["action"] == "observe_progress"
-    assert control["result"]["postcondition"] == "generation_progress"
+    assert control["result"]["action"] == "resume_role_controller"
+    assert control["result"]["postcondition"] == "observation_rearmed"
     assert hop["receipt"]["conversation_id"] == canonical_id
     assert hop["conversation_url"] == canonical_url
     assert state["roles"]["PLAN"]["page_url"] == canonical_url
@@ -5958,8 +4550,7 @@ def test_resume_reconciles_canonical_ledger_before_exact_page_validation(tmp_pat
         stop_visible=True,
     )
     client = SimpleNamespace(
-        assert_ownership=AsyncMock(return_value=snapshot),
-        wait_for_response=AsyncMock(side_effect=TimeoutError()),
+        wait_snapshot=AsyncMock(return_value=snapshot),
     )
     acquired = AcquiredRole(
         client,
@@ -5994,14 +4585,14 @@ def test_resume_reconciles_canonical_ledger_before_exact_page_validation(tmp_pat
     assert on_actions.backend_conversation.await_count == 0
     assert worker._discover_accepted_conversation_identity.await_count == 0
     assert on_actions.locate_owned.await_count == 1
-    assert client.wait_for_response.await_count == 1
+    assert client.wait_snapshot.await_count == 1
     assert on_actions.reopen.await_count == 0
     assert on_actions.send.await_count == 0
     assert on_actions.restart.await_count == 0
     assert on_actions.acquire.await_count == 0
     assert control["status"] == "applied"
-    assert control["result"]["action"] == "observe_progress"
-    assert control["result"]["postcondition"] == "generation_progress"
+    assert control["result"]["action"] == "resume_role_controller"
+    assert control["result"]["postcondition"] == "observation_rearmed"
     assert hop["receipt"]["conversation_id"] == canonical_id
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
 
@@ -6069,109 +4660,6 @@ def test_record_response_reconciles_late_conversation_id_and_conflict_fails_clos
     assert hop["state"] == "waiting"
 
 
-def test_worker_completion_is_dom_first_with_status_only_in_recovery_helpers():
-    import inspect
-
-    waiting_source = inspect.getsource(CDPAWorker._waiting)
-    assert "_waiting_dom" in waiting_source
-    assert "_waiting_backend_step" not in waiting_source
-    assert "backend_stream_status" not in waiting_source
-
-    one_shot_source = inspect.getsource(CDPAWorker._one_shot_stream_status)
-    assert "backend_stream_status" in one_shot_source
-    assert "backend_conversation" not in one_shot_source
-
-    resume_source = inspect.getsource(CDPAWorker._recover_resume_waiting)
-    assert "retry_generation(" not in resume_source
-
-    method_source = inspect.getsource(CDPAWorker._waiting_dom)
-    assert ".wait_for_response(" in method_source
-    assert "retry_generation(" not in method_source
-
-
-def test_identity_landing_during_dom_wait_reconciles_before_responded(tmp_path: Path):
-    from dataclasses import replace
-
-    _store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-conversation-during-wait"
-    )
-    ledger = RequestLedger(hop["ledger_path"])
-    response = MessageSnapshot("assistant", "a1", "ta1", "answer", ())
-    snapshot = SimpleNamespace(
-        state=ChatGPTState.WAITING_PROMPT,
-        stop_visible=False,
-        composer_empty=True,
-        manual_input_pending=False,
-        error_texts=(),
-        blocking_dialogs=(),
-        messages=(MessageSnapshot("user", "u1", "t1", receipt.prompt, ()),),
-        response_activity_turn_id=None,
-        response_activity_text="",
-        response_activity_structure="",
-        response_activity_length=0,
-    )
-
-    class Client:
-        async def wait_snapshot(self, _receipt, **_kwargs):
-            return snapshot
-        async def wait_for_response(self, _receipt, **_kwargs):
-            async def land_identity():
-                ledger.update(
-                    hop["request_id"],
-                    receipt=replace(receipt, conversation_id="conversation-during-wait").to_dict(),
-                )
-            asyncio.create_task(land_identity())
-            return response
-        async def backend_stream_status(self, *_args, **_kwargs):
-            raise AssertionError("backend completion must stay dormant")
-        async def backend_conversation(self, *_args, **_kwargs):
-            raise AssertionError("graph completion must stay dormant")
-
-    acquired = AcquiredRole(Client(), receipt.binding.page_id, "https://chatgpt.com/c/x", False, False)
-    class Actions:
-        async def locate_owned(self, _state, _role): return acquired
-
-    asyncio.run(worker._waiting(state, hop, Actions(), path))
-    assert hop["state"] == "responded"
-    assert hop["receipt"]["conversation_id"] == "conversation-during-wait"
-
-
-def test_final_reconciliation_completion_is_dom_only(tmp_path: Path):
-    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-final-reconcile-dom-only"
-    )
-    report_relative = ".plan/alpha/alpha-plan_turn1_task-final-reconcile-dom-only.md"
-    report = tmp_path / report_relative
-    report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text("final reconciliation", encoding="utf-8")
-    response = MessageSnapshot(
-        "assistant",
-        "a-final-dom",
-        "ta-final-dom",
-        json.dumps({"route": "TEST", "handoff": report_relative}),
-        (),
-    )
-
-    class Client:
-        async def wait_for_response(self, _receipt, **kwargs):
-            kwargs["candidate_validator"](response)
-            return response
-        async def backend_stream_status(self, *_args, **_kwargs):
-            raise AssertionError("final reconciliation must remain DOM-only")
-        async def backend_conversation(self, *_args, **_kwargs):
-            raise AssertionError("final reconciliation must remain DOM-only")
-
-    acquired = AcquiredRole(
-        Client(), receipt.binding.page_id, "https://chatgpt.com/c/final-dom", False, False
-    )
-    completed = asyncio.run(
-        worker._final_response_reconciliation(state, hop, acquired, receipt, hop["wait"])
-    )
-    assert completed is True
-    assert hop["state"] == "responded"
-    assert hop["response"] == response.text
-
-
 def donor_pool_record(*, donors=None, prewarm_prompt=None, max_backups=7):
     return {
         "bootstrap_id": "general-team-bootstrap",
@@ -6225,13 +4713,6 @@ def _bootstrap_graph(assistant_id: str):
             },
         },
     }
-
-
-def test_stream_status_poll_delay_is_randomized_at_or_above_30_seconds(tmp_path: Path):
-    _, _, _, worker = setup_task(tmp_path, task_id="task-stream-jitter")
-    samples = [worker._stream_status_poll_delay() for _ in range(100)]
-    assert all(30.0 <= value <= 35.0 for value in samples)
-    assert len({round(value, 4) for value in samples}) > 1
 
 
 def test_bootstrap_keeper_compatibility_is_retired_from_worker():
@@ -6897,197 +5378,6 @@ def test_active_rate_limit_blocks_ui_bootstrap_new_page_only(tmp_path: Path):
         asyncio.run(worker._branch_from_bootstrap_ui(state, "PLAN", Actions(), donor))
 
 
-def test_active_mcp_allow_dispatches_hidden_permission_node_after_stability_window(tmp_path: Path):
-    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-active-hidden-allow"
-    )
-    hop["wait"]["mcp_allow_seen_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=6)
-    ).isoformat()
-    calls = []
-
-    class Client:
-        def passive_observation(self, **_kwargs):
-            return {"coverage": "unknown"}
-
-        async def mcp_allow_visible(self):
-            return False
-
-        async def auto_allow_mcp_permission(self, *, passive_action=None):
-            calls.append(passive_action)
-            return {
-                "method": "react_handler",
-                "target_message_id": "hidden-call",
-                "remember_answer": "true",
-            }
-
-    snapshot = SimpleNamespace(
-        stop_visible=False,
-        messages=(),
-        mcp_permission_node_count=1,
-    )
-    handled = asyncio.run(
-        worker._mcp_allow_interrupt(state, hop, Client(), receipt, snapshot)
-    )
-
-    assert handled is True
-    assert calls == [None]
-    assert hop["wait"].get("mcp_allow_clicked_at")
-    assert state["active_action"] == "wait_mcp_allow_continuation"
-
-
-def test_active_mcp_allow_falls_back_to_plain_visible_allow(tmp_path: Path):
-    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-active-plain-allow"
-    )
-    hop["wait"]["mcp_allow_seen_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=6)
-    ).isoformat()
-    calls = []
-
-    class Client:
-        def passive_observation(self, **_kwargs):
-            return {"coverage": "unknown"}
-
-        async def mcp_allow_visible(self):
-            return True
-
-        async def auto_allow_mcp_permission(self, *, passive_action=None):
-            calls.append(passive_action)
-            return {"method": "dom_click", "target_message_id": "", "remember_answer": "false"}
-
-    snapshot = SimpleNamespace(stop_visible=False, messages=())
-    handled = asyncio.run(
-        worker._mcp_allow_interrupt(state, hop, Client(), receipt, snapshot)
-    )
-
-    assert handled is True
-    assert calls == [None]
-    assert hop["wait"].get("mcp_allow_clicked_at")
-    assert state["active_action"] == "wait_mcp_allow_continuation"
-
-
-def test_mcp_allow_disappearance_without_continuation_refreshes_after_five_seconds(tmp_path: Path):
-    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-allow-disappear-refresh"
-    )
-    hop["wait"]["mcp_allow_clicked_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=6)
-    ).isoformat()
-    refreshed = []
-
-    class Client:
-        async def mcp_allow_visible(self):
-            return False
-
-        async def refresh(self):
-            refreshed.append(True)
-
-    snapshot = SimpleNamespace(
-        stop_visible=False,
-        messages=(),
-        response_activity_turn_id=None,
-        response_activity_length=0,
-        response_activity_text="",
-    )
-    handled = asyncio.run(
-        worker._mcp_allow_interrupt(state, hop, Client(), receipt, snapshot)
-    )
-
-    assert handled is True
-    assert refreshed == [True]
-    assert state["active_action"] == "wait_response"
-
-
-def test_mcp_allow_stop_after_dispatch_is_real_continuation_progress(tmp_path: Path):
-    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-allow-stop-progress"
-    )
-    hop["wait"]["mcp_allow_clicked_at"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=6)
-    ).isoformat()
-    refreshed = []
-
-    class Client:
-        async def mcp_allow_visible(self):
-            return False
-
-        async def refresh(self):
-            refreshed.append(True)
-
-    snapshot = SimpleNamespace(
-        stop_visible=True,
-        messages=(),
-        response_activity_turn_id=None,
-        response_activity_length=0,
-        response_activity_text="",
-    )
-    handled = asyncio.run(
-        worker._mcp_allow_interrupt(state, hop, Client(), receipt, snapshot)
-    )
-
-    assert handled is False
-    assert refreshed == []
-    assert "mcp_allow_clicked_at" not in hop["wait"]
-
-
-def test_stale_response_state_refreshes_after_ten_minutes_without_activity(tmp_path: Path):
-    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-stale-response-refresh"
-    )
-    old = datetime.now(timezone.utc) - timedelta(seconds=601)
-    hop["wait"]["controller_state"] = "RESPONSE"
-    hop["wait"]["controller_state_since"] = old.isoformat()
-    hop["wait"]["activity_changed_at"] = old.isoformat()
-    refreshed = []
-
-    class Client:
-        async def refresh(self):
-            refreshed.append(True)
-
-    snapshot = SimpleNamespace(
-        retry_visible=False,
-        stop_visible=False,
-        response_activity_turn_id=None,
-        messages=(MessageSnapshot("assistant", "a-stale", None, "partial", ()),),
-    )
-    handled = asyncio.run(
-        worker._refresh_stalled_controller_state(state, hop, Client(), snapshot, receipt)
-    )
-
-    assert handled is True
-    assert refreshed == [True]
-
-
-def test_recent_response_activity_prevents_ten_minute_refresh_even_if_stop_stays_visible(tmp_path: Path):
-    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
-        tmp_path, task_id="task-recent-activity-no-refresh"
-    )
-    hop["wait"]["controller_state"] = "STOP"
-    hop["wait"]["controller_state_since"] = (
-        datetime.now(timezone.utc) - timedelta(seconds=601)
-    ).isoformat()
-    hop["wait"]["activity_changed_at"] = datetime.now(timezone.utc).isoformat()
-    refreshed = []
-
-    class Client:
-        async def refresh(self):
-            refreshed.append(True)
-
-    snapshot = SimpleNamespace(
-        retry_visible=False,
-        stop_visible=True,
-        response_activity_turn_id="streaming-turn",
-        messages=(),
-    )
-    handled = asyncio.run(
-        worker._refresh_stalled_controller_state(state, hop, Client(), snapshot, receipt)
-    )
-
-    assert handled is False
-    assert refreshed == []
-
-
 @pytest.mark.parametrize("status", ["DONE", "STOPPED", "PAUSED", "BLOCKED"])
 def test_ambient_old_registered_tabs_keep_auto_allow(status: str, tmp_path: Path, monkeypatch):
     _config, _store, _state, worker = setup_task(
@@ -7104,7 +5394,11 @@ def test_ambient_old_registered_tabs_keep_auto_allow(status: str, tmp_path: Path
             return False
 
         async def evaluate(self, _script):
-            return worker_module.WINDOW_NAME_PREFIX + json.dumps({"taskId": task_id})
+            return worker_module.WINDOW_NAME_PREFIX + json.dumps({
+                "taskId": task_id,
+                "pageId": "page-history",
+                "role": "PLAN",
+            })
 
     page = Page()
 
@@ -7112,7 +5406,7 @@ def test_ambient_old_registered_tabs_keep_auto_allow(status: str, tmp_path: Path
         def __init__(self, _page, *, timeout_ms):
             self.page = _page
 
-        def install_ambient_observer(self):
+        async def install_page_observer(self):
             calls.append("listen")
 
         async def read_wait_probe(self):
@@ -7122,81 +5416,34 @@ def test_ambient_old_registered_tabs_keep_auto_allow(status: str, tmp_path: Path
                 page_role="PLAN",
                 stop_visible=False,
                 last_assistant_message_id=None,
+                mcp_permission_allow_count=0,
+                mcp_permission_node_count=0,
             )
 
-        def ambient_permission_action(self):
-            return {
+        def page_observation(self):
+            return {"permission_action": {
                 "type": "allow",
                 "target_message_id": "history-call",
                 "remember_answer": True,
                 "label": "Allow mcp-g8 for this conversation",
-            }
-
-        async def mcp_allow_visible(self):
-            return False
+            }}
 
         async def auto_allow_mcp_permission(self, *, passive_action=None):
             calls.append(("allow", passive_action["target_message_id"]))
             return {"method": "react_handler", "target_message_id": passive_action["target_message_id"]}
 
-        def clear_ambient_permission_action(self):
+        def clear_permission_action(self):
             calls.append("clear")
 
     monkeypatch.setattr(worker_module, "ChatGPTPage", Client)
-    worker._ambient_allow_seen[id(page)] = time.monotonic() - 6
+    worker._ambient_controller_states[id(page)] = {
+        "mcp_allow_seen_at": (datetime.now(timezone.utc) - timedelta(seconds=6)).isoformat(),
+        "mcp_allow_seen_target": "history-call",
+    }
     asyncio.run(worker._maintain_ambient_page_automation(SimpleNamespace(pages=[page])))
 
     assert ("allow", "history-call") in calls
     assert "clear" in calls
-
-
-def test_ambient_dom_fallback_is_sparse_not_command_loop_rate(tmp_path: Path, monkeypatch):
-    _config, _store, _state, worker = setup_task(
-        tmp_path, task_id="task-ambient-sparse"
-    )
-    calls = []
-
-    class Page:
-        url = "https://chatgpt.com/c/ambient-sparse"
-
-        def is_closed(self):
-            return False
-
-        async def evaluate(self, _script):
-            calls.append("binding")
-            return worker_module.WINDOW_NAME_PREFIX + "{}"
-
-    page = Page()
-
-    class Client:
-        def __init__(self, _page, *, timeout_ms):
-            pass
-
-        def install_ambient_observer(self):
-            calls.append("listen")
-
-        async def read_wait_probe(self):
-            calls.append("probe")
-            return SimpleNamespace(
-                page_task_id=None,
-                page_id=None,
-                page_role=None,
-                stop_visible=False,
-                last_assistant_message_id=None,
-            )
-
-        def ambient_permission_action(self):
-            return None
-
-        async def mcp_allow_visible(self):
-            return False
-
-    monkeypatch.setattr(worker_module, "ChatGPTPage", Client)
-    context = SimpleNamespace(pages=[page])
-    asyncio.run(worker._maintain_ambient_page_automation(context))
-    asyncio.run(worker._maintain_ambient_page_automation(context))
-
-    assert calls.count("probe") == 1
 
 
 def test_ambient_old_tab_dom_only_visible_allow_is_clicked_without_passive_event(tmp_path: Path, monkeypatch):
@@ -7226,7 +5473,7 @@ def test_ambient_old_tab_dom_only_visible_allow_is_clicked_without_passive_event
         def __init__(self, _page, *, timeout_ms):
             self.binding = None
 
-        def install_ambient_observer(self):
+        async def install_page_observer(self):
             pass
 
         async def read_wait_probe(self):
@@ -7237,74 +5484,27 @@ def test_ambient_old_tab_dom_only_visible_allow_is_clicked_without_passive_event
                 stop_visible=False,
                 last_assistant_message_id=None,
                 mcp_permission_allow_count=1,
+                mcp_permission_node_count=0,
             )
 
-        def ambient_permission_action(self):
-            return None
+        def page_observation(self):
+            return {}
 
         async def auto_allow_mcp_permission(self, *, passive_action=None):
             assert self.binding == PageBinding("page-history-dom", "cdpa-history-dom-plan")
             calls.append(passive_action)
             return {"method": "dom_click", "target_message_id": "", "remember_answer": "false"}
 
-        def clear_ambient_permission_action(self):
+        def clear_permission_action(self):
             pass
 
     monkeypatch.setattr(worker_module, "ChatGPTPage", Client)
-    worker._ambient_allow_seen[id(page)] = time.monotonic() - 6
+    worker.runtime_db.ensure_schema()
+    worker.runtime_db.put_snapshot("settings", {"dom_only": True})
+    worker._ambient_controller_states[id(page)] = {
+        "mcp_allow_seen_at": (datetime.now(timezone.utc) - timedelta(seconds=6)).isoformat(),
+        "mcp_allow_seen_target": "",
+    }
     asyncio.run(worker._maintain_ambient_page_automation(SimpleNamespace(pages=[page])))
 
     assert calls == [None]
-
-
-def test_ambient_page_local_ownership_error_does_not_reconnect_worker(tmp_path: Path, monkeypatch):
-    _config, _store, _state, worker = setup_task(
-        tmp_path, task_id="task-ambient-local-ownership-error"
-    )
-    task_id = "task-ambient-local-ownership-error"
-    worker.registry = SimpleNamespace(tasks_by_id={task_id: {"status": "DONE"}})
-
-    class Page:
-        url = "https://chatgpt.com/c/ambient-local-error"
-
-        def is_closed(self):
-            return False
-
-        async def evaluate(self, _script):
-            return worker_module.WINDOW_NAME_PREFIX + json.dumps({
-                "taskId": task_id,
-                "pageId": "page-local-error",
-                "role": "cdpa-local-error-plan",
-            })
-
-    page = Page()
-
-    class Client:
-        def __init__(self, _page, *, timeout_ms):
-            self.binding = None
-
-        def install_ambient_observer(self):
-            pass
-
-        async def read_wait_probe(self):
-            return SimpleNamespace(
-                page_task_id=task_id,
-                page_id="page-local-error",
-                page_role="cdpa-local-error-plan",
-                stop_visible=False,
-                last_assistant_message_id=None,
-                mcp_permission_allow_count=0,
-            )
-
-        def ambient_permission_action(self):
-            return None
-
-        async def refresh(self):
-            raise PageOwnershipError("stale historical page binding")
-
-    monkeypatch.setattr(worker_module, "ChatGPTPage", Client)
-    worker._ambient_post_click[id(page)] = (time.monotonic() - 6, None)
-
-    asyncio.run(worker._maintain_ambient_page_automation(SimpleNamespace(pages=[page])))
-
-    assert id(page) not in worker._ambient_post_click

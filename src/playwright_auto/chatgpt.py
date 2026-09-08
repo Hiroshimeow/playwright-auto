@@ -319,77 +319,10 @@ def _page_wait_state(page: Any) -> dict[str, Any]:
     return state
 
 
-def _page_ambient_observation_state(page: Any) -> dict[str, Any]:
-    state: dict[str, Any] = {
-        "listener": None,
-        "navigation_listener": None,
-        "navigation_epoch": 0,
-        "permission_action": None,
-        "permission_page_url": None,
-        "tasks": set(),
-    }
-    try:
-        existing = _PAGE_AMBIENT_OBSERVATION_STATES.get(page)
-        if existing is not None:
-            return existing
-        _PAGE_AMBIENT_OBSERVATION_STATES[page] = state
-        return state
-    except TypeError:
-        existing = getattr(page, "_playwright_auto_ambient_observation_state", None)
-        if isinstance(existing, dict):
-            return existing
-        try:
-            setattr(page, "_playwright_auto_ambient_observation_state", state)
-        except Exception:
-            pass
-        return state
 
 
-def _page_passive_observation_state(page: Any) -> dict[str, Any]:
-    state: dict[str, Any] = {
-        "listener": None,
-        "close_listener": None,
-        "scope": None,
-        "scope_revision": 0,
-        "latest": None,
-        "permission_action": None,
-        "wake_event": None,
-        "tasks": set(),
-        "event_count": 0,
-    }
-    try:
-        existing = _PAGE_PASSIVE_OBSERVATION_STATES.get(page)
-        if existing is not None:
-            return existing
-        _PAGE_PASSIVE_OBSERVATION_STATES[page] = state
-        return state
-    except TypeError:
-        existing = getattr(page, "_playwright_auto_passive_observation_state", None)
-        if isinstance(existing, dict):
-            return existing
-        try:
-            setattr(page, "_playwright_auto_passive_observation_state", state)
-        except Exception:
-            pass
-        return state
 
 
-def _passive_evidence_matches_scope(
-    evidence: Mapping[str, Any], scope: Mapping[str, Any]
-) -> bool:
-    if str(evidence.get("request_id") or "") != str(scope.get("request_id") or ""):
-        return False
-    if int(evidence.get("generation") or 0) != int(scope.get("generation") or 0):
-        return False
-    expected_conversation = _safe_identity_string(scope.get("conversation_id"))
-    expected_user = _safe_identity_string(scope.get("accepted_user_message_id"))
-    evidence_conversation = _safe_identity_string(evidence.get("conversation_id"))
-    evidence_user = _safe_identity_string(evidence.get("observed_user_message_id"))
-    if expected_conversation is not None and evidence_conversation != expected_conversation:
-        return False
-    if expected_user is not None and evidence_user != expected_user:
-        return False
-    return True
 
 
 def _backend_context_state(context: Any) -> dict[str, Any]:
@@ -1241,6 +1174,8 @@ class ChatGPTSnapshot:
     messages: tuple[MessageSnapshot, ...]
     choice_prompt_labels: tuple[str, ...] = ()
     retry_visible: bool = False
+    mcp_permission_allow_count: int = 0
+    mcp_permission_node_count: int = 0
     page_task_id: str | None = None
     page_team: str | None = None
     response_activity_text: str = ""
@@ -1299,6 +1234,8 @@ class ChatGPTSnapshot:
             "choice_prompt_pending": self.choice_prompt_pending,
             "choice_prompt_labels": list(self.choice_prompt_labels),
             "retry_visible": self.retry_visible,
+            "mcp_permission_allow_count": self.mcp_permission_allow_count,
+            "mcp_permission_node_count": self.mcp_permission_node_count,
             "manual_input_pending": self.manual_input_pending,
             "image_count": self.image_count,
             "error_texts": list(self.error_texts),
@@ -1849,7 +1786,13 @@ def validate_page_role(role: str) -> str:
 
 
 def classify_chatgpt_state(raw: Mapping[str, Any]) -> ChatGPTState:
-    if raw.get("error_present"):
+    if raw.get("requires_login"):
+        return ChatGPTState.AUTH_REQUIRED
+    # A failed generation can coexist with a usable composer. Retry is an
+    # interruption for the role controller, not a fatal browser state.
+    if raw.get("error_present") and (
+        not raw.get("retry_visible") or raw.get("error_texts")
+    ):
         return ChatGPTState.ERROR
     if raw.get("stop_visible"):
         return ChatGPTState.RESPONDING
@@ -2135,7 +2078,7 @@ async def click_send_button(
             const errorAlert = [...document.querySelectorAll('[role="alert"]')]
               .filter(visible)
               .find((element) => /error|failed|issue|try again/i.test(text(element))) || null;
-            if (retry || errorAlert) {
+            if (errorAlert) {
               return {ok: false, method: 'page_state_conflict', reason: 'error_state'};
             }
             if (firstVisible('[role="dialog"], [data-testid^="modal-"]')) {
@@ -2587,207 +2530,6 @@ async def click_preferred_mcp_allow(
     }
 
 
-async def click_mcp_permission_allow(
-    page: Any,
-    *,
-    expected_page_id: str,
-    expected_role: str,
-    expected_task_id: str | None,
-    expected_team: str | None,
-    expected_user_message_id: str,
-    allowed_connectors: Sequence[str],
-    dispatch: bool = True,
-    expected_target_message_id: str | None = None,
-) -> dict[str, str]:
-    """Dispatch one offered conversation-scoped MCP allow action through React.
-
-    This deliberately does not click a visible button.  It accepts only an action
-    object already offered by the loaded client, tied to a message after the exact
-    accepted user turn and to a connector explicitly authorized by the caller.
-    """
-    user_message_id = _safe_identity_string(expected_user_message_id)
-    connectors = tuple(sorted({str(item).strip().lower() for item in allowed_connectors if str(item).strip()}))
-    if user_message_id is None:
-        raise ValueError("MCP permission approval requires an exact accepted user message ID")
-    if not connectors:
-        raise UnsafePageStateError("MCP permission approval has no task-authorized connector")
-    result = await page.evaluate(
-        r"""async ([expectedPageId, expectedRole, expectedTaskId, expectedTeam,
-                    expectedUserMessageId, allowedConnectors, dispatch,
-                    expectedTargetMessageId, roleKey, pageIdKey,
-                    taskIdKey, teamKey, windowNamePrefix]) => {
-          const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-          const allowed = new Set(allowedConnectors.map((value) => String(value).toLowerCase()));
-          let pageRole = null;
-          let pageId = null;
-          let pageTaskId = null;
-          let pageTeam = null;
-          try {
-            pageRole = sessionStorage.getItem(roleKey);
-            pageId = sessionStorage.getItem(pageIdKey);
-            pageTaskId = sessionStorage.getItem(taskIdKey);
-            pageTeam = sessionStorage.getItem(teamKey);
-          } catch (_) {}
-          if (window.name?.startsWith(windowNamePrefix)) {
-            try {
-              const binding = JSON.parse(window.name.slice(windowNamePrefix.length));
-              pageRole = pageRole || binding.role || null;
-              pageId = pageId || binding.pageId || null;
-              pageTaskId = pageTaskId || binding.taskId || null;
-              pageTeam = pageTeam || binding.team || null;
-            } catch (_) {}
-          }
-          if (
-            pageId !== expectedPageId || pageRole !== expectedRole ||
-            (pageTaskId || null) !== (expectedTaskId || null) ||
-            (pageTeam || null) !== (expectedTeam || null)
-          ) return {ok: false, method: 'ownership_conflict'};
-
-          const messages = [...document.querySelectorAll('[data-message-id]')];
-          const acceptedIndex = messages.findIndex(
-            (node) => node.getAttribute('data-message-id') === expectedUserMessageId
-          );
-
-          const permissionPattern = /^Allow (mcp-[A-Za-z0-9._-]+) for this conversation$/i;
-          const permissionNodes = [...document.querySelectorAll('button[aria-label]')]
-            .map((node) => {
-              const match = normalize(node.getAttribute('aria-label')).match(permissionPattern);
-              return match ? {node, connector: match[1].toLowerCase()} : null;
-            })
-            .filter(Boolean)
-            .filter(({connector}) => allowed.has(connector));
-
-          const walkValues = (value, seen, depth = 0) => {
-            if (!value || typeof value !== 'object' || seen.has(value) || depth > 5) return [];
-            seen.add(value);
-            const found = [];
-            if (
-              value.action && typeof value.action === 'object' &&
-              value.action.type === 'allow' && value.action.remember_answer === true &&
-              typeof value.action.target_message_id === 'string' && value.action.target_message_id
-            ) found.push(value.action);
-            if (
-              value.type === 'allow' && value.remember_answer === true &&
-              typeof value.target_message_id === 'string' && value.target_message_id
-            ) found.push(value);
-            for (const nested of Object.values(value)) {
-              if (Array.isArray(nested)) {
-                for (const item of nested.slice(0, 32)) found.push(...walkValues(item, seen, depth + 1));
-              } else if (nested && typeof nested === 'object') {
-                found.push(...walkValues(nested, seen, depth + 1));
-              }
-            }
-            return found;
-          };
-          const laterUserTurnExists = acceptedIndex >= 0 && messages.slice(acceptedIndex + 1).some(
-            (message) => message.getAttribute('data-message-author-role') === 'user'
-          );
-          const candidates = [];
-          for (const {node, connector} of permissionNodes) {
-            let current = node;
-            let fiber = null;
-            let handler = null;
-            const roots = [];
-            for (let depth = 0; current && depth < 10; depth += 1, current = current.parentElement) {
-              roots.push(current);
-              const fiberKey = Object.keys(current).find((key) => key.startsWith('__reactFiber$'));
-              if (!fiber && fiberKey) fiber = current[fiberKey];
-              const propsKey = Object.keys(current).find((key) => key.startsWith('__reactProps$'));
-              const props = propsKey ? current[propsKey] : null;
-              if (!handler && props && typeof props.onSelectOption === 'function') handler = props.onSelectOption;
-            }
-            const containers = [];
-            for (const root of roots) {
-              const propsKey = Object.keys(root).find((key) => key.startsWith('__reactProps$'));
-              if (propsKey) containers.push(root[propsKey]);
-            }
-            for (let depth = 0; fiber && depth < 40; depth += 1, fiber = fiber.return) {
-              if (!handler) {
-                for (const props of [fiber.memoizedProps, fiber.pendingProps]) {
-                  if (props && typeof props.onSelectOption === 'function') handler = props.onSelectOption;
-                }
-              }
-              containers.push(fiber.memoizedProps, fiber.pendingProps);
-            }
-            if (typeof handler !== 'function') continue;
-            const actions = [];
-            const seen = new Set();
-            for (const container of containers) actions.push(...walkValues(container, seen));
-            const unique = new Map(actions.map((action) => [
-              `${action.type}:${action.target_message_id}:${action.remember_answer}`, action
-            ]));
-            for (const action of unique.values()) {
-              const targetIndex = messages.findIndex(
-                (message) => message.getAttribute('data-message-id') === action.target_message_id
-              );
-              if (acceptedIndex >= 0 && targetIndex >= 0 && targetIndex <= acceptedIndex) continue;
-              if (targetIndex < 0 && laterUserTurnExists) continue;
-              if (expectedTargetMessageId && action.target_message_id !== expectedTargetMessageId) continue;
-              candidates.push({connector, node, handler, action});
-            }
-          }
-          if (candidates.length !== 1) {
-            return {ok: false, method: 'permission_conflict', count: candidates.length};
-          }
-          const candidate = candidates[0];
-          if (!dispatch) {
-            return {
-              ok: true,
-              method: 'offered',
-              connector: candidate.connector,
-              target_message_id: candidate.action.target_message_id,
-              remember_answer: 'true',
-            };
-          }
-          const event = {
-            preventDefault() {},
-            stopPropagation() {},
-            currentTarget: candidate.node,
-            target: candidate.node,
-          };
-          try {
-            await candidate.handler(event, candidate.action);
-          } catch (error) {
-            return {ok: false, method: 'handler_failed', error: String(error)};
-          }
-          return {
-            ok: true,
-            method: 'react_handler',
-            connector: candidate.connector,
-            target_message_id: candidate.action.target_message_id,
-            remember_answer: 'true',
-          };
-        }""",
-        [
-            expected_page_id,
-            expected_role,
-            expected_task_id,
-            expected_team,
-            user_message_id,
-            list(connectors),
-            bool(dispatch),
-            expected_target_message_id,
-            ROLE_STORAGE_KEY,
-            PAGE_ID_STORAGE_KEY,
-            TASK_ID_STORAGE_KEY,
-            TEAM_STORAGE_KEY,
-            WINDOW_NAME_PREFIX,
-        ],
-    )
-    if not result.get("ok"):
-        method = str(result.get("method") or "permission_conflict")
-        if method == "ownership_conflict":
-            raise PageOwnershipError("page ownership changed before MCP permission dispatch")
-        raise UnsafePageStateError(f"MCP permission Allow is not safely dispatchable: {method}")
-    detail = f"{result.get('connector')}:{result.get('target_message_id')}"
-    if dispatch:
-        await record_page_action(page, "mcp_allow", "complete", detail=detail)
-    return {
-        "method": str(result.get("method") or "react_handler"),
-        "connector": str(result.get("connector") or ""),
-        "target_message_id": str(result.get("target_message_id") or ""),
-        "remember_answer": str(result.get("remember_answer") or ""),
-    }
 
 
 async def send_prompt(
@@ -3548,7 +3290,12 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             blocking_dialogs: [...new Set(blockingDialogs)],
             attachment_markers: attachmentMarkers,
             choice_prompt_labels: [...new Set(choicePromptLabels)],
-            error_present: Boolean(retry || authCallbackError || alertError),
+            error_present: Boolean(authCallbackError || alertError),
+            mcp_permission_node_count: [...document.querySelectorAll('button[aria-label]')]
+              .filter(b => /^Allow mcp-[A-Za-z0-9._-]+ for this conversation$/i.test((b.getAttribute('aria-label') || '').trim())).length,
+            mcp_permission_allow_count: [...document.querySelectorAll('button')]
+              .filter(b => visible(b) && !b.disabled && b.getAttribute('aria-disabled') !== 'true' &&
+                (text(b) === 'Allow' || /^Allow mcp-[A-Za-z0-9._-]+ for this conversation$/i.test((b.getAttribute('aria-label') || '').trim()))).length,
             retry_visible: Boolean(retry),
             error_texts: errorTexts,
             response_activity_text: responseActivityText,
@@ -3616,6 +3363,8 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             str(value) for value in raw.get("choice_prompt_labels") or []
         ),
         retry_visible=bool(raw.get("retry_visible")),
+        mcp_permission_allow_count=max(0, int(raw.get("mcp_permission_allow_count") or 0)),
+        mcp_permission_node_count=max(0, int(raw.get("mcp_permission_node_count") or 0)),
     )
 
 
@@ -3712,437 +3461,54 @@ class ChatGPTPage:
         return task
 
     def _remove_passive_observer(self) -> None:
-        state = _page_passive_observation_state(self.page)
-        listener = state.get("listener")
-        close_listener = state.get("close_listener")
-        state["listener"] = None
-        state["close_listener"] = None
-        for event, callback in (("response", listener), ("close", close_listener)):
-            if callback is None:
-                continue
-            try:
-                self.page.remove_listener(event, callback)
-            except Exception:
-                try:
-                    self.page.off(event, callback)
-                except Exception:
-                    pass
-        for task in tuple(state.get("tasks") or ()):  # bounded reducer tasks only
-            if isinstance(task, asyncio.Task) and not task.done():
-                task.cancel()
-        state["tasks"] = set()
-        old_wake = state.get("wake_event")
-        state["scope_revision"] = int(state.get("scope_revision") or 0) + 1
-        state["scope"] = None
-        state["latest"] = None
-        state["permission_action"] = None
-        state["wake_event"] = None
-        if isinstance(old_wake, asyncio.Event):
-            old_wake.set()
+        from .role_runtime.page_observer import observer_for
+        observer_for(self.page).close()
 
     def install_ambient_observer(self) -> None:
-        """Attach one page-lifetime listener for MCP permission actions."""
-        state = _page_ambient_observation_state(self.page)
-        page = self.page
-
-        if state.get("navigation_listener") is None:
-            def on_navigation(frame: Any) -> None:
-                main_frame = getattr(page, "main_frame", None)
-                if main_frame is not None and frame is not main_frame:
-                    return
-                state["navigation_epoch"] = int(state.get("navigation_epoch") or 0) + 1
-                state["permission_action"] = None
-                state["permission_page_url"] = None
-
-            state["navigation_listener"] = on_navigation
-            try:
-                page.on("framenavigated", on_navigation)
-            except Exception:
-                state["navigation_listener"] = None
-
-        # An upgraded active-scope listener also feeds ambient permission state.
-        if _page_passive_observation_state(page).get("listener") is not None:
-            return
-        if state.get("listener") is not None:
-            return
-
-        async def reduce_permission(response: Any, *, navigation_epoch: int) -> None:
-            try:
-                action = _mcp_permission_action_from_frontend_body(await response.body())
-                if int(state.get("navigation_epoch") or 0) != navigation_epoch:
-                    return
-                if isinstance(action, Mapping):
-                    state["permission_action"] = dict(action)
-                    state["permission_page_url"] = str(getattr(page, "url", "") or "")
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                return
-
-        def on_response(response: Any) -> None:
-            if not _matches_frontend_conversation_response(response):
-                return
-            task = asyncio.create_task(
-                reduce_permission(
-                    response, navigation_epoch=int(state.get("navigation_epoch") or 0)
-                )
-            )
-            tasks = state.setdefault("tasks", set())
-            tasks.add(task)
-            task.add_done_callback(lambda done: tasks.discard(done))
-
-        state["listener"] = on_response
-        page.on("response", on_response)
+        from .role_runtime.page_observer import observer_for
+        observer = observer_for(self.page)
+        observer.attach()
+        if not observer.installed:
+            observer._spawn(observer.install())
 
     def ambient_permission_action(self) -> dict[str, Any] | None:
-        state = _page_ambient_observation_state(self.page)
-        action = state.get("permission_action")
-        captured_url = str(state.get("permission_page_url") or "")
-        current_url = str(getattr(self.page, "url", "") or "")
-        if isinstance(action, Mapping) and captured_url and current_url and captured_url != current_url:
-            state["permission_action"] = None
-            state["permission_page_url"] = None
-            return None
-        return dict(action) if isinstance(action, Mapping) else None
+        return self.page_observation().get("permission_action")
 
     def clear_ambient_permission_action(self) -> None:
-        state = _page_ambient_observation_state(self.page)
-        state["permission_action"] = None
-        state["permission_page_url"] = None
+        self.clear_permission_action()
 
-    def arm_passive_observer(
-        self,
-        *,
-        request_id: str,
-        generation: int,
-        conversation_id: str | None = None,
-        accepted_user_message_id: str | None = None,
-        task_id: str | None = None,
-        team: str | None = None,
-    ) -> None:
+    def arm_passive_observer(self, *, request_id: str, generation: int,
+                             conversation_id: str | None = None,
+                             accepted_user_message_id: str | None = None,
+                             task_id: str | None = None, team: str | None = None) -> None:
+        # Kept as a Send-boundary adapter: request metadata is not observation authority.
         self.install_ambient_observer()
-        exact_request = _safe_identity_string(request_id)
-        if exact_request is None:
-            raise ValueError("passive observer request ID must be bounded and printable")
-        if isinstance(generation, bool) or int(generation) < 0:
-            raise ValueError("passive observer generation must be non-negative")
-        exact_conversation = (
-            _safe_identity_string(conversation_id) if conversation_id is not None else None
-        )
-        exact_user = (
-            _safe_identity_string(accepted_user_message_id)
-            if accepted_user_message_id is not None
-            else None
-        )
-        state = _page_passive_observation_state(self.page)
-        old_scope = state.get("scope") if isinstance(state.get("scope"), Mapping) else {}
-        old_key = (old_scope.get("request_id"), old_scope.get("generation"))
-        new_key = (exact_request, int(generation))
-        same_request = old_key == new_key
-        scope = {
-            "request_id": exact_request,
-            "generation": int(generation),
-            "task_id": str(task_id or "").strip() or None,
-            "team": str(team or "").strip() or None,
-            "conversation_id": (
-                exact_conversation
-                if exact_conversation is not None
-                else (old_scope.get("conversation_id") if same_request else None)
-            ),
-            "accepted_user_message_id": (
-                exact_user
-                if exact_user is not None
-                else (old_scope.get("accepted_user_message_id") if same_request else None)
-            ),
+
+    def passive_observation(self, *, request_id: str = "", generation: int = 0) -> dict[str, Any]:
+        evidence = self.page_observation()
+        messages = evidence.get("messages") or []
+        latest_user = next((m.get("id") for m in reversed(messages)
+                            if m.get("author", {}).get("role") == "user"), None)
+        # Optional graph-shaped information serves existing report tooling. Failure
+        # does not discard a live permission/response or prevent normal operation.
+        graph = _observed_linear_graph(messages, latest_user, require_user_in_values=True) if latest_user else None
+        return {
+            **evidence, "graph": graph,
+            "coverage": "complete" if evidence.get("response") else "partial",
+            "observed_user_message_id": latest_user,
+            "event_count": evidence.get("diagnostics", {}).get("observations", 0),
         }
-        scope_changed = dict(old_scope) != scope
-        latest = state.get("latest")
-        retained_latest = bool(
-            same_request
-            and isinstance(latest, Mapping)
-            and _passive_evidence_matches_scope(latest, scope)
-        )
-        if not retained_latest:
-            state["latest"] = None
-            state["permission_action"] = None
-        if scope_changed:
-            state["scope_revision"] = int(state.get("scope_revision") or 0) + 1
-            state["wake_event"] = asyncio.Event()
-        elif not isinstance(state.get("wake_event"), asyncio.Event):
-            state["wake_event"] = asyncio.Event()
-        state["scope"] = scope
-        if retained_latest and isinstance(state.get("wake_event"), asyncio.Event):
-            state["wake_event"].set()
-        if state.get("listener") is not None:
-            return
 
-        page = self.page
-        ambient_state = _page_ambient_observation_state(page)
-        ambient_listener = ambient_state.get("listener")
-        if ambient_listener is not None:
-            try:
-                page.remove_listener("response", ambient_listener)
-            except Exception:
-                try:
-                    page.off("response", ambient_listener)
-                except Exception:
-                    pass
-            ambient_state["listener"] = None
-
-        async def reduce_ambient_permission(response: Any, *, navigation_epoch: int) -> None:
-            try:
-                action = _mcp_permission_action_from_frontend_body(await response.body())
-                if int(ambient_state.get("navigation_epoch") or 0) != navigation_epoch:
-                    return
-                if isinstance(action, Mapping):
-                    ambient_state["permission_action"] = dict(action)
-                    ambient_state["permission_page_url"] = str(getattr(page, "url", "") or "")
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                return
-
-        async def reduce_response(
-            response: Any,
-            *,
-            scope_key: tuple[str, int],
-            scope_revision: int,
-            observed_user_message_id: str | None,
-            paged_conversation_id: str | None,
-        ) -> None:
-            try:
-                if paged_conversation_id is not None:
-                    current_scope = state.get("scope")
-                    if not isinstance(current_scope, Mapping):
-                        return
-                    expected_user = _safe_identity_string(
-                        current_scope.get("accepted_user_message_id")
-                    )
-                    if expected_user is None:
-                        return
-                    evidence = _reduce_paged_conversation_body(
-                        await response.body(),
-                        conversation_id=paged_conversation_id,
-                        observed_user_message_id=expected_user,
-                    )
-                else:
-                    if observed_user_message_id is None:
-                        return
-                    evidence = await _reduce_frontend_conversation_response_observation(
-                        response, observed_user_message_id
-                    )
-                if not isinstance(evidence, Mapping):
-                    return
-                current_scope = state.get("scope")
-                if not isinstance(current_scope, Mapping):
-                    return
-                if (
-                    current_scope.get("request_id"),
-                    current_scope.get("generation"),
-                ) != scope_key or int(state.get("scope_revision") or 0) != scope_revision:
-                    return
-                evidence_conversation = _safe_identity_string(evidence.get("conversation_id"))
-                evidence_user = _safe_identity_string(evidence.get("observed_user_message_id"))
-                expected_conversation = _safe_identity_string(
-                    current_scope.get("conversation_id")
-                )
-                expected_user = _safe_identity_string(
-                    current_scope.get("accepted_user_message_id")
-                )
-                if expected_conversation and evidence_conversation != expected_conversation:
-                    return
-                if expected_user and evidence_user != expected_user:
-                    return
-                refined_scope = dict(current_scope)
-                if expected_conversation is None and evidence_conversation is not None:
-                    refined_scope["conversation_id"] = evidence_conversation
-                if expected_user is None and evidence_user is not None:
-                    refined_scope["accepted_user_message_id"] = evidence_user
-                if refined_scope != dict(current_scope):
-                    state["scope"] = refined_scope
-                state["latest"] = {
-                    **dict(evidence),
-                    "request_id": scope_key[0],
-                    "generation": scope_key[1],
-                    "observed_at": time.monotonic(),
-                }
-                if isinstance(evidence.get("permission_action"), Mapping):
-                    state["permission_action"] = dict(evidence["permission_action"])
-                state["event_count"] = int(state.get("event_count") or 0) + 1
-                binding = self.binding
-                append_live_event(
-                    "LISTEN",
-                    "response_observation",
-                    page_url=str(getattr(page, "url", "") or ""),
-                    page_id=(binding.page_id if binding is not None else None),
-                    role=(binding.role if binding is not None else None),
-                    task_id=str(current_scope.get("task_id") or "") or None,
-                    team=str(current_scope.get("team") or "") or None,
-                    request_id=scope_key[0],
-                    generation=scope_key[1],
-                    values={
-                        "coverage": evidence.get("coverage"),
-                        "conversation_id": evidence.get("conversation_id"),
-                        "observed_user_message_id": evidence.get("observed_user_message_id"),
-                        "event_count": state["event_count"],
-                        "permission_action": (
-                            dict(evidence["permission_action"])
-                            if isinstance(evidence.get("permission_action"), Mapping)
-                            else None
-                        ),
-                    },
-                )
-                wake_event = state.get("wake_event")
-                if isinstance(wake_event, asyncio.Event):
-                    wake_event.set()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                return
-
-        def on_response(response: Any) -> None:
-            if _matches_frontend_conversation_response(response):
-                ambient_task = asyncio.create_task(
-                    reduce_ambient_permission(
-                        response,
-                        navigation_epoch=int(ambient_state.get("navigation_epoch") or 0),
-                    )
-                )
-                ambient_tasks = ambient_state.setdefault("tasks", set())
-                ambient_tasks.add(ambient_task)
-                ambient_task.add_done_callback(lambda done: ambient_tasks.discard(done))
-            current_scope = state.get("scope")
-            if not isinstance(current_scope, Mapping):
-                return
-            request = str(current_scope.get("request_id") or "")
-            generation_value = current_scope.get("generation")
-            if not request or not isinstance(generation_value, int):
-                return
-            scope_key = (request, generation_value)
-            scope_revision = int(state.get("scope_revision") or 0)
-            observed_user_message_id: str | None = None
-            paged_conversation_id: str | None = None
-            if _matches_frontend_conversation_response(response):
-                observed_user_message_id = _frontend_user_message_id(response.request)
-                expected_user = _safe_identity_string(
-                    current_scope.get("accepted_user_message_id")
-                )
-                if expected_user and observed_user_message_id != expected_user:
-                    return
-            else:
-                paged_conversation_id = _paged_conversation_id_from_response(response)
-                expected_conversation = _safe_identity_string(
-                    current_scope.get("conversation_id")
-                )
-                if (
-                    paged_conversation_id is None
-                    or expected_conversation is None
-                    or paged_conversation_id != expected_conversation
-                ):
-                    return
-            task = asyncio.create_task(
-                reduce_response(
-                    response,
-                    scope_key=scope_key,
-                    scope_revision=scope_revision,
-                    observed_user_message_id=observed_user_message_id,
-                    paged_conversation_id=paged_conversation_id,
-                )
-            )
-            tasks = state.setdefault("tasks", set())
-            tasks.add(task)
-            task.add_done_callback(lambda done: tasks.discard(done))
-
-        def on_close(*_args: Any) -> None:
-            self._remove_passive_observer()
-
-        state["listener"] = on_response
-        state["close_listener"] = on_close
-        try:
-            page.on("response", on_response)
-            page.on("close", on_close)
-        except Exception:
-            self._remove_passive_observer()
-            raise
-
-    def passive_observation(
-        self,
-        *,
-        request_id: str,
-        generation: int,
-    ) -> dict[str, Any]:
-        state = _page_passive_observation_state(self.page)
-        scope = state.get("scope")
-        latest = state.get("latest")
-        if not isinstance(scope, Mapping) or (
-            scope.get("request_id"),
-            scope.get("generation"),
-        ) != (str(request_id), int(generation)):
-            return {"coverage": "unknown", "event_count": int(state.get("event_count") or 0)}
-        permission_action = state.get("permission_action")
-        if not isinstance(latest, Mapping) or not _passive_evidence_matches_scope(latest, scope):
-            result = {"coverage": "unknown", "event_count": int(state.get("event_count") or 0)}
-            if isinstance(permission_action, Mapping):
-                result["permission_action"] = dict(permission_action)
-            return result
-        result = {**dict(latest), "event_count": int(state.get("event_count") or 0)}
-        if isinstance(permission_action, Mapping):
-            result["permission_action"] = dict(permission_action)
-        return result
-
-    async def wait_for_passive_observation(
-        self,
-        *,
-        request_id: str,
-        generation: int,
-        timeout_ms: int,
-    ) -> bool | None:
-        """Wait within the caller's probe window when this exact passive scope is armed.
-
-        ``None`` means no passive scope owned the interval, so the caller must retain
-        its normal DOM wait. ``False`` means passive waiting did own the interval but
-        produced no usable exact wake; ``True`` means exact passive evidence woke it.
-        """
-        if timeout_ms <= 0:
-            return None
-        state = _page_passive_observation_state(self.page)
-        scope = state.get("scope")
-        if not isinstance(scope, Mapping) or (
-            scope.get("request_id"),
-            scope.get("generation"),
-        ) != (str(request_id), int(generation)):
-            return None
-        revision = int(state.get("scope_revision") or 0)
-        wake_event = state.get("wake_event")
-        if not isinstance(wake_event, asyncio.Event):
-            return None
-        try:
-            await asyncio.wait_for(wake_event.wait(), timeout=timeout_ms / 1000)
-        except TimeoutError:
-            return False
-        current_scope = state.get("scope")
-        if (
-            not isinstance(current_scope, Mapping)
-            or int(state.get("scope_revision") or 0) != revision
-            or (
-                current_scope.get("request_id"),
-                current_scope.get("generation"),
-            ) != (str(request_id), int(generation))
-        ):
-            return False
-        wake_event.clear()
-        evidence = self.passive_observation(request_id=request_id, generation=generation)
-        if evidence.get("coverage") == "unknown":
-            return False
-        expected_conversation = _safe_identity_string(current_scope.get("conversation_id"))
-        expected_user = _safe_identity_string(current_scope.get("accepted_user_message_id"))
-        return bool(expected_conversation and expected_user)
+    async def wait_for_passive_observation(self, *, request_id: str, generation: int,
+                                          timeout_ms: int) -> bool:
+        return await self.wait_for_page_observation(timeout_ms=timeout_ms)
 
     def clear_passive_permission_action(self) -> None:
-        _page_passive_observation_state(self.page)["permission_action"] = None
+        self.clear_permission_action()
 
     def detach_passive_observer(self) -> None:
-        self._remove_passive_observer()
+        # DOM-only is a consumer mode, not a listener lifecycle event.
+        return None
 
     def _captured_conversation_id(self, accepted_user_message_id: str | None) -> str | None:
         task = self._frontend_identity_task
@@ -4319,7 +3685,11 @@ class ChatGPTPage:
         elif probe.stop_visible or probe.transport_active:
             state = ChatGPTState.RESPONDING
         else:
-            state = cached.state
+            state = classify_chatgpt_state({
+                "composer_present": probe.composer_present,
+                "composer_text": probe.composer_text,
+                "messages": [message.to_dict() for message in cached.messages],
+            })
         markers = tuple(f"attachment-{index + 1}" for index in range(probe.attachment_count))
         return replace(
             cached,
@@ -4334,6 +3704,9 @@ class ChatGPTPage:
             composer_present=probe.composer_present,
             composer_text=probe.composer_text,
             stop_visible=probe.stop_visible,
+            retry_visible=probe.retry_visible,
+            mcp_permission_allow_count=probe.mcp_permission_allow_count,
+            mcp_permission_node_count=probe.mcp_permission_node_count,
             blocking_dialogs=probe.blocking_dialogs,
             attachment_markers=markers,
             error_texts=probe.error_texts,
@@ -4448,8 +3821,9 @@ class ChatGPTPage:
                     error_texts=full.error_texts,
                     blocking_dialogs=full.blocking_dialogs,
                     choice_prompt_labels=full.choice_prompt_labels,
-                    mcp_permission_allow_count=0,
-                    mcp_permission_node_count=0,
+                    mcp_permission_allow_count=full.mcp_permission_allow_count,
+                    mcp_permission_node_count=full.mcp_permission_node_count,
+                    retry_visible=full.retry_visible,
                     last_user_message_id=next((item.message_id for item in reversed(full.messages) if item.role == "user"), None),
                     last_user_turn_id=next((item.turn_id for item in reversed(full.messages) if item.role == "user"), None),
                     last_assistant_message_id=next((item.message_id for item in reversed(full.messages) if item.role == "assistant"), None),
@@ -4609,6 +3983,45 @@ class ChatGPTPage:
         self._assert_wait_probe_ownership(probe)
         return probe
 
+    async def install_page_observer(self) -> None:
+        from .role_runtime.page_observer import observer_for
+        await observer_for(self.page).install()
+
+    def page_observation(self) -> dict[str, Any]:
+        from .role_runtime.page_observer import observer_for
+        return observer_for(self.page).observation()
+
+    async def wait_for_page_observation(self, *, timeout_ms: int = 5_000, dom_only: bool = False) -> bool:
+        from .role_runtime.page_observer import observer_for
+        return await observer_for(self.page).wait(timeout_ms / 1000, dom_only=dom_only)
+
+    def clear_permission_action(self) -> None:
+        from .role_runtime.page_observer import observer_for
+        observer_for(self.page).clear_permission()
+
+    async def conversation_info(self, *, refresh: bool = False) -> dict[str, Any] | None:
+        """G2: optional cached information only; never called by role admission."""
+        from .role_runtime.page_observer import observer_for
+        observer = observer_for(self.page)
+        if observer.info is not None and not refresh:
+            return dict(observer.info)
+        current = extract_session_id(str(self.page.url))
+        if not current or current.startswith("WEB:"):
+            return None
+        # Bound both successful and failed explicit lookups; repeated inspection
+        # must not become a second polling channel.
+        if time.monotonic() - observer.info_at < 30:
+            return dict(observer.info) if observer.info else None
+        observer.info_at = time.monotonic()
+        try:
+            value = await asyncio.wait_for(_backend_get_object(
+                self.page.context, f"/backend-api/conversation/{current}", category="conversation_info"
+            ), timeout=10)
+        except (BackendAuthError, BackendUnavailableError, BackendSchemaError, TimeoutError):
+            return None
+        observer.info = dict(value)
+        return dict(observer.info)
+
     async def mcp_allow_visible(self) -> bool:
         return bool(
             await self.page.evaluate(
@@ -4639,55 +4052,7 @@ class ChatGPTPage:
                 self.invalidate_wait_cache()
             return result
 
-    async def inspect_mcp_permission_allow(
-        self,
-        probe: WaitProbe,
-        receipt: SendReceipt,
-        *,
-        allowed_connectors: Sequence[str],
-        expected_target_message_id: str | None = None,
-    ) -> dict[str, str]:
-        if receipt.user_message_id is None:
-            raise UnsafePageStateError("MCP permission approval requires exact accepted user identity")
-        self._assert_wait_probe_ownership(probe)
-        assert self.binding is not None
-        return await click_mcp_permission_allow(
-            self.page,
-            expected_page_id=self.binding.page_id,
-            expected_role=self.binding.role,
-            expected_task_id=probe.page_task_id,
-            expected_team=probe.page_team,
-            expected_user_message_id=receipt.user_message_id,
-            allowed_connectors=allowed_connectors,
-            dispatch=False,
-            expected_target_message_id=expected_target_message_id,
-        )
 
-    async def approve_mcp_permission_allow(
-        self,
-        probe: WaitProbe,
-        receipt: SendReceipt,
-        *,
-        allowed_connectors: Sequence[str],
-        expected_target_message_id: str,
-    ) -> dict[str, str]:
-        """Explicitly dispatch one exact previously-inspected MCP allow action."""
-        if receipt.user_message_id is None:
-            raise UnsafePageStateError("MCP permission approval requires exact accepted user identity")
-        async with self.mutation_guard():
-            self._assert_wait_probe_ownership(probe)
-            assert self.binding is not None
-            return await click_mcp_permission_allow(
-                self.page,
-                expected_page_id=self.binding.page_id,
-                expected_role=self.binding.role,
-                expected_task_id=probe.page_task_id,
-                expected_team=probe.page_team,
-                expected_user_message_id=receipt.user_message_id,
-                allowed_connectors=allowed_connectors,
-                dispatch=True,
-                expected_target_message_id=expected_target_message_id,
-            )
 
     async def resolve_choice_prompt(
         self, *, timeout_ms: int | None = None
@@ -4996,6 +4361,8 @@ class ChatGPTPage:
         timeout = timeout_ms or self.timeout_ms
         async with self.mutation_guard():
             snapshot = await self.assert_ownership()
+            if snapshot.page_task_id == task_id and snapshot.page_team == team:
+                return {"task_id": task_id, "team": team}
             if snapshot.manual_input_pending:
                 raise ComposerConflictError(
                     "task/team binding blocked by manual draft or attachments"
@@ -5206,7 +4573,11 @@ class ChatGPTPage:
         allow_dialogs: bool = False,
         allow_attachments: bool = False,
     ) -> None:
-        if snapshot.state is ChatGPTState.ERROR:
+        if snapshot.requires_login or snapshot.state is ChatGPTState.AUTH_REQUIRED:
+            raise AuthenticationRequiredError("ChatGPT sign-in is required")
+        if snapshot.state is ChatGPTState.ERROR and not (
+            snapshot.retry_visible and not snapshot.error_texts
+        ):
             raise UnsafePageStateError(
                 f"page is in error state: {list(snapshot.error_texts)!r}"
             )
@@ -5425,11 +4796,13 @@ class ChatGPTPage:
     ) -> None:
         timeout = timeout_ms or self.timeout_ms
         async with self.mutation_guard():
-            before = await self.assert_ownership()
+            before = await self.assert_ownership(require_binding=self.binding is not None)
             if before.stop_visible and not allow_responding:
                 raise UnsafePageStateError("refusing to refresh an active response")
+            if before.manual_input_pending:
+                raise ComposerConflictError("refresh would discard a manual draft or attachments")
             await refresh_page(self.page, timeout_ms=timeout)
-            await self.assert_ownership()
+            await self.assert_ownership(require_binding=self.binding is not None)
             self._owned_composer_text = None
 
     async def _wait_send_acceptance(
@@ -5936,12 +5309,11 @@ class ChatGPTPage:
                 await asyncio.sleep(self._adaptive_wait_seconds(poll_ms, unchanged_ticks))
                 continue
 
-            if manual_input_pending:
-                await asyncio.sleep(self._adaptive_wait_seconds(poll_ms, unchanged_ticks))
-                continue
-
-            user_provenance = receipt_user_message_seen(snapshot.messages, receipt)
-            assistants = assistant_turns_for_receipt(snapshot.messages, receipt)
+            # A later user turn or an unsent draft does not invalidate the current
+            # conversation result. Original-user identity protects Send receipts only.
+            from .role_runtime.response import current_assistant
+            current = current_assistant(snapshot.messages, receipt.baseline)
+            assistants = (current,) if current is not None else ()
             expected_turn = str(expected_assistant_turn_id or "").strip()
             expected_message = str(expected_assistant_message_id or "").strip()
             if expected_turn or expected_message:
@@ -5965,7 +5337,7 @@ class ChatGPTPage:
             current_fingerprint = message_fingerprint(candidate)
             transport_ui_active = response_transport_ui_active(snapshot)
 
-            candidate_present = candidate is not None and user_provenance
+            candidate_present = candidate is not None
             if candidate_present and response_is_stale(candidate, recovery_baseline):
                 saw_stale_assistant = True
                 candidate_present = False
