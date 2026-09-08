@@ -2,6 +2,8 @@
 
 The workflow layer is built for deterministic browser automation. A user workflow is a plain ordered list of blocks; selectors, recovery and ownership checks stay inside the block/client implementation.
 
+> **CDPA runtime note (2026-09-09):** this document describes the standalone block/workflow API. CDPA workflow roles now use the shared operational `RoleController`; an accepted Send receipt prevents replay but does not require later assistant output to retain exact original-prompt lineage. Current stable output is admitted from the exact owned task/team/role conversation, while full-conversation/history reads remain optional recovery information.
+
 ## One-file durable workflow
 
 Copy or edit `workflows/chatgpt_durable_loop.py`:

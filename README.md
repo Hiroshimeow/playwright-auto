@@ -147,6 +147,25 @@ A task preserves:
 
 Accepted sends are never intentionally replayed during recovery.
 
+### Operational role loop
+
+Normal workflow execution intentionally uses one short controller path:
+
+```text
+durable Send accepted once
+→ observe the exact owned page/conversation through DOM + passive Listen signals
+→ handle the operational blocker, if any
+→ accept the latest stable valid assistant result
+→ validate report + route
+→ route the next role
+```
+
+The accepted Send receipt is the non-replay boundary; after acceptance it is not a lineage/provenance gate for later conversation turns. Operator steering and ChatGPT Retry may legitimately change the current branch, so the controller evaluates the current stable result in the exact owned task/team/role conversation and never auto-clicks Retry or Regenerate.
+
+Full-conversation/history retrieval is optional information/recovery lookup only. It may enrich diagnostics or recovery but must not decide normal Send, blocker handling, result admission, Resume, or routing. If the page makes no operational progress for `response.refresh_after_seconds` (default `600` seconds), the bounded recovery action is F5/reload, never replaying an accepted Send; manual composer text or attachments suppress destructive recovery.
+
+Dashboard Live audit exposes the same operating path as four telemetry sources: `DOM` (semantic page changes), `LISTEN` (semantic transport/response signals), `CTRL` (controller decisions/transitions), and `ACTION` (browser/control actions).
+
 ## Start CDPA directly
 
 ```bash

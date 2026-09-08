@@ -6,6 +6,8 @@ Verified against the live ChatGPT web UI on 2026-07-13 through Chromium 150 and 
 
 This contract is for deterministic browser automation without an LLM agent. It uses fixed selectors plus explicit state conditions. The DOM is not a public API, so every release must be probed before relying on it in production.
 
+> **CDPA runtime note (2026-09-09):** this document is a low-level browser/DOM reference, not the current CDPA orchestration design. Current workflow roles use the shared operational `RoleController` with DOM + passive Listen observation. Full-conversation/history retrieval is optional information/recovery lookup and must not become authority for normal Send, blocker handling, result admission, Resume, or routing.
+
 ## Recommended architecture
 
 There are three viable approaches:
@@ -279,9 +281,9 @@ uv run python scripts/chatgpt_probe.py --set-role 0=PLAN
 
 The role, page ID, and current task ID are stored in that tab's `sessionStorage` and mirrored into a namespaced `window.name` binding. The mirror preserves the visible `⟦ROLE⟧` title and `ROLE · TASK-ID · page-id` badge across document and cross-origin authentication redirects.
 
-## Current runtime boundary
+## Historical runtime boundary (2026-07-13)
 
-The persistent profile is not logged in. A completed guest response and a full sequential PLAN → DEV → REVIEW → PLAN context-transfer workflow were exercised successfully. Repeated guest requests later exhausted the anonymous runtime: fresh role tabs remained active for 90–120 seconds and then redirected to OpenAI authentication. Durable recovery correctly classified the lost post-send transcript as `sent_marker_missing` and refused to resend.
+At that verification point the persistent profile was not logged in. A completed guest response and a full sequential PLAN → DEV → REVIEW → PLAN context-transfer workflow were exercised successfully. Repeated guest requests later exhausted the anonymous runtime: fresh role tabs remained active for 90–120 seconds and then redirected to OpenAI authentication. Durable recovery correctly classified the lost post-send transcript as `sent_marker_missing` and refused to resend.
 
 Structural browser stress passed for 2, 5, and 10 visible roles over three cycles per stage. Durable orchestration stress passed 200 tasks, 2,844 role executions, 44 fresh-process resumes, and up to six parallel role executions per task. Authenticated parallel response completion still requires a valid logged-in profile.
 
