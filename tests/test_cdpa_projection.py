@@ -499,6 +499,39 @@ def test_disconnected_browser_marks_role_availability_unknown(tmp_path: Path):
     assert projection.detail["roles"][0]["online"] is None
 
 
+def test_unallocated_role_does_not_inherit_anonymous_browser_page_online_state(tmp_path: Path):
+    raw = raw_task(tmp_path)
+    raw["roles"]["AUDIT"] = {
+        "physical_role": "alpha-audit",
+        "status": "unallocated",
+        "turn": 0,
+        "page_id": None,
+        "page_url": None,
+        "online": False,
+    }
+
+    projection = build_task_projection(
+        raw,
+        tasks=[raw],
+        browser_connected=True,
+        browser_pages=[
+            {
+                "page_id": None,
+                "online": True,
+                "url": "https://chatgpt.com/",
+                "role": None,
+                "task_id": None,
+                "team": None,
+            }
+        ],
+    )
+
+    audit = next(item for item in projection.detail["roles"] if item["logical_role"] == "AUDIT")
+    assert audit["status"] == "unallocated"
+    assert audit["online"] is False
+    assert audit["chat_url"] is None
+
+
 def _waiting_task(
     task_id: str,
     *,

@@ -5,7 +5,7 @@ import {
   detailCacheGet, detailCachePut, detailCacheInvalidate, pruneDetailCache,
 } from "./store.js";
 import {renderBoard, refreshElapsed} from "./views/board.js";
-import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260907-live-audit-nav-v2";
+import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260907-live-audit-nav-v3";
 import {renderHistory} from "./views/history.js";
 import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20260906-listen-controls-v1";
 import {renderRuntime} from "./views/runtime.js?v=20260906-listen-controls-v1";
@@ -604,10 +604,13 @@ function selectedLiveState(current) {
 function renderPageRail(current) {
   if (!roots.taskRail) return;
   roots.taskRail.hidden = !current.selectedTaskId;
-  const tab = selectedDetailTab(current);
+  const activeTarget = current.selectedTaskJumpByTask.get(current.selectedTaskId)
+    || selectedDetailTab(current);
   for (const node of document.querySelectorAll("[data-task-jump]")) {
-    const target = node.dataset.taskJump;
-    node.classList.toggle("active", target === tab);
+    const active = node.dataset.taskJump === activeTarget;
+    node.classList.toggle("active", active);
+    if (active) node.setAttribute("aria-current", "location");
+    else node.removeAttribute("aria-current");
   }
 }
 
@@ -798,9 +801,13 @@ subscribe(render);
 installSelectionResume(roots.detail);
 
 function selectTask(taskId, cached = null) {
-  if (state.selectedTaskId !== taskId) selectedReportByTask.clear();
+  const taskChanged = state.selectedTaskId !== taskId;
+  if (taskChanged) selectedReportByTask.clear();
   commit(current => {
     current.selectedTaskId = taskId;
+    if (taskChanged || !current.selectedTaskJumpByTask.has(taskId)) {
+      current.selectedTaskJumpByTask.set(taskId, "overview");
+    }
     current.selectedDetail = cached;
     current.selectedDetailStatus = cached ? "ready" : "loading";
     current.selectedDetailError = null;
@@ -1272,7 +1279,10 @@ roots.detail.addEventListener("click", async event => {
   if (detailTab) {
     const taskId = detailTab.dataset.taskId;
     const tab = detailTab.dataset.detailTab;
-    commit(current => { current.selectedIndependentTabByTask.set(taskId, tab); });
+    commit(current => {
+      current.selectedIndependentTabByTask.set(taskId, tab);
+      current.selectedTaskJumpByTask.set(taskId, tab);
+    });
     if (tab === "reports") loadReports(state.selectedDetail);
     if (tab === "live") loadLiveAudit();
     return;
@@ -1303,6 +1313,14 @@ roots.detail.addEventListener("click", async event => {
   if (copyRoleUrl) {
     try {
       await navigator.clipboard.writeText(copyRoleUrl.dataset.copyRoleUrl);
+      const originalLabel = copyRoleUrl.textContent;
+      copyRoleUrl.textContent = "Copied ✓";
+      copyRoleUrl.disabled = true;
+      window.setTimeout(() => {
+        if (!copyRoleUrl.isConnected) return;
+        copyRoleUrl.textContent = originalLabel;
+        copyRoleUrl.disabled = false;
+      }, 1400);
       toast(`Copied ${copyRoleUrl.dataset.role || "role"} URL`);
     } catch (error) {
       toast(`Copy failed: ${error.message}`);
@@ -1410,7 +1428,10 @@ document.addEventListener("click", async event => {
   if (taskJump && state.selectedTaskId) {
     const target = taskJump.dataset.taskJump;
     const tab = target === "live" ? "live" : target === "reports" ? "reports" : "overview";
-    commit(current => { current.selectedIndependentTabByTask.set(current.selectedTaskId, tab); });
+    commit(current => {
+      current.selectedIndependentTabByTask.set(current.selectedTaskId, tab);
+      current.selectedTaskJumpByTask.set(current.selectedTaskId, target);
+    });
     if (tab === "reports") loadReports(state.selectedDetail);
     if (tab === "live") loadLiveAudit();
     requestAnimationFrame(() => {

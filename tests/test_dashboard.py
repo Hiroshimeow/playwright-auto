@@ -458,7 +458,7 @@ def test_notify_frontend_contract_reuses_secondary_report_path_and_preserves_his
     assert 'if (current.drawer === "history") renderHistory(roots.secondaryContent, current);' in app
     assert 'if (current.drawer === "notify") renderNotify(roots.secondaryContent, current);' in app
     assert 'if (view === "notify") delete roots.secondaryContent.dataset.secondaryView;' in app
-    assert '/assets/app.js?v=20260907-live-audit-nav-v2' in html
+    assert '/assets/app.js?v=20260907-live-audit-nav-v3' in html
     assert './views/notify.js?v=20260906-listen-controls-v1' in app
     assert 'data-notify-task-id' in notify
     assert 'workflowReportModel(detail, detail.active_role)' in notify
@@ -686,6 +686,18 @@ def test_dashboard_exposes_role_urls_live_audit_and_page_level_quick_navigation(
     assert 'inputSection.dataset.disclosureKey = `role-input-${inputRole}`' in detail
     assert 'section.className = "detail-section detail-card bootstrap-context-card"' in app
     assert 'disclosure.className = "bootstrap-context-disclosure"' in app
+    assert 'current.selectedTaskJumpByTask.set(current.selectedTaskId, target)' in app
+    assert 'node.setAttribute("aria-current", "location")' in app
+    assert 'copyRoleUrl.textContent = "Copied ✓"' in app
+    assert 'select.setAttribute("aria-pressed", String(selected))' in detail
+    assert 'label: "not allocated"' in detail
+    assert '"No tab allocated"' in detail
+    assert 'DOM = observed page state' in detail
+    assert 'details.append(el("summary", "Details"))' in detail
+    responsive = css.split("@media (max-width: 920px)", 1)[1].split("@media (max-width: 720px)", 1)[0]
+    assert "display: block;" in responsive
+    assert "overflow-x: auto;" in responsive
+    assert ".rail-task-links { display: flex;" in responsive
 
 
 def test_runtime_dom_only_help_describes_both_true_modes_truthfully():

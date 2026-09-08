@@ -225,14 +225,18 @@ def _roles(
     browser_pages: Sequence[Mapping[str, Any]],
     browser_connected: bool | None,
 ) -> list[dict[str, Any]]:
-    pages = {str(page.get("page_id") or ""): page for page in browser_pages}
+    pages: dict[str, Mapping[str, Any]] = {}
+    for page in browser_pages:
+        page_key = str(page.get("page_id") or "").strip()
+        if page_key:
+            pages[page_key] = page
     source = raw.get("roles") if isinstance(raw.get("roles"), Mapping) else {}
     result: list[dict[str, Any]] = []
     for logical_role, value in source.items():
         if not isinstance(value, Mapping):
             continue
         page_id = str(value.get("page_id") or "") or None
-        page = pages.get(page_id or "")
+        page = pages.get(page_id) if page_id else None
         if browser_connected is False:
             online: bool | None = None
         elif browser_connected is True:

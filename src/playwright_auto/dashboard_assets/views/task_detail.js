@@ -152,16 +152,35 @@ function detailCard(title, {id = null, className = ""} = {}) {
 function rolesSection(detail, selectedRole) {
   const roles = detailCard("Roles / tabs", {id: "task-roles", className: "roles-card"});
   const roleList = el("div", null, "role-list");
-  for (const role of detail.roles || []) {
-    const row = el("article", null, `role-row${role.logical_role === selectedRole ? " selected" : ""}`);
+  const orderedRoles = (detail.roles || []).map((role, index) => ({
+    role,
+    index,
+    unallocated: role.status === "unallocated" && !role.chat_url,
+  })).sort((left, right) => Number(left.unallocated) - Number(right.unallocated) || left.index - right.index);
+  let unallocatedLabelAdded = false;
+  for (const item of orderedRoles) {
+    const role = item.role;
+    if (item.unallocated && !unallocatedLabelAdded) {
+      roleList.append(el("p", "Not allocated", "role-group-label"));
+      unallocatedLabelAdded = true;
+    }
+    const selected = role.logical_role === selectedRole;
+    const row = el("article", null, `role-row${selected ? " selected" : ""}${item.unallocated ? " unallocated" : ""}`);
     const select = el("button", null, "role-select");
     select.type = "button";
     select.dataset.roleSelect = role.logical_role;
     select.dataset.taskId = detail.task_id;
+    select.setAttribute("aria-pressed", String(selected));
     const identity = el("span", null, "role-identity");
     identity.append(el("strong", role.logical_role), el("span", role.physical_role, "role-physical"));
-    const availability = role.online == null ? "unknown" : role.online ? "online" : "offline";
-    select.append(identity, el("span", availability, `role-availability ${availability}`));
+    const availability = item.unallocated
+      ? {label: "not allocated", className: "unallocated"}
+      : role.online == null
+        ? {label: "unknown", className: "unknown"}
+        : role.online
+          ? {label: "online", className: "online"}
+          : {label: "offline", className: "offline"};
+    select.append(identity, el("span", availability.label, `role-availability ${availability.className}`));
     row.append(select);
 
     const urlArea = el("div", null, "role-url-area");
@@ -181,7 +200,7 @@ function rolesSection(detail, selectedRole) {
       actions.append(open, copy);
       urlArea.append(url, actions);
     } else {
-      urlArea.append(el("span", "No conversation URL yet", "muted role-url-empty"));
+      urlArea.append(el("span", item.unallocated ? "No tab allocated" : "No conversation URL yet", "muted role-url-empty"));
     }
     row.append(urlArea);
     roleList.append(row);
@@ -522,6 +541,24 @@ function workflowLive(detail, selectedRole, liveState = {}) {
     header.append(actions);
   }
   section.append(header);
+  section.append(el(
+    "p",
+    "DOM = observed page state · LISTEN = response / transport signal · CTRL = controller transition · ACTION = browser / control action.",
+    "live-audit-help",
+  ));
+  const sourceHelp = {
+    DOM: "Observed semantic page state",
+    LISTEN: "Detected response or transport activity",
+    CTRL: "Controller state transition",
+    ACTION: "Browser or controller action",
+  };
+  const legend = el("div", null, "live-legend");
+  for (const source of ["DOM", "LISTEN", "CTRL", "ACTION"]) {
+    const chip = el("span", source, `live-source source-${source.toLowerCase()}`);
+    chip.title = sourceHelp[source];
+    legend.append(chip);
+  }
+  section.append(legend);
 
   if (liveState.status === "loading" && !(liveState.items || []).length) {
     section.append(el("p", "Loading live telemetry…", "muted"));
@@ -535,9 +572,6 @@ function workflowLive(detail, selectedRole, liveState = {}) {
     section.append(el("p", "No semantic DOM / Listen / controller events have been captured for this role yet.", "muted"));
     return section;
   }
-  const legend = el("div", null, "live-legend");
-  for (const source of ["DOM", "LISTEN", "CTRL", "ACTION"]) legend.append(el("span", source, `live-source source-${source.toLowerCase()}`));
-  section.append(legend);
   const list = el("div", null, "live-event-list");
   for (const event of items) {
     const card = el("article", null, "live-event");
@@ -574,8 +608,15 @@ function workflowLive(detail, selectedRole, liveState = {}) {
     }
     const meta = [event.team, event.task_id, event.role, event.page_id, event.request_id]
       .filter(Boolean).join(" · ");
-    if (meta) card.append(el("p", meta, "live-event-meta"));
-    if (event.detail) card.append(el("p", event.detail, "live-event-detail"));
+    if (meta || event.detail) {
+      const details = el("details", null, "live-event-details");
+      details.append(el("summary", "Details"));
+      const body = el("div", null, "live-event-details-body");
+      if (meta) body.append(el("p", meta, "live-event-meta"));
+      if (event.detail) body.append(el("p", event.detail, "live-event-detail"));
+      details.append(body);
+      card.append(details);
+    }
     list.append(card);
   }
   section.append(list);

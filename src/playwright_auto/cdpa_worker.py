@@ -4045,7 +4045,11 @@ class CDPAWorker:
                     passive_action = dict(evidence["permission_action"])
         visible_reader = getattr(client, "mcp_allow_visible", None)
         visible = bool(await visible_reader()) if callable(visible_reader) else False
-        if not visible and passive_action is None:
+        permission_present = bool(
+            visible
+            or int(getattr(snapshot, "mcp_permission_node_count", 0) or 0) > 0
+        )
+        if not permission_present and passive_action is None:
             wait.pop("mcp_allow_seen_at", None)
             return False
 

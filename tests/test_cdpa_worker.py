@@ -6897,6 +6897,45 @@ def test_active_rate_limit_blocks_ui_bootstrap_new_page_only(tmp_path: Path):
         asyncio.run(worker._branch_from_bootstrap_ui(state, "PLAN", Actions(), donor))
 
 
+def test_active_mcp_allow_dispatches_hidden_permission_node_after_stability_window(tmp_path: Path):
+    _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-active-hidden-allow"
+    )
+    hop["wait"]["mcp_allow_seen_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=6)
+    ).isoformat()
+    calls = []
+
+    class Client:
+        def passive_observation(self, **_kwargs):
+            return {"coverage": "unknown"}
+
+        async def mcp_allow_visible(self):
+            return False
+
+        async def auto_allow_mcp_permission(self, *, passive_action=None):
+            calls.append(passive_action)
+            return {
+                "method": "react_handler",
+                "target_message_id": "hidden-call",
+                "remember_answer": "true",
+            }
+
+    snapshot = SimpleNamespace(
+        stop_visible=False,
+        messages=(),
+        mcp_permission_node_count=1,
+    )
+    handled = asyncio.run(
+        worker._mcp_allow_interrupt(state, hop, Client(), receipt, snapshot)
+    )
+
+    assert handled is True
+    assert calls == [None]
+    assert hop["wait"].get("mcp_allow_clicked_at")
+    assert state["active_action"] == "wait_mcp_allow_continuation"
+
+
 def test_active_mcp_allow_falls_back_to_plain_visible_allow(tmp_path: Path):
     _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-active-plain-allow"
