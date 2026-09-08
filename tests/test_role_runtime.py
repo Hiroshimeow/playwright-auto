@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from playwright_auto.chatgpt import MessageSnapshot
-from playwright_auto.role_runtime import Action, Policy, RoleController
+from playwright_auto.role_runtime import Action, Decision, Policy, RoleController
 from playwright_auto.role_runtime.allow import activity
 from test_operational_contract import snapshot, receipt
 
@@ -34,11 +34,13 @@ def test_allow_requires_five_seconds_for_every_source(source):
     assert step(current, wait, 5, **kwargs).action is Action.ALLOW
 
 
-def test_permission_presence_has_priority_over_valid_result():
+def test_stable_valid_result_wins_over_permission_evidence():
     current = current_result(mcp_permission_node_count=1)
     wait = {}
     assert step(current, wait).reason == "mcp_allow_stable"
-    assert step(current, wait, 5).action is Action.ALLOW
+    result = step(current, wait, 5)
+    assert result.action is Action.ACCEPT
+    assert result.response.text == "result"
 
 
 def test_allow_disappearance_alone_still_refreshes_after_five_seconds():
@@ -64,6 +66,34 @@ def test_failed_allow_handler_cannot_hide_stall_timer():
     wait = {"controller_state": "ALLOW", "controller_progress_at": NOW.isoformat(),
             "mcp_allow_seen_at": NOW.isoformat(), "mcp_allow_retry_at": NOW.isoformat()}
     assert step(current, wait, 601).action is Action.REFRESH
+
+
+def test_failed_allow_with_no_dom_permission_clears_stale_network_evidence():
+    current = snapshot(mcp_permission_node_count=0, mcp_permission_allow_count=0)
+    wait = {"mcp_allow_seen_at": NOW.isoformat(), "mcp_allow_seen_target": "target"}
+
+    class Client:
+        cleared = False
+
+        async def auto_allow_mcp_permission(self, *, passive_action=None):
+            return None
+
+        def clear_permission_action(self):
+            self.cleared = True
+
+    client = Client()
+    result = asyncio.run(RoleController().browser_action(
+        client,
+        current,
+        wait,
+        {"type": "allow", "target_message_id": "target", "remember_answer": True},
+        Decision(Action.ALLOW, "mcp_allow_ready"),
+    ))
+    assert result.action is Action.WAIT
+    assert result.reason == "mcp_allow_stale_cleared"
+    assert client.cleared is True
+    assert "mcp_allow_seen_at" not in wait
+    assert "mcp_allow_retry_at" not in wait
 
 
 def test_operator_continuation_accepts_current_result_without_original_user():

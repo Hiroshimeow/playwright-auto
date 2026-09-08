@@ -163,6 +163,7 @@ def test_config_loads_root_json_compatible_yaml_and_validates_defaults(tmp_path:
     packaged_root = tmp_path / "packaged-default"
     packaged_root.mkdir()
     packaged_config = load_cdpa_config(None, repository_root=packaged_root)
+    assert packaged_config.response_refresh_after_seconds == 600
     assert packaged_config.response_poll_ms == 5000
     assert config.rate_limit_quiet_seconds == 300.0
     assert config.dashboard_url == "http://127.0.0.1:9224"

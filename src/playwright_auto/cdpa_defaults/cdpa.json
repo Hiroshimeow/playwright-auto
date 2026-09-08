@@ -38,7 +38,7 @@
   },
   "response": {
     "timeout_seconds": 7200,
-    "refresh_after_seconds": 1200,
+    "refresh_after_seconds": 600,
     "stream_status_terminal_settle_seconds": 5.0,
     "stable_ms": 1000,
     "poll_ms": 5000

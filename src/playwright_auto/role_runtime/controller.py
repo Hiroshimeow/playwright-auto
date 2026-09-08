@@ -32,13 +32,20 @@ class RoleController:
             decision = handler(ctx)
             if decision is not None:
                 return self._remember(ctx, decision)
-        if phase == "waiting" and not ctx.permission_present and not wait.get("mcp_allow_clicked_at"):
+        if phase == "waiting":
             response.observe(ctx, getattr(receipt, "baseline", None), validate)
         stalled.observe(ctx)
         ready_at = parse_time(wait.get("refresh_ready_at"))
         if ready_at is not None and ctx.now < ready_at:
             return self._remember(ctx, Decision(Action.WAIT, "reload_settle"))
         wait.pop("refresh_ready_at", None)
+
+        # A stable validated role result is terminal for this hop. It must not be
+        # masked by stale permission evidence left behind by an earlier tool turn.
+        if phase == "waiting":
+            result_decision = response.handle(ctx)
+            if result_decision is not None:
+                return self._remember(ctx, result_decision)
 
         permission_decision = allow.handle(ctx)
         if permission_decision is not None:
@@ -63,10 +70,6 @@ class RoleController:
             reason = "ready" if ctx.composer_ready else "composer_pending"
             return self._remember(ctx, Decision(Action.WAIT, reason))
 
-        # A stable valid result is more useful than a stale Retry/Stop decoration.
-        decision = response.handle(ctx)
-        if decision is not None:
-            return self._remember(ctx, decision)
         for handler in (retry.handle, malformed.handle, ui_error.handle):
             decision = handler(ctx)
             if decision is not None and decision.action is not Action.WAIT:
@@ -220,6 +223,21 @@ class RoleController:
                 dispatched = None
             now = datetime.now(timezone.utc)
             if not isinstance(dispatched, Mapping):
+                # Network/listen evidence can outlive the actual permission node.
+                # If the DOM no longer contains any permission affordance, discard
+                # that stale observation instead of retrying it forever and masking
+                # a completed response or Retry state.
+                dom_permission_present = bool(
+                    int(getattr(snapshot, "mcp_permission_node_count", 0) or 0)
+                    or int(getattr(snapshot, "mcp_permission_allow_count", 0) or 0)
+                )
+                if not dom_permission_present:
+                    clear = getattr(client, "clear_permission_action", None)
+                    if callable(clear):
+                        clear()
+                    for key in ("mcp_allow_seen_at", "mcp_allow_seen_target", "mcp_allow_retry_at", "mcp_allow_dispatch_error"):
+                        wait.pop(key, None)
+                    return Decision(Action.WAIT, "mcp_allow_stale_cleared")
                 wait["mcp_allow_retry_at"] = (now + timedelta(seconds=5)).isoformat()
                 return Decision(Action.WAIT, "mcp_allow_handler_pending")
             for key in ("mcp_allow_seen_at", "mcp_allow_seen_target", "mcp_allow_retry_at", "mcp_allow_dispatch_error"):
