@@ -552,22 +552,29 @@ function workflowLive(detail, selectedRole, liveState = {}) {
     CTRL: "Controller state transition",
     ACTION: "Browser or controller action",
   };
+  const rawItems = liveState.items || [];
+  const sourceCounts = Object.create(null);
+  for (const event of rawItems) {
+    const source = String(event.source || "EVENT").toUpperCase();
+    sourceCounts[source] = (sourceCounts[source] || 0) + 1;
+  }
   const legend = el("div", null, "live-legend");
   for (const source of ["DOM", "LISTEN", "CTRL", "ACTION"]) {
     const chip = el("span", source, `live-source source-${source.toLowerCase()}`);
+    chip.append(el("b", String(sourceCounts[source] || 0)));
     chip.title = sourceHelp[source];
     legend.append(chip);
   }
   section.append(legend);
 
-  if (liveState.status === "loading" && !(liveState.items || []).length) {
+  if (liveState.status === "loading" && !rawItems.length) {
     section.append(el("p", "Loading live telemetry…", "muted"));
     return section;
   }
   if (liveState.error) {
     section.append(el("p", `Live telemetry unavailable: ${liveState.error}`, "live-error"));
   }
-  const items = [...(liveState.items || [])].reverse();
+  const items = [...rawItems].reverse();
   if (!items.length) {
     section.append(el("p", "No semantic DOM / Listen / controller events have been captured for this role yet.", "muted"));
     return section;

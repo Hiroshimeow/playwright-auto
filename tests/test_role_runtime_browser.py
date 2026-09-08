@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from playwright_auto.chatgpt import ChatGPTPage, PageBinding, SendReceipt, MessageBaseline, prompt_digest
 from playwright_auto.role_runtime import Action, RoleController
 from test_chatgpt_mcp_permission import _with_page
+from test_operational_contract import snapshot
 
 
 def request():
@@ -28,6 +29,41 @@ def environment(client):
     )
     acquired = SimpleNamespace(client=client, page_id="page-1")
     return state, hop, worker, acquired
+
+
+def test_listen_telemetry_emits_once_per_semantic_signal(monkeypatch):
+    import playwright_auto.observability as observability
+
+    events = []
+    monkeypatch.setattr(observability, "append_live_event", lambda source, kind, **kwargs: events.append((source, kind, kwargs)))
+
+    class Client:
+        evidence = {
+            "status": "IS_STREAMING",
+            "response": {"role": "assistant", "message_id": "net-1", "turn_id": "turn-1", "text": "working", "image_count": 0},
+        }
+
+        async def install_page_observer(self):
+            return None
+
+        def page_observation(self):
+            return dict(self.evidence)
+
+    client = Client()
+    state, hop, worker, acquired = environment(client)
+    worker._dom_only_enabled = lambda: False
+    controller = RoleController()
+    current = snapshot()
+
+    asyncio.run(controller.run(worker, state, hop, acquired, None, snapshot=current, wait_ms=0))
+    asyncio.run(controller.run(worker, state, hop, acquired, None, snapshot=current, wait_ms=0))
+    assert [event[:2] for event in events].count(("LISTEN", "network_signal")) == 1
+
+    client.evidence["status"] = "COMPLETE"
+    asyncio.run(controller.run(worker, state, hop, acquired, None, snapshot=current, wait_ms=0))
+    listen = [event for event in events if event[:2] == ("LISTEN", "network_signal")]
+    assert len(listen) == 2
+    assert listen[-1][2]["values"]["status"] == "COMPLETE"
 
 
 def test_hidden_allow_real_dom_snapshot_reaches_dispatch_after_five_seconds():

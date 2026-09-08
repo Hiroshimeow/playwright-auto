@@ -5,7 +5,7 @@ import {
   detailCacheGet, detailCachePut, detailCacheInvalidate, pruneDetailCache,
 } from "./store.js";
 import {renderBoard, refreshElapsed} from "./views/board.js";
-import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260907-live-audit-nav-v3";
+import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260908-live-audit-nav-v4";
 import {renderHistory} from "./views/history.js";
 import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20260906-listen-controls-v1";
 import {renderRuntime} from "./views/runtime.js?v=20260906-listen-controls-v1";

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>CDPA Control Center</title>
-  <link rel="stylesheet" href="/assets/dashboard.css?v=20260907-live-audit-nav-v3">
+  <link rel="stylesheet" href="/assets/dashboard.css?v=20260908-live-audit-nav-v4">
 </head>
 <body>
   <header class="app-header">
@@ -32,16 +32,14 @@
       <div class="page-rail-inner">
         <p class="eyebrow">Navigate</p>
         <nav class="page-rail-nav">
-          <button type="button" class="rail-link rail-link-primary" data-page-jump="task-board">
-            <strong>Task board</strong><span>Operational queue</span>
-          </button>
+          <button type="button" class="rail-link rail-link-primary" data-page-jump="task-board"><strong>Task board</strong></button>
           <div class="rail-task-links" data-task-rail hidden>
             <p class="rail-group-title">Selected task</p>
-            <button type="button" class="rail-link" data-task-jump="overview"><strong>Overview</strong><span>Controls & goal</span></button>
-            <button type="button" class="rail-link" data-task-jump="roles"><strong>Roles / tabs</strong><span>URLs & handoff</span></button>
-            <button type="button" class="rail-link" data-task-jump="live"><strong>Live audit</strong><span>DOM · Listen · Ctrl</span></button>
-            <button type="button" class="rail-link" data-task-jump="timeline"><strong>Timeline</strong><span>Workflow lifecycle</span></button>
-            <button type="button" class="rail-link" data-task-jump="reports"><strong>Reports</strong><span>Role output</span></button>
+            <button type="button" class="rail-link" data-task-jump="overview"><strong>Overview</strong></button>
+            <button type="button" class="rail-link" data-task-jump="roles"><strong>Roles / tabs</strong></button>
+            <button type="button" class="rail-link" data-task-jump="live"><strong>Live audit</strong></button>
+            <button type="button" class="rail-link" data-task-jump="timeline"><strong>Timeline</strong></button>
+            <button type="button" class="rail-link" data-task-jump="reports"><strong>Reports</strong></button>
           </div>
         </nav>
       </div>
@@ -330,6 +328,6 @@
   <datalist id="workflow-task-team-options"></datalist>
 
   <div id="toast" class="toast" hidden role="status"></div>
-  <script type="module" src="/assets/app.js?v=20260907-live-audit-nav-v3"></script>
+  <script type="module" src="/assets/app.js?v=20260908-live-audit-nav-v4"></script>
 </body>
 </html>

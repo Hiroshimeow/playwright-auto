@@ -143,9 +143,28 @@ class RoleController:
         evidence = evidence if isinstance(evidence, Mapping) else {}
         permission = evidence.get("permission_action")
         permission = permission if isinstance(permission, Mapping) else None
+        # Emit only semantic Listen changes; raw chunks stay internal to the page observer.
+        network_response = evidence.get("response")
+        listen_values: dict[str, Any] = {}
+        if evidence.get("status"):
+            listen_values["status"] = str(evidence["status"])
+        if isinstance(network_response, Mapping):
+            listen_values["response_message_id"] = str(network_response.get("message_id") or network_response.get("id") or "")
+            listen_values["response_turn_id"] = str(network_response.get("turn_id") or "")
+            listen_values["response_text_length"] = len(str(network_response.get("text") or ""))
+        if permission is not None:
+            listen_values["permission_target"] = str(permission.get("target_message_id") or "")
+        listen_signature = "|".join(f"{key}={value}" for key, value in sorted(listen_values.items()))
+        if listen_values and str(wait.get("live_listen_signature") or "") != listen_signature:
+            wait["live_listen_signature"] = listen_signature
+            append_live_event(
+                "LISTEN", "network_signal", page_url=str(snapshot.url), page_id=acquired.page_id,
+                role=str(hop.get("physical_role") or hop.get("target_role")),
+                task_id=str(state["task_id"]), team=str(state["team"]),
+                request_id=str(hop.get("request_id") or ""), values=listen_values,
+            )
         # Live network final messages may precede DOM rendering. History/G2 never
         # supplies this slot, and missing network evidence never gates DOM.
-        network_response = evidence.get("response")
         if phase == "waiting" and network_response and not response.current_assistant(snapshot.messages, getattr(receipt, "baseline", None)):
             from dataclasses import replace
             candidate = MessageSnapshot.from_dict(network_response)

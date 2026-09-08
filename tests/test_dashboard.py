@@ -458,7 +458,7 @@ def test_notify_frontend_contract_reuses_secondary_report_path_and_preserves_his
     assert 'if (current.drawer === "history") renderHistory(roots.secondaryContent, current);' in app
     assert 'if (current.drawer === "notify") renderNotify(roots.secondaryContent, current);' in app
     assert 'if (view === "notify") delete roots.secondaryContent.dataset.secondaryView;' in app
-    assert '/assets/app.js?v=20260907-live-audit-nav-v3' in html
+    assert '/assets/app.js?v=20260908-live-audit-nav-v4' in html
     assert './views/notify.js?v=20260906-listen-controls-v1' in app
     assert 'data-notify-task-id' in notify
     assert 'workflowReportModel(detail, detail.active_role)' in notify
@@ -680,7 +680,7 @@ def test_dashboard_exposes_role_urls_live_audit_and_page_level_quick_navigation(
     assert '.page-rail {' in css
     assert '.live-event-list {' in css
     assert '.role-url-actions {' in css
-    assert 'grid-template-columns: 184px minmax(0, 1fr);' in css
+    assert 'grid-template-columns: 96px minmax(0, 1fr);' in css
     assert '.task-workspace {\n  display: block;' in css
     assert 'const inputSection = el("details", null, "role-input-section role-input-disclosure")' in detail
     assert 'inputSection.dataset.disclosureKey = `role-input-${inputRole}`' in detail
@@ -693,6 +693,8 @@ def test_dashboard_exposes_role_urls_live_audit_and_page_level_quick_navigation(
     assert 'label: "not allocated"' in detail
     assert '"No tab allocated"' in detail
     assert 'DOM = observed page state' in detail
+    assert 'sourceCounts[source]' in detail
+    assert '<strong>Live audit</strong><span>' not in html
     assert 'details.append(el("summary", "Details"))' in detail
     responsive = css.split("@media (max-width: 920px)", 1)[1].split("@media (max-width: 720px)", 1)[0]
     assert "display: block;" in responsive
