@@ -78,6 +78,7 @@ from .cdpa_safety import sanitize_exception, sanitize_text
 from .cdpa_routes import (
     InlineReportMaterializationError,
     RouteContractError,
+    RouteDecision,
     expected_report_relative,
     materialize_inline_report,
     parse_role_response,
@@ -3278,6 +3279,23 @@ class CDPAWorker:
                 allowed_routes=allowed_routes,
             )
             included = False
+        elif hop.get("kind") == "report_repair":
+            locked_route = str(hop.get("locked_route") or "").strip().upper()
+            locked_handoff = str(hop.get("locked_handoff") or "").strip()
+            if locked_handoff != expected:
+                raise RouteContractError(
+                    "report repair handoff no longer matches the expected role report"
+                )
+            prompt = self.prompts.report_repair(
+                task_id=str(state["task_id"]),
+                team=str(state["team"]),
+                physical_role=str(hop["physical_role"]),
+                turn=int(hop["turn"]),
+                route=locked_route,
+                handoff=locked_handoff,
+                validation_error=str(hop["validation_error"]),
+            )
+            included = False
         else:
             built = self.prompts.build(
                 task_title=str(state.get("task_title") or state["task_text"]).splitlines()[0],
@@ -3291,6 +3309,7 @@ class CDPAWorker:
                 source_physical_role=source_physical,
                 handoff=str(hop["handoff"]),
                 goal=task_goal_for_hop(state, int(hop["hop_id"])),
+                expected_report_path=expected,
                 constructor_sent_generation=role_record.get(
                     "constructor_sent_generation"
                 ),
@@ -3664,6 +3683,11 @@ class CDPAWorker:
             text = sanitize_text(response.text, max_chars=200_000).strip()
             if not text:
                 raise ValueError("independent response must not be empty")
+            return
+        if str(hop.get("kind") or "") == "report_repair":
+            text = sanitize_text(response.text, max_chars=200_000).strip()
+            if not text:
+                raise ValueError("report repair response must not be empty")
             return
         role = str(hop["target_role"])
         parse_role_response(
@@ -4145,6 +4169,55 @@ class CDPAWorker:
         )
         return {"old_hop_id": old_hop_id, "new_hop_id": int(new_hop["hop_id"])}
 
+    def _repair_report(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        error: Exception,
+        *,
+        decision: RouteDecision,
+    ) -> None:
+        self._complete_request_response(hop)
+        validation_error = sanitize_text(error, max_chars=2000)
+        hop["validation_error"] = validation_error
+        hop["validation_route"] = decision.route
+        hop["validation_handoff"] = decision.handoff
+        attempt = int(hop.get("repair_attempt") or 0) + 1
+        if attempt > self.config.route_repair_attempts:
+            self._block(
+                state,
+                f"report repair exhausted: {error}",
+                code="report_validation_exhausted",
+                retryable=True,
+            )
+            return
+        role = str(hop["target_role"])
+        hop["state"] = "routed"
+        hop["route"] = decision.route
+        hop["timestamps"]["routed_at"] = utc_now()
+        state.setdefault("route_timeline", []).append(
+            {
+                "at": utc_now(),
+                "hop_id": hop["hop_id"],
+                "source_role": role,
+                "route": decision.route,
+                "kind": "report_repair",
+                "error": validation_error,
+            }
+        )
+        repair = self._append_hop(
+            state,
+            source_role=role,
+            target_role=role,
+            handoff="report repair",
+            kind="report_repair",
+            turn=int(hop["turn"]),
+            repair_attempt=attempt,
+            validation_error=validation_error,
+        )
+        repair["locked_route"] = decision.route
+        repair["locked_handoff"] = decision.handoff
+
     def _repair_route(
         self,
         state: dict[str, Any],
@@ -4263,6 +4336,7 @@ class CDPAWorker:
             if not isinstance(source_hop, Mapping) or str(source_hop.get("kind") or "") not in {
                 "task",
                 "handoff",
+                "report_repair",
             }:
                 continue
             source_role = str(event.get("source_role") or "").strip().upper()
@@ -4304,55 +4378,68 @@ class CDPAWorker:
         response_mode = _report_mode(state)
         legacy_inline = response_mode == "inline"
         decision = None
+        inline_report = None
         try:
-            parsed = parse_role_response(
-                str(hop.get("response") or ""),
-                source_role=role,
-                report_mode=response_mode,
-                allowed_routes=tuple(task_workflow_definitions(state, self.config))
-                + ("PAUSE", "DONE"),
-            )
-            decision = parsed.decision
+            if str(hop.get("kind") or "") == "report_repair":
+                locked_route = str(hop.get("locked_route") or "").strip().upper()
+                locked_handoff = str(hop.get("locked_handoff") or "").strip()
+                if not locked_route or not locked_handoff:
+                    raise RouteContractError("report repair is missing its locked route decision")
+                decision = RouteDecision(route=locked_route, handoff=locked_handoff)
+            else:
+                parsed = parse_role_response(
+                    str(hop.get("response") or ""),
+                    source_role=role,
+                    report_mode=response_mode,
+                    allowed_routes=tuple(task_workflow_definitions(state, self.config))
+                    + ("PAUSE", "DONE"),
+                )
+                decision = parsed.decision
+                inline_report = parsed.inline_report
             if decision.route not in {"PAUSE", "DONE"} and decision.route not in state["roles"]:
                 raise RouteContractError(
                     f"route {decision.route!r} is not selected for this task"
                 )
-            if parsed.inline_report is None:
+            if inline_report is None:
                 expected_handoff = str(hop.get("expected_report_path") or "").strip()
                 if decision.handoff != expected_handoff:
                     raise RouteContractError(
                         "report handoff must exactly match the expected role report"
                     )
                 routed_handoff = decision.handoff
-                if remote_repository_from_task(str(state.get("task_text") or "")) is None:
-                    report_repository, report_plans_root = _workflow_report_roots(
-                        self.config, state
-                    )
-                    evidence = validate_file_report(
-                        decision.handoff,
-                        repository_root=report_repository,
-                        plans_root=report_plans_root,
-                        team=str(state["team"]),
-                        physical_role=str(hop["physical_role"]),
-                        turn=int(hop["turn"]),
-                        task_id=str(state["task_id"]),
-                    )
-                    report_path = decision.handoff
-                    report_sha256 = evidence.sha256
-                    report_size = evidence.size
-                else:
-                    report_path, report_sha256, report_size = self._validated_remote_report_mirror(
-                        state,
-                        hop,
-                        decision_handoff=decision.handoff,
-                    )
+                try:
+                    if remote_repository_from_task(str(state.get("task_text") or "")) is None:
+                        report_repository, report_plans_root = _workflow_report_roots(
+                            self.config, state
+                        )
+                        evidence = validate_file_report(
+                            decision.handoff,
+                            repository_root=report_repository,
+                            plans_root=report_plans_root,
+                            team=str(state["team"]),
+                            physical_role=str(hop["physical_role"]),
+                            turn=int(hop["turn"]),
+                            task_id=str(state["task_id"]),
+                        )
+                        report_path = decision.handoff
+                        report_sha256 = evidence.sha256
+                        report_size = evidence.size
+                    else:
+                        report_path, report_sha256, report_size = self._validated_remote_report_mirror(
+                            state,
+                            hop,
+                            decision_handoff=decision.handoff,
+                        )
+                except (RouteContractError, OSError) as exc:
+                    self._repair_report(state, hop, exc, decision=decision)
+                    return
             else:
                 report_repository, report_plans_root = _workflow_report_roots(
                     self.config, state
                 )
                 try:
                     evidence = materialize_inline_report(
-                        parsed.inline_report,
+                        inline_report,
                         expected_report_path=str(hop.get("expected_report_path") or ""),
                         repository_root=report_repository,
                         plans_root=report_plans_root,
@@ -4384,6 +4471,7 @@ class CDPAWorker:
                     options["report_mode"] = "file"
             self._repair_route(state, hop, exc, decision=decision)
             return
+
         if legacy_inline:
             options = state.get("options")
             if not isinstance(options, dict):

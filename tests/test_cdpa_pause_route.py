@@ -102,6 +102,44 @@ def test_pause_is_lifecycle_route_but_not_workflow_role_definition(tmp_path: Pat
             )
 
 
+def test_missing_pause_report_repairs_artifact_without_changing_pause_route(tmp_path: Path):
+    _store, state, worker, _path, source = _prepare_pause_response(
+        tmp_path, task_id="task-pause-report-repair", role="PLAN"
+    )
+    handoff = str(source["expected_report_path"])
+    (tmp_path / handoff).unlink()
+
+    worker._responded(state, source)
+
+    repair = _active_hop(state)
+    assert source["route"] == "PAUSE"
+    assert repair["kind"] == "report_repair"
+    assert repair["locked_route"] == "PAUSE"
+    assert repair["locked_handoff"] == handoff
+    assert state["status"] == "RUNNING"
+
+    asyncio.run(worker._pre_send(state, repair, FakeActions()))
+    report = tmp_path / handoff
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(
+        "# PLAN pause report\n\nPrerequisite: operator provides the external input.\n",
+        encoding="utf-8",
+    )
+    # A report-repair turn may not revise an already accepted lifecycle decision.
+    repair["response"] = json.dumps({"route": "PLAN", "handoff": handoff})
+    repair["state"] = "responded"
+
+    worker._responded(state, repair)
+
+    assert repair["route"] == "PAUSE"
+    assert state["status"] == "PAUSED"
+    assert state["active_hop_id"] == repair["hop_id"]
+    assert not any(
+        item.get("kind") == "handoff" and item.get("target_role") == "PLAN"
+        for item in state["hops"][1:]
+    )
+
+
 def test_invalid_pause_handoff_uses_existing_route_repair(tmp_path: Path):
     _config, _store, state, worker = setup_task(
         tmp_path, task_id="task-invalid-pause-handoff"

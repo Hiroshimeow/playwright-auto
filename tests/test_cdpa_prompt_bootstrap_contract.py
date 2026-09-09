@@ -15,6 +15,9 @@ PACKAGED_PROMPTS = DEFAULT_CONFIG_PATH.parent / "prompts" / "cdpa"
 
 def _generation_zero_prompt(config, *, workspace: Path, role: str) -> str:
     allowed_routes = tuple(dict.fromkeys(("PLAN", role, "PAUSE", "DONE")))
+    expected_report_path = (
+        f".plan/prompt-contract/prompt-contract-{role.lower()}_turn1_task-prompt-contract.md"
+    )
     built = PromptBuilder(config).build(
         task_title="prompt contract",
         task_id="task-prompt-contract",
@@ -27,13 +30,15 @@ def _generation_zero_prompt(config, *, workspace: Path, role: str) -> str:
         source_physical_role=None,
         handoff="prompt contract handoff",
         goal="prompt contract goal",
+        expected_report_path=expected_report_path,
         constructor_sent_generation=None,
         conversation_generation=0,
     )
     assert built.constructor_included is True
     route_contract = "|".join(allowed_routes)
     assert f'"route":"{route_contract}"' in built.text
-    assert PromptBuilder(config).naming_rule() in built.text
+    assert f'"handoff":"{expected_report_path}"' in built.text
+    assert f"Write the complete non-empty role report to exactly: `{expected_report_path}`" in built.text
     return built.text
 
 
@@ -79,6 +84,38 @@ def test_agents_documents_goal_closure_and_explicit_bootstrap_selection():
     assert "CDPA host/browser" in agents
     assert "--bootstrap <id>" in agents
     assert "--fresh" in agents
+
+
+@pytest.mark.parametrize("prompt_root", (LOCAL_PROMPTS, PACKAGED_PROMPTS))
+def test_runtime_prompt_assets_use_concise_functional_role_contract(prompt_root: Path):
+    prompts = {
+        role: (prompt_root / f"{role}.md").read_text(encoding="utf-8")
+        for role in CDPA_ROLES
+    }
+
+    assert "workflow decision-maker" in prompts["PLAN"]
+    assert "production engineer" in prompts["DEV"]
+    assert "high-precision reviewer" in prompts["REVIEW"]
+    assert "verification engineer" in prompts["TEST"]
+    assert "operational auditor" in prompts["AUDIT"]
+    combined = "\n".join(prompts.values()).lower()
+    assert "years experience" not in combined
+    assert "world-class" not in combined
+    assert max(len(text.splitlines()) for text in prompts.values()) <= 24
+
+
+@pytest.mark.parametrize("prompt_root", (LOCAL_PROMPTS, PACKAGED_PROMPTS))
+def test_final_plan_done_report_contract_is_status_first_vietnamese(prompt_root: Path):
+    plan = (prompt_root / "PLAN.md").read_text(encoding="utf-8")
+
+    assert "# DONE — <task>" in plan
+    assert "**Kết quả:** ✅ PASS / ❌ FAIL / ⏸ PAUSED" in plan
+    assert "**Vận hành:** ✅ OK / ⚠️ DEGRADED / ❓ NOT VERIFIED" in plan
+    assert "**Rủi ro:** 🟢 NONE/LOW / 🟡 MEDIUM / 🔴 HIGH" in plan
+    assert "**Kiểm chứng:**" in plan
+    assert "**Cần làm tiếp:**" in plan
+    assert "PASS WITH SIMPLIFICATION" in plan
+    assert "must not" in plan
 
 
 @pytest.mark.parametrize("prompt_root", (LOCAL_PROMPTS, PACKAGED_PROMPTS))

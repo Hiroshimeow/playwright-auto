@@ -67,7 +67,13 @@ def write_config(root: Path) -> Path:
         encoding="utf-8",
     )
     (root / "prompts" / "cdpa" / "RESPONSE_GUIDE.md").write_text(
-        "Return only the strict route JSON.\nReport: .plan/<team>/<physical-role>_turn<N>_<task-id>.md", encoding="utf-8"
+        "Work first. Write the complete non-empty role report to exactly: "
+        "`.plan/<team>/<physical-role>_turn<N>_<task-id>.md`. "
+        "Ensure the write has completed before returning the route decision.\n"
+        "Return only the strict route JSON.\n"
+        '{"route":"PLAN|DEV|REVIEW|TEST|AUDIT|PAUSE|DONE",'
+        '"handoff":".plan/<team>/<physical-role>_turn<N>_<task-id>.md"}',
+        encoding="utf-8",
     )
     return path
 

@@ -302,7 +302,10 @@ def test_remote_report_mirror_fails_closed_when_central_hash_or_size_changes(tmp
     worker._responded(state, hop)
 
     assert hop["state"] == "routed"
-    assert hop["route"] == "PLAN"
+    assert hop["route"] == "DEV"
     assert not state.get("reports")
     assert "mirror" in str(hop.get("validation_error") or "").lower()
-    assert _active_hop(state)["kind"] == "route_repair"
+    repair = _active_hop(state)
+    assert repair["kind"] == "report_repair"
+    assert repair["locked_route"] == "DEV"
+    assert repair["locked_handoff"] == hop["expected_report_path"]

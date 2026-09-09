@@ -360,7 +360,7 @@ def test_reused_conversation_schedules_against_each_current_repository(tmp_path:
     ]
 
 
-def test_schedule_filters_missing_receipt_and_route_repair_and_is_nonblocking(tmp_path: Path, monkeypatch):
+def test_schedule_filters_missing_receipt_and_route_repair_but_counts_report_repair(tmp_path: Path, monkeypatch):
     _store, worker = make_worker(tmp_path)
     repo = str((tmp_path / "repo").resolve())
     started = []
@@ -377,11 +377,13 @@ def test_schedule_filters_missing_receipt_and_route_repair_and_is_nonblocking(tm
         repair = {"repository": repo, "hops": [{"hop_id": 2, "state": "routed", "kind": "route_repair", "receipt": {"conversation_id": "c2"}}]}
         worker._schedule_repository_project(repair, 2, object())
         assert not worker._repository_project_tasks
-        valid = {"repository": repo, "hops": [{"hop_id": 3, "state": "routed", "kind": "normal", "receipt": {"conversation_id": "c3"}}]}
-        worker._schedule_repository_project(valid, 3, object())
+        report_repair = {"repository": repo, "hops": [{"hop_id": 3, "state": "routed", "kind": "report_repair", "receipt": {"conversation_id": "c-report"}}]}
+        worker._schedule_repository_project(report_repair, 3, object())
+        valid = {"repository": repo, "hops": [{"hop_id": 4, "state": "routed", "kind": "normal", "receipt": {"conversation_id": "c3"}}]}
+        worker._schedule_repository_project(valid, 4, object())
         await asyncio.sleep(0)
-        assert started == [(repo, "c3")]
-        assert len(worker._repository_project_tasks) == 1
+        assert started == [(repo, "c-report"), (repo, "c3")]
+        assert len(worker._repository_project_tasks) == 2
         gate.set()
         await asyncio.gather(*tuple(worker._repository_project_tasks))
         await asyncio.sleep(0)

@@ -625,8 +625,9 @@ def test_pre_send_lazily_acquires_only_plan_and_persists_constructor(tmp_path: P
     assert hop["state"] == "sending"
     assert hop["expected_report_path"] == ".plan/alpha/alpha-plan_turn1_task-a.md"
     assert "Constructor for PLAN" in hop["prompt"]
-    assert ".plan/alpha/alpha-plan_turn1_task-a.md" not in hop["prompt"]
-    assert ".plan/<team>/<physical-role>_turn<N>_<task-id>.md" in hop["prompt"]
+    assert "Write the complete non-empty role report to exactly: `.plan/alpha/alpha-plan_turn1_task-a.md`" in hop["prompt"]
+    assert '"handoff":".plan/alpha/alpha-plan_turn1_task-a.md"' in hop["prompt"]
+    assert ".plan/<team>/<physical-role>_turn<N>_<task-id>.md" not in hop["prompt"]
     assert hop["prompt"].startswith("alpha · role: plan\n{")
     envelope, _ = json.JSONDecoder().raw_decode(
         hop["prompt"].removeprefix("alpha · role: plan\n")
@@ -1292,7 +1293,6 @@ def test_normal_cdpa_send_keeps_transport_identity_out_of_actual_payload(tmp_pat
         hop["request_id"],
         hop["ledger_path"],
         state["manifest_path"],
-        hop["expected_report_path"],
         "controller_id",
         "run_id",
         "prompt_sha256",
@@ -1391,7 +1391,7 @@ def test_reused_cdpa_role_persistent_empty_history_blocks_retryably_preboundary(
     assert client.send_calls == []
 
 
-def test_missing_local_file_report_enters_route_repair_without_advancing(tmp_path: Path):
+def test_missing_local_file_report_preserves_route_and_queues_report_repair(tmp_path: Path):
     _store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-missing-local-report"
     )
@@ -1402,8 +1402,11 @@ def test_missing_local_file_report_enters_route_repair_without_advancing(tmp_pat
     worker._responded(state, hop)
 
     repair = _active_hop(state)
-    assert repair["kind"] == "route_repair"
+    assert hop["route"] == "DEV"
+    assert repair["kind"] == "report_repair"
     assert repair["target_role"] == "PLAN"
+    assert repair["locked_route"] == "DEV"
+    assert repair["locked_handoff"] == handoff
     assert "report" in repair["validation_error"].lower()
     assert "missing" in repair["validation_error"].lower()
     assert state["reports"] == []
@@ -1412,8 +1415,25 @@ def test_missing_local_file_report_enters_route_repair_without_advancing(tmp_pat
         for item in state["hops"]
     )
 
+    asyncio.run(worker._pre_send(state, repair, FakeActions()))
+    assert repair["prompt"].startswith("CDPA_REPORT_REPAIR")
+    assert handoff in repair["prompt"]
+    assert '"route":"DEV"' in repair["prompt"]
+    assert "CDPA_FORMAT_REPAIR" not in repair["prompt"]
 
-def test_empty_local_file_report_enters_route_repair_without_advancing(tmp_path: Path):
+    report = tmp_path / handoff
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("# PLAN report\n\nRecovered artifact.\n", encoding="utf-8")
+    repair["response"] = json.dumps({"route": "REVIEW", "handoff": handoff})
+    repair["state"] = "responded"
+    worker._responded(state, repair)
+
+    assert repair["route"] == "DEV"
+    assert _active_hop(state)["target_role"] == "DEV"
+    assert _active_hop(state)["kind"] == "handoff"
+
+
+def test_empty_local_file_report_enters_report_repair_without_advancing(tmp_path: Path):
     _store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-empty-local-report"
     )
@@ -1427,7 +1447,8 @@ def test_empty_local_file_report_enters_route_repair_without_advancing(tmp_path:
     worker._responded(state, hop)
 
     repair = _active_hop(state)
-    assert repair["kind"] == "route_repair"
+    assert repair["kind"] == "report_repair"
+    assert repair["locked_route"] == "DEV"
     assert "report" in repair["validation_error"].lower()
     assert "empty" in repair["validation_error"].lower()
     assert state["reports"] == []
@@ -1481,7 +1502,7 @@ def test_mismatched_local_file_report_path_enters_route_repair(tmp_path: Path):
     assert state["reports"] == []
 
 
-def test_symlink_local_file_report_enters_route_repair(tmp_path: Path):
+def test_symlink_local_file_report_enters_report_repair(tmp_path: Path):
     _store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-symlink-local-report"
     )
@@ -1497,7 +1518,8 @@ def test_symlink_local_file_report_enters_route_repair(tmp_path: Path):
     worker._responded(state, hop)
 
     repair = _active_hop(state)
-    assert repair["kind"] == "route_repair"
+    assert repair["kind"] == "report_repair"
+    assert repair["locked_route"] == "DEV"
     assert "symlink" in repair["validation_error"].lower()
     assert state["reports"] == []
 
@@ -2808,7 +2830,8 @@ def test_legacy_inline_pre_send_switches_to_file_before_prompt(
     asyncio.run(worker._pre_send(state, hop, FakeActions()))
 
     assert state["options"]["report_mode"] == "file"
-    assert "Report: .plan/<team>/<physical-role>_turn<N>_<task-id>.md" in hop["prompt"]
+    assert "Write the complete non-empty role report to exactly: `.plan/alpha/alpha-plan_turn1_task-legacy-pre-send.md`" in hop["prompt"]
+    assert '"handoff":".plan/alpha/alpha-plan_turn1_task-legacy-pre-send.md"' in hop["prompt"]
     assert '"handoff":"INLINE"' not in hop["prompt"]
     assert hop["expected_report_path"] == ".plan/alpha/alpha-plan_turn1_task-legacy-pre-send.md"
     persisted = worker._persist_transport_result(path, baseline, state)
@@ -5278,6 +5301,29 @@ def test_route_repair_artifacts_neither_count_nor_reset_self_route_streak(tmp_pa
     third_normal = _accept_self_route_guard_decision(worker, state, "PLAN")
     assert state["status"] == "BLOCKED"
     assert state["active_hop_id"] == third_normal["hop_id"]
+
+
+def test_successful_report_repair_counts_locked_self_route_exactly_once(tmp_path: Path):
+    _, _, state, worker = setup_task(tmp_path, task_id="task-self-route-report-repair")
+    state["hops"] = [
+        {"hop_id": 1, "kind": "handoff"},
+        {"hop_id": 2, "kind": "report_repair"},
+    ]
+    state["route_timeline"] = [
+        {"hop_id": 1, "source_role": "DEV", "route": "DEV"},
+        {
+            "hop_id": 1,
+            "source_role": "DEV",
+            "route": "DEV",
+            "kind": "report_repair",
+        },
+        {"hop_id": 2, "source_role": "DEV", "route": "DEV"},
+    ]
+
+    assert worker._consecutive_self_route_streak(state) == ("DEV", 2)
+
+    state["route_timeline"] = state["route_timeline"][1:]
+    assert worker._consecutive_self_route_streak(state) == ("DEV", 1)
 
 
 def test_goal_revision_resets_self_route_streak_at_applies_from_hop_boundary(tmp_path: Path):
