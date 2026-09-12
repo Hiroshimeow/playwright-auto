@@ -9,6 +9,7 @@ import json
 import os
 import random
 import re
+import subprocess
 import sys
 import time
 from dataclasses import replace
@@ -529,6 +530,203 @@ class CDPAWorker:
                 hop["conversation_url"] = None
         else:
             record["browser_endpoint_id"] = endpoint_id
+        return True
+
+    @staticmethod
+    def _bounded_git_evidence(repository: object) -> dict[str, str | None]:
+        root = Path(str(repository or "")).expanduser().resolve()
+        result: dict[str, str | None] = {"git_status": None, "git_diff_stat": None}
+        for key, args in (
+            ("git_status", ("status", "--short")),
+            ("git_diff_stat", ("diff", "--stat")),
+        ):
+            try:
+                completed = subprocess.run(
+                    ["git", "-C", str(root), *args],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if completed.returncode == 0:
+                result[key] = completed.stdout.strip()[:8000]
+        return result
+
+    def _build_execution_recovery_snapshot(
+        self,
+        state: Mapping[str, Any],
+        hop: Mapping[str, Any],
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        request_id = str(hop.get("request_id") or "")
+        ledger_status = None
+        accepted_at = None
+        attempts = 0
+        response = None
+        ledger_path = str(hop.get("ledger_path") or "").strip()
+        if request_id and ledger_path:
+            try:
+                record = RequestLedger(ledger_path).peek(request_id)
+            except Exception:
+                record = None
+            if record is not None:
+                ledger_status = record.status.value
+                accepted_at = record.accepted_at
+                attempts = int(record.attempts or 0)
+                response = dict(record.response) if isinstance(record.response, Mapping) else None
+        receipt = hop.get("receipt") if isinstance(hop.get("receipt"), Mapping) else None
+        crossed = bool(
+            receipt
+            or attempts > 0
+            or accepted_at is not None
+            or ledger_status in {"sending", "sent", "completed"}
+        )
+        role = str(hop.get("target_role") or state.get("active_role") or "").upper()
+        role_record = (state.get("roles") or {}).get(role)
+        endpoint_id = (
+            str(role_record.get("browser_endpoint_id") or "").strip()
+            if isinstance(role_record, Mapping)
+            else ""
+        ) or None
+        reports = [
+            {
+                key: item.get(key)
+                for key in ("path", "role", "turn", "sha256", "size", "created_at")
+                if key in item
+            }
+            for item in (state.get("reports") or [])[-12:]
+            if isinstance(item, Mapping)
+        ]
+        repository = str(state.get("repository") or "")
+        return {
+            "schema_version": 1,
+            "reason": sanitize_text(reason, max_chars=1000),
+            "task": {
+                "task_id": str(state.get("task_id") or ""),
+                "team": str(state.get("team") or ""),
+                "goal": str(state.get("task_text") or ""),
+                "conversation_mode": str(state.get("conversation_mode") or "persistent"),
+            },
+            "execution": {
+                "role": role,
+                "physical_role": str(hop.get("physical_role") or ""),
+                "hop_id": hop.get("hop_id"),
+                "turn": hop.get("turn"),
+                "request_id": request_id,
+                "endpoint_id": endpoint_id,
+                "hop_state": str(hop.get("state") or ""),
+                "handoff": str(hop.get("handoff") or ""),
+            },
+            "send_provenance": {
+                "classification": "accepted_or_ambiguous" if crossed else "pre_send",
+                "ledger_status": ledger_status,
+                "attempts": attempts,
+                "accepted_at": accepted_at,
+                "receipt": copy.deepcopy(receipt),
+            },
+            "workspace": {
+                "repository": str(Path(repository).expanduser().resolve()) if repository else "",
+                **self._bounded_git_evidence(repository),
+            },
+            "reports": reports,
+            "last_progress": {
+                "response": response,
+                "hop_response": str(hop.get("response") or "")[:8000] or None,
+                "errors": [str(item)[:1000] for item in (hop.get("errors") or [])[-5:]],
+            },
+        }
+
+    def _consume_completed_durable_response(
+        self, state: dict[str, Any], hop: dict[str, Any]
+    ) -> bool:
+        request_id = str(hop.get("request_id") or "").strip()
+        ledger_path = str(hop.get("ledger_path") or "").strip()
+        if not request_id or not ledger_path:
+            return False
+        try:
+            record = RequestLedger(ledger_path).peek(request_id)
+        except Exception:
+            return False
+        if (
+            record is None
+            or record.status is not RequestStatus.COMPLETED
+            or not isinstance(record.response, Mapping)
+        ):
+            return False
+        response = MessageSnapshot.from_dict(record.response)
+        if response.role != "assistant" or not response.text.strip():
+            return False
+        self._record_response(state, hop, response)
+        self._responded(state, hop)
+        return True
+
+    def _prepare_cross_endpoint_recovery(
+        self,
+        state: dict[str, Any],
+        endpoint_id: str,
+        *,
+        reason: str,
+    ) -> bool:
+        hop = _active_hop(state)
+        if self._consume_completed_durable_response(state, hop):
+            return self._prepare_execution_endpoint(state, endpoint_id)
+        role = str(hop.get("target_role") or state.get("active_role") or "").upper()
+        role_record = state.get("roles", {}).get(role)
+        if not isinstance(role_record, dict):
+            return False
+        if self._execution_can_relocate(state, endpoint_id):
+            return self._prepare_execution_endpoint(state, endpoint_id)
+        snapshot = self._build_execution_recovery_snapshot(state, hop, reason=reason)
+        if snapshot["send_provenance"]["classification"] != "accepted_or_ambiguous":
+            return False
+        old_hop_id = int(hop["hop_id"])
+        original_request_id = str(hop.get("request_id") or "")
+        hop["state"] = "abandoned"
+        hop["abandon_reason"] = sanitize_text(reason, max_chars=1000)
+        hop["execution_recovery"] = {
+            "original_request_id": original_request_id,
+            "target_endpoint_id": endpoint_id,
+            "snapshot": snapshot,
+        }
+        hop.setdefault("timestamps", {})["abandoned_at"] = utc_now()
+        handoff = (
+            "Continue this existing role/task from durable state.\n"
+            "Inspect the existing workspace, reports, checkpoints, Git state, and RequestLedger.\n"
+            "Determine what is already complete and continue only unfinished work.\n"
+            "Do not repeat completed irreversible actions and do not replay the prior accepted prompt.\n\n"
+            "RECOVERY_SNAPSHOT\n"
+            + json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True)
+        )
+        child = self._append_hop(
+            state,
+            source_role=role,
+            target_role=role,
+            handoff=handoff,
+            kind="execution_recovery",
+        )
+        child["recovery_of_request_id"] = original_request_id
+        role_record.update(
+            browser_endpoint_id=endpoint_id,
+            page_id=None,
+            page_url=None,
+            online=False,
+            last_error=None,
+            context_source="execution_recovery",
+        )
+        state.setdefault("route_timeline", []).append(
+            {
+                "at": utc_now(),
+                "hop_id": old_hop_id,
+                "source_role": role,
+                "route": role,
+                "kind": "execution_recovery",
+                "new_hop_id": child["hop_id"],
+                "reason": sanitize_text(reason, max_chars=1000),
+            }
+        )
         return True
 
     def _remember_manifest(self, path: str | Path, state: dict[str, Any]) -> None:
@@ -6393,8 +6591,13 @@ class CDPAWorker:
                         json.dumps(state, ensure_ascii=False, default=str)
                     )
                 if endpoint_id is not None and not self._prepare_execution_endpoint(state, endpoint_id):
-                    state["active_action"] = "waiting_endpoint_recovery"
-                    return state
+                    if not self._prepare_cross_endpoint_recovery(
+                        state,
+                        endpoint_id,
+                        reason="previous endpoint is unavailable for the crossed Send boundary",
+                    ):
+                        state["active_action"] = "waiting_endpoint_recovery"
+                        return state
                 actions = CDPATabActions(browser_context, self.config)
                 if state.get("cleanup", {}).get("state") == "CLEARING":
                     await self._continue_cleanup(state, actions, path)
@@ -8299,14 +8502,6 @@ class CDPAWorker:
                             reservations=reservations,
                         )
                         if selected_endpoint is None:
-                            continue
-                        if (
-                            affinity is not None
-                            and selected_endpoint != affinity
-                            and not self._execution_can_relocate(
-                                state, selected_endpoint
-                            )
-                        ):
                             continue
                         selected_context = contexts.get(selected_endpoint)
                         if selected_context is None:
