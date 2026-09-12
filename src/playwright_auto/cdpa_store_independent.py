@@ -607,7 +607,7 @@ class IndependentAgentStoreMixin:
                 max_cycles=effective_max_cycles,
                 max_cycles_explicit=max_cycles is not None,
                 temporary_chat=effective_temporary_chat,
-                browser_endpoint_id=self.endpoint_id_for(previous) if previous is not None else None,
+                browser_endpoint_id=None,
                 inherited_role=(
                     previous["roles"][INDEPENDENT_ROLE]
                     if previous is not None

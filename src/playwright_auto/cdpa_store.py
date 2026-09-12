@@ -950,8 +950,10 @@ class TaskStore(IndependentAgentStoreMixin):
             record = roles.get(logical)
             if not isinstance(record, Mapping):
                 return f"role record {logical!r} must be an object"
-            if "browser_endpoint_id" in record and record["browser_endpoint_id"] != state.get("browser_endpoint_id"):
-                return f"role record {logical!r} endpoint does not match the task endpoint"
+            if "browser_endpoint_id" in record:
+                endpoint_id = record["browser_endpoint_id"]
+                if not isinstance(endpoint_id, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", endpoint_id) is None:
+                    return f"role record {logical!r} browser_endpoint_id must be a durable endpoint identifier"
             if str(record.get("logical_role") or "").upper() != logical:
                 return f"role record {logical!r} has inconsistent logical_role"
             expected_physical = physical_role(logical, team_base, suffix)
@@ -2875,6 +2877,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 manifests,
             )
             queue_blocked_by: str | None = None
+            endpoint = self.endpoints.resolve(browser_endpoint_id)
             if exact_reuse_team is not None:
                 exact_states = [state for _path, state, _record in exact_loaded]
                 identities = {
@@ -2955,19 +2958,12 @@ class TaskStore(IndependentAgentStoreMixin):
                     )
                     is not None
                 }
-                endpoint = self.endpoints.resolve(browser_endpoint_id)
-                foreign_suffixes = {
-                    reserved
-                    for item in manifests
-                    if self.endpoint_id_for(item) != endpoint["endpoint_id"]
-                    and (reserved := self._team_suffix_reservation(base, str(item.get("team") or ""))) is not None
-                }
                 team, suffix = allocate_team(
                     base,
                     [*manifests, *catalog_reservations, *filesystem_reservations],
                     reserved_suffixes=(
                         *reserved_team_suffixes,
-                        *sorted(inferred_suffixes | foreign_suffixes),
+                        *sorted(inferred_suffixes),
                     ),
                 )
                 terminal_candidates = sorted(
@@ -2976,7 +2972,6 @@ class TaskStore(IndependentAgentStoreMixin):
                         for item in manifests
                         if str(item.get("status") or "").upper() in TERMINAL
                         and int(item.get("team_suffix") or 1) == suffix
-                        and self.endpoint_id_for(item) == endpoint["endpoint_id"]
                     ),
                     key=lambda item: str(
                         item.get("completed_at")
@@ -2997,14 +2992,6 @@ class TaskStore(IndependentAgentStoreMixin):
                 )
             if set(normalized_new) - set(workflow_roles):
                 raise ValueError("new_roles must be selected workflow roles")
-            if exact_reuse_team is not None:
-                assigned = {self.endpoint_id_for(item) for item in exact_states}
-                if len(assigned) != 1:
-                    raise ValueError("exact team has inconsistent endpoint assignment")
-                inherited_endpoint_id = assigned.pop()
-                if browser_endpoint_id is not None and self.endpoints.resolve(browser_endpoint_id)["endpoint_id"] != inherited_endpoint_id:
-                    raise ValueError("exact team endpoint is locked to its original browser")
-                endpoint = self.endpoints.resolve(inherited_endpoint_id)
             selected_mode = conversation_mode or ("temporary" if temporary or endpoint["temporary_default"] else "persistent")
             workflow_agent_snapshot = self.workflow_agents.resolve(workflow_roles)
             title_slug = slugify(text)

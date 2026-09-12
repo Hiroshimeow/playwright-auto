@@ -16,14 +16,20 @@ def stores(tmp_path):
     return TaskStore(config), BrowserEndpointRegistry(config)
 
 
-def test_task_snapshots_endpoint_and_all_roles(tmp_path):
+def test_task_snapshots_initial_endpoint_affinity_but_role_placement_can_move(tmp_path):
     store, endpoints = stores(tmp_path)
     original = endpoints.resolve()
     second = endpoints.add("9202")
     task = store.create_task("First task", task_id="first", requested_team="alpha")
     endpoints.update(second["endpoint_id"], is_default=True)
+
     assert store.load(task["manifest_path"])["browser_endpoint_id"] == original["endpoint_id"]
-    assert {role["browser_endpoint_id"] for role in task["roles"].values()} == {original["endpoint_id"]}
+    moved = store.update(
+        task["manifest_path"],
+        lambda state: state["roles"]["PLAN"].update(browser_endpoint_id=second["endpoint_id"]),
+    )
+    assert moved["roles"]["PLAN"]["browser_endpoint_id"] == second["endpoint_id"]
+    assert moved["browser_endpoint_id"] == original["endpoint_id"]
     later = store.create_task("Second task", task_id="second")
     assert later["browser_endpoint_id"] == second["endpoint_id"]
 
@@ -37,15 +43,18 @@ def test_explicit_browser_selection_accepts_registry_shorthand(tmp_path):
         store.create_task("Unknown browser", browser_endpoint_id="9302")
 
 
-def test_exact_team_inherits_endpoint_not_current_default(tmp_path):
+def test_exact_team_new_work_can_choose_a_different_endpoint(tmp_path):
     store, endpoints = stores(tmp_path)
     first = store.create_task("First task", task_id="first", requested_team="alpha")
     second = endpoints.add("9202", is_default=True)
-    queued = store.create_task("Next task", task_id="next", reuse_team=first["team"])
-    assert queued["browser_endpoint_id"] == first["browser_endpoint_id"]
+    queued = store.create_task(
+        "Next task",
+        task_id="next",
+        reuse_team=first["team"],
+        browser_endpoint_id=second["endpoint_id"],
+    )
+    assert queued["browser_endpoint_id"] == second["endpoint_id"]
     assert queued["status"] == "WAITING"
-    with pytest.raises(ValueError, match="endpoint.*locked"):
-        store.create_task("Wrong browser", reuse_team=first["team"], browser_endpoint_id=second["endpoint_id"])
 
 
 def test_temporary_is_creation_snapshot_and_temp_only_forces_true(tmp_path):
@@ -63,14 +72,25 @@ def test_temporary_is_creation_snapshot_and_temp_only_forces_true(tmp_path):
         store.create_task("Invalid temp", temporary="false")
 
 
-def test_endpoint_and_mode_cannot_be_reassigned_by_save(tmp_path):
+def test_initial_endpoint_and_mode_are_durable_policy_not_role_placement(tmp_path):
     store, endpoints = stores(tmp_path)
-    task = store.create_task("Immutable assignment")
+    task = store.create_task("Durable policy")
     second = endpoints.add("9202")
-    for field, value in (("browser_endpoint_id", second["endpoint_id"]), ("conversation_mode", "temporary")):
-        with pytest.raises(ValueError, match="immutable"):
-            store.update(task["manifest_path"], lambda state: state.update({field: value}))
-    assert store.load(task["manifest_path"])["browser_endpoint_id"] == task["browser_endpoint_id"]
+    with pytest.raises(ValueError, match="immutable"):
+        store.update(
+            task["manifest_path"],
+            lambda state: state.update(browser_endpoint_id=second["endpoint_id"]),
+        )
+    with pytest.raises(ValueError, match="immutable"):
+        store.update(
+            task["manifest_path"],
+            lambda state: state.update(conversation_mode="temporary"),
+        )
+    moved = store.update(
+        task["manifest_path"],
+        lambda state: state["roles"]["DEV"].update(browser_endpoint_id=second["endpoint_id"]),
+    )
+    assert moved["roles"]["DEV"]["browser_endpoint_id"] == second["endpoint_id"]
 
 
 def test_legacy_manifest_stays_on_original_endpoint_without_read_rewrite(tmp_path):
@@ -90,59 +110,72 @@ def test_legacy_manifest_stays_on_original_endpoint_without_read_rewrite(tmp_pat
     assert path.read_bytes() == before
 
 
-def test_malformed_or_cross_endpoint_role_assignment_fails_validation(tmp_path):
+def test_role_endpoint_requires_a_durable_identifier_but_not_task_equality(tmp_path):
     store, endpoints = stores(tmp_path)
-    task = store.create_task("Role assignment")
+    task = store.create_task("Role placement")
     other = endpoints.add("9202")
-    with pytest.raises(ValueError, match="role.*endpoint"):
-        store.update(task["manifest_path"], lambda state: state["roles"]["PLAN"].update(browser_endpoint_id=other["endpoint_id"]))
-    with pytest.raises(ValueError):
-        store.update(task["manifest_path"], lambda state: state.update(conversation_mode="reopenable-temporary"))
+    moved = store.update(
+        task["manifest_path"],
+        lambda state: state["roles"]["PLAN"].update(browser_endpoint_id=other["endpoint_id"]),
+    )
+    assert moved["roles"]["PLAN"]["browser_endpoint_id"] == other["endpoint_id"]
+    with pytest.raises(ValueError, match="browser_endpoint_id"):
+        store.update(
+            task["manifest_path"],
+            lambda state: state["roles"]["PLAN"].update(browser_endpoint_id="bad endpoint"),
+        )
 
 
-def test_terminal_team_name_is_not_recycled_onto_another_endpoint(tmp_path):
+def test_terminal_team_reuse_metadata_is_not_endpoint_scoped(tmp_path):
     store, endpoints = stores(tmp_path)
     first = store.create_task("First task", requested_team="alpha")
-    store.update(first["manifest_path"], lambda state: state.update(status="DONE", active_role=None, active_hop_id=None))
+    store.update(
+        first["manifest_path"],
+        lambda state: state.update(status="DONE", active_role=None, active_hop_id=None),
+    )
     second = endpoints.add("9202", is_default=True)
     later = store.create_task("Later task", requested_team="alpha")
     assert later["browser_endpoint_id"] == second["endpoint_id"]
-    assert later["team"] != first["team"]
-    assert first["team"] not in later["reusable_teams"]
+    assert first["team"] in later["reusable_teams"]
 
 
-def test_replacement_keeps_the_original_endpoint_and_conversation_mode(tmp_path):
+def test_replacement_keeps_conversation_mode_without_endpoint_ownership_semantics(tmp_path):
     store, endpoints = stores(tmp_path)
     original = store.create_task("Continue existing workspace", temporary=True, requested_team="alpha")
     _stop_task(store, original)
     endpoints.add("9202", is_default=True)
     replacement = store.replace_task_and_rewire(
-        original["task_id"], "Inspect existing reports before continuing.",
-        reuse_team=True, rewire_children=False, incident_id="endpoint-recovery",
+        original["task_id"],
+        "Inspect existing reports before continuing.",
+        reuse_team=True,
+        rewire_children=False,
+        incident_id="endpoint-recovery",
     )["replacement"]
     assert replacement["team"] == original["team"]
-    assert replacement["browser_endpoint_id"] == original["browser_endpoint_id"]
     assert replacement["conversation_mode"] == original["conversation_mode"]
 
 
-def test_independent_generation_keeps_endpoint_and_its_existing_mode_policy(tmp_path):
+def test_independent_generation_uses_current_endpoint_capacity_and_keeps_mode_policy(tmp_path):
     store, endpoints = stores(tmp_path)
-    first = store.create_independent_agent("Browser watcher", system_prompt="Inspect only.", temporary_chat=True)
-    original = endpoints.resolve()["endpoint_id"]
-    assert first["conversation_mode"] == "temporary"
-    assert {role["browser_endpoint_id"] for role in first["roles"].values()} == {original}
-    store.update(first["manifest_path"], lambda state: state.update(status="DONE", active_role=None, active_hop_id=None))
-    endpoints.add("9202", is_default=True)
+    first = store.create_independent_agent(
+        "Browser watcher", system_prompt="Inspect only.", temporary_chat=True
+    )
+    store.update(
+        first["manifest_path"],
+        lambda state: state.update(status="DONE", active_role=None, active_hop_id=None),
+    )
+    second = endpoints.add("9202", is_default=True)
     later = store.create_independent_agent("Browser watcher", system_prompt="Inspect only.")
-    assert later["browser_endpoint_id"] == original
+    assert later["browser_endpoint_id"] == second["endpoint_id"]
+    assert later["conversation_mode"] == "temporary"
     assert later["task_id"] != first["task_id"]
 
 
-def test_new_work_for_draining_team_fails_without_reassignment(tmp_path):
+def test_draining_historical_endpoint_does_not_strand_exact_team(tmp_path):
     store, endpoints = stores(tmp_path)
     task = store.create_task("Draining team", requested_team="alpha")
-    endpoints.add("9202", is_default=True)
+    second = endpoints.add("9202", is_default=True)
     endpoints.remove(task["browser_endpoint_id"], has_nonterminal_tasks=True)
-    with pytest.raises(ValueError, match="draining"):
-        store.create_task("More work", reuse_team=task["team"])
-    assert store.endpoint_id_for(store.load(task["manifest_path"])) == task["browser_endpoint_id"]
+    queued = store.create_task("More work", reuse_team=task["team"])
+    assert queued["browser_endpoint_id"] == second["endpoint_id"]
+    assert queued["status"] == "WAITING"
