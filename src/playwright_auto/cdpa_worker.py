@@ -3539,6 +3539,18 @@ class CDPAWorker:
                     url="https://chatgpt.com/?temporary-chat=true",
                 )
             await self._dismiss_known_rate_limit_on_existing(acquired)
+        elif not isinstance(independent, Mapping) and state.get("conversation_mode") == "temporary":
+            acquired = await actions.locate_owned(state, role)
+            if acquired is None:
+                if self._rate_limit_gate_active(state=state):
+                    state["active_action"] = "rate_limit_cooldown"
+                    return
+                acquired = await actions.fresh_chat(
+                    state,
+                    role,
+                    url="https://chatgpt.com/?temporary-chat=true",
+                )
+            await self._dismiss_known_rate_limit_on_existing(acquired)
         elif (
             isinstance(independent, dict)
             and independent.get("new_chat_next_job") is True
