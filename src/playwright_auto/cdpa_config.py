@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlparse
 
-from .connection import validate_cdp_url
+from .connection import normalize_cdp_endpoint
+from .cdpa_endpoints import endpoint_config_seeds
 
 CDPA_ROLES = ("PLAN", "DEV", "REVIEW", "TEST", "AUDIT")
 DEFAULTS_ROOT = Path(__file__).with_name("cdpa_defaults")
@@ -145,6 +146,7 @@ class CDPAConfig:
     delay_minimum_seconds: float
     delay_maximum_seconds: float
     delay_multipliers: Mapping[str, float]
+    browser_endpoints: tuple[Mapping[str, Any], ...] = ()
 
 
 def load_cdpa_config(
@@ -303,7 +305,8 @@ def load_cdpa_config(
             _positive(runtime.get("browser_inventory_seconds", 5), "runtime.browser_inventory_seconds")
         ),
         repository_allowed_roots=repository_allowed_roots,
-        cdp_url=validate_cdp_url(str(browser.get("cdp_url", "http://127.0.0.1:9222"))),
+        cdp_url=normalize_cdp_endpoint(str(browser.get("cdp_url", "http://127.0.0.1:9222"))),
+        browser_endpoints=endpoint_config_seeds(browser),
         workspace_timeout_seconds=float(_positive(browser.get("workspace_timeout_seconds", 15), "browser.workspace_timeout_seconds")),
         route_repair_attempts=int(_positive(repair.get("max_attempts", 3), "route_repair.max_attempts", integer=True)),
         response_timeout_seconds=float(_positive(response.get("timeout_seconds", 7200), "response.timeout_seconds")),
