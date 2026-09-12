@@ -7,16 +7,6 @@ function serviceChip(name) {
 
 export function renderRuntime(root, state) {
   const runtime = state.runtime || {};
-  const domOnly = root.querySelector("[data-dom-only]");
-  if (domOnly && domOnly.dataset.pending !== "true") {
-    domOnly.checked = runtime.settings?.dom_only === true;
-    domOnly.disabled = Boolean(state.apiError) || typeof runtime.settings?.dom_only !== "boolean";
-    const modeHelp = domOnly.checked
-      ? "DOM-only compatibility / rollback mode."
-      : "Listen + DOM mode with sparse stream_status; no automation full-conversation graph reads.";
-    domOnly.title = modeHelp;
-    if (domOnly.parentElement) domOnly.parentElement.title = modeHelp;
-  }
   const services = [
     ["api", "API", !state.apiError, state.apiError ? "unavailable" : "online"],
     ["worker", "Worker", Boolean(runtime.worker_online), runtime.worker_stale ? "stale" : "online"],

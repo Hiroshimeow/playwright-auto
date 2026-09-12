@@ -356,15 +356,10 @@ def test_frontend_assets_are_local_modular_and_suspend_hidden_polling():
     assert "loadTaskDetail" in app
     assert "loadHistory" in app
     assert "loadTimeline" in app
-    assert 'data-dom-only' in html
-    assert "DOM only" in html
-    assert "runtime.settings?.dom_only" in runtime
-    assert 'dataset.pending !== "true"' in runtime
-    assert '"/api/runtime/settings"' in app
-    assert 'method: "POST"' in app
-    assert "response.data.settings" in app
-    assert "previousDomOnly" in app
-    assert "toast(error.message)" in app
+    assert 'data-dom-only' not in html
+    assert "DOM only" not in html
+    assert "dom_only" not in runtime
+    assert '"/api/runtime/settings"' not in app
 
 
 
@@ -702,11 +697,11 @@ def test_dashboard_exposes_role_urls_live_audit_and_page_level_quick_navigation(
     assert ".rail-task-links { display: flex;" in responsive
 
 
-def test_runtime_dom_only_help_describes_both_true_modes_truthfully():
+def test_runtime_uses_fixed_hybrid_observation_without_mode_help():
     runtime = (ASSET_ROOT / "views" / "runtime.js").read_text(encoding="utf-8")
-    assert "DOM-only compatibility / rollback mode." in runtime
-    assert "Listen + DOM mode with sparse stream_status" in runtime
-    assert "no automation full-conversation graph reads" in runtime
+    assert "dom_only" not in runtime
+    assert "DOM-only" not in runtime
+    assert "serviceChip" in runtime
 
 
 def test_workflow_controls_fail_closed_from_projected_eligibility_with_reason_tooltips():

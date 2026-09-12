@@ -22,11 +22,10 @@ class RoleController:
         self, snapshot: Any, wait: dict[str, Any], *, receipt: Any = None,
         permission: Mapping[str, Any] | None = None,
         validate: Callable[[Any], None] | None = None, phase: str = "waiting",
-        dom_only: bool = False, network_status: str | None = None,
-        now: datetime | None = None,
+        network_status: str | None = None, now: datetime | None = None,
     ) -> Decision:
         ctx = Context(snapshot, wait, self.policy, now or datetime.now(timezone.utc),
-                      permission, phase, dom_only, network_status=network_status)
+                      permission, phase, network_status=network_status)
         wait["manual_draft_present"] = ctx.draft_present
         for handler in (auth.handle, rate_limit.handle, dialog.handle):
             decision = handler(ctx)
@@ -118,21 +117,20 @@ class RoleController:
         client = acquired.client
         wait = hop.setdefault("wait", {})
         receipt = SendReceipt.from_dict(hop["receipt"]) if hop.get("receipt") else None
-        dom_only = worker._dom_only_enabled()
         install = getattr(client, "install_page_observer", None)
         if callable(install):
             await install()
         if snapshot is None:
             wait_for_signal = getattr(client, "wait_for_page_observation", None)
             if wait_ms > 0 and callable(wait_for_signal):
-                await wait_for_signal(timeout_ms=wait_ms, dom_only=dom_only)
+                await wait_for_signal(timeout_ms=wait_ms)
                 wait_ms = 0
             if receipt is not None:
                 snapshot = await client.wait_snapshot(receipt, probe_wait_ms=wait_ms)
             else:
                 snapshot = await client.assert_ownership()
         read = getattr(client, "page_observation", None)
-        evidence = read() if not dom_only and callable(read) else {}
+        evidence = read() if callable(read) else {}
         evidence = evidence if isinstance(evidence, Mapping) else {}
         permission = evidence.get("permission_action")
         permission = permission if isinstance(permission, Mapping) else None
@@ -166,7 +164,7 @@ class RoleController:
         decision = self.decide(
             snapshot, wait, receipt=receipt, permission=permission,
             validate=(lambda candidate: worker._validate_response_candidate(state, hop, candidate)),
-            phase=phase, dom_only=dom_only, network_status=evidence.get("status"),
+            phase=phase, network_status=evidence.get("status"),
         )
         if previous != (decision.action.value, decision.reason):
             append_live_event(
@@ -212,11 +210,11 @@ class RoleController:
             return decision
         raise AssertionError(f"unhandled operational action: {decision.action}")
 
-    async def maintain_history(self, client, wait: dict, *, dom_only: bool) -> Decision:
+    async def maintain_history(self, client, wait: dict) -> Decision:
         # History tabs only auto-Allow; they cannot enqueue work or route old results.
         probe = await client.read_wait_probe()
-        permission = None if dom_only else client.page_observation().get("permission_action")
-        decision = self.decide(probe, wait, permission=permission, phase="history", dom_only=dom_only)
+        permission = client.page_observation().get("permission_action")
+        decision = self.decide(probe, wait, permission=permission, phase="history")
         if decision.action is Action.ALLOW:
             return await self.browser_action(client, probe, wait, permission, decision)
         if decision.action is Action.REFRESH:

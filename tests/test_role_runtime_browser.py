@@ -23,7 +23,6 @@ def environment(client):
     state = {"task_id": "task-1", "team": "team-1", "status": "RUNNING", "active_action": "wait_response"}
     hop = {"receipt": request().to_dict(), "request_id": "task-hop1", "physical_role": "DEV", "target_role": "DEV", "wait": {}}
     worker = SimpleNamespace(
-        _dom_only_enabled=lambda: True,
         _validate_response_candidate=lambda *_: None,
         _queue_format_repair=lambda _state, _hop, _response, error: _state.update(repair=str(error)),
     )
@@ -51,7 +50,6 @@ def test_listen_telemetry_emits_once_per_semantic_signal(monkeypatch):
 
     client = Client()
     state, hop, worker, acquired = environment(client)
-    worker._dom_only_enabled = lambda: False
     controller = RoleController()
     current = snapshot()
 

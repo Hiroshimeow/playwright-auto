@@ -252,24 +252,6 @@ def test_timeout_after_refresh_keeps_waiting_and_rearms_when_stop_and_listener_a
     assert "timeout_status" not in wait
 
 
-def test_dom_only_repair_uses_missing_stop_after_refresh():
-    wait = {
-        "controller_progress_at": (NOW - timedelta(seconds=605)).isoformat(),
-        "controller_state": "IDLE",
-        "timeout_refreshed": True,
-    }
-    assert step(snapshot(), wait, dom_only=True).action is Action.REPAIR
-
-
-def test_dom_only_does_not_treat_missing_listener_as_stream_idle():
-    wait = {
-        "controller_progress_at": (NOW - timedelta(seconds=605)).isoformat(),
-        "controller_state": "STOP",
-        "timeout_refreshed": True,
-    }
-    assert step(snapshot(stop_visible=True), wait, dom_only=True).action is Action.WAIT
-
-
 def test_latest_injected_user_invalidates_old_candidate_without_identity_error():
     current = current_result()
     wait = {}
@@ -286,10 +268,13 @@ def test_history_after_allow_never_refreshes_old_conversation():
         async def read_wait_probe(self):
             return current
 
+        def page_observation(self):
+            return {}
+
         async def refresh(self):
             raise AssertionError("history automation must never refresh")
 
-    result = asyncio.run(RoleController().maintain_history(Client(), wait, dom_only=True))
+    result = asyncio.run(RoleController().maintain_history(Client(), wait))
     assert result.action is Action.WAIT
     assert result.reason == "history_observation"
 

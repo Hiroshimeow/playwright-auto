@@ -32,10 +32,10 @@ def handle(ctx: Context) -> Decision | None:
         return None
     if not ctx.wait.get("timeout_refreshed"):
         return Decision(Action.REFRESH, "response_timeout_recheck")
-    if not ctx.dom_only and not ctx.wait.get("timeout_status_checked"):
+    if not ctx.wait.get("timeout_status_checked"):
         return Decision(Action.STATUS, "response_timeout_diagnostic")
     status = str(ctx.wait.get("timeout_status") or ctx.network_status or "").upper()
-    if not ctx.dom_only and status in {"", "COMPLETE", "COMPLETED"}:
+    if status in {"", "COMPLETE", "COMPLETED"}:
         return Decision(Action.REPAIR, "state_repair")
     if not ctx.active:
         return Decision(Action.REPAIR, "state_repair")

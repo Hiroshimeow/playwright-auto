@@ -431,7 +431,7 @@ def test_board_etag_304_and_worker_offline_last_known_good(tmp_path: Path):
         status, _headers, body = request(server, "GET", "/api/state")
         assert status == 200
         runtime_state = json.loads(body)
-        assert runtime_state["settings"] == {"dom_only": False}
+        assert runtime_state["settings"] == {}
         assert runtime_state["auto_allow"] == {
             "clicks": 1,
             "by_tool": {"mcp-g8": 1},
@@ -443,42 +443,8 @@ def test_board_etag_304_and_worker_offline_last_known_good(tmp_path: Path):
         status, _headers, body = request(
             server, "POST", "/api/runtime/settings", body={"dom_only": True}
         )
-        assert status == 200
-        assert json.loads(body) == {"settings": {"dom_only": True}}
-        status, _headers, body = request(server, "GET", "/api/state")
-        assert status == 200
-        assert json.loads(body)["settings"] == {"dom_only": True}
-
-        status, _headers, body = request(
-            server, "POST", "/api/runtime/settings", body={"dom_only": False}
-        )
-        assert status == 200
-        assert json.loads(body) == {"settings": {"dom_only": False}}
-        status, _headers, body = request(server, "GET", "/api/state")
-        assert status == 200
-        assert json.loads(body)["settings"] == {"dom_only": False}
-
-        for invalid in (
-            {},
-            {"dom_only": True, "extra": False},
-            {"dom_only": 0},
-            {"dom_only": 1},
-            {"dom_only": "true"},
-            {"dom_only": None},
-            {"dom_only": []},
-            {"dom_only": {}},
-        ):
-            status, _headers, body = request(
-                server, "POST", "/api/runtime/settings", body=invalid
-            )
-            assert status == 400
-            assert json.loads(body)["error"]["code"] == "invalid_request"
-
-        status, _headers, body = request(
-            server, "POST", "/api/runtime/settings", body={"dom_only": True}
-        )
-        assert status == 200
-        assert json.loads(body) == {"settings": {"dom_only": True}}
+        assert status == 404
+        assert json.loads(body)["error"]["code"] == "not_found"
         assert db.get_task_version("task-a") == task_version
         assert db.get_board()["generation"] == board_generation
         with db.connection() as connection:
@@ -493,7 +459,7 @@ def test_board_etag_304_and_worker_offline_last_known_good(tmp_path: Path):
         thread.start()
         status, _headers, body = request(server, "GET", "/api/state")
         assert status == 200
-        assert json.loads(body)["settings"] == {"dom_only": True}
+        assert json.loads(body)["settings"] == {}
 
         status, _headers, body = request(
             server, "GET", "/api/tasks", headers={"If-None-Match": etag}

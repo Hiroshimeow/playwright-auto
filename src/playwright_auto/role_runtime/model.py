@@ -43,7 +43,6 @@ class Context:
     now: datetime
     permission: Mapping[str, Any] | None = None
     phase: str = "waiting"
-    dom_only: bool = False
     candidate: Any = None
     validation_error: str | None = None
     candidate_stable: bool = False

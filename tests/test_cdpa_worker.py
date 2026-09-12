@@ -319,7 +319,7 @@ def test_retry_ui_queues_format_repair_without_retry_click(tmp_path: Path):
     assert repair["turn"] == hop["turn"]
 
 
-def test_worker_hot_mode_switch_keeps_listener_attached_in_dom_only(tmp_path: Path):
+def test_worker_passive_listener_remains_attached_across_rearms(tmp_path: Path):
     _config, _store, state, worker = setup_task(
         tmp_path, task_id="task-passive-mode-switch"
     )
@@ -338,11 +338,9 @@ def test_worker_hot_mode_switch_keeps_listener_attached_in_dom_only(tmp_path: Pa
             self.detached += 1
 
     client = Client()
-    worker.runtime_db.put_snapshot("settings", {"dom_only": True})
     worker._arm_passive_request_observer(state, hop, client)
     assert (client.armed, client.detached) == (1, 0)
 
-    worker.runtime_db.put_snapshot("settings", {"dom_only": False})
     worker._arm_passive_request_observer(state, hop, client)
     assert (client.armed, client.detached) == (2, 0)
 
@@ -1363,7 +1361,6 @@ def test_open_tab_recovers_presend_role_offline_and_sends_original_once(
     )
     path = Path(state["manifest_path"])
     worker.runtime_db.ensure_schema()
-    worker.runtime_db.put_snapshot("settings", {"dom_only": True})
     hop = _active_hop(state)
     original_hop_id = hop["hop_id"]
     original_request_id = hop["request_id"]
@@ -4185,77 +4182,6 @@ def test_resume_reconciles_canonical_ledger_before_exact_page_validation(tmp_pat
     assert state["roles"]["PLAN"]["page_url"] == canonical_url
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
 
-    worker.runtime_db.put_snapshot("settings", {"dom_only": True})
-    control = {
-        "control_id": 2,
-        "action": "resume",
-        "role": "PLAN",
-        "status": "recovering",
-        "result": {"before": None},
-    }
-    current_receipt = SendReceipt.from_dict(hop["receipt"])
-    accepted_user = MessageSnapshot(
-        "user",
-        current_receipt.user_message_id or "accepted-user",
-        current_receipt.user_turn_id or "accepted-turn",
-        current_receipt.prompt,
-        (),
-    )
-    snapshot = replace(
-        send_snapshot(
-            messages=(accepted_user,),
-            state=ChatGPTState.RESPONDING,
-            task_id=state["task_id"],
-            team=state["team"],
-        ),
-        stop_visible=True,
-    )
-    client = SimpleNamespace(
-        wait_snapshot=AsyncMock(return_value=snapshot),
-    )
-    acquired = AcquiredRole(
-        client,
-        current_receipt.binding.page_id,
-        canonical_url,
-        False,
-        False,
-    )
-    on_actions = SimpleNamespace(
-        backend_stream_status=AsyncMock(
-            side_effect=AssertionError("DOM-only Resume must not call stream_status")
-        ),
-        backend_conversation=AsyncMock(
-            side_effect=AssertionError("DOM-only Resume must not fetch conversation graph")
-        ),
-        locate_owned=AsyncMock(return_value=acquired),
-        reopen=AsyncMock(
-            side_effect=AssertionError("exact owned DOM Resume must not reopen source")
-        ),
-        send=AsyncMock(side_effect=AssertionError("Resume must not resend")),
-        restart=AsyncMock(side_effect=AssertionError("Resume must not restart")),
-        acquire=AsyncMock(side_effect=AssertionError("Resume must not create a continuation")),
-    )
-    worker._discover_accepted_conversation_identity = AsyncMock(
-        side_effect=AssertionError("DOM-only Resume must not perform backend identity search")
-    )
-
-    asyncio.run(worker._recover_resume_waiting(state, hop, control, on_actions))
-
-    assert seen == []
-    assert on_actions.backend_stream_status.await_count == 0
-    assert on_actions.backend_conversation.await_count == 0
-    assert worker._discover_accepted_conversation_identity.await_count == 0
-    assert on_actions.locate_owned.await_count == 1
-    assert client.wait_snapshot.await_count == 1
-    assert on_actions.reopen.await_count == 0
-    assert on_actions.send.await_count == 0
-    assert on_actions.restart.await_count == 0
-    assert on_actions.acquire.await_count == 0
-    assert control["status"] == "applied"
-    assert control["result"]["action"] == "resume_role_controller"
-    assert control["result"]["postcondition"] == "observation_rearmed"
-    assert hop["receipt"]["conversation_id"] == canonical_id
-    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
 
 
 def test_waiting_reconciles_conversation_id_from_exact_ledger_without_status_poll(tmp_path: Path):
@@ -5082,7 +5008,7 @@ def test_ambient_old_registered_tabs_keep_auto_allow(status: str, tmp_path: Path
     assert "clear" in calls
 
 
-def test_ambient_old_tab_dom_only_visible_allow_is_clicked_without_passive_event(tmp_path: Path, monkeypatch):
+def test_ambient_old_tab_visible_allow_is_clicked_without_passive_event(tmp_path: Path, monkeypatch):
     _config, _store, _state, worker = setup_task(
         tmp_path, task_id="task-ambient-history-dom-allow"
     )
@@ -5136,7 +5062,6 @@ def test_ambient_old_tab_dom_only_visible_allow_is_clicked_without_passive_event
 
     monkeypatch.setattr(worker_module, "ChatGPTPage", Client)
     worker.runtime_db.ensure_schema()
-    worker.runtime_db.put_snapshot("settings", {"dom_only": True})
     worker._ambient_controller_states[id(page)] = {
         "mcp_allow_seen_at": (datetime.now(timezone.utc) - timedelta(seconds=6)).isoformat(),
         "mcp_allow_seen_target": "",

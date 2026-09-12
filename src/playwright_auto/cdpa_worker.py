@@ -3753,18 +3753,6 @@ class CDPAWorker:
         state["active_action"] = "wait_response"
 
 
-    def _dom_only_enabled(self) -> bool:
-        settings = (
-            self.runtime_db.get_snapshot("settings")
-            if self.runtime_db.path.exists()
-            else None
-        )
-        return bool(
-            isinstance(settings, Mapping)
-            and isinstance(settings.get("payload"), Mapping)
-            and settings["payload"].get("dom_only") is True
-        )
-
     def _arm_passive_request_observer(
         self,
         state: Mapping[str, Any],
@@ -8221,7 +8209,6 @@ class CDPAWorker:
         from .role_runtime.page_observer import observer_for
         from urllib.parse import urlparse
         now = time.monotonic()
-        dom_only = self._dom_only_enabled()
         live = set()
         known_urls = None
         for page in tuple(browser_context.pages):
@@ -8265,14 +8252,13 @@ class CDPAWorker:
                 if self._ambient_page_has_active_controller(binding, endpoint_id=endpoint_id):
                     continue
                 observer = observer_for(page)
-                if not due and not observer.dom_wake.is_set() and not (not dom_only and observer.network_wake.is_set()):
+                if not due and not observer.dom_wake.is_set() and not observer.network_wake.is_set():
                     continue
                 observer.dom_wake.clear()
-                if not dom_only:
-                    observer.network_wake.clear()
+                observer.network_wake.clear()
                 self._ambient_next_probe_at[key] = now + 5
                 wait = self._ambient_controller_states.setdefault(key, {})
-                await self.role_controller.maintain_history(client, wait, dom_only=dom_only)
+                await self.role_controller.maintain_history(client, wait)
             except Exception as exc:
                 if is_cdp_disconnect(exc):
                     raise

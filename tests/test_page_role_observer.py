@@ -90,13 +90,12 @@ def test_cleared_permission_is_not_replayed_from_whole_body_fallback():
     assert observer.observation()["permission_action"] is None
 
 
-def test_dom_only_ignores_network_wake_without_detaching_listener():
+def test_hybrid_wait_wakes_on_network_without_detaching_listener():
     async def run():
         page = Page()
         observer = observer_for(page)
         observer.attach()
         observer.network_wake.set()
-        assert await observer.wait(0.005, dom_only=True) is False
+        assert await observer.wait(0.005) is True
         assert observer.attached
-        assert await observer.wait(0.005, dom_only=False) is True
     asyncio.run(run())

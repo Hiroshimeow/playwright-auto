@@ -3507,7 +3507,7 @@ class ChatGPTPage:
         self.clear_permission_action()
 
     def detach_passive_observer(self) -> None:
-        # DOM-only is a consumer mode, not a listener lifecycle event.
+        # Passive observer lifetime is independent from controller polling.
         return None
 
     def _captured_conversation_id(self, accepted_user_message_id: str | None) -> str | None:
@@ -3991,9 +3991,9 @@ class ChatGPTPage:
         from .role_runtime.page_observer import observer_for
         return observer_for(self.page).observation()
 
-    async def wait_for_page_observation(self, *, timeout_ms: int = 5_000, dom_only: bool = False) -> bool:
+    async def wait_for_page_observation(self, *, timeout_ms: int = 5_000) -> bool:
         from .role_runtime.page_observer import observer_for
-        return await observer_for(self.page).wait(timeout_ms / 1000, dom_only=dom_only)
+        return await observer_for(self.page).wait(timeout_ms / 1000)
 
     def clear_permission_action(self) -> None:
         from .role_runtime.page_observer import observer_for

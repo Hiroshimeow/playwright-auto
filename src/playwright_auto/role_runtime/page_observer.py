@@ -334,8 +334,8 @@ class PageObserver:
         self.permission = None
         # Keep last identity so the body fallback cannot resurrect a chunk already dispatched.
 
-    async def wait(self, seconds: float = 5, *, dom_only: bool = False) -> bool:
-        events = [self.dom_wake] if dom_only else [self.dom_wake, self.network_wake]
+    async def wait(self, seconds: float = 5) -> bool:
+        events = [self.dom_wake, self.network_wake]
         if any(event.is_set() for event in events):
             for event in events:
                 event.clear()

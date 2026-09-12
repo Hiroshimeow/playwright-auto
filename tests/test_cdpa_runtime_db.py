@@ -51,13 +51,13 @@ def test_schema_has_exactly_three_tables_and_required_pragmas(tmp_path: Path):
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
 
-    version = db.put_snapshot("settings", {"dom_only": True})
+    version = db.put_snapshot("settings", {"view": "board"})
     assert version == 1
     assert db.get_snapshot("settings") == {
         "name": "settings",
         "version": 1,
         "updated_at": db.get_snapshot("settings")["updated_at"],
-        "payload": {"dom_only": True},
+        "payload": {"view": "board"},
     }
 
     with db.connection() as connection:
