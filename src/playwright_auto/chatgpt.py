@@ -2081,7 +2081,7 @@ async def click_send_button(
             if (errorAlert) {
               return {ok: false, method: 'page_state_conflict', reason: 'error_state'};
             }
-            if (firstVisible('[role="dialog"], [data-testid^="modal-"]')) {
+            if (firstVisible('[role="dialog"]:not(#playwright-auto-role-control-v1), [data-testid^="modal-"]')) {
               return {ok: false, method: 'page_state_conflict', reason: 'blocking_dialog'};
             }
             if (firstVisible('button[data-testid="stop-button"], button[aria-label*="Stop"]')) {
@@ -2766,6 +2766,7 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
           const errors = [...document.querySelectorAll('[role="alert"]')]
             .filter(visible).slice(-4).map((element) => boundedText(element, 240)).filter(Boolean);
           const dialogs = [...document.querySelectorAll('[role="dialog"], [data-testid^="modal-"]')]
+            .filter(element => element.id !== 'playwright-auto-role-control-v1')
             .filter(visible).slice(-4).map((element) => boundedText(element, 240) || 'dialog');
           const overlaySelector = '#playwright-auto-role-badge-v3,#playwright-auto-role-control-v1,#playwright-auto-role-badge,#playwright-auto-role-badge-v2';
           const positiveChoice = /\b(?:continue|proceed|start|yes|ok|okay|accept|approve|allow|run)\b|\bgo ahead\b|\b(?:make|create|use) a plan\b/i;
@@ -3092,6 +3093,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             .map(text)
             .filter(Boolean);
           const blockingDialogs = [...document.querySelectorAll('[role="dialog"], [data-testid^="modal-"]')]
+            .filter(element => element.id !== 'playwright-auto-role-control-v1')
             .filter(visible)
             .map((element) => text(element) || element.getAttribute('data-testid') || 'dialog')
             .filter(Boolean);
@@ -4383,7 +4385,7 @@ class ChatGPTPage:
                   if (firstVisible('button[data-testid="stop-button"], button[aria-label*="Stop"]')) {
                     return {written: false, reason: 'active_response'};
                   }
-                  if (firstVisible('[role="dialog"], [data-testid^="modal-"]')) {
+                  if (firstVisible('[role="dialog"]:not(#playwright-auto-role-control-v1), [data-testid^="modal-"]')) {
                     return {written: false, reason: 'blocking_dialog'};
                   }
                   const errorTexts = [...document.querySelectorAll('[role="alert"]')]
@@ -5123,7 +5125,7 @@ class ChatGPTPage:
                   if (composerText || attachments.length) {
                     return {clicked: false, reason: 'composer_conflict'};
                   }
-                  if ([...document.querySelectorAll('[role="dialog"], [data-testid^="modal-"]')].some(visible)) {
+                  if ([...document.querySelectorAll('[role="dialog"]:not(#playwright-auto-role-control-v1), [data-testid^="modal-"]')].some(visible)) {
                     return {clicked: false, reason: 'blocking_dialog'};
                   }
                   const retry = [...document.querySelectorAll(

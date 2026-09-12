@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 import pytest
 from playwright.async_api import async_playwright
@@ -18,7 +19,7 @@ from playwright_auto.chatgpt import (
 async def _with_page(body: str, callback):
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
-            executable_path="/snap/bin/chromium",
+            executable_path="/snap/bin/chromium" if Path("/snap/bin/chromium").is_file() else None,
             headless=True,
         )
         try:
