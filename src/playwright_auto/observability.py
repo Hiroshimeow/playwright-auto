@@ -189,7 +189,7 @@ def mcp_allow_click_summary(path: str | Path | None = None) -> dict[str, Any]:
     }
     if not target.exists():
         return summary
-    tool_pattern = re.compile(r"\bAllow\s+(mcp-[A-Za-z0-9._-]+)\s+for this conversation\b", re.I)
+    tool_pattern = re.compile(r"\bAllow\s+([^\r\n]+?)\s+for this conversation\b", re.I)
     for line in target.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
             event = json.loads(line)

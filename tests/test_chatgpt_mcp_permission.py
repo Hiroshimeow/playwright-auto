@@ -173,6 +173,28 @@ def test_sparse_probe_rejects_unrelated_or_ambiguous_allow(body):
     assert probe.mcp_permission_allow_count != 1
 
 
+def test_sparse_probe_accepts_generic_conversation_allow_label():
+    async def run(page):
+        return await inspect_chatgpt_wait_probe(page)
+
+    probe = asyncio.run(
+        _with_page(
+            """
+            <main>
+              <div id="permission-actions">
+                <button class="btn-primary"><span>Allow</span></button>
+                <button aria-label="Allow Gmail for this conversation"></button>
+              </div>
+            </main>
+            """,
+            run,
+        )
+    )
+
+    assert probe.mcp_permission_allow_count == 1
+    assert probe.mcp_permission_node_count == 1
+
+
 def test_wait_snapshot_observes_mcp_allow_without_dispatching_it():
     async def run(page):
         client = ChatGPTPage(page, timeout_ms=5_000)
@@ -242,7 +264,30 @@ def test_sparse_probe_distinguishes_hidden_permission_node_from_visible_offer():
     assert probe.mcp_permission_node_count == 1
 
 
-def test_preferred_mcp_allow_finds_remembered_react_action_at_depth_six():
+def test_auto_allow_does_not_click_unrelated_allow_label():
+    async def run(page):
+        client = ChatGPTPage(page, timeout_ms=5_000)
+        result = await client.auto_allow_mcp_permission()
+        clicks = await page.evaluate("window.__unrelatedAllowClicks || 0")
+        return result, clicks
+
+    result, clicks = asyncio.run(
+        _with_page(
+            """
+            <main>
+              <button aria-label="Allow camera access"
+                onclick="window.__unrelatedAllowClicks=(window.__unrelatedAllowClicks||0)+1"></button>
+            </main>
+            """,
+            run,
+        )
+    )
+
+    assert result is None
+    assert clicks == 0
+
+
+def test_preferred_allow_finds_generic_remembered_react_action_at_depth_six():
     async def run(page):
         client = ChatGPTPage(page, timeout_ms=5_000)
         await page.evaluate(
@@ -274,7 +319,7 @@ def test_preferred_mcp_allow_finds_remembered_react_action_at_depth_six():
         _with_page(
             """
             <main>
-              <button id="permission" aria-label="Allow mcp-g8 for this conversation"></button>
+              <button id="permission" aria-label="Allow Gmail for this conversation"></button>
             </main>
             """,
             run,

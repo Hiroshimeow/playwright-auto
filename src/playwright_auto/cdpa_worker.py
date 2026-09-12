@@ -389,7 +389,7 @@ class CDPAWorker:
         self.prompts = PromptBuilder(config)
         self.role_controller = RoleController(Policy(
             response_stable_seconds=config.response_stable_ms / 1000,
-            stalled_seconds=config.response_refresh_after_seconds,
+            timeout_seconds=config.response_refresh_after_seconds,
         ))
         self.runtime_db = RuntimeDB(config.runtime_database)
         self.registry: CDPARuntimeRegistry | None = None

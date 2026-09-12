@@ -227,28 +227,14 @@ class PromptBuilder:
         report_mode: str = "file",
         allowed_routes: Sequence[str] | None = None,
     ) -> str:
-        mode = str(report_mode).strip().lower()
-        error = self._sanitize_validation_error(
-            validation_error,
-            report_mode=mode,
-        )
-        if not error:
+        if not str(validation_error).strip():
             raise ValueError("repair requires a validation error")
-        identity = {
-            "task-id": str(task_id).strip(),
-            "team": str(team).strip(),
-            "role": str(physical_role).strip(),
-            "turn": int(turn),
-        }
         return (
-            "CDPA_FORMAT_REPAIR\n"
-            "Continue from this state. Do not repeat the task or prior tool actions. "
-            "Return the required route JSON using the existing work/report.\n\n"
-            + json.dumps(identity, ensure_ascii=False, indent=2)
-            + f"\n\nValidation error: {error}\n\n"
-            + f"Report naming rule: {self.naming_rule()}\n\n"
-            + self._guide(mode, allowed_routes)
-        ).strip()
+            "Continue from this state.\n"
+            "Finish the current task without restarting completed work.\n"
+            f"Report naming rule: {self.naming_rule()}\n"
+            'Reply only with route JSON: {"route":"<route>","handoff":"<report path or concise handoff>"}'
+        )
 
     def report_repair(
         self,

@@ -39,6 +39,14 @@ def test_mcp_allow_click_summary_counts_only_live_chatgpt_clicks(tmp_path: Path)
         detail="Allow mcp-docker for this conversation",
     )
     append_action_event(
+        "mcp_allow",
+        "complete",
+        page_url="https://chatgpt.com/c/44444444-4444-4444-8444-444444444444",
+        task_id="task-3",
+        role="team-app",
+        detail="Allow Gmail for this conversation",
+    )
+    append_action_event(
         "send",
         "complete",
         page_url="https://chatgpt.com/c/33333333-3333-4333-8333-333333333333",
@@ -46,9 +54,9 @@ def test_mcp_allow_click_summary_counts_only_live_chatgpt_clicks(tmp_path: Path)
 
     summary = mcp_allow_click_summary()
 
-    assert summary["clicks"] == 2
-    assert summary["by_tool"] == {"mcp-docker": 1, "mcp-thinkbook": 1}
-    assert summary["by_task"] == {"task-1": 1, "task-2": 1}
+    assert summary["clicks"] == 3
+    assert summary["by_tool"] == {"gmail": 1, "mcp-docker": 1, "mcp-thinkbook": 1}
+    assert summary["by_task"] == {"task-1": 1, "task-2": 1, "task-3": 1}
     assert summary["latest_at"]
 
 

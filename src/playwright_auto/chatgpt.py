@@ -2464,7 +2464,7 @@ async def click_preferred_mcp_allow(
             (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
           const norm = (v) => String(v || '').replace(/\s+/g, ' ').trim();
           const target = passiveAction?.type === 'allow' ? String(passiveAction.target_message_id || '') : '';
-          const roots = [...document.querySelectorAll('button[aria-label^="Allow mcp-"], [data-message-id]')];
+          const roots = [...document.querySelectorAll('button[aria-label^="Allow "][aria-label$=" for this conversation"], [data-message-id]')];
           for (const root of roots) {
             let node = root, fiber = null, handler = null, handlerKind = null;
             const containers = [];
@@ -2509,7 +2509,7 @@ async def click_preferred_mcp_allow(
             return {method:'react_handler', target_message_id:chosen.target_message_id,
               remember_answer:chosen.remember_answer === true ? 'true' : 'false'};
           }
-          const conversation = [...document.querySelectorAll('button[aria-label^="Allow mcp-"]')]
+          const conversation = [...document.querySelectorAll('button[aria-label^="Allow "][aria-label$=" for this conversation"]')]
             .find(e => visible(e) && !e.disabled && e.getAttribute('aria-disabled') !== 'true');
           if (conversation) { conversation.click(); return {method:'dom_click_conversation', target_message_id:'', remember_answer:'true'}; }
           const plain = [...document.querySelectorAll('button')]
@@ -2778,7 +2778,7 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             return [textLabel, ariaLabel].find((label) => positiveChoice.test(label)) || '';
           };
           const normalizeLabel = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-          const mcpConversationAllow = /^Allow mcp-[A-Za-z0-9._-]+ for this conversation$/i;
+          const mcpConversationAllow = /^Allow [^\r\n]+? for this conversation$/i;
           const mcpPermissionNodes = [...document.querySelectorAll('button[aria-label]')]
             .filter((button) => mcpConversationAllow.test(normalizeLabel(button.getAttribute('aria-label'))));
           const mcpPermissionGroups = [...document.querySelectorAll('button')]
@@ -2907,7 +2907,7 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
               '[role="alert"]',
               '[role="dialog"]',
               '[data-testid^="modal-"]',
-              'button[aria-label^="Allow mcp-"]',
+              'button[aria-label^="Allow "][aria-label$=" for this conversation"]',
               '[data-filename]',
               '[data-file-name]',
             ].join(',');
@@ -3292,10 +3292,10 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             choice_prompt_labels: [...new Set(choicePromptLabels)],
             error_present: Boolean(authCallbackError || alertError),
             mcp_permission_node_count: [...document.querySelectorAll('button[aria-label]')]
-              .filter(b => /^Allow mcp-[A-Za-z0-9._-]+ for this conversation$/i.test((b.getAttribute('aria-label') || '').trim())).length,
+              .filter(b => /^Allow [^\r\n]+? for this conversation$/i.test((b.getAttribute('aria-label') || '').trim())).length,
             mcp_permission_allow_count: [...document.querySelectorAll('button')]
               .filter(b => visible(b) && !b.disabled && b.getAttribute('aria-disabled') !== 'true' &&
-                (text(b) === 'Allow' || /^Allow mcp-[A-Za-z0-9._-]+ for this conversation$/i.test((b.getAttribute('aria-label') || '').trim()))).length,
+                (text(b) === 'Allow' || /^Allow [^\r\n]+? for this conversation$/i.test((b.getAttribute('aria-label') || '').trim()))).length,
             retry_visible: Boolean(retry),
             error_texts: errorTexts,
             response_activity_text: responseActivityText,
@@ -4032,7 +4032,7 @@ class ChatGPTPage:
                   return [...document.querySelectorAll('button')].some((button) =>
                     visible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true' &&
                     (norm(button.innerText || button.textContent) === 'Allow' ||
-                     /^Allow mcp-[A-Za-z0-9._-]+ for this conversation$/i.test(norm(button.getAttribute('aria-label'))))
+                     /^Allow [^\r\n]+? for this conversation$/i.test(norm(button.getAttribute('aria-label'))))
                   );
                 }"""
             )

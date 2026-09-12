@@ -61,11 +61,11 @@ def test_stop_after_allow_is_progress_and_does_not_refresh():
     assert "mcp_allow_clicked_at" not in wait
 
 
-def test_failed_allow_handler_cannot_hide_stall_timer():
+def test_failed_allow_handler_cannot_hide_timeout_timer():
     current = snapshot(mcp_permission_node_count=1)
     wait = {"controller_state": "ALLOW", "controller_progress_at": NOW.isoformat(),
             "mcp_allow_seen_at": NOW.isoformat(), "mcp_allow_retry_at": NOW.isoformat()}
-    assert step(current, wait, 601).action is Action.REFRESH
+    assert step(current, wait, 605).action is Action.REFRESH
 
 
 def test_failed_allow_with_no_dom_permission_clears_stale_network_evidence():
@@ -187,35 +187,87 @@ def test_actual_dialog_blocks_but_permission_dialog_uses_allow_handler():
 
 
 @pytest.mark.parametrize("stop", [False, True])
-def test_stall_refreshes_after_ten_minutes(stop):
+def test_timeout_waits_five_seconds_after_ten_minutes_before_refresh(stop):
     current = snapshot(stop_visible=stop)
     wait = {}
     step(current, wait)
     assert step(current, wait, 599).action is Action.WAIT
-    assert step(current, wait, 600).action is Action.REFRESH
+    assert step(current, wait, 604).action is Action.WAIT
+    assert step(current, wait, 605).action is Action.REFRESH
 
 
-def test_stall_does_not_destroy_manual_draft():
+def test_timeout_does_not_destroy_manual_draft():
     current = snapshot(composer_text="keep this")
     wait = {}
     step(current, wait)
-    assert step(current, wait, 601).reason == "manual_draft_preserved"
+    assert step(current, wait, 605).reason == "manual_draft_preserved"
 
 
-def test_status_is_only_one_shot_at_ambiguous_deadline():
-    wait = {"deadline_at": (NOW + timedelta(seconds=10)).isoformat()}
+def test_timeout_clock_resets_when_operational_state_changes():
+    wait = {}
     assert step(snapshot(), wait).action is Action.WAIT
-    assert step(snapshot(), wait, 10).action is Action.REFRESH
-    wait["timeout_refreshed"] = True
-    assert step(snapshot(), wait, 16).action is Action.STATUS
-    wait["timeout_status_checked"] = True
-    wait["timeout_status"] = "COMPLETE"
-    assert step(snapshot(), wait, 20).action is Action.REPAIR
+    assert step(snapshot(), wait, 590).action is Action.WAIT
+    wait.update(timeout_status_checked=True, timeout_status="COMPLETE")
+    assert step(snapshot(stop_visible=True), wait, 590).action is Action.WAIT
+    assert "timeout_status_checked" not in wait
+    assert "timeout_status" not in wait
+    assert step(snapshot(stop_visible=True), wait, 1194).action is Action.WAIT
+    assert step(snapshot(stop_visible=True), wait, 1195).action is Action.REFRESH
 
 
-def test_dom_only_does_not_require_status_or_graph():
-    wait = {"deadline_at": NOW.isoformat(), "timeout_refreshed": True}
-    assert step(snapshot(), wait, 5, dom_only=True).action is Action.REPAIR
+def test_timeout_after_refresh_repairs_even_when_reload_changes_ui_state():
+    wait = {
+        "controller_progress_at": (NOW - timedelta(seconds=605)).isoformat(),
+        "controller_state": "ALLOW",
+        "timeout_refreshed": True,
+        "timeout_status_checked": True,
+        "timeout_status": "COMPLETE",
+    }
+    assert step(snapshot(stop_visible=True), wait).action is Action.REPAIR
+
+
+def test_timeout_after_refresh_repairs_when_stop_is_absent_even_if_listener_streams():
+    wait = {
+        "controller_progress_at": (NOW - timedelta(seconds=605)).isoformat(),
+        "controller_state": "IDLE",
+        "timeout_refreshed": True,
+        "timeout_status_checked": True,
+        "timeout_status": "IS_STREAMING",
+    }
+    assert step(snapshot(), wait).action is Action.REPAIR
+
+
+def test_timeout_after_refresh_keeps_waiting_and_rearms_when_stop_and_listener_are_active():
+    wait = {
+        "controller_progress_at": (NOW - timedelta(seconds=605)).isoformat(),
+        "controller_state": "STOP",
+        "timeout_refreshed": True,
+        "timeout_status_checked": True,
+        "timeout_status": "IS_STREAMING",
+    }
+    assert step(snapshot(stop_visible=True), wait).action is Action.WAIT
+    assert wait["controller_progress_at"] == NOW.isoformat()
+    assert "timeout_refreshed" not in wait
+    assert "timeout_status_checked" not in wait
+    assert "timeout_status" not in wait
+
+
+def test_dom_only_repair_uses_missing_stop_after_refresh():
+    wait = {
+        "controller_progress_at": (NOW - timedelta(seconds=605)).isoformat(),
+        "controller_state": "IDLE",
+        "timeout_refreshed": True,
+    }
+    assert step(snapshot(), wait, dom_only=True).action is Action.REPAIR
+
+
+def test_dom_only_does_not_treat_missing_listener_as_stream_idle():
+    wait = {
+        "controller_progress_at": (NOW - timedelta(seconds=605)).isoformat(),
+        "controller_state": "STOP",
+        "timeout_refreshed": True,
+    }
+    assert step(snapshot(stop_visible=True), wait, dom_only=True).action is Action.WAIT
 
 
 def test_latest_injected_user_invalidates_old_candidate_without_identity_error():
@@ -242,7 +294,27 @@ def test_history_after_allow_never_refreshes_old_conversation():
     assert result.reason == "history_observation"
 
 
-def test_reload_settle_window_is_shared_by_all_recovery_actions():
-    wait = {"refresh_ready_at": (NOW + timedelta(seconds=5)).isoformat()}
-    assert step(snapshot(retry_visible=True), wait, 4).reason == "reload_settle"
-    assert step(snapshot(retry_visible=True), wait, 5).action is Action.REPAIR
+def test_timeout_refresh_preserves_clock_until_post_reload_state_changes():
+    class Client:
+        async def refresh(self):
+            return None
+
+    wait = {"controller_progress_at": NOW.isoformat()}
+    decision = Decision(Action.REFRESH, "response_timeout_recheck")
+    asyncio.run(RoleController().browser_action(Client(), snapshot(), wait, None, decision))
+
+    assert wait["controller_progress_at"] == NOW.isoformat()
+    assert wait["timeout_refreshed"] is True
+
+
+def test_valid_result_routes_during_reload_settle():
+    current = current_result()
+    wait = {"refresh_ready_at": (NOW + timedelta(seconds=20)).isoformat()}
+    assert step(current, wait).reason == "reload_settle"
+    assert step(current, wait, 1).action is Action.ACCEPT
+
+
+def test_reload_settle_window_is_twenty_seconds():
+    wait = {"refresh_ready_at": (NOW + timedelta(seconds=20)).isoformat()}
+    assert step(snapshot(retry_visible=True), wait, 19).reason == "reload_settle"
+    assert step(snapshot(retry_visible=True), wait, 20).action is Action.REPAIR

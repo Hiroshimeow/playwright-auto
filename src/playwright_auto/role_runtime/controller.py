@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping
 
 from ..cdpa_response import begin_refresh, finish_refresh, parse_time
-from . import allow, auth, dialog, draft, malformed, rate_limit, response, retry, stalled, timeout, ui_error
+from . import allow, auth, dialog, draft, malformed, rate_limit, response, retry, timeout, ui_error
 from .model import Action, Context, Decision, Policy
 
 
@@ -34,26 +34,19 @@ class RoleController:
                 return self._remember(ctx, decision)
         if phase == "waiting":
             response.observe(ctx, getattr(receipt, "baseline", None), validate)
-        stalled.observe(ctx)
+            result_decision = response.handle(ctx)
+            if result_decision is not None:
+                return self._remember(ctx, result_decision)
+
+        timeout.observe(ctx)
         ready_at = parse_time(wait.get("refresh_ready_at"))
         if ready_at is not None and ctx.now < ready_at:
             return self._remember(ctx, Decision(Action.WAIT, "reload_settle"))
         wait.pop("refresh_ready_at", None)
 
-        # A stable validated role result is terminal for this hop. It must not be
-        # masked by stale permission evidence left behind by an earlier tool turn.
-        if phase == "waiting":
-            result_decision = response.handle(ctx)
-            if result_decision is not None:
-                return self._remember(ctx, result_decision)
-
         permission_decision = allow.handle(ctx)
         if permission_decision is not None:
-            # A detected-but-undispatchable permission must not bypass stall/timeout
-            # recovery forever. First detection and post-click windows still get 5s.
-            recovery = stalled.handle(ctx)
-            if wait.get("mcp_allow_retry_at"):
-                recovery = timeout.handle(ctx) or recovery
+            recovery = timeout.handle(ctx) if wait.get("mcp_allow_retry_at") else None
             return self._remember(ctx, draft.protect(ctx, recovery or permission_decision))
 
         if phase == "history":
@@ -61,7 +54,7 @@ class RoleController:
 
         if phase == "pre_send":
             if ctx.active:
-                return self._remember(ctx, draft.protect(ctx, stalled.handle(ctx) or Decision(Action.WAIT, "response_in_progress")))
+                return self._remember(ctx, Decision(Action.WAIT, "response_in_progress"))
             if ctx.draft_present:
                 return self._remember(ctx, Decision(Action.WAIT, "manual_draft_preserved"))
             if getattr(snapshot, "error_texts", ()):
@@ -77,7 +70,7 @@ class RoleController:
         # Give a current candidate its normal two samples even at the deadline.
         if ctx.candidate is not None and not ctx.candidate_stable and not ctx.active:
             return self._remember(ctx, Decision(Action.WAIT, "result_stability"))
-        decision = timeout.handle(ctx) or stalled.handle(ctx)
+        decision = timeout.handle(ctx)
         if decision is not None:
             return self._remember(ctx, draft.protect(ctx, decision))
         return self._remember(ctx, Decision(Action.WAIT, "response_in_progress" if ctx.active else "wait_response"))
@@ -296,7 +289,8 @@ class RoleController:
             finish_refresh(wait)
             now = datetime.now(timezone.utc)
             wait["refresh_ready_at"] = (now + timedelta(seconds=self.policy.reload_settle_seconds)).isoformat()
-            wait["controller_progress_at"] = now.isoformat()
+            if decision.reason != "response_timeout_recheck":
+                wait["controller_progress_at"] = now.isoformat()
             wait["controller_last_refresh_at"] = now.isoformat()
             for key in ("mcp_allow_clicked_at", "mcp_allow_seen_at", "mcp_allow_retry_at"):
                 wait.pop(key, None)

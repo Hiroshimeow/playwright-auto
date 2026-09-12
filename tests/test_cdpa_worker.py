@@ -1564,7 +1564,9 @@ def test_malformed_response_creates_same_turn_guide_only_repair(tmp_path: Path):
 
     asyncio.run(worker._pre_send(state, repair, FakeActions()))
     assert "Implement exact production behavior" not in repair["prompt"]
-    assert "Validation error:" in repair["prompt"]
+    assert "Fix the current response issue:" not in repair["prompt"]
+    assert "Continue from this state" in repair["prompt"]
+    assert len(repair["prompt"].splitlines()) <= 5
     assert ".plan/alpha/alpha-plan_turn1_task-a.md" not in repair["prompt"]
     assert ".plan/<team>/<physical-role>_turn<N>_<task-id>.md" in repair["prompt"]
     assert "Constructor for PLAN" not in repair["prompt"]

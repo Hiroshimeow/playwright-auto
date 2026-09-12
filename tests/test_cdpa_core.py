@@ -432,10 +432,12 @@ def test_constructor_is_once_per_generation_and_prompt_is_compact_allowlist(tmp_
     assert "alpha-dev_turn1_task-a.md" not in repair
     assert "Constructor for PLAN" not in repair
     assert ".plan/alpha/alpha-plan_turn1_task-a.md" not in repair
-    assert "bad keys" in repair
-    assert '"task-id": "task-a"' in repair
-    assert '"role": "alpha-plan"' in repair
+    assert "bad keys" not in repair
+    assert '"task-id": "task-a"' not in repair
+    assert '"role": "alpha-plan"' not in repair
     assert ".plan/<team>/<physical-role>_turn<N>_<task-id>.md" in repair
+    assert "Continue from this state" in repair
+    assert len(repair.splitlines()) <= 5
 
 
 def test_exact_team_resume_preserves_identity_and_creation_still_allocates(tmp_path: Path):

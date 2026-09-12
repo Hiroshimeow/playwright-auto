@@ -456,6 +456,11 @@ def test_repair_release_rearms_once_when_terminal_continuation_is_still_missing(
         tmp_path, task_id="task-repair-release-terminal-missing"
     )
     snapshot = _accepted_user_only_snapshot(state, receipt)
+    hop["wait"]["controller_state"] = "IDLE"
+    hop["wait"]["controller_progress_at"] = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=worker.role_controller.policy.timeout_seconds + 5)
+    ).isoformat()
     calls = {"status": 0, "graph": 0, "locate": 0, "refresh": 0, "send": 0, "retry": 0, "restart": 0, "new_chat": 0}
 
     class Client:
