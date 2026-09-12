@@ -135,3 +135,21 @@ def test_registry_read_is_nonmutating_after_initialization(tmp_path):
     catalog.list()
     catalog.resolve()
     assert catalog.path.stat().st_mtime_ns == before
+
+
+def test_endpoint_capacity_defaults_to_two_and_is_configurable(tmp_path):
+    catalog = registry(tmp_path)
+    original = catalog.resolve()
+    assert original["max_active_tabs"] == 2
+    second = catalog.add("9202", max_active_tabs=3, rate_limit_scope="account-b")
+    assert second["max_active_tabs"] == 3
+    assert second["rate_limit_scope"] == "account-b"
+    updated = catalog.update(second["endpoint_id"], max_active_tabs=4)
+    assert updated["max_active_tabs"] == 4
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "2"])
+def test_endpoint_capacity_requires_a_positive_integer(tmp_path, value):
+    catalog = registry(tmp_path)
+    with pytest.raises(ValueError, match="max_active_tabs"):
+        catalog.add("9202", max_active_tabs=value)

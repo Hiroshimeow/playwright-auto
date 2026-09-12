@@ -15,7 +15,7 @@ _ENDPOINT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", re.ASCII)
 _ENDPOINT_FIELDS = frozenset({
     "endpoint_id", "cdp_url", "label", "is_default", "temporary_default",
     "management_mode", "profile_path", "executable_path", "rate_limit_scope",
-    "draining", "removed",
+    "max_active_tabs", "draining", "removed",
 })
 
 
@@ -31,6 +31,10 @@ def normalize_endpoint_record(raw: Mapping[str, Any], *, endpoint_id: str) -> di
         if type(value) is not bool:
             raise ValueError(f"browser {name} must be a boolean")
         result[name] = value
+    capacity = raw.get("max_active_tabs", 2)
+    if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+        raise ValueError("browser max_active_tabs must be a positive integer")
+    result["max_active_tabs"] = capacity
     for name, default in (("label", address), ("rate_limit_scope", "shared")):
         value = raw.get(name, default)
         if not isinstance(value, str) or not value.strip() or len(value) > 256:
