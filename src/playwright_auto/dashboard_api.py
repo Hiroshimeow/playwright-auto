@@ -356,6 +356,10 @@ class DashboardAPI:
                     "bootstrap_id must be a non-empty string or null",
                 )
             normalized["bootstrap_id"] = bootstrap_id
+        if normalized.get("bootstrap_id") is not None:
+            normalized["context_policy"] = "bootstrap"
+        elif "bootstrap_id" in raw:
+            normalized["context_policy"] = "fresh"
         return normalized
 
     def normalize_workflow_agent_create(

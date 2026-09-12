@@ -674,6 +674,12 @@ class TaskStore(IndependentAgentStoreMixin):
                 return "browser_endpoint_id must be a durable endpoint identifier"
         if "conversation_mode" in state and state["conversation_mode"] not in {"persistent", "temporary"}:
             return "conversation_mode must be persistent or temporary"
+        if "context_policy" in state and state["context_policy"] not in {"fresh", "bootstrap"}:
+            return "context_policy must be fresh or bootstrap"
+        if state.get("context_policy") == "fresh" and state.get("bootstrap") is not None:
+            return "fresh context policy must not include a bootstrap snapshot"
+        if state.get("context_policy") == "bootstrap" and not isinstance(state.get("bootstrap"), Mapping):
+            return "bootstrap context policy requires a bootstrap snapshot"
 
         typed_fields = {
             "roles": Mapping,
@@ -1839,7 +1845,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 )
                 result = mutator(current)
                 candidate = result if result is not None else current
-                for field in ("browser_endpoint_id", "conversation_mode"):
+                for field in ("browser_endpoint_id", "conversation_mode", "context_policy"):
                     if field in original and candidate.get(field) != original[field]:
                         raise ValueError(f"task {field} is immutable")
                 if "browser_endpoint_id" not in original and "browser_endpoint_id" in candidate:
@@ -2450,11 +2456,18 @@ class TaskStore(IndependentAgentStoreMixin):
         normalized_bootstrap: Mapping[str, Any] | None = None,
         browser_endpoint_id: str | None = None,
         conversation_mode: str | None = None,
+        context_policy: str | None = None,
     ) -> dict[str, Any]:
         endpoint = self.endpoints.resolve(browser_endpoint_id)
         mode = conversation_mode or ("temporary" if endpoint["temporary_default"] else "persistent")
         if mode not in {"persistent", "temporary"}:
             raise ValueError("conversation_mode must be persistent or temporary")
+        if context_policy not in {None, "fresh", "bootstrap"}:
+            raise ValueError("context_policy must be fresh or bootstrap")
+        if context_policy == "fresh" and normalized_bootstrap is not None:
+            raise ValueError("fresh context policy must not include a bootstrap snapshot")
+        if context_policy == "bootstrap" and normalized_bootstrap is None:
+            raise ValueError("bootstrap context policy requires a bootstrap snapshot")
         roles = {}
         for logical in workflow_roles:
             roles[logical] = {
@@ -2542,6 +2555,7 @@ class TaskStore(IndependentAgentStoreMixin):
             "task_mode": TASK_MODE_WORKFLOW,
             "browser_endpoint_id": endpoint["endpoint_id"],
             "conversation_mode": mode,
+            **({"context_policy": context_policy} if context_policy is not None else {}),
             **(
                 {
                     "bootstrap": json.loads(
@@ -2770,12 +2784,15 @@ class TaskStore(IndependentAgentStoreMixin):
         browser_endpoint_id: str | None = None,
         temporary: bool = False,
         conversation_mode: str | None = None,
+        context_policy: str | None = None,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
         if type(temporary) is not bool:
             raise ValueError("temporary must be a boolean")
         if conversation_mode is not None and conversation_mode not in {"persistent", "temporary"}:
             raise ValueError("conversation_mode must be persistent or temporary")
+        if context_policy not in {None, "fresh", "bootstrap"}:
+            raise ValueError("context_policy must be fresh or bootstrap")
         text = str(task).strip()
         if not text:
             raise ValueError("task must not be empty")
@@ -2799,6 +2816,10 @@ class TaskStore(IndependentAgentStoreMixin):
         normalized_bootstrap = (
             normalize_bootstrap_record(bootstrap) if bootstrap is not None else None
         )
+        if context_policy == "fresh" and normalized_bootstrap is not None:
+            raise ValueError("fresh context policy must not include a bootstrap snapshot")
+        if context_policy == "bootstrap" and normalized_bootstrap is None:
+            raise ValueError("bootstrap context policy requires a bootstrap snapshot")
         if requested_team is not None and reuse_team is not None:
             raise ValueError("requested_team and reuse_team are mutually exclusive")
         exact_reuse_team = validate_exact_team(reuse_team) if reuse_team is not None else None
@@ -3025,6 +3046,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 normalized_bootstrap=normalized_bootstrap,
                 browser_endpoint_id=endpoint["endpoint_id"],
                 conversation_mode=selected_mode,
+                context_policy=context_policy,
             )
             self._record_external_command(state, external_command_id)
             saved = self._save_unlocked(target, state)
@@ -4505,8 +4527,18 @@ class TaskStore(IndependentAgentStoreMixin):
                     queue_reuse=False,
                     queue_blocked_by=None,
                     now=now,
+                    normalized_bootstrap=(
+                        target_state.get("bootstrap")
+                        if isinstance(target_state.get("bootstrap"), Mapping)
+                        else None
+                    ),
                     browser_endpoint_id=self.endpoint_id_for(target_state),
                     conversation_mode=str(target_state.get("conversation_mode") or "persistent"),
+                    context_policy=(
+                        str(target_state.get("context_policy"))
+                        if target_state.get("context_policy") in {"fresh", "bootstrap"}
+                        else None
+                    ),
                 )
                 replacement_state["dependency_events"].append(
                     {

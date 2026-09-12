@@ -193,10 +193,6 @@ class IneffectiveControlError(RuntimeError):
     """The primitive ran, but its required operational postcondition did not hold."""
 
 
-class BootstrapUIBranchError(RuntimeError):
-    """The bounded semantic UI bootstrap branch failed before Send."""
-
-
 def _active_hop(state: Mapping[str, Any]) -> dict[str, Any]:
     active = state.get("active_hop_id")
     for hop in state.get("hops") or []:
@@ -3226,128 +3222,6 @@ class CDPAWorker:
             state["active_action"] = "bootstrap_retry"
             return updated
 
-    async def _branch_from_bootstrap_ui(
-        self,
-        state: Mapping[str, Any],
-        role: str,
-        actions: CDPATabActions,
-        donor: Mapping[str, Any],
-    ) -> AcquiredRole:
-        if self._rate_limit_gate_active(state=state):
-            raise RateLimitBlockedError(_RATE_LIMIT_BLOCK_MESSAGE)
-        role_record = state["roles"][role]
-        physical = str(role_record["physical_role"])
-        task_id = str(state["task_id"])
-        team = str(state["team"])
-        conversation_id = str(donor["conversation_id"])
-        message_id = str(donor["assistant_message_id"])
-        source_url = f"https://chatgpt.com/c/{conversation_id}"
-        timeout_ms = round(self.config.workspace_timeout_seconds * 1000)
-        page = None
-        response_listener = None
-        try:
-            page = await actions.browser_context.new_page()
-            await page.goto(source_url, wait_until="domcontentloaded", timeout=timeout_ms)
-            assistant = page.locator(
-                f'[data-message-author-role="assistant"][data-message-id="{message_id}"]'
-            ).first
-            await assistant.wait_for(state="visible", timeout=timeout_ms)
-            turn = assistant.locator(
-                "xpath=ancestor::section[starts-with(@data-testid, 'conversation-turn-')][1]"
-            )
-            await turn.hover()
-            await turn.get_by_role("button", name="More actions", exact=True).click()
-            branch_response, response_listener = actions._watch_new_branch_response(page)
-            await page.get_by_role(
-                "menuitem", name="Branch in new chat", exact=True
-            ).click()
-            await page.wait_for_url(
-                lambda url: str(url).split("?", 1)[0].rstrip("/") != source_url,
-                wait_until="domcontentloaded",
-                timeout=timeout_ms,
-            )
-            workspace = ChatGPTWorkspace()
-            client = await workspace.bind(
-                physical,
-                page,
-                timeout_ms=timeout_ms,
-                force_new_page_id=True,
-            )
-            await actions._sanitize_new_branch_composer(client, timeout_ms=timeout_ms)
-            await client.wait_until_clean_ready(timeout_ms=timeout_ms)
-            candidate_id = await actions._new_branch_conversation_id(
-                branch_response, timeout_ms=timeout_ms
-            )
-            await actions.validate_branch_target(
-                client,
-                source_conversation_id=conversation_id,
-                candidate_conversation_id=candidate_id,
-                physical_role=physical,
-                task_id=task_id,
-                team=team,
-            )
-            await client.bind_task_identity(task_id, team)
-            snapshot = await client.assert_ownership()
-            binding = client.binding
-            if (
-                binding is None
-                or str(snapshot.page_id or "") != binding.page_id
-                or str(snapshot.page_role or "") != physical
-                or str(snapshot.page_task_id or "") != task_id
-                or str(snapshot.page_team or "") != team
-            ):
-                raise BootstrapUIBranchError(
-                    "UI bootstrap branch target ownership did not persist"
-                )
-            return AcquiredRole(
-                client=client,
-                page_id=binding.page_id,
-                url=str(snapshot.url),
-                created=True,
-                new_chat=True,
-                conversation_id=candidate_id,
-            )
-        except Exception as exc:
-            rate_limit_error = None
-            if page is not None and not page.is_closed() and not isinstance(
-                exc,
-                (
-                    BootstrapUIBranchError,
-                    BranchBootstrapError,
-                    ChatGPTAutomationError,
-                ),
-            ):
-                try:
-                    if await ChatGPTPage(page, timeout_ms=timeout_ms).known_rate_limit_visible():
-                        rate_limit_error = RateLimitBlockedError(
-                            "request rate limit blocks UI bootstrap branch"
-                        )
-                except Exception:
-                    pass
-            if page is not None and not page.is_closed():
-                try:
-                    await page.close()
-                except Exception:
-                    pass
-            if rate_limit_error is not None:
-                raise rate_limit_error from exc
-            if isinstance(
-                exc,
-                (
-                    BootstrapUIBranchError,
-                    ComposerConflictError,
-                    ManualInputPendingError,
-                    RateLimitBlockedError,
-                ),
-            ):
-                raise
-            raise BootstrapUIBranchError(
-                f"UI bootstrap branch failed: {type(exc).__name__}: {exc}"
-            ) from exc
-        finally:
-            if page is not None and response_listener is not None:
-                page.remove_listener("response", response_listener)
-
     def _foreign_durable_conversation_owner(
         self,
         state: Mapping[str, Any],
@@ -3469,19 +3343,8 @@ class CDPAWorker:
                 )
                 return None
             except BranchBootstrapError:
-                try:
-                    acquired = await self._branch_from_bootstrap_ui(
-                        state, role, actions, donor
-                    )
-                    try:
-                        await self._reject_foreign_durable_branch_owner(
-                            state, role, acquired
-                        )
-                    except BranchBootstrapError as exc:
-                        raise BootstrapUIBranchError(str(exc)) from exc
-                except BootstrapUIBranchError:
-                    saw_transient = True
-                    continue
+                saw_transient = True
+                continue
             role_record["context_source"] = "bootstrap_donor"
             role_record["bootstrap_source_donor"] = dict(donor)
             return acquired
@@ -3550,6 +3413,19 @@ class CDPAWorker:
                     role,
                     url="https://chatgpt.com/?temporary-chat=true",
                 )
+            await self._dismiss_known_rate_limit_on_existing(acquired)
+        elif not isinstance(independent, Mapping) and state.get("context_policy") == "fresh":
+            acquired = await actions.locate_owned(state, role)
+            if acquired is None:
+                if self._rate_limit_gate_active(state=state):
+                    state["active_action"] = "rate_limit_cooldown"
+                    return
+                acquired = await actions.fresh_chat(
+                    state,
+                    role,
+                    url="https://chatgpt.com/",
+                )
+                state["roles"][role]["context_source"] = "fresh"
             await self._dismiss_known_rate_limit_on_existing(acquired)
         elif (
             isinstance(independent, dict)
@@ -5314,6 +5190,7 @@ class CDPAWorker:
         acquired = await actions.locate_owned(state, role)
         action = "confirm_preboundary_role"
         postcondition = "ownership_confirmed_before_send"
+        explicit_fresh = state.get("context_policy") == "fresh"
         proven_operator_fresh = False
         if acquired is None:
             if state.get("attachments"):
@@ -5341,10 +5218,10 @@ class CDPAWorker:
                     )
                     return
             else:
-                proven_operator_fresh = self._proven_operator_new_chat_preboundary_context(
+                proven_operator_fresh = explicit_fresh or self._proven_operator_new_chat_preboundary_context(
                     state, hop, role
                 )
-                if (
+                if not explicit_fresh and (
                     role_record.get("context_source") not in {None, ""}
                     or role_record.get("bootstrap_source_donor") is not None
                     or (generation != 0 and not proven_operator_fresh)
@@ -5387,7 +5264,6 @@ class CDPAWorker:
                     # The recorded donor is validated only when the browser performs
                     # the bounded branch/reacquire operation below. Resume must not
                     # fetch a full conversation graph as a preflight.
-            use_ui_branch = not exact_donor and not proven_operator_fresh
             if self._rate_limit_gate_active(state=state):
                 state["active_action"] = "rate_limit_cooldown"
                 self._finish_resume_control(
@@ -5402,11 +5278,23 @@ class CDPAWorker:
                 return
             if proven_operator_fresh:
                 try:
-                    acquired = await actions.restart(
-                        state,
-                        role,
-                        known_automated_draft=str(hop.get("prompt") or ""),
-                    )
+                    if explicit_fresh:
+                        acquired = await actions.fresh_chat(
+                            state,
+                            role,
+                            url=(
+                                "https://chatgpt.com/?temporary-chat=true"
+                                if state.get("conversation_mode") == "temporary"
+                                else "https://chatgpt.com/"
+                            ),
+                        )
+                        role_record["context_source"] = "fresh"
+                    else:
+                        acquired = await actions.restart(
+                            state,
+                            role,
+                            known_automated_draft=str(hop.get("prompt") or ""),
+                        )
                 except RateLimitBlockedError as exc:
                     await self._enter_rate_limit_cooldown(state, actions, exc)
                     self._apply_rate_limit_to_state(state, hop)
@@ -5440,7 +5328,7 @@ class CDPAWorker:
                         next_safe_action="Restore or reacquire the proven fresh pre-send role before Resume.",
                     )
                     return
-            if exact_donor:
+            if not proven_operator_fresh:
                 try:
                     acquired = await actions.branch_from_anchor(
                         state,
@@ -5484,37 +5372,7 @@ class CDPAWorker:
                         ),
                     )
                     return
-                except BranchBootstrapError:
-                    use_ui_branch = True
-            if use_ui_branch:
-                try:
-                    acquired = await self._branch_from_bootstrap_ui(
-                        state, role, actions, donor
-                    )
-                except RateLimitBlockedError as exc:
-                    await self._enter_rate_limit_cooldown(state, actions, exc)
-                    self._apply_rate_limit_to_state(state, hop)
-                    self._finish_resume_control(
-                        state,
-                        control,
-                        outcome="continued",
-                        action="defer_tab_open",
-                        reason_code=None,
-                        reason="New tab creation is paused for the request-rate-limit cooldown.",
-                        postcondition="tab_open_deferred",
-                    )
-                    return
-                except (ComposerConflictError, ManualInputPendingError) as exc:
-                    self._require_resume_recovery(
-                        state,
-                        control,
-                        action="reacquire_preboundary_role",
-                        reason_code="manual_composer_conflict",
-                        reason=sanitize_exception(exc),
-                        next_safe_action="Resolve the manual composer or attachments before Resume.",
-                    )
-                    return
-                except BootstrapUIBranchError as exc:
+                except BranchBootstrapError as exc:
                     self._require_resume_recovery(
                         state,
                         control,
@@ -7562,6 +7420,11 @@ class CDPAWorker:
                 raise RuntimeError(
                     "create command bootstrap provenance does not match its payload"
                 )
+            requested_context_policy = payload.get("context_policy")
+            if requested_context_policy is not None and state.get("context_policy") != requested_context_policy:
+                raise RuntimeError(
+                    "create command context policy provenance does not match its payload"
+                )
             definition = payload.get("bootstrap_definition")
             if definition is not None:
                 if not isinstance(definition, Mapping) or not isinstance(snapshot, Mapping):
@@ -7775,6 +7638,9 @@ class CDPAWorker:
                         depends_on_task_ids=tuple(payload.get("depends_on_task_ids") or ()),
                         upload_paths=tuple(payload.get("upload_paths") or ()),
                         bootstrap=bootstrap,
+                        browser_endpoint_id=payload.get("browser_endpoint_id") or None,
+                        conversation_mode=payload.get("conversation_mode") or None,
+                        context_policy=payload.get("context_policy") or None,
                         external_command_id=command_id,
                     )
                 self._publish_command_state(state)

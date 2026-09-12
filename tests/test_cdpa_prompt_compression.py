@@ -117,7 +117,7 @@ def test_inherited_builtin_omits_base_and_exact_send_payload_stays_identical(tmp
     assert record.rendered_prompt == hop["prompt"]
 
 
-def test_selected_bootstrap_transient_branch_failure_retries_without_fresh_base_context(tmp_path: Path, monkeypatch):
+def test_selected_bootstrap_transient_branch_failure_retries_without_fresh_base_context(tmp_path: Path):
     _store, state, worker = _setup(tmp_path, bootstrap=bootstrap_record())
 
     class FailedBootstrapActions(BootstrapActions):
@@ -127,10 +127,6 @@ def test_selected_bootstrap_transient_branch_failure_retries_without_fresh_base_
         async def acquire(self, *_args, **_kwargs):
             raise AssertionError("selected bootstrap must not open Fresh context")
 
-    async def ui_failure(*_args, **_kwargs):
-        raise worker_module.BootstrapUIBranchError("ui unavailable")
-
-    monkeypatch.setattr(worker, "_branch_from_bootstrap_ui", ui_failure)
     hop = _active_hop(state)
     asyncio.run(worker._pre_send(state, hop, FailedBootstrapActions()))
 

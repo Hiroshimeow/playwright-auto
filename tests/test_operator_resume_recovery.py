@@ -883,9 +883,7 @@ def _prepare_legacy_donorless_pristine_new(tmp_path: Path, *, task_id: str):
     return store, state, worker, path, hop, ledger, donor
 
 
-def test_resume_legacy_donorless_pristine_new_uses_one_current_default_bootstrap_donor(
-    tmp_path: Path, monkeypatch
-):
+def test_resume_legacy_donorless_pristine_new_uses_one_current_default_bootstrap_donor(tmp_path: Path):
     _store, state, worker, _path, hop, ledger, donor = _prepare_legacy_donorless_pristine_new(
         tmp_path, task_id="task-resume-legacy-donorless"
     )
@@ -912,23 +910,18 @@ def test_resume_legacy_donorless_pristine_new_uses_one_current_default_bootstrap
             self.backend_calls.append(conversation_id)
             return _bootstrap_graph(donor["assistant_message_id"])
 
-        async def branch_from_anchor(self, *_args, **_kwargs):
-            self.branch_calls.append(True)
-            raise AssertionError("donorless reacquisition must not open a native branch first")
+        async def branch_from_anchor(
+            self, _state, role, *, source_conversation_id, assistant_message_id
+        ):
+            self.branch_calls.append((role, source_conversation_id, assistant_message_id))
+            return AcquiredRole(
+                client=SimpleNamespace(),
+                page_id="WEB:legacy-replacement",
+                url="https://chatgpt.com/c/WEB:legacy-replacement",
+                created=True,
+                new_chat=True,
+            )
 
-    ui_calls = []
-
-    async def one_ui_branch(_state, role, _actions, selected):
-        ui_calls.append((role, dict(selected)))
-        return AcquiredRole(
-            client=SimpleNamespace(),
-            page_id="WEB:legacy-replacement",
-            url="https://chatgpt.com/c/WEB:legacy-replacement",
-            created=True,
-            new_chat=True,
-        )
-
-    monkeypatch.setattr(worker, "_branch_from_bootstrap_ui", one_ui_branch)
     actions = Actions()
     control = state["controls"][-1]
     asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
@@ -936,8 +929,7 @@ def test_resume_legacy_donorless_pristine_new_uses_one_current_default_bootstrap
     current = ledger.get(original["request_id"])
     role = state["roles"]["PLAN"]
     assert actions.backend_calls == []
-    assert actions.branch_calls == []
-    assert ui_calls == [("PLAN", donor)]
+    assert actions.branch_calls == [("PLAN", donor["conversation_id"], donor["assistant_message_id"])]
     assert control["status"] == "applied"
     assert control["result"]["postcondition"] == "ownership_reacquired_before_send"
     assert state["active_action"] == "send"
@@ -991,23 +983,15 @@ def test_resume_legacy_donorless_stops_on_bootstrap_safety_signal(
 
         async def branch_from_anchor(self, *_args, **_kwargs):
             self.branch_calls += 1
-            raise AssertionError("donorless safety path must not open a native branch first")
+            raise error
 
-    ui_calls = []
-
-    async def safety_ui(_state, role, _actions, selected):
-        ui_calls.append((role, dict(selected)))
-        raise error
-
-    monkeypatch.setattr(worker, "_branch_from_bootstrap_ui", safety_ui)
     monkeypatch.setattr(worker, "_publish_heartbeat", lambda *args, **kwargs: None)
     actions = Actions()
     control = state["controls"][-1]
     asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
 
     current = ledger.get(hop["request_id"])
-    assert actions.branch_calls == 0
-    assert ui_calls == [("PLAN", donor)]
+    assert actions.branch_calls == 1
     assert control["status"] == "recovery_required"
     assert control["result"]["reason_code"] == reason_code
     assert state["block_code"] == reason_code
@@ -1140,26 +1124,12 @@ def test_resume_reacquires_proven_operator_new_chat_generation_one_before_send(
         async def branch_from_anchor(self, *_args, **_kwargs):
             raise AssertionError("proven fresh-context recovery must not branch from a donor")
 
-    ui_calls = []
-
-    async def fresh_ui(_state, role, _actions, selected):
-        ui_calls.append((role, dict(selected)))
-        return AcquiredRole(
-            client=client,
-            page_id="WEB:operator-fresh-recovered",
-            url="https://chatgpt.com/",
-            created=True,
-            new_chat=True,
-        )
-
-    monkeypatch.setattr(worker, "_branch_from_bootstrap_ui", fresh_ui)
     actions = Actions()
     control = state["controls"][-1]
     asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
 
     assert actions.backend_calls == []
     assert actions.restart_calls == [("PLAN", original["prompt"])]
-    assert ui_calls == []
     assert client.send_calls == 0
     assert control["status"] == "applied"
     assert control["result"]["action"] == "reacquire_preboundary_role"
@@ -1320,9 +1290,7 @@ def test_resume_donorless_fallback_rejects_nonlegacy_role_context(
     assert record.attempts == 0
 
 
-def test_resume_legacy_donorless_failure_does_not_try_second_donor_or_bootstrap_retry(
-    tmp_path: Path, monkeypatch
-):
+def test_resume_legacy_donorless_failure_does_not_try_second_donor_or_bootstrap_retry(tmp_path: Path):
     _store, state, worker, _path, hop, ledger, donor = _prepare_legacy_donorless_pristine_new(
         tmp_path, task_id="task-resume-donorless-bounded"
     )
@@ -1346,25 +1314,19 @@ def test_resume_legacy_donorless_failure_does_not_try_second_donor_or_bootstrap_
             self.backend_calls.append(conversation_id)
             return _bootstrap_graph(donor["assistant_message_id"])
 
-        async def branch_from_anchor(self, *_args, **_kwargs):
-            self.branch_calls.append(True)
-            raise AssertionError("donorless bounded path must not open a native branch first")
+        async def branch_from_anchor(
+            self, _state, role, *, source_conversation_id, assistant_message_id
+        ):
+            self.branch_calls.append((role, source_conversation_id, assistant_message_id))
+            raise BranchBootstrapError("direct branch unavailable")
 
-    ui_calls = []
-
-    async def failed_ui(_state, role, _actions, selected):
-        ui_calls.append((role, dict(selected)))
-        raise worker_module.BootstrapUIBranchError("UI branch unavailable")
-
-    monkeypatch.setattr(worker, "_branch_from_bootstrap_ui", failed_ui)
     actions = Actions()
     control = state["controls"][-1]
     asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
 
     record = ledger.get(hop["request_id"])
     assert actions.backend_calls == []
-    assert actions.branch_calls == []
-    assert ui_calls == [("PLAN", donor)]
+    assert actions.branch_calls == [("PLAN", donor["conversation_id"], donor["assistant_message_id"])]
     assert control["status"] == "recovery_required"
     assert control["result"]["reason_code"] == "preboundary_context_unrecoverable"
     assert state["active_action"] != "bootstrap_retry"
@@ -1373,439 +1335,7 @@ def test_resume_legacy_donorless_failure_does_not_try_second_donor_or_bootstrap_
     assert record.attempts == 0
 
 
-def _real_ui_fallback_actions(
-    worker,
-    state,
-    donor,
-    monkeypatch,
-    *,
-    draft: str,
-    rehydrate: bool = False,
-    hover_error: BaseException | None = None,
-    rate_limit_testid: str | None = None,
-    clean_ready_error: BaseException | None = None,
-    validate_branch_error: BaseException | None = None,
-):
-    clear_calls = []
-
-    class BranchResponse:
-        url = "https://chatgpt.com/backend-api/conversation/new_branch"
-        status = 200
-
-        async def json(self):
-            return {
-                "conversation": {
-                    "conversation_id": "77777777-7777-4777-8777-777777777777"
-                }
-            }
-
-    class Button:
-        def __init__(self, page, label):
-            self.page = page
-            self.label = label
-
-        async def click(self):
-            if self.label == "Branch in new chat":
-                self.page.url = "https://chatgpt.com/c/WEB:resume-ui-fallback"
-                for listener in tuple(self.page.listeners.get("response", ())):
-                    listener(BranchResponse())
-
-    class Turn:
-        def __init__(self, page):
-            self.page = page
-
-        async def hover(self):
-            if hover_error is not None:
-                raise hover_error
-            return None
-
-        def get_by_role(self, _role, *, name, exact):
-            assert exact is True
-            return Button(self.page, name)
-
-    class Assistant:
-        def __init__(self, page):
-            self.page = page
-            self.first = self
-
-        async def wait_for(self, **_kwargs):
-            return None
-
-        def locator(self, _selector):
-            return Turn(self.page)
-
-    class Page:
-        def __init__(self):
-            self.url = "about:blank"
-            self.closed = False
-            self.snapshot_value = None
-            self.listeners = {}
-
-        async def goto(self, url, **_kwargs):
-            self.url = url
-
-        async def evaluate(self, _script, payload=None):
-            if rate_limit_testid is None:
-                return False
-            if not isinstance(payload, list) or len(payload) != 2:
-                return False
-            _markers, testids = payload
-            return rate_limit_testid in testids
-
-        def locator(self, _selector):
-            return Assistant(self)
-
-        def get_by_role(self, _role, *, name, exact):
-            assert exact is True
-            return Button(self, name)
-
-        def on(self, event, listener):
-            self.listeners.setdefault(event, []).append(listener)
-
-        def remove_listener(self, event, listener):
-            listeners = self.listeners.get(event, [])
-            if listener in listeners:
-                listeners.remove(listener)
-
-        async def wait_for_url(self, predicate, **_kwargs):
-            if not predicate(self.url):
-                raise TimeoutError("UI branch URL predicate not satisfied")
-
-        def is_closed(self):
-            return self.closed
-
-        async def close(self):
-            self.closed = True
-
-    page = Page()
-
-    class Context:
-        def __init__(self):
-            self.pages = []
-            self.new_page_calls = 0
-
-        async def new_page(self):
-            self.new_page_calls += 1
-            self.pages.append(page)
-            return page
-
-    context = Context()
-
-    class Client:
-        def __init__(self):
-            self.page = page
-            self.binding = PageBinding("ui-page", state["roles"]["PLAN"]["physical_role"])
-            self.snapshot_value = SimpleNamespace(
-                page_id="ui-page",
-                page_role=state["roles"]["PLAN"]["physical_role"],
-                page_task_id=None,
-                page_team=None,
-                composer_text=draft,
-                composer_present=True,
-                composer_editable=True,
-                stop_visible=False,
-                blocking_dialogs=(),
-                attachment_markers=(),
-                state=ChatGPTState.NEW_CHAT,
-                requires_login=False,
-                url=page.url,
-            )
-            page.snapshot_value = self.snapshot_value
-
-        async def assert_ownership(self):
-            self.snapshot_value.url = page.url
-            return self.snapshot_value
-
-        async def wait_until_clean_ready(self, *, timeout_ms):
-            del timeout_ms
-            if clean_ready_error is not None:
-                raise clean_ready_error
-            if self.snapshot_value.composer_text.strip() or self.snapshot_value.attachment_markers:
-                raise ManualInputPendingError(
-                    "composer still contains manual text or attachments; automated mutation blocked"
-                )
-            return self.snapshot_value
-
-        async def bind_task_identity(self, task_id, team):
-            self.snapshot_value.page_task_id = task_id
-            self.snapshot_value.page_team = team
-
-    class Workspace:
-        async def bind(self, _role, bound_page, **_kwargs):
-            assert bound_page is page
-            return Client()
-
-    monkeypatch.setattr(worker_module, "ChatGPTWorkspace", Workspace)
-
-    async def clear_once(target, **_kwargs):
-        clear_calls.append(target)
-        target.snapshot_value.composer_text = ""
-        if rehydrate:
-            asyncio.get_running_loop().call_later(
-                0.05,
-                setattr,
-                target.snapshot_value,
-                "composer_text",
-                draft,
-            )
-
-    monkeypatch.setattr(actions_module, "clear_composer", clear_once)
-
-    class Actions(CDPATabActions):
-        def __init__(self):
-            super().__init__(context, worker.config)
-            self.branch_calls = []
-            self.backend_calls = []
-
-        async def locate_owned(self, _state, _role):
-            return None
-
-        async def backend_conversation(self, conversation_id):
-            self.backend_calls.append(conversation_id)
-            return _bootstrap_graph(donor["assistant_message_id"])
-
-        async def branch_from_anchor(
-            self, _state, role, *, source_conversation_id, assistant_message_id
-        ):
-            self.branch_calls.append((role, source_conversation_id, assistant_message_id))
-            raise BranchBootstrapError("native branch unavailable")
-
-        async def validate_branch_target(self, client, **kwargs):
-            if validate_branch_error is not None:
-                raise validate_branch_error
-            return await super().validate_branch_target(client, **kwargs)
-
-    return Actions(), context, page, clear_calls
-
-
-def test_resume_ui_bootstrap_hover_timeout_without_rate_limit_stays_fail_closed(
-    tmp_path: Path, monkeypatch
-):
-    _store, state, worker, _path, hop, ledger, donor = _prepare_pristine_new_sending_record(
-        tmp_path, task_id="task-resume-ui-hover-timeout"
-    )
-    original = {
-        "task_id": state["task_id"],
-        "team": state["team"],
-        "hop_id": hop["hop_id"],
-        "request_id": hop["request_id"],
-        "turn": hop["turn"],
-        "prompt": hop["prompt"],
-        "prompt_sha256": hop["prompt_sha256"],
-        "generation": state["roles"]["PLAN"]["conversation_generation"],
-        "donor": dict(state["roles"]["PLAN"]["bootstrap_source_donor"]),
-    }
-    hover_error = TimeoutError(
-        "Locator.hover: Timeout while <div data-testid=\"modal-conversation-history-rate-limit\"> "
-        "intercepts pointer events"
-    )
-    actions, context, page, clear_calls = _real_ui_fallback_actions(
-        worker,
-        state,
-        donor,
-        monkeypatch,
-        draft="",
-        hover_error=hover_error,
-    )
-    control = state["controls"][-1]
-
-    asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
-
-    record = ledger.get(original["request_id"])
-    role = state["roles"]["PLAN"]
-    assert actions.branch_calls == [
-        ("PLAN", donor["conversation_id"], donor["assistant_message_id"])
-    ]
-    assert context.new_page_calls == 1
-    assert clear_calls == []
-    assert page.closed is True
-    assert page.snapshot_value is None
-    assert control["status"] == "recovery_required"
-    assert control["result"]["reason_code"] == "preboundary_context_unrecoverable"
-    assert state["block_code"] == "preboundary_context_unrecoverable"
-    assert state["block_retryable"] is False
-    assert worker._rate_limit_cooldown is None
-    assert role["page_id"] == "WEB:presend-lost"
-    assert role["conversation_generation"] == original["generation"]
-    assert role["bootstrap_source_donor"] == original["donor"]
-    assert state["task_id"] == original["task_id"]
-    assert state["team"] == original["team"]
-    assert hop["hop_id"] == original["hop_id"]
-    assert hop["request_id"] == original["request_id"]
-    assert hop["turn"] == original["turn"]
-    assert hop["prompt"] == original["prompt"]
-    assert hop["prompt_sha256"] == original["prompt_sha256"]
-    assert record is not None
-    assert record.status is RequestStatus.NEW
-    assert record.attempts == 0
-    assert record.binding is None
-    assert record.baseline is None
-    assert record.receipt is None
-    assert record.accepted_at is None
-
-
-def test_resume_ui_bootstrap_ownership_failure_stays_fail_closed_with_rate_limit_modal(
-    tmp_path: Path, monkeypatch
-):
-    _store, state, worker, _path, hop, ledger, donor = _prepare_pristine_new_sending_record(
-        tmp_path, task_id="task-resume-ui-ownership-failure-rate-limit-modal"
-    )
-    actions, context, page, clear_calls = _real_ui_fallback_actions(
-        worker,
-        state,
-        donor,
-        monkeypatch,
-        draft="",
-        rate_limit_testid="modal-conversation-history-rate-limit",
-        clean_ready_error=PageOwnershipError("physical tab changed during clean-ready"),
-    )
-    monkeypatch.setattr(worker, "_publish_heartbeat", lambda *args, **kwargs: None)
-    control = state["controls"][-1]
-
-    asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
-
-    record = ledger.get(hop["request_id"])
-    assert actions.branch_calls == [
-        ("PLAN", donor["conversation_id"], donor["assistant_message_id"])
-    ]
-    assert context.new_page_calls == 1
-    assert clear_calls == []
-    assert page.closed is True
-    assert control["status"] == "recovery_required"
-    assert control["result"]["reason_code"] == "preboundary_context_unrecoverable"
-    assert state["block_code"] == "preboundary_context_unrecoverable"
-    assert state["block_retryable"] is False
-    assert worker._rate_limit_cooldown is None
-    assert record is not None
-    assert record.status is RequestStatus.NEW
-    assert record.attempts == 0
-    assert record.binding is None
-    assert record.baseline is None
-    assert record.receipt is None
-    assert record.accepted_at is None
-
-
-def test_resume_ui_bootstrap_semantic_failure_stays_fail_closed_with_rate_limit_modal(
-    tmp_path: Path, monkeypatch
-):
-    _store, state, worker, _path, hop, ledger, donor = _prepare_pristine_new_sending_record(
-        tmp_path, task_id="task-resume-ui-semantic-failure-rate-limit-modal"
-    )
-    actions, context, page, clear_calls = _real_ui_fallback_actions(
-        worker,
-        state,
-        donor,
-        monkeypatch,
-        draft="",
-        rate_limit_testid="modal-conversation-history-rate-limit",
-        validate_branch_error=BranchBootstrapError(
-            "branch target canonicalized back to source/donor conversation"
-        ),
-    )
-    monkeypatch.setattr(worker, "_publish_heartbeat", lambda *args, **kwargs: None)
-    control = state["controls"][-1]
-
-    asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
-
-    record = ledger.get(hop["request_id"])
-    assert actions.branch_calls == [
-        ("PLAN", donor["conversation_id"], donor["assistant_message_id"])
-    ]
-    assert context.new_page_calls == 1
-    assert clear_calls == []
-    assert page.closed is True
-    assert control["status"] == "recovery_required"
-    assert control["result"]["reason_code"] == "preboundary_context_unrecoverable"
-    assert state["block_code"] == "preboundary_context_unrecoverable"
-    assert state["block_retryable"] is False
-    assert worker._rate_limit_cooldown is None
-    assert record is not None
-    assert record.status is RequestStatus.NEW
-    assert record.attempts == 0
-    assert record.binding is None
-    assert record.baseline is None
-    assert record.receipt is None
-    assert record.accepted_at is None
-
-
-def test_resume_generic_native_failure_ui_fallback_clears_fresh_stale_composer(
-    tmp_path: Path, monkeypatch
-):
-    _store, state, worker, _path, hop, ledger, donor = _prepare_pristine_new_sending_record(
-        tmp_path, task_id="task-resume-ui-stale-composer"
-    )
-    actions, context, page, clear_calls = _real_ui_fallback_actions(
-        worker,
-        state,
-        donor,
-        monkeypatch,
-        draft="stale UI bootstrap draft",
-    )
-    control = state["controls"][-1]
-
-    asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
-
-    record = ledger.get(hop["request_id"])
-    assert actions.branch_calls == [
-        ("PLAN", donor["conversation_id"], donor["assistant_message_id"])
-    ]
-    assert context.new_page_calls == 1
-    assert clear_calls == [page]
-    assert page.closed is False
-    assert control["status"] == "applied"
-    assert control["result"]["postcondition"] == "ownership_reacquired_before_send"
-    assert state["active_action"] == "send"
-    assert state["block_code"] is None
-    assert state["roles"]["PLAN"]["page_id"] == "ui-page"
-    assert record is not None
-    assert record.status is RequestStatus.NEW
-    assert record.attempts == 0
-
-
-def test_resume_ui_fallback_rehydration_closes_once_and_blocks_without_fanout(
-    tmp_path: Path, monkeypatch
-):
-    _store, state, worker, _path, hop, ledger, donor = _prepare_pristine_new_sending_record(
-        tmp_path, task_id="task-resume-ui-rehydrate"
-    )
-    actions, context, page, clear_calls = _real_ui_fallback_actions(
-        worker,
-        state,
-        donor,
-        monkeypatch,
-        draft="stale UI bootstrap draft",
-        rehydrate=True,
-    )
-    control = state["controls"][-1]
-
-    asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
-
-    record = ledger.get(hop["request_id"])
-    assert actions.branch_calls == [
-        ("PLAN", donor["conversation_id"], donor["assistant_message_id"])
-    ]
-    assert actions.backend_calls == []
-    assert context.new_page_calls == 1
-    assert clear_calls == [page]
-    assert page.closed is True
-    assert control["status"] == "recovery_required"
-    assert control["result"]["reason_code"] == "manual_composer_conflict"
-    assert state["block_code"] == "manual_composer_conflict"
-    assert state["active_action"] == "blocked"
-    assert state["roles"]["PLAN"]["page_id"] == "WEB:presend-lost"
-    assert state["active_action"] != "bootstrap_retry"
-    assert record is not None
-    assert record.status is RequestStatus.NEW
-    assert record.attempts == 0
-    assert record.binding is None
-    assert record.baseline is None
-    assert record.receipt is None
-    assert record.accepted_at is None
-
-
-def test_resume_unresolved_native_branch_stops_without_ui_fallback(
-    tmp_path: Path, monkeypatch
-):
+def test_resume_unresolved_native_branch_stops_without_ui_fallback(tmp_path: Path):
     _store, state, worker, _path, hop, ledger, donor = _prepare_pristine_new_sending_record(
         tmp_path, task_id="task-resume-unresolved-native"
     )
@@ -1830,19 +1360,6 @@ def test_resume_unresolved_native_branch_stops_without_ui_fallback(
             self.branch_calls.append((role, source_conversation_id, assistant_message_id))
             raise unresolved_type("branch target remained provisional WEB identity")
 
-    ui_calls = []
-
-    async def forbidden_ui(_state, role, _actions, selected):
-        ui_calls.append((role, dict(selected)))
-        return AcquiredRole(
-            client=SimpleNamespace(),
-            page_id="unexpected-ui-page",
-            url="https://chatgpt.com/c/unexpected-ui",
-            created=True,
-            new_chat=True,
-        )
-
-    monkeypatch.setattr(worker, "_branch_from_bootstrap_ui", forbidden_ui)
     actions = Actions()
     control = state["controls"][-1]
     asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
@@ -1851,7 +1368,6 @@ def test_resume_unresolved_native_branch_stops_without_ui_fallback(
     assert actions.branch_calls == [
         ("PLAN", donor["conversation_id"], donor["assistant_message_id"])
     ]
-    assert ui_calls == []
     assert control["status"] == "recovery_required"
     assert control["result"]["reason_code"] == "branch_target_unresolved"
     assert state["block_code"] == "branch_target_unresolved"
@@ -2073,9 +1589,7 @@ def test_resume_reacquires_empty_ledger_dead_page_before_send_and_sends_once(tmp
 
 
 
-def test_reacquired_pristine_request_crosses_send_boundary_exactly_once(
-    tmp_path: Path, monkeypatch
-):
+def test_reacquired_pristine_request_crosses_send_boundary_exactly_once(tmp_path: Path):
     _store, state, worker, _path, hop, ledger, donor = _prepare_legacy_donorless_pristine_new(
         tmp_path, task_id="task-resume-pristine-send-once"
     )
@@ -2160,17 +1674,12 @@ def test_reacquired_pristine_request_crosses_send_boundary_exactly_once(
             assert conversation_id == donor["conversation_id"]
             return _bootstrap_graph(donor["assistant_message_id"])
 
-        async def branch_from_anchor(self, *_args, **_kwargs):
-            self.branch_calls.append(True)
-            raise AssertionError("donorless send-once path must not open a native branch first")
+        async def branch_from_anchor(
+            self, _state, role, *, source_conversation_id, assistant_message_id
+        ):
+            self.branch_calls.append((role, source_conversation_id, assistant_message_id))
+            return acquired
 
-    ui_calls = []
-
-    async def one_ui_branch(_state, role, _actions, selected):
-        ui_calls.append((role, dict(selected)))
-        return acquired
-
-    monkeypatch.setattr(worker, "_branch_from_bootstrap_ui", one_ui_branch)
     actions = Actions()
     control = state["controls"][-1]
     asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
@@ -2182,8 +1691,7 @@ def test_reacquired_pristine_request_crosses_send_boundary_exactly_once(
     asyncio.run(worker._sending(state, hop, actions))
 
     after_send = ledger.get(hop["request_id"])
-    assert actions.branch_calls == []
-    assert ui_calls == [("PLAN", donor)]
+    assert actions.branch_calls == [("PLAN", donor["conversation_id"], donor["assistant_message_id"])]
     assert client.send_calls == 1
     assert after_send is not None
     assert after_send.status is RequestStatus.SENT

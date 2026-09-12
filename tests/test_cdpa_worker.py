@@ -714,9 +714,7 @@ def test_pre_send_first_role_uses_bootstrap_once_and_keeps_full_prompt(tmp_path:
     assert all(call[1:] == actions.branch_calls[0][1:] for call in actions.branch_calls)
 
 
-def test_bootstrap_branch_rejects_foreign_durable_writable_conversation(
-    tmp_path: Path, monkeypatch
-):
+def test_bootstrap_branch_rejects_foreign_durable_writable_conversation(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
     anchor = bootstrap_record()
@@ -767,10 +765,6 @@ def test_bootstrap_branch_rejects_foreign_durable_writable_conversation(
                 new_chat=True,
             )
 
-    async def no_ui_fallback(*_args, **_kwargs):
-        raise worker_module.BootstrapUIBranchError("no second branch")
-
-    monkeypatch.setattr(worker, "_branch_from_bootstrap_ui", no_ui_fallback)
     acquired = asyncio.run(worker._acquire_workflow_role(state, "PLAN", Actions()))
 
     assert acquired is None
@@ -779,9 +773,7 @@ def test_bootstrap_branch_rejects_foreign_durable_writable_conversation(
     assert state["active_action"] == "bootstrap_retry"
 
 
-def test_pre_send_unresolved_native_branch_blocks_without_ui_fallback(
-    tmp_path: Path, monkeypatch
-):
+def test_pre_send_unresolved_native_branch_blocks_without_ui_fallback(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
     anchor = bootstrap_record()
@@ -807,23 +799,9 @@ def test_pre_send_unresolved_native_branch_blocks_without_ui_fallback(
         async def branch_from_anchor(self, *_args, **_kwargs):
             raise unresolved_type("branch target remained provisional WEB identity")
 
-    ui_calls = []
-
-    async def forbidden_ui(_state, role, _actions, donor):
-        ui_calls.append((role, dict(donor)))
-        return AcquiredRole(
-            client=SimpleNamespace(),
-            page_id="unexpected-ui-page",
-            url="https://chatgpt.com/c/unexpected-ui",
-            created=True,
-            new_chat=True,
-        )
-
-    monkeypatch.setattr(worker, "_branch_from_bootstrap_ui", forbidden_ui)
     hop = _active_hop(state)
     asyncio.run(worker._pre_send(state, hop, Actions()))
 
-    assert ui_calls == []
     assert state["status"] == "BLOCKED"
     assert state["block_code"] == "branch_target_unresolved"
     assert state["active_action"] == "blocked"
@@ -831,9 +809,7 @@ def test_pre_send_unresolved_native_branch_blocks_without_ui_fallback(
     assert RequestLedger(hop["ledger_path"]).peek(hop["request_id"]) is None
 
 
-def test_bootstrap_alias_rejection_keeps_durable_attempts_at_zero(
-    tmp_path: Path, monkeypatch
-):
+def test_bootstrap_alias_rejection_keeps_durable_attempts_at_zero(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
     anchor = bootstrap_record()
@@ -856,12 +832,6 @@ def test_bootstrap_alias_rejection_keeps_durable_attempts_at_zero(
         async def branch_from_anchor(self, *_args, **_kwargs):
             raise BranchBootstrapError("branch canonicalized back to donor")
 
-    async def ui_alias(*_args, **_kwargs):
-        raise worker_module.BootstrapUIBranchError(
-            "UI branch canonicalized back to donor"
-        )
-
-    monkeypatch.setattr(worker, "_branch_from_bootstrap_ui", ui_alias)
     hop = _active_hop(state)
     asyncio.run(worker._pre_send(state, hop, Actions()))
 
@@ -870,7 +840,7 @@ def test_bootstrap_alias_rejection_keeps_durable_attempts_at_zero(
     assert RequestLedger(hop["ledger_path"]).peek(hop["request_id"]) is None
 
 
-def test_pre_send_bootstrap_fallback_chain_is_pre_send_only(tmp_path: Path, monkeypatch):
+def test_pre_send_bootstrap_transient_failure_stays_pre_send_without_fresh_fallback(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
     state = store.create_task(
@@ -903,31 +873,14 @@ def test_pre_send_bootstrap_fallback_chain_is_pre_send_only(tmp_path: Path, monk
             return await super().acquire(state, role)
 
     actions = Actions()
-    ui_calls = []
-
-    async def ui_success(_state, role, _actions, donor):
-        ui_calls.append((role, donor["conversation_id"], donor["assistant_message_id"]))
-        return AcquiredRole(
-            client=ready_client(_state, role),
-            page_id="ui-branch-plan",
-            url="https://chatgpt.com/c/ui-branch-plan",
-            created=True,
-            new_chat=True,
-        )
-
-    monkeypatch.setattr(worker, "_branch_from_bootstrap_ui", ui_success, raising=False)
     hop = _active_hop(state)
     asyncio.run(worker._pre_send(state, hop, actions))
     assert actions.branch_calls == 1
-    assert ui_calls == [
-        (
-            "PLAN",
-            bootstrap_record()["conversation_id"],
-            bootstrap_record()["terminal_assistant_message_id"],
-        )
-    ]
     assert actions.acquire_calls == 0
-    assert state["roles"]["PLAN"]["context_source"] == "bootstrap_donor"
+    assert state["active_action"] == "bootstrap_retry"
+    assert state["roles"]["PLAN"].get("context_source") is None
+    assert hop["state"] == "pre_send"
+    assert RequestLedger(hop["ledger_path"]).peek(hop["request_id"]) is None
 
     protected = store.create_task(
         "protected send",
@@ -942,323 +895,6 @@ def test_pre_send_bootstrap_fallback_chain_is_pre_send_only(tmp_path: Path, monk
     assert no_actions.branch_calls == 0
     assert no_actions.acquire_calls == 0
     assert protected["block_code"] == "pre_send_request_recovery_required"
-
-
-def test_ui_bootstrap_fallback_uses_exact_semantic_source_message(tmp_path: Path, monkeypatch):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    store = TaskStore(config)
-    anchor = bootstrap_record()
-    state = store.create_task(
-        "ui fallback semantics",
-        requested_team="alpha",
-        task_id="task-ui-bootstrap-semantics",
-        bootstrap=anchor,
-    )
-    worker = CDPAWorker(config, store=store)
-    calls = []
-
-    class BranchResponse:
-        url = "https://chatgpt.com/backend-api/conversation/new_branch"
-        status = 200
-
-        async def json(self):
-            return {
-                "conversation": {
-                    "conversation_id": "77777777-7777-4777-8777-777777777777"
-                }
-            }
-
-    class Button:
-        def __init__(self, page, label):
-            self.page = page
-            self.label = label
-
-        async def click(self):
-            calls.append(("click", self.label))
-            if self.label == "Branch in new chat":
-                self.page.url = "https://chatgpt.com/c/WEB:ui-fallback"
-                for listener in tuple(self.page.listeners.get("response", ())):
-                    listener(BranchResponse())
-
-    class Turn:
-        def __init__(self, page):
-            self.page = page
-
-        async def hover(self):
-            calls.append(("hover", "turn"))
-
-        def get_by_role(self, role, *, name, exact):
-            calls.append(("turn-role", role, name, exact))
-            return Button(self.page, name)
-
-    class Assistant:
-        def __init__(self, page):
-            self.page = page
-            self.first = self
-
-        async def wait_for(self, *, state, timeout):
-            calls.append(("assistant-wait", state, timeout))
-
-        def locator(self, selector):
-            calls.append(("ancestor", selector))
-            return Turn(self.page)
-
-    class Page:
-        def __init__(self):
-            self.url = "about:blank"
-            self.closed = False
-            self.listeners = {}
-
-        async def goto(self, url, *, wait_until, timeout):
-            self.url = url
-            calls.append(("goto", url, wait_until, timeout))
-
-        def locator(self, selector):
-            calls.append(("assistant-selector", selector))
-            return Assistant(self)
-
-        def get_by_role(self, role, *, name, exact):
-            calls.append(("page-role", role, name, exact))
-            return Button(self, name)
-
-        def on(self, event, listener):
-            self.listeners.setdefault(event, []).append(listener)
-
-        def remove_listener(self, event, listener):
-            listeners = self.listeners.get(event, [])
-            if listener in listeners:
-                listeners.remove(listener)
-
-        async def wait_for_url(self, predicate, *, wait_until, timeout):
-            calls.append(("wait-url", wait_until, timeout))
-            assert predicate(self.url)
-
-        def is_closed(self):
-            return self.closed
-
-        async def close(self):
-            self.closed = True
-
-    page = Page()
-
-    class Context:
-        def __init__(self):
-            self.pages = []
-
-        async def new_page(self):
-            self.pages.append(page)
-            return page
-
-    class Client:
-        def __init__(self):
-            self.binding = PageBinding("ui-page", "alpha-plan")
-            self.page = page
-
-        async def wait_until_clean_ready(self, *, timeout_ms):
-            calls.append(("clean-ready", timeout_ms))
-
-        async def bind_task_identity(self, task_id, team):
-            calls.append(("bind-task", task_id, team))
-
-        async def assert_ownership(self):
-            return SimpleNamespace(
-                page_id="ui-page",
-                page_role="alpha-plan",
-                page_task_id=state["task_id"],
-                page_team=state["team"],
-                composer_text="",
-                composer_present=True,
-                composer_editable=True,
-                stop_visible=False,
-                blocking_dialogs=(),
-                attachment_markers=(),
-                state=ChatGPTState.NEW_CHAT,
-                requires_login=False,
-                url=page.url,
-            )
-
-    class Workspace:
-        async def bind(self, role, bound_page, *, timeout_ms, force_new_page_id):
-            calls.append(("workspace-bind", role, timeout_ms, force_new_page_id))
-            assert bound_page is page
-            return Client()
-
-    monkeypatch.setattr(worker_module, "ChatGPTWorkspace", Workspace)
-    donor = {
-        "conversation_id": anchor["conversation_id"],
-        "assistant_message_id": anchor["terminal_assistant_message_id"],
-    }
-    context = Context()
-    acquired = asyncio.run(
-        worker._branch_from_bootstrap_ui(
-            state,
-            "PLAN",
-            worker_module.CDPATabActions(context, config),
-            donor,
-        )
-    )
-
-    assert acquired.page_id == "ui-page"
-    assert acquired.new_chat is True
-    assert (
-        "assistant-selector",
-        f'[data-message-author-role="assistant"][data-message-id="{donor["assistant_message_id"]}"]',
-    ) in calls
-    assert ("turn-role", "button", "More actions", True) in calls
-    assert ("page-role", "menuitem", "Branch in new chat", True) in calls
-    assert ("workspace-bind", "alpha-plan", 15000, True) in calls
-    assert ("bind-task", state["task_id"], state["team"]) in calls
-
-
-def test_ui_bootstrap_branch_rejects_eventual_source_alias_before_task_bind(
-    tmp_path: Path, monkeypatch
-):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    store = TaskStore(config)
-    anchor = bootstrap_record()
-    state = store.create_task(
-        "ui alias",
-        requested_team="ui-alias",
-        task_id="task-ui-alias",
-        bootstrap=anchor,
-    )
-    worker = CDPAWorker(config, store=store)
-    bind_calls = []
-
-    class BranchResponse:
-        url = "https://chatgpt.com/backend-api/conversation/new_branch"
-        status = 200
-
-        async def json(self):
-            return {"conversation": {"conversation_id": anchor["conversation_id"]}}
-
-    class ClickTarget:
-        def __init__(self, page, label):
-            self.page = page
-            self.label = label
-
-        async def click(self):
-            if self.label == "Branch in new chat":
-                self.page.url = "https://chatgpt.com/c/WEB:temporary-branch"
-                for listener in tuple(self.page.listeners.get("response", ())):
-                    listener(BranchResponse())
-
-    class Turn:
-        async def hover(self):
-            return None
-
-        def get_by_role(self, _role, *, name, exact):
-            assert exact is True
-            return ClickTarget(page, name)
-
-    class Assistant:
-        first = None
-
-        def __init__(self):
-            self.first = self
-
-        async def wait_for(self, **_kwargs):
-            return None
-
-        def locator(self, _selector):
-            return Turn()
-
-    class Page:
-        def __init__(self):
-            self.url = "about:blank"
-            self.closed = False
-            self.wait_calls = 0
-            self.listeners = {}
-
-        async def goto(self, url, **_kwargs):
-            self.url = url
-
-        def locator(self, _selector):
-            return Assistant()
-
-        def get_by_role(self, _role, *, name, exact):
-            assert exact is True
-            return ClickTarget(self, name)
-
-        def on(self, event, listener):
-            self.listeners.setdefault(event, []).append(listener)
-
-        def remove_listener(self, event, listener):
-            listeners = self.listeners.get(event, [])
-            if listener in listeners:
-                listeners.remove(listener)
-
-        async def wait_for_url(self, predicate, **_kwargs):
-            self.wait_calls += 1
-            if self.wait_calls > 1:
-                self.url = f"https://chatgpt.com/c/{anchor['conversation_id']}"
-            if not predicate(self.url):
-                raise TimeoutError("URL predicate did not match")
-
-        def is_closed(self):
-            return self.closed
-
-        async def close(self):
-            self.closed = True
-
-    page = Page()
-
-    class Context:
-        def __init__(self):
-            self.pages = []
-
-        async def new_page(self):
-            self.pages.append(page)
-            return page
-
-    class Client:
-        def __init__(self):
-            self.binding = PageBinding("ui-alias-page", "ui-alias-plan")
-            self.bound = False
-            self.page = page
-
-        async def wait_until_clean_ready(self, **_kwargs):
-            return None
-
-        async def bind_task_identity(self, task_id, team):
-            bind_calls.append((task_id, team))
-            self.bound = True
-
-        async def assert_ownership(self):
-            return SimpleNamespace(
-                page_id="ui-alias-page",
-                page_role="ui-alias-plan",
-                page_task_id=state["task_id"] if self.bound else None,
-                page_team=state["team"] if self.bound else None,
-                composer_text="",
-                composer_present=True,
-                composer_editable=True,
-                stop_visible=False,
-                blocking_dialogs=(),
-                attachment_markers=(),
-                state=ChatGPTState.NEW_CHAT,
-                requires_login=False,
-                url=page.url,
-            )
-
-    class Workspace:
-        async def bind(self, _role, bound_page, **_kwargs):
-            assert bound_page is page
-            return Client()
-
-    monkeypatch.setattr(worker_module, "ChatGPTWorkspace", Workspace)
-    context = Context()
-    actions = worker_module.CDPATabActions(context, config)
-    donor = {
-        "conversation_id": anchor["conversation_id"],
-        "assistant_message_id": anchor["terminal_assistant_message_id"],
-    }
-
-    with pytest.raises(worker_module.BootstrapUIBranchError, match="source|donor|alias"):
-        asyncio.run(worker._branch_from_bootstrap_ui(state, "PLAN", actions, donor))
-
-    assert bind_calls == []
-    assert page.closed is True
 
 
 def test_pre_send_limits_allowed_routes_to_selected_workflow_roles(tmp_path: Path):
@@ -4823,32 +4459,6 @@ def test_first_allocation_keeps_catalog_primary_before_task_backup(tmp_path: Pat
     assert state["roles"]["PLAN"]["context_source"] == "bootstrap_donor"
 
 
-def test_active_rate_limit_gate_blocks_ui_bootstrap_before_new_page(tmp_path: Path):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    store = TaskStore(config)
-    state = store.create_task(
-        "block UI bootstrap during cooldown",
-        requested_team="ui-bootstrap-gated",
-        task_id="task-ui-bootstrap-gated",
-        bootstrap=donor_pool_record(),
-    )
-    worker = CDPAWorker(config, store=store)
-    worker._rate_limit_cooldown = {
-        "state": "active",
-        "detected_at": "2026-08-09T00:00:00+00:00",
-        "release_not_before": "2999-01-01T00:00:00+00:00",
-    }
-    donor = donor_pool_record()["donors"][0]
-
-    class Actions:
-        browser_context = SimpleNamespace(
-            new_page=lambda: pytest.fail("cooldown must block UI page creation")
-        )
-
-    with pytest.raises(RateLimitBlockedError, match="cooldown"):
-        asyncio.run(worker._branch_from_bootstrap_ui(state, "PLAN", Actions(), donor))
-
-
 def test_transient_donor_backend_failure_retries_without_removing_or_blocking(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     catalog = BootstrapCatalog(tmp_path)
@@ -5402,28 +5012,6 @@ def test_rate_limit_defers_only_missing_tab_control(tmp_path: Path, action: str)
     assert control["status"] == "applied"
     assert control["result"] == {"deferred": True, "reason": "rate_limit_cooldown"}
     assert state["active_action"] == "rate_limit_cooldown"
-
-
-def test_active_rate_limit_blocks_ui_bootstrap_new_page_only(tmp_path: Path):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    store = TaskStore(config)
-    state = store.create_task(
-        "block only new UI page", requested_team="ui-gated", task_id="task-ui-gated",
-        bootstrap=donor_pool_record(),
-    )
-    worker = CDPAWorker(config, store=store)
-    worker._rate_limit_cooldown = {
-        "state": "active",
-        "detected_at": "2026-08-17T00:00:00+00:00",
-        "release_not_before": "2999-01-01T00:00:00+00:00",
-    }
-    donor = donor_pool_record()["donors"][0]
-    class Actions:
-        browser_context = SimpleNamespace(
-            new_page=lambda: pytest.fail("cooldown must block new_page")
-        )
-    with pytest.raises(RateLimitBlockedError, match="cooldown"):
-        asyncio.run(worker._branch_from_bootstrap_ui(state, "PLAN", Actions(), donor))
 
 
 @pytest.mark.parametrize("status", ["DONE", "STOPPED", "PAUSED", "BLOCKED"])
