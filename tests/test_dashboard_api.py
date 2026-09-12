@@ -952,3 +952,21 @@ def test_change_goal_endpoint_enqueues_strict_idempotent_command(tmp_path: Path)
     finally:
         server.shutdown()
         thread.join(timeout=5)
+
+
+def test_create_normalizes_explicit_temp_and_browser_overrides(tmp_path: Path):
+    config = load_cdpa_config(None, repository_root=tmp_path)
+    api = DashboardAPI(config)
+
+    payload = api.normalize_create(
+        {"task": "placed task", "temporary": True, "browser_endpoint_id": "9202"}
+    )
+    assert payload["conversation_mode"] == "temporary"
+    assert payload["browser_endpoint_id"] == "9202"
+
+    inherited = api.normalize_create({"task": "inherit browser defaults"})
+    assert "conversation_mode" not in inherited
+    assert "browser_endpoint_id" not in inherited
+
+    with pytest.raises(APIError, match="temporary"):
+        api.normalize_create({"task": "bad temp", "temporary": "true"})

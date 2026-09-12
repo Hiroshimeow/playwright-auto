@@ -109,8 +109,9 @@ def submit_task(
     team: str | None,
     new_roles: Sequence[str],
     new_all: bool,
-    reuse_team: str | None = None,
     depends_on_task_ids: Sequence[str] = (),
+    temporary: bool = False,
+    browser_endpoint_id: str | None = None,
     upload_paths: Sequence[str | Path] = (),
     bootstrap_id: str | None | object = _BOOTSTRAP_UNSET,
     idempotency_key: str | None = None,
@@ -118,7 +119,6 @@ def submit_task(
     payload = {
         "task": task,
         "requested_team": team,
-        "reuse_team": reuse_team,
         "new_roles": list(new_roles),
         "new_all": bool(new_all),
         "report_mode": "file",
@@ -127,6 +127,10 @@ def submit_task(
     }
     if repository is not None:
         payload["repository"] = str(repository.expanduser().resolve())
+    if temporary:
+        payload["temporary"] = True
+    if browser_endpoint_id is not None:
+        payload["browser_endpoint_id"] = browser_endpoint_id
     if bootstrap_id is not _BOOTSTRAP_UNSET:
         payload["bootstrap_id"] = bootstrap_id
     return _post(
@@ -457,9 +461,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="start a new task with Fresh context instead of a bootstrap",
     )
     parser.add_argument(
-        "--reuse-team",
+        "--temp",
+        action="store_true",
+        help="force Temporary Chat for this workflow task",
+    )
+    parser.add_argument(
+        "--browser",
         default=None,
-        help="queue new work for one exact existing team without allocating a suffix",
+        help="browser endpoint ID, port, host:port, or CDP URL",
     )
     parser.add_argument(
         "--depends-on",
@@ -528,16 +537,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         new_roles = parse_new_roles(args.new_roles)
         dependencies = parse_dependency_ids(args.depends_on)
         if task:
-            if args.team and args.reuse_team:
-                raise ValueError("--team and --reuse-team are mutually exclusive")
             state = submit_task(
                 config,
                 task=task,
                 repository=repository,
                 team=args.team,
-                reuse_team=args.reuse_team,
                 new_roles=new_roles,
                 new_all=bool(args.new_all),
+                temporary=bool(args.temp),
+                browser_endpoint_id=args.browser,
                 depends_on_task_ids=dependencies,
                 upload_paths=tuple(
                     str(Path(path).expanduser().resolve()) for path in args.upload
@@ -546,12 +554,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             mode = "created"
         else:
-            if args.reuse_team:
-                raise ValueError("--reuse-team is invalid in taskless resume mode")
             if not args.team:
                 raise ValueError("taskless resume requires --team <exact-existing-team>")
             if args.bootstrap_id is not _BOOTSTRAP_UNSET:
                 raise ValueError("--bootstrap and --fresh are invalid in taskless resume mode")
+            if args.temp or args.browser is not None:
+                raise ValueError("--temp and --browser are invalid in taskless resume mode")
             if new_roles or args.new_all or dependencies or args.upload:
                 raise ValueError(
                     "--new, --new-all, --depends-on, and --upload are invalid in taskless resume mode"

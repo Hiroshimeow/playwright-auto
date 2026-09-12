@@ -456,3 +456,94 @@ def test_independent_cli_config_merges_dependency_teams(tmp_path: Path, monkeypa
     assert posted[0][0] == "/api/independent-agents/agent-scoped-g1/settings"
     assert posted[0][1]["trigger_settings"]["recovery"] is True
     assert posted[0][1]["trigger_settings"]["teams"] == ["new-team"]
+
+
+def test_task_parser_retires_public_reuse_team_option():
+    with pytest.raises(SystemExit):
+        cdpa_cli_module.build_parser().parse_args(
+            ["task", "--reuse-team", "legacy-team"]
+        )
+
+
+def test_task_cli_temp_and_browser_forward_creation_policy(tmp_path: Path, monkeypatch):
+    captured = []
+    config = SimpleNamespace(
+        repository_root=tmp_path.resolve(),
+        dashboard_api_host="127.0.0.1",
+        dashboard_api_port=9225,
+        dashboard_url="http://127.0.0.1:9224",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cdpa_cli_module,
+        "load_cdpa_config",
+        lambda _path, *, repository_root: config,
+    )
+    monkeypatch.setattr(
+        cdpa_cli_module,
+        "submit_task",
+        lambda _config, **kwargs: captured.append(kwargs) or {"status": "queued"},
+    )
+
+    assert cdpa_main(["task", "--temp", "--browser", "9202"]) == 0
+    assert captured[0]["temporary"] is True
+    assert captured[0]["browser_endpoint_id"] == "9202"
+
+
+def test_submit_task_emits_only_explicit_temp_and_browser_overrides(tmp_path: Path, monkeypatch):
+    payloads = []
+    config = SimpleNamespace(repository_root=tmp_path.resolve())
+    monkeypatch.setattr(
+        cdpa_cli_module,
+        "_post",
+        lambda _config, path, payload, **_kwargs: payloads.append(payload)
+        or {"status": "queued"},
+    )
+    cdpa_cli_module.submit_task(
+        config,
+        task="placement override",
+        repository=None,
+        team=None,
+        new_roles=(),
+        new_all=False,
+        temporary=True,
+        browser_endpoint_id="100.80.10.4:9202",
+    )
+    assert payloads[0]["temporary"] is True
+    assert payloads[0]["browser_endpoint_id"] == "100.80.10.4:9202"
+
+    payloads.clear()
+    cdpa_cli_module.submit_task(
+        config,
+        task="inherit defaults",
+        repository=None,
+        team=None,
+        new_roles=(),
+        new_all=False,
+    )
+    assert "temporary" not in payloads[0]
+    assert "browser_endpoint_id" not in payloads[0]
+
+
+def test_taskless_resume_rejects_temp_and_browser(tmp_path: Path, monkeypatch, capsys):
+    config = SimpleNamespace(
+        repository_root=tmp_path.resolve(),
+        dashboard_api_host="127.0.0.1",
+        dashboard_api_port=9225,
+        dashboard_url="http://127.0.0.1:9224",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cdpa_cli_module,
+        "load_cdpa_config",
+        lambda _path, *, repository_root: config,
+    )
+    monkeypatch.setattr(
+        cdpa_cli_module,
+        "resume_task",
+        lambda *_args, **_kwargs: pytest.fail("resume API must not be called"),
+    )
+    assert cdpa_main(["--team", "existing", "--temp"]) == 2
+    assert "--temp and --browser are invalid in taskless resume mode" in capsys.readouterr().err
+    assert cdpa_main(["--team", "existing", "--browser", "9202"]) == 2
+    assert "--temp and --browser are invalid in taskless resume mode" in capsys.readouterr().err

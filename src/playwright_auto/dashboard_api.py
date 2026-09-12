@@ -292,6 +292,8 @@ class DashboardAPI:
             "upload_paths",
             "bootstrap_id",
             "bootstrap_definition",
+            "temporary",
+            "browser_endpoint_id",
         }
         unknown = set(raw) - allowed
         if unknown:
@@ -328,6 +330,16 @@ class DashboardAPI:
         }
         if "roles" in raw:
             normalized["roles"] = self._workflow_roles(raw.get("roles"))
+        if "temporary" in raw:
+            if type(raw.get("temporary")) is not bool:
+                raise APIError(400, "invalid_request", "temporary must be a boolean")
+            if raw.get("temporary") is True:
+                normalized["conversation_mode"] = "temporary"
+        if "browser_endpoint_id" in raw:
+            endpoint = raw.get("browser_endpoint_id")
+            if not isinstance(endpoint, str) or not endpoint.strip():
+                raise APIError(400, "invalid_request", "browser_endpoint_id must be a non-empty string")
+            normalized["browser_endpoint_id"] = endpoint.strip()
         definition = (
             self._bootstrap_definition(raw.get("bootstrap_definition"))
             if "bootstrap_definition" in raw
