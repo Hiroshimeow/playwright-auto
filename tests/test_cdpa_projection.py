@@ -830,3 +830,24 @@ def test_goal_revision_detail_is_full_sanitized_and_summary_stays_compact(tmp_pa
         "applies_from_hop_id": 3, "goal": "Replacement goal",
     }]
     assert "cmd-private" not in json.dumps(projection.detail)
+
+
+
+def test_role_projection_matches_composite_endpoint_and_page_identity(tmp_path: Path):
+    task = raw_task(tmp_path)
+    task["browser_endpoint_id"] = "endpoint-a"
+    task["roles"]["DEV"]["browser_endpoint_id"] = "endpoint-a"
+    task["roles"]["DEV"]["page_id"] = "shared-page"
+    projection = build_task_projection(
+        task,
+        tasks=[task],
+        browser_connected=True,
+        browser_pages=[
+            {"endpoint_id": "endpoint-a", "page_id": "shared-page", "online": False, "url": "https://chatgpt.com/c/a"},
+            {"endpoint_id": "endpoint-b", "page_id": "shared-page", "online": True, "url": "https://chatgpt.com/c/b"},
+        ],
+    )
+
+    role = projection.detail["roles"][0]
+    assert role["online"] is False
+    assert role["chat_url"] == "https://chatgpt.com/c/a"

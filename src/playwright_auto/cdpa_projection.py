@@ -225,18 +225,30 @@ def _roles(
     browser_pages: Sequence[Mapping[str, Any]],
     browser_connected: bool | None,
 ) -> list[dict[str, Any]]:
-    pages: dict[str, Mapping[str, Any]] = {}
+    pages: dict[tuple[str | None, str], Mapping[str, Any]] = {}
+    candidates: dict[str, list[Mapping[str, Any]]] = {}
     for page in browser_pages:
         page_key = str(page.get("page_id") or "").strip()
-        if page_key:
-            pages[page_key] = page
+        if not page_key:
+            continue
+        endpoint_key = str(page.get("endpoint_id") or "").strip() or None
+        pages[(endpoint_key, page_key)] = page
+        candidates.setdefault(page_key, []).append(page)
     source = raw.get("roles") if isinstance(raw.get("roles"), Mapping) else {}
+    task_endpoint = str(raw.get("browser_endpoint_id") or "").strip() or None
     result: list[dict[str, Any]] = []
     for logical_role, value in source.items():
         if not isinstance(value, Mapping):
             continue
         page_id = str(value.get("page_id") or "") or None
-        page = pages.get(page_id) if page_id else None
+        role_endpoint = str(value.get("browser_endpoint_id") or task_endpoint or "").strip() or None
+        page = None
+        if page_id:
+            page = pages.get((role_endpoint, page_id))
+            if page is None and role_endpoint is not None:
+                page = pages.get((None, page_id))
+            if page is None and role_endpoint is None and len(candidates.get(page_id, ())) == 1:
+                page = candidates[page_id][0]
         if browser_connected is False:
             online: bool | None = None
         elif browser_connected is True:

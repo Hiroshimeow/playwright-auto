@@ -41,6 +41,7 @@ from .cdpa_commands import (
 )
 from .cdpa_config import CDPAConfig, load_cdpa_config, remote_repository_from_task
 from .cdpa_browser_projection import build_browser_projection
+from .cdpa_endpoint_pool import EndpointPool
 from .cdpa_independent import (
     BUILTIN_MAINTAINERS_PROMPT,
     BUILTIN_MONITOR_PROMPT,
@@ -142,7 +143,7 @@ from .chatgpt_graph import (
     resolve_inherited_assistant,
     resolve_latest_terminal_assistant,
 )
-from .connection import connected_browser, is_cdp_disconnect
+from .connection import is_cdp_disconnect
 from .durable import (
     DurableRecoveryState,
     DurableRequestError,
@@ -403,6 +404,7 @@ class CDPAWorker:
         self._browser_error: str | None = None
         self._browser_cycle_active = False
         self._rate_limit_cooldown: dict[str, Any] | None = None
+        self._rate_limit_cooldowns: dict[str, dict[str, Any]] = {}
         self._rate_limit_lock = asyncio.Lock()
         self._send_gate_lock = asyncio.Lock()
         self._last_automated_send_at: float | None = None
@@ -421,6 +423,113 @@ class CDPAWorker:
     def _manifest_identity(path: Path) -> tuple[int, int, int, int]:
         stat = path.stat()
         return (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+    def _running_executions(
+        self, tasks: Sequence[Mapping[str, Any]] | None = None
+    ) -> list[dict[str, Any]]:
+        source = list(tasks) if tasks is not None else list(
+            self.registry.tasks_by_id.values() if self.registry is not None else ()
+        )
+        running: list[dict[str, Any]] = []
+        for state in source:
+            if str(state.get("status") or "").upper() != "RUNNING":
+                continue
+            role = str(state.get("active_role") or "").upper()
+            record = (state.get("roles") or {}).get(role) if role else None
+            if not isinstance(record, Mapping):
+                continue
+            endpoint_id = str(record.get("browser_endpoint_id") or "").strip()
+            page_id = str(record.get("page_id") or "").strip()
+            if not endpoint_id or not page_id or record.get("online") is not True:
+                continue
+            try:
+                hop = _active_hop(state)
+            except RuntimeError:
+                continue
+            if str(hop.get("target_role") or "").upper() != role:
+                continue
+            if str(hop.get("state") or "") not in {"pre_send", "sending", "sent", "waiting", "responded"}:
+                continue
+            running.append(
+                {
+                    "endpoint_id": endpoint_id,
+                    "task_id": str(state.get("task_id") or ""),
+                    "team": str(state.get("team") or ""),
+                    "role": role,
+                    "request_id": str(hop.get("request_id") or ""),
+                    "page_id": page_id,
+                }
+            )
+        return running
+
+    @staticmethod
+    def _role_endpoint_affinity(state: Mapping[str, Any]) -> str | None:
+        role = str(state.get("active_role") or "").upper()
+        record = (state.get("roles") or {}).get(role) if role else None
+        if not isinstance(record, Mapping):
+            return None
+        if not record.get("page_id") or not record.get("page_url") or record.get("online") is not True:
+            return None
+        return str(record.get("browser_endpoint_id") or "").strip() or None
+
+    def _execution_can_relocate(
+        self, state: Mapping[str, Any], target_endpoint_id: str
+    ) -> bool:
+        role = str(state.get("active_role") or "").upper()
+        record = (state.get("roles") or {}).get(role) if role else None
+        if not isinstance(record, Mapping):
+            return True
+        current = str(record.get("browser_endpoint_id") or "").strip() or None
+        if current is None or current == target_endpoint_id:
+            return True
+        try:
+            hop = _active_hop(state)
+        except RuntimeError:
+            return False
+        if str(hop.get("state") or "") != "pre_send" or hop.get("receipt") is not None:
+            return False
+        uploaded_generation = record.get("attachments_uploaded_generation")
+        if uploaded_generation is not None and uploaded_generation == record.get("conversation_generation"):
+            return False
+        request_id = str(hop.get("request_id") or "").strip()
+        ledger_path = str(hop.get("ledger_path") or "").strip()
+        if request_id and ledger_path:
+            try:
+                if RequestLedger(ledger_path).peek(request_id) is not None:
+                    return False
+            except Exception:
+                return False
+        return True
+
+    def _prepare_execution_endpoint(
+        self, state: dict[str, Any], endpoint_id: str
+    ) -> bool:
+        role = str(state.get("active_role") or "").upper()
+        record = state.get("roles", {}).get(role) if role else None
+        if not isinstance(record, dict):
+            return True
+        current = str(record.get("browser_endpoint_id") or "").strip() or None
+        if current != endpoint_id and not self._execution_can_relocate(state, endpoint_id):
+            return False
+        if current != endpoint_id:
+            record.update(
+                browser_endpoint_id=endpoint_id,
+                page_id=None,
+                page_url=None,
+                online=False,
+                last_error=None,
+            )
+            if str(record.get("status") or "") == "active":
+                record["status"] = "pending"
+            try:
+                hop = _active_hop(state)
+            except RuntimeError:
+                hop = None
+            if isinstance(hop, dict) and str(hop.get("state") or "") == "pre_send":
+                hop["conversation_url"] = None
+        else:
+            record["browser_endpoint_id"] = endpoint_id
+        return True
 
     def _remember_manifest(self, path: str | Path, state: dict[str, Any]) -> None:
         target = Path(path).expanduser().resolve()
@@ -499,31 +608,70 @@ class CDPAWorker:
         self._repository_project_tasks.add(task)
         task.add_done_callback(self._repository_project_tasks.discard)
 
-    def _rate_limit_gate_active(self) -> bool:
-        cooldown = self._rate_limit_cooldown
+    def _rate_limit_scope_for_state(self, state: Mapping[str, Any]) -> str:
+        role = str(state.get("active_role") or "").upper()
+        record = (state.get("roles") or {}).get(role) if role else None
+        endpoint_id = (
+            str(record.get("browser_endpoint_id") or "").strip()
+            if isinstance(record, Mapping)
+            else ""
+        ) or str(state.get("browser_endpoint_id") or "").strip()
+        if endpoint_id:
+            try:
+                endpoint = self.store.endpoints.get(endpoint_id)
+                return str(endpoint.get("rate_limit_scope") or "shared")
+            except Exception:
+                pass
+        return "shared"
+
+    def _rate_limit_gate_active(
+        self,
+        *,
+        state: Mapping[str, Any] | None = None,
+        scope: str | None = None,
+    ) -> bool:
+        selected_scope = scope or (
+            self._rate_limit_scope_for_state(state) if state is not None else "shared"
+        )
+        cooldown = self._rate_limit_cooldowns.get(selected_scope)
+        if cooldown is None and selected_scope == "shared":
+            cooldown = self._rate_limit_cooldown
         if not isinstance(cooldown, Mapping) or cooldown.get("state") != "active":
             return False
         release_at = parse_time(cooldown.get("release_not_before"))
         if release_at is not None and datetime.now(timezone.utc) >= release_at:
-            self._rate_limit_cooldown = None
+            self._rate_limit_cooldowns.pop(selected_scope, None)
+            if selected_scope == "shared":
+                self._rate_limit_cooldown = None
             return False
         return True
 
-    def _restore_rate_limit_cooldown(self) -> None:
+    def _active_rate_limit_scopes(self) -> set[str]:
+        scopes = set(self._rate_limit_cooldowns)
         if self._rate_limit_cooldown is not None:
+            scopes.add("shared")
+        return {scope for scope in scopes if self._rate_limit_gate_active(scope=scope)}
+
+    def _restore_rate_limit_cooldown(self) -> None:
+        if self._rate_limit_cooldowns or self._rate_limit_cooldown is not None:
             return
         snapshot = self.runtime_db.get_snapshot("worker")
         payload = snapshot.get("payload") if isinstance(snapshot, Mapping) else None
+        scoped = payload.get("rate_limit_cooldowns") if isinstance(payload, Mapping) else None
+        if isinstance(scoped, Mapping):
+            for scope, cooldown in scoped.items():
+                if isinstance(cooldown, Mapping) and cooldown.get("state") == "active":
+                    self._rate_limit_cooldowns[str(scope)] = dict(cooldown)
         cooldown = (
             payload.get("rate_limit_cooldown")
             if isinstance(payload, Mapping)
             else None
         )
-        if isinstance(cooldown, Mapping):
+        if isinstance(cooldown, Mapping) and cooldown.get("state") == "active":
             restored = dict(cooldown)
-            if restored.get("state") == "active":
-                self._rate_limit_cooldown = restored
-                self._rate_limit_gate_active()
+            self._rate_limit_cooldown = restored
+            self._rate_limit_cooldowns.setdefault("shared", restored)
+        self._active_rate_limit_scopes()
 
     async def _enter_rate_limit_cooldown(
         self,
@@ -537,20 +685,38 @@ class CDPAWorker:
             role = str(state.get("active_role") or "").upper()
             if not role and state.get("active_hop_id") is not None:
                 role = str(_active_hop(state).get("target_role") or "").upper()
+            scope = self._rate_limit_scope_for_state(state)
+            role_record = (state.get("roles") or {}).get(role) if role else None
+            endpoint_id = (
+                str(role_record.get("browser_endpoint_id") or "").strip()
+                if isinstance(role_record, Mapping)
+                else ""
+            ) or None
+            endpoint_url = None
+            if endpoint_id is not None:
+                try:
+                    endpoint_url = self.store.endpoints.get(endpoint_id).get("cdp_url")
+                except Exception:
+                    endpoint_url = None
             cooldown_seconds = float(self.rate_limit_cooldown_seconds)
-            self._rate_limit_cooldown = {
+            cooldown = {
                 "state": "active",
+                "scope": scope,
                 "detected_at": now.isoformat(),
                 "release_not_before": (
                     now + timedelta(seconds=cooldown_seconds)
                 ).isoformat(),
                 "reason": sanitize_text(error, max_chars=500),
-                "profile": str(self.config.cdp_url),
+                "profile": str(endpoint_url or self.config.cdp_url),
+                "endpoint_id": endpoint_id,
                 "detector_task_id": str(state.get("task_id") or "") or None,
                 "detector_role": role or None,
             }
+            self._rate_limit_cooldowns[scope] = cooldown
+            if scope == "shared":
+                self._rate_limit_cooldown = cooldown
             self._publish_heartbeat(force=True)
-            return self._rate_limit_cooldown
+            return cooldown
 
     def _apply_rate_limit_to_state(
         self,
@@ -567,9 +733,11 @@ class CDPAWorker:
         self, browser_context: Any
     ) -> bool:
         del browser_context
-        had_cooldown = self._rate_limit_cooldown is not None
-        active = self._rate_limit_gate_active()
-        cleared = had_cooldown and not active and self._rate_limit_cooldown is None
+        before = set(self._rate_limit_cooldowns) | (
+            {"shared"} if self._rate_limit_cooldown is not None else set()
+        )
+        after = self._active_rate_limit_scopes()
+        cleared = bool(before - after)
         if cleared:
             self._publish_heartbeat(force=True)
         return cleared
@@ -864,7 +1032,7 @@ class CDPAWorker:
                     raise RoleOwnershipError(
                         f"owned {physical_role} tab is offline", code="role_offline"
                     )
-                if self._rate_limit_gate_active():
+                if self._rate_limit_gate_active(state=state):
                     state["active_action"] = "rate_limit_cooldown"
                     return None
                 acquired = await self._recover_active_role(state, role, actions)
@@ -1595,7 +1763,7 @@ class CDPAWorker:
             reopened = False
             created = False
             if acquired is None:
-                if self._rate_limit_gate_active():
+                if self._rate_limit_gate_active(state=state):
                     state["active_action"] = "rate_limit_cooldown"
                     return {"deferred": True, "reason": "rate_limit_cooldown"}
                 role_record = state["roles"][role]
@@ -2018,7 +2186,7 @@ class CDPAWorker:
                 old_page_id = state["roles"][role].get("page_id")
                 locator = getattr(actions, "locate_owned", None)
                 existing_role = await locator(state, role) if callable(locator) else True
-                if existing_role is None and self._rate_limit_gate_active():
+                if existing_role is None and self._rate_limit_gate_active(state=state):
                     state["active_action"] = "rate_limit_cooldown"
                     result = {"deferred": True, "reason": "rate_limit_cooldown"}
                 else:
@@ -2094,7 +2262,7 @@ class CDPAWorker:
                     )
                 locator = getattr(actions, "locate_owned", None)
                 existing_role = await locator(state, role) if callable(locator) else True
-                if existing_role is None and self._rate_limit_gate_active():
+                if existing_role is None and self._rate_limit_gate_active(state=state):
                     state["active_action"] = "rate_limit_cooldown"
                     result = {"deferred": True, "reason": "rate_limit_cooldown"}
                 else:
@@ -2194,7 +2362,7 @@ class CDPAWorker:
 
                 locator = getattr(actions, "locate_owned", None)
                 existing_open_tab = await locator(state, role) if callable(locator) else True
-                if existing_open_tab is None and self._rate_limit_gate_active():
+                if existing_open_tab is None and self._rate_limit_gate_active(state=state):
                     state["active_action"] = "rate_limit_cooldown"
                     result = {"deferred": True, "reason": "rate_limit_cooldown"}
                     acquired = None
@@ -2610,7 +2778,7 @@ class CDPAWorker:
         existing = await actions.locate_owned(state, role)
         if existing is not None:
             await self._dismiss_known_rate_limit_on_existing(existing)
-        elif self._rate_limit_gate_active():
+        elif self._rate_limit_gate_active(state=state):
             state["active_action"] = "rate_limit_cooldown"
             return None
         try:
@@ -2623,7 +2791,7 @@ class CDPAWorker:
             _, expected_conversation, _, _ = self._active_recovery_context(state, role)
             if expected_conversation is None:
                 raise
-            if self._rate_limit_gate_active():
+            if self._rate_limit_gate_active(state=state):
                 state["active_action"] = "rate_limit_cooldown"
                 return None
             acquired = await self._recover_active_role(state, role, actions)
@@ -2775,7 +2943,7 @@ class CDPAWorker:
 
             async def acquire_prewarm_role() -> AcquiredRole:
                 current_acquired = await actions.acquire_global_role(
-                    "BOOTSTRAP", allow_create=not self._rate_limit_gate_active()
+                    "BOOTSTRAP", allow_create=not self._rate_limit_gate_active(state=state)
                 )
                 if existing is None:
                     await current_acquired.client.new_chat(
@@ -2798,7 +2966,7 @@ class CDPAWorker:
             try:
                 acquired = await acquire_prewarm_role()
             except RoleOwnershipError:
-                if self._rate_limit_gate_active():
+                if self._rate_limit_gate_active(state=state):
                     state["active_action"] = "rate_limit_cooldown"
                     return None
                 raise
@@ -2867,7 +3035,7 @@ class CDPAWorker:
         actions: CDPATabActions,
         donor: Mapping[str, Any],
     ) -> AcquiredRole:
-        if self._rate_limit_gate_active():
+        if self._rate_limit_gate_active(state=state):
             raise RateLimitBlockedError(_RATE_LIMIT_BLOCK_MESSAGE)
         role_record = state["roles"][role]
         physical = str(role_record["physical_role"])
@@ -3074,7 +3242,7 @@ class CDPAWorker:
         if owned is not None:
             await self._dismiss_known_rate_limit_on_existing(owned)
             return owned
-        if self._rate_limit_gate_active():
+        if self._rate_limit_gate_active(state=state):
             state["active_action"] = "rate_limit_cooldown"
             return None
 
@@ -3164,7 +3332,7 @@ class CDPAWorker:
                         code="role_offline",
                     )
             else:
-                if self._rate_limit_gate_active():
+                if self._rate_limit_gate_active(state=state):
                     state["active_action"] = "rate_limit_cooldown"
                     return
                 acquired = await actions.fresh_chat(
@@ -3188,7 +3356,7 @@ class CDPAWorker:
                 state["active_action"] = "rate_limit_cooldown"
                 return
             current = await actions.locate_owned(state, role)
-            if current is None and self._rate_limit_gate_active():
+            if current is None and self._rate_limit_gate_active(state=state):
                 state["active_action"] = "rate_limit_cooldown"
                 return
             acquired = await actions.new_chat(state, role)
@@ -4679,7 +4847,7 @@ class CDPAWorker:
         acquired = await actions.locate_owned(state, role)
         reopened = acquired is None
         if acquired is None:
-            if self._rate_limit_gate_active():
+            if self._rate_limit_gate_active(state=state):
                 state["active_action"] = "rate_limit_cooldown"
                 return None
             acquired = await actions.reopen(state, role)
@@ -5010,7 +5178,7 @@ class CDPAWorker:
                     # the bounded branch/reacquire operation below. Resume must not
                     # fetch a full conversation graph as a preflight.
             use_ui_branch = not exact_donor and not proven_operator_fresh
-            if self._rate_limit_gate_active():
+            if self._rate_limit_gate_active(state=state):
                 state["active_action"] = "rate_limit_cooldown"
                 self._finish_resume_control(
                     state,
@@ -5218,7 +5386,7 @@ class CDPAWorker:
             )
             return
         generation = int(role_record.get("conversation_generation") or 0)
-        if self._rate_limit_gate_active():
+        if self._rate_limit_gate_active(state=state):
             state["active_action"] = "rate_limit_cooldown"
             self._finish_resume_control(
                 state,
@@ -6150,6 +6318,7 @@ class CDPAWorker:
         browser_context: Any,
         *,
         scheduling_tasks: Sequence[Mapping[str, Any]] | None = None,
+        endpoint_id: str | None = None,
     ) -> dict[str, Any] | None:
         path = Path(manifest_path).resolve()
         try:
@@ -6223,6 +6392,9 @@ class CDPAWorker:
                     state = json.loads(
                         json.dumps(state, ensure_ascii=False, default=str)
                     )
+                if endpoint_id is not None and not self._prepare_execution_endpoint(state, endpoint_id):
+                    state["active_action"] = "waiting_endpoint_recovery"
+                    return state
                 actions = CDPATabActions(browser_context, self.config)
                 if state.get("cleanup", {}).get("state") == "CLEARING":
                     await self._continue_cleanup(state, actions, path)
@@ -6692,6 +6864,7 @@ class CDPAWorker:
         actions: CDPATabActions,
         *,
         now_epoch: float | None = None,
+        endpoint_id: str | None = None,
     ) -> set[str]:
         if self.registry is None:
             return set()
@@ -6725,6 +6898,8 @@ class CDPAWorker:
                 continue
             role_record = (snapshot.get("roles") or {}).get(INDEPENDENT_ROLE)
             if not isinstance(role_record, Mapping):
+                continue
+            if endpoint_id is not None and str(role_record.get("browser_endpoint_id") or "") != endpoint_id:
                 continue
             if not role_record.get("page_id") or not role_record.get("page_url"):
                 continue
@@ -6851,6 +7026,7 @@ class CDPAWorker:
                     "degraded": True,
                     "error": "catalog discovery is incomplete",
                     "rate_limit_cooldown": self._rate_limit_cooldown,
+                "rate_limit_cooldowns": dict(self._rate_limit_cooldowns),
                 },
             )
             return catalog
@@ -7040,6 +7216,7 @@ class CDPAWorker:
                 "browser_connected": self._browser_connected,
                 "browser_error": self._browser_error,
                 "rate_limit_cooldown": self._rate_limit_cooldown,
+                "rate_limit_cooldowns": dict(self._rate_limit_cooldowns),
             },
         )
 
@@ -7819,6 +7996,48 @@ class CDPAWorker:
             }
         )
 
+    async def _publish_browser_pool_inventory(
+        self,
+        contexts: Mapping[str, Any],
+        runtime_snapshot: Mapping[str, Any],
+    ) -> None:
+        inventories = await asyncio.gather(
+            *(
+                build_browser_projection(
+                    context,
+                    previous=None,
+                    endpoint_id=endpoint_id,
+                )
+                for endpoint_id, context in contexts.items()
+            )
+        )
+        by_id = {str(item.get("endpoint_id") or ""): item for item in inventories}
+        pages: list[dict[str, Any]] = []
+        endpoints: list[dict[str, Any]] = []
+        for raw in runtime_snapshot.get("endpoints") or ():
+            if not isinstance(raw, Mapping):
+                continue
+            item = dict(raw)
+            endpoint_id = str(item.get("endpoint_id") or "")
+            inventory = by_id.get(endpoint_id)
+            endpoint_pages = list((inventory or {}).get("pages") or ())
+            item["connected"] = inventory is not None
+            item["page_count"] = len(endpoint_pages)
+            item["pages"] = endpoint_pages
+            endpoints.append(item)
+            pages.extend(endpoint_pages)
+        projection = {
+            "connected": bool(contexts),
+            "observed_at": utc_now(),
+            "page_count": len(pages),
+            "pages": pages,
+            "default_endpoint_id": runtime_snapshot.get("default_endpoint_id"),
+            "endpoints": endpoints,
+        }
+        self._last_browser_inventory_at = time.time()
+        self._last_browser_page_count = len(pages)
+        self._publish_browser_projection(projection)
+
     async def _publish_browser_inventory(self, browser_context: Any) -> None:
         now = time.time()
         page_count = len(list(getattr(browser_context, "pages", ())))
@@ -7878,7 +8097,9 @@ class CDPAWorker:
             self.runtime_db.upsert_task_projections(projections)
             self._publish_dashboard_actions()
 
-    def _ambient_page_has_active_controller(self, binding: Mapping[str, Any]) -> bool:
+    def _ambient_page_has_active_controller(
+        self, binding: Mapping[str, Any], *, endpoint_id: str | None = None
+    ) -> bool:
         if self.registry is None:
             return False
         task_id = str(binding.get("taskId") or "").strip()
@@ -7905,13 +8126,16 @@ class CDPAWorker:
         role_record = (task.get("roles") or {}).get(logical_role)
         return bool(
             isinstance(role_record, Mapping)
+            and (endpoint_id is None or str(role_record.get("browser_endpoint_id") or "") == endpoint_id)
             and str(role_record.get("page_id") or "").strip() == page_id
             and str(active_hop.get("state") or "") in {
                 "pre_send", "sending", "sent", "waiting", "responded"
             }
         )
 
-    async def _maintain_ambient_page_automation(self, browser_context: Any) -> None:
+    async def _maintain_ambient_page_automation(
+        self, browser_context: Any, *, endpoint_id: str | None = None
+    ) -> None:
         """Install once on CDPA-history pages; active/history consumers share evidence."""
         from .role_runtime.page_observer import observer_for
         from urllib.parse import urlparse
@@ -7938,6 +8162,8 @@ class CDPAWorker:
                         known_urls = {}
                         for task in (self.registry.tasks_by_id.values() if self.registry else ()):
                             for record in (task.get("roles") or {}).values():
+                                if endpoint_id is not None and str(record.get("browser_endpoint_id") or "") != endpoint_id:
+                                    continue
                                 url = str(record.get("page_url") or "")
                                 if url:
                                     known_urls[url] = {"team": task.get("team"), "taskId": task.get("task_id"),
@@ -7955,7 +8181,7 @@ class CDPAWorker:
                 await client.install_page_observer()
                 if urlparse(str(page.url)).hostname not in {"chatgpt.com", "www.chatgpt.com"}:
                     continue
-                if self._ambient_page_has_active_controller(binding):
+                if self._ambient_page_has_active_controller(binding, endpoint_id=endpoint_id):
                     continue
                 observer = observer_for(page)
                 if not due and not observer.dom_wake.is_set() and not (not dom_only and observer.network_wake.is_set()):
@@ -7974,7 +8200,14 @@ class CDPAWorker:
             for key in set(mapping) - live:
                 mapping.pop(key, None)
 
-    async def run_once(self, browser_context: Any) -> list[dict[str, Any] | None]:
+    async def run_once(
+        self,
+        browser_context: Any | None,
+        *,
+        endpoint_id: str | None = None,
+        publish_browser: bool = True,
+        endpoint_pool: Any | None = None,
+    ) -> list[dict[str, Any] | None]:
         hydrated_now = False
         if self.registry is None and not self.runtime_degraded:
             self.hydrate_runtime()
@@ -7982,26 +8215,64 @@ class CDPAWorker:
         if self.runtime_degraded or self.registry is None:
             self._publish_heartbeat()
             return []
+        contexts: Mapping[str, Any] = (
+            endpoint_pool.contexts if endpoint_pool is not None else {}
+        )
+        if endpoint_pool is None and browser_context is None:
+            raise ValueError("single-endpoint cycle requires a browser context")
         self._browser_cycle_active = True
         try:
-            await self._maintain_ambient_page_automation(browser_context)
-            await self._publish_browser_inventory(browser_context)
-            await self._refresh_rate_limit_cooldown(browser_context)
+            if endpoint_pool is not None:
+                for current_endpoint_id, context in contexts.items():
+                    await self._maintain_ambient_page_automation(
+                        context, endpoint_id=current_endpoint_id
+                    )
+                if publish_browser:
+                    await self._publish_browser_pool_inventory(
+                        contexts,
+                        endpoint_pool.snapshot(
+                            running_executions=self._running_executions(),
+                            cooldown_scopes=self._active_rate_limit_scopes(),
+                        ),
+                    )
+                if contexts:
+                    await self._refresh_rate_limit_cooldown(
+                        next(iter(contexts.values()))
+                    )
+            else:
+                assert browser_context is not None
+                await self._maintain_ambient_page_automation(browser_context)
+                if publish_browser:
+                    await self._publish_browser_inventory(browser_context)
+                await self._refresh_rate_limit_cooldown(browser_context)
             self._activate_independent_agents()
-            await self._close_idle_independent_tabs(
-                CDPATabActions(browser_context, self.config)
-            )
+            if endpoint_pool is not None:
+                for current_endpoint_id, context in contexts.items():
+                    await self._close_idle_independent_tabs(
+                        CDPATabActions(context, self.config),
+                        endpoint_id=current_endpoint_id,
+                    )
+            else:
+                assert browser_context is not None
+                await self._close_idle_independent_tabs(
+                    CDPATabActions(browser_context, self.config)
+                )
             now = time.time()
             due_at = now + MINIMUM_DEADLINE_SECONDS if hydrated_now else now
             results: list[dict[str, Any] | None] = []
             disconnect: BaseException | None = None
+            pool_errors: list[str] = []
             affected: set[str] = set()
-            running: dict[asyncio.Task[Any], tuple[str, Path]] = {}
+            running: dict[
+                asyncio.Task[Any], tuple[str, Path, str | None]
+            ] = {}
             scheduled_versions: dict[str, str] = {}
+            reservations: dict[str, int] = {}
 
             def schedule_due(at: float, *, controls_only: bool = False) -> None:
                 scheduling_tasks = list(self.registry.tasks_by_id.values())
-                active_ids = {task_id for task_id, _path in running.values()}
+                active_ids = {task_id for task_id, _path, _endpoint in running.values()}
+                durable_running = self._running_executions(scheduling_tasks)
                 for task_id in self.registry.due_task_ids(at):
                     state = self.registry.tasks_by_id[task_id]
                     if controls_only and not any(
@@ -8012,15 +8283,50 @@ class CDPAWorker:
                     version = str(state.get("updated_at") or "")
                     if task_id in active_ids or scheduled_versions.get(task_id) == version:
                         continue
-                    path = self.registry.paths_by_id[task_id]
-                    task = asyncio.create_task(
-                        self.advance(
-                            path,
-                            browser_context,
-                            scheduling_tasks=scheduling_tasks,
+                    selected_endpoint = endpoint_id
+                    selected_context = browser_context
+                    if endpoint_pool is not None:
+                        affinity = self._role_endpoint_affinity(state)
+                        running_others = [
+                            item
+                            for item in durable_running
+                            if str(item.get("task_id") or "") != task_id
+                        ]
+                        selected_endpoint = endpoint_pool.select_endpoint(
+                            running_others,
+                            affinity_endpoint_id=affinity,
+                            cooldown_scopes=self._active_rate_limit_scopes(),
+                            reservations=reservations,
                         )
+                        if selected_endpoint is None:
+                            continue
+                        if (
+                            affinity is not None
+                            and selected_endpoint != affinity
+                            and not self._execution_can_relocate(
+                                state, selected_endpoint
+                            )
+                        ):
+                            continue
+                        selected_context = contexts.get(selected_endpoint)
+                        if selected_context is None:
+                            continue
+                    if selected_context is None:
+                        continue
+                    path = self.registry.paths_by_id[task_id]
+                    kwargs: dict[str, Any] = {
+                        "scheduling_tasks": scheduling_tasks
+                    }
+                    if selected_endpoint is not None:
+                        kwargs["endpoint_id"] = selected_endpoint
+                    task = asyncio.create_task(
+                        self.advance(path, selected_context, **kwargs)
                     )
-                    running[task] = (task_id, path)
+                    running[task] = (task_id, path, selected_endpoint)
+                    if endpoint_pool is not None and selected_endpoint is not None:
+                        reservations[selected_endpoint] = (
+                            reservations.get(selected_endpoint, 0) + 1
+                        )
                     scheduled_versions[task_id] = version
 
             schedule_due(due_at)
@@ -8031,14 +8337,23 @@ class CDPAWorker:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 for task in done:
-                    task_id, path = running.pop(task)
+                    task_id, path, selected_endpoint = running.pop(task)
+                    if endpoint_pool is not None and selected_endpoint is not None:
+                        reservations[selected_endpoint] = max(
+                            0, reservations.get(selected_endpoint, 0) - 1
+                        )
                     try:
                         result = task.result()
                     except BaseException as exc:
                         result = exc
                     if isinstance(result, BaseException):
                         if is_cdp_disconnect(result):
-                            disconnect = disconnect or result
+                            if endpoint_pool is None:
+                                disconnect = disconnect or result
+                            else:
+                                pool_errors.append(
+                                    f"{selected_endpoint}: {type(result).__name__}: {result}"
+                                )
                         else:
                             print(
                                 f"cdpa-worker: manifest {path}: {type(result).__name__}: {result}",
@@ -8070,10 +8385,53 @@ class CDPAWorker:
                 raise disconnect
             self._publish_affected(affected)
             self._activate_independent_agents()
-            self._publish_heartbeat(browser_connected=True)
+            if endpoint_pool is not None:
+                if publish_browser:
+                    await self._publish_browser_pool_inventory(
+                        contexts,
+                        endpoint_pool.snapshot(
+                            running_executions=self._running_executions(),
+                            cooldown_scopes=self._active_rate_limit_scopes(),
+                        ),
+                    )
+                self._publish_heartbeat(
+                    browser_connected=bool(contexts),
+                    browser_error="; ".join(pool_errors) or None,
+                )
+            elif publish_browser:
+                self._publish_heartbeat(browser_connected=True)
             return results
         finally:
             self._browser_cycle_active = False
+
+    async def run_once_pool(self, endpoint_pool: Any) -> list[dict[str, Any] | None]:
+        return await self.run_once(None, endpoint_pool=endpoint_pool)
+
+    async def run_pool_forever(self, endpoint_pool: Any) -> None:
+        first_refresh = True
+        while True:
+            await endpoint_pool.refresh(wait=first_refresh)
+            first_refresh = False
+            if endpoint_pool.contexts:
+                await self.run_once_pool(endpoint_pool)
+            else:
+                await self._publish_browser_pool_inventory(
+                    {},
+                    endpoint_pool.snapshot(
+                        running_executions=self._running_executions()
+                    ),
+                )
+                self._publish_heartbeat(
+                    force=True,
+                    browser_connected=False,
+                    browser_error="no usable browser endpoint",
+                )
+            now = time.time()
+            next_due = self.registry.next_due_at() if self.registry else None
+            delay = self.config.command_poll_seconds
+            if next_due is not None:
+                delay = min(delay, max(0.5, next_due - now))
+            await asyncio.sleep(delay)
 
     async def run_forever(self, browser_context: Any) -> None:
         browser = getattr(browser_context, "browser", None)
@@ -8094,43 +8452,19 @@ class CDPAWorker:
 async def _run(config: CDPAConfig) -> None:
     worker = CDPAWorker(config)
     worker.hydrate_runtime()
+    endpoint_pool = EndpointPool(
+        worker.store.endpoints,
+        retry_delay=max(1.0, min(15.0, config.worker_poll_seconds * 2)),
+    )
     command_task = asyncio.create_task(worker.run_command_loop())
     heartbeat_task = asyncio.create_task(worker._heartbeat_loop())
-    reconnect_delay = max(0.5, min(2.0, config.worker_poll_seconds))
-    last_reconnect_signature: str | None = None
-    last_reconnect_log_at = 0.0
     try:
-        while True:
-            try:
-                async with connected_browser(config.cdp_url) as browser:
-                    if not browser.contexts:
-                        raise RuntimeError("CDP browser has no persistent context")
-                    reconnect_delay = max(0.5, min(2.0, config.worker_poll_seconds))
-                    last_reconnect_signature = None
-                    worker._publish_heartbeat(force=True, browser_connected=True)
-                    await worker.run_forever(browser.contexts[0])
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                signature = f"{type(exc).__name__}: {exc}"
-                worker._publish_browser_disconnected()
-                worker._publish_heartbeat(
-                    force=True, browser_connected=False, browser_error=signature
-                )
-                now = time.monotonic()
-                if (
-                    signature != last_reconnect_signature
-                    or now - last_reconnect_log_at >= 60.0
-                ):
-                    print(f"cdpa-worker: CDP reconnect after {signature}", file=sys.stderr)
-                    last_reconnect_signature = signature
-                    last_reconnect_log_at = now
-                await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(10.0, reconnect_delay * 2)
+        await worker.run_pool_forever(endpoint_pool)
     finally:
         command_task.cancel()
         heartbeat_task.cancel()
         await asyncio.gather(command_task, heartbeat_task, return_exceptions=True)
+        await endpoint_pool.close()
         worker.runtime_db.close()
 
 

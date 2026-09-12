@@ -68,13 +68,19 @@ async def build_browser_projection(
     browser_context: Any,
     *,
     previous: Mapping[str, Any] | None,
+    endpoint_id: str | None = None,
 ) -> dict[str, Any]:
     pages = await asyncio.gather(
         *(inspect_page_metadata(page) for page in list(getattr(browser_context, "pages", ())))
     )
+    if endpoint_id is not None:
+        pages = [{**page, "endpoint_id": endpoint_id} for page in pages]
     pages = sorted(pages, key=lambda item: (str(item.get("page_id") or ""), item["url"]))
-    return {
+    projection = {
         "connected": True,
         "page_count": len(pages),
         "pages": pages,
     }
+    if endpoint_id is not None:
+        projection["endpoint_id"] = endpoint_id
+    return projection

@@ -63,3 +63,16 @@ def test_browser_projection_is_stable_and_contains_no_chat_content():
     assert "dialog" not in serialized
     assert "button" not in serialized
     assert first["page_count"] == 1
+
+
+
+def test_browser_projection_carries_endpoint_identity_on_every_page():
+    page = FakePage()
+    context = SimpleNamespace(pages=[page])
+
+    projection = asyncio.run(
+        build_browser_projection(context, previous=None, endpoint_id="endpoint-a")
+    )
+
+    assert projection["endpoint_id"] == "endpoint-a"
+    assert projection["pages"][0]["endpoint_id"] == "endpoint-a"
