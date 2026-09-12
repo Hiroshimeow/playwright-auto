@@ -8,6 +8,7 @@ from playwright_auto.cdpa_worker import CDPAWorker, _active_hop
 
 from test_cdpa_core import write_config
 from test_cdpa_worker import FakeActions, _prepare_sent_waiting_task, ready_client
+from test_operator_resume_recovery import _prepare_pristine_new_sending_record
 
 
 TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true"
@@ -127,3 +128,33 @@ def test_cross_endpoint_accepted_temporary_recovery_starts_new_temporary_generat
     assert role["browser_endpoint_id"] == new_endpoint
     assert role["page_url"] == TEMPORARY_CHAT_URL
     assert recovery["state"] == "sending"
+
+
+def test_same_endpoint_pristine_temporary_resume_starts_new_temporary_generation(tmp_path: Path):
+    _store, state, worker, _path, hop, ledger, _donor = _prepare_pristine_new_sending_record(
+        tmp_path, task_id="task-temp-pristine-resume"
+    )
+    state["conversation_mode"] = "temporary"
+    state["context_policy"] = "bootstrap"
+    original_request_id = hop["request_id"]
+
+    class Actions(TemporaryWorkflowActions):
+        async def branch_from_anchor(self, *_args, **_kwargs):
+            raise AssertionError("temporary resume must not branch from a persistent donor")
+
+        async def restart(self, *_args, **_kwargs):
+            raise AssertionError("temporary resume must not use persistent restart")
+
+    actions = Actions()
+    control = state["controls"][-1]
+    asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
+
+    current = ledger.get(original_request_id)
+    assert actions.fresh_urls == [TEMPORARY_CHAT_URL]
+    assert hop["request_id"] == original_request_id
+    assert hop["state"] == "sending"
+    assert control["status"] == "applied"
+    assert state["roles"]["PLAN"]["page_url"] == TEMPORARY_CHAT_URL
+    assert current is not None
+    assert current.attempts == 0
+    assert current.receipt is None

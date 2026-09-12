@@ -5179,6 +5179,7 @@ class CDPAWorker:
         action = "confirm_preboundary_role"
         postcondition = "ownership_confirmed_before_send"
         explicit_fresh = state.get("context_policy") == "fresh"
+        temporary_recovery = state.get("conversation_mode") == "temporary"
         proven_operator_fresh = False
         if acquired is None:
             if state.get("attachments"):
@@ -5191,8 +5192,13 @@ class CDPAWorker:
                     next_safe_action="Restore the exact attachment-owning pre-send page before Resume.",
                 )
                 return
-            exact_donor = role_record.get("context_source") == "bootstrap_donor"
-            if exact_donor:
+            exact_donor = (
+                not temporary_recovery
+                and role_record.get("context_source") == "bootstrap_donor"
+            )
+            if temporary_recovery:
+                proven_operator_fresh = True
+            elif exact_donor:
                 try:
                     donor = normalize_bootstrap_donor(role_record.get("bootstrap_source_donor"))
                 except Exception:
@@ -5266,17 +5272,18 @@ class CDPAWorker:
                 return
             if proven_operator_fresh:
                 try:
-                    if explicit_fresh:
+                    if explicit_fresh or temporary_recovery:
                         acquired = await actions.fresh_chat(
                             state,
                             role,
                             url=(
                                 "https://chatgpt.com/?temporary-chat=true"
-                                if state.get("conversation_mode") == "temporary"
+                                if temporary_recovery
                                 else "https://chatgpt.com/"
                             ),
                         )
-                        role_record["context_source"] = "fresh"
+                        if explicit_fresh:
+                            role_record["context_source"] = "fresh"
                     else:
                         acquired = await actions.restart(
                             state,
