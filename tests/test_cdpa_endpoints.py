@@ -97,6 +97,11 @@ def test_managed_remote_and_unsafe_profile_are_rejected(tmp_path):
     catalog = registry(tmp_path)
     with pytest.raises(ValueError, match="local"):
         catalog.add("100.80.10.4:9222", management_mode="managed-local", profile_path=str(tmp_path))
+    with pytest.raises(ValueError, match="HTTP"):
+        catalog.add(
+            "ws://127.0.0.1:9202/devtools/browser/test",
+            management_mode="managed-local", profile_path=str(tmp_path),
+        )
     with pytest.raises(ValueError, match="absolute"):
         catalog.add("9202", management_mode="managed-local", profile_path="relative/profile")
 

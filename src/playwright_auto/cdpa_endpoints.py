@@ -6,6 +6,7 @@ import re
 import tempfile
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from .connection import is_local_cdp_endpoint, normalize_cdp_endpoint
@@ -35,7 +36,7 @@ def normalize_endpoint_record(raw: Mapping[str, Any], *, endpoint_id: str) -> di
     if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
         raise ValueError("browser max_active_tabs must be a positive integer")
     result["max_active_tabs"] = capacity
-    for name, default in (("label", address), ("rate_limit_scope", "shared")):
+    for name, default in (("label", address), ("rate_limit_scope", f"endpoint:{endpoint_id}")):
         value = raw.get(name, default)
         if not isinstance(value, str) or not value.strip() or len(value) > 256:
             raise ValueError(f"browser {name} must contain 1-256 characters")
@@ -47,6 +48,10 @@ def normalize_endpoint_record(raw: Mapping[str, Any], *, endpoint_id: str) -> di
         raise ValueError("management_mode must be external or managed-local")
     if mode == "managed-local" and not is_local_cdp_endpoint(address):
         raise ValueError("only local endpoints can have a managed process")
+    if mode == "managed-local":
+        parsed = urlsplit(address)
+        if parsed.scheme != "http" or parsed.port is None:
+            raise ValueError("managed-local browser requires a loopback HTTP endpoint with an explicit port")
     result["management_mode"] = mode
     for name in ("profile_path", "executable_path"):
         value = raw.get(name)
@@ -82,6 +87,8 @@ def endpoint_config_seeds(browser: Mapping[str, Any]) -> tuple[dict[str, Any], .
         record = normalize_endpoint_record(value, endpoint_id=identity)
         if "endpoint_id" not in value:
             record.pop("endpoint_id")
+            if "rate_limit_scope" not in value:
+                record.pop("rate_limit_scope")  # derive from the final durable ID at seeding
         seeds.append(record)
     identities = [item["endpoint_id"] for item in seeds if "endpoint_id" in item]
     if len(identities) != len(set(identities)):

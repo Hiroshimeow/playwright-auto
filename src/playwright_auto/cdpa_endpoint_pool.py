@@ -4,10 +4,12 @@ import asyncio
 import inspect
 import json
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Collection, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
+from uuid import UUID
 
 from .cdpa_endpoints import BrowserEndpointRegistry
 from .chatgpt import ChatGPTPage
@@ -71,6 +73,7 @@ class _Runtime:
     error: str | None = None
     observed_at: float | None = None
     retry_after: float = 0.0
+    auth_probe_after: float = 0.0
 
 
 class EndpointPool:
@@ -85,6 +88,7 @@ class EndpointPool:
         auth_probe: Callable[[Any], Awaitable[Mapping[str, Any]]] = probe_chatgpt_auth,
         clock: Callable[[], float] = time.monotonic,
         retry_delay: float = 15.0,
+        auth_refresh_seconds: float = 15.0,
     ) -> None:
         self.registry = registry
         self.connector = connector
@@ -92,6 +96,7 @@ class EndpointPool:
         self.auth_probe = auth_probe
         self.clock = clock
         self.retry_delay = retry_delay
+        self.auth_refresh_seconds = auth_refresh_seconds
         self._runtimes: dict[str, _Runtime] = {}
 
     @property
@@ -109,14 +114,32 @@ class EndpointPool:
         runtime.context = None
         runtime.physical_id = None
         if playwright is not None:
-            result = playwright.stop()
-            if inspect.isawaitable(result):
-                await result
+            with suppress(Exception):  # A broken attachment must not take healthy peers down.
+                result = playwright.stop()
+                if inspect.isawaitable(result):
+                    await result
 
     @staticmethod
     def _physical_identity(version: Mapping[str, Any], address: str) -> str:
         value = str(version.get("webSocketDebuggerUrl") or "").strip()
+        path = urlsplit(value).path
+        if path.startswith("/devtools/browser/"):
+            with suppress(ValueError):
+                return f"devtools:{UUID(path.removeprefix('/devtools/browser/'))}"
         return value or address
+
+    async def _refresh_auth(self, runtime: _Runtime) -> None:
+        try:
+            auth = await asyncio.wait_for(self.auth_probe(runtime.context), timeout=8.0)
+            runtime.auth_state = str(auth.get("auth_state") or "unknown")
+            runtime.chatgpt_ready = bool(auth.get("chatgpt_ready"))
+            runtime.error = None
+        except Exception as exc:
+            runtime.auth_state = "unknown"
+            runtime.chatgpt_ready = False
+            runtime.error = f"ChatGPT readiness probe failed: {exc}"
+        runtime.auth_probe_after = self.clock() + self.auth_refresh_seconds
+        runtime.observed_at = self.clock()
 
     async def _connect(self, record: Mapping[str, Any], runtime: _Runtime, claimed: set[str]) -> None:
         address = str(record["cdp_url"])
@@ -125,7 +148,9 @@ class EndpointPool:
         runtime.observed_at = self.clock()
         try:
             version = await self.version_probe(address)
-            playwright, browser = await self.connector(address)
+            playwright, browser = await asyncio.wait_for(self.connector(address), timeout=15.0)
+            runtime.playwright = playwright
+            runtime.browser = browser
             contexts = list(getattr(browser, "contexts", ()) or ())
             if not contexts:
                 raise RuntimeError("CDP browser has no contexts")
@@ -140,16 +165,15 @@ class EndpointPool:
                 runtime.chatgpt_ready = False
                 runtime.error = "physical browser is already owned by another endpoint"
                 await self._stop_attachment(runtime)
+                runtime.retry_after = self.clock() + self.retry_delay
                 return
             runtime.playwright = playwright
             runtime.browser = browser
             runtime.context = contexts[0]
             runtime.physical_id = physical_id
             claimed.add(physical_id)
-            auth = await self.auth_probe(runtime.context)
             runtime.health = "online"
-            runtime.auth_state = str(auth.get("auth_state") or "unknown")
-            runtime.chatgpt_ready = bool(auth.get("chatgpt_ready"))
+            await self._refresh_auth(runtime)
             runtime.retry_after = 0.0
             runtime.observed_at = self.clock()
         except Exception as exc:
@@ -193,8 +217,8 @@ class EndpointPool:
                 runtime = _Runtime(endpoint_id=endpoint_id, address=str(record["cdp_url"]))
                 self._runtimes[endpoint_id] = runtime
             if runtime.context is not None:
-                continue
-            if runtime.health == "conflict" and not wait:
+                if wait or now >= runtime.auth_probe_after:
+                    await self._refresh_auth(runtime)
                 continue
             if not wait and now < runtime.retry_after:
                 continue
@@ -274,6 +298,18 @@ class EndpointPool:
             return None
         eligible.sort(key=lambda item: item["active_count"])
         return str(eligible[0]["endpoint_id"])
+
+    async def mark_unavailable(self, endpoint_id: str, error: BaseException | str) -> None:
+        runtime = self._runtimes.get(endpoint_id)
+        if runtime is None:
+            return
+        await self._stop_attachment(runtime)
+        runtime.health = "offline"
+        runtime.auth_state = "unknown"
+        runtime.chatgpt_ready = False
+        runtime.error = str(error)
+        runtime.retry_after = self.clock() + self.retry_delay
+        runtime.observed_at = self.clock()
 
     async def close(self) -> None:
         for runtime in list(self._runtimes.values()):
