@@ -23,6 +23,7 @@ from .cdpa_commands import (
     workflow_control_eligibility,
 )
 from .cdpa_config import CDPAConfig
+from .cdpa_endpoints import BrowserEndpointRegistry
 from .cdpa_dependencies import (
     DependencyReadiness,
     dependency_readiness,
@@ -278,6 +279,11 @@ class TaskStore(IndependentAgentStoreMixin):
         self.phase4_journal_path = self.root / ".cdpa-phase4-replacement.journal"
         self.repair_journal_path = self.root / ".cdpa-repair-transaction.journal"
         self.workflow_agents = WorkflowAgentCatalog(config)
+        self.endpoints = BrowserEndpointRegistry(config)
+
+    def endpoint_id_for(self, state: Mapping[str, Any]) -> str:
+        """Missing legacy assignments refer to the original browser, never the default."""
+        return str(state["browser_endpoint_id"]) if "browser_endpoint_id" in state else self.endpoints.legacy_endpoint_id
 
     def _lock_path(self, manifest_path: Path) -> Path:
         return manifest_path.with_suffix(manifest_path.suffix + ".lock")
@@ -662,6 +668,13 @@ class TaskStore(IndependentAgentStoreMixin):
         if status not in _TASK_STATUSES:
             return f"unsupported task status {status!r}"
 
+        if "browser_endpoint_id" in state:
+            endpoint_id = state["browser_endpoint_id"]
+            if not isinstance(endpoint_id, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", endpoint_id) is None:
+                return "browser_endpoint_id must be a durable endpoint identifier"
+        if "conversation_mode" in state and state["conversation_mode"] not in {"persistent", "temporary"}:
+            return "conversation_mode must be persistent or temporary"
+
         typed_fields = {
             "roles": Mapping,
             "hops": list,
@@ -937,6 +950,8 @@ class TaskStore(IndependentAgentStoreMixin):
             record = roles.get(logical)
             if not isinstance(record, Mapping):
                 return f"role record {logical!r} must be an object"
+            if "browser_endpoint_id" in record and record["browser_endpoint_id"] != state.get("browser_endpoint_id"):
+                return f"role record {logical!r} endpoint does not match the task endpoint"
             if str(record.get("logical_role") or "").upper() != logical:
                 return f"role record {logical!r} has inconsistent logical_role"
             expected_physical = physical_role(logical, team_base, suffix)
@@ -1822,6 +1837,12 @@ class TaskStore(IndependentAgentStoreMixin):
                 )
                 result = mutator(current)
                 candidate = result if result is not None else current
+                for field in ("browser_endpoint_id", "conversation_mode"):
+                    if field in original and candidate.get(field) != original[field]:
+                        raise ValueError(f"task {field} is immutable")
+                if "browser_endpoint_id" not in original and "browser_endpoint_id" in candidate:
+                    if candidate["browser_endpoint_id"] != self.endpoint_id_for(original):
+                        raise ValueError("legacy task browser_endpoint_id is immutable")
                 if before_dependencies != normalize_dependency_ids(
                     candidate.get("depends_on_task_ids")
                 ):
@@ -2425,11 +2446,18 @@ class TaskStore(IndependentAgentStoreMixin):
         now: str,
         workflow_agents: Mapping[str, Mapping[str, Any]] | None = None,
         normalized_bootstrap: Mapping[str, Any] | None = None,
+        browser_endpoint_id: str | None = None,
+        conversation_mode: str | None = None,
     ) -> dict[str, Any]:
+        endpoint = self.endpoints.resolve(browser_endpoint_id)
+        mode = conversation_mode or ("temporary" if endpoint["temporary_default"] else "persistent")
+        if mode not in {"persistent", "temporary"}:
+            raise ValueError("conversation_mode must be persistent or temporary")
         roles = {}
         for logical in workflow_roles:
             roles[logical] = {
                 "logical_role": logical,
+                "browser_endpoint_id": endpoint["endpoint_id"],
                 "physical_role": physical_role(logical, base, suffix),
                 "status": "pending" if logical == "PLAN" else "unallocated",
                 "turn": 0,
@@ -2510,6 +2538,8 @@ class TaskStore(IndependentAgentStoreMixin):
         return {
             "schema_version": SCHEMA_VERSION,
             "task_mode": TASK_MODE_WORKFLOW,
+            "browser_endpoint_id": endpoint["endpoint_id"],
+            "conversation_mode": mode,
             **(
                 {
                     "bootstrap": json.loads(
@@ -2735,8 +2765,15 @@ class TaskStore(IndependentAgentStoreMixin):
         replacement_incident_id: str | None = None,
         upload_paths: Sequence[str | Path] = (),
         bootstrap: Mapping[str, Any] | None = None,
+        browser_endpoint_id: str | None = None,
+        temporary: bool = False,
+        conversation_mode: str | None = None,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
+        if type(temporary) is not bool:
+            raise ValueError("temporary must be a boolean")
+        if conversation_mode is not None and conversation_mode not in {"persistent", "temporary"}:
+            raise ValueError("conversation_mode must be persistent or temporary")
         text = str(task).strip()
         if not text:
             raise ValueError("task must not be empty")
@@ -2918,12 +2955,19 @@ class TaskStore(IndependentAgentStoreMixin):
                     )
                     is not None
                 }
+                endpoint = self.endpoints.resolve(browser_endpoint_id)
+                foreign_suffixes = {
+                    reserved
+                    for item in manifests
+                    if self.endpoint_id_for(item) != endpoint["endpoint_id"]
+                    and (reserved := self._team_suffix_reservation(base, str(item.get("team") or ""))) is not None
+                }
                 team, suffix = allocate_team(
                     base,
                     [*manifests, *catalog_reservations, *filesystem_reservations],
                     reserved_suffixes=(
                         *reserved_team_suffixes,
-                        *sorted(inferred_suffixes),
+                        *sorted(inferred_suffixes | foreign_suffixes),
                     ),
                 )
                 terminal_candidates = sorted(
@@ -2932,6 +2976,7 @@ class TaskStore(IndependentAgentStoreMixin):
                         for item in manifests
                         if str(item.get("status") or "").upper() in TERMINAL
                         and int(item.get("team_suffix") or 1) == suffix
+                        and self.endpoint_id_for(item) == endpoint["endpoint_id"]
                     ),
                     key=lambda item: str(
                         item.get("completed_at")
@@ -2952,6 +2997,15 @@ class TaskStore(IndependentAgentStoreMixin):
                 )
             if set(normalized_new) - set(workflow_roles):
                 raise ValueError("new_roles must be selected workflow roles")
+            if exact_reuse_team is not None:
+                assigned = {self.endpoint_id_for(item) for item in exact_states}
+                if len(assigned) != 1:
+                    raise ValueError("exact team has inconsistent endpoint assignment")
+                inherited_endpoint_id = assigned.pop()
+                if browser_endpoint_id is not None and self.endpoints.resolve(browser_endpoint_id)["endpoint_id"] != inherited_endpoint_id:
+                    raise ValueError("exact team endpoint is locked to its original browser")
+                endpoint = self.endpoints.resolve(inherited_endpoint_id)
+            selected_mode = conversation_mode or ("temporary" if temporary or endpoint["temporary_default"] else "persistent")
             workflow_agent_snapshot = self.workflow_agents.resolve(workflow_roles)
             title_slug = slugify(text)
             target = (self.root / team / task_id / f"{title_slug}.json").resolve()
@@ -2982,6 +3036,8 @@ class TaskStore(IndependentAgentStoreMixin):
                 now=now,
                 workflow_agents=workflow_agent_snapshot,
                 normalized_bootstrap=normalized_bootstrap,
+                browser_endpoint_id=endpoint["endpoint_id"],
+                conversation_mode=selected_mode,
             )
             self._record_external_command(state, external_command_id)
             saved = self._save_unlocked(target, state)
@@ -4462,6 +4518,8 @@ class TaskStore(IndependentAgentStoreMixin):
                     queue_reuse=False,
                     queue_blocked_by=None,
                     now=now,
+                    browser_endpoint_id=self.endpoint_id_for(target_state),
+                    conversation_mode=str(target_state.get("conversation_mode") or "persistent"),
                 )
                 replacement_state["dependency_events"].append(
                     {

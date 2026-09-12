@@ -66,6 +66,7 @@ class IndependentAgentStoreMixin:
         new_chat_next_job: bool = False,
         new_chat_deferred_task_id: str | None = None,
         close_tab_when_idle: bool = False,
+        browser_endpoint_id: str | None = None,
         now: str | None = None,
     ) -> dict[str, Any]:
         created = now or utc_now()
@@ -94,6 +95,8 @@ class IndependentAgentStoreMixin:
             queue_reuse=False,
             queue_blocked_by=None,
             now=created,
+            browser_endpoint_id=browser_endpoint_id,
+            conversation_mode="temporary" if temporary_chat else "persistent",
         )
         physical = physical_role(INDEPENDENT_ROLE, team, 1)
         previous_role = dict(inherited_role or {})
@@ -127,6 +130,7 @@ class IndependentAgentStoreMixin:
             )
         role = {
             "logical_role": INDEPENDENT_ROLE,
+            "browser_endpoint_id": state["browser_endpoint_id"],
             "physical_role": physical,
             "status": "pending" if enabled else "paused",
             "turn": 0,
@@ -603,6 +607,7 @@ class IndependentAgentStoreMixin:
                 max_cycles=effective_max_cycles,
                 max_cycles_explicit=max_cycles is not None,
                 temporary_chat=effective_temporary_chat,
+                browser_endpoint_id=self.endpoint_id_for(previous) if previous is not None else None,
                 inherited_role=(
                     previous["roles"][INDEPENDENT_ROLE]
                     if previous is not None
