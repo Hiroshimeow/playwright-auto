@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from playwright_auto.cdpa_actions import CDPATabActions
 from playwright_auto.cdpa_worker import CDPAWorker
 from playwright_auto.connection import connect
+from accept_cdpa_workflow import stable_target_ids, target_types
 
 
 def targets(address):
@@ -37,8 +38,10 @@ def canonical(value):
 async def probe(address, evidence_path):
     tag = "cdpa-transport-" + uuid4().hex[:12]
     evidence = {"endpoint": address, "tag": tag, "started_at": datetime.now(timezone.utc).isoformat(), "events": []}
-    before = await asyncio.to_thread(targets, address)
+    before_types = await asyncio.to_thread(target_types, address)
+    before = sorted(before_types)
     evidence["target_ids_before"] = before
+    evidence["target_types_before"] = before_types
     owned = []
     pw, browser = await connect(address)
     context = browser.contexts[0]
@@ -138,22 +141,25 @@ async def probe(address, evidence_path):
             if not page.is_closed():
                 await page.close()
         await pw.stop()
-        after_ids = await asyncio.to_thread(targets, address)
+        after_types = await asyncio.to_thread(target_types, address)
         for _ in range(300):
-            if before == after_ids:
+            if stable_target_ids(before_types) == stable_target_ids(after_types):
                 break
             await asyncio.sleep(0.2)
-            after_ids = await asyncio.to_thread(targets, address)
+            after_types = await asyncio.to_thread(target_types, address)
+        after_ids = sorted(after_types)
         evidence["target_ids_after"] = after_ids
+        evidence["target_types_after"] = after_types
+        evidence["non_service_worker_target_sets_unchanged"] = stable_target_ids(before_types) == stable_target_ids(after_types)
         evidence["original_targets_preserved"] = set(before).issubset(after_ids)
         evidence["target_sets_unchanged"] = before == after_ids
-        if not evidence["target_sets_unchanged"]:
+        if not evidence["non_service_worker_target_sets_unchanged"]:
             evidence["status"] = "failed"
             evidence["error"] = evidence.get("error") or "acceptance cleanup did not preserve exact browser target sets"
         evidence["finished_at"] = datetime.now(timezone.utc).isoformat()
         save()
         print(json.dumps({"endpoint": address, "status": evidence.get("status"), "evidence": str(evidence_path), "error": evidence.get("error")}), flush=True)
-        assert evidence["target_sets_unchanged"], evidence["error"]
+        assert evidence["non_service_worker_target_sets_unchanged"], evidence["error"]
 
 
 async def main():

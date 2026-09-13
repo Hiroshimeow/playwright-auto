@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from dataclasses import replace
 from pathlib import Path
 from urllib.request import urlopen
 
@@ -27,6 +28,7 @@ from playwright_auto.cdpa_endpoint_pool import EndpointPool
 from playwright_auto.cdpa_store import TaskStore
 from playwright_auto.cdpa_worker import CDPAWorker, _active_hop
 from playwright_auto.durable import RequestLedger, RequestStatus
+from playwright_auto.chatgpt import ChatGPTPage
 from playwright_auto.file_lock import exclusive_file_lock
 from playwright_auto.cdpa_worker import task_workflow_definitions
 
@@ -41,6 +43,18 @@ def targets(address):
 def target_types(address):
     with urlopen(address + "/json/list", timeout=5) as response:
         return {item["id"]: item.get("type") for item in json.load(response) if item.get("id")}
+
+
+def stable_target_ids(types: dict[str, str | None]) -> set[str]:
+    """Service workers may restart independently; all other surfaces stay exact."""
+    return {target_id for target_id, kind in types.items() if kind != "service_worker"}
+
+
+def assert_pipeline_role_sequence(state):
+    roles = [hop["target_role"] for hop in state["hops"]
+             if hop["kind"] not in {"route_repair", "report_repair"}]
+    assert roles == ["PLAN", "DEV", "TEST", "REVIEW", "PLAN"], roles
+    return roles
 
 
 def make_config(workspace):
@@ -135,7 +149,7 @@ async def run(args):
         "source_hashes": {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
                           for path in (ROOT / "src/playwright_auto").rglob("*.py")},
         "fault_injection": previous.get("fault_injection"), "project_grouping_disabled": True,
-        "filesystem_tool": filesystem_tool,
+        "filesystem_tool": filesystem_tool, "run_kind": "resume" if args.resume else "fresh",
         "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "checkpoint_sha256_before": hashlib.sha256((workspace / "checkpoint.md").read_bytes()).hexdigest()}
     if previous.get("error"):
@@ -144,9 +158,10 @@ async def run(args):
     evidence["passed"] = False
     existing_result = workspace / "result.txt"
     evidence["result_sha256_before_run"] = hashlib.sha256(existing_result.read_bytes()).hexdigest() if existing_result.exists() else None
-    before = {key: await asyncio.to_thread(targets, url) for key, url in ADDRESSES.items()}
+    before_types = {key: await asyncio.to_thread(target_types, url) for key, url in ADDRESSES.items()}
+    before = {key: set(types) for key, types in before_types.items()}
     evidence["target_ids_before"] = {key: sorted(ids) for key, ids in before.items()}
-    evidence["target_types_before"] = {key: await asyncio.to_thread(target_types, url) for key, url in ADDRESSES.items()}
+    evidence["target_types_before"] = before_types
     def save():
         evidence_path.write_text(json.dumps(evidence, indent=2, default=str), encoding="utf-8")
     def event(kind, **values):
@@ -164,7 +179,7 @@ async def run(args):
                 old_token = await worker._temporary_document_token(acquired.client, create=True)
                 await acquired.client.page.reload(wait_until="domcontentloaded", timeout=30000)
                 new_token = await worker._temporary_document_token(acquired.client)
-                event("temporary_f5", document_changed=bool(old_token and old_token != new_token))
+                event("temporary_f5", old_document_id=old_token, document_changed=bool(old_token and old_token != new_token))
             else:
                 await acquired.client.page.close()
         fault_done = True
@@ -190,7 +205,22 @@ async def run(args):
             await partition(endpoint_id, current, hop, actions)
             raise ConnectionError("browser has been closed: acceptance pre-send partition")
         await original_send(current, hop, actions)
+        if args.scenario == "ambiguous" and not fault_done and hop["state"] == "sending":
+            durable = RequestLedger(hop["ledger_path"]).peek(hop["request_id"])
+            if durable and durable.status is RequestStatus.SENDING and durable.attempts == 1 and durable.receipt is None:
+                endpoint_id = current["roles"][hop["target_role"]]["browser_endpoint_id"]
+                event("ambiguous_send_provenance", attempts=1, receipt=None)
+                await partition(endpoint_id, current, hop, actions)
+                raise ConnectionError("browser has been closed: acceptance ambiguous-send partition")
     worker._sending = send_with_fault
+    original_page_send = ChatGPTPage.send
+    async def ambiguous_page_send(client, *args, **kwargs):
+        receipt = await original_page_send(client, *args, **kwargs)
+        if not fault_done:
+            return replace(receipt, accepted_via="stop_button", user_message_id=None, user_turn_id=None)
+        return receipt
+    if args.scenario == "ambiguous":
+        ChatGPTPage.send = ambiguous_page_send
     last = None
     started = time.monotonic()
     heartbeat = asyncio.create_task(worker._heartbeat_loop())
@@ -219,6 +249,12 @@ async def run(args):
                 # Cross Send deliberately. Existing checkpoint is authoritative regardless of partial prose.
                 source = state["roles"][hop["target_role"]].get("browser_endpoint_id")
                 await partition(source, state, hop, CDPATabActions(pool.contexts[source], config), reload_first=args.scenario == "f5")
+            if args.scenario == "ambiguous" and not fault_done and hop["state"] == "sending":
+                durable = RequestLedger(hop["ledger_path"]).peek(hop["request_id"])
+                if durable and durable.status is RequestStatus.SENDING and durable.attempts == 1 and durable.receipt is None:
+                    source = state["roles"][hop["target_role"]]["browser_endpoint_id"]
+                    event("ambiguous_send_provenance", attempts=1, receipt=None)
+                    await partition(source, state, hop, CDPATabActions(pool.contexts[source], config))
             if state["status"] in {"DONE", "BLOCKED", "PAUSED", "STOPPED"}:
                 break
             await asyncio.sleep(0.3)
@@ -238,14 +274,22 @@ async def run(args):
         assert hashlib.sha256((workspace / "checkpoint.md").read_bytes()).hexdigest() == evidence["checkpoint_sha256_before"], "checkpoint changed"
         assert all(item["attempts"] == 1 for item in evidence["requests"]), "every executed request must have exactly one Send attempt"
         if args.scenario == "pipeline":
+            evidence["pipeline_role_sequence"] = assert_pipeline_role_sequence(state)
             assert state["roles"]["PLAN"]["browser_endpoint_id"] != state["roles"]["DEV"]["browser_endpoint_id"]
-        if args.scenario in {"pre-send", "accepted", "f5"}:
+        if args.scenario in {"pre-send", "accepted", "ambiguous", "f5"}:
             assert fault_done
             assert state["roles"]["PLAN"]["browser_endpoint_id"] != evidence["fault_injection"]["endpoint"]
             if args.scenario == "pre-send":
                 assert state["hops"][0]["request_id"] == evidence["fault_injection"]["request_id"]
+                assert state["hops"][0]["hop_id"] == evidence["fault_injection"]["hop_id"]
+                assert not any(hop.get("recovery_of_request_id") for hop in state["hops"])
             else:
                 assert any(hop.get("recovery_of_request_id") == evidence["fault_injection"]["request_id"] for hop in state["hops"])
+        if args.scenario == "f5":
+            f5 = next(item for item in evidence["events"] if item["kind"] == "temporary_f5")
+            assert f5["document_changed"]
+            assert state["roles"]["PLAN"]["conversation_generation"] >= 2
+            assert state["roles"]["PLAN"]["temporary_document_id"] != f5["old_document_id"]
         evidence["result_sha256_after_run"] = hashlib.sha256((workspace / "result.txt").read_bytes()).hexdigest()
         if evidence["result_sha256_before_run"]:
             assert evidence["result_sha256_before_run"] == evidence["result_sha256_after_run"], "recovery rewrote existing result bytes"
@@ -256,6 +300,7 @@ async def run(args):
         evidence["error"] = f"{type(exc).__name__}: {exc}"
         raise
     finally:
+        ChatGPTPage.send = original_page_send
         heartbeat.cancel()
         await asyncio.gather(heartbeat, return_exceptions=True)
         blocked.clear()
@@ -274,22 +319,24 @@ async def run(args):
                     evidence.setdefault("cleanup_errors", []).append(type(exc).__name__)
         await pool.close()
         worker.runtime_db.close()
-        after = {key: await asyncio.to_thread(targets, url) for key, url in ADDRESSES.items()}
-        evidence["target_types_cleanup_start"] = {key: await asyncio.to_thread(target_types, url) for key, url in ADDRESSES.items()}
+        after_types = {key: await asyncio.to_thread(target_types, url) for key, url in ADDRESSES.items()}
+        evidence["target_types_cleanup_start"] = after_types
         for _ in range(300):
-            if before == after:
+            if all(stable_target_ids(before_types[key]) == stable_target_ids(after_types[key]) for key in before):
                 break
             await asyncio.sleep(0.2)
-            after = {key: await asyncio.to_thread(targets, url) for key, url in ADDRESSES.items()}
+            after_types = {key: await asyncio.to_thread(target_types, url) for key, url in ADDRESSES.items()}
+        after = {key: set(types) for key, types in after_types.items()}
         evidence["target_ids_after"] = {key: sorted(ids) for key, ids in after.items()}
-        evidence["target_types_after"] = {key: await asyncio.to_thread(target_types, url) for key, url in ADDRESSES.items()}
+        evidence["target_types_after"] = after_types
+        evidence["non_service_worker_target_sets_unchanged"] = {key: stable_target_ids(before_types[key]) == stable_target_ids(after_types[key]) for key in before}
         evidence["target_delta"] = {key: {"added": sorted(after[key] - before[key]), "removed": sorted(before[key] - after[key])} for key in before}
         evidence["original_targets_preserved"] = {key: before[key].issubset(after[key]) for key in before}
         evidence["target_sets_unchanged"] = {key: before[key] == after[key] for key in before}
-        cleanup_safe = all(evidence["target_sets_unchanged"].values()) and not evidence.get("cleanup_errors")
+        cleanup_safe = all(evidence["non_service_worker_target_sets_unchanged"].values()) and not evidence.get("cleanup_errors")
         if not cleanup_safe:
             evidence["passed"] = False
-            evidence["error"] = evidence.get("error") or "acceptance cleanup did not preserve exact browser target sets"
+            evidence["error"] = evidence.get("error") or "acceptance cleanup did not preserve exact non-service-worker browser targets"
         evidence["finished_at"] = datetime.now(timezone.utc).isoformat()
         save()
         print(json.dumps({"passed": evidence.get("passed"), "status": evidence.get("final_status"), "evidence": str(evidence_path), "error": evidence.get("error")}), flush=True)
@@ -301,7 +348,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--workspace", required=True, type=Path)
     parser.add_argument("--mode", choices=["persistent", "temporary"], default="persistent")
-    parser.add_argument("--scenario", choices=["smoke", "pipeline", "pre-send", "accepted", "f5"], default="smoke")
+    parser.add_argument("--scenario", choices=["smoke", "pipeline", "pre-send", "accepted", "ambiguous", "f5"], default="smoke")
     parser.add_argument("--endpoint", choices=list(ADDRESSES), default="live-a")
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--resume")
