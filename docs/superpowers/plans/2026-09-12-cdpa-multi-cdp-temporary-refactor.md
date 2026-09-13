@@ -1390,11 +1390,11 @@ Kết quả phase: bootstrap persistent không còn phụ thuộc DOM branch v�
 - [x] Verify pre-send relocation, accepted-send non-replay recovery, pool exhaustion waiting, rate-limit-scope isolation, and capacity release.
 - [x] Verify disconnect/reconnect isolation.
 - [x] Verify persistent workflow trên hai endpoint.
-- [ ] Verify Temporary default và `--temp` trên hai endpoint.
-- [ ] Verify direct bootstrap `/branch/C/A` + canonical `new_branch` identity.
-- [ ] Verify explicit fresh recovery semantics.
+- [x] Verify Temporary default và `--temp` trên hai endpoint.
+- [x] Verify direct bootstrap `/branch/C/A` + canonical `new_branch` identity.
+- [x] Verify explicit fresh recovery semantics.
 - [x] Verify F5/lost Temporary generation + Recovery Snapshot continuation.
-- [ ] Verify persistent và Temporary task cùng tồn tại trong browser pool.
+- [x] Verify persistent và Temporary task cùng tồn tại trong browser pool.
 - [x] Verify legacy single-CDP config/task compatibility.
 
 Read-only probe hoặc smoke check có thể chạy sớm khi cần evidence. Bài live acceptance hoàn chỉnh dùng hai CDP thật nằm ở phase cuối để luôn kiểm tra cả Temporary.
@@ -1402,6 +1402,7 @@ Read-only probe hoặc smoke check có thể chạy sớm khi cần evidence. B�
 ### Closeout evidence - 2026-09-13
 
 - Browser pool live trên `9222` và `9202`: cả hai endpoint `online`, `authenticated`, `chatgpt_ready`; allocator chuyển sang `9202` khi `9222` full, cooldown hoặc draining, và detach không làm chết browser.
+- Transport live artifacts `acceptance-20260913/transport-run2/9222-transport.json` và `transport-run3/9202-transport.json` đều PASS: persistent Send, direct `/branch/C/A` nhận `new_branch` 200 với canonical child identity, Temporary Send trên `?temporary-chat=true`, F5 đổi document và mất prior Temporary generation. Probe giữ persistent/branch sống trong lúc tạo Temporary rồi mới cleanup, nên hai mode đã coexist thật trong cùng browser pool. `temporary_default`/`--temp` resolution được khóa bằng contract tests cùng live Temporary transport trên cả hai endpoint.
 - Persistent live: pre-Send `NEW` và `PROMPT_SET` relocation giữ nguyên task/hop/request rồi Send đúng một lần; accepted-Send recovery đi tới `DONE` mà không replay original request. `PROMPT_SET` cũng đi tới `DONE` với bytes kết quả đúng; harness chỉ fail hậu kiểm vì hai tab không thuộc probe được mở độc lập trong lúc bài test dài đang chạy.
 - Temporary live: F5 làm đổi document identity, endpoint nguồn bị partition, worker tạo `execution_recovery` trên endpoint còn lại và tiếp tục bằng recovery snapshot; bản chạy từ `9202` sang `9222` vượt qua recovery generation, chạm guard ba PLAN liên tiếp, sau durable Resume tiếp tục đúng state và kết thúc `DONE` mà không replay request gốc. Một run đối xứng gặp composer-verification timeout trên UI hiện thời; đây được giữ là live limitation, không dùng để nới non-replay invariant.
 - Synthetic ambiguous-Send live cố ý xóa receipt sau một Send đã thật sự accepted và vì vậy va vào fail-closed manual-composer guard. Deterministic recovery tests chứng minh lost ambiguous `SENDING/attempts=1/receipt=None` tạo `execution_recovery` child và không tăng attempt của request gốc; synthetic case không được coi là bằng chứng cho phép replay.
