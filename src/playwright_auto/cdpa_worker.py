@@ -15,6 +15,7 @@ import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Sequence
 
 from .cdpa_actions import (
@@ -43,6 +44,8 @@ from .cdpa_commands import (
 from .cdpa_config import CDPAConfig, load_cdpa_config, remote_repository_from_task
 from .cdpa_browser_projection import build_browser_projection
 from .cdpa_endpoint_pool import EndpointPool
+from .cdpa_endpoints import normalize_endpoint_record
+from .cdpa_managed_browser import ManagedBrowserLifecycle
 from .cdpa_independent import (
     BUILTIN_MAINTAINERS_PROMPT,
     BUILTIN_MONITOR_PROMPT,
@@ -76,7 +79,7 @@ from .cdpa_response import (
     remaining_timeout_ms,
     start_wait_budget,
 )
-from .cdpa_safety import sanitize_exception, sanitize_text
+from .cdpa_safety import sanitize_exception, sanitize_text, sanitize_value
 from .cdpa_routes import (
     InlineReportMaterializationError,
     RouteContractError,
@@ -144,7 +147,7 @@ from .chatgpt_graph import (
     resolve_inherited_assistant,
     resolve_latest_terminal_assistant,
 )
-from .connection import is_cdp_disconnect
+from .connection import is_cdp_disconnect, is_local_cdp_endpoint, normalize_cdp_endpoint
 from .durable import (
     DurableRecoveryState,
     DurableRequestError,
@@ -384,6 +387,7 @@ class CDPAWorker:
             config.delay_multipliers,
         )
         self.store = store or TaskStore(config)
+        self.managed_browsers = ManagedBrowserLifecycle(config)
         self.prompts = PromptBuilder(config)
         self.role_controller = RoleController(Policy(
             response_stable_seconds=config.response_stable_ms / 1000,
@@ -400,6 +404,9 @@ class CDPAWorker:
         self._browser_connected = False
         self._browser_error: str | None = None
         self._browser_cycle_active = False
+        self._execution_leases: dict[str, dict[str, Any]] = {}
+        self._endpoint_pool: EndpointPool | None = None
+        self._browser_command_tasks: set[asyncio.Task[Any]] = set()
         self._rate_limit_cooldown: dict[str, Any] | None = None
         self._rate_limit_cooldowns: dict[str, dict[str, Any]] = {}
         self._rate_limit_lock = asyncio.Lock()
@@ -435,7 +442,7 @@ class CDPAWorker:
             record = (state.get("roles") or {}).get(role) if role else None
             if not isinstance(record, Mapping):
                 continue
-            endpoint_id = str(record.get("browser_endpoint_id") or "").strip()
+            endpoint_id = self._execution_endpoint_id(state)
             page_id = str(record.get("page_id") or "").strip()
             if not endpoint_id or not page_id or record.get("online") is not True:
                 continue
@@ -457,17 +464,36 @@ class CDPAWorker:
                     "page_id": page_id,
                 }
             )
-        return running
+        by_task = {item["task_id"]: item for item in running}
+        for task_id, lease in self._execution_leases.items():
+            recorded = by_task.get(task_id, {})
+            by_task[task_id] = {**lease, "page_id": recorded.get("page_id") if recorded.get("endpoint_id") == lease["endpoint_id"] else lease.get("page_id")}
+        return list(by_task.values())
 
-    @staticmethod
-    def _role_endpoint_affinity(state: Mapping[str, Any]) -> str | None:
+    def _execution_endpoint_id(self, state: Mapping[str, Any], role: str | None = None) -> str | None:
+        logical = role or str(state.get("active_role") or "").upper()
+        record = (state.get("roles") or {}).get(logical)
+        if not isinstance(record, Mapping):
+            return None
+        endpoint_id = str(record.get("browser_endpoint_id") or "").strip()
+        if endpoint_id:
+            return endpoint_id
+        try:
+            hop = _active_hop(state)
+        except RuntimeError:
+            hop = {}
+        if record.get("page_id") or record.get("page_url") or hop.get("receipt") or str(hop.get("state") or "pre_send") != "pre_send":
+            return self.store.endpoint_id_for(state)
+        return None
+
+    def _role_endpoint_affinity(self, state: Mapping[str, Any]) -> str | None:
         role = str(state.get("active_role") or "").upper()
         record = (state.get("roles") or {}).get(role) if role else None
         if not isinstance(record, Mapping):
             return None
         if not record.get("page_id") or not record.get("page_url") or record.get("online") is not True:
             return None
-        return str(record.get("browser_endpoint_id") or "").strip() or None
+        return self._execution_endpoint_id(state)
 
     def _execution_can_relocate(
         self, state: Mapping[str, Any], target_endpoint_id: str
@@ -476,14 +502,14 @@ class CDPAWorker:
         record = (state.get("roles") or {}).get(role) if role else None
         if not isinstance(record, Mapping):
             return True
-        current = str(record.get("browser_endpoint_id") or "").strip() or None
-        if current is None or current == target_endpoint_id:
+        current = self._execution_endpoint_id(state)
+        if current == target_endpoint_id:
             return True
         try:
             hop = _active_hop(state)
         except RuntimeError:
             return False
-        if str(hop.get("state") or "") != "pre_send" or hop.get("receipt") is not None:
+        if str(hop.get("state") or "") not in {"pre_send", "sending"} or hop.get("receipt") is not None or hop.get("message_identity") is not None:
             return False
         uploaded_generation = record.get("attachments_uploaded_generation")
         if uploaded_generation is not None and uploaded_generation == record.get("conversation_generation"):
@@ -492,8 +518,9 @@ class CDPAWorker:
         ledger_path = str(hop.get("ledger_path") or "").strip()
         if request_id and ledger_path:
             try:
-                if RequestLedger(ledger_path).peek(request_id) is not None:
-                    return False
+                durable = RequestLedger(ledger_path).peek(request_id)
+                if durable is not None:
+                    return self._is_pristine_preboundary_sending_record(state, hop, durable)
             except Exception:
                 return False
         return True
@@ -505,10 +532,13 @@ class CDPAWorker:
         record = state.get("roles", {}).get(role) if role else None
         if not isinstance(record, dict):
             return True
-        current = str(record.get("browser_endpoint_id") or "").strip() or None
+        current = self._execution_endpoint_id(state)
         if current != endpoint_id and not self._execution_can_relocate(state, endpoint_id):
             return False
         if current != endpoint_id:
+            if current is not None:
+                record["last_endpoint_id"] = current
+            record.pop("branch_conversation_id", None)
             record.update(
                 browser_endpoint_id=endpoint_id,
                 page_id=None,
@@ -522,8 +552,10 @@ class CDPAWorker:
                 hop = _active_hop(state)
             except RuntimeError:
                 hop = None
-            if isinstance(hop, dict) and str(hop.get("state") or "") == "pre_send":
+            if isinstance(hop, dict) and str(hop.get("state") or "") in {"pre_send", "sending"}:
                 hop["conversation_url"] = None
+                hop["browser_endpoint_id"] = endpoint_id
+                hop.pop("branch_conversation_id", None)
         else:
             record["browser_endpoint_id"] = endpoint_id
         return True
@@ -535,6 +567,8 @@ class CDPAWorker:
         for key, args in (
             ("git_status", ("status", "--short")),
             ("git_diff_stat", ("diff", "--stat")),
+            ("git_head", ("rev-parse", "HEAD")),
+            ("git_branch", ("branch", "--show-current")),
         ):
             try:
                 completed = subprocess.run(
@@ -549,6 +583,81 @@ class CDPAWorker:
             if completed.returncode == 0:
                 result[key] = completed.stdout.strip()[:8000]
         return result
+
+    def _recovery_current_report(self, state: Mapping[str, Any], hop: Mapping[str, Any]) -> dict[str, Any] | None:
+        if is_independent_task(state):
+            return None
+        repository, plans = _workflow_report_roots(self.config, state)
+        expected = expected_report_relative(
+            repository_root=repository, plans_root=plans, team=str(state["team"]),
+            physical_role=str(hop["physical_role"]), turn=int(hop["turn"]), task_id=str(state["task_id"]),
+        )
+        result: dict[str, Any] = {"path": expected, "absolute_path": str(repository / expected), "availability": "missing"}
+        try:
+            if (repository / expected).stat().st_size > 1024 * 1024:
+                return {**result, "availability": "too_large", "requires_filesystem_inspection": True}
+            report = validate_file_report(
+                expected, repository_root=repository, plans_root=plans, team=str(state["team"]),
+                physical_role=str(hop["physical_role"]), turn=int(hop["turn"]), task_id=str(state["task_id"]),
+            )
+            with (repository / report.path).open("rb") as handle:
+                body = handle.read(1024 * 1024 + 1)
+            if len(body) > 1024 * 1024 or hashlib.sha256(body).hexdigest() != report.sha256:
+                raise ValueError("report changed while capturing recovery evidence")
+            return {**result, "availability": "verified", "sha256": report.sha256, "size": report.size,
+                    "content": body.decode("utf-8", errors="replace")[:8000], "content_truncated": len(body) > 8000}
+        except FileNotFoundError:
+            return result
+        except (OSError, ValueError) as exc:
+            return {**result, "availability": "invalid", "error": sanitize_text(exc, max_chars=500)}
+
+    def _recovery_checkpoints(self, state: Mapping[str, Any]) -> list[dict[str, Any]]:
+        root = Path(str(state["repository"])).expanduser().resolve()
+        candidates = ["checkpoint.md", "CHECKPOINT.md"]
+        for item in state.get("checkpoints", []) if isinstance(state.get("checkpoints", []), list) else []:
+            path = item.get("path") if isinstance(item, Mapping) else item
+            if isinstance(path, str):
+                candidates.append(path)
+        result: list[dict[str, Any]] = []
+        seen: set[Path] = set()
+        for name in candidates[:6]:
+            path = root / name
+            try:
+                if path in seen or not path.is_file() or not path.resolve().is_relative_to(root):
+                    continue
+                seen.add(path)
+                if any(p.is_symlink() or getattr(p, "is_junction", lambda: False)() for p in (path, *path.parents) if p != root):
+                    continue
+                with path.open("rb") as handle:
+                    body = handle.read(65537)
+                if len(body) > 65536:
+                    result.append({"path": str(path), "availability": "too_large", "requires_filesystem_inspection": True})
+                    continue
+                result.append({"path": str(path), "availability": "observed", "sha256": hashlib.sha256(body).hexdigest(),
+                               "size": len(body), "content": body.decode("utf-8", errors="replace")[:8000]})
+            except OSError:
+                continue
+        return result
+
+    def _recovery_recent_logs(self, task_id: str) -> list[dict[str, Any]]:
+        path = self.config.repository_root / ".runtime" / "live-events.jsonl"
+        try:
+            with path.open("rb") as handle:
+                size = handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, size - 65536))
+                lines = handle.read(65536).decode("utf-8", errors="replace").splitlines()
+        except OSError:
+            return []
+        selected: list[dict[str, Any]] = []
+        for line in lines:
+            try:
+                item = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(item, Mapping) or item.get("task_id") != task_id:
+                continue
+            selected.append({key: sanitize_value(item[key]) for key in ("at", "source", "kind", "role", "values", "changes") if key in item})
+        return selected[-12:]
 
     def _build_execution_recovery_snapshot(
         self,
@@ -581,12 +690,7 @@ class CDPAWorker:
             or ledger_status in {"sending", "sent", "completed"}
         )
         role = str(hop.get("target_role") or state.get("active_role") or "").upper()
-        role_record = (state.get("roles") or {}).get(role)
-        endpoint_id = (
-            str(role_record.get("browser_endpoint_id") or "").strip()
-            if isinstance(role_record, Mapping)
-            else ""
-        ) or None
+        endpoint_id = self._execution_endpoint_id(state, role) or self.store.endpoint_id_for(state)
         reports = [
             {
                 key: item.get(key)
@@ -597,13 +701,25 @@ class CDPAWorker:
             if isinstance(item, Mapping)
         ]
         repository = str(state.get("repository") or "")
+        compact_receipt = {
+            key: copy.deepcopy(receipt[key])
+            for key in ("prompt_sha256", "binding", "user_message_id", "user_turn_id", "conversation_id", "accepted_via", "attempts", "session_id_before")
+            if receipt is not None and key in receipt
+        } if receipt is not None else None
+        compact_response = {
+            key: (str(response[key])[:8000] if key == "text" else response[key])
+            for key in ("role", "text", "message_id", "turn_id") if response is not None and key in response
+        } if response is not None else None
         return {
             "schema_version": 1,
+            "source_of_truth": ["workspace_reports_checkpoints_git", "durable_request_ledger", "assistant_progress_advisory"],
             "reason": sanitize_text(reason, max_chars=1000),
             "task": {
                 "task_id": str(state.get("task_id") or ""),
                 "team": str(state.get("team") or ""),
-                "goal": str(state.get("task_text") or ""),
+                "goal": task_goal_for_hop(state, int(hop["hop_id"])),
+                "original_task": str(state.get("task_text") or ""),
+                "context_policy": state.get("context_policy"),
                 "conversation_mode": str(state.get("conversation_mode") or "persistent"),
             },
             "execution": {
@@ -614,22 +730,34 @@ class CDPAWorker:
                 "request_id": request_id,
                 "endpoint_id": endpoint_id,
                 "hop_state": str(hop.get("state") or ""),
-                "handoff": str(hop.get("handoff") or ""),
+                "handoff": str(hop.get("handoff") or "")[:4000],
+                "handoff_truncated": len(str(hop.get("handoff") or "")) > 4000,
             },
             "send_provenance": {
                 "classification": "accepted_or_ambiguous" if crossed else "pre_send",
+                "boundary": "accepted" if receipt or accepted_at else "ambiguous" if crossed else "not_sent",
                 "ledger_status": ledger_status,
                 "attempts": attempts,
                 "accepted_at": accepted_at,
-                "receipt": copy.deepcopy(receipt),
+                "receipt": compact_receipt,
             },
+            "durable_paths": {"manifest": str(state.get("manifest_path") or ""), "ledger": ledger_path,
+                              "logs": str(self.config.repository_root / ".runtime" / "live-events.jsonl")},
             "workspace": {
                 "repository": str(Path(repository).expanduser().resolve()) if repository else "",
                 **self._bounded_git_evidence(repository),
             },
             "reports": reports,
+            "current_report": self._recovery_current_report(state, hop),
+            "checkpoints": self._recovery_checkpoints(state),
+            "recent_logs": self._recovery_recent_logs(str(state["task_id"])),
+            "validation": {"error": hop.get("validation_error"),
+                           "test_evidence": sanitize_value(state.get("test_evidence")),
+                           "validation_evidence": sanitize_value(state.get("validation_evidence"))},
             "last_progress": {
-                "response": response,
+                "response": compact_response,
+                "assistant": copy.deepcopy((hop.get("wait") or {}).get("last_assistant_progress")),
+                "advisory_only": True,
                 "hop_response": str(hop.get("response") or "")[:8000] or None,
                 "errors": [str(item)[:1000] for item in (hop.get("errors") or [])[-5:]],
             },
@@ -665,21 +793,40 @@ class CDPAWorker:
         endpoint_id: str,
         *,
         reason: str,
+        force_new_generation: bool = False,
     ) -> bool:
         hop = _active_hop(state)
+        try:
+            ledger_path = str(hop.get("ledger_path") or "")
+            request_id = str(hop.get("request_id") or "")
+            if not ledger_path or not request_id:
+                raise ValueError("missing exact request ledger identity")
+            durable = RequestLedger(ledger_path).peek(request_id)
+            if durable is not None:
+                expected_source = {"task_id": state["task_id"], "team": state["team"],
+                                   "hop_id": hop["hop_id"], "manifest": state["manifest_path"]}
+                if durable.role != hop.get("physical_role") or (
+                    durable.source_context is not None and durable.source_context != expected_source
+                ):
+                    raise ValueError("request provenance belongs to another execution")
+        except Exception as exc:
+            self._block(state, f"Cannot safely recover execution provenance: {exc}",
+                        code="execution_recovery_provenance_invalid", retryable=False)
+            return False
         if self._consume_completed_durable_response(state, hop):
             return self._prepare_execution_endpoint(state, endpoint_id)
         role = str(hop.get("target_role") or state.get("active_role") or "").upper()
         role_record = state.get("roles", {}).get(role)
         if not isinstance(role_record, dict):
             return False
-        if self._execution_can_relocate(state, endpoint_id):
+        if not force_new_generation and self._execution_can_relocate(state, endpoint_id):
             return self._prepare_execution_endpoint(state, endpoint_id)
         snapshot = self._build_execution_recovery_snapshot(state, hop, reason=reason)
         if snapshot["send_provenance"]["classification"] != "accepted_or_ambiguous":
             return False
         old_hop_id = int(hop["hop_id"])
         original_request_id = str(hop.get("request_id") or "")
+        hop.setdefault("browser_endpoint_id", self._execution_endpoint_id(state, role) or self.store.endpoint_id_for(state))
         hop["state"] = "abandoned"
         hop["abandon_reason"] = sanitize_text(reason, max_chars=1000)
         hop["execution_recovery"] = {
@@ -704,12 +851,16 @@ class CDPAWorker:
             kind="execution_recovery",
         )
         child["recovery_of_request_id"] = original_request_id
+        role_record.pop("branch_conversation_id", None)
         role_record.update(
+            last_endpoint_id=self._execution_endpoint_id(state, role),
             browser_endpoint_id=endpoint_id,
             page_id=None,
             page_url=None,
             online=False,
             last_error=None,
+            constructor_sent_generation=None,
+            attachments_uploaded_generation=None,
             context_source="execution_recovery",
         )
         state.setdefault("route_timeline", []).append(
@@ -785,7 +936,8 @@ class CDPAWorker:
         repository = state.get("repository")
         conversation_id = receipt.get("conversation_id") if isinstance(receipt, Mapping) else None
         if (
-            not isinstance(hop, Mapping)
+            state.get("conversation_mode") == "temporary"
+            or not isinstance(hop, Mapping)
             or hop.get("state") != "routed"
             or hop.get("kind") == "route_repair"
             or hop.get("validation_error")
@@ -828,22 +980,33 @@ class CDPAWorker:
             self._rate_limit_scope_for_state(state) if state is not None else "shared"
         )
         cooldown = self._rate_limit_cooldowns.get(selected_scope)
-        if cooldown is None and selected_scope == "shared":
+        using_legacy = cooldown is None and not self._rate_limit_cooldowns
+        if using_legacy:
             cooldown = self._rate_limit_cooldown
         if not isinstance(cooldown, Mapping) or cooldown.get("state") != "active":
             return False
         release_at = parse_time(cooldown.get("release_not_before"))
         if release_at is not None and datetime.now(timezone.utc) >= release_at:
             self._rate_limit_cooldowns.pop(selected_scope, None)
-            if selected_scope == "shared":
+            if using_legacy or (
+                isinstance(self._rate_limit_cooldown, Mapping)
+                and self._rate_limit_cooldown.get("detected_at") == cooldown.get("detected_at")
+                and self._rate_limit_cooldown.get("release_not_before") == cooldown.get("release_not_before")
+            ):
                 self._rate_limit_cooldown = None
             return False
         return True
 
     def _active_rate_limit_scopes(self) -> set[str]:
-        scopes = set(self._rate_limit_cooldowns)
-        if self._rate_limit_cooldown is not None:
-            scopes.add("shared")
+        if self._rate_limit_cooldowns:
+            scopes = set(self._rate_limit_cooldowns)
+        elif isinstance(self._rate_limit_cooldown, Mapping):
+            scopes = {
+                str(endpoint.get("rate_limit_scope") or "shared")
+                for endpoint in self.store.endpoints.list()
+            } or {"shared"}
+        else:
+            scopes = set()
         return {scope for scope in scopes if self._rate_limit_gate_active(scope=scope)}
 
     def _restore_rate_limit_cooldown(self) -> None:
@@ -864,7 +1027,8 @@ class CDPAWorker:
         if isinstance(cooldown, Mapping) and cooldown.get("state") == "active":
             restored = dict(cooldown)
             self._rate_limit_cooldown = restored
-            self._rate_limit_cooldowns.setdefault("shared", restored)
+            if restored.get("scope"):
+                self._rate_limit_cooldowns.setdefault(str(restored["scope"]), restored)
         self._active_rate_limit_scopes()
 
     async def _enter_rate_limit_cooldown(
@@ -907,8 +1071,13 @@ class CDPAWorker:
                 "detector_role": role or None,
             }
             self._rate_limit_cooldowns[scope] = cooldown
-            if scope == "shared":
-                self._rate_limit_cooldown = cooldown
+            self._rate_limit_cooldown = {
+                key: cooldown[key]
+                for key in (
+                    "state", "detected_at", "release_not_before", "reason",
+                    "profile", "detector_task_id", "detector_role",
+                )
+            }
             self._publish_heartbeat(force=True)
             return cooldown
 
@@ -1104,6 +1273,9 @@ class CDPAWorker:
         )
         if acquired.new_chat:
             record["conversation_generation"] = int(record.get("conversation_generation") or 0) + 1
+            record.pop("branch_conversation_id", None)
+        if getattr(acquired, "conversation_id", None):
+            record["branch_conversation_id"] = acquired.conversation_id
         generation = int(record.get("conversation_generation") or 0)
         if record.get("reset_requested"):
             record["reset_applied_generation"] = generation
@@ -1194,6 +1366,18 @@ class CDPAWorker:
         self._record_acquired(state, role, acquired)
         return acquired
 
+    @staticmethod
+    async def _temporary_document_token(client: Any, *, create: bool = False) -> str | None:
+        page = getattr(client, "page", None)
+        if page is None or not callable(getattr(page, "evaluate", None)):
+            return None
+        value = await page.evaluate(
+            "create => { if (create && !window.__cdpaTemporaryDocument) "
+            "window.__cdpaTemporaryDocument = crypto.randomUUID(); "
+            "return window.__cdpaTemporaryDocument || null; }", create,
+        )
+        return str(value) if value else None
+
     async def _owned_or_block(
         self,
         state: dict[str, Any],
@@ -1205,6 +1389,30 @@ class CDPAWorker:
                 self._active_recovery_context(state, role)
             )
             acquired = await actions.locate_owned(state, role)
+            temporary = state.get("conversation_mode") == "temporary"
+            if temporary:
+                token = state["roles"][role].get("temporary_document_id")
+                lost_document = bool(
+                    acquired is not None and token
+                    and await self._temporary_document_token(acquired.client) != token
+                )
+                if acquired is None or lost_document:
+                    endpoint = self._execution_endpoint_id(state, role) or self.store.endpoint_id_for(state)
+                    if self._prepare_cross_endpoint_recovery(
+                        state, endpoint, reason="Temporary generation lost by tab loss or document reload",
+                        force_new_generation=True,
+                    ):
+                        return None
+                    # A truly pristine request can reacquire a surface without being replayed.
+                    ledger = RequestLedger(str(hop["ledger_path"]))
+                    durable = ledger.peek(str(hop["request_id"]))
+                    if self._is_pristine_preboundary_sending_record(state, hop, durable):
+                        acquired = await actions.fresh_chat(state, role, url="https://chatgpt.com/?temporary-chat=true")
+                        state["roles"][role]["temporary_document_id"] = await self._temporary_document_token(acquired.client, create=True)
+                        self._record_acquired(state, role, acquired)
+                        return acquired
+                # Temporary URLs are generation evidence, never saved-conversation reopen targets.
+                expected_conversation = None
             if acquired is not None:
                 await self._dismiss_known_rate_limit_on_existing(acquired)
             live_conversation = (
@@ -1212,7 +1420,7 @@ class CDPAWorker:
                 if acquired is not None
                 else None
             )
-            if acquired is not None and live_conversation is not None and expected_conversation is None:
+            if not temporary and acquired is not None and live_conversation is not None and expected_conversation is None:
                 expected_conversation = live_conversation
                 hop["conversation_url"] = acquired.url
             needs_reopen = (
@@ -1221,6 +1429,27 @@ class CDPAWorker:
                 or (expected_page_id is not None and str(acquired.page_id) != expected_page_id)
             )
             if needs_reopen:
+                role_record = state["roles"][role]
+                fresh_policy = state.get("context_policy") == "fresh" or (
+                    state.get("bootstrap") is None and state.get("context_policy") != "bootstrap"
+                ) or hop.get("kind") == "execution_recovery"
+                if acquired is None and fresh_policy and hop.get("state") == "sending" and hop.get("receipt") is None:
+                    durable = RequestLedger(str(hop["ledger_path"])).peek(str(hop["request_id"]))
+                    pristine = durable is None or self._is_pristine_preboundary_sending_record(state, hop, durable)
+                    owns_attachments = role_record.get("attachments_uploaded_generation") is not None and (
+                        role_record.get("attachments_uploaded_generation") == role_record.get("conversation_generation")
+                    )
+                    if pristine and not owns_attachments and hop.get("message_identity") is None:
+                        acquired = await actions.fresh_chat(
+                            state, role, url="https://chatgpt.com/?temporary-chat=true" if temporary else "https://chatgpt.com/",
+                        )
+                        self._record_acquired(state, role, acquired)
+                        hop["conversation_url"] = acquired.url
+                        hop["conversation_generation"] = role_record.get("conversation_generation", 0)
+                        hop["generation_started_here"] = True
+                        if temporary:
+                            role_record["temporary_document_id"] = await self._temporary_document_token(acquired.client, create=True)
+                        return acquired
                 if expected_conversation is None:
                     physical_role = state["roles"][role]["physical_role"]
                     raise RoleOwnershipError(
@@ -1235,6 +1464,8 @@ class CDPAWorker:
             state["active_action"] = "rate_limit_cooldown"
             return None
         except Exception as exc:
+            if is_cdp_disconnect(exc):
+                raise
             code = _role_ownership_block_code(exc) or "role_ownership_ambiguous"
             self._block(state, exc, code=code, retryable=False)
             return None
@@ -1421,6 +1652,31 @@ class CDPAWorker:
             control["applied_at"] = now
         return result
 
+    def _control_actions(self, state: Mapping[str, Any], role: str, actions: CDPATabActions) -> CDPATabActions:
+        if self._endpoint_pool is None:
+            return actions
+        endpoint_id = self._execution_endpoint_id(state, role)
+        if not endpoint_id:
+            return actions
+        context = self._endpoint_pool.contexts.get(endpoint_id)
+        if context is None:
+            raise RoleOwnershipError(f"selected role browser {endpoint_id} is unavailable", code="role_offline")
+        return actions if context is actions.browser_context else CDPATabActions(context, self.config)
+
+    async def _cleanup_preflight(self, state: Mapping[str, Any], actions: CDPATabActions) -> list[Any]:
+        if self._endpoint_pool is None:
+            return await actions.preflight_team(state)
+        contexts = self._endpoint_pool.contexts
+        for role, record in state.get("roles", {}).items():
+            if record.get("page_id"):
+                endpoint_id = self._execution_endpoint_id(state, role)
+                if endpoint_id and endpoint_id not in contexts:
+                    raise RoleOwnershipError(f"cleanup cannot verify unavailable browser {endpoint_id}", code="role_offline")
+        pages: list[Any] = []
+        for context in contexts.values():
+            pages.extend(await CDPATabActions(context, self.config).preflight_team(state))
+        return pages
+
     async def _continue_cleanup(
         self,
         state: dict[str, Any],
@@ -1491,9 +1747,10 @@ class CDPAWorker:
                 ).upper()
                 stopped = False
                 if active_role and active_role in state.get("roles", {}):
-                    acquired = await actions.locate_owned(state, active_role)
+                    stop_actions = self._control_actions(state, active_role, actions)
+                    acquired = await stop_actions.locate_owned(state, active_role)
                     if acquired is not None:
-                        stopped = await actions.stop_if_active(acquired)
+                        stopped = await stop_actions.stop_if_active(acquired)
 
                 def persist_stop(current: dict[str, Any]) -> dict[str, Any]:
                     current_cleanup = current.setdefault("cleanup", {})
@@ -1509,8 +1766,8 @@ class CDPAWorker:
             if phase in {"close_pending", "closing"}:
                 selected = (
                     list(preflighted_pages)
-                    if preflighted_pages is not None
-                    else await actions.preflight_team(state)
+                    if preflighted_pages is not None and self._endpoint_pool is None
+                    else await self._cleanup_preflight(state, actions)
                 )
 
                 def persist_closing(current: dict[str, Any]) -> dict[str, Any]:
@@ -1555,7 +1812,7 @@ class CDPAWorker:
                 persist(persist_closed)
                 phase = "verify_pending"
             if phase == "verify_pending":
-                remaining = await actions.preflight_team(state)
+                remaining = await self._cleanup_preflight(state, actions)
                 if remaining:
                     error = RoleOwnershipError(
                         f"post-close verification found {len(remaining)} assigned team tab(s) still open"
@@ -2097,6 +2354,8 @@ class CDPAWorker:
         result: Any = None
         command: WorkerCommand | None = None
         try:
+            if action in {"open_tab", "close_tab", "new_chat", "restart_role"}:
+                actions = self._control_actions(state, role, actions)
             command_value = control.get("command")
             if isinstance(command_value, Mapping):
                 command = WorkerCommand.from_dict(command_value)
@@ -3319,9 +3578,9 @@ class CDPAWorker:
             return None
 
         saw_transient = False
+        unavailable_donors: list[dict[str, Any]] = []
         for donor in self._bootstrap_donor_candidates(state, bootstrap):
-            # The branch operation and its local/UI fallback validate the recorded
-            # donor at the actual browser boundary; do not preflight with a graph GET.
+            # Direct branching validates the donor at the browser boundary; no graph GET.
             branch_from_anchor = getattr(actions, "branch_from_anchor", None)
             if not callable(branch_from_anchor):
                 saw_transient = True
@@ -3342,11 +3601,29 @@ class CDPAWorker:
                     retryable=False,
                 )
                 return None
-            except BranchBootstrapError:
-                saw_transient = True
+            except BranchBootstrapError as exc:
+                if getattr(exc, "donor_unavailable", False):
+                    unavailable_donors.append({**donor, "error": sanitize_text(exc, max_chars=500)})
+                else:
+                    saw_transient = True
                 continue
             role_record["context_source"] = "bootstrap_donor"
             role_record["bootstrap_source_donor"] = dict(donor)
+            return acquired
+
+        if unavailable_donors and not saw_transient:
+            # Account-local inaccessibility must not invalidate donors usable by peers.
+            # No task Send has occurred: continue the SAME request in fresh context.
+            acquired = await actions.fresh_chat(state, role, url="https://chatgpt.com/")
+            role_record["context_source"] = "fresh_fallback"
+            role_record["bootstrap_context_recovery"] = {
+                "endpoint_id": self._execution_endpoint_id(state, role) or self.store.endpoint_id_for(state),
+                "bootstrap_id": bootstrap["bootstrap_id"], "unavailable_donors": unavailable_donors,
+                "prewarm_context": bootstrap.get("prewarm_prompt"),
+            }
+            _active_hop(state)["context_recovery_snapshot"] = self._build_execution_recovery_snapshot(
+                state, _active_hop(state), reason="persistent bootstrap donor is inaccessible on the selected account",
+            )
             return acquired
 
         current = self._bootstrap_for_state(state) or bootstrap
@@ -3404,6 +3681,9 @@ class CDPAWorker:
             await self._dismiss_known_rate_limit_on_existing(acquired)
         elif not isinstance(independent, Mapping) and state.get("conversation_mode") == "temporary":
             acquired = await actions.locate_owned(state, role)
+            token = state["roles"][role].get("temporary_document_id")
+            if acquired is not None and token and await self._temporary_document_token(acquired.client) != token:
+                acquired = None
             if acquired is None:
                 if self._rate_limit_gate_active(state=state):
                     state["active_action"] = "rate_limit_cooldown"
@@ -3414,7 +3694,7 @@ class CDPAWorker:
                     url="https://chatgpt.com/?temporary-chat=true",
                 )
             await self._dismiss_known_rate_limit_on_existing(acquired)
-        elif not isinstance(independent, Mapping) and state.get("context_policy") == "fresh":
+        elif not isinstance(independent, Mapping) and (state.get("context_policy") == "fresh" or hop.get("kind") == "execution_recovery"):
             acquired = await actions.locate_owned(state, role)
             if acquired is None:
                 if self._rate_limit_gate_active(state=state):
@@ -3425,7 +3705,8 @@ class CDPAWorker:
                     role,
                     url="https://chatgpt.com/",
                 )
-                state["roles"][role]["context_source"] = "fresh"
+                if state.get("context_policy") == "fresh":
+                    state["roles"][role]["context_source"] = "fresh"
             await self._dismiss_known_rate_limit_on_existing(acquired)
         elif (
             isinstance(independent, dict)
@@ -3454,6 +3735,15 @@ class CDPAWorker:
             if acquired is None:
                 return
         self._record_acquired(state, role, acquired)
+        generation = int(state["roles"][role].get("conversation_generation") or 0)
+        if hop.get("conversation_generation") != generation:
+            hop["conversation_generation"] = generation
+            hop["generation_started_here"] = bool(acquired.new_chat)
+        hop["browser_endpoint_id"] = self._execution_endpoint_id(state, role) or self.store.endpoint_id_for(state)
+        if state["roles"][role].get("branch_conversation_id"):
+            hop["branch_conversation_id"] = state["roles"][role]["branch_conversation_id"]
+        if state.get("conversation_mode") == "temporary":
+            state["roles"][role]["temporary_document_id"] = await self._temporary_document_token(acquired.client, create=True)
         preparation = await self.role_controller.run(
             self, state, hop, acquired, actions, phase="pre_send", wait_ms=0,
         )
@@ -3529,6 +3819,7 @@ class CDPAWorker:
                 physical_role=str(hop["physical_role"]),
                 turn=int(hop["turn"]),
                 validation_error=str(hop["validation_error"]),
+                expected_report_path=expected,
                 report_mode=_report_mode(state),
                 allowed_routes=allowed_routes,
             )
@@ -3575,6 +3866,21 @@ class CDPAWorker:
             )
             prompt = built.text
             included = built.constructor_included
+        if hop.get("kind") == "report_repair":
+            prompt += "\n\n" + self.prompts.filesystem_scope(str(state["repository"]), expected)
+        if hop.get("kind") in {"route_repair", "report_repair"} and (
+            acquired.new_chat or (acquired.created and role_record.get("last_endpoint_id"))
+        ):
+            hop["context_recovery_snapshot"] = self._build_execution_recovery_snapshot(
+                state, hop, reason="repair continuation acquired a new browser conversation",
+            )
+        if hop.get("context_recovery_snapshot"):
+            prompt += ("\n\nInspect the existing workspace, reports, checkpoints and Git state. "
+                       "Continue only unfinished work; do not repeat completed irreversible actions.\nRECOVERY_SNAPSHOT\n"
+                       + json.dumps(hop["context_recovery_snapshot"], ensure_ascii=False, sort_keys=True))
+            prewarm = (role_record.get("bootstrap_context_recovery") or {}).get("prewarm_context")
+            if prewarm:
+                prompt += "\n\nReusable bootstrap instructions (conversation history is unavailable):\n" + str(prewarm)
         hop["prompt"] = prompt
         hop["prompt_sha256"] = _sha(prompt)
         hop["expected_report_path"] = expected
@@ -3629,10 +3935,13 @@ class CDPAWorker:
             constructor = str(
                 task_workflow_definitions(state, self.config)[role]["system_prompt"]
             )
-        prior_accepted_role_turn = any(
+        generation = int(state["roles"][role].get("conversation_generation") or 0)
+        prior_accepted_role_turn = not hop.get("generation_started_here", False) and any(
             isinstance(item, Mapping)
             and item.get("hop_id") != hop.get("hop_id")
             and str(item.get("target_role") or "").upper() == role
+            and item.get("conversation_generation", generation) == generation
+            and item.get("browser_endpoint_id", hop.get("browser_endpoint_id")) == hop.get("browser_endpoint_id")
             and isinstance(item.get("receipt"), Mapping)
             and bool(item.get("receipt"))
             for item in state.get("hops") or []
@@ -3677,6 +3986,26 @@ class CDPAWorker:
                 retryable=True,
             )
             return
+        except DurableRequestError as exc:
+            current_record = ledger.get(str(hop["request_id"]))
+            late_identity = "markerless send reached transport progress without accepted user-message identity"
+            if current_record is not None and current_record.status is RequestStatus.SENDING and (
+                str(exc) == late_identity or str(current_record.error or "") == late_identity
+            ):
+                since = parse_time(hop.get("send_identity_reconcile_started_at"))
+                now = datetime.now(timezone.utc)
+                if since is None:
+                    hop["send_identity_reconcile_started_at"] = now.isoformat()
+                    since = now
+                if (now - since).total_seconds() < 15:
+                    # Re-entering the existing SENDING ledger performs observation only.
+                    # Never clear/rebind or call Send again to fix a late DOM user ID.
+                    state["active_action"] = "reconcile_send"
+                    return
+                self._block(state, "Accepted user identity did not reconcile from the exact live page.",
+                            code="send_acceptance_ambiguous", retryable=False)
+                return
+            raise
         except UploadIdentityChangedError:
             attachment = next(
                 (
@@ -3944,6 +4273,8 @@ class CDPAWorker:
     def _canonicalize_receipt_conversation_url(
         state: dict[str, Any], hop: dict[str, Any]
     ) -> None:
+        if state.get("conversation_mode") == "temporary":
+            return  # Backend identity remains receipt evidence, never a saved reopen URL.
         payload = hop.get("receipt")
         if not isinstance(payload, Mapping):
             return
@@ -4963,6 +5294,13 @@ class CDPAWorker:
                 wait.pop(key, None)
         role = str(hop["target_role"])
         acquired = await self._owned_or_block(state, role, actions)
+        if state.get("active_hop_id") != hop.get("hop_id") and state.get("status") != "BLOCKED":
+            self._finish_resume_control(
+                state, control, outcome="continued", action="recover_execution",
+                reason_code=None, reason="Durable recovery continuation was queued without replaying the accepted request.",
+                postcondition="recovery_continuation_queued",
+            )
+            return
         if acquired is None:
             self._require_resume_recovery(
                 state, control, action="reopen_saved_tab",
@@ -5003,7 +5341,7 @@ class CDPAWorker:
             return False
         if str(hop.get("state") or "") != "sending":
             return False
-        if record is None or record.status is not RequestStatus.NEW:
+        if record is None or record.status not in {RequestStatus.NEW, RequestStatus.PROMPT_SET}:
             return False
         if int(record.attempts or 0) != 0:
             return False
@@ -5996,6 +6334,24 @@ class CDPAWorker:
                     state, hop, control, actions, ledger, record
                 )
                 return
+            if self._endpoint_pool is not None:
+                endpoint_id = self._execution_endpoint_id(state, role) or self.store.endpoint_id_for(state)
+                if self._prepare_cross_endpoint_recovery(
+                    state,
+                    endpoint_id,
+                    reason="The exact SENDING page is gone and acceptance/non-acceptance is unproven.",
+                    force_new_generation=True,
+                ):
+                    self._finish_resume_control(
+                        state,
+                        control,
+                        outcome="continued",
+                        action="recover_execution",
+                        reason_code=None,
+                        reason="Durable recovery continuation was queued without replaying the ambiguous request.",
+                        postcondition="recovery_continuation_queued",
+                    )
+                    return
             self._require_resume_recovery(
                 state,
                 control,
@@ -6461,8 +6817,10 @@ class CDPAWorker:
                         endpoint_id,
                         reason="previous endpoint is unavailable for the crossed Send boundary",
                     ):
-                        state["active_action"] = "waiting_endpoint_recovery"
-                        return state
+                        if state.get("status") != "BLOCKED":
+                            self._block(state, "No safe execution relocation path: reconcile request and page-owned effects.",
+                                        code="execution_recovery_requires_reconciliation", retryable=True)
+                        return self._persist_transport_result(path, transport_baseline, state)
                 actions = CDPATabActions(browser_context, self.config)
                 if state.get("cleanup", {}).get("state") == "CLEARING":
                     await self._continue_cleanup(state, actions, path)
@@ -7487,6 +7845,112 @@ class CDPAWorker:
                 raise RuntimeError("control command provenance has different confirmation")
         return state
 
+    def _browser_endpoint_has_running_execution(self, endpoint_id: str) -> bool:
+        return any(
+            str(item.get("endpoint_id") or "") == endpoint_id
+            for item in self._running_executions()
+        )
+
+    def _finalize_drained_endpoints(self) -> list[str]:
+        finalized: list[str] = []
+        for endpoint in self.store.endpoints.list():
+            endpoint_id = str(endpoint.get("endpoint_id") or "")
+            if not endpoint_id or endpoint.get("draining") is not True:
+                continue
+            if self._browser_endpoint_has_running_execution(endpoint_id):
+                continue
+            removed = self.store.endpoints.remove(
+                endpoint_id, has_nonterminal_tasks=False
+            )
+            if removed.get("removed") is True:
+                finalized.append(endpoint_id)
+        return finalized
+
+    @staticmethod
+    def _browser_endpoint_add_settings(payload: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+        address = normalize_cdp_endpoint(str(payload.get("address") or ""))
+        settings = {key: value for key, value in payload.items()
+                    if key not in {"address", "clone_from_endpoint_id", "start"}}
+        normalize_endpoint_record({**settings, "cdp_url": address}, endpoint_id="admission-validation")
+        if settings.get("management_mode", "external") == "external" and any(
+            key in payload for key in ("profile_path", "executable_path", "clone_from_endpoint_id", "start")
+        ):
+            raise ValueError("external browsers are attach-only")
+        return address, settings
+
+    async def _probe_browser_endpoint(self, address: str) -> dict[str, Any]:
+        pool = self._endpoint_pool or EndpointPool(self.store.endpoints)
+        return await pool.probe_address(address)
+
+    async def _complete_browser_endpoint_add(self, command_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        address = None
+        try:
+            address, settings = self._browser_endpoint_add_settings(payload)
+            probe = None
+            existing = any(item["cdp_url"] == address for item in self.store.endpoints.list())
+            if settings.get("management_mode", "external") == "external" and not existing:
+                probe = await self._probe_browser_endpoint(address)
+                if probe.get("health") != "online":
+                    raise ConnectionError(probe.get("error") or "CDP endpoint is unavailable")
+            if settings.get("management_mode") == "managed-local":
+                endpoint = await asyncio.to_thread(self._apply_browser_endpoint_add, payload)
+            else:
+                endpoint = self._apply_browser_endpoint_add(payload)
+            self.runtime_db.finish_command(command_id, result={
+                "endpoint_id": endpoint["endpoint_id"], "endpoint": endpoint, "probe": probe,
+            })
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}"
+            if address and is_local_cdp_endpoint(address) and isinstance(exc, (ConnectionError, OSError)):
+                detail += "; for an offline local browser choose managed-local and a new, existing, or safe cloned profile"
+            self.runtime_db.finish_command(command_id, error=sanitize_text(detail, max_chars=2000))
+        return self.runtime_db.get_command(command_id)
+
+    def _apply_browser_endpoint_add(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        address, settings = self._browser_endpoint_add_settings(payload)
+        for existing in self.store.endpoints.list(include_removed=True):
+            if existing.get("removed") or existing.get("cdp_url") != address:
+                continue
+            if any(existing.get(key) != value for key, value in settings.items()):
+                raise ValueError("browser endpoint address is already registered with different settings")
+            if payload.get("start") is True:
+                self.managed_browsers.start(existing)
+            return existing
+        if settings.get("management_mode") == "managed-local":
+            clone_id = str(payload.get("clone_from_endpoint_id") or "").strip()
+            source = self.store.endpoints.get(clone_id) if clone_id else None
+            source_running = bool(
+                source and self.managed_browsers.read_pid(str(source["endpoint_id"]))
+            )
+            self.managed_browsers.prepare_profile(
+                profile_path=str(settings.get("profile_path") or ""),
+                clone_from=source,
+                source_running=source_running,
+            )
+        endpoint = self.store.endpoints.add(address, **settings)
+        if payload.get("start") is True:
+            self.managed_browsers.start(endpoint)
+        return endpoint
+
+    def _apply_browser_endpoint_update(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        endpoint_id = str(payload.get("endpoint_id") or "").strip()
+        if not endpoint_id:
+            raise ValueError("browser endpoint update requires endpoint_id")
+        changes = {key: value for key, value in payload.items() if key != "endpoint_id"}
+        if "cdp_url" in changes and normalize_cdp_endpoint(changes["cdp_url"]) != self.store.endpoints.get(endpoint_id)["cdp_url"]:
+            if self._browser_endpoint_has_running_execution(endpoint_id):
+                raise ValueError("cannot retarget a running endpoint; drain its executions first")
+        return self.store.endpoints.update(endpoint_id, **changes)
+
+    def _apply_browser_endpoint_remove(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        endpoint_id = str(payload.get("endpoint_id") or "").strip()
+        if not endpoint_id:
+            raise ValueError("browser endpoint removal requires endpoint_id")
+        return self.store.endpoints.remove(
+            endpoint_id,
+            has_nonterminal_tasks=self._browser_endpoint_has_running_execution(endpoint_id),
+        )
+
     def _apply_next_command(
         self, *, allowed_kinds: Sequence[str] | None = None
     ) -> dict[str, Any] | None:
@@ -7540,6 +8004,34 @@ class CDPAWorker:
                         f"{len(catalog.get('errors') or [])} discovery errors"
                     )
                 result = {"catalog": catalog}
+            elif kind == "browser_endpoint_add":
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    return asyncio.run(self._complete_browser_endpoint_add(command_id, payload))
+                task = loop.create_task(self._complete_browser_endpoint_add(command_id, payload))
+                self._browser_command_tasks.add(task)
+                task.add_done_callback(self._browser_command_tasks.discard)
+                return self.runtime_db.get_command(command_id)
+            elif kind == "browser_endpoint_update":
+                endpoint = self._apply_browser_endpoint_update(payload)
+                result = {"endpoint_id": endpoint["endpoint_id"], "endpoint": endpoint}
+            elif kind == "browser_endpoint_remove":
+                endpoint = self._apply_browser_endpoint_remove(payload)
+                result = {
+                    "endpoint_id": endpoint["endpoint_id"],
+                    "draining": endpoint["draining"],
+                    "removed": endpoint["removed"],
+                }
+            elif kind in {"browser_endpoint_start", "browser_endpoint_stop"}:
+                endpoint_id = str(payload.get("endpoint_id") or "").strip()
+                endpoint = self.store.endpoints.get(endpoint_id)
+                if kind == "browser_endpoint_start":
+                    self.managed_browsers.start(endpoint)
+                    result = {"endpoint_id": endpoint_id, "running": True}
+                else:
+                    stopped = self.managed_browsers.stop(endpoint)
+                    result = {"endpoint_id": endpoint_id, "running": False, "stopped": stopped}
             elif kind == "create_task":
                 if task_id is None:
                     raise ValueError("create_task requires preallocated task_id")
@@ -7963,7 +8455,14 @@ class CDPAWorker:
 
     def dispatch_command_once(self) -> dict[str, Any] | None:
         if self.runtime_degraded or self.registry is None:
-            recovery = self._apply_next_command(allowed_kinds=("reload_catalog",))
+            recovery = self._apply_next_command(allowed_kinds=(
+                "reload_catalog",
+                "browser_endpoint_add",
+                "browser_endpoint_update",
+                "browser_endpoint_remove",
+                "browser_endpoint_start",
+                "browser_endpoint_stop",
+            ))
             if recovery is not None:
                 return recovery
             rejected = self.runtime_db.claim_next_command(
@@ -8017,6 +8516,11 @@ class CDPAWorker:
             "independent_task_control",
             "resume_team",
             "task_control",
+            "browser_endpoint_add",
+            "browser_endpoint_update",
+            "browser_endpoint_remove",
+            "browser_endpoint_start",
+            "browser_endpoint_stop",
         )
         if self._browser_cycle_active:
             allowed = browser_safe_commands
@@ -8100,6 +8604,14 @@ class CDPAWorker:
             item["connected"] = inventory is not None
             item["page_count"] = len(endpoint_pages)
             item["pages"] = endpoint_pages
+            if item.get("management_mode") == "managed-local":
+                item.update(self.managed_browsers.process_state(endpoint_id))
+            else:
+                item.update(
+                    managed_running=None,
+                    process_ownership=None,
+                    process_error=None,
+                )
             endpoints.append(item)
             pages.extend(endpoint_pages)
         projection = {
@@ -8249,6 +8761,32 @@ class CDPAWorker:
             if not isinstance(binding, Mapping):
                 self._ambient_next_probe_at[key] = now + 5
                 continue
+            if self.registry is not None and binding.get("taskId"):
+                owner = self.registry.tasks_by_id.get(str(binding["taskId"]))
+                if not isinstance(owner, Mapping):
+                    continue  # Another worker's or unrelated tab is never our automation surface.
+                retired = False
+                for hop in owner.get("hops", []):
+                    if not isinstance(hop, Mapping) or hop.get("state") != "abandoned":
+                        continue
+                    hop_endpoint = hop.get("browser_endpoint_id", self.store.endpoint_id_for(owner))
+                    if endpoint_id is not None and hop_endpoint != endpoint_id:
+                        continue
+                    retired_page_id = None
+                    receipt = hop.get("receipt")
+                    if isinstance(receipt, Mapping) and isinstance(receipt.get("binding"), Mapping):
+                        retired_page_id = receipt["binding"].get("page_id")
+                    if retired_page_id is None and hop.get("ledger_path") and hop.get("request_id"):
+                        try:
+                            durable = RequestLedger(str(hop["ledger_path"])).peek(str(hop["request_id"]))
+                            retired_page_id = getattr(getattr(durable, "binding", None), "page_id", None)
+                        except Exception:
+                            retired_page_id = None
+                    if retired_page_id is None or binding.get("history_only") or retired_page_id == binding.get("pageId"):
+                        retired = True
+                        break
+                if retired:
+                    continue  # Never approve delayed tools on an execution superseded by recovery.
             client = ChatGPTPage(page, timeout_ms=min(15_000, round(self.config.workspace_timeout_seconds * 1000)))
             if binding.get("pageId") and binding.get("role"):
                 client.binding = PageBinding(str(binding["pageId"]), str(binding["role"]))
@@ -8274,6 +8812,31 @@ class CDPAWorker:
             for key in set(mapping) - live:
                 mapping.pop(key, None)
 
+    def _set_pool_wait(self, state: Mapping[str, Any], *, waiting: bool) -> dict[str, Any]:
+        """Resource waiting is a durable pause of the same hop, never a task replacement."""
+        def mutate(current: dict[str, Any]) -> None:
+            prior = current.get("waiting") or {}
+            is_pool_wait = current.get("status") == "WAITING" and prior.get("reason") == "browser_pool"
+            if waiting:
+                if current.get("status") not in {"INBOX", "RUNNING"}:
+                    return
+                current["waiting"] = {
+                    "reason": "browser_pool", "since": utc_now(), "waiting_on": [], "stopped": [], "missing": [],
+                    "resume_status": current["status"], "resume_column": current["kanban_column"],
+                    "resume_action": current["active_action"],
+                }
+                current.update(status="WAITING", kanban_column="WAITING", active_action="waiting_browser_capacity",
+                               waiting_code="browser_pool", waiting_reason="Waiting for usable browser capacity (health, login, cooldown or slots).")
+            elif is_pool_wait:
+                current.update(status=prior["resume_status"], kanban_column=prior["resume_column"],
+                               active_action=prior["resume_action"], waiting_code=None, waiting_reason=None,
+                               waiting={"reason": None, "since": None, "waiting_on": [], "stopped": [], "missing": []})
+        saved = self.store.update(str(state["manifest_path"]), mutate)
+        self._remember_manifest(Path(str(saved["manifest_path"])), saved)
+        if self.registry is not None:
+            self.registry.update_task(saved, now=time.time())
+        return saved
+
     async def run_once(
         self,
         browser_context: Any | None,
@@ -8282,6 +8845,8 @@ class CDPAWorker:
         publish_browser: bool = True,
         endpoint_pool: Any | None = None,
     ) -> list[dict[str, Any] | None]:
+        if self._browser_cycle_active:
+            return []
         hydrated_now = False
         if self.registry is None and not self.runtime_degraded:
             self.hydrate_runtime()
@@ -8289,18 +8854,25 @@ class CDPAWorker:
         if self.runtime_degraded or self.registry is None:
             self._publish_heartbeat()
             return []
-        contexts: Mapping[str, Any] = (
+        contexts: dict[str, Any] = dict(
             endpoint_pool.contexts if endpoint_pool is not None else {}
         )
+        pool_errors: list[str] = []
         if endpoint_pool is None and browser_context is None:
             raise ValueError("single-endpoint cycle requires a browser context")
         self._browser_cycle_active = True
+        running: dict[asyncio.Task[Any], tuple[str, Path, str | None]] = {}
         try:
             if endpoint_pool is not None:
-                for current_endpoint_id, context in contexts.items():
-                    await self._maintain_ambient_page_automation(
-                        context, endpoint_id=current_endpoint_id
-                    )
+                for current_endpoint_id, context in list(contexts.items()):
+                    try:
+                        await self._maintain_ambient_page_automation(context, endpoint_id=current_endpoint_id)
+                    except Exception as exc:
+                        if not is_cdp_disconnect(exc):
+                            raise
+                        pool_errors.append(f"{current_endpoint_id}: {type(exc).__name__}: {exc}")
+                        contexts.pop(current_endpoint_id, None)
+                        await endpoint_pool.mark_unavailable(current_endpoint_id, exc)
                 if publish_browser:
                     await self._publish_browser_pool_inventory(
                         contexts,
@@ -8321,11 +8893,17 @@ class CDPAWorker:
                 await self._refresh_rate_limit_cooldown(browser_context)
             self._activate_independent_agents()
             if endpoint_pool is not None:
-                for current_endpoint_id, context in contexts.items():
-                    await self._close_idle_independent_tabs(
-                        CDPATabActions(context, self.config),
-                        endpoint_id=current_endpoint_id,
-                    )
+                for current_endpoint_id, context in list(contexts.items()):
+                    try:
+                        await self._close_idle_independent_tabs(
+                            CDPATabActions(context, self.config), endpoint_id=current_endpoint_id,
+                        )
+                    except Exception as exc:
+                        if not is_cdp_disconnect(exc):
+                            raise
+                        pool_errors.append(f"{current_endpoint_id}: {type(exc).__name__}: {exc}")
+                        contexts.pop(current_endpoint_id, None)
+                        await endpoint_pool.mark_unavailable(current_endpoint_id, exc)
             else:
                 assert browser_context is not None
                 await self._close_idle_independent_tabs(
@@ -8335,7 +8913,6 @@ class CDPAWorker:
             due_at = now + MINIMUM_DEADLINE_SECONDS if hydrated_now else now
             results: list[dict[str, Any] | None] = []
             disconnect: BaseException | None = None
-            pool_errors: list[str] = []
             affected: set[str] = set()
             running: dict[
                 asyncio.Task[Any], tuple[str, Path, str | None]
@@ -8361,10 +8938,12 @@ class CDPAWorker:
                     selected_context = browser_context
                     if endpoint_pool is not None:
                         affinity = self._role_endpoint_affinity(state)
+                        if affinity is None and state.get("active_hop_id") == 1:
+                            affinity = str(state.get("browser_endpoint_id") or "") or None
                         running_others = [
                             item
                             for item in durable_running
-                            if str(item.get("task_id") or "") != task_id
+                            if str(item.get("task_id") or "") not in active_ids | {task_id}
                         ]
                         selected_endpoint = endpoint_pool.select_endpoint(
                             running_others,
@@ -8372,9 +8951,31 @@ class CDPAWorker:
                             cooldown_scopes=self._active_rate_limit_scopes(),
                             reservations=reservations,
                         )
-                        if selected_endpoint is None:
+                        previous_endpoint = self._execution_endpoint_id(state)
+                        current_hop = next((item for item in state.get("hops", []) if item.get("hop_id") == state.get("active_hop_id")), {})
+                        crossed = current_hop.get("state") in {"sent", "waiting", "responded"} or (
+                            current_hop.get("state") == "sending"
+                            and self._sending_hop_durable_boundary_state(current_hop) != "preboundary"
+                        )
+                        protected = any(item.get("task_id") == task_id for item in durable_running)
+                        previous_ready = next((item for item in endpoint_pool.snapshot()["endpoints"] if item["endpoint_id"] == previous_endpoint and item["chatgpt_ready"]), None)
+                        if previous_endpoint in contexts and previous_ready and (
+                            crossed or (protected and previous_ready["rate_limit_scope"] not in self._active_rate_limit_scopes())
+                        ):
+                            # Receiving/reconciling an existing request is not a new allocation.
+                            selected_endpoint = previous_endpoint
+                        stop_requested = any(item.get("status") == "requested" and item.get("action") == "stop"
+                                             for item in state.get("controls", []) if isinstance(item, Mapping))
+                        if selected_endpoint is None and not stop_requested:
+                            if state.get("status") in {"INBOX", "RUNNING"}:
+                                state = self._set_pool_wait(state, waiting=True)
+                                affected.add(task_id)
                             continue
-                        selected_context = contexts.get(selected_endpoint)
+                        if state.get("status") == "WAITING" and (state.get("waiting") or {}).get("reason") == "browser_pool":
+                            state = self._set_pool_wait(state, waiting=False)
+                            affected.add(task_id)
+                            scheduling_tasks = list(self.registry.tasks_by_id.values())
+                        selected_context = contexts.get(selected_endpoint) if selected_endpoint else SimpleNamespace(pages=[])
                         if selected_context is None:
                             continue
                     if selected_context is None:
@@ -8385,10 +8986,19 @@ class CDPAWorker:
                     }
                     if selected_endpoint is not None:
                         kwargs["endpoint_id"] = selected_endpoint
+                    if task_id in self._execution_leases:
+                        continue
+                    if selected_endpoint is not None:
+                        hop = next((item for item in state.get("hops", []) if item.get("hop_id") == state.get("active_hop_id")), {})
+                        self._execution_leases[task_id] = {
+                            "endpoint_id": selected_endpoint, "task_id": task_id, "team": str(state.get("team") or ""),
+                            "role": state.get("active_role"), "request_id": hop.get("request_id"), "page_id": None,
+                        }
                     task = asyncio.create_task(
                         self.advance(path, selected_context, **kwargs)
                     )
                     running[task] = (task_id, path, selected_endpoint)
+                    active_ids.add(task_id)
                     if endpoint_pool is not None and selected_endpoint is not None:
                         reservations[selected_endpoint] = (
                             reservations.get(selected_endpoint, 0) + 1
@@ -8404,6 +9014,7 @@ class CDPAWorker:
                 )
                 for task in done:
                     task_id, path, selected_endpoint = running.pop(task)
+                    self._execution_leases.pop(task_id, None)
                     if endpoint_pool is not None and selected_endpoint is not None:
                         reservations[selected_endpoint] = max(
                             0, reservations.get(selected_endpoint, 0) - 1
@@ -8420,6 +9031,8 @@ class CDPAWorker:
                                 pool_errors.append(
                                     f"{selected_endpoint}: {type(result).__name__}: {result}"
                                 )
+                                contexts.pop(selected_endpoint, None)
+                                await endpoint_pool.mark_unavailable(selected_endpoint, result)
                         else:
                             print(
                                 f"cdpa-worker: manifest {path}: {type(result).__name__}: {result}",
@@ -8468,30 +9081,27 @@ class CDPAWorker:
                 self._publish_heartbeat(browser_connected=True)
             return results
         finally:
+            for task in running:
+                task.cancel()
+            if running:
+                await asyncio.gather(*running, return_exceptions=True)
+            for task_id, _path, _endpoint in running.values():
+                self._execution_leases.pop(task_id, None)
             self._browser_cycle_active = False
 
     async def run_once_pool(self, endpoint_pool: Any) -> list[dict[str, Any] | None]:
+        self._endpoint_pool = endpoint_pool
         return await self.run_once(None, endpoint_pool=endpoint_pool)
 
     async def run_pool_forever(self, endpoint_pool: Any) -> None:
         first_refresh = True
         while True:
+            self._finalize_drained_endpoints()
             await endpoint_pool.refresh(wait=first_refresh)
             first_refresh = False
-            if endpoint_pool.contexts:
-                await self.run_once_pool(endpoint_pool)
-            else:
-                await self._publish_browser_pool_inventory(
-                    {},
-                    endpoint_pool.snapshot(
-                        running_executions=self._running_executions()
-                    ),
-                )
-                self._publish_heartbeat(
-                    force=True,
-                    browser_connected=False,
-                    browser_error="no usable browser endpoint",
-                )
+            await self.run_once_pool(endpoint_pool)
+            if not endpoint_pool.contexts:
+                self._publish_heartbeat(force=True, browser_connected=False, browser_error="no usable browser endpoint")
             now = time.time()
             next_due = self.registry.next_due_at() if self.registry else None
             delay = self.config.command_poll_seconds
@@ -8522,6 +9132,7 @@ async def _run(config: CDPAConfig) -> None:
         worker.store.endpoints,
         retry_delay=max(1.0, min(15.0, config.worker_poll_seconds * 2)),
     )
+    worker._endpoint_pool = endpoint_pool
     command_task = asyncio.create_task(worker.run_command_loop())
     heartbeat_task = asyncio.create_task(worker._heartbeat_loop())
     try:
@@ -8530,6 +9141,9 @@ async def _run(config: CDPAConfig) -> None:
         command_task.cancel()
         heartbeat_task.cancel()
         await asyncio.gather(command_task, heartbeat_task, return_exceptions=True)
+        for task in tuple(worker._browser_command_tasks):
+            task.cancel()
+        await asyncio.gather(*worker._browser_command_tasks, return_exceptions=True)
         await endpoint_pool.close()
         worker.runtime_db.close()
 

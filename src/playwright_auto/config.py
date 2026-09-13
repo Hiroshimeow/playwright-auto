@@ -22,6 +22,20 @@ def resolve_chromium(explicit: str | None = None) -> str:
         resolved = shutil.which(command)
         if resolved:
             return resolved
+    if os.name == "nt":
+        candidates = (
+            ("LOCALAPPDATA", "Google/Chrome/Application/chrome.exe"),
+            ("PROGRAMFILES", "Google/Chrome/Application/chrome.exe"),
+            ("PROGRAMFILES(X86)", "Google/Chrome/Application/chrome.exe"),
+            ("PROGRAMFILES", "Microsoft/Edge/Application/msedge.exe"),
+            ("PROGRAMFILES(X86)", "Microsoft/Edge/Application/msedge.exe"),
+        )
+        for variable, suffix in candidates:
+            root = os.environ.get(variable, "").strip()
+            if root:
+                candidate = Path(root) / suffix
+                if candidate.is_file():
+                    return str(candidate)
     snap_chromium = Path("/snap/bin/chromium")
     if snap_chromium.is_file():
         return str(snap_chromium)

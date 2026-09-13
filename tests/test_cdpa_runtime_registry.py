@@ -35,7 +35,7 @@ def test_hydrate_builds_identity_dependency_and_team_indexes():
     )
 
     assert set(registry.tasks_by_id) == {"parent", "child"}
-    assert registry.paths_by_id["parent"] == Path("/repo/.plan/alpha/parent.json")
+    assert registry.paths_by_id["parent"] == Path("/repo/.plan/alpha/parent.json").resolve()
     assert registry.dependency_children == {"parent": {"child"}}
     assert registry.team_members == {"alpha": {"parent"}, "beta": {"child"}}
     assert registry.affected_by("parent") == {"parent", "child"}

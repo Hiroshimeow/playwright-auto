@@ -453,8 +453,8 @@ def test_notify_frontend_contract_reuses_secondary_report_path_and_preserves_his
     assert 'if (current.drawer === "history") renderHistory(roots.secondaryContent, current);' in app
     assert 'if (current.drawer === "notify") renderNotify(roots.secondaryContent, current);' in app
     assert 'if (view === "notify") delete roots.secondaryContent.dataset.secondaryView;' in app
-    assert '/assets/app.js?v=20260908-live-audit-nav-v4' in html
-    assert './views/notify.js?v=20260906-listen-controls-v1' in app
+    assert '/assets/app.js?v=20260913-multi-cdp-v1' in html
+    assert './views/notify.js?v=20260913-multi-cdp-v1' in app
     assert 'data-notify-task-id' in notify
     assert 'workflowReportModel(detail, detail.active_role)' in notify
     assert 'reportBody(report, reportBodies)' in notify

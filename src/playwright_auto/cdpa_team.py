@@ -77,7 +77,11 @@ def allocate_team(
 
 
 def is_active_team_owner(manifest: Mapping[str, Any]) -> bool:
-    return str(manifest.get("status") or "").upper() in ACTIVE_TEAM_OWNER_STATUSES
+    status = str(manifest.get("status") or "").upper()
+    waiting = manifest.get("waiting")
+    return status in ACTIVE_TEAM_OWNER_STATUSES or (
+        status == "WAITING" and isinstance(waiting, Mapping) and waiting.get("reason") == "browser_pool"
+    )
 
 
 def is_team_availability_barrier(manifest: Mapping[str, Any]) -> bool:
@@ -142,6 +146,7 @@ def exact_team_ready_waiters(
             manifest
             for manifest in team_tasks
             if str(manifest.get("status") or "").upper() == "WAITING"
+            and (manifest.get("waiting") or {}).get("reason") != "browser_pool"
             and (
                 (
                     isinstance(manifest.get("queue"), Mapping)

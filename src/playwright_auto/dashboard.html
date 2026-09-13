@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>CDPA Control Center</title>
-  <link rel="stylesheet" href="/assets/dashboard.css?v=20260908-live-audit-nav-v4">
+  <link rel="stylesheet" href="/assets/dashboard.css?v=20260913-multi-cdp-v1">
 </head>
 <body>
   <header class="app-header">
@@ -53,6 +53,7 @@
         </div>
         <div id="catalog-health" class="catalog-health" aria-live="polite"></div>
       </header>
+      <div id="browser-scope" class="browser-scope" aria-label="Browser endpoint scope"></div>
       <div id="board" class="board-grid" aria-live="polite">
         <aside id="commands" class="lane command-lane" data-column="COMMANDS" aria-live="polite"></aside>
       </div>
@@ -78,6 +79,20 @@
         <button type="button" class="button icon-button" data-close-secondary aria-label="Close secondary view">Close</button>
       </header>
       <div id="secondary-content" class="secondary-content" aria-live="polite"></div>
+    </section>
+  </dialog>
+
+  <dialog id="browser-dialog" class="create-dialog browser-dialog" aria-labelledby="browser-dialog-title">
+    <section class="secondary-shell browser-shell">
+      <header class="secondary-header">
+        <div>
+          <p class="eyebrow">Browser pool</p>
+          <h2 id="browser-dialog-title">Manage browsers</h2>
+          <p class="detail-subtitle">Endpoints are shared capacity. Removing a busy endpoint drains it before detaching.</p>
+        </div>
+        <button type="button" class="button icon-button" data-close-browser-manager aria-label="Close browser manager">Close</button>
+      </header>
+      <div id="browser-manager" class="secondary-content browser-manager" aria-live="polite"></div>
     </section>
   </dialog>
 
@@ -123,6 +138,11 @@
             <label>Reuse exact team<select name="reuse_team"><option value="">Do not reuse</option></select></label>
           </div>
           <label>Repository<input name="repository" autocomplete="off" placeholder="Uses dashboard repository when blank"></label>
+          <div class="form-grid">
+            <label>Initial browser<select name="browser_endpoint_id"><option value="">Pool default</option></select></label>
+            <label class="check-row create-temporary-control"><input type="checkbox" name="temporary"> Force Temporary chat</label>
+          </div>
+          <p class="form-help">Browser selection is initial placement/provenance only; later roles may use any eligible endpoint. Leave Temporary unchecked to inherit the selected endpoint default.</p>
           <p class="form-help">Choose one team path. Exact-team reuse inherits and locks its workflow-agent composition.</p>
         </section>
 
@@ -327,6 +347,6 @@
   <datalist id="workflow-task-team-options"></datalist>
 
   <div id="toast" class="toast" hidden role="status"></div>
-  <script type="module" src="/assets/app.js?v=20260908-live-audit-nav-v4"></script>
+  <script type="module" src="/assets/app.js?v=20260913-multi-cdp-v1"></script>
 </body>
 </html>

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Mapping, Sequence
 
 from .cdpa_config import CDPAConfig
@@ -73,6 +74,16 @@ class PromptBuilder:
             report_path,
         ).replace(".plan/<team>", f"{self._plans_prefix()}/<team>")
 
+    @staticmethod
+    def filesystem_scope(workspace: str, report_path: str) -> str:
+        path_type = PureWindowsPath if PureWindowsPath(workspace).drive else PurePosixPath
+        destination = path_type(workspace) / report_path
+        return (
+            f"FILESYSTEM_SCOPE: Resolve relative paths under {workspace}, not its parent or Git's top-level directory.\n"
+            f"Absolute report destination: {destination}\n"
+            "Use this exact working directory for MCP filesystem/tool calls. Keep the route handoff relative as specified."
+        )
+
     def build(
         self,
         *,
@@ -141,6 +152,7 @@ class PromptBuilder:
             if is_system_role and not bootstrap_inherited:
                 sections.append(self._base_context())
             sections.append(constructor)
+        sections.append(self.filesystem_scope(str(workspace).strip(), expected_report_path))
         sections.append(
             self._guide(
                 report_mode,
@@ -224,15 +236,19 @@ class PromptBuilder:
         physical_role: str,
         turn: int,
         validation_error: str,
+        expected_report_path: str,
         report_mode: str = "file",
         allowed_routes: Sequence[str] | None = None,
     ) -> str:
         if not str(validation_error).strip():
             raise ValueError("repair requires a validation error")
+        exact_report = str(expected_report_path).strip()
+        if not exact_report:
+            raise ValueError("repair requires an expected report path")
         return (
             "Continue from this state.\n"
             "Finish the current task without restarting completed work.\n"
-            f"Report naming rule: {self.naming_rule()}\n"
+            f"Report path: {exact_report}\n"
             'Reply only with route JSON: {"route":"<route>","handoff":"<report path or concise handoff>"}'
         )
 

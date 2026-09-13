@@ -34,6 +34,19 @@ def test_allow_requires_five_seconds_for_every_source(source):
     assert step(current, wait, 5, **kwargs).action is Action.ALLOW
 
 
+def test_temporary_save_offer_does_not_block_consuming_completed_response():
+    current = current_result(blocking_dialogs=("Want to keep this chat? You can now save it to your history.",),
+                             url="https://chatgpt.com/?temporary-chat=true")
+    wait = {}
+    assert step(current, wait).action is Action.WAIT
+    assert step(current, wait, 5).action is Action.ACCEPT
+    # This exception authorizes reading a result, never sending through a dialog or saving a chat.
+    assert step(current, {}, phase="pre_send").action is Action.BLOCK
+    other = current_result(blocking_dialogs=("Want to keep this chat? You can now save it to your history.", "Delete chat?"),
+                           url="https://chatgpt.com/?temporary-chat=true")
+    assert step(other, {}).action is Action.BLOCK
+
+
 def test_stable_valid_result_wins_over_permission_evidence():
     current = current_result(mcp_permission_node_count=1)
     wait = {}

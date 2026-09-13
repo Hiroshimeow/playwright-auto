@@ -70,6 +70,11 @@ class BranchBootstrapError(RuntimeError):
     pass
 
 
+class BootstrapDonorUnavailableError(BranchBootstrapError):
+    """The server definitively denied this donor on this account, before Send."""
+    donor_unavailable = True
+
+
 class BranchTargetUnresolvedError(BranchBootstrapError):
     pass
 
@@ -456,6 +461,10 @@ class CDPATabActions:
                 "new_branch backend response did not provide canonical conversation identity"
             ) from exc
         status = int(getattr(response, "status", 0) or 0)
+        if status in {403, 404, 410}:
+            raise BootstrapDonorUnavailableError(f"bootstrap donor is unavailable on this endpoint (HTTP {status})")
+        if status == 429:
+            raise RateLimitBlockedError("new_branch backend reported HTTP 429")
         if status < 200 or status >= 300:
             raise BranchTargetUnresolvedError(
                 f"new_branch backend response failed with HTTP {status}"
@@ -894,13 +903,15 @@ class CDPATabActions:
         *,
         url: str,
     ) -> AcquiredRole:
-        selected = await self.preflight_team(manifest)
-        if selected:
-            await self.close_team(manifest, preflighted_pages=selected)
-            if await self.preflight_team(manifest):
-                raise TeamCloseError("fresh chat could not close the previous owned tab")
         logical_role = str(logical_role).upper()
         record = manifest["roles"][logical_role]
+        # A generation belongs to one role execution, not every role in its team.
+        role_scope = {**manifest, "roles": {logical_role: record}}
+        selected = await self.preflight_team(role_scope)
+        if selected:
+            await self.close_team(role_scope, preflighted_pages=selected)
+            if await self.preflight_team(role_scope):
+                raise TeamCloseError("fresh chat could not close the previous owned role tab")
         physical = str(record["physical_role"])
         await random_delay(action_delay_multiplier("open_tab"))
         workspace = ChatGPTWorkspace()

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -22,6 +23,7 @@ from .cdpa_bootstraps import (
 )
 from .cdpa_commands import RepairRequest
 from .cdpa_config import CDPAConfig, declared_repository_from_task, load_cdpa_config
+from .cdpa_endpoints import BrowserEndpointRegistry
 from .cdpa_identity import generate_idempotent_task_id, validate_task_id
 from .cdpa_independent import (
     normalize_agent_name,
@@ -115,8 +117,7 @@ class DashboardAPI:
                     1,
                 )
         try:
-            disk = os.statvfs(self.config.repository_root)
-            disk_free_bytes: int | None = disk.f_bavail * disk.f_frsize
+            disk_free_bytes: int | None = shutil.disk_usage(self.config.repository_root).free
         except OSError:
             disk_free_bytes = None
         return {"cpu_percent": cpu_percent, "disk_free_bytes": disk_free_bytes}
@@ -340,12 +341,24 @@ class DashboardAPI:
             if not isinstance(endpoint, str) or not endpoint.strip():
                 raise APIError(400, "invalid_request", "browser_endpoint_id must be a non-empty string")
             normalized["browser_endpoint_id"] = endpoint.strip()
+        effective_temporary = raw.get("temporary") is True
+        if not effective_temporary:
+            try:
+                effective_temporary = bool(
+                    BrowserEndpointRegistry(self.config)
+                    .resolve(normalized.get("browser_endpoint_id"))
+                    .get("temporary_default")
+                )
+            except ValueError:
+                pass
         definition = (
             self._bootstrap_definition(raw.get("bootstrap_definition"))
             if "bootstrap_definition" in raw
             else None
         )
         if definition is not None:
+            if effective_temporary:
+                raise APIError(400, "invalid_request", "temporary workflows do not support bootstrap context")
             requested_id = raw.get("bootstrap_id")
             if requested_id not in {None, definition["bootstrap_id"]}:
                 raise APIError(
@@ -356,7 +369,7 @@ class DashboardAPI:
             normalized["bootstrap_id"] = definition["bootstrap_id"]
             normalized["bootstrap_definition"] = definition
         elif "bootstrap_id" not in raw:
-            normalized["bootstrap_id"] = self._default_bootstrap_id()
+            normalized["bootstrap_id"] = None if effective_temporary else self._default_bootstrap_id()
         elif raw.get("bootstrap_id") is None:
             normalized["bootstrap_id"] = None
         else:
@@ -368,9 +381,11 @@ class DashboardAPI:
                     "bootstrap_id must be a non-empty string or null",
                 )
             normalized["bootstrap_id"] = bootstrap_id
+        if effective_temporary and normalized.get("bootstrap_id") is not None:
+            raise APIError(400, "invalid_request", "temporary workflows do not support bootstrap context")
         if normalized.get("bootstrap_id") is not None:
             normalized["context_policy"] = "bootstrap"
-        elif "bootstrap_id" in raw:
+        elif "bootstrap_id" in raw or effective_temporary:
             normalized["context_policy"] = "fresh"
         return normalized
 
@@ -402,6 +417,79 @@ class DashboardAPI:
         if raw:
             raise APIError(400, "invalid_request", "request body must be empty")
         return {}
+
+    @staticmethod
+    def _browser_endpoint_id(value: object) -> str:
+        endpoint_id = str(value or "").strip()
+        if not endpoint_id or len(endpoint_id) > 128:
+            raise APIError(400, "invalid_request", "browser endpoint id is invalid")
+        return endpoint_id
+
+    def normalize_browser_endpoint_add(self, raw: Mapping[str, Any]) -> dict[str, Any]:
+        allowed = {
+            "address", "label", "temporary_default", "management_mode",
+            "profile_path", "executable_path", "rate_limit_scope",
+            "max_active_tabs", "clone_from_endpoint_id", "start",
+        }
+        unknown = set(raw) - allowed
+        if unknown:
+            raise APIError(400, "invalid_request", f"unknown fields: {sorted(unknown)!r}")
+        address = raw.get("address")
+        if not isinstance(address, str) or not address.strip():
+            raise APIError(400, "invalid_request", "address must be a non-empty string")
+        payload: dict[str, Any] = {"address": address.strip()}
+        mode = raw.get("management_mode", "external")
+        if mode not in {"external", "managed-local"}:
+            raise APIError(400, "invalid_request", "management_mode must be external or managed-local")
+        if "management_mode" in raw:
+            payload["management_mode"] = mode
+        for name in ("label", "profile_path", "executable_path", "rate_limit_scope", "clone_from_endpoint_id"):
+            if name not in raw:
+                continue
+            value = raw.get(name)
+            if not isinstance(value, str) or not value.strip():
+                raise APIError(400, "invalid_request", f"{name} must be a non-empty string")
+            payload[name] = value.strip()
+        for name in ("temporary_default", "start"):
+            if name in raw:
+                if type(raw.get(name)) is not bool:
+                    raise APIError(400, "invalid_request", f"{name} must be a boolean")
+                payload[name] = raw[name]
+        if "max_active_tabs" in raw:
+            capacity = raw.get("max_active_tabs")
+            if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+                raise APIError(400, "invalid_request", "max_active_tabs must be a positive integer")
+            payload["max_active_tabs"] = capacity
+        managed_only = {"profile_path", "executable_path", "clone_from_endpoint_id", "start"}
+        if mode == "external" and any(name in payload for name in managed_only):
+            raise APIError(400, "invalid_request", "external browsers are attach-only")
+        if mode == "managed-local" and "profile_path" not in payload:
+            raise APIError(400, "invalid_request", "managed-local browsers require profile_path")
+        return payload
+
+    def normalize_browser_endpoint_update(self, endpoint_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        allowed = {"cdp_url", "label", "is_default", "temporary_default", "rate_limit_scope", "max_active_tabs"}
+        unknown = set(raw) - allowed
+        if unknown or not raw:
+            raise APIError(400, "invalid_request", "browser settings contain unsupported or empty fields")
+        payload: dict[str, Any] = {"endpoint_id": self._browser_endpoint_id(endpoint_id)}
+        for name in ("cdp_url", "label", "rate_limit_scope"):
+            if name in raw:
+                value = raw.get(name)
+                if not isinstance(value, str) or not value.strip():
+                    raise APIError(400, "invalid_request", f"{name} must be a non-empty string")
+                payload[name] = value.strip()
+        for name in ("is_default", "temporary_default"):
+            if name in raw:
+                if type(raw.get(name)) is not bool:
+                    raise APIError(400, "invalid_request", f"{name} must be a boolean")
+                payload[name] = raw[name]
+        if "max_active_tabs" in raw:
+            capacity = raw.get("max_active_tabs")
+            if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+                raise APIError(400, "invalid_request", "max_active_tabs must be a positive integer")
+            payload["max_active_tabs"] = capacity
+        return payload
 
     def normalize_independent_create(self, raw: Mapping[str, Any]) -> dict[str, Any]:
         allowed = {"name", "system_prompt", "mode", "trigger_settings", "max_cycles", "temporary_chat"}
@@ -1087,6 +1175,14 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                 task_id=None,
                 payload=payload,
             )
+        elif path == "/api/browser-endpoints":
+            payload = app.normalize_browser_endpoint_add(raw)
+            command = app.enqueue(
+                idempotency_key=key,
+                kind="browser_endpoint_add",
+                task_id=None,
+                payload=payload,
+            )
         elif path == "/api/workflow-agents":
             payload = app.normalize_workflow_agent_create(raw)
             command = app.enqueue(
@@ -1124,7 +1220,24 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
             )
         else:
             parts = [unquote(part) for part in path.strip("/").split("/") if part]
-            if len(parts) == 4 and parts[:2] == ["api", "workflow-agents"]:
+            if len(parts) == 4 and parts[:2] == ["api", "browser-endpoints"]:
+                endpoint_id = app._browser_endpoint_id(parts[2])
+                operation = parts[3]
+                if operation == "settings":
+                    payload = app.normalize_browser_endpoint_update(endpoint_id, raw)
+                    kind = "browser_endpoint_update"
+                elif operation in {"remove", "start", "stop"}:
+                    payload = {**app.normalize_empty(raw), "endpoint_id": endpoint_id}
+                    kind = f"browser_endpoint_{operation}"
+                else:
+                    raise APIError(404, "not_found", "endpoint does not exist")
+                command = app.enqueue(
+                    idempotency_key=key,
+                    kind=kind,
+                    task_id=None,
+                    payload=payload,
+                )
+            elif len(parts) == 4 and parts[:2] == ["api", "workflow-agents"]:
                 route_key = validate_workflow_route_key(parts[2])
                 operation = parts[3]
                 if operation == "settings":

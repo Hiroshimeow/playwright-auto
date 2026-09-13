@@ -33,6 +33,11 @@ COMMAND_KINDS = frozenset(
         "independent_task_control",
         "resume_team",
         "task_control",
+        "browser_endpoint_add",
+        "browser_endpoint_update",
+        "browser_endpoint_remove",
+        "browser_endpoint_start",
+        "browser_endpoint_stop",
         "reload_catalog",
     }
 )

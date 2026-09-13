@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .cdpa_independent import is_independent_task
+from .cdpa_team import is_active_team_owner
 
 TERMINAL = frozenset({"DONE", "STOPPED"})
 ACTIVE_HOP_STATES = frozenset({"pre_send", "sending", "sent", "waiting", "responded", "routed"})
@@ -90,7 +91,7 @@ class CDPARuntimeRegistry:
             sibling_status = str(
                 self.tasks_by_id[sibling_id].get("status") or ""
             ).upper()
-            if sibling_status not in TERMINAL and sibling_status != "WAITING":
+            if is_active_team_owner(self.tasks_by_id[sibling_id]) or (sibling_status not in TERMINAL and sibling_status != "WAITING"):
                 return False
         return True
 
@@ -118,6 +119,8 @@ class CDPARuntimeRegistry:
             )
             deadline = (base if base is not None else now) + self.cleanup_idle_seconds
             return max(deadline, now + MINIMUM_DEADLINE_SECONDS)
+        if status == "WAITING" and (state.get("waiting") or {}).get("reason") == "browser_pool":
+            return now + MINIMUM_DEADLINE_SECONDS
         if is_independent_task(state):
             if status != "RUNNING":
                 return None

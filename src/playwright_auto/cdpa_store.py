@@ -783,8 +783,15 @@ class TaskStore(IndependentAgentStoreMixin):
                 "dependency_team_busy",
                 "trigger",
                 "bootstrap",
+                "browser_pool",
             }:
                 return "waiting reason is invalid"
+            if waiting.get("reason") == "browser_pool" and (
+                waiting.get("resume_status") not in {"INBOX", "RUNNING"}
+                or not isinstance(waiting.get("resume_column"), str)
+                or not isinstance(waiting.get("resume_action"), str)
+            ):
+                return "browser_pool waiting requires a valid resume state"
             for field in ("waiting_on", "stopped", "missing"):
                 try:
                     normalize_dependency_ids(waiting.get(field, []))
@@ -977,9 +984,22 @@ class TaskStore(IndependentAgentStoreMixin):
                 return f"role record {logical!r} has invalid online flag"
             context_source = record.get("context_source")
             if context_source is not None:
-                if bootstrap is None:
-                    return f"role record {logical!r} context_source requires bootstrap snapshot"
-                if context_source not in _BOOTSTRAP_CONTEXT_SOURCES:
+                if context_source in _BOOTSTRAP_CONTEXT_SOURCES:
+                    if bootstrap is None:
+                        return f"role record {logical!r} context_source requires bootstrap snapshot"
+                elif context_source == "fresh":
+                    if state.get("context_policy") != "fresh":
+                        return f"role record {logical!r} fresh context requires explicit fresh policy"
+                elif context_source == "execution_recovery":
+                    if not any(
+                        isinstance(hop, Mapping)
+                        and hop.get("kind") == "execution_recovery"
+                        and hop.get("target_role") == logical
+                        and hop.get("recovery_of_request_id")
+                        for hop in state.get("hops", [])
+                    ):
+                        return f"role record {logical!r} recovery context requires durable recovery provenance"
+                else:
                     return f"role record {logical!r} has invalid context_source"
             uploaded_generation = record.get("attachments_uploaded_generation")
             conversation_generation = record.get("conversation_generation")
@@ -2148,6 +2168,8 @@ class TaskStore(IndependentAgentStoreMixin):
             ):
                 return current, False
             readiness = dependency_readiness(current, scheduling_tasks)
+            if status == "WAITING" and (current.get("waiting") or {}).get("reason") == "browser_pool" and readiness.ready:
+                return current, False  # Capacity release belongs to the worker allocator, not dependency/team queues.
             next_state = json.loads(json.dumps(current, ensure_ascii=False))
             changed = False
             if status != "WAITING":
@@ -2468,11 +2490,12 @@ class TaskStore(IndependentAgentStoreMixin):
             raise ValueError("fresh context policy must not include a bootstrap snapshot")
         if context_policy == "bootstrap" and normalized_bootstrap is None:
             raise ValueError("bootstrap context policy requires a bootstrap snapshot")
+        if mode == "temporary" and normalized_bootstrap is not None:
+            raise ValueError("temporary workflows do not support bootstrap context")
         roles = {}
         for logical in workflow_roles:
             roles[logical] = {
                 "logical_role": logical,
-                "browser_endpoint_id": endpoint["endpoint_id"],
                 "physical_role": physical_role(logical, base, suffix),
                 "status": "pending" if logical == "PLAN" else "unallocated",
                 "turn": 0,

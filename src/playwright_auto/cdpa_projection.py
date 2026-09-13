@@ -241,11 +241,12 @@ def _roles(
         if not isinstance(value, Mapping):
             continue
         page_id = str(value.get("page_id") or "") or None
-        role_endpoint = str(value.get("browser_endpoint_id") or task_endpoint or "").strip() or None
+        role_endpoint = str(value.get("browser_endpoint_id") or "").strip() or None
+        lookup_endpoint = role_endpoint or task_endpoint
         page = None
         if page_id:
-            page = pages.get((role_endpoint, page_id))
-            if page is None and role_endpoint is not None:
+            page = pages.get((lookup_endpoint, page_id))
+            if page is None and lookup_endpoint is not None:
                 page = pages.get((None, page_id))
             if page is None and role_endpoint is None and len(candidates.get(page_id, ())) == 1:
                 page = candidates[page_id][0]
@@ -259,6 +260,8 @@ def _roles(
             {
                 "logical_role": str(logical_role),
                 "physical_role": str(value.get("physical_role") or logical_role),
+                "browser_endpoint_id": role_endpoint,
+                "last_endpoint_id": str(value.get("last_endpoint_id") or "").strip() or None,
                 "status": str(value.get("status") or "unknown"),
                 "turn": int(value.get("turn") or 0),
                 "online": online,
@@ -1041,12 +1044,18 @@ def build_task_projection(
         {
             "logical_role": role["logical_role"],
             "physical_role": role["physical_role"],
+            "browser_endpoint_id": role["browser_endpoint_id"],
             "status": role["status"],
             "turn": role["turn"],
             "online": role["online"],
         }
         for role in roles
     ]
+    browser_endpoint_ids = list(dict.fromkeys(
+        role["browser_endpoint_id"]
+        for role in roles
+        if role.get("browser_endpoint_id")
+    ))
     summary = {
         "task_id": task_id,
         "team": team,
@@ -1056,6 +1065,7 @@ def build_task_projection(
         "active_role": raw.get("active_role"),
         "active_hop_id": raw.get("active_hop_id"),
         "active_action": raw.get("active_action"),
+        "browser_endpoint_ids": browser_endpoint_ids,
         "created_at": str(raw.get("created_at") or "") or None,
         "started_at": str(raw.get("started_at") or "") or None,
         "updated_at": updated_at,

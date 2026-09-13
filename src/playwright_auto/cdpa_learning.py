@@ -133,6 +133,7 @@ def _validate_span(disposition: str, old_text: str, new_text: str) -> None:
 
 
 def _validate_markdown(text: str) -> None:
+    text = text.replace("\r\n", "\n")
     if "\r" in text or "\0" in text:
         raise LearningEditError("LEARNING.md must remain UTF-8 Markdown")
     lines = text.splitlines()
@@ -187,7 +188,7 @@ def _exact_span_positions(text: str, target: str) -> list[int]:
             return positions
         end = index + len(target)
         if (index == 0 or text[index - 1] == "\n") and (
-            end == len(text) or text[end] == "\n"
+            end == len(text) or text[end] == "\n" or text.startswith("\r\n", end)
         ):
             positions.append(index)
         start = index + 1
@@ -213,6 +214,9 @@ def update_learning(
                 current = target.read_bytes().decode("utf-8")
             except UnicodeDecodeError as exc:
                 raise LearningEditError("LEARNING.md is not valid UTF-8") from exc
+            newline = "\r\n" if "\r\n" in current else "\n"
+            old_text = old_text.replace("\n", newline)
+            new_text = new_text.replace("\n", newline)
             positions = _exact_span_positions(current, old_text)
             if len(positions) != 1:
                 raise LearningEditError(
@@ -319,6 +323,9 @@ def update_trigger_learning(
                     current = target.read_bytes().decode("utf-8")
                 except UnicodeDecodeError as exc:
                     raise LearningEditError("trigger learning is not valid UTF-8") from exc
+                newline = "\r\n" if "\r\n" in current else "\n"
+                old_text = old_text.replace("\n", newline)
+                new_text = new_text.replace("\n", newline)
                 positions = _exact_span_positions(current, old_text)
                 if len(positions) != 1:
                     raise LearningEditError(

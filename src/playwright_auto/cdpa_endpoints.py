@@ -58,7 +58,13 @@ def normalize_endpoint_record(raw: Mapping[str, Any], *, endpoint_id: str) -> di
         if value is not None:
             if not isinstance(value, str) or not Path(value).expanduser().is_absolute():
                 raise ValueError(f"browser {name} must be an absolute path")
-            value = str(Path(value).expanduser().resolve())
+            path = Path(value).expanduser()
+            if name == "profile_path" and any(
+                part.is_symlink() or getattr(part, "is_junction", lambda: False)()
+                for part in (path, *path.parents)
+            ):
+                raise ValueError("profile paths must not traverse a symlink or junction")
+            value = str(path.resolve())
         result[name] = value
     if mode == "managed-local" and not result["profile_path"]:
         raise ValueError("managed-local browser requires a profile_path")

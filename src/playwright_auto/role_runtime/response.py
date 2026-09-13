@@ -47,6 +47,13 @@ def observe(ctx: Context, baseline: Any, validate: Callable[[Any], None] | None)
         ctx.wait.pop("result_samples", None)
         return
     if ctx.wait.get("result_seen_key") != key:
+        if getattr(ctx, "phase", "wait") != "pre_send":
+            ctx.wait["last_assistant_progress"] = {
+                "text": str(ctx.candidate.text or "")[:8000],
+                "message_id": getattr(ctx.candidate, "message_id", None),
+                "turn_id": getattr(ctx.candidate, "turn_id", None),
+                "observed_at": ctx.now.isoformat(),
+            }
         ctx.wait["result_seen_key"] = key
         ctx.wait["result_seen_at"] = ctx.now.isoformat()
         ctx.wait["result_samples"] = 1

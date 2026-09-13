@@ -396,6 +396,7 @@ def test_constructor_is_once_per_generation_and_prompt_is_compact_allowlist(tmp_
         physical_role="alpha-plan",
         turn=1,
         validation_error="bad keys at .plan/alpha/alpha-plan_turn1_task-a.md",
+        expected_report_path=".plan/alpha/alpha-plan_turn1_task-a.md",
     )
 
     assert first.text.startswith("alpha · role: plan\n{")
@@ -431,11 +432,11 @@ def test_constructor_is_once_per_generation_and_prompt_is_compact_allowlist(tmp_
     assert "full task" not in repair
     assert "alpha-dev_turn1_task-a.md" not in repair
     assert "Constructor for PLAN" not in repair
-    assert ".plan/alpha/alpha-plan_turn1_task-a.md" not in repair
+    assert ".plan/alpha/alpha-plan_turn1_task-a.md" in repair
     assert "bad keys" not in repair
     assert '"task-id": "task-a"' not in repair
     assert '"role": "alpha-plan"' not in repair
-    assert ".plan/<team>/<physical-role>_turn<N>_<task-id>.md" in repair
+    assert ".plan/<team>/<physical-role>_turn<N>_<task-id>.md" not in repair
     assert "Continue from this state" in repair
     assert len(repair.splitlines()) <= 5
 

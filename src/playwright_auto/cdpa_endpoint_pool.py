@@ -13,7 +13,7 @@ from uuid import UUID
 
 from .cdpa_endpoints import BrowserEndpointRegistry
 from .chatgpt import ChatGPTPage
-from .connection import connect
+from .connection import connect, normalize_cdp_endpoint
 
 
 async def probe_cdp_version(address: str) -> Mapping[str, Any]:
@@ -184,6 +184,38 @@ class EndpointPool:
             runtime.error = str(exc)
             runtime.retry_after = self.clock() + self.retry_delay
             runtime.observed_at = self.clock()
+
+    async def probe_address(self, address: str) -> dict[str, Any]:
+        """Inspect before registration, without adopting or closing a user browser."""
+        address = normalize_cdp_endpoint(address)
+        runtime = _Runtime(endpoint_id="admission-probe", address=address)
+        claimed = {item.physical_id for item in self._runtimes.values()
+                   if item.health == "online" and item.context is not None and item.physical_id}
+        probe_page = None
+        try:
+            await self._connect({"cdp_url": address}, runtime, claimed)
+            if runtime.health != "online":
+                raise ConnectionError(runtime.error or "CDP endpoint is unavailable")
+            if runtime.auth_state == "unknown":
+                # Add Browser is explicit permission to inspect a fresh ChatGPT surface.
+                # Periodic inventory never opens pages merely to determine login state.
+                probe_page = await runtime.context.new_page()
+                await probe_page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=15000)
+                deadline = self.clock() + 8.0
+                runtime.chatgpt_ready = False
+                while self.clock() < deadline:
+                    await self._refresh_auth(runtime)
+                    if runtime.auth_state != "unknown":
+                        break
+                    runtime.chatgpt_ready = False
+                    await asyncio.sleep(0.25)
+            return {"health": runtime.health, "auth_state": runtime.auth_state,
+                    "chatgpt_ready": runtime.chatgpt_ready, "error": runtime.error}
+        finally:
+            if probe_page is not None:
+                with suppress(Exception):
+                    await probe_page.close()
+            await self._stop_attachment(runtime)
 
     async def refresh(self, *, wait: bool = False) -> dict[str, Any]:
         records = {item["endpoint_id"]: item for item in self.registry.list()}

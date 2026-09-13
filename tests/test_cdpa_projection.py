@@ -660,7 +660,7 @@ def test_projection_summary_is_compact_and_deterministic(tmp_path: Path):
         "running_since", "active_role_running_elapsed_seconds", "active_role_running_since",
         "elapsed_end_at",
         "availability", "primary_problem", "waiting_reason", "block_code",
-        "queue_position", "queue_length", "waiting_order", "roles", "has_reports", "task_title",
+        "queue_position", "queue_length", "waiting_order", "roles", "browser_endpoint_ids", "has_reports", "task_title",
         "version", "projection_sha256",
     }
 

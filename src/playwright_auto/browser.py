@@ -10,7 +10,9 @@ def build_chromium_command(config:BrowserConfig,headless:bool):
 
 def read_pid(config):
     try:
-        pid=int(config.pid_file.read_text().strip()); os.kill(pid,0); return pid
+        from .cdpa_managed_browser import _pid_alive
+        pid = int(config.pid_file.read_text().strip())
+        return pid if _pid_alive(pid) else None
     except (FileNotFoundError,ValueError,ProcessLookupError,PermissionError): return None
 
 def start_browser(config,headless=False):

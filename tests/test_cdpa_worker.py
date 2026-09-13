@@ -1201,8 +1201,8 @@ def test_malformed_response_creates_same_turn_guide_only_repair(tmp_path: Path):
     assert "Fix the current response issue:" not in repair["prompt"]
     assert "Continue from this state" in repair["prompt"]
     assert len(repair["prompt"].splitlines()) <= 5
-    assert ".plan/alpha/alpha-plan_turn1_task-a.md" not in repair["prompt"]
-    assert ".plan/<team>/<physical-role>_turn<N>_<task-id>.md" in repair["prompt"]
+    assert ".plan/alpha/alpha-plan_turn1_task-a.md" in repair["prompt"]
+    assert ".plan/<team>/<physical-role>_turn<N>_<task-id>.md" not in repair["prompt"]
     assert "Constructor for PLAN" not in repair["prompt"]
     assert repair["handoff"] == "route repair"
 

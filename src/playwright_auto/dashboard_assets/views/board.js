@@ -128,6 +128,7 @@ function taskSignature(task, board) {
     task.primary_problem?.message,
     task.waiting_reason,
     task.waiting_order,
+    task.browser_endpoint_ids,
     waitingDisplay(task, board),
     task.task_mode,
     task.agent,
@@ -311,7 +312,15 @@ export function renderBoard(root, state) {
   }
 
   const grouped = new Map(COLUMNS.map(column => [column, []]));
+  const endpointFilter = state.selectedEndpointId !== "all"
+    && (state.runtime?.browser?.endpoints || []).some(endpoint => (
+      !endpoint.removed && endpoint.endpoint_id === state.selectedEndpointId
+    )) ? state.selectedEndpointId : "all";
   for (const task of state.board.values()) {
+    if (
+      endpointFilter !== "all"
+      && !(task.browser_endpoint_ids || []).includes(endpointFilter)
+    ) continue;
     const column = task.task_mode === "independent" ? "INDEPENDENT_AGENTS"
       : grouped.has(task.column) ? task.column : task.status;
     if (grouped.has(column)) grouped.get(column).push(task);

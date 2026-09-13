@@ -936,3 +936,16 @@ def test_create_normalizes_explicit_temp_and_browser_overrides(tmp_path: Path):
 
     with pytest.raises(APIError, match="temporary"):
         api.normalize_create({"task": "bad temp", "temporary": "true"})
+
+
+def test_system_status_uses_cross_platform_disk_usage(tmp_path, monkeypatch):
+    import playwright_auto.dashboard_api as dashboard_module
+    config = load_cdpa_config(None, repository_root=tmp_path)
+    api = DashboardAPI(config)
+    seen = []
+    class Usage:
+        free = 123456
+    monkeypatch.setattr(dashboard_module.shutil, "disk_usage", lambda path: seen.append(path) or Usage())
+    result = api.system_status()
+    assert result["disk_free_bytes"] == 123456
+    assert seen == [config.repository_root]

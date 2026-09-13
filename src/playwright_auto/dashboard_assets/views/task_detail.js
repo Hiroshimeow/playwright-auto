@@ -173,6 +173,10 @@ function rolesSection(detail, selectedRole) {
     select.setAttribute("aria-pressed", String(selected));
     const identity = el("span", null, "role-identity");
     identity.append(el("strong", role.logical_role), el("span", role.physical_role, "role-physical"));
+    if (role.browser_endpoint_id) identity.append(el("span", `Browser: ${role.browser_endpoint_id}`, "role-physical"));
+    if (role.last_endpoint_id && role.last_endpoint_id !== role.browser_endpoint_id) {
+      identity.append(el("span", `Previous browser: ${role.last_endpoint_id}`, "role-physical"));
+    }
     const availability = item.unallocated
       ? {label: "not allocated", className: "unallocated"}
       : role.online == null

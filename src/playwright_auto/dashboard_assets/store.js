@@ -14,6 +14,7 @@ export const state = {
   counts: {},
   catalog: null,
   selectedTaskId: saved.selectedTaskId || null,
+  selectedEndpointId: saved.selectedEndpointId || "all",
   selectedRoleByTask: savedMap(saved.selectedRoleByTask),
   selectedIndependentTabByTask: savedMap(saved.selectedIndependentTabByTask),
   selectedTaskJumpByTask: savedMap(saved.selectedTaskJumpByTask),
@@ -55,6 +56,7 @@ const listeners = new Set();
 function persist() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify({
     selectedTaskId: state.selectedTaskId,
+    selectedEndpointId: state.selectedEndpointId,
     selectedRoleByTask: [...state.selectedRoleByTask],
     selectedIndependentTabByTask: [...state.selectedIndependentTabByTask],
     selectedTaskJumpByTask: [...state.selectedTaskJumpByTask],

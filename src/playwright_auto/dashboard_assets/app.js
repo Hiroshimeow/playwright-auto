@@ -3,11 +3,12 @@ import {PollController} from "./polling.js";
 import {
   state, commit, subscribe, commandKey, persistViewState,
   detailCacheGet, detailCachePut, detailCacheInvalidate, pruneDetailCache,
-} from "./store.js";
-import {renderBoard, refreshElapsed} from "./views/board.js";
-import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260908-live-audit-nav-v4";
+} from "./store.js?v=20260913-multi-cdp-v1";
+import {renderBoard, refreshElapsed} from "./views/board.js?v=20260913-multi-cdp-v1";
+import {renderBrowserManager, renderBrowserScope, syncCreateBrowserOptions, creationUsesTemporary} from "./views/browsers.js?v=20260913-multi-cdp-v1";
+import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260913-multi-cdp-v1";
 import {renderHistory} from "./views/history.js";
-import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20260906-listen-controls-v1";
+import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20260913-multi-cdp-v1";
 import {renderRuntime} from "./views/runtime.js?v=20260906-listen-controls-v1";
 import {
   applyReuseRoleSelection, renderCreateActions, renderResume, renderWorkflowAgentOptions,
@@ -21,6 +22,9 @@ const roots = {
   commands: document.querySelector("#commands"),
   services: document.querySelector("#service-status"),
   catalog: document.querySelector("#catalog-health"),
+  browserScope: document.querySelector("#browser-scope"),
+  browserDialog: document.querySelector("#browser-dialog"),
+  browserManager: document.querySelector("#browser-manager"),
   secondaryDialog: document.querySelector("#secondary-dialog"),
   secondaryTitle: document.querySelector("#secondary-title"),
   secondaryContent: document.querySelector("#secondary-content"),
@@ -31,6 +35,7 @@ const roots = {
   dependencyOptions: document.querySelector("#dependency-options"),
   reuseTeam: document.querySelector('#create-form select[name="reuse_team"]'),
   requestedTeam: document.querySelector('#create-form input[name="requested_team"]'),
+  browserEndpointSelect: document.querySelector('#create-form select[name="browser_endpoint_id"]'),
   bootstrapSelect: document.querySelector('#create-form select[name="bootstrap_id"]'),
   bootstrapInline: document.querySelector("#create-form [data-bootstrap-inline]"),
   workflowAgentOptions: document.querySelector("#workflow-agent-options"),
@@ -249,7 +254,11 @@ async function loadBootstrapOptions() {
 }
 
 function syncBootstrapInlineFields() {
-  roots.bootstrapInline.hidden = roots.bootstrapSelect.value !== INLINE_BOOTSTRAP_VALUE;
+  const temporary = creationUsesTemporary(state, roots.browserEndpointSelect.value, roots.form.elements.temporary.checked);
+  if (temporary) roots.bootstrapSelect.value = "";
+  roots.bootstrapSelect.disabled = temporary;
+  roots.bootstrapSelect.title = temporary ? "Temporary chats use fresh context; persistent bootstrap branching is unavailable" : "";
+  roots.bootstrapInline.hidden = temporary || roots.bootstrapSelect.value !== INLINE_BOOTSTRAP_VALUE;
 }
 
 function resetBootstrapSelection() {
@@ -759,6 +768,10 @@ function render(current) {
   renderBootstrapContext(current.selectedDetail);
   renderCommands(current);
   renderRuntime(roots.services, current);
+  renderBrowserScope(roots.browserScope, current);
+  renderBrowserManager(roots.browserManager, current);
+  syncCreateBrowserOptions(roots.browserEndpointSelect, current);
+  syncBootstrapInlineFields();
   renderAgents(current);
   renderTriggerChoices(current);
   renderCreateActions(
@@ -1082,6 +1095,20 @@ async function pollCommands() {
           detailCacheInvalidate(command.taskId);
         }
         await loadBoard();
+        if (["browser_endpoint_add", "browser_endpoint_update", "browser_endpoint_remove", "browser_endpoint_start", "browser_endpoint_stop"].includes(command.kind)) {
+          if (response.data.status === "applied") {
+            const endpointId = response.data.result?.endpoint_id;
+            const form = command.kind === "browser_endpoint_add"
+              ? roots.browserManager.querySelector("[data-browser-add]")
+              : roots.browserManager.querySelector(`[data-browser-settings="${CSS.escape(endpointId || "")}"]`);
+            if (form) {
+              delete form.dataset.dirty;
+              if (command.kind === "browser_endpoint_add") form.reset();
+            }
+            delete roots.browserManager.dataset.browserSignature;
+          }
+          await loadRuntime();
+        }
         if (["create_task", "resume_team"].includes(command.kind)) {
           await loadDashboardActions();
         }
@@ -1175,6 +1202,15 @@ function openChangeGoal(detail) {
 
 function closeChangeGoal() {
   if (roots.changeGoalDialog.open) roots.changeGoalDialog.close();
+}
+
+function openBrowserManager(focusAdd = false) {
+  if (!roots.browserDialog.open) roots.browserDialog.showModal();
+  if (focusAdd) requestAnimationFrame(() => roots.browserManager.querySelector('[data-browser-add] input[name="address"]')?.focus());
+}
+
+function closeBrowserManager() {
+  if (roots.browserDialog.open) roots.browserDialog.close();
 }
 
 function openCreate() {
@@ -1443,6 +1479,38 @@ document.addEventListener("click", async event => {
     });
     return;
   }
+  const browserScope = event.target.closest("[data-browser-scope]");
+  if (browserScope) {
+    commit(current => { current.selectedEndpointId = browserScope.dataset.browserScope; });
+    return;
+  }
+  if (event.target.closest("[data-open-browser-add]")) {
+    openBrowserManager(true);
+    return;
+  }
+  if (event.target.closest("[data-open-browser-manager]")) {
+    openBrowserManager(false);
+    return;
+  }
+  if (event.target.closest("[data-close-browser-manager]")) {
+    closeBrowserManager();
+    return;
+  }
+  const browserAction = event.target.closest("[data-browser-start], [data-browser-stop], [data-browser-remove]");
+  if (browserAction) {
+    const operation = browserAction.dataset.browserStart ? "start"
+      : browserAction.dataset.browserStop ? "stop" : "remove";
+    const endpointId = browserAction.dataset.browserStart
+      || browserAction.dataset.browserStop || browserAction.dataset.browserRemove;
+    await queueCommand({
+      kind: `browser_endpoint_${operation}`,
+      taskId: `browser:${endpointId}`,
+      endpoint: `/api/browser-endpoints/${encodeURIComponent(endpointId)}/${operation}`,
+      body: {},
+      label: `${operation} browser ${endpointId}`,
+    });
+    return;
+  }
   if (event.target.closest("[data-open-create]")) openCreate();
   if (event.target.closest("[data-close-create]")) closeCreate();
   if (event.target.closest("[data-open-agent]")) {
@@ -1501,6 +1569,67 @@ roots.requestedTeam.addEventListener("input", () => {
   updateCreateSummary();
 });
 
+roots.browserManager.addEventListener("input", event => {
+  const form = event.target.closest("form");
+  if (form) form.dataset.dirty = "true";
+});
+roots.browserEndpointSelect.addEventListener("change", syncBootstrapInlineFields);
+roots.form.elements.temporary.addEventListener("change", syncBootstrapInlineFields);
+
+roots.browserManager.addEventListener("submit", async event => {
+  const form = event.target.closest("form");
+  if (!form) return;
+  event.preventDefault();
+  const values = new FormData(form);
+  if (form.matches("[data-browser-add]")) {
+    const mode = String(values.get("management_mode") || "external");
+    const body = {
+      address: String(values.get("address") || "").trim(),
+      management_mode: mode,
+      max_active_tabs: Number(values.get("max_active_tabs") || 2),
+      temporary_default: values.get("temporary_default") === "on",
+    };
+    const label = String(values.get("label") || "").trim();
+    const rateLimitScope = String(values.get("rate_limit_scope") || "").trim();
+    if (label) body.label = label;
+    if (rateLimitScope) body.rate_limit_scope = rateLimitScope;
+    if (mode === "managed-local") {
+      body.profile_path = String(values.get("profile_path") || "").trim();
+      const executablePath = String(values.get("executable_path") || "").trim();
+      if (executablePath) body.executable_path = executablePath;
+      const cloneFrom = String(values.get("clone_from_endpoint_id") || "").trim();
+      if (cloneFrom) body.clone_from_endpoint_id = cloneFrom;
+      if (values.get("start") === "on") body.start = true;
+    }
+    await queueCommand({
+      kind: "browser_endpoint_add",
+      taskId: `browser:add:${body.address}`,
+      endpoint: "/api/browser-endpoints",
+      body,
+      label: `Add browser ${body.address}`,
+    });
+    return; // Keep the draft until the probe/registration command actually succeeds.
+  }
+  const endpointId = form.dataset.browserSettings;
+  if (!endpointId) return;
+  const body = {
+    max_active_tabs: Number(values.get("max_active_tabs") || 2),
+    ...(values.get("is_default") === "on" ? {is_default: true} : {}),
+    temporary_default: values.get("temporary_default") === "on",
+  };
+  const label = String(values.get("label") || "").trim();
+  const rateLimitScope = String(values.get("rate_limit_scope") || "").trim();
+  if (label) body.label = label;
+  if (rateLimitScope) body.rate_limit_scope = rateLimitScope;
+  await queueCommand({
+    kind: "browser_endpoint_update",
+    taskId: `browser:${endpointId}`,
+    endpoint: `/api/browser-endpoints/${encodeURIComponent(endpointId)}/settings`,
+    body,
+    label: `Update browser ${endpointId}`,
+  });
+});
+
 roots.form.addEventListener("submit", event => {
   event.preventDefault();
   showCreateValidation();
@@ -1528,6 +1657,9 @@ roots.form.addEventListener("submit", event => {
     depends_on_task_ids: dependencies,
   };
   body.roles = selectedWorkflowRoles();
+  const browserEndpointId = String(values.get("browser_endpoint_id") || "").trim();
+  if (browserEndpointId) body.browser_endpoint_id = browserEndpointId;
+  if (values.get("temporary") === "on") body.temporary = true;
   const bootstrapId = String(values.get("bootstrap_id") || "");
   if (bootstrapId === INLINE_BOOTSTRAP_VALUE) {
     const bootstrapNewId = String(values.get("bootstrap_new_id") || "").trim();
@@ -1585,6 +1717,12 @@ roots.dependencyOptions.addEventListener("change", updateCreateSummary);
 roots.workflowAgentOptions.addEventListener("change", updateCreateSummary);
 
 document.addEventListener("change", event => {
+  const browserMode = event.target.closest('[data-browser-add] select[name="management_mode"]');
+  if (browserMode) {
+    const managed = browserMode.closest("form")?.querySelector("[data-managed-browser-fields]");
+    if (managed) managed.hidden = browserMode.value !== "managed-local";
+    return;
+  }
   const stateToggle = event.target.closest("[data-dependency-state-toggle]");
   if (stateToggle) {
     const group = stateToggle.closest("[data-dependency-state-group]");
@@ -1749,6 +1887,14 @@ for (const close of document.querySelectorAll("[data-close-change-goal]")) {
 }
 roots.changeGoalDialog.addEventListener("click", event => {
   if (event.target === roots.changeGoalDialog) closeChangeGoal();
+});
+
+roots.browserDialog.addEventListener("click", event => {
+  if (event.target === roots.browserDialog) closeBrowserManager();
+});
+roots.browserDialog.addEventListener("cancel", event => {
+  event.preventDefault();
+  closeBrowserManager();
 });
 
 roots.dialog.addEventListener("click", event => {

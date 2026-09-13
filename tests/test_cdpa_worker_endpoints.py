@@ -214,6 +214,7 @@ def test_pool_exhaustion_waits_without_semantic_block(tmp_path, monkeypatch):
 
 def test_endpoint_disconnect_does_not_abort_peer_execution(tmp_path, monkeypatch):
     worker, store, _first, _second, _tasks = _setup(tmp_path, task_count=2)
+    store.endpoints.update(_first["endpoint_id"], max_active_tabs=1)
     seen = []
 
     async def scenario():
@@ -293,6 +294,42 @@ def test_pool_inventory_keeps_capacity_and_flattened_compatibility_view(tmp_path
     assert states[second["endpoint_id"]]["health"] == "offline"
 
 
+def test_pool_inventory_contains_unverified_managed_process_state(tmp_path):
+    worker, _store, first, _second, _tasks = _setup(tmp_path)
+    ctx = SimpleNamespace(pages=[])
+    runtime = {
+        "default_endpoint_id": first["endpoint_id"],
+        "endpoints": [{
+            **first,
+            "management_mode": "managed-local",
+            "health": "online",
+            "auth_state": "logged_in",
+            "chatgpt_ready": True,
+            "active_count": 0,
+            "capacity": 2,
+            "available_slots": 2,
+            "running_executions": [],
+        }],
+    }
+
+    class Managed:
+        def read_pid(self, _endpoint_id):
+            raise AssertionError("inventory must not adopt process ownership directly")
+
+        def process_state(self, _endpoint_id):
+            return {
+                "managed_running": None,
+                "process_ownership": "unverified",
+                "process_error": "stale receipt",
+            }
+
+    worker.managed_browsers = Managed()
+    asyncio.run(worker._publish_browser_pool_inventory({first["endpoint_id"]: ctx}, runtime))
+    state = worker._browser_projection["endpoints"][0]
+    assert state["managed_running"] is None
+    assert state["process_ownership"] == "unverified"
+    assert state["process_error"] == "stale receipt"
+
 
 def test_pool_forever_refreshes_one_shared_pool_instead_of_reconnecting_one_url(tmp_path, monkeypatch):
     worker, _store, _first, _second, _tasks = _setup(tmp_path)
@@ -315,7 +352,8 @@ def test_pool_forever_refreshes_one_shared_pool_instead_of_reconnecting_one_url(
 
     async def run_once_pool(_pool):
         calls.append(("cycle", bool(_pool.contexts)))
-        raise asyncio.CancelledError()
+        if _pool.contexts:
+            raise asyncio.CancelledError()
 
     monkeypatch.setattr(worker, "run_once_pool", run_once_pool)
     monkeypatch.setattr(worker, "_publish_browser_pool_inventory", _noop)
@@ -327,6 +365,7 @@ def test_pool_forever_refreshes_one_shared_pool_instead_of_reconnecting_one_url(
 
     assert pool.refresh_count >= 2
     assert calls[0] == ("refresh", True)
+    assert ("cycle", False) in calls  # Offline pools still publish resource waiting.
     assert ("cycle", True) in calls
 
 

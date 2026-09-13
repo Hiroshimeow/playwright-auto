@@ -10,6 +10,22 @@ from test_cdpa_core import write_config
 from test_cdpa_worker import FakeActions, bootstrap_record, ready_client
 
 
+def test_canonical_branch_identity_survives_store_with_provisional_visible_url(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_task("canonical branch", task_id="canonical-branch", bootstrap=bootstrap_record())
+    worker = CDPAWorker(config, store=store)
+    canonical = "77777777-7777-4777-8777-777777777777"
+    visible = "https://chatgpt.com/c/WEB:88888888-8888-4888-8888-888888888888"
+    acquired = AcquiredRole(ready_client(state, "PLAN"), "branch-page", visible, True, True, canonical)
+    worker._record_acquired(state, "PLAN", acquired)
+    saved = store.save(state["manifest_path"], state)
+    assert saved["roles"]["PLAN"]["branch_conversation_id"] == canonical
+    assert saved["roles"]["PLAN"]["page_url"] == visible
+    worker._record_acquired(saved, "PLAN", AcquiredRole(ready_client(saved, "PLAN"), "fresh-page", "https://chatgpt.com/", True, True))
+    assert saved["roles"]["PLAN"].get("branch_conversation_id") is None
+
+
 def test_bootstrap_donor_rotation_uses_direct_branch_route_only(tmp_path: Path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
