@@ -20,7 +20,7 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _CHATGPT_HOSTS = frozenset({"chatgpt.com", "www.chatgpt.com"})
 _DEFAULT_MAX_BACKUPS = 7
 _MAX_BACKUPS = 32
-_DEFAULT_BOOTSTRAP_IDS = ("g8-bootstrap", "general-team-bootstrap")
+_DEFAULT_BOOTSTRAP_IDS = ("thinkbook-bootstrap", "g8-bootstrap", "general-team-bootstrap")
 
 _NEW_REQUIRED_FIELDS = frozenset(
     {

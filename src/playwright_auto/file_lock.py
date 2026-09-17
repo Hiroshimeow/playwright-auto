@@ -8,9 +8,146 @@ from pathlib import Path
 from typing import BinaryIO, Iterator
 
 if os.name == "nt":
+    import ctypes
     import msvcrt
+    from ctypes import wintypes
 else:
     import fcntl
+
+
+@contextmanager
+def open_shared_read(path: str | Path) -> Iterator[BinaryIO]:
+    """Open a read-only file without blocking atomic replacement on Windows."""
+    target = Path(path).expanduser().resolve()
+    if os.name != "nt":
+        with target.open("rb") as handle:
+            yield handle
+        return
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    raw_handle = create_file(
+        str(target),
+        0x80000000,  # GENERIC_READ
+        0x00000001 | 0x00000002 | 0x00000004,  # READ | WRITE | DELETE sharing
+        None,
+        3,  # OPEN_EXISTING
+        0x00000080,  # FILE_ATTRIBUTE_NORMAL
+        None,
+    )
+    if raw_handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        fd = msvcrt.open_osfhandle(
+            raw_handle,
+            os.O_RDONLY | getattr(os, "O_BINARY", 0),
+        )
+    except BaseException:
+        close_handle(raw_handle)
+        raise
+    with os.fdopen(fd, "rb") as handle:
+        yield handle
+
+
+def read_shared_bytes(path: str | Path) -> bytes:
+    with open_shared_read(path) as handle:
+        return handle.read()
+
+
+def read_shared_text(path: str | Path, *, encoding: str = "utf-8") -> str:
+    return read_shared_bytes(path).decode(encoding)
+
+
+def _windows_posix_replace(source: Path, target: Path) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    set_information = kernel32.SetFileInformationByHandle
+    set_information.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    set_information.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    raw_handle = create_file(
+        str(source),
+        0x00010000,  # DELETE
+        0x00000001 | 0x00000002 | 0x00000004,  # READ | WRITE | DELETE sharing
+        None,
+        3,  # OPEN_EXISTING
+        0x00000080,  # FILE_ATTRIBUTE_NORMAL
+        None,
+    )
+    if raw_handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        class RenameHeader(ctypes.Structure):
+            _fields_ = [
+                ("Flags", wintypes.DWORD),
+                ("RootDirectory", wintypes.HANDLE),
+                ("FileNameLength", wintypes.DWORD),
+                ("FileName", wintypes.WCHAR * 1),
+            ]
+
+        encoded_name = str(target).encode("utf-16-le")
+        name_offset = RenameHeader.FileName.offset
+        buffer = ctypes.create_string_buffer(name_offset + len(encoded_name) + 2)
+        header = RenameHeader.from_buffer(buffer)
+        header.Flags = 0x00000001 | 0x00000002  # REPLACE_IF_EXISTS | POSIX_SEMANTICS
+        header.RootDirectory = None
+        header.FileNameLength = len(encoded_name)
+        ctypes.memmove(
+            ctypes.addressof(buffer) + name_offset,
+            encoded_name + b"\0\0",
+            len(encoded_name) + 2,
+        )
+        if not set_information(raw_handle, 22, buffer, len(buffer)):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        close_handle(raw_handle)
+
+
+def atomic_replace(source: str | Path, target: str | Path) -> None:
+    """Atomically replace target, tolerating replacement-safe readers on Windows."""
+    source_path = Path(source).expanduser().resolve()
+    target_path = Path(target).expanduser().resolve()
+    try:
+        os.replace(source_path, target_path)
+        return
+    except PermissionError as primary:
+        if os.name != "nt":
+            raise
+        try:
+            _windows_posix_replace(source_path, target_path)
+        except OSError as native_error:
+            raise primary from native_error
 
 
 def _ensure_lock_byte(handle: BinaryIO) -> None:

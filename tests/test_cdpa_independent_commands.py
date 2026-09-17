@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from playwright_auto.cdpa_config import load_cdpa_config
+from playwright_auto.cdpa_endpoints import BrowserEndpointRegistry
 from playwright_auto.cdpa_runtime_db import RuntimeDB
 from playwright_auto.cdpa_store import TaskStore
 from playwright_auto.cdpa_worker import CDPAWorker
@@ -54,6 +55,7 @@ def fail_after(seconds: float):
 
 def test_create_independent_agent_command_is_idempotent(tmp_path: Path):
     _config, store, worker = setup_worker(tmp_path)
+    pinned = store.endpoints.add("9212")
     enqueue(
         worker.runtime_db,
         command_id="cmd-create-agent",
@@ -68,6 +70,7 @@ def test_create_independent_agent_command_is_idempotent(tmp_path: Path):
                 "teams": ["unused-team"],
                 "states": ["BLOCKED"],
             },
+            "browser_endpoint_id": pinned["endpoint_id"],
         },
     )
 
@@ -86,6 +89,7 @@ def test_create_independent_agent_command_is_idempotent(tmp_path: Path):
     assert agents[0]["status"] == "WAITING"
     assert agents[0]["independent"]["system_prompt"] == "Review releases."
     assert agents[0]["independent"]["temporary_chat"] is True
+    assert agents[0]["independent"]["browser_endpoint_id"] == pinned["endpoint_id"]
     assert agents[0]["independent"]["trigger_settings"] == {
         "recovery": False,
         "interval_minutes": None,
@@ -102,6 +106,39 @@ def test_create_independent_agent_command_is_idempotent(tmp_path: Path):
 
 
 
+
+
+def test_independent_settings_command_distinguishes_omitted_affinity_from_clear(tmp_path: Path):
+    _config, store, worker = setup_worker(tmp_path)
+    pinned = store.endpoints.add("9212")
+    agent = store.create_independent_agent(
+        "Pinned Watcher",
+        system_prompt="Inspect only.",
+        browser_endpoint_id=pinned["endpoint_id"],
+    )
+    worker.hydrate_runtime(startup=False)
+
+    enqueue(
+        worker.runtime_db,
+        command_id="cmd-keep-affinity",
+        kind="independent_settings",
+        task_id=agent["task_id"],
+        payload={"display_name": "Pinned Watcher Renamed"},
+    )
+    assert worker.dispatch_command_once()["status"] == "applied"
+    kept = store.load(agent["manifest_path"])
+    assert kept["independent"]["browser_endpoint_id"] == pinned["endpoint_id"]
+
+    enqueue(
+        worker.runtime_db,
+        command_id="cmd-clear-affinity",
+        kind="independent_settings",
+        task_id=agent["task_id"],
+        payload={"browser_endpoint_id": None},
+    )
+    assert worker.dispatch_command_once()["status"] == "applied"
+    cleared = store.load(agent["manifest_path"])
+    assert cleared["independent"]["browser_endpoint_id"] is None
 
 
 def test_custom_agent_create_configure_run_complete_reuses_identity(tmp_path: Path):
@@ -302,6 +339,7 @@ def test_independent_target_control_is_bound_to_active_event(tmp_path: Path):
 def test_dashboard_normalizes_independent_creation_completion_activation_repair_and_control(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     api = DashboardAPI(config, db=RuntimeDB(config.runtime_database))
+    endpoint = BrowserEndpointRegistry(config).resolve()
 
     created = api.normalize_independent_create(
         {
@@ -312,6 +350,7 @@ def test_dashboard_normalizes_independent_creation_completion_activation_repair_
                 "interval_minutes": 20,
                 "role_completed": ["dev"],
             },
+            "browser_endpoint_id": endpoint["endpoint_id"],
         }
     )
     persistent = api.normalize_independent_create(
@@ -364,6 +403,7 @@ def test_dashboard_normalizes_independent_creation_completion_activation_repair_
         "system_prompt": "Inspect progress.",
         "mode": "Independent",
         "temporary_chat": True,
+        "browser_endpoint_id": endpoint["endpoint_id"],
         "trigger_settings": {
             "recovery": False,
             "interval_minutes": 20,
@@ -375,6 +415,15 @@ def test_dashboard_normalizes_independent_creation_completion_activation_repair_
             "check_all": False,
         },
     }
+    assert created["browser_endpoint_id"] == endpoint["endpoint_id"]
+    settings = api.normalize_independent_settings(
+        {"browser_endpoint_id": endpoint["endpoint_id"]}
+    )
+    cleared_settings = api.normalize_independent_settings(
+        {"browser_endpoint_id": None}
+    )
+    assert settings["browser_endpoint_id"] == endpoint["endpoint_id"]
+    assert cleared_settings["browser_endpoint_id"] is None
     assert persistent["temporary_chat"] is False
     assert completed["outcome"] == "SUCCESS"
     assert completed["summary"] == "Checks passed."
@@ -388,3 +437,80 @@ def test_dashboard_normalizes_independent_creation_completion_activation_repair_
         "reason": "Restore ownership.",
         "confirmed": False,
     }
+
+
+def test_independent_board_clear_preserves_durable_agent_and_run_recreates_projection(tmp_path: Path):
+    _config, store, worker = setup_worker(tmp_path)
+    agent = store.create_independent_agent(
+        "Off Board Watcher",
+        system_prompt="Keep durable state.",
+        trigger_settings={"interval_minutes": 30},
+    )
+    task_id = agent["task_id"]
+    path = agent["manifest_path"]
+    before = store.load(path)
+    before_watermarks = dict(before["independent"]["watermarks"])
+    before_settings = dict(before["independent"]["trigger_settings"])
+
+    worker.hydrate_runtime(startup=False)
+    assert task_id in {item["task_id"] for item in worker.runtime_db.get_board()["items"]}
+
+    store.request_control(path, "clear_team", confirmed=True, reason="remove board projection")
+    cleared = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+    assert cleared["status"] == "WAITING"
+    assert cleared["independent"]["deleted_at"] is None
+    assert cleared["independent"]["board_projection_hidden_at"]
+    assert cleared["independent"]["system_prompt"] == "Keep durable state."
+    assert cleared["independent"]["trigger_settings"] == before_settings
+    assert cleared["independent"]["watermarks"] == before_watermarks
+
+    worker.hydrate_runtime(startup=False)
+    assert task_id not in {item["task_id"] for item in worker.runtime_db.get_board()["items"]}
+    assert worker.runtime_db.get_task_detail(task_id)["agent"]["board_visible"] is False
+    agents = worker.runtime_db.get_snapshot("agents")["payload"]["independent"]
+    assert task_id in {item["task_id"] for item in agents}
+
+    running = store.run_independent_now(path, instruction="Run after board cleanup")
+    assert running["task_id"] == task_id
+    assert running["independent"]["board_projection_hidden_at"] is None
+    worker.hydrate_runtime(startup=False)
+    assert task_id in {item["task_id"] for item in worker.runtime_db.get_board()["items"]}
+
+
+def test_legacy_cleared_independent_agent_migrates_to_off_board_durable_identity(tmp_path: Path):
+    _config, store, worker = setup_worker(tmp_path)
+    agent = store.create_independent_agent(
+        "Legacy Cleared Watcher",
+        system_prompt="Preserve me.",
+    )
+    path = agent["manifest_path"]
+
+    def legacy_clear(state):
+        state["independent"].pop("board_projection_hidden_at", None)
+        state["status"] = "STOPPED"
+        state["kanban_column"] = "STOPPED"
+        state["terminal_state"] = "STOPPED"
+        state["active_role"] = None
+        state["active_hop_id"] = None
+        state["stopped_at"] = "2026-09-01T00:00:00+00:00"
+        state["cleanup"] = {"state": "CLEARED", "cleared_at": "2026-09-01T00:00:00+00:00"}
+        return state
+
+    store.update(path, legacy_clear)
+    store.normalize_legacy_independent_agents()
+    migrated = store.load(path)
+    assert migrated["status"] == "WAITING"
+    assert migrated["independent"]["deleted_at"] is None
+    assert migrated["independent"]["board_projection_hidden_at"] == "2026-09-01T00:00:00+00:00"
+
+    worker.hydrate_runtime(startup=False)
+    task_id = migrated["task_id"]
+    assert task_id not in {item["task_id"] for item in worker.runtime_db.get_board()["items"]}
+    agents = worker.runtime_db.get_snapshot("agents")["payload"]["independent"]
+    assert task_id in {item["task_id"] for item in agents}
+
+    deleted = store.delete_independent_agent(path)
+    assert deleted["independent"]["deleted_at"]
+    worker.hydrate_runtime(startup=False)
+    agents = worker.runtime_db.get_snapshot("agents")["payload"]["independent"]
+    assert task_id not in {item["task_id"] for item in agents}

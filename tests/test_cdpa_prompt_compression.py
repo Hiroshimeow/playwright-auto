@@ -88,7 +88,7 @@ def test_fresh_builtin_first_turn_includes_base_role_and_response_guide(tmp_path
 
     assert "TEST_BASE_CONTEXT" in hop["prompt"]
     assert "Constructor for PLAN" in hop["prompt"]
-    assert "Return only the strict route JSON." in hop["prompt"]
+    assert "Return exactly one valid JSON object" in hop["prompt"]
 
 
 def test_inherited_builtin_omits_base_and_exact_send_payload_stays_identical(tmp_path: Path):
@@ -103,7 +103,7 @@ def test_inherited_builtin_omits_base_and_exact_send_payload_stays_identical(tmp
     assert state["roles"]["PLAN"]["conversation_generation"] == 1
     assert "TEST_BASE_CONTEXT" not in hop["prompt"]
     assert "Constructor for PLAN" in hop["prompt"]
-    assert "Return only the strict route JSON." in hop["prompt"]
+    assert "Return exactly one valid JSON object" in hop["prompt"]
 
     state["roles"]["PLAN"]["page_id"] = "page-PLAN"
     state["roles"]["PLAN"]["page_url"] = "https://chatgpt.com/c/cdpa-send"
@@ -115,6 +115,9 @@ def test_inherited_builtin_omits_base_and_exact_send_payload_stays_identical(tmp
     assert hop["receipt"]["prompt"] == hop["prompt"]
     assert record is not None
     assert record.rendered_prompt == hop["prompt"]
+    assert record.rendered_prompt.endswith(
+        "If not routing DONE, identify a concrete unmet acceptance criterion or fixable defect from the current evidence."
+    )
 
 
 def test_selected_bootstrap_transient_branch_failure_retries_without_fresh_base_context(tmp_path: Path):
@@ -200,7 +203,7 @@ def test_custom_workflow_prompt_is_preserved_even_when_bootstrap_inherited(tmp_p
     assert state["roles"][route]["conversation_generation"] == 1
     assert "CUSTOM_BOOTSTRAP_PROMPT_EXACT" in hop["prompt"]
     assert "TEST_BASE_CONTEXT" not in hop["prompt"]
-    assert "Return only the strict route JSON." in hop["prompt"]
+    assert "Return exactly one valid JSON object" in hop["prompt"]
 
 
 def test_production_prompt_split_keeps_common_context_out_of_role_files():
@@ -226,4 +229,3 @@ def test_production_prompt_split_keeps_common_context_out_of_role_files():
 
     assert '"route":"PLAN|DEV|TEST|REVIEW|AUDIT|PAUSE|DONE"' in guide
     assert "Only PLAN may use `DONE`" in guide
-    assert "REVIEW and AUDIT must route clean work back to PLAN" in guide

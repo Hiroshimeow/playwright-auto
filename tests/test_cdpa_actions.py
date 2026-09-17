@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 from dataclasses import replace
+import os
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -124,6 +126,7 @@ class FakeClient:
         self.prepare_calls = []
         self.bind_calls = []
         self.clean_ready_calls = []
+        self.clear_calls = []
         self.set_role_calls = []
         self.events = []
         self.send_calls = []
@@ -183,6 +186,14 @@ class FakeClient:
                 "composer still contains manual text or attachments; automated mutation blocked"
             )
         return snapshot
+
+    async def clear(self, *, force=False, discard_attachments=False, timeout_ms=None):
+        self.clear_calls.append((force, discard_attachments, timeout_ms))
+        if self.page.snapshot_value.stop_visible:
+            raise RuntimeError("page is already responding")
+        self.page.snapshot_value.composer_text = ""
+        if discard_attachments:
+            self.page.snapshot_value.attachment_markers = ()
 
     async def bind_task_identity(self, task_id, team):
         self.bind_calls.append((task_id, team))
@@ -481,6 +492,7 @@ def test_branch_from_anchor_clears_rehydrated_text_once_before_bind(tmp_path, mo
             "PLAN",
             source_conversation_id=SOURCE_CONVERSATION_ID,
             assistant_message_id=ASSISTANT_MESSAGE_ID,
+            clean_for_send=True,
         )
     )
 
@@ -528,6 +540,7 @@ def test_branch_from_anchor_clear_rehydration_closes_fresh_page_without_retry(
                 "PLAN",
                 source_conversation_id=SOURCE_CONVERSATION_ID,
                 assistant_message_id=ASSISTANT_MESSAGE_ID,
+                clean_for_send=True,
             )
         )
 
@@ -563,6 +576,7 @@ def test_branch_from_anchor_clear_failure_closes_fresh_page_without_retry(
                 "PLAN",
                 source_conversation_id=SOURCE_CONVERSATION_ID,
                 assistant_message_id=ASSISTANT_MESSAGE_ID,
+                clean_for_send=True,
             )
         )
 
@@ -599,6 +613,7 @@ def test_branch_from_anchor_post_clear_snapshot_failure_stays_manual_conflict(
                 "PLAN",
                 source_conversation_id=SOURCE_CONVERSATION_ID,
                 assistant_message_id=ASSISTANT_MESSAGE_ID,
+                clean_for_send=True,
             )
         )
 
@@ -607,7 +622,7 @@ def test_branch_from_anchor_post_clear_snapshot_failure_stays_manual_conflict(
     assert context.pages[-1].closed is True
 
 
-def test_branch_from_anchor_never_clears_fresh_page_attachments(tmp_path, monkeypatch):
+def test_branch_from_anchor_discards_fresh_target_attachments_before_bind(tmp_path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     monkeypatch.setattr(actions_module, "ChatGPTWorkspace", FakeWorkspace)
     monkeypatch.setattr(
@@ -617,8 +632,6 @@ def test_branch_from_anchor_never_clears_fresh_page_attachments(tmp_path, monkey
     )
     context = FakeContext(draft_on_new="stale bootstrap draft")
     actions = CDPATabActions(context, config)
-    clear_calls = []
-
     original_new_page = context.new_page
 
     async def new_page_with_attachment():
@@ -628,24 +641,23 @@ def test_branch_from_anchor_never_clears_fresh_page_attachments(tmp_path, monkey
 
     context.new_page = new_page_with_attachment
 
-    async def forbidden_clear(page, **_kwargs):
-        clear_calls.append(page)
-
-    monkeypatch.setattr(actions_module, "clear_composer", forbidden_clear)
-
-    with pytest.raises(ManualInputPendingError, match="attachment|manual"):
-        asyncio.run(
-            actions.branch_from_anchor(
-                manifest(physical_role="new-team-dev"),
-                "PLAN",
-                source_conversation_id=SOURCE_CONVERSATION_ID,
-                assistant_message_id=ASSISTANT_MESSAGE_ID,
-            )
+    acquired = asyncio.run(
+        actions.branch_from_anchor(
+            manifest(physical_role="new-team-dev"),
+            "PLAN",
+            source_conversation_id=SOURCE_CONVERSATION_ID,
+            assistant_message_id=ASSISTANT_MESSAGE_ID,
+            clean_for_send=True,
         )
+    )
 
     assert context.new_page_calls == 1
-    assert clear_calls == []
-    assert context.pages[-1].closed is True
+    assert acquired.client.clear_calls == [
+        (True, True, round(config.workspace_timeout_seconds * 1000))
+    ]
+    assert acquired.client.page.snapshot_value.attachment_markers == ()
+    assert acquired.client.bind_calls == [("task-1", "new-team")]
+    assert acquired.client.page.closed is False
 
 
 def test_branch_from_anchor_preserves_rate_limit_without_clearing_draft(tmp_path, monkeypatch):
@@ -681,12 +693,170 @@ def test_branch_from_anchor_preserves_rate_limit_without_clearing_draft(tmp_path
                 "PLAN",
                 source_conversation_id=SOURCE_CONVERSATION_ID,
                 assistant_message_id=ASSISTANT_MESSAGE_ID,
+                clean_for_send=True,
             )
         )
 
     assert context.new_page_calls == 1
     assert clear_calls == []
     assert context.pages[-1].closed is True
+
+
+def test_acquire_cleans_only_routed_target_before_task_binding(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    target = FakePage(
+        page_id="recorded-page",
+        role="new-team-plan",
+        team="new-team",
+        task_id="task-1",
+    )
+    target.snapshot_value.composer_text = "stale target draft"
+    target.snapshot_value.attachment_markers = ("stale.txt",)
+    unrelated = FakePage(
+        page_id="other-page",
+        role="new-team-review",
+        team="new-team",
+        task_id="task-1",
+    )
+    unrelated.snapshot_value.stop_visible = True
+    unrelated.snapshot_value.composer_text = "operator steering while responding"
+    client = FakeClient(target, timeout_ms=1234)
+    client.binding = SimpleNamespace(page_id="recorded-page", role="new-team-plan")
+    context = FakeContext([target, unrelated])
+    actions = CDPATabActions(context, config)
+    order = []
+
+    async def matches(*_args, **_kwargs):
+        return [(client, target.snapshot_value)]
+
+    original_clear = client.clear
+    async def ordered_clear(**kwargs):
+        order.append("clear")
+        await original_clear(**kwargs)
+
+    original_bind = client.bind_task_identity
+    async def ordered_bind(task_id, team):
+        assert target.snapshot_value.composer_text == ""
+        assert target.snapshot_value.attachment_markers == ()
+        order.append("bind")
+        return await original_bind(task_id, team)
+
+    client.clear = ordered_clear
+    client.bind_task_identity = ordered_bind
+    monkeypatch.setattr(actions, "_matching_clients", matches)
+
+    acquired = asyncio.run(
+        actions.acquire(
+            manifest(
+                physical_role="new-team-plan",
+                page_id="recorded-page",
+                page_url=target.url,
+            ),
+            "PLAN",
+            clean_for_send=True,
+        )
+    )
+
+    assert acquired.client is client
+    assert order[:2] == ["clear", "bind"]
+    assert client.clear_calls == [
+        (True, True, round(config.workspace_timeout_seconds * 1000))
+    ]
+    assert target.snapshot_value.page_task_id == "task-1"
+    assert target.snapshot_value.page_team == "new-team"
+    assert unrelated.snapshot_value.stop_visible is True
+    assert unrelated.snapshot_value.composer_text == "operator steering while responding"
+
+
+def test_adopt_conversation_opens_exact_url_binds_without_send(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    monkeypatch.setattr(actions_module, "ChatGPTWorkspace", FakeWorkspace)
+    monkeypatch.setattr(
+        actions_module,
+        "random_delay",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+    url = "https://chatgpt.com/c/solo-adopt-exact"
+    context = FakeContext()
+    actions = CDPATabActions(context, config)
+    state = manifest(
+        page_id=None,
+        page_url=None,
+        conversation_url=url,
+    )
+
+    adopted = asyncio.run(actions.adopt_conversation(state, "PLAN", url=url))
+
+    assert context.new_page_calls == 1
+    assert adopted.url == url
+    assert adopted.new_chat is False
+    assert adopted.conversation_id == "solo-adopt-exact"
+    assert adopted.client.page.goto_calls == [url]
+    assert adopted.client.bind_calls == [("task-1", "new-team")]
+    assert adopted.client.send_calls == []
+
+
+def test_adopt_conversation_redirect_fails_closed_and_closes_page(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+
+    class RedirectWorkspace(FakeWorkspace):
+        async def open_role(self, *args, **kwargs):
+            client = await super().open_role(*args, **kwargs)
+            client.page.url = "https://chatgpt.com/"
+            client.page.snapshot_value.url = client.page.url
+            return client
+
+    monkeypatch.setattr(actions_module, "ChatGPTWorkspace", RedirectWorkspace)
+    monkeypatch.setattr(
+        actions_module,
+        "random_delay",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+    url = "https://chatgpt.com/c/solo-adopt-redirect"
+    context = FakeContext()
+    actions = CDPATabActions(context, config)
+
+    with pytest.raises(RoleOwnershipError, match="redirected away"):
+        asyncio.run(actions.adopt_conversation(manifest(), "PLAN", url=url))
+
+    assert context.new_page_calls == 1
+    assert context.pages[-1].closed is True
+
+
+def test_restart_exact_reopens_same_conversation_with_fresh_page_identity(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    monkeypatch.setattr(actions_module, "ChatGPTWorkspace", FakeWorkspace)
+    monkeypatch.setattr(
+        actions_module,
+        "random_delay",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+    url = "https://chatgpt.com/c/exact-solo-conversation"
+    old_page = FakePage(
+        page_id="old-page",
+        role="PLAN",
+        team="new-team",
+        task_id="task-1",
+    )
+    old_page.url = url
+    old_page.snapshot_value.url = url
+    context = FakeContext([old_page])
+    actions = CDPATabActions(context, config)
+    state = manifest(
+        page_id="old-page",
+        page_url=url,
+        conversation_url=url,
+    )
+
+    restarted = asyncio.run(actions.restart_exact(state, "PLAN", url=url))
+
+    assert old_page.closed is True
+    assert restarted.page_id == "fresh-page-1"
+    assert restarted.url == url
+    assert restarted.new_chat is False
+    assert restarted.client.page.snapshot_value.page_task_id == "task-1"
+    assert restarted.client.page.snapshot_value.page_team == "new-team"
 
 
 def test_reopen_existing_conversation_never_uses_branch_composer_cleanup(tmp_path, monkeypatch):
@@ -1530,6 +1700,29 @@ def test_explicit_restart_discards_only_exact_known_automated_draft(tmp_path, mo
             )
         )
     assert mismatched.pages[0].closed is True
+
+
+def test_close_team_treats_windows_access_denied_after_observed_close_as_success(tmp_path, monkeypatch):
+    if os.name != "nt":
+        pytest.skip("WinError 5 regression is Windows-specific")
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+
+    class WinErrorAfterClosePage(FakePage):
+        async def close(self):
+            self.closed = True
+            raise ctypes.WinError(5)
+
+    owned = WinErrorAfterClosePage(
+        page_id="runtime-page", role="PLAN", team="new-team", task_id="task-1"
+    )
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    monkeypatch.setattr(
+        actions_module, "action_delay", lambda *_args, **_kwargs: asyncio.sleep(0)
+    )
+    actions = CDPATabActions(FakeContext([owned]), config)
+
+    assert asyncio.run(actions.close_team(manifest(page_id="runtime-page"))) == 1
+    assert owned.closed is True
 
 
 def test_close_team_uses_role_team_task_and_ignores_stale_page_id(tmp_path, monkeypatch):

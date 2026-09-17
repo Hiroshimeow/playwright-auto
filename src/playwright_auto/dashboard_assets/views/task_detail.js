@@ -1,3 +1,5 @@
+import {endpointIdentity, taskPlacement} from "./topology.js?v=20260914-goal2-ops-v1";
+
 function el(tag, value, className) {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -63,6 +65,30 @@ function reportSort(a, b) {
   return turn || b._order - a._order;
 }
 
+function roleInput(detail, role) {
+  return detail.role_inputs?.[role]
+    || (detail.active_role === role ? detail.active_input : null)
+    || null;
+}
+
+function missingReportReason(detail, role, input = roleInput(detail, role)) {
+  const expected = input?.expected_report;
+  if (expected) {
+    return `Expected ${expected}; no validated ${role} report has been recorded yet.`;
+  }
+  if (detail.active_role === role && detail.active_hop_id != null) {
+    return `Current ${role} hop has not produced a validated report yet.`;
+  }
+  return `No validated ${role} report has been recorded yet.`;
+}
+
+function reportForInput(reports, input) {
+  if (!input?.expected_report) return reports[0] || null;
+  const turn = Number(input.turn);
+  if (!Number.isFinite(turn) || turn <= 0) return null;
+  return reports.find(report => Number(report.turn) === turn) || null;
+}
+
 export function workflowReportModel(detail = {}, selectedRole = null, selectedReportUrl = null) {
   const roles = detail.roles || [];
   const physicalRoles = new Map(roles.map(role => [role.physical_role, role.logical_role]));
@@ -73,24 +99,52 @@ export function workflowReportModel(detail = {}, selectedRole = null, selectedRe
     _logicalRole: report.role || physicalRoles.get(report.physical_role) || null,
   })).filter(report => report._logicalRole && logicalRoles.has(report._logicalRole));
 
-  const roleModels = roles.map(role => {
+  const roleModels = roles.filter(role =>
+    Number(role.turn || 0) > 0 || reports.some(report => report._logicalRole === role.logical_role)
+  ).map(role => {
     const roleReports = reports.filter(report => report._logicalRole === role.logical_role).sort(reportSort);
+    const input = roleInput(detail, role.logical_role);
+    const current = reportForInput(roleReports, input);
+    const expectedMissing = Boolean(input?.expected_report) && current === null;
     return {
       role: role.logical_role,
       physicalRole: role.physical_role,
       latest: roleReports[0] || null,
+      current,
       reports: roleReports,
+      expectedMissing,
+      missingReason: current ? null : missingReportReason(detail, role.logical_role, input),
     };
   });
-  const latestOrders = new Set(roleModels.filter(item => item.latest).map(item => item.latest._order));
-  const olderReports = reports.filter(report => !latestOrders.has(report._order)).sort(reportSort);
+  const currentOrders = new Set(roleModels.filter(item => item.current).map(item => item.current._order));
+  const olderReports = reports.filter(report => !currentOrders.has(report._order)).sort(reportSort);
   const newest = [...reports].sort(reportSort)[0] || null;
   const explicit = selectedReportUrl ? reports.find(report => report.url === selectedReportUrl) : null;
+  const selectedRoleModel = roleModels.find(item => item.role === selectedRole)
+    || roleModels.find(item => item.role === detail.active_role)
+    || null;
+  const planModel = roleModels.find(item => item.role === "PLAN") || null;
+  const selectedExpectedMissing = Boolean(
+    !explicit && detail.status !== "DONE" && selectedRoleModel?.expectedMissing
+  );
   const selectedReport = explicit || (detail.status === "DONE"
-    ? roleModels.find(item => item.role === "PLAN")?.latest || newest
-    : roleModels.find(item => item.role === selectedRole)?.latest || newest);
-  const coverage = `${roleModels.filter(item => item.latest).length}/${roleModels.length}`;
-  return {roles: roleModels, olderReports, selectedReport, coverage};
+    ? planModel?.current || planModel?.latest || newest
+    : selectedExpectedMissing
+      ? null
+      : selectedRoleModel?.current || newest);
+  const coverage = `${roleModels.filter(item => item.current).length}/${roleModels.length}`;
+  const missingRole = selectedRoleModel || roleModels[0] || null;
+  const selectedMissingReason = selectedReport
+    ? null
+    : missingRole?.missingReason || "No validated workflow report has been recorded yet.";
+  return {
+    roles: roleModels,
+    olderReports,
+    selectedReport,
+    selectedMissingReason,
+    selectedExpectedMissing,
+    coverage,
+  };
 }
 
 function relativeTime(value, now = Date.now()) {
@@ -149,7 +203,66 @@ function detailCard(title, {id = null, className = ""} = {}) {
   return section;
 }
 
-function rolesSection(detail, selectedRole) {
+function operationalField(label, value, className = "") {
+  const field = el("span", null, "operational-state-field" + (className ? " " + className : ""));
+  field.append(el("b", label), el("span", value || "—"));
+  return field;
+}
+
+function operationalStateSection(detail, endpoints = []) {
+  const section = detailCard("Operational state", {id: "task-overview", className: "operational-state-card"});
+  const placement = taskPlacement(detail, endpoints);
+  const grid = el("div", null, "operational-state-grid");
+  const state = [detail.status, detail.availability].filter(Boolean).join(" · ");
+  grid.append(operationalField("State", state || "Unknown"));
+
+  if (detail.task_mode === "independent") {
+    grid.append(operationalField(
+      "Affinity",
+      placement.affinity ? placement.affinity.label : "Pool default",
+      placement.affinity ? "is-affinity" : "",
+    ));
+  } else {
+    grid.append(operationalField(
+      "Requested",
+      placement.requested ? placement.requested.label : "Pool default",
+      placement.relocated ? "is-requested" : "",
+    ));
+  }
+
+  grid.append(operationalField(
+    "Execution",
+    placement.actual ? placement.actual.label : "Not allocated",
+    placement.relocated ? "is-relocated" : "",
+  ));
+  grid.append(operationalField("Active role", detail.active_role || "None"));
+  grid.append(operationalField("Action", detail.active_action || "None"));
+
+  const dependencyCount = (detail.dependencies || []).length;
+  if (dependencyCount) {
+    grid.append(operationalField(
+      "Dependencies",
+      dependencyCount + " parent" + (dependencyCount === 1 ? "" : "s"),
+    ));
+  }
+
+  const reportCount = (detail.reports || []).length + (detail.maintenance_reports || []).length;
+  const eventCount = Number(detail.timeline_total || (detail.timeline || []).length || 0);
+  grid.append(operationalField("Evidence", reportCount + " reports · " + eventCount + " events"));
+  section.append(grid);
+
+  const reason = detail.waiting_reason || detail.primary_problem?.message || null;
+  if (reason) {
+    const explanation = el("p", reason, "operational-state-reason");
+    if (detail.primary_problem?.code || detail.block_code) {
+      explanation.prepend(el("strong", (detail.primary_problem?.code || detail.block_code) + " · "));
+    }
+    section.append(explanation);
+  }
+  return section;
+}
+
+function rolesSection(detail, selectedRole, endpoints = []) {
   const roles = detailCard("Roles / tabs", {id: "task-roles", className: "roles-card"});
   const roleList = el("div", null, "role-list");
   const orderedRoles = (detail.roles || []).map((role, index) => ({
@@ -173,9 +286,13 @@ function rolesSection(detail, selectedRole) {
     select.setAttribute("aria-pressed", String(selected));
     const identity = el("span", null, "role-identity");
     identity.append(el("strong", role.logical_role), el("span", role.physical_role, "role-physical"));
-    if (role.browser_endpoint_id) identity.append(el("span", `Browser: ${role.browser_endpoint_id}`, "role-physical"));
+    if (role.browser_endpoint_id) {
+      const browser = endpointIdentity(role.browser_endpoint_id, endpoints);
+      identity.append(el("span", "Execution: " + (browser?.label || role.browser_endpoint_id), "role-physical"));
+    }
     if (role.last_endpoint_id && role.last_endpoint_id !== role.browser_endpoint_id) {
-      identity.append(el("span", `Previous browser: ${role.last_endpoint_id}`, "role-physical"));
+      const previous = endpointIdentity(role.last_endpoint_id, endpoints);
+      identity.append(el("span", "Previous: " + (previous?.label || role.last_endpoint_id), "role-physical"));
     }
     const availability = item.unallocated
       ? {label: "not allocated", className: "unallocated"}
@@ -285,10 +402,12 @@ function independentControls(detail) {
   return controls;
 }
 
-function independentOverview(detail, timeline, selectedRole) {
+function independentOverview(detail, timeline, selectedRole, endpoints) {
   const fragment = document.createDocumentFragment();
   const agent = detail.agent || {};
-  fragment.append(independentControls(detail));
+  const operational = operationalStateSection(detail, endpoints);
+  operational.append(independentControls(detail));
+  fragment.append(operational);
   const section = el("section", null, "detail-section independent-overview");
   section.append(el("h3", "Independent Agent"));
   const prompt = agent.system_prompt || detail.task_text || "No system prompt projected.";
@@ -325,7 +444,7 @@ function independentOverview(detail, timeline, selectedRole) {
     tabState.textContent = "Tab is closed. Open tab keeps it available for up to 10 idle minutes when the backend contract is active.";
   }
   fragment.append(tabState);
-  fragment.append(rolesSection(detail, selectedRole), timelineSection(detail, timeline));
+  fragment.append(rolesSection(detail, selectedRole, endpoints), timelineSection(detail, timeline));
   return fragment;
 }
 
@@ -447,12 +566,12 @@ function workflowReports(detail, selectedRole, selectedReportUrl, reportBodies) 
   for (const item of model.roles) {
     const role = el("button", null, `report-role${item.role === model.selectedReport?._logicalRole ? " selected" : ""}`);
     role.type = "button";
-    role.disabled = !item.latest;
+    role.disabled = !item.current;
     role.dataset.taskId = detail.task_id;
     role.append(el("strong", item.role));
-    role.append(el("span", item.latest ? `Turn ${item.latest.turn ?? "—"}` : "No report"));
-    if (item.latest?.url) {
-      role.dataset.reportSelect = item.latest.url;
+    role.append(el("span", item.current ? `Turn ${item.current.turn ?? "—"}` : item.missingReason));
+    if (item.current?.url) {
+      role.dataset.reportSelect = item.current.url;
       role.dataset.reportRole = item.role;
     }
     navigator.append(role);
@@ -462,17 +581,16 @@ function workflowReports(detail, selectedRole, selectedReportUrl, reportBodies) 
 
   const report = model.selectedReport;
   if (!report) {
-    content.append(el("p", "No workflow reports are available yet.", "muted"));
-    return section;
+    content.append(el("p", model.selectedMissingReason, "muted report-missing-reason"));
+  } else {
+    const reader = el("article", null, "report-reader");
+    const meta = [report._logicalRole || report.role, `Turn ${report.turn ?? "—"}`, report.created_at].filter(Boolean).join(" · ");
+    reader.append(el("strong", meta || "Report"));
+    const link = reportLink(report);
+    if (link) reader.append(link);
+    reader.append(el("pre", reportBody(report, reportBodies), "task-text report-body"));
+    content.append(reader);
   }
-
-  const reader = el("article", null, "report-reader");
-  const meta = [report._logicalRole || report.role, `Turn ${report.turn ?? "—"}`, report.created_at].filter(Boolean).join(" · ");
-  reader.append(el("strong", meta || "Report"));
-  const link = reportLink(report);
-  if (link) reader.append(link);
-  reader.append(el("pre", reportBody(report, reportBodies), "task-text report-body"));
-  content.append(reader);
 
   if (model.olderReports.length) {
     const older = el("details", null, "older-reports");
@@ -634,9 +752,9 @@ function workflowLive(detail, selectedRole, liveState = {}) {
   return section;
 }
 
-function workflowOverview(detail, timeline, selectedRole) {
+function workflowOverview(detail, timeline, selectedRole, endpoints) {
   const fragment = document.createDocumentFragment();
-  const operations = detailCard("Operations", {id: "task-overview", className: "operations-card"});
+  const operations = operationalStateSection(detail, endpoints);
   const controls = el("div", null, "control-grid");
   if (detail.status === "RUNNING") controls.append(changeGoalButton(detail));
   for (const [action, label] of [
@@ -644,6 +762,7 @@ function workflowOverview(detail, timeline, selectedRole) {
     ["restart_role", "Restart role"], ["new_chat", "New chat"],
     ["open_tab", "Open tab"], ["route_plan", "Route PLAN"],
     ["stop", "Stop"], ["clear_team", "Clear team"],
+    ["archive_worktree", "Archive worktree"],
   ]) {
     const eligibility = detail.control_eligibility?.[action] || {
       eligible: false,
@@ -699,11 +818,11 @@ function workflowOverview(detail, timeline, selectedRole) {
     fragment.append(problem);
   }
 
-  fragment.append(rolesSection(detail, selectedRole), timelineSection(detail, timeline));
+  fragment.append(rolesSection(detail, selectedRole, endpoints), timelineSection(detail, timeline));
   return fragment;
 }
 
-function build(detail, timeline, selectedRole, selectedTab, selectedReportUrl, reportBodies, liveState) {
+function build(detail, timeline, selectedRole, selectedTab, selectedReportUrl, reportBodies, liveState, endpoints) {
   const fragment = document.createDocumentFragment();
   const agent = detail.task_mode === "independent" ? (detail.agent || {}) : null;
   const displayTitle = agent
@@ -725,7 +844,7 @@ function build(detail, timeline, selectedRole, selectedTab, selectedReportUrl, r
       ? workflowReports(detail, selectedRole, selectedReportUrl, reportBodies)
       : tab === "live"
         ? workflowLive(detail, selectedRole, liveState)
-        : workflowOverview(detail, timeline, selectedRole));
+        : workflowOverview(detail, timeline, selectedRole, endpoints));
     fragment.append(panel);
     return fragment;
   }
@@ -736,7 +855,7 @@ function build(detail, timeline, selectedRole, selectedTab, selectedReportUrl, r
   panel.setAttribute("role", "tabpanel");
   if (tab === "history") panel.append(independentHistory(detail));
   else if (tab === "reports") panel.append(independentReports(detail, reportBodies));
-  else panel.append(independentOverview(detail, timeline, selectedRole));
+  else panel.append(independentOverview(detail, timeline, selectedRole, endpoints));
   fragment.append(panel);
   return fragment;
 }
@@ -773,6 +892,7 @@ export function renderTaskDetail(
   reportBodies = new Map(),
   reportRevision = 0,
   liveState = {},
+  endpoints = [],
 ) {
   if (!detail || detail.task_id !== selectedTaskId) {
     const signature = JSON.stringify(["unavailable", selectedTaskId, status, error]);
@@ -788,6 +908,7 @@ export function renderTaskDetail(
   const signature = JSON.stringify([
     detail.projection_sha256, detail.version, timeline, selectedRole,
     selectedTab, reportRevision, liveState,
+    endpoints.map(endpoint => [endpoint.endpoint_id, endpoint.label, endpoint.health, endpoint.connected, endpoint.chatgpt_ready, endpoint.active_count, endpoint.capacity, endpoint.draining, endpoint.cooldown]),
   ]);
   if (root.dataset.signature === signature) return;
   const sameTask = root.dataset.taskId === selectedTaskId;
@@ -796,7 +917,7 @@ export function renderTaskDetail(
   if (sameTask && selection && !selection.isCollapsed && root.contains(selection.anchorNode)) {
     root._pendingRender = () => renderTaskDetail(
       root, detail, timeline, selectedRole, selectedTaskId, status, error,
-      selectedTab, selectedReportUrl, reportBodies, reportRevision, liveState,
+      selectedTab, selectedReportUrl, reportBodies, reportRevision, liveState, endpoints,
     );
     return;
   }
@@ -804,7 +925,7 @@ export function renderTaskDetail(
     [...root.querySelectorAll("details[data-disclosure-key][open]")].map(details => details.dataset.disclosureKey),
   ) : new Set();
   const scroll = root.scrollTop;
-  root.replaceChildren(build(detail, timeline, selectedRole, selectedTab, selectedReportUrl, reportBodies, liveState));
+  root.replaceChildren(build(detail, timeline, selectedRole, selectedTab, selectedReportUrl, reportBodies, liveState, endpoints));
   for (const details of root.querySelectorAll("details[data-disclosure-key]")) {
     details.open = openDisclosureKeys.has(details.dataset.disclosureKey);
   }

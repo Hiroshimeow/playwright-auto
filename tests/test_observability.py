@@ -1,4 +1,24 @@
+import json
+import multiprocessing
 from pathlib import Path
+
+
+def _append_action_events_from_process(log_path: str, worker_index: int, count: int, start) -> None:
+    import playwright_auto.observability as observability
+
+    observability.configure_action_event_log(Path(log_path))
+    observability._ACTION_EVENT_MAX_BYTES = 4096
+    if not start.wait(timeout=10):
+        raise RuntimeError("action-writer start gate timed out")
+    for index in range(count):
+        observability.append_action_event(
+            "mcp_allow",
+            "complete",
+            page_url=f"https://chatgpt.com/c/worker-{worker_index}-{index}",
+            task_id=f"task-{worker_index}",
+            detail="Allow mcp-thinkbook for this conversation",
+        )
+
 
 from playwright_auto.observability import (
     append_action_event,
@@ -60,6 +80,261 @@ def test_mcp_allow_click_summary_counts_only_live_chatgpt_clicks(tmp_path: Path)
     assert summary["latest_at"]
 
 
+def test_action_summary_observation_without_sidecar_is_read_only(tmp_path: Path):
+    import json
+
+    log = tmp_path / "actions.jsonl"
+    legacy = {
+        "action": "mcp_allow",
+        "phase": "complete",
+        "page_url": "https://chatgpt.com/c/legacy",
+        "task_id": "legacy-task",
+        "detail": "Allow mcp-thinkbook for this conversation",
+        "at": "2026-09-15T00:00:00+00:00",
+    }
+    log.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+    configure_action_event_log(log)
+    sidecar = tmp_path / "actions.summary.json"
+    lock = tmp_path / "actions.jsonl.lock"
+
+    summary = mcp_allow_click_summary()
+
+    assert summary["clicks"] is None
+    assert "unavailable" in summary["error"].lower()
+    assert not sidecar.exists()
+    assert not lock.exists()
+
+
+def test_action_summary_migrates_once_on_first_writer_and_uses_sidecar_afterward(
+    tmp_path: Path, monkeypatch
+):
+    import json
+    import playwright_auto.observability as observability
+
+    log = tmp_path / "actions.jsonl"
+    legacy = {
+        "action": "mcp_allow",
+        "phase": "complete",
+        "page_url": "https://chatgpt.com/c/legacy",
+        "task_id": "legacy-task",
+        "detail": "Allow mcp-thinkbook for this conversation",
+        "at": "2026-09-15T00:00:00+00:00",
+    }
+    log.write_text(json.dumps(legacy) + "\n{partial", encoding="utf-8")
+    configure_action_event_log(log)
+
+    assert mcp_allow_click_summary()["clicks"] is None
+    sidecar = tmp_path / "actions.summary.json"
+    lock = tmp_path / "actions.jsonl.lock"
+    assert not sidecar.exists()
+    assert not lock.exists()
+
+    append_action_event(
+        "mcp_allow",
+        "complete",
+        page_url="https://chatgpt.com/c/new",
+        task_id="new-task",
+        detail="Allow mcp-docker for this conversation",
+    )
+    assert sidecar.exists()
+    assert lock.exists()
+    summary = mcp_allow_click_summary()
+    assert summary["clicks"] == 2
+    assert summary["by_tool"] == {"mcp-docker": 1, "mcp-thinkbook": 1}
+
+    monkeypatch.setattr(
+        observability,
+        "_scan_allow_summary",
+        lambda _target: (_ for _ in ()).throw(AssertionError("rescanned history")),
+    )
+    append_action_event(
+        "mcp_allow",
+        "complete",
+        page_url="https://chatgpt.com/c/newer",
+        task_id="newer-task",
+        detail="Allow mcp-g8 for this conversation",
+    )
+    assert mcp_allow_click_summary()["clicks"] == 3
+
+
+def test_precreated_lock_without_action_history_does_not_suppress_first_summary_initialization(tmp_path: Path):
+    log = tmp_path / "actions.jsonl"
+    configure_action_event_log(log)
+    (tmp_path / "actions.jsonl.lock").touch()
+
+    append_action_event(
+        "mcp_allow",
+        "complete",
+        page_url="https://chatgpt.com/c/first",
+        task_id="task-first",
+        detail="Allow mcp-thinkbook for this conversation",
+    )
+
+    assert mcp_allow_click_summary(log)["clicks"] == 1
+
+
+def test_concurrent_action_writers_preserve_exact_all_time_summary_and_valid_bounded_log(tmp_path: Path):
+    log = tmp_path / "actions.jsonl"
+    configure_action_event_log(log)
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    writers = 4
+    per_writer = 20
+    processes = [
+        context.Process(
+            target=_append_action_events_from_process,
+            args=(str(log), worker_index, per_writer, start),
+        )
+        for worker_index in range(writers)
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    for process in processes:
+        process.join(timeout=20)
+        assert process.exitcode == 0
+
+    summary = mcp_allow_click_summary(log)
+    assert summary["clicks"] == writers * per_writer
+    assert summary["by_tool"] == {"mcp-thinkbook": writers * per_writer}
+    assert summary["by_task"] == {
+        f"task-{worker_index}": per_writer for worker_index in range(writers)
+    }
+    sidecar = tmp_path / "actions.summary.json"
+    json.loads(sidecar.read_text(encoding="utf-8"))
+    assert log.stat().st_size <= 4096
+    for line in log.read_text(encoding="utf-8").splitlines():
+        json.loads(line)
+
+
+def test_action_log_trim_preserves_all_time_summary(tmp_path: Path, monkeypatch):
+    import playwright_auto.observability as observability
+
+    log = tmp_path / "actions.jsonl"
+    configure_action_event_log(log)
+    monkeypatch.setattr(observability, "_ACTION_EVENT_MAX_BYTES", 700)
+    for index in range(20):
+        append_action_event(
+            "mcp_allow",
+            "complete",
+            page_url=f"https://chatgpt.com/c/{index}",
+            task_id=f"task-{index}",
+            detail="Allow mcp-thinkbook for this conversation",
+        )
+    assert log.stat().st_size < 700
+    assert mcp_allow_click_summary()["clicks"] == 20
+
+
+def test_missing_established_action_summary_is_not_rebuilt_from_rotated_log(
+    tmp_path: Path, monkeypatch
+):
+    import playwright_auto.observability as observability
+
+    log = tmp_path / "actions.jsonl"
+    configure_action_event_log(log)
+    max_bytes = 1800
+    monkeypatch.setattr(observability, "_ACTION_EVENT_MAX_BYTES", max_bytes)
+    for index in range(20):
+        append_action_event(
+            "mcp_allow",
+            "complete",
+            page_url=f"https://chatgpt.com/c/{index}",
+            task_id=f"task-{index}",
+            detail="Allow mcp-thinkbook for this conversation",
+        )
+    assert mcp_allow_click_summary()["clicks"] == 20
+    sidecar = tmp_path / "actions.summary.json"
+    lock = tmp_path / "actions.jsonl.lock"
+    assert sidecar.exists()
+    assert lock.exists()
+    sidecar.unlink()
+
+    summary = mcp_allow_click_summary()
+
+    assert summary["clicks"] is None
+    assert "unavailable" in summary["error"].lower()
+    assert not sidecar.exists()
+    append_action_event(
+        "mcp_allow",
+        "complete",
+        page_url="https://chatgpt.com/c/after-loss",
+        task_id="task-after-loss",
+        detail="Allow mcp-docker for this conversation",
+    )
+    assert not sidecar.exists()
+    assert log.stat().st_size <= max_bytes
+    assert "task-after-loss" in log.read_text(encoding="utf-8")
+    assert mcp_allow_click_summary()["clicks"] is None
+
+
+def test_established_action_summary_corruption_is_reported_without_rebuild(
+    tmp_path: Path, monkeypatch
+):
+    import playwright_auto.observability as observability
+
+    log = tmp_path / "actions.jsonl"
+    configure_action_event_log(log)
+    monkeypatch.setattr(observability, "_ACTION_EVENT_MAX_BYTES", 700)
+    for index in range(20):
+        append_action_event(
+            "mcp_allow",
+            "complete",
+            page_url=f"https://chatgpt.com/c/{index}",
+            task_id=f"task-{index}",
+            detail="Allow mcp-thinkbook for this conversation",
+        )
+    assert mcp_allow_click_summary()["clicks"] == 20
+
+    sidecar = tmp_path / "actions.summary.json"
+    sidecar.write_text("{broken", encoding="utf-8")
+
+    summary = mcp_allow_click_summary()
+
+    assert summary["clicks"] is None
+    assert summary["by_tool"] == {}
+    assert summary["by_task"] == {}
+    assert summary["latest_at"] is None
+    assert "corrupt" in summary["error"].lower()
+    assert sidecar.read_text(encoding="utf-8") == "{broken"
+
+
+def test_action_append_preserves_corrupt_summary_and_bounds_recent_evidence(
+    tmp_path: Path, monkeypatch
+):
+    import playwright_auto.observability as observability
+
+    log = tmp_path / "actions.jsonl"
+    configure_action_event_log(log)
+    max_bytes = 1800
+    monkeypatch.setattr(observability, "_ACTION_EVENT_MAX_BYTES", max_bytes)
+    for index in range(20):
+        append_action_event(
+            "mcp_allow",
+            "complete",
+            page_url=f"https://chatgpt.com/c/{index}",
+            task_id=f"task-{index}",
+            detail="Allow mcp-thinkbook for this conversation",
+        )
+    sidecar = tmp_path / "actions.summary.json"
+    sidecar.write_text("{broken", encoding="utf-8")
+
+    for index in range(20):
+        append_action_event(
+            "send",
+            "complete",
+            page_url=f"https://chatgpt.com/c/after-corruption-{index}",
+            task_id=f"task-after-corruption-{index}",
+            detail="x" * 120,
+        )
+
+    assert sidecar.read_text(encoding="utf-8") == "{broken"
+    assert log.stat().st_size <= max_bytes
+    assert "task-after-corruption-19" in log.read_text(encoding="utf-8")
+    summary = mcp_allow_click_summary()
+    assert summary["clicks"] is None
+    assert "corrupt" in summary["error"].lower()
+
+
 def test_live_event_log_filters_by_task_and_role(tmp_path: Path):
     old_log = live_event_log_path()
     old_enabled = live_event_logging_enabled()
@@ -113,5 +388,44 @@ def test_live_event_log_filters_by_task_and_role(tmp_path: Path):
         assert review[0]["request_id"] == "req-2"
         assert review[0]["generation"] == 3
         assert review[0]["team"] == "alpha"
+    finally:
+        configure_live_event_log(old_log, enabled=old_enabled)
+
+
+def test_live_event_log_dedupes_unchanged_listen_and_ctrl_across_calls(tmp_path: Path):
+    old_log = live_event_log_path()
+    old_enabled = live_event_logging_enabled()
+    log = tmp_path / "live.jsonl"
+    configure_live_event_log(log)
+    try:
+        common = {
+            "page_url": "https://chatgpt.com/c/one",
+            "page_id": "page-1",
+            "role": "DEV",
+            "task_id": "task-1",
+            "team": "alpha",
+            "request_id": "req-1",
+            "generation": 2,
+        }
+        append_live_event("LISTEN", "network_signal", **common, values={"status": "IS_STREAMING"})
+        append_live_event("LISTEN", "network_signal", **common, values={"status": "IS_STREAMING"})
+        append_live_event("CTRL", "role_decision", **common, values={"action": "wait", "reason": "mcp_allow_stable"})
+        append_live_event("CTRL", "role_decision", **common, values={"action": "wait", "reason": "mcp_allow_stable"})
+        append_live_event("LISTEN", "network_signal", **common, values={"status": "DONE"})
+        append_live_event("CTRL", "role_decision", **common, values={"action": "accept", "reason": "stable_current_result"})
+        append_live_event(
+            "LISTEN", "network_signal", **{**common, "page_url": "https://chatgpt.com/c/two"},
+            values={"status": "DONE"},
+        )
+
+        events = read_recent_live_events(task_id="task-1", limit=20)
+
+        assert [(item["source"], item["values"]) for item in events] == [
+            ("LISTEN", {"status": "IS_STREAMING"}),
+            ("CTRL", {"action": "wait", "reason": "mcp_allow_stable"}),
+            ("LISTEN", {"status": "DONE"}),
+            ("CTRL", {"action": "accept", "reason": "stable_current_result"}),
+            ("LISTEN", {"status": "DONE"}),
+        ]
     finally:
         configure_live_event_log(old_log, enabled=old_enabled)

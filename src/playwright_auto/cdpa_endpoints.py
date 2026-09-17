@@ -227,8 +227,10 @@ class BrowserEndpointRegistry:
             return item
 
     def update(self, endpoint_id: str, **changes: Any) -> dict[str, Any]:
-        if set(changes) - (_ENDPOINT_FIELDS - {"endpoint_id", "removed", "draining"}):
+        if set(changes) - (_ENDPOINT_FIELDS - {"endpoint_id", "removed"}):
             raise ValueError("unsupported browser endpoint update")
+        if "draining" in changes and changes["draining"] is not False:
+            raise ValueError("browser endpoint settings may only clear draining; use Remove to drain")
         self.snapshot()
         with exclusive_file_lock(self.lock_path):
             catalog = self._read_existing()

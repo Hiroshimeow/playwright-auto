@@ -70,8 +70,8 @@
   },
   "repositories": {
     "allowed_roots": [
-      "/home/ayumi/Workspace/git_project",
-      "/home/ayumi/Workspace/fpt"
+      "E:\\git-project",
+      "E:\\FPT"
     ]
   }
 }

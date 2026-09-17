@@ -120,6 +120,14 @@ def exact_team_reuse_eligible(
     return sum(is_team_availability_barrier(manifest) for manifest in team_tasks) <= 1
 
 
+def dispatch_order_key(item: Mapping[str, Any]) -> tuple[str, str]:
+    """Durable FIFO key shared by browser admission and queue projections."""
+    return (
+        str(item.get("created_at") or ""),
+        str(item.get("task_id") or ""),
+    )
+
+
 def exact_team_waiter_order_key(item: Mapping[str, Any]) -> tuple[int, str, str]:
     return (
         0 if item.get("priority") == "urgent_repair" else 1,

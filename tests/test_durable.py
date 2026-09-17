@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import playwright_auto.durable as durable_module
 from playwright_auto.chatgpt import (
     ChatGPTSnapshot,
     ChatGPTState,
@@ -18,12 +19,14 @@ from playwright_auto.chatgpt import (
 from playwright_auto.durable import (
     DurableRecoveryState,
     DurableRequestError,
+    FileIdentity,
     RequestLedger,
     RequestStatus,
     build_idempotency_key,
     classify_recovery_state,
 )
 from playwright_auto.durable_blocks import DurableSendBlock
+from playwright_auto.file_lock import open_shared_read
 from playwright_auto.upload import UploadReceipt, collect_file_identities
 from playwright_auto.workflow import Workflow, WorkflowExecutionError
 
@@ -227,6 +230,103 @@ def test_reused_conversation_persistent_empty_baseline_stays_preboundary(tmp_pat
     assert client.send_calls == []
 
 
+def test_ledger_replace_succeeds_while_replacement_safe_reader_is_open(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(role="DEV", prompt="shared reader")
+
+    with open_shared_read(ledger_path):
+        updated = ledger.update(record.request_id, status=RequestStatus.PROMPT_SET)
+
+    assert updated.status is RequestStatus.PROMPT_SET
+    assert RequestLedger(ledger_path).peek(record.request_id) == updated
+    assert not ledger_path.with_suffix(".json.tmp").exists()
+
+
+def test_ledger_peek_uses_replacement_safe_reader(tmp_path, monkeypatch):
+    ledger_path = tmp_path / "ledger.json"
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(role="DEV", prompt="replacement-safe peek")
+    reader = getattr(durable_module, "read_shared_bytes", None)
+    assert reader is not None, "RequestLedger.peek must use the replacement-safe read primitive"
+    calls = []
+
+    def tracking_reader(path):
+        calls.append(Path(path).resolve())
+        return reader(path)
+
+    monkeypatch.setattr(durable_module, "read_shared_bytes", tracking_reader)
+
+    assert ledger.peek(record.request_id) == record
+    assert calls == [ledger_path.resolve()]
+
+
+def test_ledger_replace_retries_transient_windows_permission_error(tmp_path, monkeypatch):
+    ledger_path = tmp_path / "ledger.json"
+    real_replace = durable_module.atomic_replace
+    calls = 0
+
+    def flaky_replace(source, target):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise PermissionError(5, "synthetic contention", str(target))
+        return real_replace(source, target)
+
+    monkeypatch.setattr(durable_module, "atomic_replace", flaky_replace)
+
+    record = RequestLedger(ledger_path).begin(role="DEV", prompt="transient contention")
+
+    assert calls == 3
+    assert RequestLedger(ledger_path).peek(record.request_id) == record
+    assert not ledger_path.with_suffix(".json.tmp").exists()
+
+
+def test_ledger_replace_contention_exhaustion_preserves_old_target_and_tmp(tmp_path, monkeypatch):
+    ledger_path = tmp_path / "ledger.json"
+    ledger = RequestLedger(ledger_path)
+    original = ledger.begin(role="DEV", prompt="original")
+    original_bytes = ledger_path.read_bytes()
+    calls = 0
+
+    def denied_replace(source, target):
+        nonlocal calls
+        calls += 1
+        raise PermissionError(5, "synthetic persistent contention", str(target))
+
+    monkeypatch.setattr(durable_module, "atomic_replace", denied_replace)
+
+    with pytest.raises(PermissionError):
+        ledger.begin(role="DEV", prompt="replacement")
+
+    temporary = ledger_path.with_suffix(".json.tmp")
+    assert calls == 6
+    assert ledger_path.read_bytes() == original_bytes
+    assert RequestLedger(ledger_path).peek(original.request_id) == original
+    assert temporary.exists()
+    tmp_payload = json.loads(temporary.read_text(encoding="utf-8"))
+    assert len(tmp_payload["records"]) == 2
+
+
+def test_ledger_replace_does_not_retry_non_permission_error(tmp_path, monkeypatch):
+    ledger_path = tmp_path / "ledger.json"
+    calls = 0
+
+    def broken_replace(source, target):
+        nonlocal calls
+        calls += 1
+        raise OSError("synthetic non-permission failure")
+
+    monkeypatch.setattr(durable_module, "atomic_replace", broken_replace)
+
+    with pytest.raises(OSError, match="synthetic non-permission failure"):
+        RequestLedger(ledger_path).begin(role="DEV", prompt="hard failure")
+
+    assert calls == 1
+    assert not ledger_path.exists()
+    assert ledger_path.with_suffix(".json.tmp").exists()
+
+
 def test_ledger_begin_is_stable_for_same_normalized_request(tmp_path):
     ledger = RequestLedger(tmp_path / "ledger.json")
 
@@ -236,6 +336,74 @@ def test_ledger_begin_is_stable_for_same_normalized_request(tmp_path):
     assert first.request_id == second.request_id
     assert first.marker in first.rendered_prompt
     assert ledger.get(first.request_id) == first
+
+
+def test_ledger_rebinds_only_pristine_request_and_preserves_request_id(tmp_path):
+    ledger = RequestLedger(tmp_path / "ledger.json")
+    source = {"task_id": "task", "team": "team", "hop_id": 2, "manifest": "manifest"}
+    record = ledger.begin(
+        role="DEV", prompt="old prompt", source_context=source,
+        role_prompt_hash="old-hash", request_id="stable-request",
+        render_request_marker=False,
+    )
+    rebound = ledger.rebind_pristine(
+        record.request_id, role="DEV", prompt="rebuilt prompt",
+        source_context=source, role_prompt_hash="new-hash",
+    )
+    assert rebound.request_id == "stable-request"
+    assert rebound.prompt == "rebuilt prompt"
+    assert rebound.idempotency_key != record.idempotency_key
+
+
+def test_ledger_rebind_preserves_original_files_and_render_marker_policy(tmp_path):
+    ledger = RequestLedger(tmp_path / "ledger.json")
+    source = {"task_id": "task", "team": "team", "hop_id": 2, "manifest": "manifest"}
+    original = FileIdentity(path="/original.txt", name="original.txt", size=1, sha256="a" * 64, mime_type="text/plain")
+    replacement = FileIdentity(path="/replacement.txt", name="replacement.txt", size=2, sha256="b" * 64, mime_type="text/plain")
+    record = ledger.begin(
+        role="DEV", prompt="old prompt", source_context=source,
+        role_prompt_hash="old-hash", files=(original,), request_id="stable-request",
+        render_request_marker=True,
+    )
+    rebound = ledger.rebind_pristine(
+        record.request_id, role="DEV", prompt="rebuilt prompt",
+        source_context=source, role_prompt_hash="new-hash",
+        # A relocation caller must not be able to substitute this payload.
+    )
+    assert rebound.files == (original,)
+    assert rebound.marker in rebound.rendered_prompt
+    assert replacement not in rebound.files
+
+
+@pytest.mark.parametrize("change", [
+    {"source_context": {"task_id": "other", "team": "team", "hop_id": 2, "manifest": "manifest"}},
+    {"role": "PLAN"},
+])
+def test_ledger_rebind_rejects_source_or_role_mismatch(tmp_path, change):
+    ledger = RequestLedger(tmp_path / "ledger.json")
+    source = {"task_id": "task", "team": "team", "hop_id": 2, "manifest": "manifest"}
+    record = ledger.begin(role="DEV", prompt="old", source_context=source)
+    with pytest.raises(DurableRequestError):
+        ledger.rebind_pristine(
+            record.request_id,
+            role=change.get("role", "DEV"),
+            prompt="new",
+            source_context=change.get("source_context", source),
+        )
+
+
+@pytest.mark.parametrize("change", [
+    {"attempts": 1}, {"status": RequestStatus.SENDING}, {"error": "e"},
+])
+def test_ledger_rebind_rejects_irreversible_or_ambiguous_request(tmp_path, change):
+    ledger = RequestLedger(tmp_path / "ledger.json")
+    source = {"task_id": "task", "team": "team", "hop_id": 2, "manifest": "manifest"}
+    record = ledger.begin(role="DEV", prompt="old", source_context=source, render_request_marker=False)
+    ledger.update(record.request_id, **change)
+    with pytest.raises(DurableRequestError):
+        ledger.rebind_pristine(
+            record.request_id, role="DEV", prompt="new", source_context=source,
+        )
 
 
 def test_file_content_changes_idempotency_key(tmp_path):

@@ -3,12 +3,12 @@ import {PollController} from "./polling.js";
 import {
   state, commit, subscribe, commandKey, persistViewState,
   detailCacheGet, detailCachePut, detailCacheInvalidate, pruneDetailCache,
-} from "./store.js?v=20260913-multi-cdp-v1";
-import {renderBoard, refreshElapsed} from "./views/board.js?v=20260913-multi-cdp-v1";
-import {renderBrowserManager, renderBrowserScope, syncCreateBrowserOptions, creationUsesTemporary} from "./views/browsers.js?v=20260913-multi-cdp-v1";
-import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260913-multi-cdp-v1";
+} from "./store.js?v=20260914-goal2-ops-v1";
+import {renderBoard, refreshElapsed} from "./views/board.js?v=20260915-operator-ux-v1";
+import {renderBrowserManager, renderBrowserScope, syncCreateBrowserOptions, creationUsesTemporary} from "./views/browsers.js?v=20260915-endpoint-all-v1";
+import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260915-report-context-integrate-v1";
 import {renderHistory} from "./views/history.js";
-import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20260913-multi-cdp-v1";
+import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20260915-report-context-integrate-v1";
 import {renderRuntime} from "./views/runtime.js?v=20260906-listen-controls-v1";
 import {
   applyReuseRoleSelection, renderCreateActions, renderResume, renderWorkflowAgentOptions,
@@ -35,7 +35,16 @@ const roots = {
   dependencyOptions: document.querySelector("#dependency-options"),
   reuseTeam: document.querySelector('#create-form select[name="reuse_team"]'),
   requestedTeam: document.querySelector('#create-form input[name="requested_team"]'),
+  requestedTeamField: document.querySelector('#create-form [data-requested-team-field]'),
+  taskInput: document.querySelector('#create-form textarea[name="task"]'),
+  taskDetails: document.querySelector('#create-form [data-create-section="task-details"]'),
+  conversationUrl: document.querySelector('#create-form input[name="conversation_url"]'),
   browserEndpointSelect: document.querySelector('#create-form select[name="browser_endpoint_id"]'),
+  browserEndpointField: document.querySelector('#create-form [data-create-browser-field]'),
+  teamBrowserSlot: document.querySelector('#create-form [data-team-browser-slot]'),
+  soloBrowserSlot: document.querySelector('#create-form [data-solo-browser-slot]'),
+  workflowModeInputs: [...document.querySelectorAll('#create-form input[name="workflow_mode"]')],
+  soloRole: document.querySelector('#create-form select[name="solo_role"]'),
   bootstrapSelect: document.querySelector('#create-form select[name="bootstrap_id"]'),
   bootstrapInline: document.querySelector("#create-form [data-bootstrap-inline]"),
   workflowAgentOptions: document.querySelector("#workflow-agent-options"),
@@ -47,12 +56,14 @@ const roots = {
   workflowTaskTeamOptions: document.querySelector("#workflow-task-team-options"),
   agentSelect: document.querySelector('#agents-panel select[name="agent_select"]'),
   agentForm: document.querySelector("#agent-form"),
+  agentBrowserEndpointSelect: document.querySelector('#agent-form select[name="browser_endpoint_id"]'),
   independentSettings: document.querySelector("#independent-settings"),
   deleteAgent: document.querySelector("[data-delete-agent]"),
   agentCommandDialog: document.querySelector("#agent-command-dialog"),
   agentCommandForm: document.querySelector("#agent-command-form"),
   agentSettingsDialog: document.querySelector("#agent-settings-dialog"),
   agentSettingsForm: document.querySelector("#agent-settings-form"),
+  agentSettingsBrowserEndpointSelect: document.querySelector('#agent-settings-form select[name="browser_endpoint_id"]'),
   agentSettingsCaption: document.querySelector("#agent-settings-caption"),
   agentSettingsTriggerHelp: document.querySelector("#independent-settings-trigger-help"),
   toast: document.querySelector("#toast"),
@@ -84,6 +95,41 @@ function toast(message) {
 
 function selectedWorkflowRoles() {
   return roots.roleInputs.filter(input => input.checked).map(input => input.value);
+}
+
+function createWorkflowMode() {
+  return roots.workflowModeInputs.find(input => input.checked)?.value === "solo" ? "solo" : "team";
+}
+
+function syncSoloRoleOptions() {
+  const selected = roots.soloRole.value;
+  const options = [new Option("Select role", "")];
+  for (const input of roots.roleInputs) {
+    options.push(new Option(input.value, input.value));
+  }
+  roots.soloRole.replaceChildren(...options);
+  roots.soloRole.value = [...roots.soloRole.options].some(option => option.value === selected)
+    ? selected
+    : "";
+}
+
+function syncCreateMode() {
+  const solo = createWorkflowMode() === "solo";
+  const existingSolo = solo && Boolean(roots.conversationUrl.value.trim());
+  for (const node of roots.form.querySelectorAll("[data-team-only]")) node.hidden = solo;
+  for (const node of roots.form.querySelectorAll("[data-solo-only]")) node.hidden = !solo;
+  if (solo) roots.soloBrowserSlot.append(roots.browserEndpointField);
+  else roots.teamBrowserSlot.prepend(roots.browserEndpointField);
+  roots.taskDetails.hidden = existingSolo;
+  roots.requestedTeamField.hidden = existingSolo;
+  roots.taskInput.required = !existingSolo;
+  roots.taskInput.disabled = existingSolo;
+  roots.soloRole.required = solo;
+  roots.browserEndpointSelect.required = solo;
+  if (solo) roots.reuseTeam.value = "";
+  roots.requestedTeam.disabled = existingSolo || (!solo && Boolean(roots.reuseTeam.value));
+  syncBootstrapInlineFields();
+  updateCreateSummary();
 }
 
 function basicTriggerSettings(values) {
@@ -254,11 +300,14 @@ async function loadBootstrapOptions() {
 }
 
 function syncBootstrapInlineFields() {
-  const temporary = creationUsesTemporary(state, roots.browserEndpointSelect.value, roots.form.elements.temporary.checked);
+  const solo = createWorkflowMode() === "solo";
+  const temporary = !solo && creationUsesTemporary(state, roots.browserEndpointSelect.value, roots.form.elements.temporary.checked);
   if (temporary) roots.bootstrapSelect.value = "";
-  roots.bootstrapSelect.disabled = temporary;
-  roots.bootstrapSelect.title = temporary ? "Temporary chats use fresh context; persistent bootstrap branching is unavailable" : "";
-  roots.bootstrapInline.hidden = temporary || roots.bootstrapSelect.value !== INLINE_BOOTSTRAP_VALUE;
+  roots.bootstrapSelect.disabled = solo || temporary;
+  roots.bootstrapSelect.title = solo
+    ? "Solo Task uses its selected conversation directly"
+    : temporary ? "Temporary chats use fresh context; persistent bootstrap branching is unavailable" : "";
+  roots.bootstrapInline.hidden = solo || temporary || roots.bootstrapSelect.value !== INLINE_BOOTSTRAP_VALUE;
 }
 
 function resetBootstrapSelection() {
@@ -269,6 +318,15 @@ function resetBootstrapSelection() {
 }
 
 function updateCreateSummary() {
+  if (createWorkflowMode() === "solo") {
+    const role = roots.soloRole.value || "Select role";
+    const requested = roots.requestedTeam.value.trim();
+    const existingSolo = Boolean(roots.conversationUrl.value.trim());
+    const team = existingSolo ? "Existing conversation" : requested ? `Solo ${requested}` : "Solo automatic team";
+    const endpoint = roots.browserEndpointSelect.selectedOptions[0]?.textContent || "Select browser";
+    roots.createSummary.textContent = `${team} A� ${role} A� ${endpoint}`;
+    return;
+  }
   const roles = selectedWorkflowRoles();
   const dependencies = selectedDependencyIds(roots.dependencyOptions);
   const reuse = roots.reuseTeam.value.trim();
@@ -428,6 +486,20 @@ function setAgentPanelOpen(open, {restoreFocus = false} = {}) {
   else if (restoreFocus) roots.agentOpener.focus();
 }
 
+function setConfiguredBrowserEndpoint(select, endpointId) {
+  const configured = String(endpointId || "");
+  select.dataset.configuredEndpointId = configured;
+  select.dataset.initialEndpointId = configured;
+  syncCreateBrowserOptions(select, state);
+  select.value = configured;
+}
+
+function addEditedBrowserEndpoint(body, select, values) {
+  const selected = String(values.get("browser_endpoint_id") || "").trim();
+  const initial = String(select.dataset.initialEndpointId || "");
+  if (selected !== initial) body.browser_endpoint_id = selected || null;
+}
+
 function resetAgentEditor() {
   const form = roots.agentForm;
   form.reset();
@@ -440,6 +512,7 @@ function resetAgentEditor() {
   form.elements.temporary_chat.closest("label").hidden = false;
   form.elements.trigger_type.value = "manual";
   form.elements.max_cycles.value = "0";
+  setConfiguredBrowserEndpoint(roots.agentBrowserEndpointSelect, "");
   rememberTriggerSettings(form, {});
   roots.deleteAgent.hidden = true;
   document.querySelector("#agent-editor-help").textContent =
@@ -479,6 +552,7 @@ function loadAgentEditor(value) {
     rememberTriggerSettings(form, settings);
     form.elements.trigger_type.value = triggerTypeFromSettings(settings);
     form.elements.max_cycles.value = Number.isFinite(Number(agent.max_cycles)) ? String(Number(agent.max_cycles)) : "0";
+    setConfiguredBrowserEndpoint(roots.agentBrowserEndpointSelect, agent.browser_endpoint_id);
     form.elements.interval_minutes.value = settings.interval_minutes || "";
     for (const input of form.querySelectorAll('input[name="dependency_team"]')) {
       input.checked = (settings.teams || []).includes(input.value);
@@ -489,6 +563,7 @@ function loadAgentEditor(value) {
   } else {
     form.elements.trigger_type.value = "manual";
     form.elements.max_cycles.value = "0";
+    setConfiguredBrowserEndpoint(roots.agentBrowserEndpointSelect, "");
     rememberTriggerSettings(form, {});
   }
   document.querySelector("#agent-editor-help").textContent = agent.is_system
@@ -502,6 +577,7 @@ function loadAgentEditor(value) {
 function renderAgents(current) {
   renderWorkflowAgentOptions(roots.workflowAgentOptions, current.agents?.workflow || []);
   roots.roleInputs = [...roots.workflowAgentOptions.querySelectorAll('input[name="roles"]')];
+  syncSoloRoleOptions();
   const selected = roots.agentSelect.value;
   const signature = JSON.stringify([
     current.agents?.workflow || [], current.agents?.independent || [],
@@ -566,6 +642,7 @@ function openAgentSettings(detail) {
   form.elements.enabled.checked = detail.agent?.enabled !== false;
   form.elements.system_prompt.value = detail.agent?.system_prompt || "";
   form.elements.max_cycles.value = Number.isFinite(Number(detail.agent?.max_cycles)) ? String(Number(detail.agent.max_cycles)) : "0";
+  setConfiguredBrowserEndpoint(roots.agentSettingsBrowserEndpointSelect, detail.agent?.browser_endpoint_id);
   form.elements.trigger_type.value = triggerTypeFromSettings(settings);
   form.elements.interval_minutes.value = settings.interval_minutes || "";
   for (const input of form.querySelectorAll('input[name="dependency_team"]')) {
@@ -763,6 +840,7 @@ function render(current) {
     reportBodies,
     current.agentReportsRevision,
     selectedLiveState(current),
+    current.runtime?.browser?.endpoints || [],
   );
   renderPageRail(current);
   renderBootstrapContext(current.selectedDetail);
@@ -771,6 +849,8 @@ function render(current) {
   renderBrowserScope(roots.browserScope, current);
   renderBrowserManager(roots.browserManager, current);
   syncCreateBrowserOptions(roots.browserEndpointSelect, current);
+  syncCreateBrowserOptions(roots.agentBrowserEndpointSelect, current);
+  syncCreateBrowserOptions(roots.agentSettingsBrowserEndpointSelect, current);
   syncBootstrapInlineFields();
   renderAgents(current);
   renderTriggerChoices(current);
@@ -1217,7 +1297,7 @@ function openCreate() {
   if (!state.modalOpen) pushOverlay("modal");
   commit(current => { current.modalOpen = true; });
   showCreateValidation();
-  updateCreateSummary();
+  syncCreateMode();
   loadDashboardActions();
   loadBootstrapOptions();
 }
@@ -1395,7 +1475,7 @@ roots.detail.addEventListener("click", async event => {
         action: control.dataset.control,
         role: selectedRole(state),
         expected_task_version: Number(control.dataset.version),
-        confirmed: ["stop", "clear_team"].includes(control.dataset.control),
+        confirmed: ["stop", "clear_team", "archive_worktree"].includes(control.dataset.control),
       },
       label: `${control.textContent} · ${detail?.team || taskId}`,
     });
@@ -1632,82 +1712,114 @@ roots.browserManager.addEventListener("submit", async event => {
 
 roots.form.addEventListener("submit", event => {
   event.preventDefault();
+  syncCreateMode();
   showCreateValidation();
   if (!roots.form.reportValidity()) {
     showCreateValidation("Complete the required task details before queueing.");
     return;
   }
   const values = new FormData(roots.form);
+  const mode = createWorkflowMode();
+  const conversationUrl = String(values.get("conversation_url") || "").trim();
+  const existingSolo = mode === "solo" && Boolean(conversationUrl);
   const task = String(values.get("task") || "").trim();
-  if (!task) {
+  if (!task && !existingSolo) {
     showCreateValidation("Task details are required.");
     return;
   }
-  const manualDependencies = String(values.get("depends_on_task_ids") || "")
-    .split(",").map(value => value.trim()).filter(Boolean);
-  const dependencies = [...new Set([
-    ...selectedDependencyIds(roots.dependencyOptions),
-    ...manualDependencies,
-  ])];
   const requestedTeam = String(values.get("requested_team") || "").trim();
-  const reuseTeam = String(values.get("reuse_team") || "").trim();
-  const body = {
-    task,
-    repository: String(values.get("repository") || "").trim() || null,
-    depends_on_task_ids: dependencies,
-  };
-  body.roles = selectedWorkflowRoles();
   const browserEndpointId = String(values.get("browser_endpoint_id") || "").trim();
-  if (browserEndpointId) body.browser_endpoint_id = browserEndpointId;
-  if (values.get("temporary") === "on") body.temporary = true;
-  const bootstrapId = String(values.get("bootstrap_id") || "");
-  if (bootstrapId === INLINE_BOOTSTRAP_VALUE) {
-    const bootstrapNewId = String(values.get("bootstrap_new_id") || "").trim();
-    const bootstrapName = String(values.get("bootstrap_new_name") || "").trim();
-    const bootstrapSource = String(values.get("bootstrap_new_source") || "").trim() || null;
-    const bootstrapPrewarm = String(values.get("bootstrap_new_prewarm_prompt") || "").trim() || null;
-    const bootstrapMaxBackups = Number(values.get("bootstrap_new_max_backups") || 7);
-    if (!bootstrapNewId || !bootstrapName) {
-      showCreateValidation("Inline bootstrap ID and name are required.");
+  let body;
+  if (mode === "solo") {
+    const role = String(values.get("solo_role") || "").trim();
+    if (!role || !browserEndpointId) {
+      showCreateValidation("Solo Task requires one role and one browser endpoint.");
       return;
     }
-    if (!bootstrapSource && !bootstrapPrewarm) {
-      showCreateValidation("Inline bootstrap requires a source or prewarm prompt.");
-      return;
-    }
-    body.bootstrap_definition = {
-      bootstrap_id: bootstrapNewId,
-      name: bootstrapName,
-      source: bootstrapSource,
-      prewarm_prompt: bootstrapPrewarm,
-      max_backups: bootstrapMaxBackups,
+    body = {
+      workflow_mode: "solo",
+      role,
+      goal: String(values.get("goal") || "").trim(),
+      browser_endpoint_id: browserEndpointId,
     };
+    if (existingSolo) body.conversation_url = conversationUrl;
+    else {
+      body.task = task;
+      if (requestedTeam) body.requested_team = requestedTeam;
+    }
   } else {
-    body.bootstrap_id = bootstrapId || null;
+    const manualDependencies = String(values.get("depends_on_task_ids") || "")
+      .split(",").map(value => value.trim()).filter(Boolean);
+    const dependencies = [...new Set([
+      ...selectedDependencyIds(roots.dependencyOptions),
+      ...manualDependencies,
+    ])];
+    const reuseTeam = String(values.get("reuse_team") || "").trim();
+    body = {
+      task,
+      repository: String(values.get("repository") || "").trim() || null,
+      depends_on_task_ids: dependencies,
+    };
+    body.roles = selectedWorkflowRoles();
+    if (browserEndpointId) body.browser_endpoint_id = browserEndpointId;
+    if (values.get("temporary") === "on") body.temporary = true;
+    const bootstrapId = String(values.get("bootstrap_id") || "");
+    if (bootstrapId === INLINE_BOOTSTRAP_VALUE) {
+      const bootstrapNewId = String(values.get("bootstrap_new_id") || "").trim();
+      const bootstrapName = String(values.get("bootstrap_new_name") || "").trim();
+      const bootstrapSource = String(values.get("bootstrap_new_source") || "").trim() || null;
+      const bootstrapPrewarm = String(values.get("bootstrap_new_prewarm_prompt") || "").trim() || null;
+      const bootstrapMaxBackups = Number(values.get("bootstrap_new_max_backups") || 7);
+      if (!bootstrapNewId || !bootstrapName) {
+        showCreateValidation("Inline bootstrap ID and name are required.");
+        return;
+      }
+      if (!bootstrapSource && !bootstrapPrewarm) {
+        showCreateValidation("Inline bootstrap requires a source or prewarm prompt.");
+        return;
+      }
+      body.bootstrap_definition = {
+        bootstrap_id: bootstrapNewId,
+        name: bootstrapName,
+        source: bootstrapSource,
+        prewarm_prompt: bootstrapPrewarm,
+        max_backups: bootstrapMaxBackups,
+      };
+    } else {
+      body.bootstrap_id = bootstrapId || null;
+    }
+    if (reuseTeam) body.reuse_team = reuseTeam;
+    else if (requestedTeam) body.requested_team = requestedTeam;
   }
-  if (reuseTeam) body.reuse_team = reuseTeam;
-  else if (requestedTeam) body.requested_team = requestedTeam;
   queueCommand({
     kind: "create_task",
     taskId: "new",
     endpoint: "/api/tasks",
     body,
-    label: task.split("\n")[0],
+    label: task.split("\n")[0] || `Solo ${String(values.get("solo_role") || "task").trim()}`,
   });
   roots.form.reset();
   resetBootstrapSelection();
   roots.requestedTeam.disabled = false;
   applyReuseRoleSelection(roots.roleInputs, null, {reset: true});
-  updateCreateSummary();
+  syncCreateMode();
   closeCreate();
 });
 
 roots.form.addEventListener("input", event => {
-  if (event.target.matches('input[name="roles"], input[name="depends_on_task_ids"], textarea[name="task"]')) {
+  if (event.target.matches('input[name="conversation_url"]')) syncCreateMode();
+  if (event.target.matches('input[name="roles"], input[name="depends_on_task_ids"], textarea[name="task"], input[name="requested_team"], select[name="solo_role"], select[name="browser_endpoint_id"], input[name="conversation_url"]')) {
     showCreateValidation();
     updateCreateSummary();
   }
 });
+for (const input of roots.workflowModeInputs) {
+  input.addEventListener("change", () => {
+    showCreateValidation();
+    syncCreateMode();
+  });
+}
+roots.soloRole.addEventListener("change", updateCreateSummary);
 roots.bootstrapSelect.addEventListener("change", () => {
   syncBootstrapInlineFields();
   showCreateValidation();
@@ -1767,6 +1879,7 @@ roots.agentForm.addEventListener("submit", event => {
         temporary_chat: values.has("temporary_chat"),
         max_cycles: Math.max(0, Number(values.get("max_cycles") || 0)),
         trigger_settings: basicTriggerSettings(values),
+        browser_endpoint_id: String(values.get("browser_endpoint_id") || "").trim() || null,
       },
       label: `Create independent agent · ${name}`,
     });
@@ -1787,16 +1900,18 @@ roots.agentForm.addEventListener("submit", event => {
       label: `Save workflow agent · ${name}`,
     });
   } else {
+    const body = {
+      display_name: name,
+      system_prompt: systemPrompt,
+      max_cycles: Math.max(0, Number(values.get("max_cycles") || 0)),
+      trigger_settings: configuredTriggerSettings(roots.agentForm, values),
+    };
+    addEditedBrowserEndpoint(body, roots.agentBrowserEndpointSelect, values);
     queueCommand({
       kind: "update_independent_agent",
       taskId: id,
       endpoint: `/api/independent-agents/${encodeURIComponent(id)}/settings`,
-      body: {
-        display_name: name,
-        system_prompt: systemPrompt,
-        max_cycles: Math.max(0, Number(values.get("max_cycles") || 0)),
-        trigger_settings: configuredTriggerSettings(roots.agentForm, values),
-      },
+      body,
       label: `Save independent agent · ${name}`,
     });
   }
@@ -1850,6 +1965,7 @@ roots.agentSettingsForm.addEventListener("submit", event => {
     max_cycles: Math.max(0, Number(values.get("max_cycles") || 0)),
     trigger_settings: configuredTriggerSettings(roots.agentSettingsForm, values),
   };
+  addEditedBrowserEndpoint(body, roots.agentSettingsBrowserEndpointSelect, values);
   queueCommand({
     kind: "independent_settings",
     taskId,

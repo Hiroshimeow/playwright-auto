@@ -14,6 +14,7 @@ def task(
     dependencies: tuple[str, ...] = (),
     controls: list[dict] | None = None,
     updated_at: str = "2026-07-25T00:00:00+00:00",
+    created_at: str | None = None,
 ) -> dict:
     return {
         "task_id": task_id,
@@ -26,7 +27,48 @@ def task(
         "controls": controls or [],
         "cleanup": {"state": "ACTIVE"},
         "updated_at": updated_at,
+        "created_at": created_at or updated_at,
     }
+
+
+def test_due_tasks_follow_durable_fifo_instead_of_task_id_order():
+    registry = CDPARuntimeRegistry.hydrate(
+        [
+            task("aaa-new", created_at="2026-07-25T00:00:02+00:00"),
+            task("zzz-old", created_at="2026-07-25T00:00:01+00:00"),
+        ],
+        now=1000.0,
+    )
+
+    assert registry.due_task_ids(1000.5) == ("zzz-old", "aaa-new")
+
+
+def test_due_tasks_do_not_starve_old_normal_work_behind_new_urgent_repairs():
+    normal = task("normal-old", created_at="2026-07-25T00:00:01+00:00")
+    repair_one = task("repair-one", created_at="2026-07-25T00:00:02+00:00")
+    repair_two = task("repair-two", created_at="2026-07-25T00:00:03+00:00")
+    repair_one["priority"] = "urgent_repair"
+    repair_two["priority"] = "urgent_repair"
+
+    registry = CDPARuntimeRegistry.hydrate([repair_two, normal, repair_one], now=1000.0)
+
+    assert registry.due_task_ids(1000.5) == ("normal-old", "repair-one", "repair-two")
+
+
+def test_restart_hydration_preserves_browser_pool_fifo():
+    old = task("zzz-old", status="WAITING", created_at="2026-07-25T00:00:01+00:00")
+    new = task("aaa-new", status="WAITING", created_at="2026-07-25T00:00:02+00:00")
+    for item in (old, new):
+        item["waiting"] = {
+            "reason": "browser_pool",
+            "since": item["created_at"],
+            "resume_status": "INBOX",
+            "resume_column": "INBOX",
+            "resume_action": "queued",
+        }
+    registry = CDPARuntimeRegistry.hydrate([new, old], now=1000.0)
+
+    assert registry.due_task_ids(1000.5) == ("zzz-old", "aaa-new")
 
 
 def test_hydrate_builds_identity_dependency_and_team_indexes():
@@ -73,6 +115,48 @@ def test_controls_cleanup_and_ready_waiters_are_due():
 
     assert registry.due_task_ids(1000.0) == ()
     assert registry.due_task_ids(1000.5) == ("clearing", "paused", "waiting")
+
+
+def test_cleanup_retry_gate_schedules_persisted_boundary_and_suppression():
+    cooling = task("cooling", status="DONE")
+    cooling["cleanup"] = {
+        "state": "CLEARING",
+        "next_retry_at": "1970-01-01T00:16:50+00:00",
+        "retry_suppressed": False,
+    }
+    suppressed = task("suppressed", status="DONE")
+    suppressed["cleanup"] = {
+        "state": "CLEARING",
+        "next_retry_at": None,
+        "retry_suppressed": True,
+    }
+
+    registry = CDPARuntimeRegistry.hydrate([cooling, suppressed], now=1000.0)
+
+    assert registry.due_task_ids(1000.5) == ()
+    assert registry.next_due_at() == 1010.0
+    assert registry.due_task_ids(1010.0) == ("cooling",)
+
+
+def test_cleanup_retry_gate_survives_registry_hydration():
+    clearing = task("clearing", status="DONE")
+    clearing["cleanup"] = {
+        "state": "CLEARING",
+        "next_retry_at": "1970-01-01T00:17:00+00:00",
+        "failure_fingerprint": "same-failure",
+        "same_failure_count": 2,
+        "retry_suppressed": False,
+    }
+
+    first = CDPARuntimeRegistry.hydrate([clearing], now=1000.0)
+    restarted = CDPARuntimeRegistry.hydrate(
+        [first.tasks_by_id["clearing"]],
+        now=1005.0,
+    )
+
+    assert restarted.next_due_at() == 1020.0
+    assert restarted.due_task_ids(1019.9) == ()
+    assert restarted.due_task_ids(1020.0) == ("clearing",)
 
 
 def test_update_schedules_only_self_children_and_same_team_members():

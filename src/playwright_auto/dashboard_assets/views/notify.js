@@ -1,4 +1,4 @@
-import {reportBody, workflowReportModel} from "./task_detail.js?v=20260913-multi-cdp-v1";
+import {reportBody, workflowReportModel} from "./task_detail.js?v=20260915-report-context-integrate-v1";
 
 const NOTIFY_STATUSES = new Set(["DONE", "BLOCKED", "PAUSED", "STOPPED"]);
 
@@ -76,7 +76,8 @@ export function renderNotify(root, state) {
 
 export function notifyReportModel(detail) {
   const model = workflowReportModel(detail, detail.active_role);
-  if (detail.status === "DONE" || model.selectedReport?._logicalRole === detail.active_role) return model;
+  if (detail.status === "DONE" || model.selectedExpectedMissing
+    || model.selectedReport?._logicalRole === detail.active_role) return model;
   const reports = model.roles.flatMap(item => item.reports);
   const newest = reports.reduce((best, report) => {
     if (!best) return report;
@@ -110,7 +111,7 @@ export function renderNotifyReport(root, detail, reportBodies) {
   if (!report) {
     const empty = document.createElement("p");
     empty.className = "muted";
-    empty.textContent = "No report yet";
+    empty.textContent = model.selectedMissingReason;
     wrapper.append(empty);
   } else {
     const reader = document.createElement("article");

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import json
@@ -388,7 +388,12 @@ def test_repair_release_rearms_stale_terminal_wait_and_consumes_materialized_bac
     report_relative = hop["expected_report_path"]
     report = tmp_path / report_relative
     report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text("repair release terminal response", encoding="utf-8")
+    report.write_text(
+        "# Repair release report\n\n## Evidence\n"
+        f"- Inspected the accepted terminal response for `report_path={report_relative}`.\n"
+        "- `send_attempts=1` -> stable backend response consumed without replay.\n",
+        encoding="utf-8",
+    )
     response_text = json.dumps({"route": "REVIEW", "handoff": report_relative})
     snapshot = _accepted_user_only_snapshot(state, receipt)
     response = MessageSnapshot(
@@ -438,15 +443,21 @@ def test_repair_release_rearms_stale_terminal_wait_and_consumes_materialized_bac
             raise AssertionError("repair release recovery must not open New Chat")
 
     actions = Actions()
+    completed_hop_id = hop["hop_id"]
+    completed_request_id = hop["request_id"]
+    completed_ledger_path = hop["ledger_path"]
     asyncio.run(worker._waiting(state, hop, actions, path))
+    routed = next(item for item in state["hops"] if item["hop_id"] == completed_hop_id)
     hop = _active_hop(state)
 
     assert state["status"] == "RUNNING"
-    assert hop["state"] == "responded"
-    assert hop["response"] == response_text
-    assert hop["wait"]["controller_reason"] == "stable_current_result"
+    assert routed["state"] == "routed"
+    assert routed["response"] == response_text
+    assert routed["wait"]["controller_reason"] == "stable_current_result"
+    assert hop["state"] == "pre_send"
+    assert hop["target_role"] == "REVIEW"
     assert calls == {"status": 0, "graph": 0, "locate": 1, "send": 0, "retry": 0, "restart": 0, "new_chat": 0}
-    record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
+    record = RequestLedger(completed_ledger_path).get(completed_request_id)
     assert record is not None and record.attempts == 1 and record.receipt == before_record.receipt
     assert not any(control["action"] == "resume" for control in state["controls"])
 

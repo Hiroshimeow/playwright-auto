@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .cdpa_independent import is_independent_task
-from .cdpa_team import is_active_team_owner
+from .cdpa_team import dispatch_order_key, is_active_team_owner
 
 TERMINAL = frozenset({"DONE", "STOPPED"})
 ACTIVE_HOP_STATES = frozenset({"pre_send", "sending", "sent", "waiting", "responded", "routed"})
@@ -106,6 +106,11 @@ class CDPARuntimeRegistry:
             return now + MINIMUM_DEADLINE_SECONDS
         cleanup = state.get("cleanup") if isinstance(state.get("cleanup"), Mapping) else {}
         cleanup_state = str(cleanup.get("state") or "ACTIVE").upper()
+        if bool(cleanup.get("retry_suppressed")):
+            return None
+        cleanup_retry_at = _timestamp(cleanup.get("next_retry_at"))
+        if cleanup.get("next_retry_at") is not None and cleanup_retry_at is not None:
+            return max(cleanup_retry_at, now + MINIMUM_DEADLINE_SECONDS)
         if cleanup_state == "CLEARING":
             return now + MINIMUM_DEADLINE_SECONDS
         status = str(state.get("status") or "INBOX").upper()
@@ -161,7 +166,9 @@ class CDPARuntimeRegistry:
         return min(self._due_at.values(), default=None)
 
     def due_task_ids(self, now: float) -> tuple[str, ...]:
-        return tuple(sorted(task_id for task_id, due_at in self._due_at.items() if due_at <= now))
+        due = [task_id for task_id, due_at in self._due_at.items() if due_at <= now]
+        due.sort(key=lambda task_id: dispatch_order_key(self.tasks_by_id[task_id]))
+        return tuple(due)
 
     def affected_by(self, task_id: str) -> set[str]:
         affected = {task_id}

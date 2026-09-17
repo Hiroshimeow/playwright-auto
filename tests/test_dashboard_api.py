@@ -4,6 +4,7 @@ import ast
 import hashlib
 import http.client
 import json
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -432,6 +433,7 @@ def test_board_etag_304_and_worker_offline_last_known_good(tmp_path: Path):
         assert status == 200
         runtime_state = json.loads(body)
         assert runtime_state["settings"] == {}
+        assert runtime_state["semantic_stale_after_seconds"] == config.response_refresh_after_seconds
         assert runtime_state["auto_allow"] == {
             "clicks": 1,
             "by_tool": {"mcp-g8": 1},
@@ -841,7 +843,7 @@ def test_independent_create_accepts_initial_triggers_and_preserves_idempotency(
 def test_report_uses_exact_hashed_private_locator(tmp_path: Path):
     report = tmp_path / ".plan" / "alpha" / "report.md"
     report.parent.mkdir(parents=True)
-    report.write_text("# report\n", encoding="utf-8")
+    report.write_bytes(b"# report\n")
     _config, _db, server, thread = start_api(tmp_path, report=report)
     try:
         status, headers, body = request(server, "GET", "/api/reports/task-a/r1")
@@ -949,3 +951,12 @@ def test_system_status_uses_cross_platform_disk_usage(tmp_path, monkeypatch):
     result = api.system_status()
     assert result["disk_free_bytes"] == 123456
     assert seen == [config.repository_root]
+
+
+def test_system_cpu_reader_supports_current_linux_or_windows_host():
+    if os.name != "nt" and not Path("/proc/stat").exists():
+        pytest.skip("host CPU reader is only required for Windows and procfs hosts")
+
+    first = DashboardAPI._read_cpu()
+    assert first is not None
+    assert first[0] >= first[1] >= 0

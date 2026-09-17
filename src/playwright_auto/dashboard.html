@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>CDPA Control Center</title>
-  <link rel="stylesheet" href="/assets/dashboard.css?v=20260913-multi-cdp-v1">
+  <link rel="stylesheet" href="/assets/dashboard.css?v=20260915-operator-ux-v1">
 </head>
 <body>
   <header class="app-header">
@@ -108,14 +108,20 @@
       </header>
 
       <div class="create-dialog-body">
-        <section class="create-section" data-create-section="task-details" aria-labelledby="create-task-details-title">
+        <fieldset class="action-fieldset create-mode-picker">
+          <legend>Task mode</legend>
+          <label class="check-row"><input type="radio" name="workflow_mode" value="team" checked> Team Task</label>
+          <label class="check-row"><input type="radio" name="workflow_mode" value="solo"> Solo Task</label>
+        </fieldset>
+
+        <section class="create-section" data-create-section="task-details" data-existing-solo-hidden aria-labelledby="create-task-details-title">
           <div class="create-section-heading">
             <span class="create-section-index">01</span>
             <div><p class="eyebrow">Task details</p><h3 id="create-task-details-title">What should the team deliver?</h3></div>
           </div>
           <label>Task<textarea name="task" rows="7" required placeholder="Describe the required result, constraints, and acceptance evidence."></textarea></label>
-          <label>Bootstrap context<select name="bootstrap_id"><option value="">None / Fresh context</option><option value="__create_inline__">Create bootstrap inline…</option></select></label>
-          <div data-bootstrap-inline hidden>
+          <label data-team-only>Bootstrap context<select name="bootstrap_id"><option value="">None / Fresh context</option><option value="__create_inline__">Create bootstrap inline…</option></select></label>
+          <div data-bootstrap-inline data-team-only hidden>
             <div class="form-grid">
               <label>Bootstrap ID<input name="bootstrap_new_id" autocomplete="off" placeholder="general-team-bootstrap-v2"></label>
               <label>Name<input name="bootstrap_new_name" autocomplete="off" placeholder="General Team Bootstrap"></label>
@@ -125,28 +131,43 @@
             <label>Prewarm prompt<textarea name="bootstrap_new_prewarm_prompt" rows="4" placeholder="Optional reusable bootstrap prompt"></textarea></label>
             <p class="form-help">Provide a source, a prewarm prompt, or both. Inline creation is persisted by the same durable create-task command.</p>
           </div>
-          <p class="form-help">The selected reusable context is used only for each workflow role's first allocation. Fresh must be selected explicitly.</p>
+          <p class="form-help" data-team-only>The selected reusable context is used only for each workflow role's first allocation. Fresh must be selected explicitly.</p>
         </section>
 
-        <section class="create-section" data-create-section="team-repository" aria-labelledby="create-team-title">
+        <section class="create-section" data-create-section="team-repository" data-team-only aria-labelledby="create-team-title">
           <div class="create-section-heading">
             <span class="create-section-index">02</span>
-            <div><p class="eyebrow">Team / repository</p><h3 id="create-team-title">Choose identity and workspace</h3></div>
+            <div><p class="eyebrow">Identity / endpoint</p><h3 id="create-team-title">Choose identity and browser</h3></div>
           </div>
           <div class="form-grid">
-            <label>New team<input name="requested_team" autocomplete="off" placeholder="dashboard-agent-ux"></label>
-            <label>Reuse exact team<select name="reuse_team"><option value="">Do not reuse</option></select></label>
+            <label data-requested-team-field>New team<input name="requested_team" autocomplete="off" placeholder="dashboard-agent-ux"></label>
+            <label data-team-only>Reuse exact team<select name="reuse_team"><option value="">Do not reuse</option></select></label>
           </div>
-          <label>Repository<input name="repository" autocomplete="off" placeholder="Uses dashboard repository when blank"></label>
-          <div class="form-grid">
-            <label>Initial browser<select name="browser_endpoint_id"><option value="">Pool default</option></select></label>
+          <label data-team-only>Repository<input name="repository" autocomplete="off" placeholder="Uses dashboard repository when blank"></label>
+          <div class="form-grid" data-team-browser-slot>
+            <label data-create-browser-field>Browser endpoint<select name="browser_endpoint_id"><option value="">Pool default</option></select></label>
             <label class="check-row create-temporary-control"><input type="checkbox" name="temporary"> Force Temporary chat</label>
           </div>
-          <p class="form-help">Browser selection is initial placement/provenance only; later roles may use any eligible endpoint. Leave Temporary unchecked to inherit the selected endpoint default.</p>
-          <p class="form-help">Choose one team path. Exact-team reuse inherits and locks its workflow-agent composition.</p>
+          <p class="form-help" data-team-only>Browser selection is initial placement/provenance only; later roles may use any eligible endpoint. Leave Temporary unchecked to inherit the selected endpoint default.</p>
+          <p class="form-help" data-team-only>Choose one team path. Exact-team reuse inherits and locks its workflow-agent composition.</p>
+          <p class="form-help" data-solo-only hidden>Solo stays pinned to the selected endpoint for its durable conversation.</p>
         </section>
 
-        <section class="create-section" data-create-section="workflow-agents" aria-labelledby="create-agents-title">
+        <section class="create-section" data-create-section="solo-task" data-solo-only hidden aria-labelledby="create-solo-title">
+          <div class="create-section-heading">
+            <span class="create-section-index">03</span>
+            <div><p class="eyebrow">Solo role</p><h3 id="create-solo-title">Run one existing workflow role</h3></div>
+          </div>
+          <div class="form-grid solo-core-grid">
+            <label>Role<select name="solo_role"><option value="">Select role</option></select></label>
+            <div data-solo-browser-slot></div>
+            <label>Conversation URL<input name="conversation_url" autocomplete="off" placeholder="Optional https://chatgpt.com/c/..."></label>
+          </div>
+          <label>Goal<textarea name="goal" rows="4" placeholder="Optional goal"></textarea></label>
+          <p class="form-help">Leave Conversation URL blank to start a new conversation. An exact URL is adopted on this endpoint without creating a second owner.</p>
+        </section>
+
+        <section class="create-section" data-create-section="workflow-agents" data-team-only aria-labelledby="create-agents-title">
           <div class="create-section-heading">
             <span class="create-section-index">03</span>
             <div><p class="eyebrow">Workflow agents</p><h3 id="create-agents-title">Select the execution path</h3></div>
@@ -155,7 +176,7 @@
           <p class="form-help">PLAN is required. PLAN, DEV, and REVIEW are selected by default. Custom workflow agents start unchecked.</p>
         </section>
 
-        <section class="create-section" data-create-section="dependencies-output" aria-labelledby="dependency-title">
+        <section class="create-section" data-create-section="dependencies-output" data-team-only aria-labelledby="dependency-title">
           <div class="create-section-heading">
             <span class="create-section-index">04</span>
             <div><p class="eyebrow">Dependencies / output</p><h3 id="dependency-title">Gate the start and preserve reports</h3></div>
@@ -220,6 +241,7 @@
       <details id="independent-settings" class="action-fieldset" hidden>
         <summary>Independent settings</summary>
         <label class="check-row" data-create-temporary-chat><input type="checkbox" name="temporary_chat" checked> Temporary chat</label>
+        <label>Browser affinity<select name="browser_endpoint_id"><option value="">Pool default</option></select><span class="form-help">Optional hard pin for this independent agent.</span></label>
         <label>Trigger
           <select name="trigger_type">
             <option value="manual">Manual only</option>
@@ -291,6 +313,7 @@
         <label>Name<input name="display_name" maxlength="80" required></label>
         <label>System prompt<textarea class="agent-settings-prompt" name="system_prompt" rows="6" required></textarea></label>
         <label>Max turns per job<input type="number" name="max_cycles" min="0" step="1" value="0" inputmode="numeric"><span class="form-help">0 means Unlimited.</span></label>
+        <label>Browser affinity<select name="browser_endpoint_id"><option value="">Pool default</option></select><span class="form-help">Pinned agents wait when this endpoint is unavailable instead of relocating.</span></label>
 
         <section class="agent-trigger-card" aria-labelledby="agent-trigger-title">
           <div class="agent-trigger-heading">
@@ -347,6 +370,6 @@
   <datalist id="workflow-task-team-options"></datalist>
 
   <div id="toast" class="toast" hidden role="status"></div>
-  <script type="module" src="/assets/app.js?v=20260913-multi-cdp-v1"></script>
+  <script type="module" src="/assets/app.js?v=20260916-solo-task-v2"></script>
 </body>
 </html>

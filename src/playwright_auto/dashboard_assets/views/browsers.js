@@ -1,3 +1,5 @@
+import {endpointIdentity, endpointOperationalState} from "./topology.js?v=20260914-goal2-ops-v1";
+
 function endpointLabel(endpoint) {
   return endpoint.label || endpoint.endpoint_id || endpoint.cdp_url || "Browser";
 }
@@ -24,6 +26,73 @@ export function creationUsesTemporary(state, endpointId, forced = false) {
     selected ? item.endpoint_id === selected : item.is_default)?.temporary_default);
 }
 
+function endpointMetric(label, value, className = "") {
+  const node = document.createElement("span");
+  node.className = `endpoint-metric${className ? ` ${className}` : ""}`;
+  const key = document.createElement("b");
+  key.textContent = label;
+  const text = document.createElement("span");
+  text.textContent = value;
+  if (className === "endpoint-load") text.className = "endpoint-load-value";
+  node.append(key, text);
+  return node;
+}
+
+function decorateEndpointCard(node, endpoint) {
+  const identity = endpointIdentity(endpoint.endpoint_id, [endpoint]);
+  const operational = endpointOperationalState(endpoint);
+  node.dataset.operationalState = operational.key;
+
+  const head = document.createElement("span");
+  head.className = "endpoint-card-head";
+  const name = document.createElement("span");
+  name.className = "endpoint-card-identity";
+  const strong = document.createElement("strong");
+  strong.textContent = identity?.label || endpointLabel(endpoint);
+  name.append(strong);
+  head.append(name);
+
+  const statusline = document.createElement("span");
+  statusline.className = "endpoint-card-statusline";
+  const status = document.createElement("span");
+  status.className = "endpoint-state endpoint-state-" + operational.key;
+  status.textContent = operational.label;
+  const address = document.createElement("span");
+  address.className = "endpoint-card-address";
+  address.textContent = identity?.port ? "CDP :" + identity.port : (identity?.address || endpoint.endpoint_id);
+  statusline.append(status, address);
+
+  const active = Number(endpoint.active_count || 0);
+  const capacity = Number(endpoint.capacity || endpoint.max_active_tabs || 0);
+  const metrics = document.createElement("span");
+  metrics.className = "endpoint-card-metrics";
+  metrics.append(
+    endpointMetric("Load", capacity ? active + "/" + capacity : String(active), "endpoint-load"),
+    endpointMetric("Health", endpoint.health || (endpoint.connected ? "online" : "unknown")),
+  );
+
+  const workload = document.createElement("span");
+  workload.className = "endpoint-workload";
+  const executions = endpoint.running_executions || [];
+  workload.textContent = executions.length
+    ? [
+        executions[0].team || executions[0].task_id,
+        executions[0].role || "allocating",
+        executions.length > 1 ? "+" + (executions.length - 1) : null,
+      ].filter(Boolean).join(" · ")
+    : "No active execution";
+
+  const flags = document.createElement("span");
+  flags.className = "endpoint-card-flags";
+  flags.textContent = [
+    endpoint.is_default ? "Pool default" : null,
+    endpoint.temporary_default ? "Temporary default" : null,
+    endpoint.draining ? "Draining" : null,
+    endpoint.cooldown ? "Cooldown" : null,
+  ].filter(Boolean).join(" · ") || "Eligible pool member";
+  node.replaceChildren(head, statusline, metrics, workload, flags);
+}
+
 export function renderBrowserScope(root, state) {
   if (!root) return;
   const endpoints = visibleBrowserEndpoints(state);
@@ -31,14 +100,15 @@ export function renderBrowserScope(root, state) {
   const selected = requested === "all" || endpoints.some(endpoint => endpoint.endpoint_id === requested)
     ? requested : "all";
   const scopes = document.createElement("div");
-  scopes.className = "browser-scope-options";
-  const all = button("All", {browserScope: "all", className: "browser-scope-button"});
+  scopes.className = "browser-scope-options endpoint-topology";
+  const all = button("All", {browserScope: "all", className: "browser-scope-button endpoint-scope-card endpoint-scope-all"});
   all.setAttribute("aria-pressed", String(selected === "all"));
   scopes.append(all);
   for (const endpoint of endpoints) {
-    const label = `${endpointLabel(endpoint)} - ${endpoint.health || "unknown"} ${endpoint.active_count || 0}/${endpoint.capacity || endpoint.max_active_tabs || 2}`;
-    const node = button(label, {browserScope: endpoint.endpoint_id, className: "browser-scope-button"});
+    const node = button("", {browserScope: endpoint.endpoint_id, className: "browser-scope-button"});
+    node.classList.add("endpoint-scope-card");
     node.setAttribute("aria-pressed", String(selected === endpoint.endpoint_id));
+    decorateEndpointCard(node, endpoint);
     if (endpoint.draining) node.title = "Draining: no new allocations";
     scopes.append(node);
   }
@@ -50,14 +120,22 @@ export function renderBrowserScope(root, state) {
 
 export function syncCreateBrowserOptions(select, state) {
   if (!select) return;
-  const current = select.value;
+  const configured = String(select.dataset.configuredEndpointId || "");
+  const current = String(select.value || configured);
   const endpoints = visibleBrowserEndpoints(state).filter(endpoint => !endpoint.draining);
-  const signature = JSON.stringify(endpoints.map(item => [item.endpoint_id, item.label]));
+  const knownConfigured = endpoints.some(endpoint => endpoint.endpoint_id === configured);
+  const signature = JSON.stringify({
+    endpoints: endpoints.map(item => [item.endpoint_id, item.label]),
+    configured,
+  });
   if (select.dataset.browserSignature === signature) return;
   select.dataset.browserSignature = signature;
   select.replaceChildren(new Option("Pool default", ""));
   for (const endpoint of endpoints) select.append(new Option(endpointLabel(endpoint), endpoint.endpoint_id));
-  select.value = endpoints.some(endpoint => endpoint.endpoint_id === current) ? current : "";
+  if (configured && !knownConfigured) {
+    select.append(new Option(`Unavailable configured endpoint · ${configured}`, configured));
+  }
+  select.value = Array.from(select.options).some(option => option.value === current) ? current : "";
 }
 
 function field(label, value) {

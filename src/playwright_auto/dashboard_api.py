@@ -93,6 +93,25 @@ class DashboardAPI:
 
     @staticmethod
     def _read_cpu() -> tuple[int, int] | None:
+        if os.name == "nt":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                idle = wintypes.FILETIME()
+                kernel = wintypes.FILETIME()
+                user = wintypes.FILETIME()
+                if not ctypes.windll.kernel32.GetSystemTimes(
+                    ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
+                ):
+                    return None
+                def ticks(value: wintypes.FILETIME) -> int:
+                    return (value.dwHighDateTime << 32) | value.dwLowDateTime
+
+                return ticks(kernel) + ticks(user), ticks(idle)
+            except (AttributeError, OSError, ValueError):
+                return None
+
         try:
             with Path("/proc/stat").open(encoding="utf-8") as handle:
                 values = [int(value) for value in handle.readline().split()[1:]]
@@ -131,10 +150,18 @@ class DashboardAPI:
         heartbeat = (worker or {}).get("heartbeat_at")
         timestamp = _iso_timestamp(heartbeat)
         stale = timestamp is None or time.time() - timestamp > self.config.worker_stale_seconds
+        source_drift = dict((worker or {}).get("source_drift") or {})
+        reload_required = bool((worker or {}).get("reload_required"))
+        status = "OFFLINE" if worker is None else "STALE" if stale else "SOURCE_DRIFT" if reload_required else "HEALTHY"
         return {
             "worker_online": worker is not None and not stale,
             "worker_stale": stale,
             "worker_heartbeat_at": heartbeat,
+            "worker_status": status,
+            "worker_source_drift": source_drift,
+            "worker_reload_required": reload_required,
+            "worker_source_identity": dict((worker or {}).get("source_identity") or {}),
+            "worker_lease": dict((worker or {}).get("lease") or {}),
         }
 
     @staticmethod
@@ -295,19 +322,44 @@ class DashboardAPI:
             "bootstrap_definition",
             "temporary",
             "browser_endpoint_id",
+            "required_browser_endpoint_id",
+            "workflow_mode",
+            "role",
+            "goal",
+            "conversation_url",
         }
         unknown = set(raw) - allowed
         if unknown:
             raise APIError(400, "invalid_request", f"unknown fields: {sorted(unknown)!r}")
+        workflow_mode = str(raw.get("workflow_mode") or "team").strip().lower()
+        if workflow_mode not in {"team", "solo"}:
+            raise APIError(400, "invalid_request", "workflow_mode must be team or solo")
         task = str(raw.get("task") or "").strip()
+        if not task and workflow_mode == "solo":
+            existing_url = str(raw.get("conversation_url") or "").strip()
+            if existing_url:
+                role_hint = str(raw.get("role") or "solo").strip().upper() or "SOLO"
+                task = f"Continue existing {role_hint} conversation {existing_url.rsplit('/', 1)[-1]}"
         if not task:
             raise APIError(400, "invalid_request", "task must not be empty")
         requested_repository = raw.get("repository")
-        if requested_repository is None or (
+        inferred_repository = requested_repository is None or (
             isinstance(requested_repository, str) and not requested_repository.strip()
-        ):
+        )
+        if inferred_repository:
             requested_repository = self._declared_repository(task)
-        repository = self._repository(requested_repository)
+        try:
+            repository = self._repository(requested_repository)
+        except APIError as exc:
+            requested_path = Path(str(requested_repository or ""))
+            control_drive = self.config.repository_root.drive.casefold()
+            requested_drive = requested_path.drive.casefold()
+            remote_drive = bool(requested_drive and control_drive and requested_drive != control_drive)
+            if not inferred_repository or exc.code != "repository_not_allowed" or not remote_drive:
+                raise
+            # Cross-drive repository prose is a remote product hint for this
+            # control runtime, not an implicit local execution-root override.
+            repository = self._repository(None)
         try:
             report_mode = effective_report_mode(
                 raw.get("report_mode") or "file",
@@ -329,7 +381,38 @@ class DashboardAPI:
             ),
             "upload_paths": self._list(raw.get("upload_paths"), "upload_paths"),
         }
-        if "roles" in raw:
+        if workflow_mode == "solo":
+            conflicting = {
+                "roles",
+                "reuse_team",
+                "new_roles",
+                "new_all",
+                "bootstrap_id",
+                "bootstrap_definition",
+                "temporary",
+                "required_browser_endpoint_id",
+            } & set(raw)
+            if conflicting:
+                raise APIError(
+                    400,
+                    "invalid_request",
+                    f"solo task does not accept Team Task fields: {sorted(conflicting)!r}",
+                )
+            role = str(raw.get("role") or "").strip().upper()
+            if not role:
+                raise APIError(400, "invalid_request", "solo role must not be empty")
+            if role not in self._active_workflow_routes():
+                raise APIError(400, "invalid_request", f"unknown workflow role: {role!r}")
+            normalized["workflow_mode"] = "solo"
+            normalized["roles"] = [role]
+            normalized["goal"] = str(raw.get("goal") or "").strip()
+        elif "role" in raw or "goal" in raw or "conversation_url" in raw:
+            raise APIError(
+                400,
+                "invalid_request",
+                "role, goal, and conversation_url are valid only for Solo Task",
+            )
+        elif "roles" in raw:
             normalized["roles"] = self._workflow_roles(raw.get("roles"))
         if "temporary" in raw:
             if type(raw.get("temporary")) is not bool:
@@ -341,6 +424,51 @@ class DashboardAPI:
             if not isinstance(endpoint, str) or not endpoint.strip():
                 raise APIError(400, "invalid_request", "browser_endpoint_id must be a non-empty string")
             normalized["browser_endpoint_id"] = endpoint.strip()
+        if workflow_mode == "solo":
+            if "browser_endpoint_id" not in normalized:
+                raise APIError(
+                    400,
+                    "invalid_request",
+                    "Solo Task requires a browser_endpoint_id",
+                )
+            endpoint_id = self._resolved_browser_endpoint_id(
+                normalized["browser_endpoint_id"]
+            )
+            normalized["browser_endpoint_id"] = endpoint_id
+            normalized["required_browser_endpoint_id"] = endpoint_id
+            conversation_url = raw.get("conversation_url")
+            if conversation_url is not None:
+                if not isinstance(conversation_url, str) or not conversation_url.strip():
+                    raise APIError(
+                        400,
+                        "invalid_request",
+                        "conversation_url must be an exact ChatGPT /c/... URL",
+                    )
+                parsed = urlsplit(conversation_url.strip())
+                parts = [part for part in parsed.path.split("/") if part]
+                if (
+                    parsed.scheme != "https"
+                    or (parsed.hostname or "").lower()
+                    not in {"chatgpt.com", "www.chatgpt.com"}
+                    or len(parts) != 2
+                    or parts[0] != "c"
+                    or not parts[1]
+                    or parsed.query
+                    or parsed.fragment
+                ):
+                    raise APIError(
+                        400,
+                        "invalid_request",
+                        "conversation_url must be an exact ChatGPT /c/... URL",
+                    )
+                normalized["conversation_url"] = conversation_url.strip()
+            normalized["bootstrap_id"] = None
+            normalized["context_policy"] = "fresh"
+            return normalized
+        if "required_browser_endpoint_id" in raw:
+            normalized["required_browser_endpoint_id"] = self._resolved_browser_endpoint_id(
+                raw.get("required_browser_endpoint_id")
+            )
         effective_temporary = raw.get("temporary") is True
         if not effective_temporary:
             try:
@@ -425,6 +553,14 @@ class DashboardAPI:
             raise APIError(400, "invalid_request", "browser endpoint id is invalid")
         return endpoint_id
 
+    def _resolved_browser_endpoint_id(self, value: object) -> str:
+        try:
+            return BrowserEndpointRegistry(self.config).resolve(
+                self._browser_endpoint_id(value)
+            )["endpoint_id"]
+        except ValueError as exc:
+            raise APIError(400, "invalid_request", str(exc)) from exc
+
     def normalize_browser_endpoint_add(self, raw: Mapping[str, Any]) -> dict[str, Any]:
         allowed = {
             "address", "label", "temporary_default", "management_mode",
@@ -468,7 +604,7 @@ class DashboardAPI:
         return payload
 
     def normalize_browser_endpoint_update(self, endpoint_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
-        allowed = {"cdp_url", "label", "is_default", "temporary_default", "rate_limit_scope", "max_active_tabs"}
+        allowed = {"cdp_url", "label", "is_default", "temporary_default", "rate_limit_scope", "max_active_tabs", "draining"}
         unknown = set(raw) - allowed
         if unknown or not raw:
             raise APIError(400, "invalid_request", "browser settings contain unsupported or empty fields")
@@ -484,6 +620,10 @@ class DashboardAPI:
                 if type(raw.get(name)) is not bool:
                     raise APIError(400, "invalid_request", f"{name} must be a boolean")
                 payload[name] = raw[name]
+        if "draining" in raw:
+            if raw.get("draining") is not False:
+                raise APIError(400, "invalid_request", "browser settings may only restore draining=false; use Remove to drain")
+            payload["draining"] = False
         if "max_active_tabs" in raw:
             capacity = raw.get("max_active_tabs")
             if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
@@ -492,7 +632,7 @@ class DashboardAPI:
         return payload
 
     def normalize_independent_create(self, raw: Mapping[str, Any]) -> dict[str, Any]:
-        allowed = {"name", "system_prompt", "mode", "trigger_settings", "max_cycles", "temporary_chat"}
+        allowed = {"name", "system_prompt", "mode", "trigger_settings", "max_cycles", "temporary_chat", "browser_endpoint_id"}
         unknown = set(raw) - allowed
         if unknown:
             raise APIError(400, "invalid_request", f"unknown fields: {sorted(unknown)!r}")
@@ -527,6 +667,14 @@ class DashboardAPI:
             payload["trigger_settings"] = settings
         if max_cycles is not None:
             payload["max_cycles"] = max_cycles
+        if "browser_endpoint_id" in raw:
+            browser_endpoint_id = raw.get("browser_endpoint_id")
+            payload["browser_endpoint_id"] = (
+                None
+                if browser_endpoint_id is None
+                or (isinstance(browser_endpoint_id, str) and not browser_endpoint_id.strip())
+                else self._resolved_browser_endpoint_id(browser_endpoint_id)
+            )
         return payload
 
     def normalize_independent_completion(
@@ -631,7 +779,11 @@ class DashboardAPI:
         }
 
     def normalize_independent_run(self, raw: Mapping[str, Any]) -> dict[str, Any]:
-        unknown = set(raw) - {"trigger_type", "instruction"}
+        unknown = set(raw) - {
+            "trigger_type",
+            "instruction",
+            "required_browser_endpoint_id",
+        }
         if unknown:
             raise APIError(400, "invalid_request", f"unknown fields: {sorted(unknown)!r}")
         trigger_type = str(raw.get("trigger_type") or "manual").strip().lower()
@@ -654,6 +806,16 @@ class DashboardAPI:
                     "instruction is valid only for a manual run",
                 )
             payload["instruction"] = instruction
+        if "required_browser_endpoint_id" in raw:
+            if trigger_type != "manual":
+                raise APIError(
+                    400,
+                    "invalid_request",
+                    "required_browser_endpoint_id is valid only for a manual run",
+                )
+            payload["required_browser_endpoint_id"] = self._resolved_browser_endpoint_id(
+                raw.get("required_browser_endpoint_id")
+            )
         return payload
 
     def normalize_independent_settings(
@@ -666,6 +828,7 @@ class DashboardAPI:
             "trigger_settings",
             "new_chat_next_job",
             "max_cycles",
+            "browser_endpoint_id",
         }
         unknown = set(raw) - allowed
         if unknown:
@@ -701,6 +864,14 @@ class DashboardAPI:
                 payload["max_cycles"] = normalize_max_cycles(raw["max_cycles"])
             except ValueError as exc:
                 raise APIError(400, "invalid_request", str(exc)) from exc
+        if "browser_endpoint_id" in raw:
+            browser_endpoint_id = raw.get("browser_endpoint_id")
+            payload["browser_endpoint_id"] = (
+                None
+                if browser_endpoint_id is None
+                or (isinstance(browser_endpoint_id, str) and not browser_endpoint_id.strip())
+                else self._resolved_browser_endpoint_id(browser_endpoint_id)
+            )
         if "new_chat_next_job" in raw:
             if not isinstance(raw["new_chat_next_job"], bool):
                 raise APIError(
@@ -1070,6 +1241,7 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                     "worker": (worker or {}).get("payload") or {},
                     "browser": (browser or {}).get("payload") or {},
                     "settings": {},
+                    "semantic_stale_after_seconds": app.config.response_refresh_after_seconds,
                     "auto_allow": mcp_allow_click_summary(),
                     **app.worker_health(),
                 },

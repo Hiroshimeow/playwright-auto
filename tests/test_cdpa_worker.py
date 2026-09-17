@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import multiprocessing
+import os
+import queue
+import subprocess
+import threading
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -56,6 +61,74 @@ from test_cdpa_core import (
 )
 
 
+def _run_worker_lease_probe(repository: str, entered) -> None:
+    import asyncio as _asyncio
+    from pathlib import Path as _Path
+    from types import SimpleNamespace as _SimpleNamespace
+
+    import playwright_auto.cdpa_worker as _worker_module
+
+    class _RuntimeDB:
+        def close(self) -> None:
+            pass
+
+    class _Worker:
+        def __init__(self, config) -> None:
+            self.store = _SimpleNamespace(endpoints={})
+            self.runtime_db = _RuntimeDB()
+            self._browser_command_tasks = set()
+
+        def hydrate_runtime(self) -> None:
+            entered.put(os.getpid())
+
+        async def run_command_loop(self) -> None:
+            await _asyncio.Event().wait()
+
+        async def _heartbeat_loop(self) -> None:
+            await _asyncio.Event().wait()
+
+        async def run_pool_forever(self, _pool) -> None:
+            await _asyncio.Event().wait()
+
+    class _EndpointPool:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+    _worker_module.CDPAWorker = _Worker
+    _worker_module.EndpointPool = _EndpointPool
+    config = _SimpleNamespace(repository_root=_Path(repository), worker_poll_seconds=0.1)
+    _asyncio.run(_worker_module._run(config))
+
+
+def _git(repository: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(repository), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+def _linked_worktree_fixture(root: Path) -> tuple[Path, Path, str]:
+    control = root / "control"
+    target = root / "task-worktree"
+    control.mkdir()
+    _git(control, "init")
+    _git(control, "config", "user.email", "cdpa-tests@example.invalid")
+    _git(control, "config", "user.name", "CDPA Tests")
+    (control / ".gitignore").write_text(".plan/\n.runtime/\n", encoding="utf-8")
+    (control / "base.txt").write_text("base\n", encoding="utf-8")
+    _git(control, "add", ".gitignore", "base.txt")
+    _git(control, "commit", "-m", "base")
+    head = _git(control, "rev-parse", "HEAD")
+    _git(control, "worktree", "add", "--detach", str(target), head)
+    return control, target, head
+
+
 def canonical_recovery_events(state: dict) -> list[dict]:
     agent = {
         "task_mode": "independent",
@@ -101,7 +174,7 @@ class FakeActions:
         self.stop_calls = 0
         self.pages = ["assigned-page"]
 
-    async def acquire(self, state, role):
+    async def acquire(self, state, role, **_kwargs):
         record = state["roles"][role]
         return AcquiredRole(
             client=ready_client(state, role),
@@ -179,6 +252,642 @@ def setup_task(
         repository=repository,
     )
     return config, store, state, CDPAWorker(config, store=store)
+
+
+def _persist_removed_endpoint_cleanup(store, state):
+    path = Path(state["manifest_path"])
+    state["status"] = "DONE"
+    state["terminal_state"] = "DONE"
+    state["active_role"] = None
+    state["active_hop_id"] = None
+    role = state["roles"]["PLAN"]
+    role["browser_endpoint_id"] = "legacy"
+    role["page_id"] = "legacy-page"
+    role["page_url"] = "https://chatgpt.com/c/legacy"
+    role["online"] = False
+    state["cleanup"] = {
+        "state": "CLEARING",
+        "phase": "close_pending",
+        "retry_count": 0,
+        "last_error": None,
+        "last_error_at": None,
+    }
+    return store.save(path, state)
+
+
+def test_worker_scheduler_lease_serializes_spawned_worker_lifetimes_and_crash_handoffs(tmp_path: Path):
+    context = multiprocessing.get_context("spawn")
+    entered = context.Queue()
+    processes = []
+
+    def start_probe():
+        process = context.Process(target=_run_worker_lease_probe, args=(str(tmp_path), entered))
+        process.start()
+        processes.append(process)
+        return process
+
+    first = start_probe()
+    try:
+        assert entered.get(timeout=10) == first.pid
+        second = start_probe()
+        with pytest.raises(queue.Empty):
+            entered.get(timeout=1)
+
+        first.terminate()
+        first.join(timeout=10)
+        assert not first.is_alive()
+        assert entered.get(timeout=10) == second.pid
+
+        third = start_probe()
+        with pytest.raises(queue.Empty):
+            entered.get(timeout=1)
+
+        second.terminate()
+        second.join(timeout=10)
+        assert not second.is_alive()
+        assert entered.get(timeout=10) == third.pid
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=10)
+
+
+def test_presend_block_closes_team_tabs_and_preserves_block_truth(tmp_path: Path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    attachment = tmp_path / "required.txt"
+    attachment.write_text("required context", encoding="utf-8")
+    state = store.create_task(
+        "Requires attachment",
+        requested_team="blocked-release",
+        task_id="task-presend-block-release",
+        upload_paths=[attachment],
+    )
+    path = Path(state["manifest_path"])
+    attachment.unlink()
+    worker = CDPAWorker(config, store=store)
+    actions = FakeActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    saved = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    assert saved is not None
+    assert saved["status"] == "BLOCKED"
+    assert saved["block_code"] == "attachment_missing"
+    assert "required.txt" in saved["block_reason"]
+    assert actions.closed_teams == 1
+    assert actions.pages == []
+    reloaded = store.load(path)
+    assert reloaded["status"] == "BLOCKED"
+    assert reloaded["block_code"] == "attachment_missing"
+    assert reloaded["block_reason"] == saved["block_reason"]
+
+
+def test_blocked_ambiguous_sending_preserves_team_tabs(tmp_path: Path, monkeypatch):
+    config, store, state, worker = setup_task(
+        tmp_path,
+        task_id="task-blocked-sending-preserves-tabs",
+    )
+    path = Path(state["manifest_path"])
+    hop = _active_hop(state)
+    hop["prompt"] = "durable prompt"
+    hop["prompt_sha256"] = worker_module._sha(hop["prompt"])
+    hop["state"] = "sending"
+    hop["timestamps"]["sending_at"] = utc_now()
+    ledger = RequestLedger(hop["ledger_path"])
+    ledger.begin(
+        role=hop["physical_role"],
+        prompt=hop["prompt"],
+        source_context={
+            "task_id": state["task_id"],
+            "team": state["team"],
+            "hop_id": hop["hop_id"],
+            "manifest": state["manifest_path"],
+        },
+        role_prompt_hash="a" * 64,
+        request_id=hop["request_id"],
+        render_request_marker=False,
+    )
+    ledger.update(hop["request_id"], status=RequestStatus.PROMPT_SET)
+    ledger.update(hop["request_id"], status=RequestStatus.SENDING, attempts=1)
+    state = store.save(path, state)
+    actions = FakeActions()
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    async def force_ambiguous_block(current, current_hop, _actions):
+        assert current_hop["state"] == "sending"
+        worker._block(
+            current,
+            "send acceptance remains ambiguous",
+            code="send_acceptance_ambiguous",
+            retryable=False,
+        )
+
+    monkeypatch.setattr(worker, "_sending", force_ambiguous_block)
+    saved = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    assert saved is not None
+    assert saved["status"] == "BLOCKED"
+    assert saved["block_code"] == "send_acceptance_ambiguous"
+    assert actions.closed_teams == 0
+    assert actions.pages == ["assigned-page"]
+    durable = ledger.get(hop["request_id"])
+    assert durable is not None
+    assert durable.status is RequestStatus.SENDING
+    assert durable.attempts == 1
+
+
+def test_archive_worktree_control_preserves_evidence_and_head_before_removal(tmp_path: Path):
+    control, target, head = _linked_worktree_fixture(tmp_path)
+    config, store, state, worker = setup_task(
+        control,
+        task_id="task-worktree-archive",
+        repository=str(target),
+    )
+    path = Path(state["manifest_path"])
+    state["status"] = "DONE"
+    state["terminal_state"] = "DONE"
+    state["kanban_column"] = "DONE"
+    state["active_role"] = None
+    state["active_hop_id"] = None
+    state["cleanup"] = {
+        "state": "CLEARED",
+        "verified_empty_at": utc_now(),
+        "closed_tabs": 0,
+    }
+    state = store.save(path, state)
+    evidence = target / ".plan" / state["team"] / "archive-proof.md"
+    evidence.parent.mkdir(parents=True, exist_ok=True)
+    evidence.write_text("durable archive evidence\n", encoding="utf-8")
+
+    state = store.request_control(
+        path,
+        "archive_worktree",
+        reason="operator archival after verified cleanup",
+        confirmed=True,
+    )
+    persisted = []
+    assert asyncio.run(
+        worker._apply_control(state, FakeActions(), path, persisted_result=persisted)
+    ) is True
+
+    saved = store.load(path)
+    archive = saved["worktree_archive"]
+    assert archive["state"] == "ARCHIVED"
+    assert archive["head"] == head
+    assert archive["preservation_ref"].startswith("refs/cdpa/worktree-archive/")
+    assert archive["evidence_root"] == f".plan/{state['team']}"
+    assert _git(control, "rev-parse", archive["preservation_ref"]) == head
+    assert not target.exists()
+    archived_evidence = control / ".plan" / state["team"] / "archive-proof.md"
+    assert archived_evidence.read_text(encoding="utf-8") == "durable archive evidence\n"
+    assert str(target) not in _git(control, "worktree", "list", "--porcelain")
+    assert persisted == [True]
+
+
+def test_archive_worktree_control_rejects_dirty_worktree_without_preservation_mutation(tmp_path: Path):
+    control, target, _head = _linked_worktree_fixture(tmp_path)
+    _config, store, state, worker = setup_task(
+        control,
+        task_id="task-worktree-dirty",
+        repository=str(target),
+    )
+    path = Path(state["manifest_path"])
+    state.update(status="DONE", terminal_state="DONE", active_role=None, active_hop_id=None)
+    state["cleanup"] = {"state": "CLEARED", "verified_empty_at": utc_now()}
+    state = store.save(path, state)
+    (target / "base.txt").write_text("dirty\n", encoding="utf-8")
+    state = store.request_control(path, "archive_worktree", confirmed=True)
+
+    assert asyncio.run(worker._apply_control(state, FakeActions(), path)) is True
+
+    saved = store.load(path)
+    assert saved["controls"][-1]["status"] == "rejected"
+    assert "modified or untracked" in str(saved["controls"][-1]["result"]).lower()
+    assert "worktree_archive" not in saved
+    assert target.exists()
+    assert "refs/cdpa/worktree-archive/" not in _git(control, "show-ref")
+
+
+def test_archive_worktree_control_rejects_repository_with_nonterminal_owner(tmp_path: Path):
+    control, target, _head = _linked_worktree_fixture(tmp_path)
+    _config, store, state, worker = setup_task(
+        control,
+        task_id="task-worktree-terminal",
+        repository=str(target),
+    )
+    path = Path(state["manifest_path"])
+    state.update(status="DONE", terminal_state="DONE", active_role=None, active_hop_id=None)
+    state["cleanup"] = {"state": "CLEARED", "verified_empty_at": utc_now()}
+    state = store.save(path, state)
+    owner = store.create_task(
+        "Still owns this repository",
+        requested_team="active-owner",
+        task_id="task-worktree-owner",
+        repository=str(target),
+    )
+    assert owner["status"] not in {"DONE", "STOPPED"}
+    state = store.request_control(path, "archive_worktree", confirmed=True)
+
+    assert asyncio.run(worker._apply_control(state, FakeActions(), path)) is True
+
+    saved = store.load(path)
+    assert saved["controls"][-1]["status"] == "rejected"
+    assert "nonterminal" in str(saved["controls"][-1]["result"]).lower()
+    assert target.exists()
+    assert "worktree_archive" not in saved
+
+
+def test_archive_worktree_control_serializes_final_owner_proof_and_removal_with_task_creation(
+    tmp_path: Path, monkeypatch
+):
+    control, target, _head = _linked_worktree_fixture(tmp_path)
+    _config, store, state, worker = setup_task(
+        control,
+        task_id="task-worktree-owner-race",
+        repository=str(target),
+    )
+    path = Path(state["manifest_path"])
+    state.update(status="DONE", terminal_state="DONE", active_role=None, active_hop_id=None)
+    state["cleanup"] = {"state": "CLEARED", "verified_empty_at": utc_now()}
+    state = store.save(path, state)
+    state = store.request_control(path, "archive_worktree", confirmed=True)
+
+    real_git_command = worker._git_command
+    owner_started = threading.Event()
+    owner_finished = threading.Event()
+    ordering: list[str] = []
+    failures: list[BaseException] = []
+    threads: list[threading.Thread] = []
+
+    def create_competing_owner() -> None:
+        owner_started.set()
+        try:
+            store.create_task(
+                "Concurrent owner",
+                requested_team="concurrent-owner",
+                task_id="task-worktree-concurrent-owner",
+                repository=str(target),
+            )
+            ordering.append("owner-created")
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+        finally:
+            owner_finished.set()
+
+    def interleaved_git_command(repository: Path, *args: str, **kwargs):
+        if tuple(args[:2]) == ("worktree", "remove"):
+            thread = threading.Thread(target=create_competing_owner)
+            threads.append(thread)
+            thread.start()
+            assert owner_started.wait(timeout=2)
+            owner_finished.wait(timeout=0.5)
+            ordering.append("remove-started")
+        return real_git_command(repository, *args, **kwargs)
+
+    monkeypatch.setattr(worker, "_git_command", interleaved_git_command)
+    assert asyncio.run(worker._apply_control(state, FakeActions(), path)) is True
+
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+    assert failures == []
+    assert ordering.index("remove-started") < ordering.index("owner-created")
+
+
+def test_archive_worktree_control_rejects_clean_head_drift_after_preparation(tmp_path: Path):
+    control, target, head = _linked_worktree_fixture(tmp_path)
+    _config, store, state, worker = setup_task(
+        control,
+        task_id="task-worktree-head-drift",
+        repository=str(target),
+    )
+    path = Path(state["manifest_path"])
+    state.update(status="DONE", terminal_state="DONE", active_role=None, active_hop_id=None)
+    state["cleanup"] = {"state": "CLEARED", "verified_empty_at": utc_now()}
+    state = store.save(path, state)
+    state = store.request_control(path, "archive_worktree", confirmed=True)
+    prepared_archive = worker._prepare_worktree_archive(state)
+    store.update(path, lambda current: {**current, "worktree_archive": prepared_archive})
+
+    (target / "base.txt").write_text("new committed state\n", encoding="utf-8")
+    _git(target, "add", "base.txt")
+    _git(target, "commit", "-m", "post-prepare head drift")
+    changed_head = _git(target, "rev-parse", "HEAD")
+    assert changed_head != head
+    assert _git(target, "status", "--porcelain") == ""
+
+    reloaded = store.load(path)
+    assert asyncio.run(worker._apply_control(reloaded, FakeActions(), path)) is True
+
+    rejected = store.load(path)
+    assert rejected["controls"][-1]["status"] == "rejected"
+    assert "head" in str(rejected["controls"][-1]["result"]).lower()
+    assert target.exists()
+    assert rejected["worktree_archive"]["state"] == "PREPARED"
+    assert _git(control, "rev-parse", prepared_archive["preservation_ref"]) == head
+
+
+def test_archive_worktree_control_finishes_prepared_removal_after_restart_and_repeats_idempotently(tmp_path: Path):
+    control, target, head = _linked_worktree_fixture(tmp_path)
+    _config, store, state, worker = setup_task(
+        control,
+        task_id="task-worktree-restart",
+        repository=str(target),
+    )
+    path = Path(state["manifest_path"])
+    state.update(status="DONE", terminal_state="DONE", active_role=None, active_hop_id=None)
+    state["cleanup"] = {"state": "CLEARED", "verified_empty_at": utc_now()}
+    evidence = target / ".plan" / state["team"] / "restart-proof.md"
+    evidence.parent.mkdir(parents=True, exist_ok=True)
+    evidence.write_text("restart evidence\n", encoding="utf-8")
+    state = store.save(path, state)
+    state = store.request_control(path, "archive_worktree", confirmed=True)
+    prepared_archive = worker._prepare_worktree_archive(state)
+    assert prepared_archive["state"] == "PREPARED"
+    preservation_ref = prepared_archive["preservation_ref"]
+    assert _git(control, "rev-parse", preservation_ref) == head
+    assert (control / ".plan" / state["team"] / "restart-proof.md").is_file()
+    prepared = store.update(
+        path,
+        lambda current: {**current, "worktree_archive": prepared_archive},
+    )
+    assert prepared["controls"][-1]["status"] == "requested"
+    _git(control, "worktree", "remove", str(target))
+    assert not target.exists()
+
+    reloaded = store.load(path)
+    assert reloaded["controls"][-1]["status"] == "requested"
+    assert asyncio.run(worker._apply_control(reloaded, FakeActions(), path)) is True
+    completed = store.load(path)
+    assert completed["worktree_archive"]["state"] == "ARCHIVED"
+    assert completed["controls"][-1]["status"] == "applied"
+
+    completed = store.request_control(
+        path,
+        "archive_worktree",
+        confirmed=True,
+        external_command_id="cmd-archive-repeat",
+    )
+    assert asyncio.run(worker._apply_control(completed, FakeActions(), path)) is True
+    repeated = store.load(path)
+    assert repeated["controls"][-1]["status"] == "applied"
+    assert repeated["controls"][-1]["result"]["idempotent"] is True
+    assert _git(control, "rev-parse", preservation_ref) == head
+
+
+def test_identical_cleanup_failure_is_gated_between_actual_attempts(tmp_path: Path):
+    _config, store, state, worker = setup_task(
+        tmp_path,
+        task_id="task-cleanup-retry-gate",
+    )
+    state = _persist_removed_endpoint_cleanup(store, state)
+    worker._endpoint_pool = SimpleNamespace(contexts={})
+    actions = FakeActions()
+
+    assert asyncio.run(
+        worker._continue_cleanup(state, actions, Path(state["manifest_path"]))
+    ) is False
+    first = store.load(state["manifest_path"])
+    for _ in range(1000):
+        current = store.load(state["manifest_path"])
+        assert asyncio.run(
+            worker._continue_cleanup(current, actions, Path(current["manifest_path"]))
+        ) is False
+
+    saved = store.load(state["manifest_path"])
+    assert saved["cleanup"]["retry_count"] == 1
+    assert saved["cleanup"]["same_failure_count"] == 1
+    assert saved["cleanup"]["failure_fingerprint"]
+    assert saved["cleanup"]["next_retry_at"]
+    assert saved["cleanup"]["retry_suppressed"] is False
+    assert saved["cleanup"]["last_error"] == (
+        "RoleOwnershipError: cleanup cannot verify unavailable browser legacy"
+    )
+    assert saved["cleanup"]["phase"] == "close_pending"
+    assert saved["roles"]["PLAN"]["page_id"] == "legacy-page"
+    assert first["cleanup"]["retry_count"] == saved["cleanup"]["retry_count"]
+    assert actions.closed_teams == 0
+
+
+def test_cleanup_identical_failure_caps_and_changed_evidence_resets_streak(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _config, store, state, worker = setup_task(
+        tmp_path,
+        task_id="task-cleanup-retry-cap",
+    )
+    state = _persist_removed_endpoint_cleanup(store, state)
+    worker._endpoint_pool = SimpleNamespace(contexts={})
+    actions = FakeActions()
+    clock = datetime(2026, 9, 15, 9, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(worker_module, "utc_now", lambda: clock.isoformat())
+    for attempt in range(worker_module.CLEANUP_IDENTICAL_FAILURE_LIMIT):
+        current = store.load(state["manifest_path"])
+        if attempt:
+            current["cleanup"]["next_retry_at"] = clock.isoformat()
+            current = store.save(current["manifest_path"], current)
+        asyncio.run(worker._continue_cleanup(current, actions, Path(current["manifest_path"])))
+        clock += timedelta(hours=1)
+
+    capped = store.load(state["manifest_path"])
+    assert capped["cleanup"]["state"] == "CLEARING"
+    assert capped["cleanup"]["phase"] == "close_pending"
+    assert capped["cleanup"]["same_failure_count"] == worker_module.CLEANUP_IDENTICAL_FAILURE_LIMIT
+    assert capped["cleanup"]["retry_suppressed"] is True
+    assert capped["cleanup"]["next_retry_at"] is None
+    assert capped["roles"]["PLAN"]["page_id"] == "legacy-page"
+    assert actions.closed_teams == 0
+
+    capped["roles"]["PLAN"]["browser_endpoint_id"] = "legacy-2"
+    capped["cleanup"]["retry_suppressed"] = False
+    capped["cleanup"]["next_retry_at"] = clock.isoformat()
+    capped = store.save(capped["manifest_path"], capped)
+    asyncio.run(worker._continue_cleanup(capped, actions, Path(capped["manifest_path"])))
+
+    changed = store.load(state["manifest_path"])
+    assert changed["cleanup"]["same_failure_count"] == 1
+    assert changed["cleanup"]["retry_suppressed"] is False
+    assert "legacy-2" in changed["cleanup"]["last_error"]
+
+
+def test_zero_progress_close_verification_failure_reaches_retry_cap(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _config, store, state, worker = setup_task(
+        tmp_path,
+        task_id="task-cleanup-zero-progress-cap",
+    )
+    state = _persist_removed_endpoint_cleanup(store, state)
+    path = Path(state["manifest_path"])
+    clock = datetime(2026, 9, 15, 9, 0, tzinfo=timezone.utc)
+
+    class ZeroProgressActions(FakeActions):
+        async def close_team(self, _state, *, preflighted_pages=None):
+            selected = list(preflighted_pages or [])
+            assert selected == self.pages
+            self.closed_teams += 1
+            return 0
+
+    actions = ZeroProgressActions()
+    monkeypatch.setattr(worker_module, "utc_now", lambda: clock.isoformat())
+
+    for _ in range(worker_module.CLEANUP_IDENTICAL_FAILURE_LIMIT):
+        current = store.load(path)
+        assert asyncio.run(worker._continue_cleanup(current, actions, path)) is False
+        clock += timedelta(hours=1)
+
+    capped = store.load(path)
+    assert capped["cleanup"]["state"] == "CLEARING"
+    assert capped["cleanup"]["phase"] == "close_pending"
+    assert capped["cleanup"]["retry_count"] == worker_module.CLEANUP_IDENTICAL_FAILURE_LIMIT
+    assert capped["cleanup"]["same_failure_count"] == worker_module.CLEANUP_IDENTICAL_FAILURE_LIMIT
+    assert capped["cleanup"]["retry_suppressed"] is True
+    assert capped["cleanup"]["next_retry_at"] is None
+    assert capped["roles"]["PLAN"]["page_id"] == "legacy-page"
+    assert actions.closed_teams == worker_module.CLEANUP_IDENTICAL_FAILURE_LIMIT
+
+    for _ in range(1000):
+        current = store.load(path)
+        assert asyncio.run(worker._continue_cleanup(current, actions, path)) is False
+
+    quiescent = store.load(path)
+    assert quiescent["cleanup"]["retry_count"] == worker_module.CLEANUP_IDENTICAL_FAILURE_LIMIT
+    assert actions.closed_teams == worker_module.CLEANUP_IDENTICAL_FAILURE_LIMIT
+
+
+def test_partial_close_progress_resets_failure_streak_until_progress_stops(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _config, store, state, worker = setup_task(
+        tmp_path,
+        task_id="task-cleanup-partial-progress",
+    )
+    state = _persist_removed_endpoint_cleanup(store, state)
+    path = Path(state["manifest_path"])
+    clock = datetime(2026, 9, 15, 9, 0, tzinfo=timezone.utc)
+
+    class PartialProgressActions(FakeActions):
+        def __init__(self):
+            super().__init__()
+            self.pages = [
+                f"assigned-page-{index}"
+                for index in range(worker_module.CLEANUP_IDENTICAL_FAILURE_LIMIT + 2)
+            ]
+            self.make_progress = True
+
+        async def close_team(self, _state, *, preflighted_pages=None):
+            selected = list(preflighted_pages or [])
+            assert selected == self.pages
+            self.closed_teams += 1
+            if self.make_progress:
+                self.pages.pop(0)
+                raise TeamCloseError(
+                    "assigned team tab did not report closed after page.close()",
+                    closed_tabs=1,
+                )
+            raise TeamCloseError(
+                "assigned team tab did not report closed after page.close()",
+                closed_tabs=0,
+            )
+
+    actions = PartialProgressActions()
+    monkeypatch.setattr(worker_module, "utc_now", lambda: clock.isoformat())
+
+    for attempt in range(worker_module.CLEANUP_IDENTICAL_FAILURE_LIMIT):
+        current = store.load(path)
+        assert asyncio.run(worker._continue_cleanup(current, actions, path)) is False
+        saved = store.load(path)
+        assert saved["cleanup"]["closed_tabs"] == attempt + 1
+        assert saved["cleanup"]["same_failure_count"] == 1
+        assert saved["cleanup"]["retry_suppressed"] is False
+        clock += timedelta(hours=1)
+
+    actions.make_progress = False
+    for _ in range(worker_module.CLEANUP_IDENTICAL_FAILURE_LIMIT - 1):
+        current = store.load(path)
+        assert asyncio.run(worker._continue_cleanup(current, actions, path)) is False
+        clock += timedelta(hours=1)
+
+    capped = store.load(path)
+    assert capped["cleanup"]["state"] == "CLEARING"
+    assert capped["cleanup"]["phase"] == "close_pending"
+    assert capped["cleanup"]["closed_tabs"] == worker_module.CLEANUP_IDENTICAL_FAILURE_LIMIT
+    assert capped["cleanup"]["same_failure_count"] == worker_module.CLEANUP_IDENTICAL_FAILURE_LIMIT
+    assert capped["cleanup"]["retry_suppressed"] is True
+    assert capped["cleanup"]["next_retry_at"] is None
+    assert len(actions.pages) == 2
+    attempts_at_cap = actions.closed_teams
+
+    for _ in range(1000):
+        current = store.load(path)
+        assert asyncio.run(worker._continue_cleanup(current, actions, path)) is False
+
+    quiescent = store.load(path)
+    assert quiescent["cleanup"]["retry_count"] == attempts_at_cap
+    assert actions.closed_teams == attempts_at_cap
+
+
+def test_normal_cleanup_still_requires_close_then_zero_match_verification(tmp_path: Path):
+    _config, store, state, worker = setup_task(
+        tmp_path,
+        task_id="task-cleanup-normal",
+    )
+    state = _persist_removed_endpoint_cleanup(store, state)
+    path = Path(state["manifest_path"])
+    actions = FakeActions()
+
+    assert asyncio.run(worker._continue_cleanup(state, actions, path)) is True
+
+    saved = store.load(path)
+    assert actions.closed_teams == 1
+    assert actions.preflight_calls == 2
+    assert saved["cleanup"]["state"] == "CLEARED"
+    assert saved["cleanup"]["phase"] == "cleared"
+    assert saved["cleanup"]["verified_empty_at"]
+    assert saved["cleanup"]["retry_suppressed"] is False
+    assert saved["cleanup"]["failure_fingerprint"] is None
+
+
+def test_explicit_clear_team_retries_suppressed_cleanup_once(tmp_path: Path):
+    _config, store, state, worker = setup_task(
+        tmp_path,
+        task_id="task-cleanup-explicit-retry",
+    )
+    state = _persist_removed_endpoint_cleanup(store, state)
+    path = Path(state["manifest_path"])
+    state["cleanup"].update(
+        failure_fingerprint="old",
+        same_failure_count=worker_module.CLEANUP_IDENTICAL_FAILURE_LIMIT,
+        retry_suppressed=True,
+        next_retry_at=None,
+        retry_count=7,
+    )
+    state = store.save(path, state)
+    requested = store.request_control(path, "clear_team", reason="operator reverify")
+    worker._endpoint_pool = SimpleNamespace(contexts={})
+
+    assert asyncio.run(
+        worker._apply_control(
+            requested,
+            FakeActions(),
+            path,
+            persisted_result=[],
+        )
+    ) is True
+
+    saved = store.load(path)
+    assert saved["cleanup"]["retry_count"] == 8
+    assert saved["cleanup"]["same_failure_count"] == 1
+    assert saved["cleanup"]["retry_suppressed"] is False
+    assert saved["cleanup"]["last_error"] == (
+        "RoleOwnershipError: cleanup cannot verify unavailable browser legacy"
+    )
 
 
 def test_ambient_page_automation_uses_workspace_timeout_config(tmp_path: Path, monkeypatch):
@@ -534,7 +1243,7 @@ def test_pause_requested_during_role_acquisition_survives_and_applies_before_sen
     worker = CDPAWorker(config, store=store)
 
     class ConcurrentAcquireActions(FakeActions):
-        async def acquire(self, current, role):
+        async def acquire(self, current, role, **_kwargs):
             store.request_control(
                 path,
                 "pause",
@@ -623,24 +1332,19 @@ def test_pre_send_lazily_acquires_only_plan_and_persists_constructor(tmp_path: P
     assert hop["state"] == "sending"
     assert hop["expected_report_path"] == ".plan/alpha/alpha-plan_turn1_task-a.md"
     assert "Constructor for PLAN" in hop["prompt"]
-    assert "Write the complete non-empty role report to exactly: `.plan/alpha/alpha-plan_turn1_task-a.md`" in hop["prompt"]
+    assert "Write the complete report to exactly: .plan/alpha/alpha-plan_turn1_task-a.md" in hop["prompt"]
     assert '"handoff":".plan/alpha/alpha-plan_turn1_task-a.md"' in hop["prompt"]
     assert ".plan/<team>/<physical-role>_turn<N>_<task-id>.md" not in hop["prompt"]
-    assert hop["prompt"].startswith("alpha · role: plan\n{")
+    assert hop["prompt"].startswith("You are PLAN for the team alpha | task-a:")
     envelope, _ = json.JSONDecoder().raw_decode(
-        hop["prompt"].removeprefix("alpha · role: plan\n")
+        hop["prompt"].split("TURN_CONTEXT\n", 1)[1]
     )
     assert envelope == {
-        "title": "Implement exact production behavior",
-        "task-id": "task-a",
-        "team": "alpha",
-        "role": "alpha-plan",
-        "source-role": None,
         "turn": 1,
         "workspace": str(tmp_path),
         "allowed-routes": ["PLAN", "DEV", "TEST", "REVIEW", "AUDIT", "PAUSE", "DONE"],
         "goal": "Implement exact production behavior",
-        "handoff": "Implement exact production behavior",
+        "handoff": "Initial task intake; no prior role handoff.",
     }
     assert state["roles"]["PLAN"]["page_id"] == "page-alpha-plan"
     assert state["roles"]["DEV"]["status"] == "unallocated"
@@ -673,7 +1377,7 @@ def test_pre_send_first_role_uses_bootstrap_once_and_keeps_full_prompt(tmp_path:
             return _bootstrap_graph(anchor["terminal_assistant_message_id"])
 
         async def branch_from_anchor(
-            self, _state, role, *, source_conversation_id, assistant_message_id
+            self, _state, role, *, source_conversation_id, assistant_message_id, **_kwargs
         ):
             self.branch_calls.append((role, source_conversation_id, assistant_message_id))
             return AcquiredRole(
@@ -694,13 +1398,17 @@ def test_pre_send_first_role_uses_bootstrap_once_and_keeps_full_prompt(tmp_path:
     assert state["roles"]["PLAN"]["context_source"] == "bootstrap_donor"
     assert state["roles"]["PLAN"]["conversation_generation"] == 1
     assert "Constructor for PLAN" in first["prompt"]
-    assert "Return only the strict route JSON." in first["prompt"]
+    assert "Return exactly one valid JSON object" in first["prompt"]
 
     plan_turn2 = worker._append_hop(
         state, source_role="REVIEW", target_role="PLAN", handoff="return to plan"
     )
     asyncio.run(worker._pre_send(state, plan_turn2, actions))
     assert len(actions.branch_calls) == 1
+    assert "PLAN_CLOSURE: Treat the handoff and accepted role reports as closure evidence." in plan_turn2["prompt"]
+    assert "Constructor for PLAN" not in plan_turn2["prompt"]
+    assert plan_turn2["prompt"].index("Work first.") < plan_turn2["prompt"].index("PLAN_CLOSURE")
+    assert plan_turn2["prompt"].count('{"route":"') == 1
     assert state["roles"]["PLAN"]["page_id"] == "page-alpha-plan"
 
     for role in ("DEV", "REVIEW"):
@@ -866,7 +1574,7 @@ def test_pre_send_bootstrap_transient_failure_stays_pre_send_without_fresh_fallb
             self.branch_calls += 1
             raise BranchBootstrapError("native unavailable")
 
-        async def acquire(self, state, role):
+        async def acquire(self, state, role, **_kwargs):
             self.acquire_calls += 1
             return await super().acquire(state, role)
 
@@ -902,7 +1610,7 @@ def test_pre_send_limits_allowed_routes_to_selected_workflow_roles(tmp_path: Pat
     asyncio.run(worker._pre_send(state, hop, FakeActions()))
 
     envelope, _ = json.JSONDecoder().raw_decode(
-        hop["prompt"].removeprefix("alpha · role: plan\n")
+        hop["prompt"].split("TURN_CONTEXT\n", 1)[1]
     )
     assert envelope["allowed-routes"] == ["PLAN", "REVIEW", "PAUSE", "DONE"]
     assert list(state["roles"]) == ["PLAN", "REVIEW"]
@@ -918,7 +1626,7 @@ def test_normal_cdpa_send_keeps_transport_identity_out_of_actual_payload(tmp_pat
 
     record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
     assert client.send_calls == [hop["prompt"]]
-    assert client.send_calls[0].startswith("alpha · role: plan\n{")
+    assert client.send_calls[0].startswith("You are PLAN for the team alpha | task-a:")
     assert hop["receipt"]["prompt"] == hop["prompt"]
     assert record is not None
     assert record.rendered_prompt == hop["prompt"]
@@ -1050,14 +1758,22 @@ def test_missing_local_file_report_preserves_route_and_queues_report_repair(tmp_
     )
 
     asyncio.run(worker._pre_send(state, repair, FakeActions()))
-    assert repair["prompt"].startswith("CDPA_REPORT_REPAIR")
+    assert "CDPA_REPORT_REPAIR" in repair["prompt"]
+    assert repair["prompt"].rstrip().endswith(
+        json.dumps({"route": "DEV", "handoff": handoff}, separators=(",", ":"))
+    )
     assert handoff in repair["prompt"]
     assert '"route":"DEV"' in repair["prompt"]
+    assert len(repair["prompt"]) <= 2500
+    assert "do not invent evidence" in repair["prompt"]
     assert "CDPA_FORMAT_REPAIR" not in repair["prompt"]
 
     report = tmp_path / handoff
     report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text("# PLAN report\n\nRecovered artifact.\n", encoding="utf-8")
+    report.write_text(
+        "# PLAN report\n\n## Evidence\n- Inspected `path=.plan/alpha/alpha-plan_turn1_task-missing-local-report.md`.\n- `send_attempts=1` -> recovered report artifact without replay.\n",
+        encoding="utf-8",
+    )
     repair["response"] = json.dumps({"route": "REVIEW", "handoff": handoff})
     repair["state"] = "responded"
     worker._responded(state, repair)
@@ -1095,7 +1811,7 @@ def test_local_file_report_routes_once_with_hash_and_size_evidence(tmp_path: Pat
     handoff = str(hop["expected_report_path"])
     report = tmp_path / handoff
     report.parent.mkdir(parents=True, exist_ok=True)
-    data = b"# DEV report\n\nVerified local artifact.\n"
+    data = b"# DEV report\n\n## Evidence\n- Verified `path=.plan/alpha/alpha-plan_turn1_task-valid-local-report.md`.\n- `checks=1` -> local artifact validation passed.\n"
     report.write_bytes(data)
     hop["response"] = json.dumps({"route": "DEV", "handoff": handoff})
     hop["state"] = "responded"
@@ -1201,8 +1917,7 @@ def test_malformed_response_creates_same_turn_guide_only_repair(tmp_path: Path):
     assert "Fix the current response issue:" not in repair["prompt"]
     assert "Continue from this state" in repair["prompt"]
     assert len(repair["prompt"].splitlines()) <= 5
-    assert ".plan/alpha/alpha-plan_turn1_task-a.md" in repair["prompt"]
-    assert ".plan/<team>/<physical-role>_turn<N>_<task-id>.md" not in repair["prompt"]
+    assert repair["prompt"] == "Continue from this state!\nReturn exactly one valid JSON object"
     assert "Constructor for PLAN" not in repair["prompt"]
     assert repair["handoff"] == "route repair"
 
@@ -1227,7 +1942,10 @@ def test_only_plan_done_can_make_task_terminal(tmp_path: Path):
     asyncio.run(worker._pre_send(state, hop, FakeActions()))
     report = tmp_path / ".plan" / "alpha" / "alpha-plan_turn1_task-a.md"
     report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text("final evidence", encoding="utf-8")
+    report.write_text(
+        "# PLAN report\n\n## Evidence\n- Inspected `path=.plan/alpha/alpha-plan_turn1_task-a.md` before final routing.\n- `checks=1` -> final PLAN verification passed.\n",
+        encoding="utf-8",
+    )
     hop["response"] = '{"route":"DONE","handoff":".plan/alpha/alpha-plan_turn1_task-a.md"}'
     hop["state"] = "responded"
 
@@ -1456,7 +2174,7 @@ def test_open_tab_recovers_presend_role_offline_and_sends_original_once(
         async def open_tab(self, _acquired):
             self.recovered = True
 
-        async def acquire(self, _state, _role):
+        async def acquire(self, _state, _role, **_kwargs):
             assert self.recovered is True
             return acquired
 
@@ -1862,6 +2580,66 @@ def test_advance_persists_ineffective_open_tab_before_later_requested_control(
     assert worker.runtime_db.get_command("cmd-btm-like-restart")["status"] == "failed"
 
 
+def test_restart_role_from_report_repair_preserves_substantive_handoff(tmp_path: Path):
+    _, store, state, worker = setup_task(tmp_path, task_id="task-restart-report-repair-handoff")
+    path = Path(state["manifest_path"])
+    original = _active_hop(state)
+    original["source_role"] = "REVIEW"
+    original["target_role"] = "PLAN"
+    original["handoff"] = ".plan/alpha/alpha-review_turn2_task-restart-report-repair-handoff.md"
+    original["state"] = "routed"
+
+    first_repair = worker._append_hop(
+        state,
+        source_role="PLAN",
+        target_role="PLAN",
+        handoff="report repair",
+        kind="report_repair",
+        turn=int(original["turn"]),
+        repair_attempt=1,
+        validation_error="report file is missing",
+    )
+    first_repair["locked_route"] = "PAUSE"
+    first_repair["locked_handoff"] = ".plan/alpha/alpha-plan_turn1_task-restart-report-repair-handoff.md"
+    first_repair["state"] = "routed"
+    second_repair = worker._append_hop(
+        state,
+        source_role="PLAN",
+        target_role="PLAN",
+        handoff="report repair",
+        kind="report_repair",
+        turn=int(original["turn"]),
+        repair_attempt=2,
+        validation_error="report file is missing",
+    )
+    second_repair["locked_route"] = "PAUSE"
+    second_repair["locked_handoff"] = first_repair["locked_handoff"]
+    state.update(
+        status="BLOCKED",
+        kanban_column="BLOCKED",
+        active_role="PLAN",
+        active_action="blocked",
+        block_code="report_validation_exhausted",
+        block_retryable=True,
+        block_reason="report repair exhausted: report file is missing",
+    )
+    store.save(path, state)
+    queued = store.request_control(
+        path,
+        "restart_role",
+        role="PLAN",
+        reason="replace inaccessible repair context",
+        external_command_id="restart-report-repair-handoff-once",
+    )
+
+    assert asyncio.run(worker._apply_control(queued, FakeActions(), path)) is True
+
+    child = _active_hop(queued)
+    assert child["kind"] == "role_restart"
+    assert child["parent_hop_id"] == second_repair["hop_id"]
+    assert child["handoff"] == original["handoff"]
+
+
 def test_blocked_task_does_not_advance_without_explicit_control(tmp_path: Path):
     _, store, state, worker = setup_task(tmp_path)
     path = Path(state["manifest_path"])
@@ -2082,9 +2860,13 @@ def test_unresolved_complete_accepts_terminal_continuation_before_final_block(
     asyncio.run(worker._waiting(state, hop, Actions(), path))
 
     assert state["status"] == "RUNNING"
-    assert hop["state"] == "responded"
+    assert hop["state"] == "routed"
     assert hop["response"] == response.text
-    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
+    assert _active_hop(state)["hop_id"] != hop["hop_id"]
+    assert hop["route"] == "REVIEW"
+    record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
+    assert record.attempts == 1
+    assert record.status is RequestStatus.COMPLETED
 
 
 def _mark_completed_refresh(hop: dict, *, seconds_ago: int) -> None:
@@ -2104,7 +2886,7 @@ def test_normal_wait_routes_valid_local_file_response_without_repair(tmp_path: P
     handoff = str(hop["expected_report_path"])
     report = tmp_path / handoff
     report.parent.mkdir(parents=True, exist_ok=True)
-    report_bytes = b"# TEST report\n\nNormal wait evidence.\n"
+    report_bytes = b"# TEST report\n\n## Evidence\n- Inspected `report_path=.plan/alpha/alpha-plan_turn1_task-normal-wait-path-only.md`.\n- `samples=2` -> stable route/report evidence verified.\n"
     report.write_bytes(report_bytes)
     response = MessageSnapshot(
         "assistant",
@@ -2139,11 +2921,9 @@ def test_normal_wait_routes_valid_local_file_response_without_repair(tmp_path: P
 
     asyncio.run(worker._waiting(state, hop, Actions(), path))
 
-    assert hop["state"] == "responded"
+    assert hop["state"] == "routed"
     assert hop["response"] == response.text
     assert hop.get("validation_error") is None
-
-    worker._responded(state, hop)
 
     child = _active_hop(state)
     record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
@@ -2169,7 +2949,10 @@ def test_waiting_requires_valid_route_report_and_two_samples_before_hop_response
     worker.config = replace(worker.config, response_poll_ms=5000)
     report = tmp_path / ".plan" / "alpha" / "alpha-plan_turn1_task-valid-gate.md"
     report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text("valid report", encoding="utf-8")
+    report.write_text(
+        "# PLAN report\n\n## Evidence\n- Inspected `report_path=.plan/alpha/alpha-plan_turn1_task-valid-gate.md`.\n- `samples=2`; `controller_reason=stable_current_result` -> route/report candidate verified.\n",
+        encoding="utf-8",
+    )
     response = MessageSnapshot(
         "assistant",
         "a-valid",
@@ -2210,10 +2993,7 @@ def test_waiting_requires_valid_route_report_and_two_samples_before_hop_response
     asyncio.run(worker._waiting(state, hop, Actions(), path))
 
     assert hop["wait"]["result_samples"] == 2
-    assert hop["state"] == "responded"
-    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).status is RequestStatus.SENT
-
-    worker._responded(state, hop)
+    assert hop["state"] == "routed"
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).status is RequestStatus.COMPLETED
     assert _active_hop(state)["target_role"] == "TEST"
 
@@ -2446,6 +3226,48 @@ def test_pre_send_with_durable_record_fails_closed_without_rebuilding_prompt(
     assert current.attempts == 1
 
 
+def test_relocated_prompt_rebind_crash_reconciles_persisted_intent_and_new_ledger(tmp_path: Path):
+    config, store, state, worker = setup_task(tmp_path, task_id="task-rebind-crash")
+    path = Path(state["manifest_path"])
+    hop = _active_hop(state)
+    role = str(hop["target_role"])
+    source_context = {
+        "task_id": state["task_id"],
+        "team": state["team"],
+        "hop_id": hop["hop_id"],
+        "manifest": state["manifest_path"],
+    }
+    role_prompt_hash = worker_module._sha(
+        str(worker_module.task_workflow_definitions(state, config)[role]["system_prompt"])
+    )
+    ledger = RequestLedger(hop["ledger_path"])
+    ledger.begin(
+        role=str(hop["physical_role"]), prompt="old prompt", request_id=hop["request_id"],
+        source_context=source_context, role_prompt_hash=role_prompt_hash, render_request_marker=False,
+    )
+    intended_prompt = "rebuilt prompt after relocation"
+    ledger.rebind_pristine(
+        hop["request_id"], role=str(hop["physical_role"]), prompt=intended_prompt,
+        source_context=source_context, role_prompt_hash=role_prompt_hash,
+    )
+    hop["prompt"] = "old prompt"
+    hop["prompt_sha256"] = worker_module._sha("old prompt")
+    hop["rebuild_prompt_after_relocation"] = True
+    hop["prompt_rebind_intent"] = {
+        "request_id": hop["request_id"],
+        "role": str(hop["physical_role"]),
+        "prompt": intended_prompt,
+        "prompt_sha256": worker_module._sha(intended_prompt),
+        "source_context": source_context,
+        "role_prompt_hash": role_prompt_hash,
+    }
+    state = store.save(path, state)
+    hop = _active_hop(state)
+
+    assert worker._pre_send_request_identity_is_safe(state, hop) is True
+    assert state["status"] != "BLOCKED"
+
+
 def test_legacy_inline_pre_send_switches_to_file_before_prompt(
     tmp_path: Path,
 ):
@@ -2465,7 +3287,7 @@ def test_legacy_inline_pre_send_switches_to_file_before_prompt(
     asyncio.run(worker._pre_send(state, hop, FakeActions()))
 
     assert state["options"]["report_mode"] == "file"
-    assert "Write the complete non-empty role report to exactly: `.plan/alpha/alpha-plan_turn1_task-legacy-pre-send.md`" in hop["prompt"]
+    assert "Write the complete report to exactly: .plan/alpha/alpha-plan_turn1_task-legacy-pre-send.md" in hop["prompt"]
     assert '"handoff":".plan/alpha/alpha-plan_turn1_task-legacy-pre-send.md"' in hop["prompt"]
     assert '"handoff":"INLINE"' not in hop["prompt"]
     assert hop["expected_report_path"] == ".plan/alpha/alpha-plan_turn1_task-legacy-pre-send.md"
@@ -2575,14 +3397,9 @@ def test_accepted_legacy_inline_hop_drains_once_to_execution_repo_then_file(
     waiting_baseline = json.loads(json.dumps(state))
     asyncio.run(worker._waiting(state, hop, Actions(), path))
     state = worker._persist_transport_result(path, waiting_baseline, state)
-    hop = _active_hop(state)
-    assert hop["state"] == "responded"
-    assert state["options"]["report_mode"] == "inline"
-
-    responded_baseline = json.loads(json.dumps(state))
-    worker._responded(state, hop)
-    state = worker._persist_transport_result(path, responded_baseline, state)
     completed_hop = state["hops"][0]
+    assert completed_hop["state"] == "routed"
+    assert state["options"]["report_mode"] == "file"
     report_path = Path(completed_hop["report_path"])
 
     assert report_path == (
@@ -2758,7 +3575,7 @@ def test_cross_workspace_local_file_report_requires_execution_repository_artifac
     handoff = str(hop["expected_report_path"])
     report = execution_repository / handoff
     report.parent.mkdir(parents=True, exist_ok=True)
-    report_bytes = b"# PLAN report\n\nCross-workspace local evidence.\n"
+    report_bytes = b"# PLAN report\n\n## Evidence\n- Inspected `report_path=.plan/alpha/alpha-plan_turn1_task-cross-workspace-file.md` in the execution repository.\n- `checks=1` -> cross-workspace local artifact validation passed.\n"
     report.write_bytes(report_bytes)
     response = MessageSnapshot(
         "assistant",
@@ -2802,8 +3619,7 @@ def test_cross_workspace_local_file_report_requires_execution_repository_artifac
     assert RequestLedger(hop["ledger_path"]).get(original_request_id).attempts == 1
 
     asyncio.run(worker._waiting(state, hop, Actions(), Path(state["manifest_path"])))
-    assert hop["state"] == "responded"
-    worker._responded(state, hop)
+    assert hop["state"] == "routed"
 
     child = _active_hop(state)
     assert hop["report_path"] == handoff
@@ -4091,7 +4907,7 @@ def test_change_goal_keeps_current_prompt_and_updates_first_later_hop(tmp_path: 
     current = _active_hop(state)
     asyncio.run(worker._pre_send(state, current, FakeActions()))
     current_envelope, _ = json.JSONDecoder().raw_decode(
-        current["prompt"].removeprefix("alpha · role: plan\n")
+        current["prompt"].split("TURN_CONTEXT\n", 1)[1]
     )
     assert current_envelope["goal"] == "Implement exact production behavior"
 
@@ -4101,7 +4917,7 @@ def test_change_goal_keeps_current_prompt_and_updates_first_later_hop(tmp_path: 
     )
     asyncio.run(worker._pre_send(state, later, FakeActions()))
     later_envelope, _ = json.JSONDecoder().raw_decode(
-        later["prompt"].removeprefix("alpha · role: dev\n")
+        later["prompt"].split("TURN_CONTEXT\n", 1)[1]
     )
     assert later_envelope["goal"] == "Replacement for later roles"
 
@@ -4364,7 +5180,7 @@ def test_first_allocation_keeps_catalog_primary_before_task_backup(tmp_path: Pat
             return _bootstrap_graph(donor["assistant_message_id"])
 
         async def branch_from_anchor(
-            self, _state, role, *, source_conversation_id, assistant_message_id
+            self, _state, role, *, source_conversation_id, assistant_message_id, **_kwargs
         ):
             self.branches.append((source_conversation_id, assistant_message_id))
             return AcquiredRole(
@@ -4439,7 +5255,7 @@ def test_source_only_bootstrap_requires_local_materialization_without_graph_fetc
             raise AssertionError("source-only bootstrap must not fetch conversation graph")
 
         async def branch_from_anchor(
-            self, _state, role, *, source_conversation_id, assistant_message_id
+            self, _state, role, *, source_conversation_id, assistant_message_id, **_kwargs
         ):
             self.branches.append((source_conversation_id, assistant_message_id))
             return AcquiredRole(
@@ -4732,68 +5548,36 @@ def _accept_self_route_guard_decision(worker, state, route: str):
     return hop
 
 
-def test_consecutive_self_route_guard_blocks_third_without_child_or_send_after_reload(
-    tmp_path: Path, monkeypatch
-):
-    config, store, state, worker = setup_task(tmp_path, task_id="task-self-route-limit")
+def test_self_routes_use_shared_execution_budget_instead_of_local_guard(tmp_path: Path):
+    _, _, state, worker = setup_task(tmp_path, task_id="task-self-route-budget")
 
     first = _accept_self_route_guard_decision(worker, state, "PLAN")
     second = _accept_self_route_guard_decision(worker, state, "PLAN")
     third = _accept_self_route_guard_decision(worker, state, "PLAN")
 
     assert first["state"] == second["state"] == third["state"] == "routed"
-    assert len(state["hops"]) == 3
-    assert state["active_hop_id"] == third["hop_id"]
-    assert state["status"] == "BLOCKED"
-    assert state["block_code"] == "consecutive_self_route_limit"
-    assert state["block_retryable"] is False
-    assert "PLAN" in state["block_reason"]
-    assert "3" in state["block_reason"]
-    assert "operator Resume" in state["block_reason"]
-    assert [item.get("kind") for item in state["route_timeline"]] == [None, None, None]
-    assert len(state["reports"]) == 3
-    assert not any(hop["request_id"].endswith("-hop4") for hop in state["hops"])
-
-    path = Path(state["manifest_path"])
-    store.save(path, state)
-    restarted = CDPAWorker(config, store=store)
-
-    async def forbidden_pre_send(*_args, **_kwargs):
-        raise AssertionError("guarded reload must not reach _pre_send")
-
-    monkeypatch.setattr(restarted, "_pre_send", forbidden_pre_send)
-    reloaded = asyncio.run(restarted.advance(path, SimpleNamespace(pages=[])))
-
-    assert reloaded["status"] == "BLOCKED"
-    assert reloaded["block_code"] == "consecutive_self_route_limit"
-    assert len(reloaded["hops"]) == 3
-    assert len(reloaded["reports"]) == 3
-    assert len(reloaded["route_timeline"]) == 3
-    assert RequestLedger(third["ledger_path"]).peek("task-self-route-limit-hop4") is None
+    assert state["status"] == "RUNNING"
+    assert state["block_code"] is None
+    assert state["active_hop_id"] == 4
+    assert state["execution_budget"]["charged_hop_ids"] == [1, 2, 3, 4]
 
 
-def test_consecutive_self_route_guard_resets_on_normal_role_change(tmp_path: Path):
+def test_role_changes_do_not_reset_shared_execution_budget(tmp_path: Path):
     _, _, state, worker = setup_task(
         tmp_path,
-        task_id="task-self-route-role-reset",
+        task_id="task-role-change-budget",
         roles=("PLAN", "DEV"),
     )
 
-    _accept_self_route_guard_decision(worker, state, "PLAN")
-    _accept_self_route_guard_decision(worker, state, "PLAN")
-    _accept_self_route_guard_decision(worker, state, "DEV")
+    for route in ("PLAN", "PLAN", "DEV", "DEV", "DEV", "DEV"):
+        _accept_self_route_guard_decision(worker, state, route)
+
+    assert state["status"] == "RUNNING"
     assert state["active_role"] == "DEV"
-
-    _accept_self_route_guard_decision(worker, state, "DEV")
-    _accept_self_route_guard_decision(worker, state, "DEV")
-    third_dev = _accept_self_route_guard_decision(worker, state, "DEV")
-
-    assert state["status"] == "BLOCKED"
-    assert state["active_hop_id"] == third_dev["hop_id"]
-    assert len([item for item in state["route_timeline"] if item.get("source_role") == "DEV"]) == 3
+    assert state["execution_budget"]["charged_hop_ids"] == list(range(1, 8))
 
 
-def test_consecutive_self_route_guard_applies_to_custom_workflow_role(tmp_path: Path):
+def test_custom_workflow_roles_share_the_same_execution_budget(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
     custom = store.create_workflow_agent(
@@ -4802,26 +5586,24 @@ def test_consecutive_self_route_guard_applies_to_custom_workflow_role(tmp_path: 
         external_command_id="create-custom-loop-role",
     )["route_key"]
     state = store.create_task(
-        "Exercise custom self-route guard",
+        "Exercise custom workflow budget",
         requested_team="custom-loop",
-        task_id="task-custom-self-route-limit",
+        task_id="task-custom-budget",
         roles=("PLAN", custom),
     )
     worker = CDPAWorker(config, store=store)
 
-    _accept_self_route_guard_decision(worker, state, custom)
-    _accept_self_route_guard_decision(worker, state, custom)
-    _accept_self_route_guard_decision(worker, state, custom)
-    third = _accept_self_route_guard_decision(worker, state, custom)
+    for _ in range(4):
+        _accept_self_route_guard_decision(worker, state, custom)
 
     assert custom.startswith("WF_")
-    assert state["status"] == "BLOCKED"
-    assert state["active_hop_id"] == third["hop_id"]
-    assert custom in state["block_reason"]
+    assert state["status"] == "RUNNING"
+    assert state["active_hop_id"] == 5
+    assert state["execution_budget"]["charged_hop_ids"] == [1, 2, 3, 4, 5]
 
 
-def test_route_repair_artifacts_neither_count_nor_reset_self_route_streak(tmp_path: Path):
-    _, _, state, worker = setup_task(tmp_path, task_id="task-self-route-repair")
+def test_route_repair_execution_is_charged_once_by_hop_identity(tmp_path: Path):
+    _, _, state, worker = setup_task(tmp_path, task_id="task-route-repair-budget")
 
     _accept_self_route_guard_decision(worker, state, "PLAN")
     _accept_self_route_guard_decision(worker, state, "PLAN")
@@ -4830,42 +5612,49 @@ def test_route_repair_artifacts_neither_count_nor_reset_self_route_streak(tmp_pa
     malformed["state"] = "responded"
     worker._responded(state, malformed)
     repair = _active_hop(state)
+
     assert repair["kind"] == "route_repair"
+    assert state["execution_budget"]["charged_hop_ids"] == [1, 2, 3, 4]
+    assert len(set(state["execution_budget"]["charged_hop_ids"])) == 4
 
-    _accept_self_route_guard_decision(worker, state, "PLAN")
+
+def test_alternating_dev_review_loop_does_not_force_context_rotation(tmp_path: Path):
+    _, _, state, worker = setup_task(
+        tmp_path,
+        task_id="task-alternating-budget",
+        roles=("PLAN", "DEV", "REVIEW"),
+    )
+
+    for route in ("DEV", "REVIEW", "DEV", "REVIEW", "DEV", "REVIEW", "DEV"):
+        _accept_self_route_guard_decision(worker, state, route)
+
     assert state["status"] == "RUNNING"
-    assert _active_hop(state)["kind"] == "handoff"
+    assert state["active_role"] == "DEV"
+    assert state["roles"]["DEV"]["reset_requested"] is False
+    assert state["execution_budget"]["charged_hop_ids"] == list(range(1, 9))
+    assert not any(
+        event.get("kind") == "alternating_route_context_rotation"
+        for event in state["route_timeline"]
+    )
 
-    third_normal = _accept_self_route_guard_decision(worker, state, "PLAN")
-    assert state["status"] == "BLOCKED"
-    assert state["active_hop_id"] == third_normal["hop_id"]
 
-
-def test_successful_report_repair_counts_locked_self_route_exactly_once(tmp_path: Path):
-    _, _, state, worker = setup_task(tmp_path, task_id="task-self-route-report-repair")
+def test_legacy_manifest_lazily_initializes_budget_from_existing_hop_ids(tmp_path: Path):
+    _, _, state, worker = setup_task(tmp_path, task_id="task-legacy-budget-migration")
+    state.pop("execution_budget", None)
     state["hops"] = [
         {"hop_id": 1, "kind": "handoff"},
         {"hop_id": 2, "kind": "report_repair"},
     ]
-    state["route_timeline"] = [
-        {"hop_id": 1, "source_role": "DEV", "route": "DEV"},
-        {
-            "hop_id": 1,
-            "source_role": "DEV",
-            "route": "DEV",
-            "kind": "report_repair",
-        },
-        {"hop_id": 2, "source_role": "DEV", "route": "DEV"},
-    ]
 
-    assert worker._consecutive_self_route_streak(state) == ("DEV", 2)
+    budget = worker._execution_budget(state)
 
-    state["route_timeline"] = state["route_timeline"][1:]
-    assert worker._consecutive_self_route_streak(state) == ("DEV", 1)
+    assert budget["epoch"] == 1
+    assert budget["limit"] == 12
+    assert budget["charged_hop_ids"] == [1, 2]
 
 
-def test_goal_revision_resets_self_route_streak_at_applies_from_hop_boundary(tmp_path: Path):
-    _, _, state, worker = setup_task(tmp_path, task_id="task-self-route-goal-reset")
+def test_goal_revision_does_not_reset_shared_execution_budget(tmp_path: Path):
+    _, _, state, worker = setup_task(tmp_path, task_id="task-goal-budget-stable")
 
     _accept_self_route_guard_decision(worker, state, "PLAN")
     _accept_self_route_guard_decision(worker, state, "PLAN")
@@ -4885,14 +5674,16 @@ def test_goal_revision_resets_self_route_streak_at_applies_from_hop_boundary(tmp
 
     assert state["status"] == "RUNNING"
     assert state["active_hop_id"] == boundary + 1
+    assert state["execution_budget"]["epoch"] == 1
+    assert state["execution_budget"]["charged_hop_ids"] == [1, 2, 3, 4]
 
 
 @pytest.mark.parametrize("operational_kind", ["role_restart", "control"])
-def test_operational_hop_decision_neither_counts_nor_resets_self_route_streak(
+def test_allocated_operational_hops_count_once_in_shared_budget(
     tmp_path: Path, operational_kind: str
 ):
     _, _, state, worker = setup_task(
-        tmp_path, task_id=f"task-self-route-{operational_kind}"
+        tmp_path, task_id=f"task-budget-{operational_kind}"
     )
     _accept_self_route_guard_decision(worker, state, "PLAN")
     _accept_self_route_guard_decision(worker, state, "PLAN")
@@ -4900,12 +5691,10 @@ def test_operational_hop_decision_neither_counts_nor_resets_self_route_streak(
     operational = _active_hop(state)
     operational["kind"] = operational_kind
     _accept_self_route_guard_decision(worker, state, "PLAN")
-    assert state["status"] == "RUNNING"
 
-    third_normal = _accept_self_route_guard_decision(worker, state, "PLAN")
-    assert state["status"] == "BLOCKED"
-    assert state["block_code"] == "consecutive_self_route_limit"
-    assert state["active_hop_id"] == third_normal["hop_id"]
+    assert state["status"] == "RUNNING"
+    assert state["execution_budget"]["charged_hop_ids"] == [1, 2, 3, 4]
+    assert len(set(state["execution_budget"]["charged_hop_ids"])) == 4
 
 
 @pytest.mark.parametrize("action", ["open_tab", "new_chat"])
@@ -5004,8 +5793,60 @@ def test_ambient_old_registered_tabs_keep_auto_allow(status: str, tmp_path: Path
     }
     asyncio.run(worker._maintain_ambient_page_automation(SimpleNamespace(pages=[page])))
 
-    assert ("allow", "history-call") in calls
-    assert "clear" in calls
+    if status in {"DONE", "STOPPED"}:
+        assert calls == []
+    else:
+        assert ("allow", "history-call") in calls
+        assert "clear" in calls
+
+
+def test_worker_source_identity_detects_runtime_config_drift(tmp_path: Path):
+    config, _store, _state, worker = setup_task(tmp_path, task_id="task-source-drift")
+    config_path = config.repository_root / "cdpa.yaml"
+    assert config_path.exists()
+    baseline = worker._source_identity["fingerprint"]
+    assert worker._refresh_source_drift(force=True)["drifted"] is False
+
+    config_path.write_text(config_path.read_text(encoding="utf-8") + "\n# source-drift-test\n", encoding="utf-8")
+
+    drift = worker._refresh_source_drift(force=True)
+    assert drift["drifted"] is True
+    assert "cdpa.yaml" in drift["changed"]
+    assert worker._source_identity["fingerprint"] == baseline
+
+    restarted = CDPAWorker(config, store=_store)
+    assert restarted._source_identity["fingerprint"] != baseline
+    assert restarted._refresh_source_drift(force=True)["drifted"] is False
+
+
+def test_worker_source_identity_covers_dashboard_runtime_but_ignores_task_artifacts(tmp_path: Path):
+    config, _store, _state, worker = setup_task(tmp_path, task_id="task-source-runtime-surface")
+    package = Path(worker_module.__file__).resolve().parent
+    dashboard_api = package / "dashboard_api.py"
+    assert dashboard_api in worker._source_identity_paths()
+
+    dashboard_asset = package / "dashboard_assets" / "app.js"
+    if dashboard_asset.exists():
+        assert dashboard_asset in worker._source_identity_paths()
+
+    task_artifact = config.repository_root / ".plan" / "noise.md"
+    task_artifact.parent.mkdir(parents=True, exist_ok=True)
+    task_artifact.write_text("runtime-irrelevant", encoding="utf-8")
+    assert worker._refresh_source_drift(force=True)["drifted"] is False
+
+
+def test_worker_heartbeat_exposes_lease_and_source_identity(tmp_path: Path):
+    _config, _store, _state, worker = setup_task(tmp_path, task_id="task-heartbeat-identity")
+    worker.runtime_db.ensure_schema()
+    worker._worker_lease_acquired_at = "2026-09-15T12:00:00+00:00"
+    worker._publish_heartbeat(force=True)
+
+    snapshot = worker.runtime_db.get_snapshot("worker")
+    payload = snapshot["payload"]
+    assert payload["lease"]["acquired"] is True
+    assert payload["lease"]["owner_pid"]
+    assert payload["source_identity"]["fingerprint"] == worker._source_identity["fingerprint"]
+    assert payload["reload_required"] is False
 
 
 def test_ambient_old_tab_visible_allow_is_clicked_without_passive_event(tmp_path: Path, monkeypatch):
@@ -5068,4 +5909,4 @@ def test_ambient_old_tab_visible_allow_is_clicked_without_passive_event(tmp_path
     }
     asyncio.run(worker._maintain_ambient_page_automation(SimpleNamespace(pages=[page])))
 
-    assert calls == [None]
+    assert calls == []

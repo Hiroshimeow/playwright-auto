@@ -4,7 +4,13 @@ from contextlib import asynccontextmanager
 import pytest
 
 import playwright_auto.workspace as workspace_module
-from playwright_auto.chatgpt import MessageBaseline, MessageSnapshot, PageBinding, SendReceipt
+from playwright_auto.chatgpt import (
+    MessageBaseline,
+    MessageSnapshot,
+    PageBinding,
+    RateLimitBlockedError,
+    SendReceipt,
+)
 from playwright_auto.workflow import Workflow
 from playwright_auto.workspace import (
     ChatGPTWorkspace,
@@ -264,3 +270,43 @@ def test_parallel_dispatch_can_return_partial_results_without_raising():
     output = result.context.results["dispatch_route"]
     assert set(output["receipts"]) == {"DEV"}
     assert set(output["errors"]) == {"PLAN"}
+
+
+class ChallengeLocator:
+    @property
+    def first(self):
+        return self
+
+    async def wait_for(self, **_options):
+        raise TimeoutError("composer absent")
+
+
+class ChallengePage:
+    url = "about:blank"
+    closed = False
+
+    async def goto(self, _url, **_options):
+        self.url = "https://chatgpt.com/?__cf_chl_rt_tk=challenge-token"
+
+    def locator(self, _selector):
+        return ChallengeLocator()
+
+    async def close(self):
+        self.closed = True
+
+
+class ChallengeContext:
+    def __init__(self):
+        self.page = ChallengePage()
+
+    async def new_page(self):
+        return self.page
+
+
+def test_open_role_classifies_cloudflare_challenge_as_retryable_rate_limit():
+    context = ChallengeContext()
+
+    with pytest.raises(RateLimitBlockedError, match="Cloudflare challenge"):
+        asyncio.run(ChatGPTWorkspace().open_role(context, "PLAN"))
+
+    assert context.page.closed is True

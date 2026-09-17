@@ -39,7 +39,8 @@ def test_pristine_pool_failover_preserves_request_and_records_new_endpoint(tmp_p
     _, store, state, worker = setup_task(tmp_path)
     hop = module._active_hop(state)
     asyncio.run(worker._pre_send(state, hop, FakeActions()))
-    original = (state["task_id"], hop["hop_id"], hop["request_id"], hop["prompt"])
+    original = (state["task_id"], hop["hop_id"], hop["request_id"])
+    original_prompt = hop["prompt"]
     source = store.endpoints.resolve()["endpoint_id"]
     target = store.endpoints.add("9202")["endpoint_id"]
     constructor = module.task_workflow_definitions(state, worker.config)["PLAN"]["system_prompt"]
@@ -60,22 +61,37 @@ def test_pristine_pool_failover_preserves_request_and_records_new_endpoint(tmp_p
             return replace(await super().assert_ownership(), page_role=hop["physical_role"])
     client = Client()
     client.binding = replace(client.binding, role=hop["physical_role"])
-    monkeypatch.setattr(module, "CDPATabActions", lambda *a, **kw: RecordingCDPASendActions(client))
+    class Actions(RecordingCDPASendActions):
+        async def acquire(self, *_args, **_kwargs):
+            return module.AcquiredRole(
+                client=self.client,
+                page_id="page-PLAN",
+                url="https://chatgpt.com/",
+                created=True,
+                new_chat=True,
+            )
+    monkeypatch.setattr(module, "CDPATabActions", lambda *a, **kw: Actions(client))
     for name in ("_maintain_ambient_page_automation", "_refresh_rate_limit_cooldown", "_close_idle_independent_tabs"):
         monkeypatch.setattr(worker, name, _noop)
     async def run():
         pool = await _pool(store)
         try:
             await pool.mark_unavailable(source, "test partition")
-            await worker.run_once_pool(pool)
+            for _ in range(3):
+                await worker.run_once_pool(pool)
+                worker.registry.update_task(
+                    store.load(state["manifest_path"]), now=0
+                )
         finally:
             await pool.close()
     asyncio.run(run())
     saved = store.load(state["manifest_path"])
     active = module._active_hop(saved)
     assert saved["status"] != "BLOCKED", (saved.get("block_code"), saved.get("block_reason"))
-    assert (saved["task_id"], active["hop_id"], active["request_id"], active["prompt"]) == original
-    assert len(client.send_calls) == 1
+    assert (saved["task_id"], active["hop_id"], active["request_id"]) == original
+    assert active["prompt"] != original_prompt
+    assert "RECOVERY_SNAPSHOT" in active["prompt"]
+    assert client.send_calls == [active["prompt"]]
     assert ledger.peek(record.request_id).attempts == 1
     assert saved["roles"]["PLAN"]["browser_endpoint_id"] == target
     assert active["browser_endpoint_id"] == target

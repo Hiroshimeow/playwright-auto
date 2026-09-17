@@ -1452,3 +1452,13 @@ Mục tiêu của report là cho thấy flow thực tế đã được kiểm ch
 Final architecture principle:
 
 > CDP endpoints are a capacity pool. Durable workflow state belongs to CDPA/workspace, not to a browser account. Preserve Send safety, then use any available endpoint to keep the task moving toward DONE.
+
+## Astra follow-up resolution evidence — 2026-09-13
+
+- The six findings from the first Astra review are integrated in the current feature worktree: accepted/ambiguous execution reconciliation now distinguishes CDP connectivity from allocation readiness; draining endpoints remain protected by unresolved durable accepted/ambiguous requests; pristine relocation keeps the same request ID while rebuilding prompt/context for the new generation and fails closed when durable proof is missing or corrupt.
+- Managed-browser follow-up uses NUL-delimited POSIX argv parsing so profile paths with spaces remain intact, and canonical profile-path locks serialize start/clone operations across endpoint IDs with deterministic source/destination ordering.
+- Partial endpoint disconnect is projected as unknown rather than confirmed offline for roles assigned to an unobservable endpoint; task availability becomes unknown when no role is confirmed online but at least one is unobservable.
+- Multi-endpoint stability follow-up adds durable independent-agent browser affinity, requested-endpoint board visibility before allocation while actual placement wins afterward, PLAN turn-1 prompt de-duplication, cross-cycle semantic LISTEN/CTRL event de-duplication, terminal/unowned observation stop, immediate advancement after a valid route/report, and Windows Clear Team page-close tolerance.
+- Operator documentation/help now states the shared browser pool, global dependency semantics, browser endpoint preference/affinity, Temporary/Persistent behavior, rate-limit scope, and supported controls.
+- Focused regression after integration: `322 passed, 5 failed, 2 skipped`; all five failures are in the previously documented baseline set (Windows `SIGALRM`, two legacy projection/symlink cases, symlink report privilege, legacy inline-conflict recovery). Targeted new/changed-behavior gate: `22 passed, 2 skipped`.
+- `uv run python -m compileall -q src tests` and `git diff --check` are clean aside from expected Git CRLF conversion warnings. The final full-suite run and single post-fix Astra review are recorded in the task evidence after completion.

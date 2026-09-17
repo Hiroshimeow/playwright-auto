@@ -117,8 +117,28 @@ def test_new_triggered_agent_ignores_history_and_opens_only_for_a_new_event(
     assert persisted["independent"]["active_event"]["target_task_id"] == "new-done"
 
 
+def test_workflow_create_api_canonicalizes_required_browser_endpoint(tmp_path: Path):
+    config, store, _state, worker = setup_agent(tmp_path)
+    gmail = store.endpoints.add("9202")
+    api = DashboardAPI(config, db=worker.runtime_db)
+
+    payload = api.normalize_create(
+        {
+            "task": "Gmail child workflow",
+            "required_browser_endpoint_id": "localhost:9202",
+        }
+    )
+
+    assert payload["required_browser_endpoint_id"] == gmail["endpoint_id"]
+    with pytest.raises(Exception, match="not registered"):
+        api.normalize_create(
+            {"task": "Bad Gmail child", "required_browser_endpoint_id": "9302"}
+        )
+
+
 def test_command_dispatch_is_idempotent_and_persists_instruction(tmp_path: Path):
     config, store, state, worker = setup_agent(tmp_path)
+    gmail = store.endpoints.add("9202")
     worker.hydrate_runtime()
     api = DashboardAPI(config, db=worker.runtime_db)
     assert api.normalize_independent_run({}) == {"trigger_type": "manual"}
@@ -128,12 +148,25 @@ def test_command_dispatch_is_idempotent_and_persists_instruction(tmp_path: Path)
         api.normalize_independent_run(
             {"trigger_type": "check_all", "instruction": "Not valid."}
         )
+    with pytest.raises(Exception, match="not registered"):
+        api.normalize_independent_run(
+            {"required_browser_endpoint_id": "9302"}
+        )
+    with pytest.raises(Exception, match="manual"):
+        api.normalize_independent_run(
+            {
+                "trigger_type": "check_all",
+                "required_browser_endpoint_id": gmail["endpoint_id"],
+            }
+        )
     payload = api.normalize_independent_run(
         {
             "trigger_type": "manual",
             "instruction": "Inspect only the selected task.",
+            "required_browser_endpoint_id": "localhost:9202",
         }
     )
+    assert payload["required_browser_endpoint_id"] == gmail["endpoint_id"]
     first = api.enqueue(
         idempotency_key="same-command",
         kind="independent_run_now",
@@ -154,6 +187,8 @@ def test_command_dispatch_is_idempotent_and_persists_instruction(tmp_path: Path)
     assert persisted["independent"]["active_event"]["instruction"] == (
         "Inspect only the selected task."
     )
+    assert persisted["independent"]["active_event"]["required_browser_endpoint_id"] == gmail["endpoint_id"]
+    assert persisted["independent"]["browser_endpoint_id"] is None
     assert persisted["applied_command_ids"].count(first["command_id"]) == 1
     assert '"instruction": "Inspect only the selected task."' in (
         _active_hop(persisted)["handoff"]
@@ -502,6 +537,8 @@ def test_board_uses_operator_labels_run_task_and_restored_settings():
     assert 'body: {trigger_type: "manual", instruction}' in app
     assert '/api/independent-agents/${encodeURIComponent(taskId)}/reset' in app
     assert '.filter(item => !item.agent?.deleted_at)' in app
-    assert 'app.js?v=20260913-multi-cdp-v1' in html
-    assert 'dashboard.css?v=20260913-multi-cdp-v1' in html
+    assert 'app.js?v=20260915-operator-ux-v1' in html
+    assert 'dashboard.css?v=20260915-operator-ux-v1' in html
+    assert 'function addEditedBrowserEndpoint(body, select, values)' in app
+    assert 'if (selected !== initial) body.browser_endpoint_id = selected || null;' in app
     assert "new_chat_next_job" not in html[html.index('id="agent-settings-dialog"') :]

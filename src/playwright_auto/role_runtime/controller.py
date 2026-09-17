@@ -54,8 +54,6 @@ class RoleController:
         if phase == "pre_send":
             if ctx.active:
                 return self._remember(ctx, Decision(Action.WAIT, "response_in_progress"))
-            if ctx.draft_present:
-                return self._remember(ctx, Decision(Action.WAIT, "manual_draft_preserved"))
             if getattr(snapshot, "error_texts", ()):
                 decision = ui_error.handle(ctx)
                 return self._remember(ctx, decision or Decision(Action.WAIT, "ui_error"))

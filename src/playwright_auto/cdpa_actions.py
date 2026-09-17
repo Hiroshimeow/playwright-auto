@@ -17,6 +17,7 @@ from .chatgpt import (
     ManualInputPendingError,
     PageBinding,
     RateLimitBlockedError,
+    UnsafePageStateError,
     action_delay,
     action_delay_multiplier,
     backend_stream_status as read_backend_stream_status,
@@ -369,74 +370,45 @@ class CDPATabActions:
             new_chat=False,
         )
 
-    async def _sanitize_new_branch_composer(
+    async def _clean_target_composer(
         self,
         client: ChatGPTPage,
         *,
         timeout_ms: int,
     ) -> None:
-        async def inspect(phase: str) -> Any:
-            try:
-                return await client.assert_ownership()
-            except Exception as exc:
-                raise ComposerConflictError(
-                    f"new branch composer {phase} inspection failed: "
-                    f"{type(exc).__name__}: {exc}"
-                ) from exc
-
-        snapshot = await inspect("initial")
+        snapshot = await client.assert_ownership()
         limited = rate_limit_dialogs(snapshot)
         if limited:
             raise RateLimitBlockedError(
-                f"request rate limit blocks branch composer cleanup: {list(limited)!r}"
+                f"request rate limit blocks target composer cleanup: {list(limited)!r}"
             )
+        if snapshot.stop_visible:
+            raise UnsafePageStateError("page is already responding")
         if snapshot.attachment_markers:
-            raise ManualInputPendingError(
-                "new branch page contains attachments; automated composer cleanup blocked"
+            await client.clear(
+                force=True,
+                discard_attachments=True,
+                timeout_ms=timeout_ms,
             )
-
-        draft = snapshot.composer_text.strip()
-        if not draft:
-            return
-        if (
-            snapshot.requires_login
-            or not snapshot.composer_present
-            or not snapshot.composer_editable
-            or snapshot.stop_visible
-            or snapshot.blocking_dialogs
-            or str(getattr(snapshot.state, "value", snapshot.state)) == "error"
-        ):
-            raise ManualInputPendingError(
-                "new branch page has ambiguous state with composer text; automated cleanup blocked"
-            )
-
+        elif snapshot.composer_text.strip():
+            try:
+                await clear_composer(client.page, timeout_ms=timeout_ms)
+            except Exception as exc:
+                raise ComposerConflictError(
+                    f"target composer cleanup failed: {type(exc).__name__}: {exc}"
+                ) from exc
+        clean = await client.wait_until_clean_ready(timeout_ms=timeout_ms)
+        if clean.composer_text.strip() or clean.attachment_markers:
+            raise ComposerConflictError("target composer did not become empty")
+        await asyncio.sleep(0.1)
         try:
-            await clear_composer(client.page, timeout_ms=timeout_ms)
+            stable = await client.assert_ownership()
         except Exception as exc:
             raise ComposerConflictError(
-                f"new branch composer clear failed: {type(exc).__name__}: {exc}"
+                f"target composer cleanup verification failed: {type(exc).__name__}: {exc}"
             ) from exc
-
-        immediate = await inspect("post-clear")
-        if rate_limit_dialogs(immediate):
-            raise RateLimitBlockedError("request rate limit appeared during branch composer cleanup")
-        if immediate.attachment_markers:
-            raise ManualInputPendingError(
-                "attachments appeared during new branch composer cleanup"
-            )
-        if immediate.composer_text.strip():
-            raise ComposerConflictError("new branch composer did not become empty")
-
-        await asyncio.sleep(0.1)
-        stable = await inspect("stable-empty")
-        if rate_limit_dialogs(stable):
-            raise RateLimitBlockedError("request rate limit appeared after branch composer cleanup")
-        if stable.attachment_markers:
-            raise ManualInputPendingError(
-                "attachments appeared after new branch composer cleanup"
-            )
-        if stable.composer_text.strip():
-            raise ComposerConflictError("new branch composer rehydrated after cleanup")
+        if stable.composer_text.strip() or stable.attachment_markers:
+            raise ComposerConflictError("target composer rehydrated after cleanup")
 
     @staticmethod
     def _watch_new_branch_response(page: Any) -> tuple[asyncio.Future[Any], Any]:
@@ -541,6 +513,7 @@ class CDPATabActions:
         *,
         source_conversation_id: str,
         assistant_message_id: str,
+        clean_for_send: bool = False,
     ) -> AcquiredRole:
         try:
             logical_role = str(logical_role).upper()
@@ -584,8 +557,10 @@ class CDPATabActions:
                 timeout_ms=timeout,
                 force_new_page_id=True,
             )
-            await self._sanitize_new_branch_composer(client, timeout_ms=timeout)
-            await client.wait_until_clean_ready(timeout_ms=timeout)
+            if clean_for_send:
+                await self._clean_target_composer(client, timeout_ms=timeout)
+            else:
+                await client.wait_until_clean_ready(timeout_ms=timeout)
             candidate_id = await self._new_branch_conversation_id(
                 branch_response, timeout_ms=timeout
             )
@@ -647,6 +622,8 @@ class CDPATabActions:
         self,
         manifest: Mapping[str, Any],
         logical_role: str,
+        *,
+        clean_for_send: bool = False,
     ) -> AcquiredRole:
         logical_role = str(logical_role).upper()
         role_record = manifest["roles"][logical_role]
@@ -669,11 +646,21 @@ class CDPATabActions:
                 timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
             )
             snapshot = await client.assert_ownership()
+            if clean_for_send:
+                await self._clean_target_composer(
+                    client,
+                    timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
+                )
             await client.bind_task_identity(task_id, team)
             new_chat = False
         else:
             client, snapshot = matches[0]
             await client.assert_ownership()
+            if clean_for_send:
+                await self._clean_target_composer(
+                    client,
+                    timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
+                )
             force_new = bool(
                 role_record.get("reset_requested")
                 and role_record.get("reset_applied_generation")
@@ -896,12 +883,92 @@ class CDPATabActions:
             await client.page.close()
             raise
 
+    async def restart_exact(
+        self,
+        manifest: Mapping[str, Any],
+        logical_role: str,
+        *,
+        url: str,
+    ) -> AcquiredRole:
+        if _reopenable_conversation_identity(url) is None:
+            raise RoleOwnershipError(
+                "Solo restart requires an exact ChatGPT /c/... conversation URL",
+                code="conversation_identity_unavailable",
+            )
+        existing = await self.locate_owned(manifest, logical_role)
+        if existing is not None:
+            page = getattr(existing.client, "page", None)
+            if page is not None and not page.is_closed():
+                await page.close()
+        return await self.adopt_conversation(
+            manifest,
+            logical_role,
+            url=url,
+        )
+
+    async def adopt_conversation(
+        self,
+        manifest: Mapping[str, Any],
+        logical_role: str,
+        *,
+        url: str,
+    ) -> AcquiredRole:
+        logical_role = str(logical_role).upper()
+        record = manifest["roles"][logical_role]
+        expected = _reopenable_conversation_identity(url)
+        if expected is None:
+            raise RoleOwnershipError(
+                "Solo conversation URL is not an exact ChatGPT /c/... identity",
+                code="conversation_identity_unavailable",
+            )
+        physical = str(record["physical_role"])
+        await random_delay(action_delay_multiplier("open_tab"))
+        workspace = ChatGPTWorkspace()
+        client = await workspace.open_role(
+            self.browser_context,
+            physical,
+            url=url,
+            timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
+            force_new_page_id=True,
+        )
+        try:
+            snapshot = await client.assert_ownership()
+            if _reopenable_conversation_identity(snapshot.url) != expected:
+                raise RoleOwnershipError(
+                    "Solo conversation URL redirected away from the requested conversation",
+                    code="conversation_identity_unavailable",
+                )
+            await client.bind_task_identity(
+                str(manifest["task_id"]),
+                str(manifest["team"]),
+            )
+            snapshot = await client.assert_ownership()
+            if _reopenable_conversation_identity(snapshot.url) != expected:
+                raise RoleOwnershipError(
+                    "Solo conversation identity changed while binding task ownership",
+                    code="conversation_identity_unavailable",
+                )
+            assert client.binding is not None
+            await self._set_page_active(client.page)
+            return AcquiredRole(
+                client=client,
+                page_id=client.binding.page_id,
+                url=str(snapshot.url),
+                created=True,
+                new_chat=False,
+                conversation_id=expected.rsplit("/", 1)[-1],
+            )
+        except Exception:
+            await client.page.close()
+            raise
+
     async def fresh_chat(
         self,
         manifest: Mapping[str, Any],
         logical_role: str,
         *,
         url: str,
+        clean_for_send: bool = False,
     ) -> AcquiredRole:
         logical_role = str(logical_role).upper()
         record = manifest["roles"][logical_role]
@@ -923,6 +990,11 @@ class CDPATabActions:
             force_new_page_id=True,
         )
         try:
+            if clean_for_send:
+                await self._clean_target_composer(
+                    client,
+                    timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
+                )
             await client.bind_task_identity(str(manifest["task_id"]), str(manifest["team"]))
             snapshot = await client.assert_ownership()
             assert client.binding is not None
@@ -1160,6 +1232,7 @@ class CDPATabActions:
             except Exception as exc:
                 if page.is_closed():
                     closed += 1
+                    continue
                 raise TeamCloseError(
                     f"failed to close an assigned team tab: {type(exc).__name__}: {exc}",
                     closed_tabs=closed,

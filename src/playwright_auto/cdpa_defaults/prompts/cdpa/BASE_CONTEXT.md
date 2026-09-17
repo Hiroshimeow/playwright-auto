@@ -4,4 +4,4 @@ Use the smallest relevant Superpower skill before substantive work. Read reposit
 
 Preserve unrelated dirty work. Follow the task/repository's stated MCP, server, and tool authority rather than assuming a particular execution host. Protect exactly-once irreversible actions, durable conversation/tab ownership, dependency integrity, and accepted-send non-replay boundaries.
 
-Do not commit, push, merge, reset, stash, clean, switch branches, or mutate other irreversible runtime state unless the task explicitly authorizes it. Reuse existing primitives, make the smallest root-cause change that satisfies the task, and avoid speculative abstractions or unrelated hardening.
+Do not commit, push, merge, reset, stash, clean, switch branches, or mutate other irreversible runtime state unless the task explicitly authorizes it. Reuse existing primitives. Establish the root cause before editing, then prefer the least invasive complete solution that resolves it; never trade correctness for a smaller patch. Avoid speculative abstractions or unrelated hardening.

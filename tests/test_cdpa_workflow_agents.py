@@ -152,8 +152,8 @@ def test_worker_custom_hop_uses_snapshotted_prompt_and_dynamic_routes(tmp_path: 
     asyncio.run(worker._pre_send(state, hop, FakeActions()))
 
     assert "CUSTOM_WORKER_PROMPT_MARKER" in hop["prompt"]
-    prefix = f"alpha · role: {route_key.lower()}\n"
-    envelope = json.loads(hop["prompt"].split("\n\nCUSTOM_WORKER_PROMPT_MARKER", 1)[0].removeprefix(prefix))
+    envelope_text = hop["prompt"].split("TURN_CONTEXT\n", 1)[1]
+    envelope, _ = json.JSONDecoder().raw_decode(envelope_text)
     assert envelope["allowed-routes"] == ["PLAN", "REVIEW", route_key, "PAUSE", "DONE"]
     assert "PAUSE" not in state["roles"]
 
@@ -192,7 +192,10 @@ def test_custom_agent_receives_real_hop_and_routes_onward(tmp_path: Path):
     asyncio.run(worker._pre_send(state, plan_hop, actions))
     plan_report = tmp_path / plan_hop["expected_report_path"]
     plan_report.parent.mkdir(parents=True, exist_ok=True)
-    plan_report.write_text("Verified custom workflow routing.", encoding="utf-8")
+    plan_report.write_text(
+        f"# PLAN report\n\n## Evidence\n- Inspected `file=tests/test_cdpa_workflow_agents.py` for route registration.\n- `checks=1` -> custom route selection verified for `{route_key}`.\n",
+        encoding="utf-8",
+    )
     plan_hop["response"] = json.dumps(
         {"route": route_key, "handoff": plan_hop["expected_report_path"]}
     )
@@ -205,7 +208,10 @@ def test_custom_agent_receives_real_hop_and_routes_onward(tmp_path: Path):
     assert "REAL_CUSTOM_HOP_PROMPT" in custom_hop["prompt"]
     custom_report = tmp_path / custom_hop["expected_report_path"]
     custom_report.parent.mkdir(parents=True, exist_ok=True)
-    custom_report.write_text("Custom agent evidence.", encoding="utf-8")
+    custom_report.write_text(
+        f"# Custom report\n\n## Evidence\n- Inspected `file=tests/test_cdpa_workflow_agents.py` for the custom-role prompt and route.\n- `checks=1` -> custom workflow execution verified for `{route_key}`.\n",
+        encoding="utf-8",
+    )
     custom_hop["response"] = json.dumps(
         {"route": "REVIEW", "handoff": custom_hop["expected_report_path"]}
     )

@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from .chatgpt import ChatGPTPage, PageBinding, validate_page_role
+from .chatgpt import ChatGPTPage, PageBinding, RateLimitBlockedError, validate_page_role
 
 
 class WorkspaceBindingError(RuntimeError):
@@ -126,8 +126,13 @@ class ChatGPTWorkspace:
                 timeout_ms=timeout_ms,
                 force_new_page_id=force_new_page_id,
             )
-        except Exception:
+        except Exception as exc:
+            cloudflare_challenge = "__cf_chl_rt_tk=" in str(getattr(page, "url", ""))
             await page.close()
+            if cloudflare_challenge:
+                raise RateLimitBlockedError(
+                    "Cloudflare challenge blocked fresh ChatGPT page readiness"
+                ) from exc
             raise
 
     async def attach_existing(

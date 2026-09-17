@@ -4,11 +4,13 @@ These instructions apply to the entire repository.
 
 ## Primary task entrypoint
 
-After a free-form discussion becomes an actionable task, read this file and `LEARNING.md`, then submit the task through `cdpa` instead of directly editing the repository:
+After a free-form discussion becomes an actionable task, read this file and `LEARNING.md`, then submit the task through `cdpa` instead of directly editing the repository. The direct chat coordinator owns this intake step: once clarification is sufficient, normalize the request into one complete normal workflow task and submit it directly. Do not put Manual Dispatcher or an Independent Agent in the critical path merely to re-dispatch the same request.
 
 ```bash
 cdpa "<complete task with scope, constraints, acceptance evidence, and repository path>"
 ```
+
+Normal workflow intake does not depend on any enabled Independent Agent. Independent Agents are reserved for supervision, recovery, monitoring, and other explicit agent jobs. Leave execution endpoint placement to the existing worker/pool unless the user explicitly requests a specific endpoint; intake should not consume a browser slot or pin capacity just to dispatch.
 
 Optional task-start controls:
 
@@ -29,6 +31,15 @@ cdpa --team <exact-existing-team>
 - `--new-all` applies that rule lazily to every role PLAN later selects.
 - Bootstrap selection follows the task's primary MCP execution surface, never the CDPA host/browser: `mcp-g8` -> `g8-bootstrap`; `mcp-thinkbook` -> `thinkbook-bootstrap`; `mcp-docker` / a5 -> `a5docker-bootstrap`. For a multi-MCP task, select the bootstrap for the primary execution MCP. Use `--bootstrap <id>` for an explicit bootstrap or `--fresh` for Fresh context; omitting both preserves the enabled-default behavior. Resume preserves the task's existing bootstrap and must not change it.
 - `cdpa` creates the task and returns immediately. Progress and controls live on the Kanban dashboard.
+
+## Multi-browser operator model
+
+- Registered CDP endpoints form one shared browser-capacity pool. Endpoint IDs are durable configuration identities; a live page is identified by `(endpoint_id, page_id)`. Workflow `--browser` / dashboard **Initial browser** is an initial placement preference, not permanent ownership: pristine pre-Send work may move when capacity requires it, while accepted or ambiguous Send remains bound to the exact execution until reconciled.
+- Independent-agent `cdpa independent create ... --browser <endpoint>` and `cdpa independent config <task-id> --browser <endpoint>` set durable browser affinity. A pinned independent agent waits in `WAITING/browser_pool` when that endpoint is unavailable, full, draining, or cooling down instead of silently relocating for capacity. Accepted/ambiguous execution recovery remains stricter than affinity and follows the exact durable Send provenance.
+- Dependencies are global by task ID, not browser-local. A task on one endpoint may depend on a task executing on another endpoint; endpoint filtering in the dashboard is only a view. Before a role is actually placed, the requested endpoint is shown; after placement, the role's actual endpoint wins.
+- `--temp` forces Temporary Chat with Fresh context. Persistent workflow conversations may use the configured bootstrap policy. Independent agents default to a fresh Temporary Chat per job; `--persistent-chat` reuses persistent conversation context instead. Losing an ephemeral conversation mid-job still fails closed rather than replaying accepted work.
+- Each endpoint has a `rate_limit_scope`; endpoints sharing the same scope share cooldown. The default scope is endpoint-local. Cooldown blocks new mutations/allocations for that scope but does not authorize replay or destroy owned tabs.
+- Supported durable workflow controls are Resume, Change goal, Route PLAN, Retry only for structured retryable blocks, Pause, Stop, Restart role, New chat, Open tab, and Clear team. Use dashboard/API controls rather than manual browser steering or manifest edits.
 
 ## Task-writing contract
 

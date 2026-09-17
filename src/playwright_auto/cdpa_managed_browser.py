@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -8,7 +9,7 @@ import signal
 import socket
 import subprocess
 import tempfile
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 from urllib.parse import urlsplit
@@ -129,6 +130,15 @@ def _endpoint_online(address: str) -> bool:
         return False
 
 
+def _profile_arg_from_argv(argv: list[str]) -> str | None:
+    for index, argument in enumerate(argv):
+        if argument.startswith('--user-data-dir='):
+            return argument.split('=', 1)[1]
+        if argument == '--user-data-dir' and index + 1 < len(argv):
+            return argv[index + 1]
+    return None
+
+
 def _profile_in_use(profile: Path) -> bool:
     """Read browser command lines only to compare explicit profile paths; do not log them."""
     if not profile.exists():
@@ -143,7 +153,7 @@ def _profile_in_use(profile: Path) -> bool:
         commands = []
         for path in Path('/proc').glob('[0-9]*/cmdline'):
             try:
-                commands.append(path.read_bytes()[:65536].replace(b'\0', b' ').decode('utf-8', 'replace'))
+                commands.append(path.read_bytes()[:65536].split(b'\0'))
             except (FileNotFoundError, PermissionError, ProcessLookupError):
                 continue
     else:
@@ -151,8 +161,12 @@ def _profile_in_use(profile: Path) -> bool:
         commands = result.stdout.splitlines()
     wanted = os.path.normcase(str(profile.resolve()))
     for command in commands:
-        match = re.search(r'(?:^|\s)(?:"--user-data-dir=([^"]+)"|--user-data-dir(?:=|\s+)(?:"([^"]+)"|(\S+)))', str(command or ''))
-        value = next((part for part in match.groups() if part is not None), None) if match else None
+        if isinstance(command, list):
+            argv = [part.decode('utf-8', 'replace') for part in command if part]
+            value = _profile_arg_from_argv(argv)
+        else:
+            match = re.search(r'(?:^|\s)(?:"--user-data-dir=([^"]+)"|--user-data-dir(?:=|\s+)(?:"([^"]+)"|(\S+)))', str(command or ''))
+            value = next((part for part in match.groups() if part is not None), None) if match else None
         if value and os.path.normcase(str(Path(value).resolve())) == wanted:
             return True
     return False
@@ -188,6 +202,19 @@ class ManagedBrowserLifecycle:
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', endpoint_id):
             raise ValueError('invalid browser endpoint identity')
         return self.runtime_root / endpoint_id
+
+    def _profile_lock_path(self, profile: Path) -> Path:
+        canonical = os.path.normcase(str(profile.resolve()))
+        digest = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+        return self.runtime_root / 'profile-locks' / f'{digest}.lock'
+
+    @contextmanager
+    def _profile_locks(self, *profiles: Path) -> Iterator[None]:
+        unique = sorted({profile.resolve() for profile in profiles}, key=lambda path: os.path.normcase(str(path)))
+        with ExitStack() as stack:
+            for profile in unique:
+                stack.enter_context(exclusive_file_lock(self._profile_lock_path(profile)))
+            yield
 
     def pid_file(self, endpoint_id: str) -> Path:
         return self.runtime_dir(endpoint_id) / 'browser.pid'
@@ -233,13 +260,19 @@ class ManagedBrowserLifecycle:
     def prepare_profile(self, *, profile_path: str, clone_from: Mapping[str, Any] | None = None,
                         source_running: bool = False) -> Path:
         target = _profile_path(profile_path)
+        source = None
+        if clone_from is not None:
+            source_record = self._managed(clone_from)
+            source = _profile_path(str(source_record['profile_path']))
+        with self._profile_locks(*(path for path in (source, target) if path is not None)):
+            return self._prepare_profile_locked(target, source, source_running)
+
+    def _prepare_profile_locked(self, target: Path, source: Path | None, source_running: bool) -> Path:
         if _profile_in_use(target):
             raise ValueError('target profile is in use by a running browser')
-        if clone_from is None:
+        if source is None:
             target.mkdir(parents=True, exist_ok=True)
             return target
-        source_record = self._managed(clone_from)
-        source = _profile_path(str(source_record['profile_path']))
         if source == target or target.is_relative_to(source) or source.is_relative_to(target):
             raise ValueError('clone source and target must not overlap')
         if source_running or _profile_in_use(source):
@@ -275,33 +308,37 @@ class ManagedBrowserLifecycle:
                 return existing
             if _endpoint_online(record['cdp_url']):
                 raise ValueError('CDP port is occupied by an unowned browser; attach as external instead')
-            profile = self.prepare_profile(profile_path=record['profile_path'])
-            executable = str(record.get('executable_path') or resolve_chromium())
-            if not Path(executable).is_file() and not shutil.which(executable):
-                raise ValueError('Chromium executable not found; supply executable_path')
-            parsed = urlsplit(record['cdp_url'])
-            command = [executable, f'--remote-debugging-address={parsed.hostname}', f'--remote-debugging-port={parsed.port}',
-                       f'--user-data-dir={profile}', '--no-first-run', '--no-default-browser-check', 'https://chatgpt.com/']
-            kwargs: dict[str, Any] = {'cwd': str(self.config.repository_root), 'env': dict(os.environ), 'stderr': subprocess.STDOUT}
-            if os.name == 'nt':
-                kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                kwargs['start_new_session'] = True
-            with self.log_file(endpoint_id).open('ab') as log:
-                process = self.popen_factory(command, stdout=log, **kwargs)
-            pid = int(process.pid)
-            started = self.process_token(pid)
-            if started is None:
-                raise RuntimeError('managed browser exited before process identity could be recorded; inspect browser.log')
-            receipt = {'endpoint_id': endpoint_id, 'pid': pid, 'started': started, 'profile_path': str(profile), 'cdp_url': record['cdp_url']}
-            temporary = runtime / 'process.json.tmp'
-            with temporary.open('w', encoding='utf-8') as handle:
-                json.dump(receipt, handle)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, runtime / 'process.json')
-            self.pid_file(endpoint_id).write_text(str(pid), encoding='utf-8')
-            return pid
+            profile = _profile_path(record['profile_path'])
+            with self._profile_locks(profile):
+                if _profile_in_use(profile):
+                    raise ValueError('target profile is in use by a running browser')
+                profile.mkdir(parents=True, exist_ok=True)
+                executable = str(record.get('executable_path') or resolve_chromium())
+                if not Path(executable).is_file() and not shutil.which(executable):
+                    raise ValueError('Chromium executable not found; supply executable_path')
+                parsed = urlsplit(record['cdp_url'])
+                command = [executable, f'--remote-debugging-address={parsed.hostname}', f'--remote-debugging-port={parsed.port}',
+                           f'--user-data-dir={profile}', '--no-first-run', '--no-default-browser-check', 'https://chatgpt.com/']
+                kwargs: dict[str, Any] = {'cwd': str(self.config.repository_root), 'env': dict(os.environ), 'stderr': subprocess.STDOUT}
+                if os.name == 'nt':
+                    kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
+                else:
+                    kwargs['start_new_session'] = True
+                with self.log_file(endpoint_id).open('ab') as log:
+                    process = self.popen_factory(command, stdout=log, **kwargs)
+                pid = int(process.pid)
+                started = self.process_token(pid)
+                if started is None:
+                    raise RuntimeError('managed browser exited before process identity could be recorded; inspect browser.log')
+                receipt = {'endpoint_id': endpoint_id, 'pid': pid, 'started': started, 'profile_path': str(profile), 'cdp_url': record['cdp_url']}
+                temporary = runtime / 'process.json.tmp'
+                with temporary.open('w', encoding='utf-8') as handle:
+                    json.dump(receipt, handle)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, runtime / 'process.json')
+                self.pid_file(endpoint_id).write_text(str(pid), encoding='utf-8')
+                return pid
 
     def stop(self, record: Mapping[str, Any]) -> bool:
         record = self._managed(record)

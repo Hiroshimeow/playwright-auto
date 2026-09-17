@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict","confidence","executive_assessment","current_waiting_team_action","source_health_task_action","plan_markdown","team_name","team_task_text","start_recommended","revised_audit_markdown"],
+  "properties": {
+    "verdict": {"type":"string","enum":["PASS","REVISE","REJECT"]},
+    "confidence": {"type":"string","enum":["high","medium","low"]},
+    "executive_assessment": {"type":"string"},
+    "strengths": {"type":"array","items":{"type":"string"}},
+    "problems": {"type":"array","items":{"type":"string"}},
+    "retain_invariants": {"type":"array","items":{"type":"string"}},
+    "simplify_or_remove": {"type":"array","items":{"type":"string"}},
+    "risks": {"type":"array","items":{"type":"string"}},
+    "current_waiting_team_action": {"type":"string","enum":["START_AS_IS","STOP_AND_REPLACE","KEEP_WAITING"]},
+    "source_health_task_action": {"type":"string","enum":["LEAVE_PAUSED","STOP","RESUME_LATER"]},
+    "plan_markdown": {"type":"string"},
+    "team_name": {"type":"string"},
+    "team_task_text": {"type":"string"},
+    "start_recommended": {"type":"boolean"},
+    "revised_audit_markdown": {"type":["string","null"]}
+  }
+}

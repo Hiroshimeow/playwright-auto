@@ -1,5 +1,7 @@
 const path = require("path");
 const root = __dirname;
+const isWindows = process.platform === "win32";
+const venvExe = (name) => path.join(root, ".venv", "Scripts", `${name}.exe`);
 module.exports = {
   apps: [
     {
@@ -51,8 +53,9 @@ module.exports = {
     {
       name: "playwright-dashboard-api",
       cwd: root,
-      script: path.join(root, "scripts/dashboard-api-start.sh"),
-      interpreter: "/bin/bash",
+      script: isWindows ? venvExe("playwright-dashboard-api") : path.join(root, "scripts/dashboard-api-start.sh"),
+      args: isWindows ? ["--repository", root, "--config", path.join(root, "cdpa.yaml")] : [],
+      interpreter: isWindows ? "none" : "/bin/bash",
       autorestart: true,
       min_uptime: "5s",
       max_restarts: 20,
@@ -61,8 +64,9 @@ module.exports = {
     {
       name: "playwright-dashboard",
       cwd: root,
-      script: path.join(root, "scripts/dashboard-start.sh"),
-      interpreter: "/bin/bash",
+      script: isWindows ? venvExe("playwright-dashboard") : path.join(root, "scripts/dashboard-start.sh"),
+      args: isWindows ? ["--repository", root, "--host", "0.0.0.0", "--port", "9224", "--config", path.join(root, "cdpa.yaml")] : [],
+      interpreter: isWindows ? "none" : "/bin/bash",
       autorestart: true,
       min_uptime: "5s",
       max_restarts: 20,
@@ -71,12 +75,26 @@ module.exports = {
     {
       name: "playwright-cdpa-worker",
       cwd: root,
-      script: path.join(root, "scripts/cdpa-worker-start.sh"),
-      interpreter: "/bin/bash",
+      script: isWindows ? venvExe("cdpa-worker") : path.join(root, "scripts/cdpa-worker-start.sh"),
+      args: isWindows ? ["--repository", root, "--config", path.join(root, "cdpa.yaml")] : [],
+      interpreter: isWindows ? "none" : "/bin/bash",
       autorestart: true,
       min_uptime: "5s",
       max_restarts: 20,
       restart_delay: 1000,
+    },
+    {
+      name: "playwright-cdpa-supervisor",
+      cwd: root,
+      script: isWindows
+        ? venvExe("cdpa-supervisor")
+        : path.join(root, ".venv/bin/cdpa-supervisor"),
+      args: ["--repository", root],
+      interpreter: "none",
+      autorestart: true,
+      min_uptime: "5s",
+      max_restarts: 20,
+      restart_delay: 2000,
     },
   ],
 };

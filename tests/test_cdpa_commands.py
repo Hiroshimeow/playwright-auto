@@ -87,7 +87,7 @@ def test_workflow_control_matrix_projects_positive_and_negative_durable_admissio
 
     assert tuple(matrix) == (
         "pause", "resume", "retry", "restart_role", "new_chat",
-        "open_tab", "route_plan", "stop", "clear_team",
+        "open_tab", "route_plan", "stop", "clear_team", "archive_worktree",
     )
     assert matrix["pause"]["eligible"] is True
     assert matrix["resume"]["eligible"] is True
@@ -99,6 +99,7 @@ def test_workflow_control_matrix_projects_positive_and_negative_durable_admissio
     assert matrix["route_plan"]["eligible"] is False
     assert matrix["stop"]["eligible"] is True
     assert matrix["clear_team"]["eligible"] is True
+    assert matrix["archive_worktree"]["eligible"] is False
 
     current["status"] = "BLOCKED"
     current["block_retryable"] = True
@@ -111,6 +112,23 @@ def test_workflow_control_matrix_projects_positive_and_negative_durable_admissio
     assert terminal["resume"]["eligible"] is False
     assert terminal["stop"]["eligible"] is False
     assert terminal["clear_team"]["eligible"] is True
+    assert terminal["archive_worktree"]["eligible"] is False
+    current["cleanup"] = {"state": "CLEARED", "verified_empty_at": "2026-09-15T00:00:00+00:00"}
+    assert workflow_control_matrix(current)["archive_worktree"]["eligible"] is True
+
+
+def test_legacy_no_progress_block_can_be_explicitly_resumed_for_budget_migration():
+    current = state()
+    current["status"] = "BLOCKED"
+    current["block_code"] = "no_progress_route_cycle"
+    current["block_retryable"] = False
+    current["hops"][0].update(state="routed", route="DEV")
+
+    matrix = workflow_control_matrix(current)
+
+    assert matrix["resume"]["eligible"] is True
+    assert matrix["retry"]["eligible"] is False
+    assert matrix["restart_role"]["eligible"] is False
 
 
 def test_worker_command_rejects_stale_hop_conversation_and_receipt():

@@ -17,6 +17,60 @@ def quiet(worker, monkeypatch):
     monkeypatch.setattr(worker, "_close_idle_independent_tabs", _noop)
 
 
+def test_direct_create_without_independent_agents_claims_idle_pool_capacity(tmp_path, monkeypatch):
+    worker, store, first, second, _ = _setup(tmp_path, task_count=0)
+    quiet(worker, monkeypatch)
+    assert store.discover() == []
+
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-direct-intake",
+        idempotency_key="direct-intake",
+        kind="create_task",
+        task_id="task-direct-intake",
+        expected_task_version=None,
+        payload={
+            "task": "Normal task created directly from clarified chat intake",
+            "requested_team": "direct-intake",
+            "repository": str(tmp_path),
+            "report_mode": "file",
+        },
+    )
+
+    applied = worker._apply_next_command()
+    assert applied["status"] == "applied"
+    created = store.load_task_id("task-direct-intake")
+    assert created is not None
+    assert created.get("task_mode") != "independent"
+    assert not any(item.get("task_mode") == "independent" for item in store.discover())
+    # Model the next scheduler tick after the registry's bounded 0.5s admission grace.
+    worker.registry.update_task(created, now=0.0)
+
+    observed = []
+    busy = [
+        _execution(first["endpoint_id"], "busy-a"),
+        _execution(first["endpoint_id"], "busy-b"),
+    ]
+    monkeypatch.setattr(worker, "_running_executions", lambda _tasks=None: busy)
+
+    async def advance(path, context, *, scheduling_tasks=None, endpoint_id=None):
+        observed.append((store.load(path)["task_id"], endpoint_id))
+        return store.load(path)
+
+    monkeypatch.setattr(worker, "advance", advance)
+
+    async def run():
+        pool = await _pool(store)
+        try:
+            await worker.run_once_pool(pool)
+        finally:
+            await pool.close()
+
+    asyncio.run(run())
+
+    assert observed == [("task-direct-intake", second["endpoint_id"])]
+    assert store.load(created["manifest_path"])["browser_endpoint_id"] == first["endpoint_id"]
+
+
 @pytest.mark.parametrize("unavailable", ["full", "offline", "auth", "cooldown"])
 def test_resource_pressure_is_durable_waiting_and_resumes_same_execution(tmp_path, monkeypatch, unavailable):
     worker, store, first, second, tasks = _setup(tmp_path)

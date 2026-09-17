@@ -1,3 +1,5 @@
+import {taskPlacement} from "./topology.js?v=20260914-goal2-ops-v1";
+
 const COLUMNS = ["RUNNING", "WAITING", "BLOCKED", "PAUSED", "DONE", "STOPPED", "INDEPENDENT_AGENTS"];
 const COLUMN_LABELS = {INDEPENDENT_AGENTS: "AGENTS"};
 
@@ -61,13 +63,46 @@ function field(label, value, className = "task-field") {
   return node;
 }
 
-function waitingOrderField(task) {
+function browserQueuePosition(task) {
+  const position = Number.isInteger(task.queue_position) && task.queue_position > 0
+    ? task.queue_position
+    : null;
+  const length = Number.isInteger(task.queue_length) && task.queue_length > 0
+    ? task.queue_length
+    : null;
+  return position !== null && length !== null && position <= length ? position : null;
+}
+
+export function waitingPresentation(task) {
+  const position = browserQueuePosition(task);
+  if (position !== null) {
+    return {
+      kind: "browser_queue",
+      label: "Queue",
+      value: `${position}/${task.queue_length}`,
+      since: String(task.queue_since || "") || null,
+      reason: String(task.queue_reason || "") || null,
+      intervention: null,
+    };
+  }
   const order = task.waiting_order || {};
   const rank = Number.isInteger(order.rank) && order.rank > 0 ? String(order.rank) : "—";
-  const node = field("Order", rank, "task-field task-order");
-  if (rank === "—" && order.intervention) {
-    node.title = order.intervention;
-    node.setAttribute("aria-label", `Execution order unavailable: ${order.intervention}`);
+  return {
+    kind: "waiting_order",
+    label: "Order",
+    value: rank,
+    since: null,
+    reason: null,
+    intervention: rank === "—" ? (order.intervention || null) : null,
+  };
+}
+
+function waitingField(task) {
+  const presentation = waitingPresentation(task);
+  const node = field(presentation.label, presentation.value, "task-field task-order");
+  if (presentation.intervention) {
+    node.title = presentation.intervention;
+    node.setAttribute("aria-label", `Execution order unavailable: ${presentation.intervention}`);
   }
   return node;
 }
@@ -90,6 +125,19 @@ function waitingOrderSort(a, b) {
     || String(a.task_id).localeCompare(String(b.task_id));
 }
 
+export function waitingLaneSort(a, b) {
+  const aQueue = browserQueuePosition(a);
+  const bQueue = browserQueuePosition(b);
+  if (aQueue !== null && bQueue !== null) {
+    return aQueue - bQueue
+      || String(a.created_at || "").localeCompare(String(b.created_at || ""))
+      || String(a.task_id).localeCompare(String(b.task_id));
+  }
+  if (aQueue !== null) return -1;
+  if (bQueue !== null) return 1;
+  return waitingOrderSort(a, b);
+}
+
 function waitingDisplay(task, board) {
   if (task.status !== "WAITING") return null;
   const raw = task.waiting_reason || task.primary_problem?.message || "";
@@ -104,7 +152,49 @@ function waitingDisplay(task, board) {
   return teams.length ? `Waiting for ${teams.join(", ")}` : raw;
 }
 
-function taskSignature(task, board) {
+export function deriveOperationalTruth(task = {}, runtime = null, now = Date.now()) {
+  if (task.task_mode === "independent" || task.status !== "RUNNING") return null;
+  const reasons = [];
+  const recovery = [];
+  let unknownReason = null;
+
+  if (!runtime || typeof runtime.worker_stale !== "boolean") {
+    unknownReason = "Worker heartbeat status is unknown.";
+  } else if (runtime.worker_stale) {
+    reasons.push("Worker heartbeat is stale.");
+    recovery.push("pm2 restart playwright-cdpa-worker");
+  }
+
+  const activeRole = (task.roles || []).find(role => role.logical_role === task.active_role);
+  if (task.availability === "unknown" || !activeRole || activeRole.online == null) {
+    unknownReason ||= "Active role ownership is unknown.";
+  } else if (activeRole.online === false) {
+    reasons.push(`Active ${task.active_role || "role"} ownership is offline.`);
+  }
+
+  const staleAfter = Number(runtime?.semantic_stale_after_seconds);
+  const activityAt = Date.parse(task.effective_activity_at || "");
+  if (!Number.isFinite(staleAfter) || staleAfter <= 0 || !Number.isFinite(activityAt)) {
+    unknownReason ||= "Semantic activity freshness is unknown.";
+  } else if (now - activityAt > staleAfter * 1000) {
+    reasons.push("Semantic activity is stale.");
+    recovery.push("automatic F5 recovery is due under the response-stall policy");
+  }
+
+  const state = reasons.length ? "degraded" : unknownReason ? "unknown" : "healthy";
+  return {
+    state,
+    label: state === "healthy" ? "Healthy" : state === "degraded" ? "Degraded" : "Unknown",
+    reason: reasons.length
+      ? reasons.join(" ")
+      : unknownReason || "Worker heartbeat, active role ownership, and semantic activity are current.",
+    action: task.active_action || null,
+    recovery: recovery.length ? recovery.join("; ") : null,
+  };
+}
+
+export function taskSignature(task, board, runtime) {
+  const operational = deriveOperationalTruth(task, runtime);
   return JSON.stringify([
     task.projection_sha256,
     task.version,
@@ -128,11 +218,20 @@ function taskSignature(task, board) {
     task.primary_problem?.message,
     task.waiting_reason,
     task.waiting_order,
+    task.queue_position,
+    task.queue_length,
+    task.queue_since,
+    task.queue_reason,
+    task.requested_browser_endpoint_id,
     task.browser_endpoint_ids,
     waitingDisplay(task, board),
     task.task_mode,
     task.agent,
-    (task.roles || []).map(role => [role.logical_role, role.status, role.online]),
+    (task.roles || []).map(role => [role.logical_role, role.status, role.online, role.browser_endpoint_id]),
+    operational?.state,
+    operational?.reason,
+    operational?.action,
+    operational?.recovery,
   ]);
 }
 
@@ -145,11 +244,54 @@ function appendAgentTags(root, tags) {
   root.append(list);
 }
 
-function card(task, selected, board) {
+function placementLine(task, endpoints) {
+  const placement = taskPlacement(task, endpoints);
+  const node = document.createElement("div");
+  node.className = "task-placement";
+  const primary = document.createElement("span");
+  primary.className = "task-placement-primary";
+  const secondary = document.createElement("span");
+  secondary.className = "task-placement-secondary";
+
+  if (task.task_mode === "independent") {
+    if (placement.actual) primary.textContent = `Execution · ${placement.actual.label}`;
+    else if (placement.affinity) primary.textContent = `Pinned · ${placement.affinity.label}`;
+    else primary.textContent = "Pool placement";
+    if (placement.affinity) {
+      secondary.textContent = placement.actual && placement.actual.id !== placement.affinity.id
+        ? `Affinity · ${placement.affinity.label}`
+        : "Pinned affinity";
+    } else {
+      secondary.textContent = "Pool affinity";
+    }
+  } else {
+    if (placement.actual) primary.textContent = `Execution · ${placement.actual.label}`;
+    else if (placement.requested) primary.textContent = `Requested · ${placement.requested.label}`;
+    else primary.textContent = "Pool placement";
+    if (placement.requested && placement.actual) {
+      secondary.textContent = placement.relocated
+        ? `Requested · ${placement.requested.label}`
+        : "";
+    } else if (placement.requested) {
+      secondary.textContent = "Awaiting allocation";
+    } else {
+      secondary.textContent = "No endpoint requested";
+    }
+  }
+  primary.title = primary.textContent;
+  node.append(primary);
+  if (secondary.textContent) {
+    secondary.title = secondary.textContent;
+    node.append(secondary);
+  }
+  return node;
+}
+
+function card(task, selected, board, endpoints, runtime) {
   const node = document.createElement("article");
   node.className = `task-card${selected ? " selected" : ""}`;
   node.dataset.taskId = task.task_id;
-  node.dataset.signature = taskSignature(task, board);
+  node.dataset.signature = taskSignature(task, board, runtime);
   const agent = task.task_mode === "independent" ? (task.agent || {}) : null;
 
   const head = document.createElement("div");
@@ -163,7 +305,9 @@ function card(task, selected, board) {
     ? (agent.name || task.team || task.task_id)
     : (task.team || task.task_id);
   if (agent) select.append(text("span", "Independent Agent", "task-agent-context"));
-  select.append(text("strong", cardName, "task-team"));
+  const team = text("strong", cardName, "task-team");
+  team.title = cardName;
+  select.append(team);
   if (agent) appendAgentTags(select, agent.tags);
 
   const roleGroup = document.createElement("span");
@@ -198,11 +342,10 @@ function card(task, selected, board) {
   const agentTarget = agent?.target_team
     ? `Working on ${agent.target_team}`
     : agent?.trigger_type ? "Active job" : "Waiting for trigger";
-  summary.append(text(
-    "span",
-    agent ? agentTarget : (task.task_title || task.task_id),
-    "task-title",
-  ));
+  const titleText = agent ? agentTarget : (task.task_title || task.task_id);
+  const titleNode = text("span", titleText, "task-title");
+  titleNode.title = titleText;
+  summary.append(titleNode);
   if (agent?.trigger_type) {
     const maxTurns = agent.max_cycles === 0 ? "unlimited turns" : `turn ${agent.cycle || 0}/${agent.max_cycles}`;
     const trigger = [
@@ -214,14 +357,39 @@ function card(task, selected, board) {
     ].filter(Boolean).join(" · ");
     summary.append(text("span", trigger, "task-agent-context"));
   }
+  const lifecycle = task.lifecycle_label || null;
   const problem = agent
     ? (task.primary_problem?.message || null)
-    : (waitingDisplay(task, board) || task.primary_problem?.message || task.waiting_reason);
+    : (waitingDisplay(task, board) || task.primary_problem?.message || task.waiting_reason || task.stop_reason);
+  if (lifecycle) {
+    const lifecycleNode = text("span", lifecycle, "task-lifecycle");
+    lifecycleNode.dataset.kind = task.lifecycle_kind || "";
+    lifecycleNode.title = lifecycle;
+    summary.append(lifecycleNode);
+  }
   if (problem) {
     summary.classList.add("has-problem");
-    summary.append(text("span", problem, "task-problem"));
+    const problemNode = text(
+      "span",
+      problem,
+      task.status === "WAITING" ? "task-problem task-waiting" : "task-problem task-blocked",
+    );
+    problemNode.title = problem;
+    summary.append(problemNode);
   }
-  node.append(summary);
+  const operational = deriveOperationalTruth(task, runtime);
+  if (operational) {
+    node.dataset.operationalState = operational.state;
+    if (operational.state !== "healthy") {
+      const parts = [operational.label, operational.reason];
+      if (operational.recovery) parts.push(`Recovery ${operational.recovery}`);
+      const status = text("span", parts.filter(Boolean).join(" · "), "task-operational");
+      status.dataset.state = operational.state;
+      status.title = status.textContent;
+      summary.append(status);
+    }
+  }
+  node.append(summary, placementLine(task, endpoints));
 
   const identity = document.createElement("div");
   identity.className = "task-identity";
@@ -244,8 +412,16 @@ function card(task, selected, board) {
     meta.append(field("Last", agent.last_run_at ? `${elapsed(agent.last_run_at)} ago` : "—"));
   } else {
     const normalWaiting = task.status === "WAITING";
-    meta.append(normalWaiting ? waitingOrderField(task) : field("Status", task.status));
-    meta.append(field("Action", task.active_action));
+    const waiting = normalWaiting ? waitingPresentation(task) : null;
+    if (normalWaiting) meta.append(waitingField(task));
+    if (waiting?.kind === "browser_queue" && waiting.since) {
+      const queued = field("Queued", elapsed(waiting.since), "task-field task-elapsed");
+      queued.dataset.elapsedAt = waiting.since;
+      queued.dataset.elapsedLegacy = "true";
+      meta.append(queued);
+    } else {
+      meta.append(field("Action", task.active_action));
+    }
     if (task.running_elapsed_seconds == null) {
       const timestamp = task.started_at || task.created_at;
       if (task.status === "RUNNING") {
@@ -286,7 +462,9 @@ function ensureLane(root, column) {
   const list = document.createElement("div");
   list.className = "lane-list";
   section.append(heading, list);
-  root.append(section);
+  const commands = root.querySelector(".command-lane");
+  if (commands) root.insertBefore(section, commands);
+  else root.append(section);
   return section;
 }
 
@@ -306,14 +484,16 @@ export function refreshElapsed(root, now = Date.now()) {
 }
 
 export function renderBoard(root, state) {
+  const firstMaterialization = !root.querySelector(".lane:not(.command-lane)");
   for (const list of root.querySelectorAll(".lane-list")) {
     const column = list.closest(".lane")?.dataset.column;
     if (column) state.scrollState.laneScroll[column] = list.scrollTop;
   }
 
   const grouped = new Map(COLUMNS.map(column => [column, []]));
+  const endpoints = state.runtime?.browser?.endpoints || [];
   const endpointFilter = state.selectedEndpointId !== "all"
-    && (state.runtime?.browser?.endpoints || []).some(endpoint => (
+    && endpoints.some(endpoint => (
       !endpoint.removed && endpoint.endpoint_id === state.selectedEndpointId
     )) ? state.selectedEndpointId : "all";
   for (const task of state.board.values()) {
@@ -327,7 +507,7 @@ export function renderBoard(root, state) {
   }
   for (const [column, tasks] of grouped.entries()) {
     tasks.sort(column === "WAITING"
-      ? waitingOrderSort
+      ? waitingLaneSort
       : (a, b) => String(b.updated_at).localeCompare(String(a.updated_at)) || String(a.task_id).localeCompare(String(b.task_id)));
   }
 
@@ -346,10 +526,10 @@ export function renderBoard(root, state) {
       const selector = `[data-task-id="${CSS.escape(task.task_id)}"]`;
       let current = list.querySelector(selector);
       const selected = task.task_id === state.selectedTaskId;
-      const signature = taskSignature(task, state.board);
+      const signature = taskSignature(task, state.board, state.runtime);
       const occupiedCursor = Boolean(current) && current === cursor;
       if (!current || current.dataset.signature !== signature) {
-        const replacement = card(task, selected, state.board);
+        const replacement = card(task, selected, state.board, endpoints, state.runtime);
         if (current) current.replaceWith(replacement);
         current = replacement;
         if (occupiedCursor) cursor = current;
@@ -365,4 +545,5 @@ export function renderBoard(root, state) {
     }
     list.scrollTop = scrollTop;
   }
+  if (firstMaterialization) root.scrollLeft = 0;
 }

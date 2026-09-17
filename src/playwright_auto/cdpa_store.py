@@ -5,11 +5,13 @@ import hashlib
 import json
 import os
 import re
+import time
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any, Callable, Iterator, Mapping, Sequence
+from urllib.parse import urlparse
 
 from .cdpa_bootstraps import (
     is_legacy_bootstrap_record,
@@ -73,7 +75,13 @@ from .cdpa_team import (
     queued_team_tasks,
     validate_exact_team,
 )
-from .file_lock import exclusive_file_lock, fsync_parent_directory
+from .file_lock import (
+    atomic_replace,
+    exclusive_file_lock,
+    fsync_parent_directory,
+    read_shared_bytes,
+    read_shared_text,
+)
 from .upload import collect_file_identities
 
 SCHEMA_VERSION = 1
@@ -100,6 +108,8 @@ def report_mode_from_options(options: Mapping[str, Any]) -> str:
 def normalize_workflow_roles(
     value: Any,
     configured_roles: Sequence[str],
+    *,
+    require_plan: bool = True,
 ) -> tuple[str, ...]:
     available = tuple(str(role).strip().upper() for role in configured_roles)
     if value is None:
@@ -118,7 +128,7 @@ def normalize_workflow_roles(
     unknown = set(requested) - set(available)
     if unknown:
         raise ValueError(f"unknown workflow roles: {sorted(unknown)!r}")
-    if "PLAN" not in requested:
+    if require_plan and "PLAN" not in requested:
         raise ValueError("roles must include PLAN")
     selected = set(requested)
     return tuple(role for role in available if role in selected)
@@ -150,15 +160,43 @@ def _optional_nonempty_string(value: Any, field: str) -> str | None:
     return value.strip()
 
 
+def _optional_solo_conversation_url(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("conversation URL must be null or an exact ChatGPT conversation URL")
+    normalized = value.strip()
+    parsed = urlparse(normalized)
+    parts = [part for part in parsed.path.split("/") if part]
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").lower() not in {"chatgpt.com", "www.chatgpt.com"}
+        or len(parts) != 2
+        or parts[0] != "c"
+        or not parts[1]
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("conversation URL must be an exact ChatGPT /c/... conversation URL")
+    return normalized
+
+
 def effective_task_goal(state: Mapping[str, Any]) -> str:
     value = state.get("effective_goal")
     if isinstance(value, str) and value.strip():
         return value
+    if str(state.get("workflow_mode") or "team").strip().lower() == "solo":
+        return str(state.get("goal") or "")
     return str(state.get("task_text") or "")
 
 
 def task_goal_for_hop(state: Mapping[str, Any], hop_id: int) -> str:
-    selected = str(state.get("task_text") or "")
+    selected = (
+        str(state.get("goal") or "")
+        if str(state.get("workflow_mode") or "team").strip().lower() == "solo"
+        else str(state.get("task_text") or "")
+    )
     revisions = state.get("goal_revisions")
     if not isinstance(revisions, list):
         return selected
@@ -318,12 +356,12 @@ class TaskStore(IndependentAgentStoreMixin):
             json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=True)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, self.catalog_path)
+        atomic_replace(temporary, self.catalog_path)
         fsync_parent_directory(self.catalog_path)
 
     def _load_catalog_unlocked(self, *, reconcile: bool = True) -> dict[str, Any]:
         if self.catalog_path.exists():
-            value = json.loads(self.catalog_path.read_text(encoding="utf-8"))
+            value = json.loads(read_shared_text(self.catalog_path, encoding="utf-8"))
             if not isinstance(value, dict) or value.get("version") != CATALOG_VERSION:
                 raise ValueError(
                     f"unsupported CDPA catalog version in {self.catalog_path}"
@@ -344,7 +382,7 @@ class TaskStore(IndependentAgentStoreMixin):
             entries = value["entries"]
             for path in self._filesystem_primary_paths():
                 try:
-                    state = json.loads(path.read_text(encoding="utf-8"))
+                    state = json.loads(read_shared_text(path, encoding="utf-8"))
                     if state.get("schema_version") != SCHEMA_VERSION:
                         continue
                     entry = self._catalog_entry(state)
@@ -559,7 +597,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 )
             try:
                 with exclusive_file_lock(self._lock_path(target)):
-                    state = json.loads(target.read_text(encoding="utf-8"))
+                    state = json.loads(read_shared_text(target, encoding="utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise ValueError(
                     f"exact team {team!r} has a corrupt unreadable manifest {target}: "
@@ -672,6 +710,10 @@ class TaskStore(IndependentAgentStoreMixin):
             endpoint_id = state["browser_endpoint_id"]
             if not isinstance(endpoint_id, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", endpoint_id) is None:
                 return "browser_endpoint_id must be a durable endpoint identifier"
+        if "required_browser_endpoint_id" in state:
+            endpoint_id = state["required_browser_endpoint_id"]
+            if not isinstance(endpoint_id, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", endpoint_id) is None:
+                return "required_browser_endpoint_id must be a durable endpoint identifier"
         if "conversation_mode" in state and state["conversation_mode"] not in {"persistent", "temporary"}:
             return "conversation_mode must be persistent or temporary"
         if "context_policy" in state and state["context_policy"] not in {"fresh", "bootstrap"}:
@@ -1131,7 +1173,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 ):
                     continue
                 try:
-                    sibling_state = json.loads(sibling.read_text(encoding="utf-8"))
+                    sibling_state = json.loads(read_shared_text(sibling, encoding="utf-8"))
                 except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                     continue
                 if (
@@ -1157,7 +1199,7 @@ class TaskStore(IndependentAgentStoreMixin):
         if not candidate.is_file():
             return None
         try:
-            state = json.loads(candidate.read_text(encoding="utf-8"))
+            state = json.loads(read_shared_text(candidate, encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return None
         if not isinstance(state, Mapping):
@@ -1190,7 +1232,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 continue
             team_directory, task_directory, _filename = relative.parts
             try:
-                value = json.loads(path.read_text(encoding="utf-8"))
+                value = json.loads(read_shared_text(path, encoding="utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 manifest_lock = candidate.with_suffix(candidate.suffix + ".lock")
                 if include_unreadable or manifest_lock.is_file():
@@ -1285,7 +1327,7 @@ class TaskStore(IndependentAgentStoreMixin):
         if not self.catalog_path.exists():
             return []
         try:
-            catalog = json.loads(self.catalog_path.read_text(encoding="utf-8"))
+            catalog = json.loads(read_shared_text(self.catalog_path, encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return []
         if not isinstance(catalog, Mapping):
@@ -1334,7 +1376,7 @@ class TaskStore(IndependentAgentStoreMixin):
             if candidate in paths or str(candidate) in diagnosed:
                 continue
             try:
-                value = json.loads(candidate.read_text(encoding="utf-8"))
+                value = json.loads(read_shared_text(candidate, encoding="utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                 detail = f"{type(exc).__name__}: {exc}"
             else:
@@ -1459,7 +1501,7 @@ class TaskStore(IndependentAgentStoreMixin):
             if candidate.exists():
                 invalid_catalog_paths.add(candidate)
                 try:
-                    value = json.loads(candidate.read_text(encoding="utf-8"))
+                    value = json.loads(read_shared_text(candidate, encoding="utf-8"))
                 except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                     detail = f"{type(exc).__name__}: {exc}"
                 else:
@@ -1497,6 +1539,26 @@ class TaskStore(IndependentAgentStoreMixin):
     ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
         tasks, errors = self._discover_candidates(catalog)
         return self._filter_catalog_tasks(tasks, errors, catalog)
+
+    def _discover_with_errors_unlocked(
+        self,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+        catalog = self._load_catalog_unlocked(reconcile=False)
+        tasks, errors = self._discover_with_catalog_unlocked(catalog)
+        records = [
+            (Path(str(task["manifest_path"])).expanduser().resolve(), task)
+            for task in tasks
+        ]
+        try:
+            self.validate_repository_integrity(records)
+        except ValueError as exc:
+            errors.append(
+                {
+                    "manifest_path": str(self.catalog_path),
+                    "error": f"DependencyGraphError: {exc}",
+                }
+            )
+        return tasks, errors
 
     def discover_with_errors(
         self,
@@ -1541,7 +1603,7 @@ class TaskStore(IndependentAgentStoreMixin):
             if target is not None and candidate == target:
                 continue
             try:
-                value = json.loads(candidate.read_text(encoding="utf-8"))
+                value = json.loads(read_shared_text(candidate, encoding="utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 continue
             if (
@@ -1616,7 +1678,7 @@ class TaskStore(IndependentAgentStoreMixin):
     def load(self, path: str | Path) -> dict[str, Any]:
         target = Path(path).expanduser().resolve()
         with exclusive_file_lock(self._lock_path(target)):
-            value = json.loads(target.read_text(encoding="utf-8"))
+            value = json.loads(read_shared_text(target, encoding="utf-8"))
         if not isinstance(value, Mapping):
             raise ValueError(f"invalid CDPA task manifest in {target}: root must be an object")
         error = self._manifest_value_error(target, value)
@@ -1642,12 +1704,22 @@ class TaskStore(IndependentAgentStoreMixin):
             json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=True)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, target)
+        for attempt in range(6):
+            try:
+                atomic_replace(temporary, target)
+                break
+            except OSError as exc:
+                if os.name != "nt" or (
+                    not isinstance(exc, PermissionError)
+                    and getattr(exc, "winerror", None) != 5
+                ) or attempt == 5:
+                    raise
+                time.sleep(0.05)
         fsync_parent_directory(target)
         return value
 
     def _load_current_manifest_unlocked(self, target: Path) -> dict[str, Any]:
-        current = json.loads(target.read_text(encoding="utf-8"))
+        current = json.loads(read_shared_text(target, encoding="utf-8"))
         if not isinstance(current, Mapping):
             raise ValueError(
                 f"invalid CDPA task manifest in {target}: root must be an object"
@@ -1865,7 +1937,12 @@ class TaskStore(IndependentAgentStoreMixin):
                 )
                 result = mutator(current)
                 candidate = result if result is not None else current
-                for field in ("browser_endpoint_id", "conversation_mode", "context_policy"):
+                for field in (
+                    "browser_endpoint_id",
+                    "required_browser_endpoint_id",
+                    "conversation_mode",
+                    "context_policy",
+                ):
                     if field in original and candidate.get(field) != original[field]:
                         raise ValueError(f"task {field} is immutable")
                 if "browser_endpoint_id" not in original and "browser_endpoint_id" in candidate:
@@ -2477,10 +2554,19 @@ class TaskStore(IndependentAgentStoreMixin):
         workflow_agents: Mapping[str, Mapping[str, Any]] | None = None,
         normalized_bootstrap: Mapping[str, Any] | None = None,
         browser_endpoint_id: str | None = None,
+        required_browser_endpoint_id: str | None = None,
         conversation_mode: str | None = None,
         context_policy: str | None = None,
+        workflow_mode: str = "team",
+        goal: str = "",
+        conversation_url: str | None = None,
     ) -> dict[str, Any]:
         endpoint = self.endpoints.resolve(browser_endpoint_id)
+        required_endpoint = (
+            self.endpoints.resolve(required_browser_endpoint_id)
+            if required_browser_endpoint_id is not None
+            else None
+        )
         mode = conversation_mode or ("temporary" if endpoint["temporary_default"] else "persistent")
         if mode not in {"persistent", "temporary"}:
             raise ValueError("conversation_mode must be persistent or temporary")
@@ -2492,12 +2578,13 @@ class TaskStore(IndependentAgentStoreMixin):
             raise ValueError("bootstrap context policy requires a bootstrap snapshot")
         if mode == "temporary" and normalized_bootstrap is not None:
             raise ValueError("temporary workflows do not support bootstrap context")
+        initial_role = workflow_roles[0] if workflow_mode == "solo" else "PLAN"
         roles = {}
         for logical in workflow_roles:
             roles[logical] = {
                 "logical_role": logical,
                 "physical_role": physical_role(logical, base, suffix),
-                "status": "pending" if logical == "PLAN" else "unallocated",
+                "status": "pending" if logical == initial_role else "unallocated",
                 "turn": 0,
                 "page_id": None,
                 "page_url": None,
@@ -2514,11 +2601,11 @@ class TaskStore(IndependentAgentStoreMixin):
             "hop_id": 1,
             "parent_hop_id": None,
             "source_role": None,
-            "target_role": "PLAN",
-            "physical_role": roles["PLAN"]["physical_role"],
+            "target_role": initial_role,
+            "physical_role": roles[initial_role]["physical_role"],
             "turn": 1,
             "kind": "task",
-            "handoff": text,
+            "handoff": "Initial task intake; no prior role handoff.",
             "state": "pre_send",
             "request_id": f"{task_id}-hop1",
             "prompt": None,
@@ -2527,6 +2614,7 @@ class TaskStore(IndependentAgentStoreMixin):
             "ledger_path": str((target.parent / "requests.json").resolve()),
             "receipt": None,
             "message_identity": None,
+            **({"conversation_url": conversation_url} if conversation_url is not None else {}),
             "response": None,
             "response_sha256": None,
             "report_path": None,
@@ -2576,7 +2664,13 @@ class TaskStore(IndependentAgentStoreMixin):
         return {
             "schema_version": SCHEMA_VERSION,
             "task_mode": TASK_MODE_WORKFLOW,
+            "workflow_mode": workflow_mode,
             "browser_endpoint_id": endpoint["endpoint_id"],
+            **(
+                {"required_browser_endpoint_id": required_endpoint["endpoint_id"]}
+                if required_endpoint is not None
+                else {}
+            ),
             "conversation_mode": mode,
             **({"context_policy": context_policy} if context_policy is not None else {}),
             **(
@@ -2592,6 +2686,7 @@ class TaskStore(IndependentAgentStoreMixin):
             "task_id": task_id,
             "task_title": text.splitlines()[0],
             "task_text": text,
+            **({"goal": goal} if workflow_mode == "solo" else {}),
             "task_slug": slugify(text),
             "repository": str(repository_path),
             "requested_team": requested_team,
@@ -2602,7 +2697,7 @@ class TaskStore(IndependentAgentStoreMixin):
             "status": "WAITING" if waiting_status else "INBOX",
             "kanban_column": "WAITING" if waiting_status else "INBOX",
             "terminal_state": None,
-            "active_role": "PLAN",
+            "active_role": initial_role,
             "active_hop_id": 1,
             "active_action": (
                 "waiting_dependency_team"
@@ -2805,9 +2900,13 @@ class TaskStore(IndependentAgentStoreMixin):
         upload_paths: Sequence[str | Path] = (),
         bootstrap: Mapping[str, Any] | None = None,
         browser_endpoint_id: str | None = None,
+        required_browser_endpoint_id: str | None = None,
         temporary: bool = False,
         conversation_mode: str | None = None,
         context_policy: str | None = None,
+        workflow_mode: str = "team",
+        goal: str | None = None,
+        conversation_url: str | None = None,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
         if type(temporary) is not bool:
@@ -2816,6 +2915,16 @@ class TaskStore(IndependentAgentStoreMixin):
             raise ValueError("conversation_mode must be persistent or temporary")
         if context_policy not in {None, "fresh", "bootstrap"}:
             raise ValueError("context_policy must be fresh or bootstrap")
+        normalized_workflow_mode = str(workflow_mode or "team").strip().lower()
+        if normalized_workflow_mode not in {"team", "solo"}:
+            raise ValueError("workflow_mode must be team or solo")
+        normalized_goal = str(goal or "").strip()
+        normalized_conversation_url = _optional_solo_conversation_url(conversation_url)
+        if normalized_workflow_mode == "team":
+            if goal is not None or normalized_conversation_url is not None:
+                raise ValueError("goal and conversation_url are valid only for solo workflow tasks")
+        elif browser_endpoint_id is None or not str(browser_endpoint_id).strip():
+            raise ValueError("solo workflow task requires an explicit browser endpoint")
         text = str(task).strip()
         if not text:
             raise ValueError("task must not be empty")
@@ -2823,11 +2932,27 @@ class TaskStore(IndependentAgentStoreMixin):
         catalog_routes = tuple(
             item["route_key"] for item in self.workflow_agents.list_agents()
         )
+        if normalized_workflow_mode == "solo" and (
+            roles is None
+            or isinstance(roles, (str, bytes))
+            or not isinstance(roles, Sequence)
+            or len(roles) != 1
+        ):
+            raise ValueError("solo workflow task requires exactly one selected role")
         requested_roles = (
-            normalize_workflow_roles(roles, catalog_routes)
+            normalize_workflow_roles(
+                roles,
+                catalog_routes,
+                require_plan=normalized_workflow_mode != "solo",
+            )
             if roles is not None
             else None
         )
+        if normalized_workflow_mode == "solo":
+            if requested_roles is None or len(requested_roles) != 1:
+                raise ValueError("solo workflow task requires exactly one selected role")
+            if reuse_team is not None:
+                raise ValueError("solo workflow task does not support exact-team reuse")
         normalized_new = tuple(dict.fromkeys(str(role).strip().upper() for role in new_roles))
         unknown = set(normalized_new) - set(catalog_routes)
         if unknown:
@@ -2839,6 +2964,11 @@ class TaskStore(IndependentAgentStoreMixin):
         normalized_bootstrap = (
             normalize_bootstrap_record(bootstrap) if bootstrap is not None else None
         )
+        if normalized_workflow_mode == "solo":
+            if normalized_bootstrap is not None:
+                raise ValueError("solo workflow task does not support bootstrap context")
+            context_policy = "fresh"
+            conversation_mode = "persistent"
         if context_policy == "fresh" and normalized_bootstrap is not None:
             raise ValueError("fresh context policy must not include a bootstrap snapshot")
         if context_policy == "bootstrap" and normalized_bootstrap is None:
@@ -2922,6 +3052,20 @@ class TaskStore(IndependentAgentStoreMixin):
             )
             queue_blocked_by: str | None = None
             endpoint = self.endpoints.resolve(browser_endpoint_id)
+            required_endpoint = (
+                self.endpoints.resolve(required_browser_endpoint_id)
+                if required_browser_endpoint_id is not None
+                else None
+            )
+            if normalized_workflow_mode == "solo":
+                if (
+                    required_endpoint is not None
+                    and required_endpoint["endpoint_id"] != endpoint["endpoint_id"]
+                ):
+                    raise ValueError(
+                        "solo workflow task browser endpoint and required endpoint must match"
+                    )
+                required_endpoint = endpoint
             if exact_reuse_team is not None:
                 exact_states = [state for _path, state, _record in exact_loaded]
                 identities = {
@@ -3037,7 +3181,10 @@ class TaskStore(IndependentAgentStoreMixin):
             if set(normalized_new) - set(workflow_roles):
                 raise ValueError("new_roles must be selected workflow roles")
             selected_mode = conversation_mode or ("temporary" if temporary or endpoint["temporary_default"] else "persistent")
-            workflow_agent_snapshot = self.workflow_agents.resolve(workflow_roles)
+            workflow_agent_snapshot = self.workflow_agents.resolve(
+                workflow_roles,
+                require_plan=normalized_workflow_mode != "solo",
+            )
             title_slug = slugify(text)
             target = (self.root / team / task_id / f"{title_slug}.json").resolve()
             if target.exists():
@@ -3068,8 +3215,16 @@ class TaskStore(IndependentAgentStoreMixin):
                 workflow_agents=workflow_agent_snapshot,
                 normalized_bootstrap=normalized_bootstrap,
                 browser_endpoint_id=endpoint["endpoint_id"],
+                required_browser_endpoint_id=(
+                    required_endpoint["endpoint_id"]
+                    if required_endpoint is not None
+                    else None
+                ),
                 conversation_mode=selected_mode,
                 context_policy=context_policy,
+                workflow_mode=normalized_workflow_mode,
+                goal=normalized_goal,
+                conversation_url=normalized_conversation_url,
             )
             self._record_external_command(state, external_command_id)
             saved = self._save_unlocked(target, state)
@@ -3097,7 +3252,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, path)
+            atomic_replace(temporary, path)
             fsync_parent_directory(path)
         finally:
             temporary.unlink(missing_ok=True)
@@ -3150,7 +3305,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 json.dump(body, handle, ensure_ascii=False, indent=2, sort_keys=True)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, self.phase4_journal_path)
+            atomic_replace(temporary, self.phase4_journal_path)
             fsync_parent_directory(self.phase4_journal_path)
         finally:
             temporary.unlink(missing_ok=True)
@@ -3158,7 +3313,7 @@ class TaskStore(IndependentAgentStoreMixin):
     def _load_phase4_journal_unlocked(self) -> dict[str, Any] | None:
         if not self.phase4_journal_path.exists():
             return None
-        value = json.loads(self.phase4_journal_path.read_text(encoding="utf-8"))
+        value = json.loads(read_shared_text(self.phase4_journal_path, encoding="utf-8"))
         if not isinstance(value, Mapping):
             raise ValueError("Phase-4 journal root must be an object")
         if value.get("version") != 1 or value.get("operation") != "replace_task_and_rewire":
@@ -3240,7 +3395,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, path)
+            atomic_replace(temporary, path)
             fsync_parent_directory(path)
         finally:
             temporary.unlink(missing_ok=True)
@@ -3252,7 +3407,7 @@ class TaskStore(IndependentAgentStoreMixin):
         write_paths: set[Path],
     ) -> dict[str, Any]:
         try:
-            current = json.loads(self.catalog_path.read_text(encoding="utf-8"))
+            current = json.loads(read_shared_text(self.catalog_path, encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             current = json.loads(fallback_bytes.decode("utf-8"))
         if not isinstance(current, dict) or current.get("version") != CATALOG_VERSION:
@@ -3285,7 +3440,7 @@ class TaskStore(IndependentAgentStoreMixin):
         target_path = self._phase4_absolute_path(
             journal["target_manifest_path"], "target_manifest_path"
         )
-        if hashlib.sha256(target_path.read_bytes()).hexdigest() != journal["target_sha256"]:
+        if hashlib.sha256(read_shared_bytes(target_path)).hexdigest() != journal["target_sha256"]:
             raise RuntimeError("Phase-4 recovery mutated immutable parent history")
         affected_ids = {
             str(item["task_id"])
@@ -3307,7 +3462,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 raise RuntimeError(
                     f"Phase-4 recovery left dependency on old task: {state['task_id']}"
                 )
-        catalog = json.loads(self.catalog_path.read_text(encoding="utf-8"))
+        catalog = json.loads(read_shared_text(self.catalog_path, encoding="utf-8"))
         if not isinstance(catalog, Mapping) or not isinstance(catalog.get("entries"), Mapping):
             raise RuntimeError("Phase-4 recovery catalog is invalid")
         write_paths = {
@@ -3368,7 +3523,7 @@ class TaskStore(IndependentAgentStoreMixin):
             for manifest_path in canonical_paths:
                 if not manifest_path.exists():
                     continue
-                data = manifest_path.read_bytes()
+                data = read_shared_bytes(manifest_path)
                 states_by_path[manifest_path] = self._phase4_parse_manifest_bytes(
                     manifest_path, data
                 )
@@ -3489,7 +3644,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 json.dump(body, handle, ensure_ascii=False, indent=2, sort_keys=True)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, self.repair_journal_path)
+            atomic_replace(temporary, self.repair_journal_path)
             fsync_parent_directory(self.repair_journal_path)
         finally:
             temporary.unlink(missing_ok=True)
@@ -3497,7 +3652,7 @@ class TaskStore(IndependentAgentStoreMixin):
     def _load_repair_journal_unlocked(self) -> dict[str, Any] | None:
         if not self.repair_journal_path.exists():
             return None
-        value = json.loads(self.repair_journal_path.read_text(encoding="utf-8"))
+        value = json.loads(read_shared_text(self.repair_journal_path, encoding="utf-8"))
         if not isinstance(value, Mapping):
             raise ValueError("repair transaction journal root must be an object")
         if value.get("version") != 1 or value.get("operation") != "create_or_gate_repair":
@@ -3563,7 +3718,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 before = self._phase4_decode_bytes(item.get("before"), "write.before")
                 after = self._phase4_decode_bytes(item.get("after"), "write.after")
                 assert after is not None
-                current = path.read_bytes() if path.exists() else None
+                current = read_shared_bytes(path) if path.exists() else None
                 if current == after:
                     continue
                 if current != before:
@@ -3578,7 +3733,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 journal["catalog"].get("after"), "catalog.after"
             )
             assert catalog_after is not None
-            current_catalog = self.catalog_path.read_bytes() if self.catalog_path.exists() else None
+            current_catalog = read_shared_bytes(self.catalog_path) if self.catalog_path.exists() else None
             if current_catalog != catalog_after:
                 if current_catalog != catalog_before:
                     raise RuntimeError("repair transaction found conflicting task catalog")
@@ -3590,8 +3745,8 @@ class TaskStore(IndependentAgentStoreMixin):
             affected_path = self._phase4_absolute_path(
                 journal["affected_manifest_path"], "affected_manifest_path"
             )
-            repair = json.loads(repair_path.read_text(encoding="utf-8"))
-            affected = json.loads(affected_path.read_text(encoding="utf-8"))
+            repair = json.loads(read_shared_text(repair_path, encoding="utf-8"))
+            affected = json.loads(read_shared_text(affected_path, encoding="utf-8"))
             if not isinstance(repair, Mapping) or not isinstance(affected, Mapping):
                 raise RuntimeError("repair transaction installed invalid manifest roots")
             metadata = repair.get("repair")
@@ -3701,7 +3856,7 @@ class TaskStore(IndependentAgentStoreMixin):
             self._recover_repair_transaction_unlocked()
             self._recover_phase4_replacement_unlocked()
             catalog = self._load_catalog_unlocked(reconcile=False)
-            catalog_before = self.catalog_path.read_bytes() if self.catalog_path.exists() else None
+            catalog_before = read_shared_bytes(self.catalog_path) if self.catalog_path.exists() else None
             manifests, _errors = self._discover_with_catalog_unlocked(catalog)
             affected = next(
                 (
@@ -4308,7 +4463,7 @@ class TaskStore(IndependentAgentStoreMixin):
             ).encode("utf-8")
             journal_writes = []
             for path in sorted(writes, key=str):
-                before = path.read_bytes() if path.exists() else None
+                before = read_shared_bytes(path) if path.exists() else None
                 after = self._phase4_bytes(writes[path])
                 journal_writes.append(
                     {
@@ -4372,7 +4527,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 return recovered
             catalog = self._load_catalog_unlocked(reconcile=False)
             catalog_before = (
-                self.catalog_path.read_bytes() if self.catalog_path.exists() else None
+                read_shared_bytes(self.catalog_path) if self.catalog_path.exists() else None
             )
             planning, _discovery_errors = self._discover_with_catalog_unlocked(catalog)
             canonical_paths = sorted(
@@ -4390,7 +4545,7 @@ class TaskStore(IndependentAgentStoreMixin):
 
                 manifests: list[dict[str, Any]] = []
                 for manifest_path in canonical_paths:
-                    value = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    value = json.loads(read_shared_text(manifest_path, encoding="utf-8"))
                     if not isinstance(value, Mapping):
                         raise ValueError(
                             f"invalid CDPA task manifest in {manifest_path}: "
@@ -4663,7 +4818,7 @@ class TaskStore(IndependentAgentStoreMixin):
 
                 originals: dict[Path, bytes | None] = {
                     manifest_path: (
-                        manifest_path.read_bytes()
+                        read_shared_bytes(manifest_path)
                         if manifest_path.exists()
                         else None
                     )
@@ -4708,7 +4863,7 @@ class TaskStore(IndependentAgentStoreMixin):
                         replacement_path
                     ),
                     "target_sha256": hashlib.sha256(
-                        Path(target_state["manifest_path"]).read_bytes()
+                        read_shared_bytes(Path(target_state["manifest_path"]))
                     ).hexdigest(),
                     "created_at": now,
                     "writes": journal_writes,
@@ -4749,10 +4904,10 @@ class TaskStore(IndependentAgentStoreMixin):
                         raise RuntimeError("Phase-4 journal disappeared before install")
                     journal = durable_journal
                     for manifest_path in sorted(writes, key=str):
-                        os.replace(staged[manifest_path], manifest_path)
+                        atomic_replace(staged[manifest_path], manifest_path)
                         installed.append(manifest_path)
                         fsync_parent_directory(manifest_path)
-                    os.replace(
+                    atomic_replace(
                         staged[self.catalog_path], self.catalog_path
                     )
                     installed.append(self.catalog_path)
@@ -5166,7 +5321,7 @@ class TaskStore(IndependentAgentStoreMixin):
                     )
                 try:
                     with exclusive_file_lock(self._lock_path(target)):
-                        state = json.loads(target.read_text(encoding="utf-8"))
+                        state = json.loads(read_shared_text(target, encoding="utf-8"))
                 except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                     raise ValueError(
                         f"exact team {team!r} has a corrupt unreadable manifest {target}: "
@@ -5280,7 +5435,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 releasing_dependency = not releasing_queue
             with exclusive_file_lock(self._lock_path(target)):
                 try:
-                    current = json.loads(target.read_text(encoding="utf-8"))
+                    current = json.loads(read_shared_text(target, encoding="utf-8"))
                 except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                     raise ValueError(
                         f"exact team {team!r} became corrupt while resuming {target}: "
@@ -5498,7 +5653,7 @@ class TaskStore(IndependentAgentStoreMixin):
         confirmed: bool = False,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
-        allowed = {"pause", "resume", "retry", "stop", "reset", "restart_role", "open_tab", "close_tab", "new_chat", "route_plan", "clear_team"}
+        allowed = {"pause", "resume", "retry", "stop", "reset", "restart_role", "open_tab", "close_tab", "new_chat", "route_plan", "clear_team", "archive_worktree"}
         action = str(action).strip().lower()
         if action not in allowed:
             raise ValueError(f"unsupported control action {action!r}")

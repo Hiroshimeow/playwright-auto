@@ -88,10 +88,14 @@ def declared_repository_from_task(task: str) -> str | None:
             continue
         for match in _REPOSITORY_DECLARATION.finditer(line):
             label, value = match.groups()
-            if _WINDOWS_ABSOLUTE.match(value):
+            # A doubly escaped Windows path in task prose denotes a remote example,
+            # not a local control-worktree declaration after JSON/string decoding.
+            if len(value) >= 4 and value[2:4] == "\\\\":
                 continue
             if Path(value).is_absolute():
                 declarations.append(value)
+                continue
+            if _WINDOWS_ABSOLUTE.match(value):
                 continue
             raise ValueError("invalid repository declaration")
     if len(declarations) > 1:

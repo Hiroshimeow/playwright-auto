@@ -86,3 +86,54 @@ def test_unreadable_ledger_is_semantic_safety_block_not_silent_resource_wait(tmp
     assert state["status"] == "BLOCKED"
     assert state["block_code"] == "execution_recovery_provenance_invalid"
     assert len(state["hops"]) == original_hop_count
+
+
+def test_pristine_relocation_rebuilds_same_request_before_exactly_one_send(tmp_path):
+    store, state, worker, path, hop, ledger, _ = _prepare_pristine_new_sending_record(
+        tmp_path, task_id="pristine-rebuild-single-send"
+    )
+    state["bootstrap"] = None
+    state["context_policy"] = "fresh"
+    role = state["roles"]["PLAN"]
+    role.update(context_source="fresh", bootstrap_source_donor=None,
+                browser_endpoint_id=store.endpoints.resolve()["endpoint_id"])
+    target = store.endpoints.add("9202")["endpoint_id"]
+    request_id = hop["request_id"]
+    old_prompt = hop["prompt"]
+    assert worker._prepare_execution_endpoint(state, target)
+    def persist_relocated(current):
+        current.clear()
+        current.update(state)
+        return current
+    store.update(str(path), persist_relocated)
+    first_actions = TemporaryWorkflowActions()
+    asyncio.run(worker._sending(state, hop, first_actions))
+    assert first_actions.fresh_urls == ["https://chatgpt.com/"]
+    assert hop["state"] == "pre_send"
+    assert hop["rebuild_prompt_after_relocation"] is True
+    before = ledger.get(request_id)
+    assert before is not None and before.prompt == old_prompt and before.attempts == 0
+
+    asyncio.run(worker._pre_send(state, hop, TemporaryWorkflowActions(owned=True)))
+    rebound = ledger.get(request_id)
+    assert hop["state"] == "sending"
+    assert hop["request_id"] == request_id
+    assert hop["rebuild_prompt_after_relocation"] is False
+    assert rebound is not None and rebound.request_id == request_id
+    assert rebound.prompt == hop["prompt"] and rebound.prompt != old_prompt
+    assert rebound.attempts == 0 and rebound.receipt is None
+    assert "RECOVERY_SNAPSHOT" in rebound.prompt
+
+    client = RecordingCDPASendClient(task_id=state["task_id"], team=state["team"])
+    client.binding = type(client.binding)(client.binding.page_id, hop["physical_role"])
+    class CurrentActions:
+        async def locate_owned(self, current_state, current_role):
+            current = current_state["roles"][current_role]
+            return SimpleNamespace(
+                client=client, page_id=current["page_id"], url=current["page_url"],
+                created=False, new_chat=False,
+            )
+    asyncio.run(worker._sending(state, hop, CurrentActions()))
+    final = ledger.get(request_id)
+    assert client.send_calls == [rebound.rendered_prompt]
+    assert final is not None and final.attempts == 1 and final.receipt is not None

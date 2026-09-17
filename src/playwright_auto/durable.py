@@ -22,7 +22,13 @@ from .chatgpt import (
     validate_page_role,
     visible_text_matches,
 )
-from .file_lock import exclusive_file_lock, fsync_parent_directory
+from .file_lock import (
+    atomic_replace,
+    exclusive_file_lock,
+    fsync_parent_directory,
+    read_shared_bytes,
+    read_shared_text,
+)
 from .upload import FileIdentity
 
 
@@ -298,7 +304,7 @@ class RequestLedger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with exclusive_file_lock(self.lock_path):
             if self.path.exists():
-                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                raw = json.loads(read_shared_text(self.path, encoding="utf-8"))
             else:
                 raw = {"version": self.VERSION, "records": {}}
             if raw.get("version") != self.VERSION:
@@ -312,7 +318,17 @@ class RequestLedger:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, self.path)
+            for attempt in range(6):
+                try:
+                    atomic_replace(temporary, self.path)
+                    break
+                except OSError as exc:
+                    if os.name != "nt" or (
+                        not isinstance(exc, PermissionError)
+                        and getattr(exc, "winerror", None) != 5
+                    ) or attempt == 5:
+                        raise
+                    time.sleep(0.05)
             fsync_parent_directory(self.path)
 
     @contextmanager
@@ -400,9 +416,65 @@ class RequestLedger:
             value = data["records"].get(request_id)
             return DurableRequestRecord.from_dict(value) if value else None
 
+    def rebind_pristine(
+        self,
+        request_id: str,
+        *,
+        role: str,
+        prompt: str,
+        source_context: Any,
+        role_prompt_hash: str = "",
+    ) -> DurableRequestRecord:
+        """Replace only the unsent payload while retaining the durable request ID."""
+        role = validate_page_role(role)
+        normalized = normalize_prompt(prompt)
+        if not normalized:
+            raise ValueError("durable prompt must not be empty")
+        source_context = canonical_json_value(source_context)
+        with self._locked() as data:
+            value = data["records"].get(request_id)
+            if not value:
+                raise KeyError(request_id)
+            current = DurableRequestRecord.from_dict(value)
+            if current.request_id != request_id or current.role != role:
+                raise DurableRequestError("pristine request identity does not match rebind")
+            if current.source_context != source_context:
+                raise DurableRequestError("pristine request source identity does not match rebind")
+            if current.status not in {RequestStatus.NEW, RequestStatus.PROMPT_SET} or current.attempts != 0:
+                raise DurableRequestError("only a pristine preboundary request may be rebound")
+            if any(
+                item is not None
+                for item in (current.binding, current.baseline, current.receipt,
+                             current.accepted_at, current.upload_receipt, current.response,
+                             current.session_id_before, current.error)
+            ):
+                raise DurableRequestError("request contains irreversible evidence")
+            key = build_idempotency_key(
+                role=role, prompt=normalized, source_context=source_context,
+                role_prompt_hash=role_prompt_hash, files=current.files,
+            )
+            marker = request_marker(request_id)
+            rendered_prompt = (
+                render_prompt(normalized, marker)
+                if current.marker in current.rendered_prompt
+                else normalized
+            )
+            rebound = replace(
+                current,
+                idempotency_key=key,
+                prompt=normalized,
+                rendered_prompt=rendered_prompt,
+                marker=marker,
+                source_context=source_context,
+                role_prompt_hash=role_prompt_hash,
+                updated_at=time.time(),
+            )
+            data["records"][request_id] = rebound.to_dict()
+            return rebound
+
     def peek(self, request_id: str) -> DurableRequestRecord | None:
         try:
-            raw = json.loads(self.path.read_bytes())
+            raw = json.loads(read_shared_bytes(self.path))
         except FileNotFoundError:
             return None
         if raw.get("version") != self.VERSION:

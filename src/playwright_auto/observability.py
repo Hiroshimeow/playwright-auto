@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from .file_lock import atomic_replace, exclusive_file_lock, open_shared_read
+
 _ACTION_EVENT_LOG = Path(
     os.environ.get("PLAYWRIGHT_AUTO_ACTION_LOG", ".runtime/action-events.jsonl")
 )
@@ -17,7 +19,17 @@ _LIVE_EVENT_LOG = Path(
     os.environ.get("PLAYWRIGHT_AUTO_LIVE_LOG", ".runtime/live-events.jsonl")
 )
 _LIVE_EVENT_MAX_BYTES = 4 * 1024 * 1024
+_ACTION_EVENT_MAX_BYTES = 4 * 1024 * 1024
 _LIVE_EVENT_ENABLED = bool(os.environ.get("PLAYWRIGHT_AUTO_LIVE_LOG"))
+_LIVE_EVENT_SIGNATURES: dict[tuple[Any, ...], str] = {}
+
+
+class _AllowSummaryCorruptionError(RuntimeError):
+    pass
+
+
+class _AllowSummaryMissingError(_AllowSummaryCorruptionError):
+    pass
 
 
 def configure_action_event_log(path: str | Path) -> Path:
@@ -34,6 +46,7 @@ def configure_live_event_log(path: str | Path, *, enabled: bool = True) -> Path:
     global _LIVE_EVENT_LOG, _LIVE_EVENT_ENABLED
     _LIVE_EVENT_LOG = Path(path)
     _LIVE_EVENT_ENABLED = bool(enabled)
+    _LIVE_EVENT_SIGNATURES.clear()
     return _LIVE_EVENT_LOG
 
 
@@ -106,6 +119,28 @@ def append_live_event(
         "detail": detail,
     }
     if _LIVE_EVENT_ENABLED:
+        event_source = payload["source"]
+        if event_source in {"LISTEN", "CTRL"}:
+            identity = (
+                event_source,
+                payload["kind"],
+                payload["page_url"],
+                payload["page_id"],
+                payload["role"],
+                payload["task_id"],
+                payload["team"],
+                payload["request_id"],
+                payload["generation"],
+            )
+            signature = json.dumps(
+                [payload["changes"], payload["values"], payload["detail"]],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if _LIVE_EVENT_SIGNATURES.get(identity) == signature:
+                return payload
+            _LIVE_EVENT_SIGNATURES[identity] = signature
         _append_jsonl(_LIVE_EVENT_LOG, payload)
         _trim_live_log(_LIVE_EVENT_LOG)
     return payload
@@ -149,6 +184,156 @@ def read_recent_live_events(
     return events[-limit:]
 
 
+def _empty_allow_summary() -> dict[str, Any]:
+    return {"clicks": 0, "by_tool": {}, "by_task": {}, "latest_at": None}
+
+
+def _allow_summary_path(target: Path) -> Path:
+    return target.with_name(f"{target.stem}.summary.json")
+
+
+def _action_lock_path(target: Path) -> Path:
+    return target.with_name(f"{target.name}.lock")
+
+
+def _apply_allow_event(summary: dict[str, Any], event: dict[str, Any]) -> None:
+    page_url = str(event.get("page_url") or "")
+    if (
+        event.get("action") != "mcp_allow"
+        or event.get("phase") != "complete"
+        or not page_url.startswith(("https://chatgpt.com/", "https://www.chatgpt.com/"))
+    ):
+        return
+    summary["clicks"] = int(summary.get("clicks") or 0) + 1
+    detail = str(event.get("detail") or "")
+    match = re.search(r"\bAllow\s+([^\r\n]+?)\s+for this conversation\b", detail, re.I)
+    tool = match.group(1).lower() if match else "unknown"
+    by_tool = summary.setdefault("by_tool", {})
+    by_tool[tool] = int(by_tool.get(tool, 0)) + 1
+    task_id = str(event.get("task_id") or "").strip()
+    if task_id:
+        by_task = summary.setdefault("by_task", {})
+        by_task[task_id] = int(by_task.get(task_id, 0)) + 1
+    at = str(event.get("at") or "").strip()
+    if at:
+        summary["latest_at"] = at
+
+
+def _scan_allow_summary(target: Path) -> dict[str, Any]:
+    summary = _empty_allow_summary()
+    if not target.exists():
+        return summary
+    for line in target.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            _apply_allow_event(summary, event)
+    return summary
+
+
+def _write_allow_summary(target: Path, summary: dict[str, Any]) -> None:
+    sidecar = _allow_summary_path(target)
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "clicks": int(summary.get("clicks") or 0),
+        "by_tool": dict(sorted((summary.get("by_tool") or {}).items())),
+        "by_task": dict(sorted((summary.get("by_task") or {}).items())),
+        "latest_at": summary.get("latest_at"),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    temporary = sidecar.with_name(f"{sidecar.name}.{uuid4().hex}.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    atomic_replace(temporary, sidecar)
+
+
+def _load_allow_summary(target: Path) -> dict[str, Any]:
+    sidecar = _allow_summary_path(target)
+    try:
+        with open_shared_read(sidecar) as handle:
+            raw = handle.read().decode("utf-8")
+    except FileNotFoundError as exc:
+        raise _AllowSummaryMissingError(
+            f"Auto-Allow aggregate is unavailable: {sidecar}"
+        ) from exc
+    except OSError as exc:
+        raise _AllowSummaryCorruptionError(
+            f"Auto-Allow aggregate is unreadable: {sidecar}"
+        ) from exc
+
+    try:
+        payload = json.loads(raw)
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            raise ValueError("unsupported aggregate payload")
+        clicks = payload.get("clicks")
+        by_tool = payload.get("by_tool")
+        by_task = payload.get("by_task")
+        latest_at = payload.get("latest_at")
+        if isinstance(clicks, bool) or not isinstance(clicks, int) or clicks < 0:
+            raise ValueError("clicks must be a non-negative integer")
+        for name, counts in (("by_tool", by_tool), ("by_task", by_task)):
+            if not isinstance(counts, dict):
+                raise ValueError(f"{name} must be an object")
+            if any(
+                not isinstance(key, str)
+                or isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                for key, value in counts.items()
+            ):
+                raise ValueError(f"{name} contains an invalid counter")
+        if latest_at is not None and not isinstance(latest_at, str):
+            raise ValueError("latest_at must be a string or null")
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise _AllowSummaryCorruptionError(
+            f"Auto-Allow aggregate is corrupt: {sidecar}"
+        ) from exc
+
+    return {
+        "clicks": clicks,
+        "by_tool": dict(by_tool),
+        "by_task": dict(by_task),
+        "latest_at": latest_at,
+    }
+
+
+def _load_or_migrate_allow_summary(
+    target: Path, *, allow_migration: bool
+) -> dict[str, Any]:
+    try:
+        return _load_allow_summary(target)
+    except _AllowSummaryMissingError:
+        if not allow_migration:
+            try:
+                fresh_log = not target.exists() or target.stat().st_size == 0
+            except OSError:
+                fresh_log = False
+            if not fresh_log:
+                raise
+    summary = _scan_allow_summary(target)
+    _write_allow_summary(target, summary)
+    return summary
+
+
+def _trim_action_log(target: Path, *, max_bytes: int | None = None) -> None:
+    max_bytes = _ACTION_EVENT_MAX_BYTES if max_bytes is None else max_bytes
+    try:
+        if target.stat().st_size <= max_bytes:
+            return
+        data = target.read_bytes()
+    except FileNotFoundError:
+        return
+    keep = data[-(max_bytes // 2):]
+    newline = keep.find(b"\n")
+    if newline >= 0:
+        keep = keep[newline + 1:]
+    temporary = target.with_name(f"{target.name}.{uuid4().hex}.tmp")
+    temporary.write_bytes(keep)
+    atomic_replace(temporary, target)
+
+
 def append_action_event(
     action: str,
     phase: str,
@@ -175,48 +360,40 @@ def append_action_event(
         "delay_seconds": delay_seconds,
         "detail": detail,
     }
-    _append_jsonl(_ACTION_EVENT_LOG, payload)
+    target = _ACTION_EVENT_LOG
+    lock_path = _action_lock_path(target)
+    allow_migration = not lock_path.exists()
+    with exclusive_file_lock(lock_path):
+        try:
+            summary = _load_or_migrate_allow_summary(
+                target, allow_migration=allow_migration
+            )
+        except _AllowSummaryCorruptionError:
+            # Aggregate truth stays unavailable, but recent evidence must remain bounded.
+            _append_jsonl(target, payload)
+            _trim_action_log(target)
+            return payload
+        _apply_allow_event(summary, payload)
+        _write_allow_summary(target, summary)
+        _append_jsonl(target, payload)
+        _trim_action_log(target)
     return payload
 
 
 def mcp_allow_click_summary(path: str | Path | None = None) -> dict[str, Any]:
     target = Path(path) if path is not None else _ACTION_EVENT_LOG
-    summary: dict[str, Any] = {
-        "clicks": 0,
-        "by_tool": {},
-        "by_task": {},
-        "latest_at": None,
-    }
-    if not target.exists():
-        return summary
-    tool_pattern = re.compile(r"\bAllow\s+([^\r\n]+?)\s+for this conversation\b", re.I)
-    for line in target.read_text(encoding="utf-8", errors="replace").splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
-        page_url = str(event.get("page_url") or "")
-        if (
-            event.get("action") != "mcp_allow"
-            or event.get("phase") != "complete"
-            or not page_url.startswith(("https://chatgpt.com/", "https://www.chatgpt.com/"))
-        ):
-            continue
-        summary["clicks"] += 1
-        detail = str(event.get("detail") or "")
-        match = tool_pattern.search(detail)
-        tool = match.group(1).lower() if match else "unknown"
-        summary["by_tool"][tool] = int(summary["by_tool"].get(tool, 0)) + 1
-        task_id = str(event.get("task_id") or "").strip()
-        if task_id:
-            summary["by_task"][task_id] = int(summary["by_task"].get(task_id, 0)) + 1
-        at = str(event.get("at") or "").strip()
-        if at:
-            summary["latest_at"] = at
-    summary["by_tool"] = dict(sorted(summary["by_tool"].items()))
-    summary["by_task"] = dict(sorted(summary["by_task"].items()))
+    try:
+        summary = _load_allow_summary(target)
+    except _AllowSummaryCorruptionError as exc:
+        return {
+            "clicks": None,
+            "by_tool": {},
+            "by_task": {},
+            "latest_at": None,
+            "error": str(exc),
+        }
+    summary["by_tool"] = dict(sorted((summary.get("by_tool") or {}).items()))
+    summary["by_task"] = dict(sorted((summary.get("by_task") or {}).items()))
     return summary
 
 
@@ -230,7 +407,8 @@ def read_recent_action_events(
     target = Path(path) if path is not None else _ACTION_EVENT_LOG
     if not target.exists():
         return []
-    all_lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+    with open_shared_read(target) as handle:
+        all_lines = handle.read().decode("utf-8", errors="replace").splitlines()
     start = max(0, len(all_lines) - limit)
     events: list[dict[str, Any]] = []
     for line_number, line in enumerate(all_lines[start:], start=start + 1):

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import playwright_auto.observability as observability
 from playwright_auto.cdpa_worker import _active_hop
 from playwright_auto.durable import RequestLedger
 from test_cdpa_worker import _prepare_sent_waiting_task
@@ -97,6 +99,7 @@ def test_accepted_response_keeps_existing_endpoint_while_draining_or_cooling(tmp
         seen.append(endpoint_id)
         return task
     monkeypatch.setattr(worker, "advance", advance)
+    monkeypatch.setattr(worker, "_execution_page_observed", lambda _state, _endpoint: True)
     monkeypatch.setattr(worker, "_maintain_ambient_page_automation", _noop)
     monkeypatch.setattr(worker, "_refresh_rate_limit_cooldown", _noop)
     monkeypatch.setattr(worker, "_close_idle_independent_tabs", _noop)
@@ -149,3 +152,116 @@ def test_pristine_prompt_set_ledger_request_can_relocate_without_replay(tmp_path
     assert current.status is RequestStatus.PROMPT_SET
     assert current.attempts == 0
     assert current.receipt is None
+
+
+def test_accepted_execution_reconciles_on_connected_endpoint_when_readiness_probe_fails(tmp_path, monkeypatch):
+    worker, store, first, _second, tasks = _setup(tmp_path)
+    task = copy.deepcopy(tasks[0])
+    task.update(status="RUNNING", active_role="PLAN")
+    task["roles"]["PLAN"].update(
+        browser_endpoint_id=first["endpoint_id"], page_id="accepted-page",
+        page_url="https://chatgpt.com/c/accepted", online=True,
+    )
+    _active_hop(task).update(
+        state="waiting", receipt={"accepted_via": "test"},
+        browser_endpoint_id=first["endpoint_id"],
+    )
+    worker.registry.update_task(task, now=0)
+    seen = []
+    async def advance(_path, _context, *, scheduling_tasks=None, endpoint_id=None):
+        seen.append(endpoint_id)
+        return task
+    monkeypatch.setattr(worker, "advance", advance)
+    monkeypatch.setattr(worker, "_execution_page_observed", lambda _state, _endpoint: True)
+    monkeypatch.setattr(worker, "_maintain_ambient_page_automation", _noop)
+    monkeypatch.setattr(worker, "_refresh_rate_limit_cooldown", _noop)
+    monkeypatch.setattr(worker, "_close_idle_independent_tabs", _noop)
+    async def run():
+        pool = await _pool(store)
+        try:
+            runtime = pool._runtimes[first["endpoint_id"]]
+            runtime.chatgpt_ready = False
+            await worker.run_once_pool(pool)
+        finally:
+            await pool.close()
+    asyncio.run(run())
+    assert seen == [first["endpoint_id"]]
+
+
+@pytest.mark.parametrize("status", ["PAUSED", "BLOCKED"])
+def test_drain_keeps_endpoint_for_unresolved_accepted_execution_without_online_page(tmp_path, status):
+    case = tmp_path / status.lower()
+    case.mkdir()
+    store, state, worker, path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
+        case, task_id=f"drain-{status.lower()}"
+    )
+    endpoint_id = store.endpoints.resolve()["endpoint_id"]
+    state["status"] = status
+    state["roles"]["PLAN"].update(
+        browser_endpoint_id=endpoint_id, page_id=None, page_url=None, online=False
+    )
+    hop["browser_endpoint_id"] = endpoint_id
+    store.save(path, state)
+    worker.hydrate_runtime(startup=False)
+    removed = worker._apply_browser_endpoint_remove({"endpoint_id": endpoint_id})
+    assert removed["draining"] is True
+    assert removed["removed"] is False
+    assert worker._finalize_drained_endpoints() == []
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_sending_relocation_requires_readable_pristine_durable_record(tmp_path, damage):
+    store, state, worker, _path, hop, _ledger, _ = _prepare_pristine_new_sending_record(
+        tmp_path, task_id=f"pristine-proof-{damage}"
+    )
+    original = store.endpoints.resolve()["endpoint_id"]
+    state["roles"]["PLAN"]["browser_endpoint_id"] = original
+    target = store.endpoints.add("9202")["endpoint_id"]
+    ledger_path = Path(hop["ledger_path"])
+    if damage == "missing":
+        ledger_path.unlink()
+    else:
+        ledger_path.write_text("{broken", encoding="utf-8")
+
+    assert worker._prepare_execution_endpoint(state, target) is False
+    assert state["roles"]["PLAN"]["browser_endpoint_id"] == original
+    assert hop.get("rebuild_prompt_after_relocation") is not True
+
+
+def test_worker_cycles_do_not_reappend_unchanged_live_audit_pairs(tmp_path, monkeypatch):
+    worker, store, _first, _second, _tasks = _setup(tmp_path)
+    log_path = tmp_path / ".runtime" / "live-events.jsonl"
+
+    async def advance(path, context, *, scheduling_tasks=None, endpoint_id=None):
+        for source in ("LISTEN", "CTRL"):
+            observability.append_live_event(
+                source, "worker_cycle_probe", page_id="page-stable", task_id="task-0",
+                values={"status": "IS_STREAMING", "permission_target": "same"},
+            )
+        return store.load(path)
+
+    monkeypatch.setattr(worker, "advance", advance)
+    monkeypatch.setattr(worker, "_maintain_ambient_page_automation", _noop)
+    monkeypatch.setattr(worker, "_refresh_rate_limit_cooldown", _noop)
+    monkeypatch.setattr(worker, "_close_idle_independent_tabs", _noop)
+
+    async def run():
+        pool = await _pool(store)
+        try:
+            await worker.run_once_pool(pool)
+            await worker.run_once_pool(pool)
+        finally:
+            await pool.close()
+
+    asyncio.run(run())
+    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    stable = [item for item in events if item.get("kind") == "worker_cycle_probe"]
+    assert [item["source"] for item in stable] == ["LISTEN", "CTRL"]
+
+    observability.append_live_event(
+        "CTRL", "worker_cycle_probe", page_id="page-stable", task_id="task-0",
+        values={"status": "DONE", "permission_target": "same"},
+    )
+    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    changed = [item for item in events if item.get("kind") == "worker_cycle_probe"]
+    assert [item["values"]["status"] for item in changed] == ["IS_STREAMING", "IS_STREAMING", "DONE"]

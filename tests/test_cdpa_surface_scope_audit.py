@@ -36,6 +36,36 @@ def test_new_generation_closes_only_exact_role_not_team_peers(tmp_path, monkeypa
     assert acquired.client.page not in [plan, dev, other]
 
 
+def test_history_controller_skips_terminal_owned_pages(tmp_path, monkeypatch):
+    _, _, state, worker = setup_task(tmp_path)
+    state.update(status="DONE", terminal_state="DONE", active_role=None, active_hop_id=None)
+    worker.registry = SimpleNamespace(tasks_by_id={state["task_id"]: state})
+    maintained = []
+
+    class Page:
+        url = "https://chatgpt.com/c/terminal"
+        def is_closed(self): return False
+        async def evaluate(self, _script):
+            return worker_module.WINDOW_NAME_PREFIX + json.dumps({
+                "taskId": state["task_id"], "pageId": "terminal-page", "role": "PLAN"
+            })
+
+    class Client:
+        def __init__(self, page, **kwargs): self.page = page
+        async def install_page_observer(self): pass
+
+    async def maintain(client, wait): maintained.append(client.page)
+
+    monkeypatch.setattr(worker_module, "ChatGPTPage", Client)
+    monkeypatch.setattr(worker.role_controller, "maintain_history", maintain)
+    monkeypatch.setattr(
+        "playwright_auto.role_runtime.page_observer.observer_for",
+        lambda page: SimpleNamespace(dom_wake=asyncio.Event(), network_wake=asyncio.Event()),
+    )
+    asyncio.run(worker._maintain_ambient_page_automation(SimpleNamespace(pages=[Page()])))
+    assert maintained == []
+
+
 def test_history_controller_does_not_approve_foreign_or_retired_execution_tools(tmp_path, monkeypatch):
     _, _, state, worker = setup_task(tmp_path)
     state["hops"][0].update(state="abandoned", receipt={"binding": {"page_id": "retired"}})
@@ -59,7 +89,7 @@ def test_history_controller_does_not_approve_foreign_or_retired_execution_tools(
     monkeypatch.setattr(worker_module, "ChatGPTPage", Client)
     monkeypatch.setattr(worker.role_controller, "maintain_history", maintain)
     monkeypatch.setattr("playwright_auto.role_runtime.page_observer.observer_for", lambda page: SimpleNamespace(dom_wake=asyncio.Event(), network_wake=asyncio.Event()))
-    asyncio.run(worker._maintain_ambient_page_automation(SimpleNamespace(pages=[Page("foreign-task", "foreign"), Page(state["task_id"], "retired")])))
+    asyncio.run(worker._maintain_ambient_page_automation(SimpleNamespace(pages=[Page(None, "unowned"), Page("foreign-task", "foreign"), Page(state["task_id"], "retired")])))
     assert maintained == []
 
 

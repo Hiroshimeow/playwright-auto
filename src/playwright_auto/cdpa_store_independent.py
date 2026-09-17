@@ -33,6 +33,9 @@ from .cdpa_workflow_agents import normalize_workflow_display_name
 from .file_lock import exclusive_file_lock
 
 
+_BROWSER_ENDPOINT_UNSET = object()
+
+
 class IndependentAgentStoreMixin:
     @staticmethod
     def _independent_task_id(agent_key: str, generation: int) -> str:
@@ -186,6 +189,7 @@ class IndependentAgentStoreMixin:
                 "agent_key": agent_key,
                 "display_name": str(display_name or agent_name).strip(),
                 "deleted_at": None,
+                "board_projection_hidden_at": None,
                 "agent_generation": generation,
                 "previous_task_id": previous_task_id,
                 "enabled": bool(enabled),
@@ -202,6 +206,7 @@ class IndependentAgentStoreMixin:
                 "settings_reset_request": None,
                 "job_history": [],
                 "temporary_chat": bool(temporary_chat),
+                "browser_endpoint_id": browser_endpoint_id,
                 "new_chat_next_job": bool(new_chat_next_job),
                 "new_chat_deferred_task_id": new_chat_deferred_task_id,
                 "close_tab_when_idle": bool(close_tab_when_idle),
@@ -316,6 +321,29 @@ class IndependentAgentStoreMixin:
         migrated_tasks: list[dict[str, Any]] = []
         for state in tasks:
             independent = state.get("independent")
+            if (
+                is_independent_task(state)
+                and isinstance(independent, Mapping)
+                and not independent.get("deleted_at")
+                and "board_projection_hidden_at" not in independent
+            ):
+                cleanup = state.get("cleanup") if isinstance(state.get("cleanup"), Mapping) else {}
+                hidden_at = (
+                    str(cleanup.get("cleared_at") or state.get("updated_at") or utc_now())
+                    if str(cleanup.get("state") or "").upper() == "CLEARED"
+                    else None
+                )
+
+                def migrate_board_projection(current: dict[str, Any]) -> dict[str, Any]:
+                    if is_independent_task(current) and not current["independent"].get("deleted_at"):
+                        current["independent"].setdefault("board_projection_hidden_at", hidden_at)
+                    return current
+
+                migrated = self.update(state["manifest_path"], migrate_board_projection)
+                if migrated != state:
+                    normalized.append(migrated)
+                state = migrated
+                independent = state.get("independent")
             if (
                 is_independent_task(state)
                 and isinstance(independent, Mapping)
@@ -448,6 +476,7 @@ class IndependentAgentStoreMixin:
         enabled: bool = True,
         max_cycles: int | None = None,
         temporary_chat: bool | None = None,
+        browser_endpoint_id: str | None = None,
         external_command_id: str | None = None,
         _seed_only: bool = False,
     ) -> dict[str, Any]:
@@ -531,6 +560,15 @@ class IndependentAgentStoreMixin:
                 if previous is not None
                 else True
             )
+            effective_browser_endpoint_id = (
+                self.endpoints.resolve(browser_endpoint_id)["endpoint_id"]
+                if browser_endpoint_id is not None
+                else (
+                    self.endpoints.resolve(previous["independent"]["browser_endpoint_id"])["endpoint_id"]
+                    if previous is not None and previous["independent"].get("browser_endpoint_id")
+                    else None
+                )
+            )
             repository_path = Path(
                 repository
                 or (previous.get("repository") if previous is not None else None)
@@ -607,7 +645,7 @@ class IndependentAgentStoreMixin:
                 max_cycles=effective_max_cycles,
                 max_cycles_explicit=max_cycles is not None,
                 temporary_chat=effective_temporary_chat,
-                browser_endpoint_id=None,
+                browser_endpoint_id=effective_browser_endpoint_id,
                 inherited_role=(
                     previous["roles"][INDEPENDENT_ROLE]
                     if previous is not None
@@ -1190,6 +1228,7 @@ class IndependentAgentStoreMixin:
         *,
         trigger_type: str = "manual",
         instruction: str | None = None,
+        required_browser_endpoint_id: str | None = None,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
         normalized_type = str(trigger_type or "manual").strip().lower()
@@ -1200,6 +1239,13 @@ class IndependentAgentStoreMixin:
         )
         if normalized_instruction is not None and normalized_type != "manual":
             raise ValueError("instruction is valid only for a manual run")
+        normalized_required_endpoint = (
+            self.endpoints.resolve(required_browser_endpoint_id)["endpoint_id"]
+            if required_browser_endpoint_id is not None
+            else None
+        )
+        if normalized_required_endpoint is not None and normalized_type != "manual":
+            raise ValueError("required_browser_endpoint_id is valid only for a manual run")
 
         def mutate(state: dict[str, Any]) -> dict[str, Any]:
             if not is_independent_task(state):
@@ -1228,7 +1274,10 @@ class IndependentAgentStoreMixin:
             }
             if normalized_instruction is not None:
                 event["instruction"] = normalized_instruction
+            if normalized_required_endpoint is not None:
+                event["required_browser_endpoint_id"] = normalized_required_endpoint
             independent["active_event"] = event
+            independent["board_projection_hidden_at"] = None
             independent["cycle"] = 1
             independent["completion_request"] = None
             independent["continuation_request"] = None
@@ -1322,6 +1371,7 @@ class IndependentAgentStoreMixin:
         trigger_settings: Mapping[str, Any] | None = None,
         max_cycles: int | None = None,
         new_chat_next_job: bool | None = None,
+        browser_endpoint_id: str | None | object = _BROWSER_ENDPOINT_UNSET,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
         normalized_display = (
@@ -1339,6 +1389,12 @@ class IndependentAgentStoreMixin:
         )
         normalized_max_cycles = (
             normalize_max_cycles(max_cycles) if max_cycles is not None else None
+        )
+        browser_endpoint_requested = browser_endpoint_id is not _BROWSER_ENDPOINT_UNSET
+        normalized_browser_endpoint_id = (
+            self.endpoints.resolve(str(browser_endpoint_id))["endpoint_id"]
+            if browser_endpoint_requested and browser_endpoint_id is not None
+            else None
         )
         target = Path(path).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
@@ -1386,6 +1442,23 @@ class IndependentAgentStoreMixin:
                     return current
                 if independent.get("deleted_at"):
                     raise ValueError("independent agent is deleted")
+                if browser_endpoint_requested:
+                    role = current["roles"][INDEPENDENT_ROLE]
+                    current_affinity = (
+                        str(independent.get("browser_endpoint_id") or "").strip() or None
+                    )
+                    if normalized_browser_endpoint_id != current_affinity:
+                        if independent.get("active_event") is not None:
+                            raise ValueError("cannot change browser endpoint during an active job")
+                        if (role.get("page_id") or role.get("page_url")) and not independent.get("idle_tab_closed_at"):
+                            raise ValueError("cannot change browser endpoint while the agent owns a live tab")
+                        placement_endpoint_id = (
+                            normalized_browser_endpoint_id
+                            or self.endpoints.resolve()["endpoint_id"]
+                        )
+                        current["browser_endpoint_id"] = placement_endpoint_id
+                        role["browser_endpoint_id"] = placement_endpoint_id
+                        independent["browser_endpoint_id"] = normalized_browser_endpoint_id
                 if normalized_display is not None:
                     independent["display_name"] = normalized_display
                 if normalized_prompt is not None:

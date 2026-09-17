@@ -453,14 +453,18 @@ def test_notify_frontend_contract_reuses_secondary_report_path_and_preserves_his
     assert 'if (current.drawer === "history") renderHistory(roots.secondaryContent, current);' in app
     assert 'if (current.drawer === "notify") renderNotify(roots.secondaryContent, current);' in app
     assert 'if (view === "notify") delete roots.secondaryContent.dataset.secondaryView;' in app
-    assert '/assets/app.js?v=20260913-multi-cdp-v1' in html
-    assert './views/notify.js?v=20260913-multi-cdp-v1' in app
+    cache_key = "20260915-report-context-integrate-v1"
+    assert '/assets/app.js?v=20260916-solo-task-v1' in html
+    assert f'./views/task_detail.js?v={cache_key}' in app
+    assert f'./views/notify.js?v={cache_key}' in app
+    assert f'./task_detail.js?v={cache_key}' in notify
     assert 'data-notify-task-id' in notify
     assert 'workflowReportModel(detail, detail.active_role)' in notify
     assert 'reportBody(report, reportBodies)' in notify
     assert 'data-notify-back' in notify
     assert 'Open raw report' in notify
-    assert 'No report yet' in notify
+    assert 'empty.textContent = model.selectedMissingReason' in notify
+    assert 'No report yet' not in notify
     assert 'event.target.closest("[data-notify-task-id]")' in app
     notify_open = app.split("async function openNotifyReport", 1)[1].split("\n}", 1)[0]
     assert "loadTaskDetail(taskId)" in notify_open
@@ -525,10 +529,11 @@ def test_workflow_report_model_selects_latest_per_role_and_retains_older_reports
       const detail = {{
         status: "RUNNING",
         roles: [
-          {{logical_role: "PLAN", physical_role: "alpha-plan"}},
-          {{logical_role: "DEV", physical_role: "alpha-dev"}},
-          {{logical_role: "REVIEW", physical_role: "alpha-review"}},
-          {{logical_role: "AUDIT", physical_role: "alpha-audit"}},
+          {{logical_role: "PLAN", physical_role: "alpha-plan", turn: 2}},
+          {{logical_role: "DEV", physical_role: "alpha-dev", turn: 2}},
+          {{logical_role: "REVIEW", physical_role: "alpha-review", turn: 2}},
+          {{logical_role: "AUDIT", physical_role: "alpha-audit", turn: 0}},
+          {{logical_role: "TEST", physical_role: "alpha-test", turn: 0}},
         ],
         reports: [
           {{role: "PLAN", turn: 1, url: "/p1"}},
@@ -560,14 +565,14 @@ def test_workflow_report_model_selects_latest_per_role_and_retains_older_reports
         text=True,
     )
     assert json.loads(result.stdout) == {
-        "latest": [["PLAN", "/p2"], ["DEV", "/d2"], ["REVIEW", "/r2"], ["AUDIT", None]],
+        "latest": [["PLAN", "/p2"], ["DEV", "/d2"], ["REVIEW", "/r2"]],
         "older": ["/d1", "/p1"],
         "running": "/d2",
         "fallback": "/r2",
         "done": "/p2",
         "explicit": "/p1",
         "explicitRole": "PLAN",
-        "coverage": "3/4",
+        "coverage": "3/3",
     }
 
 
@@ -604,8 +609,10 @@ def test_workflow_report_polish_uses_coverage_rail_and_responsive_selector():
     assert '"workflow-report-layout"' in detail
     assert '"workflow-report-content"' in detail
     assert '`report-role${item.role === model.selectedReport?._logicalRole ? " selected" : ""}`' in detail
-    assert "role.disabled = !item.latest;" in detail
-    assert 'item.latest ? `Turn ${item.latest.turn ?? "—"}` : "No report"' in detail
+    assert "role.disabled = !item.current;" in detail
+    assert 'item.current ? `Turn ${item.current.turn ?? "—"}` : item.missingReason' in detail
+    assert 'model.selectedMissingReason' in detail
+    assert 'No workflow reports are available yet.' not in detail
     assert ".workflow-report-layout {" in css
     assert "grid-template-columns: 175px minmax(0, 1fr);" in css
     assert "box-shadow: inset 2px 0 0 var(--accent);" in css
@@ -716,13 +723,25 @@ def test_workflow_controls_fail_closed_from_projected_eligibility_with_reason_to
     assert "node.dataset.disabledReason = String(reason)" in detail
 
 
-def test_task_controls_render_before_task_prompt():
+def test_worktree_archive_control_is_operator_visible_and_requires_confirmation():
+    detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
+    app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
+    workflow = detail.split("function workflowOverview", 1)[1].split("function build", 1)[0]
+
+    assert '["archive_worktree", "Archive worktree"]' in workflow
+    assert '["stop", "clear_team", "archive_worktree"].includes(control.dataset.control)' in app
+
+
+def test_task_controls_render_inside_operational_state_before_task_prompt():
     detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
     workflow = detail.split("function workflowOverview", 1)[1].split("function build", 1)[0]
     independent = detail.split("function independentOverview", 1)[1].split("function independentHistory", 1)[0]
 
-    assert workflow.index("fragment.append(operations);") < workflow.index("fragment.append(taskSection);")
-    assert independent.index("fragment.append(independentControls(detail));") < independent.index("fragment.append(section);")
+    assert 'const operations = operationalStateSection(detail, endpoints);' in workflow
+    assert workflow.index("operations.append(controls);") < workflow.index("fragment.append(taskSection);")
+    assert 'const operational = operationalStateSection(detail, endpoints);' in independent
+    assert "operational.append(independentControls(detail));" in independent
+    assert independent.index("fragment.append(operational);") < independent.index("fragment.append(section);")
 
 
 def test_independent_agents_have_one_lane_and_operator_facing_controls():
@@ -904,3 +923,320 @@ def test_change_goal_ui_contract_is_running_only_and_uses_shared_command_path():
     assert 'kind: "change_goal"' in app
     assert 'expected_task_version' in app
     assert 'roots.changeGoalForm' in app
+
+
+def test_operational_topology_unifies_endpoint_health_and_task_placement():
+    topology_path = ASSET_ROOT / "views" / "topology.js"
+    assert topology_path.exists()
+    module = topology_path.resolve().as_uri()
+    script = f"""
+      import {{endpointOperationalState, taskPlacement}} from {json.dumps(module)};
+      const endpoints = [
+        {{
+          endpoint_id: "requested",
+          label: "9202 Extra",
+          cdp_url: "http://127.0.0.1:9202",
+          connected: true,
+          chatgpt_ready: true,
+          health: "online",
+          active_count: 0,
+          capacity: 2,
+          available_slots: 2,
+        }},
+        {{
+          endpoint_id: "actual",
+          label: "9222 Plus",
+          cdp_url: "http://127.0.0.1:9222",
+          connected: true,
+          chatgpt_ready: true,
+          health: "online",
+          active_count: 2,
+          capacity: 2,
+          available_slots: 0,
+        }},
+      ];
+      const workflow = taskPlacement({{
+        requested_browser_endpoint_id: "requested",
+        active_role: "DEV",
+        roles: [{{logical_role: "DEV", browser_endpoint_id: "actual"}}],
+      }}, endpoints);
+      const independent = taskPlacement({{
+        task_mode: "independent",
+        agent: {{browser_endpoint_id: "requested"}},
+        active_role: "AGENT",
+        roles: [{{logical_role: "AGENT", browser_endpoint_id: "requested"}}],
+      }}, endpoints);
+      console.log(JSON.stringify({{
+        ready: endpointOperationalState(endpoints[0]),
+        full: endpointOperationalState(endpoints[1]),
+        workflow,
+        independent,
+      }}));
+    """
+    result = __import__("subprocess").run(
+        ["node", "--input-type=module", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["ready"]["key"] == "ready"
+    assert payload["full"]["key"] == "full"
+    assert payload["workflow"]["requested"]["label"] == "9202 Extra"
+    assert payload["workflow"]["actual"]["label"] == "9222 Plus"
+    assert payload["workflow"]["relocated"] is True
+    assert payload["independent"]["affinity"]["label"] == "9202 Extra"
+    assert payload["independent"]["actual"]["label"] == "9202 Extra"
+
+    browsers = (ASSET_ROOT / "views" / "browsers.js").read_text(encoding="utf-8")
+    board = (ASSET_ROOT / "views" / "board.js").read_text(encoding="utf-8")
+    detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
+    css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
+    assert '"endpoint-scope-card"' in browsers
+    assert '"endpoint-workload"' in browsers
+    assert '"task-placement"' in board
+    assert '"Operational state"' in detail
+    assert ".endpoint-scope-card {" in css
+    assert ".task-placement {" in css
+    assert ".operational-state-grid {" in css
+
+
+def test_board_lane_materialization_keeps_commands_after_operational_lanes():
+    html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+    app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
+    board = (ASSET_ROOT / "views" / "board.js").read_text(encoding="utf-8")
+
+    # Commands is present in the initial HTML. New workflow lanes must be inserted
+    # before it so DOM order matches visual order and narrow Chromium does not
+    # preserve scroll anchoring on Commands as that lane moves to the far right.
+    assert 'const commands = root.querySelector(".command-lane");' in board
+    assert "if (commands) root.insertBefore(section, commands);" in board
+    assert 'const firstMaterialization = !root.querySelector(".lane:not(.command-lane)");' in board
+    assert "if (firstMaterialization) root.scrollLeft = 0;" in board
+
+    # board.js and its importing entrypoint both get fresh cache identities.
+    assert './views/board.js?v=20260915-operator-ux-v1' in app
+    assert '/assets/app.js?v=20260916-solo-task-v1' in html
+
+
+def test_dashboard_compact_layout_contract_keeps_operational_content_visible():
+    html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+    css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
+
+    # CSS byte changes must publish under a new cache identity.
+    assert '/assets/dashboard.css?v=20260915-operator-ux-v1' in html
+
+    # Endpoint scope is one compact equal-height topology; required operational
+    # fields must not be hidden behind a fixed maximum card height.
+    assert "grid-auto-rows: 1fr;" in css
+    assert "height: 100%;" in css
+    assert "max-height: 118px" not in css
+
+    # A workflow card renders head, summary, placement, identity, and metadata.
+    # The layout must account for all five rows instead of clipping the fifth.
+    assert "grid-template-rows: auto auto auto auto auto;" in css
+    assert ".task-operational {" in css
+    assert "overflow-wrap: anywhere;" in css
+
+    # Narrow viewports keep endpoint actions and cards bounded rather than
+    # squeezing the topology beside the management controls.
+    assert ".browser-scope { grid-template-columns: minmax(0, 1fr); }" in css
+
+
+def test_dashboard_dense_operator_layout_contract():
+    html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+    app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
+    browsers = (ASSET_ROOT / "views" / "browsers.js").read_text(encoding="utf-8")
+    board = (ASSET_ROOT / "views" / "board.js").read_text(encoding="utf-8")
+    css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
+
+    # Published frontend bytes use a fresh cache identity through the changed import graph.
+    assert '/assets/dashboard.css?v=20260915-operator-ux-v1' in html
+    assert '/assets/app.js?v=20260916-solo-task-v1' in html
+    assert './views/board.js?v=20260915-operator-ux-v1' in app
+    assert './views/browsers.js?v=20260915-endpoint-all-v1' in app
+
+    # Endpoint controls are compact: state + CDP share a row and load gets visual priority.
+    assert '"endpoint-card-statusline"' in browsers
+    assert '"endpoint-load-value"' in browsers
+    assert ".endpoint-card-statusline {" in css
+    assert ".endpoint-load-value {" in css
+
+    # Browser management uses the same balanced form/control system instead of native uneven fields.
+    assert ".browser-manager input," in css
+    assert ".browser-manager select {" in css
+    assert ".browser-add-grid > label:nth-child(5)" in css
+    assert ".browser-settings-grid > .check-row" in css
+
+    # Lane already communicates status. Cards keep action/duration but do not repeat status/queue reason.
+    assert 'meta.append(normalWaiting ? waitingField(task) : field("Status", task.status));' not in board
+    assert 'meta.append(field("Queue reason", waiting.reason));' not in board
+    assert 'secondary.textContent = placement.relocated' in board
+    assert ': "";' in board
+
+    # Preserve the proven board geometry from the pre-endpoint UI. Status lanes are
+    # fixed grid items; responsive breakpoints change the column count instead of
+    # widening lanes ad hoc. A 388px lane with two 150px cards fits two complete
+    # teams before the lane needs vertical scrolling.
+    board = css.split(".board-section {", 1)[1].split("}", 1)[0]
+    lane = css.split(".lane {", 1)[1].split("}", 1)[0]
+    lane_header = css.split(".lane > header {", 1)[1].split("}", 1)[0]
+    lane_list = css.split(".lane-list {", 1)[1].split("}", 1)[0]
+    task_card = css.split(".task-card {", 1)[1].split("}", 1)[0]
+    wide = css.split("@media (min-width: 1600px)", 1)[1].split("@media (max-width: 1199px)", 1)[0]
+    medium = css.split("@media (max-width: 1199px)", 1)[1].split("@media (max-width: 920px)", 1)[0]
+
+    assert "grid-template-columns: repeat(4, minmax(0, 1fr));" in board
+    assert "grid-template-columns: repeat(5, minmax(0, 1fr));" in wide
+    assert "grid-template-columns: repeat(3, minmax(0, 1fr));" in medium
+    assert "height: 388px;" in lane
+    assert "min-height: 52px;" in lane_header
+    assert "padding: .8rem .9rem;" in lane_header
+    assert "gap: .6rem;" in lane_list
+    assert "padding: .7rem;" in lane_list
+    assert "height: 150px;" in task_card
+
+
+def test_endpoint_all_scope_is_compact_and_does_not_consume_endpoint_card_width():
+    browsers = (ASSET_ROOT / "views" / "browsers.js").read_text(encoding="utf-8")
+    css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
+
+    assert 'button("All", {browserScope: "all"' in browsers
+    assert 'button("All endpoints", {browserScope: "all"' not in browsers
+    assert "grid-template-columns: 64px repeat(auto-fit, minmax(145px, 1fr));" in css
+
+
+def test_task_card_ellipsis_keeps_full_text_and_distinguishes_waiting_from_blockers():
+    board = (ASSET_ROOT / "views" / "board.js").read_text(encoding="utf-8")
+    css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
+
+    assert "team.title = cardName;" in board
+    assert "titleNode.title = titleText;" in board
+    assert "problemNode.title = problem;" in board
+    assert 'task.status === "WAITING" ? "task-problem task-waiting" : "task-problem task-blocked"' in board
+    assert "primary.title = primary.textContent;" in board
+    assert "secondary.title = secondary.textContent;" in board
+    assert ".task-waiting {" in css
+    assert ".task-blocked {" in css
+
+
+def test_browser_pool_waiting_board_uses_projected_fifo_queue_truth():
+    module = (ASSET_ROOT / "views" / "board.js").resolve().as_uri()
+    script = f"""
+      import {{ waitingLaneSort, waitingPresentation, taskSignature }} from {json.dumps(module)};
+      import assert from 'node:assert/strict';
+      const older = {{
+        task_id: "zzz-old",
+        status: "WAITING",
+        created_at: "2026-09-14T00:00:01Z",
+        queue_position: 1,
+        queue_length: 2,
+        queue_since: "2026-09-14T00:01:00Z",
+        queue_reason: "Waiting for browser capacity.",
+        waiting_order: {{rank: 2, fifo: 1}},
+        roles: [],
+      }};
+      const newerRepair = {{
+        task_id: "aaa-new-repair",
+        status: "WAITING",
+        created_at: "2026-09-14T00:00:02Z",
+        queue_position: 2,
+        queue_length: 2,
+        queue_since: "2026-09-14T00:02:00Z",
+        queue_reason: "Waiting for browser capacity.",
+        waiting_order: {{rank: 1, fifo: 0}},
+        roles: [],
+      }};
+      const dependency = {{
+        task_id: "dependency",
+        status: "WAITING",
+        waiting_order: {{rank: 3, fifo: 3}},
+        roles: [],
+      }};
+      assert.deepEqual(
+        [newerRepair, older].sort(waitingLaneSort).map(task => task.task_id),
+        ["zzz-old", "aaa-new-repair"],
+      );
+      assert.deepEqual(waitingPresentation(older), {{
+        kind: "browser_queue",
+        label: "Queue",
+        value: "1/2",
+        since: "2026-09-14T00:01:00Z",
+        reason: "Waiting for browser capacity.",
+        intervention: null,
+      }});
+      assert.equal(waitingPresentation(dependency).label, "Order");
+      assert.notEqual(
+        taskSignature(older, new Map(), null),
+        taskSignature({{...older, queue_position: 2}}, new Map(), null),
+      );
+    """
+    __import__("subprocess").run(
+        ["node", "--input-type=module", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_health_dashboard_running_operational_truth_distinguishes_unknown_from_offline():
+    module = (ASSET_ROOT / "views" / "board.js").resolve().as_uri()
+    script = f"""
+      import {{ deriveOperationalTruth }} from {json.dumps(module)};
+      const now = Date.parse("2026-09-14T03:00:00Z");
+      const base = {{
+        status: "RUNNING",
+        active_role: "DEV",
+        active_action: "wait_response",
+        effective_activity_at: "2026-09-14T02:59:30Z",
+        roles: [{{logical_role: "DEV", online: true}}],
+        availability: "online",
+      }};
+      const runtime = {{worker_online: true, worker_stale: false, semantic_stale_after_seconds: 600}};
+      console.log(JSON.stringify({{
+        healthy: deriveOperationalTruth(base, runtime, now),
+        unknown: deriveOperationalTruth({{...base, availability: "unknown", roles: [{{logical_role: "DEV", online: null}}]}}, runtime, now),
+        offline: deriveOperationalTruth({{...base, availability: "offline", roles: [{{logical_role: "DEV", online: false}}]}}, runtime, now),
+      }}));
+    """
+    result = __import__("subprocess").run(
+        ["node", "--input-type=module", "-e", script], check=True, capture_output=True, text=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["healthy"]["state"] == "healthy"
+    assert payload["unknown"]["state"] == "unknown"
+    assert payload["unknown"]["reason"] == "Active role ownership is unknown."
+    assert payload["offline"]["state"] == "degraded"
+    assert payload["offline"]["reason"] == "Active DEV ownership is offline."
+
+
+def test_health_dashboard_report_model_does_not_show_prior_turn_as_current():
+    module = (ASSET_ROOT / "views" / "task_detail.js").resolve().as_uri()
+    script = f"""
+      import {{ workflowReportModel }} from {json.dumps(module)};
+      const detail = {{
+        status: "RUNNING", active_role: "DEV", active_hop_id: 3,
+        roles: [{{logical_role: "DEV", physical_role: "alpha-dev"}}],
+        role_inputs: {{DEV: {{logical_role: "DEV", turn: 2, expected_report: "alpha-dev_turn2_task-a.md"}}}},
+        active_input: {{logical_role: "DEV", turn: 2, expected_report: "alpha-dev_turn2_task-a.md"}},
+        reports: [{{role: "DEV", physical_role: "alpha-dev", turn: 1, url: "/dev-turn1"}}],
+      }};
+      const model = workflowReportModel(detail, "DEV");
+      console.log(JSON.stringify({{
+        selected: model.selectedReport?.url || null,
+        missing: model.selectedMissingReason || null,
+        current: model.roles[0]?.current?.url || null,
+        history: model.olderReports.map(report => report.url),
+        coverage: model.coverage,
+      }}));
+    """
+    result = __import__("subprocess").run(
+        ["node", "--input-type=module", "-e", script], check=True, capture_output=True, text=True,
+    )
+    assert json.loads(result.stdout) == {
+        "selected": None,
+        "missing": "Expected alpha-dev_turn2_task-a.md; no validated DEV report has been recorded yet.",
+        "current": None,
+        "history": ["/dev-turn1"],
+        "coverage": "0/1",
+    }

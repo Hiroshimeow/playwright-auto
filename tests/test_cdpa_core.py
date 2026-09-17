@@ -15,6 +15,7 @@ from playwright_auto.cdpa_prompts import PromptBuilder
 from playwright_auto.cdpa_routes import RouteContractError, parse_route_response
 from playwright_auto.cdpa_store import TaskStore, effective_task_goal, task_goal_for_hop, utc_now
 from playwright_auto.cdpa_worker import CDPAWorker
+from playwright_auto.file_lock import open_shared_read
 from playwright_auto.cdpa_team import (
     cleanup_eligible,
     is_active_team_owner,
@@ -67,12 +68,10 @@ def write_config(root: Path) -> Path:
         encoding="utf-8",
     )
     (root / "prompts" / "cdpa" / "RESPONSE_GUIDE.md").write_text(
-        "Work first. Write the complete non-empty role report to exactly: "
-        "`.plan/<team>/<physical-role>_turn<N>_<task-id>.md`. "
-        "Ensure the write has completed before returning the route decision.\n"
-        "Return only the strict route JSON.\n"
+        "Return exactly one valid JSON object:\n"
         '{"route":"PLAN|DEV|REVIEW|TEST|AUDIT|PAUSE|DONE",'
-        '"handoff":".plan/<team>/<physical-role>_turn<N>_<task-id>.md"}',
+        '"handoff":".plan/<team>/<physical-role>_turn<N>_<task-id>.md"}\n\n'
+        "Only PLAN may use `DONE`.\n",
         encoding="utf-8",
     )
     return path
@@ -346,6 +345,17 @@ def test_task_bootstrap_snapshot_is_optional_immutable_and_validated(tmp_path: P
         )
 
 
+def test_initial_plan_handoff_does_not_duplicate_authoritative_goal(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    goal = "Implement the requested behavior with focused tests."
+    state = store.create_task(goal, task_id="task-prompt-dedup")
+    hop = state["hops"][0]
+    assert state["task_text"] == goal
+    assert hop["handoff"] == "Initial task intake; no prior role handoff."
+    assert hop["handoff"] != state["task_text"]
+
+
 def _prompt_kwargs(config, tmp_path: Path, **overrides):
     value = {
         "task_title": "full task",
@@ -399,27 +409,25 @@ def test_constructor_is_once_per_generation_and_prompt_is_compact_allowlist(tmp_
         expected_report_path=".plan/alpha/alpha-plan_turn1_task-a.md",
     )
 
-    assert first.text.startswith("alpha · role: plan\n{")
-    envelope_text = first.text.removeprefix("alpha · role: plan\n")
-    envelope, _ = json.JSONDecoder().raw_decode(envelope_text)
-    assert envelope == {
-        "title": "full task",
-        "task-id": "task-a",
-        "team": "alpha",
-        "role": "alpha-plan",
-        "source-role": None,
-        "turn": 1,
-        "workspace": str(tmp_path),
-        "allowed-routes": ["PLAN", "DEV", "TEST", "REVIEW", "AUDIT", "DONE"],
-        "goal": "full task",
-        "handoff": "full task",
-    }
+    assert first.text.startswith("You are PLAN for the team alpha | task-a:")
+    assert f"Turn: 1\nWorkspace: {tmp_path}\nGoal: full task\nHandoff: full task" in first.text
+    assert "TURN_CONTEXT" not in first.text
+    assert "allowed-routes" not in first.text
     assert "Constructor for PLAN" in first.text
     assert "Constructor for DEV" not in later.text
     assert "Constructor for PLAN" in restarted.text
-    assert '"source-role": "alpha-plan"' in later.text
-    assert '"handoff": ".plan/alpha/alpha-plan_turn1_task-a.md"' in later.text
-    assert '"goal": "full task"' in later.text
+    assert '"source-role"' not in later.text
+    assert '"team"' not in later.text
+    assert '"role"' not in later.text
+    assert '"task-id"' not in later.text
+    assert "Handoff: .plan/alpha/alpha-plan_turn1_task-a.md" in later.text
+    assert "Goal: full task" in later.text
+    assert "Use @mcp-g8 or @mcp-docker on Linux, and @mcp-thinkbook on Windows." in later.text
+    assert "Establish the root cause before changing or judging code; prefer the least invasive complete solution, never a smaller patch that leaves the cause intact." in later.text
+    assert "Do not claim tool or workspace access is unavailable until an actual tool call fails." in later.text
+    assert "Work first." in later.text
+    assert "block_code" in later.text
+    assert "resume_condition" in later.text
     assert ".plan/alpha/alpha-plan_turn1_task-a.md" not in first.text
     for forbidden in (
         "logical_role", "physical_role", "source_physical_role", "allowed_roles",
@@ -429,16 +437,26 @@ def test_constructor_is_once_per_generation_and_prompt_is_compact_allowlist(tmp_
     ):
         assert forbidden not in first.text
 
-    assert "full task" not in repair
-    assert "alpha-dev_turn1_task-a.md" not in repair
-    assert "Constructor for PLAN" not in repair
-    assert ".plan/alpha/alpha-plan_turn1_task-a.md" in repair
-    assert "bad keys" not in repair
-    assert '"task-id": "task-a"' not in repair
-    assert '"role": "alpha-plan"' not in repair
-    assert ".plan/<team>/<physical-role>_turn<N>_<task-id>.md" not in repair
-    assert "Continue from this state" in repair
-    assert len(repair.splitlines()) <= 5
+    assert repair == "Continue from this state!\nReturn exactly one valid JSON object"
+
+
+def test_same_role_continuation_prompt_rejects_report_only_turn(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    prompt = PromptBuilder(config).build(
+        **_prompt_kwargs(
+            config,
+            tmp_path,
+            logical_role="DEV",
+            physical_role="alpha-dev",
+            source_physical_role="alpha-dev",
+            handoff=".plan/alpha/alpha-dev_turn8_task-a.md",
+            turn=9,
+            constructor_sent_generation=0,
+        )
+    ).text
+
+    assert "Continue the previous DEV turn; do not restate it." in prompt
+    assert prompt.rstrip().endswith("Write the report, then return exactly one valid route JSON object.")
 
 
 def test_exact_team_resume_preserves_identity_and_creation_still_allocates(tmp_path: Path):
@@ -513,6 +531,142 @@ def test_exact_team_resume_preserves_identity_and_creation_still_allocates(tmp_p
 
 
 
+
+
+def test_manifest_replace_succeeds_while_replacement_safe_reader_is_open(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    created = store.create_task(
+        "resume with replacement-safe reader",
+        requested_team="alpha",
+        task_id="task-shared-reader",
+    )
+    manifest = Path(created["manifest_path"])
+
+    with open_shared_read(manifest):
+        resumed = store.request_resume(
+            manifest,
+            reason="operator resume after accepted send",
+            external_command_id="cmd-resume-shared-reader",
+        )
+
+    assert "cmd-resume-shared-reader" in resumed["applied_command_ids"]
+    assert resumed["controls"][-1]["action"] == "resume"
+    assert not manifest.with_suffix(manifest.suffix + ".tmp").exists()
+
+
+def test_task_discovery_reads_manifest_with_replacement_safe_reader(tmp_path: Path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    created = store.create_task(
+        "replacement-safe discovery",
+        requested_team="alpha",
+        task_id="task-shared-discovery",
+    )
+    manifest = Path(created["manifest_path"]).resolve()
+    reader = getattr(store_module, "read_shared_text", None)
+    assert reader is not None, "TaskStore must use the replacement-safe read primitive"
+    observed = []
+
+    def tracking_reader(path, *, encoding="utf-8"):
+        observed.append(Path(path).resolve())
+        return reader(path, encoding=encoding)
+
+    monkeypatch.setattr(store_module, "read_shared_text", tracking_reader)
+
+    assert manifest in store.discover_paths()
+    assert manifest in observed
+
+
+def test_resume_manifest_replace_retries_transient_windows_permission_error(tmp_path: Path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    created = store.create_task("resume replace contention", requested_team="alpha", task_id="task-replace")
+    manifest = Path(created["manifest_path"])
+    temporary = manifest.with_suffix(manifest.suffix + ".tmp")
+    real_replace = store_module.atomic_replace
+    manifest_attempts = 0
+
+    def flaky_replace(src, dst):
+        nonlocal manifest_attempts
+        if Path(dst).resolve() == manifest.resolve():
+            manifest_attempts += 1
+            if manifest_attempts <= 3:
+                raise PermissionError(13, "Access is denied", str(src), str(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(store_module, "atomic_replace", flaky_replace)
+
+    resumed = store.request_resume(
+        manifest,
+        reason="operator resume after accepted send",
+        external_command_id="cmd-resume-replace",
+    )
+
+    assert manifest_attempts == 4
+    assert "cmd-resume-replace" in resumed["applied_command_ids"]
+    assert resumed["controls"][-1]["action"] == "resume"
+    assert resumed["controls"][-1]["status"] == "requested"
+    assert not temporary.exists()
+    persisted = json.loads(manifest.read_text(encoding="utf-8"))
+    assert "cmd-resume-replace" in persisted["applied_command_ids"]
+
+
+def test_manifest_replace_contention_exhaustion_preserves_old_target_and_tmp(tmp_path: Path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    created = store.create_task("resume replace exhaustion", requested_team="alpha", task_id="task-replace-exhaust")
+    manifest = Path(created["manifest_path"])
+    temporary = manifest.with_suffix(manifest.suffix + ".tmp")
+    original = manifest.read_text(encoding="utf-8")
+    real_replace = store_module.atomic_replace
+    attempts = 0
+
+    def blocked_replace(src, dst):
+        nonlocal attempts
+        if Path(dst).resolve() == manifest.resolve():
+            attempts += 1
+            raise PermissionError(13, "Access is denied", str(src), str(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(store_module, "atomic_replace", blocked_replace)
+    monkeypatch.setattr(store_module.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(PermissionError):
+        store.request_resume(
+            manifest,
+            reason="operator resume",
+            external_command_id="cmd-resume-exhaust",
+        )
+
+    assert attempts == 6
+    assert manifest.read_text(encoding="utf-8") == original
+    assert temporary.exists()
+    persisted = json.loads(manifest.read_text(encoding="utf-8"))
+    assert "cmd-resume-exhaust" not in persisted.get("applied_command_ids", [])
+
+
+def test_manifest_replace_does_not_retry_non_permission_error(tmp_path: Path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    created = store.create_task("resume replace invalid", requested_team="alpha", task_id="task-replace-invalid")
+    manifest = Path(created["manifest_path"])
+    real_replace = store_module.atomic_replace
+    attempts = 0
+
+    def invalid_replace(src, dst):
+        nonlocal attempts
+        if Path(dst).resolve() == manifest.resolve():
+            attempts += 1
+            raise OSError(22, "Invalid argument")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(store_module, "atomic_replace", invalid_replace)
+
+    with pytest.raises(OSError, match="Invalid argument"):
+        store.request_resume(manifest, external_command_id="cmd-resume-invalid")
+
+    assert attempts == 1
 
 
 def test_route_contract_validates_only_worker_owned_fields():
@@ -1145,6 +1299,32 @@ def test_noop_manifest_update_performs_no_replace_or_timestamp_write(tmp_path: P
     assert returned == before
     assert after_stat.st_ino == before_stat.st_ino
     assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
+
+
+def test_manifest_replace_retries_windows_access_denied(tmp_path: Path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_task("replace retry", requested_team="replace-retry", task_id="task-replace-retry")
+    target = Path(state["manifest_path"]).resolve()
+    original_replace = store_module.os.replace
+    calls = []
+
+    def flaky_replace(source, destination):
+        calls.append((Path(source).resolve(), Path(destination).resolve()))
+        if Path(destination).resolve() == target and len(calls) == 1:
+            error = OSError("Access is denied")
+            error.winerror = 5
+            raise error
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(store_module.os, "replace", flaky_replace)
+    monkeypatch.setattr(store_module.time, "sleep", lambda _seconds: None)
+
+    saved = store.update(state["manifest_path"], lambda current: {**current, "active_action": "retry-proved"})
+
+    assert saved["active_action"] == "retry-proved"
+    assert store.load(state["manifest_path"])["active_action"] == "retry-proved"
+    assert sum(destination == target for _source, destination in calls) == 2
 
 
 def test_change_goal_is_durable_next_hop_only_and_rejects_invalid_tasks(tmp_path: Path):

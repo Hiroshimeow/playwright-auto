@@ -36,7 +36,7 @@ def test_browser_endpoint_api_queues_pool_management_commands(tmp_path: Path):
         }
 
         for operation, kind, payload in (
-            ("settings", "browser_endpoint_update", {"temporary_default": True}),
+            ("settings", "browser_endpoint_update", {"draining": False}),
             ("start", "browser_endpoint_start", {}),
             ("stop", "browser_endpoint_stop", {}),
             ("remove", "browser_endpoint_remove", {}),
@@ -69,6 +69,14 @@ def test_browser_endpoint_api_rejects_invalid_management_settings(tmp_path: Path
                 headers={"Idempotency-Key": f"invalid-browser-{index}"},
             )
             assert status == 400
+        status, _headers, _response = request(
+            server,
+            "POST",
+            "/api/browser-endpoints/peer-id/settings",
+            body={"draining": True},
+            headers={"Idempotency-Key": "invalid-browser-redrain"},
+        )
+        assert status == 400
     finally:
         server.shutdown()
         thread.join(timeout=5)
@@ -103,6 +111,18 @@ def test_worker_applies_external_endpoint_registry_commands(tmp_path: Path, monk
     assert worker._apply_next_command()["status"] == "applied"
     assert store.endpoints.resolve()["endpoint_id"] == endpoint_id
     assert store.endpoints.get(endpoint_id)["temporary_default"] is True
+
+    store.endpoints.remove(endpoint_id, has_nonterminal_tasks=True)
+    assert store.endpoints.get(endpoint_id)["draining"] is True
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-restore-browser", idempotency_key="restore-browser",
+        kind="browser_endpoint_update", task_id=None, expected_task_version=None,
+        payload={"endpoint_id": endpoint_id, "draining": False},
+    )
+    assert worker._apply_next_command()["status"] == "applied"
+    restored = store.endpoints.get(endpoint_id)
+    assert restored["draining"] is False
+    assert restored["removed"] is False
 
     worker.runtime_db.enqueue_command(
         command_id="cmd-remove-browser", idempotency_key="remove-browser",
@@ -190,6 +210,37 @@ def test_draining_endpoint_is_removed_after_running_execution_finishes(tmp_path:
     assert store.endpoints.get(endpoint["endpoint_id"])["removed"] is True
 
 
+def test_projection_uses_requested_endpoint_until_role_is_actually_placed(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    requested = store.endpoints.add("9212")
+    state = store.create_task(
+        "queued placement",
+        requested_team="queued-alpha",
+        task_id="task-queued-placement",
+        browser_endpoint_id=requested["endpoint_id"],
+    )
+
+    queued = build_task_projection(
+        state,
+        tasks=[state],
+        browser_pages=(),
+        browser_connected=True,
+        repository_allowed_roots=config.repository_allowed_roots,
+    )
+    assert queued.summary["browser_endpoint_ids"] == [requested["endpoint_id"]]
+
+    state["roles"]["PLAN"]["browser_endpoint_id"] = "actual-endpoint"
+    placed = build_task_projection(
+        state,
+        tasks=[state],
+        browser_pages=(),
+        browser_connected=True,
+        repository_allowed_roots=config.repository_allowed_roots,
+    )
+    assert placed.summary["browser_endpoint_ids"] == ["actual-endpoint"]
+
+
 def test_projection_exposes_role_execution_endpoint_placement(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
@@ -222,7 +273,7 @@ def test_dashboard_browser_scope_and_create_controls_are_explicit():
     store = (ASSET_ROOT / "store.js").read_text(encoding="utf-8")
 
     assert 'id="browser-scope"' in html
-    assert 'name="browser_endpoint_id"' in html
+    assert html.count('name="browser_endpoint_id"') >= 3
     assert 'name="temporary"' in html
     assert 'id="browser-dialog"' in html
     assert "selectedEndpointId" in store
@@ -230,6 +281,9 @@ def test_dashboard_browser_scope_and_create_controls_are_explicit():
     assert "renderBrowserScope" in app
     assert "renderBrowserManager" in app
     assert "body.browser_endpoint_id" in app
+    assert "agentBrowserEndpointSelect" in app
+    assert "agentSettingsBrowserEndpointSelect" in app
+    assert 'browser_endpoint_id: String(values.get("browser_endpoint_id") || "").trim() || null' in app
     assert "body.temporary = true" in app
     for operation in ("browser_endpoint_add", "browser_endpoint_update", "browser_endpoint_remove", "browser_endpoint_start", "browser_endpoint_stop"):
         assert operation in app or operation in browsers

@@ -613,6 +613,7 @@ _WORKFLOW_CONTROL_ACTIONS = (
     "route_plan",
     "stop",
     "clear_team",
+    "archive_worktree",
 )
 _WORKFLOW_TERMINAL = frozenset({"DONE", "STOPPED"})
 _WORKFLOW_IN_FLIGHT = frozenset({"sending", "sent", "waiting"})
@@ -649,7 +650,11 @@ def workflow_control_eligibility(
             break
     hop_state = str((hop or {}).get("state") or "")
     block_code = str(state.get("block_code") or "")
-    guard_blocked = status == "BLOCKED" and block_code == "consecutive_self_route_limit"
+    renewal_blocked = status == "BLOCKED" and block_code in {
+        "autonomous_execution_budget_exhausted",
+        "consecutive_self_route_limit",
+        "no_progress_route_cycle",
+    }
 
     def yes() -> dict[str, Any]:
         return {"eligible": True, "reason": None, "role": selected_role}
@@ -683,8 +688,8 @@ def workflow_control_eligibility(
             return no("Terminal work cannot replace its role context.")
         if not role_exists:
             return no("The selected workflow role does not exist for this task.")
-        if guard_blocked and normalized_action == "restart_role":
-            return no("Restart role cannot bypass the consecutive self-route guard; Resume is required.")
+        if renewal_blocked and normalized_action == "restart_role":
+            return no("Restart role cannot bypass an execution-renewal boundary; Resume is required.")
         if hop_state in _WORKFLOW_IN_FLIGHT:
             return no("This control cannot cross an in-flight or accepted Send boundary; use Resume.")
         return yes()
@@ -695,6 +700,8 @@ def workflow_control_eligibility(
             return no("The selected workflow role does not exist for this task.")
         return yes()
     if normalized_action == "route_plan":
+        if str(state.get("workflow_mode") or "team").strip().lower() == "solo":
+            return no("Route PLAN is unavailable for Solo Task.")
         if status in _WORKFLOW_TERMINAL:
             return no("Terminal work cannot route to PLAN.")
         if hop is None:
@@ -708,8 +715,8 @@ def workflow_control_eligibility(
             return yes()
         if active_role == "PLAN":
             return no("PLAN is already the active role.")
-        if guard_blocked:
-            return no("Route PLAN cannot bypass the consecutive self-route guard; Resume is required.")
+        if renewal_blocked:
+            return no("Route PLAN cannot bypass an execution-renewal boundary; Resume is required.")
         if hop_state in _WORKFLOW_IN_FLIGHT:
             return no("Route PLAN cannot abandon an in-flight Send; use Resume.")
         return yes()
@@ -718,6 +725,13 @@ def workflow_control_eligibility(
     if normalized_action == "clear_team":
         # The actual control still requires confirmation before destructive
         # nonterminal cleanup and exact-owner browser preflight.
+        return yes()
+    if normalized_action == "archive_worktree":
+        if status not in _WORKFLOW_TERMINAL:
+            return no("Worktree archival is available only for terminal work.")
+        cleanup = state.get("cleanup") if isinstance(state.get("cleanup"), Mapping) else {}
+        if cleanup.get("state") != "CLEARED" or not cleanup.get("verified_empty_at"):
+            return no("Worktree archival requires a verified CLEARED team first.")
         return yes()
     return no("Unsupported workflow control.")
 

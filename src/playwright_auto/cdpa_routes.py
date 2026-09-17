@@ -91,6 +91,7 @@ def parse_route_response(
     *,
     source_role: str | None = None,
     allowed_routes: Sequence[str] | None = None,
+    allow_non_plan_done: bool = False,
 ) -> RouteDecision:
     source = str(text).strip()
     match = _FENCE.fullmatch(source)
@@ -125,7 +126,11 @@ def parse_route_response(
         raise RouteContractError(f"unsupported route {route!r}")
     if not handoff:
         raise RouteContractError("handoff must not be empty")
-    if route == "DONE" and str(source_role or "").strip().upper() != "PLAN":
+    if (
+        route == "DONE"
+        and not allow_non_plan_done
+        and str(source_role or "").strip().upper() != "PLAN"
+    ):
         raise RouteContractError("only PLAN may route DONE")
     return RouteDecision(route, handoff)
 
@@ -192,6 +197,7 @@ def parse_role_response(
     source_role: str,
     report_mode: str = "file",
     allowed_routes: Sequence[str] | None = None,
+    allow_non_plan_done: bool = False,
 ) -> ParsedRoleResponse:
     mode = str(report_mode).strip().lower()
     if mode not in {"file", "inline"}:
@@ -206,6 +212,7 @@ def parse_role_response(
                 text,
                 source_role=source_role,
                 allowed_routes=allowed_routes,
+                allow_non_plan_done=allow_non_plan_done,
             ),
             None,
         )
@@ -214,6 +221,7 @@ def parse_role_response(
         route_source,
         source_role=source_role,
         allowed_routes=allowed_routes,
+        allow_non_plan_done=allow_non_plan_done,
     )
     if decision.handoff != "INLINE":
         raise RouteContractError('inline report mode requires handoff "INLINE"')
@@ -378,10 +386,21 @@ def materialize_inline_report(
             if target.parent.resolve() != team_root or target.is_symlink():
                 raise RouteContractError("report path must not traverse symlinks")
             if target.exists():
-                if not target.is_file() or target.read_bytes() != data:
+                if not target.is_file():
                     raise RouteContractError(
                         "inline report path already contains different content"
                     )
+                existing = target.read_bytes()
+                if existing != data:
+                    try:
+                        same_text = existing.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n") == body.replace("\r\n", "\n").replace("\r", "\n")
+                    except UnicodeDecodeError:
+                        same_text = False
+                    if not same_text:
+                        raise RouteContractError(
+                            "inline report path already contains different content"
+                        )
+                    data = existing
             else:
                 with tempfile.NamedTemporaryFile(
                     mode="wb",

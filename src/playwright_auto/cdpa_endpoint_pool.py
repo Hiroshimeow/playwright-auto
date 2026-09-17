@@ -301,18 +301,22 @@ class EndpointPool:
         running_executions: Sequence[Mapping[str, Any]],
         *,
         affinity_endpoint_id: str | None = None,
+        hard_affinity: bool = False,
         cooldown_scopes: Collection[str] = (),
         reservations: Mapping[str, int] | None = None,
+        excluded_endpoint_ids: Collection[str] = (),
     ) -> str | None:
         snapshot = self.snapshot(
             running_executions=running_executions,
             cooldown_scopes=cooldown_scopes,
             reservations=reservations,
         )
+        excluded = set(excluded_endpoint_ids)
         eligible = [
             item
             for item in snapshot["endpoints"]
-            if item["health"] == "online"
+            if item["endpoint_id"] not in excluded
+            and item["health"] == "online"
             and item["chatgpt_ready"]
             and not item["draining"]
             and not item["removed"]
@@ -326,6 +330,8 @@ class EndpointPool:
             )
             if preferred is not None:
                 return str(preferred["endpoint_id"])
+            if hard_affinity:
+                return None
         if not eligible:
             return None
         eligible.sort(key=lambda item: item["active_count"])

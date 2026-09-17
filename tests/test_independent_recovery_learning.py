@@ -578,7 +578,17 @@ def test_independent_reset_command_kind_is_durable(tmp_path: Path):
     assert command["kind"] == "independent_reset"
 
 
-def test_consecutive_self_route_guard_is_not_canonical_recovery_eligible(tmp_path: Path):
+@pytest.mark.parametrize(
+    "block_code",
+    (
+        "autonomous_execution_budget_exhausted",
+        "consecutive_self_route_limit",
+        "no_progress_route_cycle",
+    ),
+)
+def test_operator_renewal_blocks_are_not_canonical_recovery_eligible(
+    tmp_path: Path, block_code: str
+):
     now = datetime(2026, 8, 10, 3, 30, tzinfo=UTC)
     store = _store(tmp_path)
     agent = store.create_independent_agent(
@@ -596,10 +606,10 @@ def test_consecutive_self_route_guard_is_not_canonical_recovery_eligible(tmp_pat
 
     agent = store.update(agent["manifest_path"], warmed)
     guarded = _blocked(
-        "guarded-self-route",
+        f"guarded-{block_code}",
         blocked_at=now - timedelta(seconds=RECOVERY_BLOCKED_SECONDS + 1),
     )
-    guarded["block_code"] = "consecutive_self_route_limit"
-    guarded["block_reason"] = "PLAN self-route streak 3 requires explicit operator Resume"
+    guarded["block_code"] = block_code
+    guarded["block_reason"] = "explicit operator Resume is required"
 
     assert canonical_independent_events(agent, [agent, guarded], now=now) == []

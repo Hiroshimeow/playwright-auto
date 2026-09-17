@@ -288,7 +288,8 @@ class RuntimeDB:
         counts = {
             str(row["status"]): int(row["count"])
             for row in connection.execute(
-                "SELECT status, COUNT(*) AS count FROM task_projection GROUP BY status"
+                "SELECT status, COUNT(*) AS count FROM task_projection "
+                "WHERE surface IN ('active', 'offline_recoverable', 'history') GROUP BY status"
             )
         }
         payload = {"generation": version, "counts": counts}

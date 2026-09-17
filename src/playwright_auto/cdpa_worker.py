@@ -67,6 +67,7 @@ from .cdpa_projection import (
 from .cdpa_runtime_db import RuntimeDB
 from .cdpa_runtime_registry import CDPARuntimeRegistry, MINIMUM_DEADLINE_SECONDS
 from .cdpa_prompts import PromptBuilder
+from .file_lock import exclusive_file_lock
 from .role_runtime import Action, Policy, RoleController
 from .cdpa_response import (
     begin_refresh,
@@ -87,6 +88,7 @@ from .cdpa_routes import (
     expected_report_relative,
     materialize_inline_report,
     parse_role_response,
+    parse_route_response,
     validate_file_report,
 )
 from .cdpa_store import (
@@ -164,11 +166,17 @@ from .workspace import ChatGPTWorkspace
 TERMINAL = frozenset({"DONE", "STOPPED"})
 IN_FLIGHT = frozenset({"sending", "sent", "waiting"})
 _STREAM_STATUS_RECOVERY_SECONDS = 30.0
-_CONSECUTIVE_SELF_ROUTE_LIMIT = 3
-_CONSECUTIVE_SELF_ROUTE_BLOCK_CODE = "consecutive_self_route_limit"
+_LEGACY_CONSECUTIVE_SELF_ROUTE_BLOCK_CODE = "consecutive_self_route_limit"
+_LEGACY_NO_PROGRESS_ROUTE_CYCLE_BLOCK_CODE = "no_progress_route_cycle"
+_AUTONOMOUS_EXECUTION_BUDGET_BLOCK_CODE = "autonomous_execution_budget_exhausted"
+_AUTONOMOUS_EXECUTION_LIMIT = 12
+_RECOVERY_SNAPSHOT_MAX_CHARS = 12_000
+_RECOVERY_GOAL_MAX_CHARS = 1_000
 _STATUS_RECOVERY_GRAPH_SECONDS = 300.0
 _TERMINAL_GRAPH_RETRY_SECONDS = 120.0
 _TERMINAL_GRAPH_MAX_ATTEMPTS = 3
+CLEANUP_IDENTICAL_FAILURE_LIMIT = 3
+_CLEANUP_RETRY_DELAYS_SECONDS = (30.0, 120.0)
 _DOM_FALLBACK_SETTLE_SECONDS = 30.0
 _POST_REFRESH_RESPONSE_PROBE_SECONDS = 60.0
 _POST_REFRESH_FINAL_RECONCILE_SECONDS = 120.0
@@ -397,6 +405,11 @@ class CDPAWorker:
         self.registry: CDPARuntimeRegistry | None = None
         self.runtime_degraded = False
         self._last_heartbeat_at = 0.0
+        self._worker_started_at = utc_now()
+        self._worker_lease_acquired_at: str | None = None
+        self._source_identity = self._capture_source_identity()
+        self._last_source_drift_check_at = 0.0
+        self._source_drift: dict[str, Any] = {"drifted": False, "changed": []}
         self._last_browser_inventory_at = 0.0
         self._last_browser_page_count = -1
         self._browser_projection: dict[str, Any] | None = None
@@ -406,6 +419,9 @@ class CDPAWorker:
         self._browser_cycle_active = False
         self._execution_leases: dict[str, dict[str, Any]] = {}
         self._endpoint_pool: EndpointPool | None = None
+        self._endpoint_admission_locks: dict[str, asyncio.Lock] = {}
+        self._endpoint_admission_holds: dict[asyncio.Task[Any], tuple[str, asyncio.Lock]] = {}
+        self._endpoint_admission_loop: asyncio.AbstractEventLoop | None = None
         self._browser_command_tasks: set[asyncio.Task[Any]] = set()
         self._rate_limit_cooldown: dict[str, Any] | None = None
         self._rate_limit_cooldowns: dict[str, dict[str, Any]] = {}
@@ -427,6 +443,140 @@ class CDPAWorker:
     def _manifest_identity(path: Path) -> tuple[int, int, int, int]:
         stat = path.stat()
         return (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+    def _source_identity_paths(self) -> list[Path]:
+        package = Path(__file__).resolve().parent
+        names = (
+            "cdpa_worker.py", "cdpa_actions.py", "cdpa_commands.py", "cdpa_config.py",
+            "cdpa_endpoint_pool.py", "cdpa_endpoints.py", "cdpa_managed_browser.py",
+            "cdpa_projection.py", "cdpa_prompts.py", "cdpa_routes.py", "cdpa_runtime_db.py",
+            "cdpa_runtime_registry.py", "cdpa_store.py", "durable.py", "file_lock.py",
+            "observability.py", "role_runtime.py", "dashboard_api.py", "dashboard.html",
+        )
+        paths = [package / name for name in names]
+        dashboard_assets = package / "dashboard_assets"
+        if dashboard_assets.is_dir():
+            paths.extend(
+                sorted(
+                    path
+                    for path in dashboard_assets.rglob("*")
+                    if path.is_file() and path.suffix.lower() in {".js", ".css", ".html"}
+                )
+            )
+        paths.extend(
+            path
+            for path in (
+                self.config.repository_root / "cdpa.yaml",
+                self.config.repository_root / "ecosystem.config.cjs",
+            )
+            if path.exists()
+        )
+        prompt_root = self.config.repository_root / "prompts" / "cdpa"
+        if prompt_root.is_dir():
+            paths.extend(sorted(prompt_root.glob("*.md")))
+        return paths
+
+    @staticmethod
+    def _source_file_identity(path: Path) -> dict[str, Any]:
+        stat = path.stat()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        return {
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "ctime_ns": stat.st_ctime_ns,
+            "sha256": digest,
+        }
+
+    def _source_identity_key(self, path: Path) -> str:
+        resolved = path.resolve()
+        root = self.config.repository_root.resolve()
+        if resolved.is_relative_to(root):
+            return str(resolved.relative_to(root)).replace("\\", "/")
+        return f"runtime/{resolved.name}"
+
+    def _capture_source_identity(self) -> dict[str, Any]:
+        files: dict[str, Any] = {}
+        for path in self._source_identity_paths():
+            relative = self._source_identity_key(path)
+            try:
+                files[relative] = self._source_file_identity(path)
+            except FileNotFoundError:
+                files[relative] = {"missing": True}
+        fingerprint = hashlib.sha256(
+            json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return {"fingerprint": fingerprint, "files": files, "captured_at": utc_now()}
+
+    def _refresh_source_drift(self, *, force: bool = False) -> dict[str, Any]:
+        now = time.time()
+        if not force and now - self._last_source_drift_check_at < max(5.0, self.config.heartbeat_seconds):
+            return self._source_drift
+        self._last_source_drift_check_at = now
+        changed: list[str] = []
+        loaded_files = self._source_identity.get("files") or {}
+        current_paths = {self._source_identity_key(path): path for path in self._source_identity_paths()}
+        for relative in sorted(set(loaded_files) | set(current_paths)):
+            loaded = loaded_files.get(relative)
+            path = current_paths.get(relative)
+            if path is None:
+                changed.append(relative)
+                continue
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                if not isinstance(loaded, Mapping) or loaded.get("missing") is not True:
+                    changed.append(relative)
+                continue
+            if not isinstance(loaded, Mapping) or loaded.get("missing") is True:
+                changed.append(relative)
+                continue
+            cheap = (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+            baseline = (loaded.get("size"), loaded.get("mtime_ns"), loaded.get("ctime_ns"))
+            if cheap != baseline and hashlib.sha256(path.read_bytes()).hexdigest() != loaded.get("sha256"):
+                changed.append(relative)
+        self._source_drift = {"drifted": bool(changed), "changed": changed, "checked_at": utc_now()}
+        return self._source_drift
+
+    async def _acquire_endpoint_admission(
+        self,
+        state: Mapping[str, Any],
+        role: str | None = None,
+        *,
+        endpoint_id: str | None = None,
+    ) -> None:
+        """Serialize endpoint admission; ``advance`` releases only after persistence."""
+        endpoint_id = (
+            str(endpoint_id).strip() or None
+            if endpoint_id is not None
+            else self._execution_endpoint_id(state, role) or self.store.endpoint_id_for(state)
+        )
+        if not endpoint_id:
+            raise RuntimeError("endpoint admission requires a selected endpoint")
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("endpoint admission requires an asyncio task")
+        loop = asyncio.get_running_loop()
+        if self._endpoint_admission_loop is not loop:
+            if self._endpoint_admission_holds:
+                raise RuntimeError("endpoint admission loop changed while a gate is held")
+            self._endpoint_admission_locks.clear()
+            self._endpoint_admission_loop = loop
+        held = self._endpoint_admission_holds.get(task)
+        if held is not None:
+            if held[0] != endpoint_id:
+                raise RuntimeError("one admission transaction cannot span multiple endpoints")
+            return
+        lock = self._endpoint_admission_locks.setdefault(endpoint_id, asyncio.Lock())
+        await lock.acquire()
+        self._endpoint_admission_holds[task] = (endpoint_id, lock)
+
+    def _release_endpoint_admission(self) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            return
+        held = self._endpoint_admission_holds.pop(task, None)
+        if held is not None:
+            held[1].release()
 
     def _running_executions(
         self, tasks: Sequence[Mapping[str, Any]] | None = None
@@ -495,6 +645,28 @@ class CDPAWorker:
             return None
         return self._execution_endpoint_id(state)
 
+    def _execution_page_observed(self, state: Mapping[str, Any], endpoint_id: str | None) -> bool:
+        if endpoint_id is None or not isinstance(self._browser_projection, Mapping):
+            return True
+        role = str(state.get("active_role") or "").upper()
+        record = (state.get("roles") or {}).get(role) if role else None
+        page_id = str(record.get("page_id") or "").strip() if isinstance(record, Mapping) else ""
+        if not page_id:
+            return False
+        endpoint = next(
+            (
+                item for item in self._browser_projection.get("endpoints") or ()
+                if isinstance(item, Mapping) and str(item.get("endpoint_id") or "") == endpoint_id
+            ),
+            None,
+        )
+        if endpoint is None:
+            return True
+        return any(
+            isinstance(page, Mapping) and str(page.get("page_id") or "").strip() == page_id
+            for page in endpoint.get("pages") or ()
+        )
+
     def _execution_can_relocate(
         self, state: Mapping[str, Any], target_endpoint_id: str
     ) -> bool:
@@ -516,12 +688,22 @@ class CDPAWorker:
             return False
         request_id = str(hop.get("request_id") or "").strip()
         ledger_path = str(hop.get("ledger_path") or "").strip()
+        if str(hop.get("state") or "") == "sending":
+            if not request_id or not ledger_path:
+                return False
+            try:
+                durable = RequestLedger(ledger_path).peek(request_id)
+            except Exception:
+                return False
+            return durable is None or self._is_pristine_preboundary_sending_record(
+                state, hop, durable
+            )
         if request_id and ledger_path:
             try:
                 durable = RequestLedger(ledger_path).peek(request_id)
-                if durable is not None:
-                    return self._is_pristine_preboundary_sending_record(state, hop, durable)
             except Exception:
+                return False
+            if durable is not None:
                 return False
         return True
 
@@ -536,6 +718,14 @@ class CDPAWorker:
         if current != endpoint_id and not self._execution_can_relocate(state, endpoint_id):
             return False
         if current != endpoint_id:
+            try:
+                relocation_hop = _active_hop(state)
+            except RuntimeError:
+                relocation_hop = None
+            pristine_relocation = (
+                isinstance(relocation_hop, Mapping)
+                and str(relocation_hop.get("state") or "") == "sending"
+            )
             if current is not None:
                 record["last_endpoint_id"] = current
             record.pop("branch_conversation_id", None)
@@ -546,6 +736,8 @@ class CDPAWorker:
                 online=False,
                 last_error=None,
             )
+            if state.get("conversation_mode") == "temporary":
+                record.pop("temporary_document_id", None)
             if str(record.get("status") or "") == "active":
                 record["status"] = "pending"
             try:
@@ -556,8 +748,16 @@ class CDPAWorker:
                 hop["conversation_url"] = None
                 hop["browser_endpoint_id"] = endpoint_id
                 hop.pop("branch_conversation_id", None)
+                if pristine_relocation:
+                    hop["rebuild_prompt_after_relocation"] = True
         else:
             record["browser_endpoint_id"] = endpoint_id
+            try:
+                hop = _active_hop(state)
+            except RuntimeError:
+                hop = None
+            if isinstance(hop, dict):
+                hop["browser_endpoint_id"] = endpoint_id
         return True
 
     @staticmethod
@@ -583,6 +783,369 @@ class CDPAWorker:
             if completed.returncode == 0:
                 result[key] = completed.stdout.strip()[:8000]
         return result
+
+    @staticmethod
+    def _worktree_path_identity(path: object) -> str:
+        return os.path.normcase(str(Path(str(path or "")).expanduser().resolve()))
+
+    @staticmethod
+    def _git_command(
+        repository: Path,
+        *args: str,
+        check: bool = True,
+        timeout: float = 10.0,
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(repository), *args],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"git command failed before completion: {sanitize_exception(exc)}") from exc
+        if check and completed.returncode != 0:
+            detail = sanitize_text(completed.stderr or completed.stdout or "git command failed", max_chars=1000)
+            raise RuntimeError(f"git {' '.join(args[:2])} failed: {detail}")
+        return completed
+
+    def _registered_git_worktrees(self) -> dict[str, dict[str, str | None]]:
+        control_root = self.config.repository_root.expanduser().resolve()
+        completed = self._git_command(control_root, "worktree", "list", "--porcelain")
+        records: dict[str, dict[str, str | None]] = {}
+        current: dict[str, str | None] | None = None
+        for raw_line in completed.stdout.splitlines():
+            line = raw_line.rstrip("\r\n")
+            if line.startswith("worktree "):
+                if current is not None and current.get("path"):
+                    records[self._worktree_path_identity(current["path"])] = current
+                current = {"path": line[len("worktree "):], "head": None, "branch": None}
+            elif current is not None and line.startswith("HEAD "):
+                current["head"] = line[len("HEAD "):].strip() or None
+            elif current is not None and line.startswith("branch "):
+                current["branch"] = line[len("branch "):].strip() or None
+            elif current is not None and line == "detached":
+                current["branch"] = None
+        if current is not None and current.get("path"):
+            records[self._worktree_path_identity(current["path"])] = current
+        return records
+
+    @staticmethod
+    def _is_link_like(path: Path) -> bool:
+        try:
+            return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
+        except OSError:
+            return True
+
+    def _archive_team_evidence(
+        self,
+        *,
+        repository: Path,
+        team: str,
+    ) -> list[dict[str, Any]]:
+        control_root = self.config.repository_root.expanduser().resolve()
+        source_root = repository / ".plan" / team
+        destination_root = control_root / ".plan" / team
+        if not source_root.exists():
+            return []
+        for boundary in (repository / ".plan", source_root):
+            if self._is_link_like(boundary):
+                raise RuntimeError("worktree evidence namespace must not cross a symlink or junction")
+            if not boundary.is_dir():
+                raise RuntimeError("worktree evidence namespace is not a directory")
+        if destination_root.exists() and (
+            self._is_link_like(destination_root) or not destination_root.is_dir()
+        ):
+            raise RuntimeError("archive destination is not a safe directory")
+        destination_root.mkdir(parents=True, exist_ok=True)
+
+        archived: list[dict[str, Any]] = []
+        for source in sorted(source_root.rglob("*"), key=lambda item: item.as_posix()):
+            if self._is_link_like(source):
+                raise RuntimeError(f"worktree evidence contains a symlink or junction: {source}")
+            if source.is_dir():
+                continue
+            if not source.is_file():
+                raise RuntimeError(f"worktree evidence contains an unsupported entry: {source}")
+            relative = source.relative_to(source_root)
+            destination = destination_root / relative
+            current_parent = destination_root
+            for part in relative.parts[:-1]:
+                current_parent = current_parent / part
+                if current_parent.exists() and (
+                    self._is_link_like(current_parent) or not current_parent.is_dir()
+                ):
+                    raise RuntimeError("archive destination parent is not a safe directory")
+                current_parent.mkdir(exist_ok=True)
+            data = source.read_bytes()
+            if destination.exists():
+                if self._is_link_like(destination) or not destination.is_file():
+                    raise RuntimeError(f"archive destination is not a regular file: {destination}")
+                if destination.read_bytes() != data:
+                    raise RuntimeError(
+                        f"archive destination already contains different evidence: {destination}"
+                    )
+            else:
+                try:
+                    with destination.open("xb") as handle:
+                        handle.write(data)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                except FileExistsError:
+                    if (
+                        self._is_link_like(destination)
+                        or not destination.is_file()
+                        or destination.read_bytes() != data
+                    ):
+                        raise RuntimeError(
+                            f"archive destination changed while evidence was copied: {destination}"
+                        )
+            archived.append(
+                {
+                    "path": destination.relative_to(control_root).as_posix(),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "size": len(data),
+                }
+            )
+        return archived
+
+    def _assert_worktree_archive_ownership(
+        self,
+        repository: Path,
+        *,
+        allocation_locked: bool = False,
+    ) -> None:
+        tasks, errors = (
+            self.store._discover_with_errors_unlocked()
+            if allocation_locked
+            else self.store.discover_with_errors()
+        )
+        if errors:
+            raise RuntimeError("cannot prove worktree ownership while task discovery has errors")
+        target_identity = self._worktree_path_identity(repository)
+        owners = [
+            str(task.get("task_id") or "")
+            for task in tasks
+            if str(task.get("status") or "").upper() not in TERMINAL
+            and self._worktree_path_identity(task.get("repository")) == target_identity
+        ]
+        if owners:
+            raise RuntimeError(
+                "cannot archive a worktree still owned by nonterminal tasks: "
+                + ", ".join(sorted(owner for owner in owners if owner))
+            )
+
+    def _prepare_worktree_archive(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        control_root = self.config.repository_root.expanduser().resolve()
+        repository = Path(str(state.get("repository") or "")).expanduser().resolve()
+        if self._worktree_path_identity(repository) == self._worktree_path_identity(control_root):
+            raise RuntimeError("the controller worktree cannot archive itself")
+        worktrees = self._registered_git_worktrees()
+        record = worktrees.get(self._worktree_path_identity(repository))
+        if record is None:
+            raise RuntimeError("archive target is not a registered linked Git worktree")
+        head = str(record.get("head") or "").strip()
+        if not head:
+            raise RuntimeError("archive target has no durable Git HEAD")
+        status = self._git_command(
+            repository,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ).stdout.strip()
+        if status:
+            raise RuntimeError("worktree archival refuses modified or untracked repository data")
+        self._assert_worktree_archive_ownership(repository)
+        evidence_files = self._archive_team_evidence(
+            repository=repository,
+            team=str(state.get("team") or ""),
+        )
+        ref_digest = hashlib.sha256(str(state.get("task_id") or "").encode("utf-8")).hexdigest()[:24]
+        preservation_ref = f"refs/cdpa/worktree-archive/{ref_digest}"
+        existing = self._git_command(
+            control_root,
+            "rev-parse",
+            "--verify",
+            preservation_ref,
+            check=False,
+        )
+        if existing.returncode == 0:
+            if existing.stdout.strip() != head:
+                raise RuntimeError("worktree preservation ref already points at another commit")
+        else:
+            self._git_command(control_root, "update-ref", preservation_ref, head)
+        verified = self._git_command(
+            control_root,
+            "rev-parse",
+            "--verify",
+            preservation_ref,
+        ).stdout.strip()
+        if verified != head:
+            raise RuntimeError("worktree preservation ref verification failed")
+        return {
+            "state": "PREPARED",
+            "repository": str(repository),
+            "head": head,
+            "branch": record.get("branch"),
+            "preservation_ref": preservation_ref,
+            "evidence_root": f".plan/{state.get('team')}",
+            "evidence_files": evidence_files,
+            "prepared_at": utc_now(),
+            "archived_at": None,
+        }
+
+    def _finish_worktree_archive(
+        self,
+        state: Mapping[str, Any],
+        archive: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        control_root = self.config.repository_root.expanduser().resolve()
+        repository = Path(str(archive.get("repository") or state.get("repository") or "")).expanduser().resolve()
+        state_repository = Path(str(state.get("repository") or "")).expanduser().resolve()
+        if self._worktree_path_identity(repository) != self._worktree_path_identity(state_repository):
+            raise RuntimeError("prepared worktree archive repository no longer matches task ownership")
+        head = str(archive.get("head") or "").strip()
+        preservation_ref = str(archive.get("preservation_ref") or "").strip()
+        if not head or not preservation_ref:
+            raise RuntimeError("prepared worktree archive is missing Git preservation identity")
+        verified = self._git_command(
+            control_root,
+            "rev-parse",
+            "--verify",
+            preservation_ref,
+        ).stdout.strip()
+        if verified != head:
+            raise RuntimeError("prepared worktree preservation ref no longer matches archived HEAD")
+
+        target_identity = self._worktree_path_identity(repository)
+        with exclusive_file_lock(self.store.allocation_lock):
+            worktrees = self._registered_git_worktrees()
+            if target_identity in worktrees:
+                current_record = worktrees[target_identity]
+                if str(current_record.get("head") or "").strip() != head:
+                    raise RuntimeError("worktree HEAD changed after archive preparation")
+                if current_record.get("branch") != archive.get("branch"):
+                    raise RuntimeError("worktree branch identity changed after archive preparation")
+                self._assert_worktree_archive_ownership(
+                    repository,
+                    allocation_locked=True,
+                )
+                status = self._git_command(
+                    repository,
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ).stdout.strip()
+                if status:
+                    raise RuntimeError("worktree became dirty after archive preparation")
+                self._git_command(control_root, "worktree", "remove", str(repository))
+            elif repository.exists():
+                raise RuntimeError("archive target exists but is no longer a registered linked worktree")
+
+            if target_identity in self._registered_git_worktrees() or repository.exists():
+                raise RuntimeError("linked worktree removal did not reach the required absent postcondition")
+        if self._git_command(
+            control_root,
+            "rev-parse",
+            "--verify",
+            preservation_ref,
+        ).stdout.strip() != head:
+            raise RuntimeError("worktree preservation ref changed during archival")
+        result = dict(archive)
+        result["state"] = "ARCHIVED"
+        result["archived_at"] = utc_now()
+        return result
+
+    def _apply_worktree_archive_control(
+        self,
+        state: Mapping[str, Any],
+        manifest_path: Path,
+        control: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        control_id = control.get("control_id")
+        if isinstance(control_id, bool) or not isinstance(control_id, int) or control_id < 1:
+            raise RuntimeError("worktree archival requires a durable control ID")
+        if not bool(control.get("confirmed")):
+            raise RuntimeError("worktree archival requires explicit operator confirmation")
+
+        archive = state.get("worktree_archive")
+        if archive is not None and not isinstance(archive, Mapping):
+            raise RuntimeError("persisted worktree archive state is invalid")
+
+        idempotent = bool(isinstance(archive, Mapping) and archive.get("state") == "ARCHIVED")
+        if idempotent:
+            completed = dict(archive)
+        else:
+            if archive is None:
+                prepared = self._prepare_worktree_archive(state)
+
+                def persist_prepared(current: dict[str, Any]) -> dict[str, Any]:
+                    eligibility = workflow_control_eligibility(current, "archive_worktree")
+                    if not eligibility["eligible"]:
+                        raise RuntimeError(
+                            str(eligibility["reason"] or "worktree archival is no longer eligible")
+                        )
+                    existing = current.get("worktree_archive")
+                    if existing is not None:
+                        raise RuntimeError("worktree archive preparation raced with another update")
+                    pending = next(
+                        (
+                            item
+                            for item in current.get("controls") or []
+                            if isinstance(item, dict) and item.get("control_id") == control_id
+                        ),
+                        None,
+                    )
+                    if pending is None or pending.get("status") != "requested":
+                        raise RuntimeError("worktree archive control is no longer pending")
+                    current["worktree_archive"] = dict(prepared)
+                    return current
+
+                prepared_state = self.store.update(manifest_path, persist_prepared)
+                archive = prepared_state["worktree_archive"]
+                state = prepared_state
+            elif archive.get("state") != "PREPARED":
+                raise RuntimeError("persisted worktree archive has an unsupported lifecycle state")
+            completed = self._finish_worktree_archive(state, archive)
+
+        def persist_completed(current: dict[str, Any]) -> dict[str, Any]:
+            current_archive = current.get("worktree_archive")
+            if idempotent:
+                if not isinstance(current_archive, Mapping) or current_archive.get("state") != "ARCHIVED":
+                    raise RuntimeError("completed worktree archive state changed before idempotent replay")
+            else:
+                if not isinstance(current_archive, Mapping) or current_archive.get("state") != "PREPARED":
+                    raise RuntimeError("prepared worktree archive state changed before completion")
+                for field in ("repository", "head", "preservation_ref"):
+                    if current_archive.get(field) != completed.get(field):
+                        raise RuntimeError(f"prepared worktree archive {field} changed before completion")
+                current["worktree_archive"] = dict(completed)
+            current_control = next(
+                (
+                    item
+                    for item in current.get("controls") or []
+                    if isinstance(item, dict) and item.get("control_id") == control_id
+                ),
+                None,
+            )
+            if current_control is None:
+                raise RuntimeError("worktree archive control disappeared before completion")
+            if current_control.get("status") not in {"requested", "applied"}:
+                raise RuntimeError("worktree archive control is no longer applicable")
+            current_control["status"] = "applied"
+            current_control["command_state"] = "APPLIED"
+            current_control["result"] = {
+                "state": "ARCHIVED",
+                "head": completed.get("head"),
+                "preservation_ref": completed.get("preservation_ref"),
+                "evidence_files": list(completed.get("evidence_files") or []),
+                "idempotent": idempotent,
+            }
+            current_control["applied_at"] = utc_now()
+            return current
+
+        return self.store.update(manifest_path, persist_completed)
 
     def _recovery_current_report(self, state: Mapping[str, Any], hop: Mapping[str, Any]) -> dict[str, Any] | None:
         if is_independent_task(state):
@@ -659,6 +1222,68 @@ class CDPAWorker:
             selected.append({key: sanitize_value(item[key]) for key in ("at", "source", "kind", "role", "values", "changes") if key in item})
         return selected[-12:]
 
+    @staticmethod
+    def _compact_recovery_value(
+        value: Any,
+        *,
+        string_limit: int,
+        collection_limit: int,
+        depth: int = 0,
+    ) -> Any:
+        if isinstance(value, Mapping):
+            items = list(value.items())
+            if depth >= 2 and len(items) > collection_limit:
+                items = items[:collection_limit]
+            return {
+                str(key): CDPAWorker._compact_recovery_value(
+                    item,
+                    string_limit=string_limit,
+                    collection_limit=collection_limit,
+                    depth=depth + 1,
+                )
+                for key, item in items
+            }
+        if isinstance(value, (list, tuple)):
+            selected = list(value)[-collection_limit:]
+            return [
+                CDPAWorker._compact_recovery_value(
+                    item,
+                    string_limit=string_limit,
+                    collection_limit=collection_limit,
+                    depth=depth + 1,
+                )
+                for item in selected
+            ]
+        if isinstance(value, str):
+            return sanitize_text(value, max_chars=string_limit)
+        return copy.deepcopy(value)
+
+    @classmethod
+    def _bound_execution_recovery_snapshot(cls, snapshot: dict[str, Any]) -> dict[str, Any]:
+        def encoded_size(value: Mapping[str, Any]) -> int:
+            return len(
+                json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+
+        if encoded_size(snapshot) <= _RECOVERY_SNAPSHOT_MAX_CHARS:
+            return snapshot
+        for string_limit, collection_limit in ((1200, 8), (600, 6), (300, 4), (150, 3)):
+            candidate = cls._compact_recovery_value(
+                snapshot,
+                string_limit=string_limit,
+                collection_limit=collection_limit,
+            )
+            if isinstance(candidate, dict):
+                candidate["snapshot_truncated"] = True
+                if encoded_size(candidate) <= _RECOVERY_SNAPSHOT_MAX_CHARS:
+                    return candidate
+        raise ValueError("execution recovery snapshot cannot be bounded safely")
+
     def _build_execution_recovery_snapshot(
         self,
         state: Mapping[str, Any],
@@ -710,15 +1335,19 @@ class CDPAWorker:
             key: (str(response[key])[:8000] if key == "text" else response[key])
             for key in ("role", "text", "message_id", "turn_id") if response is not None and key in response
         } if response is not None else None
-        return {
+        goal = task_goal_for_hop(state, int(hop["hop_id"]))
+        manifest_path = str(state.get("manifest_path") or "").strip()
+        task_text_ref = f"{manifest_path}#task_text" if manifest_path else f"task:{state.get('task_id') or ''}#task_text"
+        snapshot = {
             "schema_version": 1,
             "source_of_truth": ["workspace_reports_checkpoints_git", "durable_request_ledger", "assistant_progress_advisory"],
             "reason": sanitize_text(reason, max_chars=1000),
             "task": {
                 "task_id": str(state.get("task_id") or ""),
                 "team": str(state.get("team") or ""),
-                "goal": task_goal_for_hop(state, int(hop["hop_id"])),
-                "original_task": str(state.get("task_text") or ""),
+                "goal": sanitize_text(goal, max_chars=_RECOVERY_GOAL_MAX_CHARS),
+                "goal_truncated": len(goal) > _RECOVERY_GOAL_MAX_CHARS,
+                "task_text_ref": task_text_ref,
                 "context_policy": state.get("context_policy"),
                 "conversation_mode": str(state.get("conversation_mode") or "persistent"),
             },
@@ -762,6 +1391,7 @@ class CDPAWorker:
                 "errors": [str(item)[:1000] for item in (hop.get("errors") or [])[-5:]],
             },
         }
+        return self._bound_execution_recovery_snapshot(snapshot)
 
     def _consume_completed_durable_response(
         self, state: dict[str, Any], hop: dict[str, Any]
@@ -848,7 +1478,7 @@ class CDPAWorker:
             source_role=role,
             target_role=role,
             handoff=handoff,
-            kind="execution_recovery",
+            kind="independent_job" if is_independent_task(state) else "execution_recovery",
         )
         child["recovery_of_request_id"] = original_request_id
         role_record.pop("branch_conversation_id", None)
@@ -861,8 +1491,11 @@ class CDPAWorker:
             last_error=None,
             constructor_sent_generation=None,
             attachments_uploaded_generation=None,
-            context_source="execution_recovery",
         )
+        if is_independent_task(state):
+            role_record.pop("context_source", None)
+        else:
+            role_record["context_source"] = "execution_recovery"
         state.setdefault("route_timeline", []).append(
             {
                 "at": utc_now(),
@@ -1289,6 +1922,10 @@ class CDPAWorker:
                 "last_error": None,
             }
         )
+        if logical_role == INDEPENDENT_ROLE and is_independent_task(state):
+            independent = state.get("independent")
+            if isinstance(independent, dict):
+                independent["idle_tab_closed_at"] = None
         if changed:
             record["last_activity_at"] = utc_now()
             state["last_role_activity_at"] = record["last_activity_at"]
@@ -1383,6 +2020,8 @@ class CDPAWorker:
         state: dict[str, Any],
         role: str,
         actions: CDPATabActions,
+        *,
+        admitted: list[bool] | None = None,
     ) -> AcquiredRole | None:
         try:
             hop, expected_conversation, expected_page_id, _ = (
@@ -1407,6 +2046,9 @@ class CDPAWorker:
                     ledger = RequestLedger(str(hop["ledger_path"]))
                     durable = ledger.peek(str(hop["request_id"]))
                     if self._is_pristine_preboundary_sending_record(state, hop, durable):
+                        await self._acquire_endpoint_admission(state, role)
+                        if admitted is not None:
+                            admitted.append(True)
                         acquired = await actions.fresh_chat(state, role, url="https://chatgpt.com/?temporary-chat=true")
                         state["roles"][role]["temporary_document_id"] = await self._temporary_document_token(acquired.client, create=True)
                         self._record_acquired(state, role, acquired)
@@ -1440,6 +2082,9 @@ class CDPAWorker:
                         role_record.get("attachments_uploaded_generation") == role_record.get("conversation_generation")
                     )
                     if pristine and not owns_attachments and hop.get("message_identity") is None:
+                        await self._acquire_endpoint_admission(state, role)
+                        if admitted is not None:
+                            admitted.append(True)
                         acquired = await actions.fresh_chat(
                             state, role, url="https://chatgpt.com/?temporary-chat=true" if temporary else "https://chatgpt.com/",
                         )
@@ -1458,6 +2103,9 @@ class CDPAWorker:
                 if self._rate_limit_gate_active(state=state):
                     state["active_action"] = "rate_limit_cooldown"
                     return None
+                await self._acquire_endpoint_admission(state, role)
+                if admitted is not None:
+                    admitted.append(True)
                 acquired = await self._recover_active_role(state, role, actions)
         except RateLimitBlockedError as exc:
             await self._enter_rate_limit_cooldown(state, actions, exc)
@@ -1549,6 +2197,10 @@ class CDPAWorker:
                 "retry_count": 0,
                 "last_error": None,
                 "last_error_at": None,
+                "failure_fingerprint": None,
+                "same_failure_count": 0,
+                "next_retry_at": None,
+                "retry_suppressed": False,
             }
         )
         if working_control is not None:
@@ -1594,6 +2246,31 @@ class CDPAWorker:
         state.update(saved)
         return started
 
+    @staticmethod
+    def _reset_cleanup_retry_gate(cleanup: dict[str, Any]) -> None:
+        cleanup["failure_fingerprint"] = None
+        cleanup["same_failure_count"] = 0
+        cleanup["next_retry_at"] = None
+        cleanup["retry_suppressed"] = False
+
+    @staticmethod
+    def _cleanup_retry_due(cleanup: Mapping[str, Any]) -> bool:
+        if bool(cleanup.get("retry_suppressed")):
+            return False
+        retry_at = str(cleanup.get("next_retry_at") or "").strip()
+        if not retry_at:
+            return True
+        try:
+            due = datetime.fromisoformat(retry_at.replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        if due.tzinfo is None:
+            due = due.replace(tzinfo=timezone.utc)
+        now = datetime.fromisoformat(utc_now().replace("Z", "+00:00"))
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return now >= due
+
     def _record_cleanup_failure(
         self,
         state: dict[str, Any],
@@ -1604,9 +2281,34 @@ class CDPAWorker:
             cleanup["phase"] = "close_pending"
         now = utc_now()
         detail = sanitize_exception(error)
+        fingerprint = hashlib.sha256(
+            f"{cleanup.get('phase') or ''}\n{type(error).__name__}\n{detail}".encode("utf-8")
+        ).hexdigest()
+        previous = str(cleanup.get("failure_fingerprint") or "")
+        same_failure_count = (
+            int(cleanup.get("same_failure_count") or 0) + 1
+            if previous == fingerprint
+            else 1
+        )
         cleanup["last_error"] = detail
         cleanup["last_error_at"] = now
         cleanup["retry_count"] = int(cleanup.get("retry_count") or 0) + 1
+        cleanup["failure_fingerprint"] = fingerprint
+        cleanup["same_failure_count"] = same_failure_count
+        if same_failure_count >= CLEANUP_IDENTICAL_FAILURE_LIMIT:
+            cleanup["next_retry_at"] = None
+            cleanup["retry_suppressed"] = True
+        else:
+            delay_seconds = _CLEANUP_RETRY_DELAYS_SECONDS[
+                min(same_failure_count - 1, len(_CLEANUP_RETRY_DELAYS_SECONDS) - 1)
+            ]
+            parsed_now = datetime.fromisoformat(now.replace("Z", "+00:00"))
+            if parsed_now.tzinfo is None:
+                parsed_now = parsed_now.replace(tzinfo=timezone.utc)
+            cleanup["next_retry_at"] = (
+                parsed_now + timedelta(seconds=delay_seconds)
+            ).isoformat()
+            cleanup["retry_suppressed"] = False
         state["active_action"] = "cleanup_recoverable"
         control = self._cleanup_control(state, cleanup)
         if control is not None:
@@ -1621,6 +2323,7 @@ class CDPAWorker:
     def _finish_cleanup(self, state: dict[str, Any]) -> dict[str, Any]:
         cleanup = state.setdefault("cleanup", {})
         now = utc_now()
+        self._reset_cleanup_retry_gate(cleanup)
         cleanup.update(
             {
                 "state": "CLEARED",
@@ -1684,6 +2387,7 @@ class CDPAWorker:
         manifest_path: Path,
         *,
         preflighted_pages: list[Any] | None = None,
+        force_retry: bool = False,
     ) -> bool:
         def persist(
             mutator: Callable[[dict[str, Any]], Mapping[str, Any] | None],
@@ -1698,6 +2402,8 @@ class CDPAWorker:
             return True
         if cleanup.get("state") != "CLEARING":
             raise RuntimeError("cleanup continuation requires CLEARING state")
+        if not force_retry and not self._cleanup_retry_due(cleanup):
+            return False
         if str(state.get("status") or "").upper() not in TERMINAL:
             def normalize_stopped(current: dict[str, Any]) -> dict[str, Any]:
                 current_cleanup = current.setdefault("cleanup", {})
@@ -1758,6 +2464,7 @@ class CDPAWorker:
                     current_cleanup["phase"] = "close_pending"
                     current_cleanup["last_error"] = None
                     current_cleanup["last_error_at"] = None
+                    self._reset_cleanup_retry_gate(current_cleanup)
                     current["active_action"] = "cleanup_close_pending"
                     return current
 
@@ -1794,6 +2501,10 @@ class CDPAWorker:
                         current_cleanup["closed_tabs"] = int(
                             current_cleanup.get("closed_tabs") or 0
                         ) + int(exc.closed_tabs)
+                        if exc.closed_tabs > 0:
+                            current_cleanup["last_error"] = None
+                            current_cleanup["last_error_at"] = None
+                            self._reset_cleanup_retry_gate(current_cleanup)
                         self._record_cleanup_failure(current, exc)
                         return current
 
@@ -1806,6 +2517,10 @@ class CDPAWorker:
                         current_cleanup.get("closed_tabs") or 0
                     ) + int(closed)
                     current_cleanup["phase"] = "verify_pending"
+                    if closed > 0:
+                        current_cleanup["last_error"] = None
+                        current_cleanup["last_error_at"] = None
+                        self._reset_cleanup_retry_gate(current_cleanup)
                     current["active_action"] = "cleanup_verify_pending"
                     return current
 
@@ -2111,6 +2826,9 @@ class CDPAWorker:
             raise RuntimeError("independent controls must target AGENT")
         action = str(control.get("action") or "")
         active = independent.get("active_event") is not None
+        if action == "clear_team":
+            independent["board_projection_hidden_at"] = utc_now()
+            return {"board_projection_removed": True, "active_job_preserved": active}
         if action == "pause":
             if str(state.get("status") or "").upper() in TERMINAL:
                 raise RuntimeError("cannot pause a terminal independent task")
@@ -2286,6 +3004,32 @@ class CDPAWorker:
             raise RuntimeError("independent agents use Reset; Stop is not supported")
         raise RuntimeError(f"unsupported independent control action {action!r}")
 
+    async def _release_blocked_workflow_tabs(
+        self,
+        state: Mapping[str, Any],
+        actions: CDPATabActions,
+    ) -> None:
+        if is_independent_task(state) or str(state.get("status") or "").upper() != "BLOCKED":
+            return
+        try:
+            hop = _active_hop(state)
+        except Exception:
+            hop = None
+        if (
+            isinstance(hop, Mapping)
+            and str(hop.get("state") or "") == "sending"
+            and self._sending_hop_durable_boundary_state(hop) != "preboundary"
+        ):
+            return
+        try:
+            selected = await actions.preflight_team(state)
+            if selected:
+                await actions.close_team(state, preflighted_pages=selected)
+        except Exception:
+            # BLOCKED truth is already durable. Browser-resource release is best-effort
+            # and must never replace the original diagnosis.
+            return
+
     def _sending_hop_durable_boundary_state(self, hop: Mapping[str, Any]) -> str:
         receipt = hop.get("receipt")
         if isinstance(receipt, Mapping) and receipt:
@@ -2348,7 +3092,15 @@ class CDPAWorker:
         guard_blocked = (
             str(baseline.get("status") or "").upper() == "BLOCKED"
             and str(baseline.get("block_code") or "")
-            == _CONSECUTIVE_SELF_ROUTE_BLOCK_CODE
+            == _LEGACY_CONSECUTIVE_SELF_ROUTE_BLOCK_CODE
+        )
+        budget_blocked = (
+            str(baseline.get("status") or "").upper() == "BLOCKED"
+            and str(baseline.get("block_code") or "")
+            in {
+                _AUTONOMOUS_EXECUTION_BUDGET_BLOCK_CODE,
+                _LEGACY_NO_PROGRESS_ROUTE_CYCLE_BLOCK_CODE,
+            }
         )
         resume_completed = False
         result: Any = None
@@ -2419,11 +3171,9 @@ class CDPAWorker:
                         )
                     source_role = str(hop.get("target_role") or "").strip().upper()
                     handoff = str(
-                        (
-                            hop.get("expected_report_path")
-                            if hop.get("report_sha256") is not None
-                            else hop.get("report_path")
-                        )
+                        hop.get("expected_report_path")
+                        or hop.get("report_path")
+                        or hop.get("routed_handoff")
                         or ""
                     ).strip()
                     if source_role not in state.get("roles", {}) or not handoff:
@@ -2451,6 +3201,108 @@ class CDPAWorker:
                         "postcondition": "child_hop_appended",
                         "before": before,
                         "after": command_snapshot(state, role=source_role),
+                        "child_hop_id": child["hop_id"],
+                    }
+                    resume_completed = True
+                elif budget_blocked:
+                    control_origin = str(
+                        control.get("origin")
+                        or (command.origin if command is not None else "")
+                        or "operator"
+                    ).strip().lower()
+                    if control_origin != "operator":
+                        raise RuntimeError(
+                            "autonomous execution budget renewal requires explicit operator Resume"
+                        )
+                    if hop is None or hop_state != "routed":
+                        raise RuntimeError(
+                            "autonomous execution budget renewal requires its persisted routed source hop"
+                        )
+                    source_role = str(hop.get("target_role") or "").strip().upper()
+                    pending = self._pending_budget_continuation(state, hop)
+                    if source_role not in state.get("roles", {}):
+                        raise RuntimeError(
+                            "autonomous execution budget block lost its persisted source role"
+                        )
+                    before = command_snapshot(baseline, role=source_role)
+                    if pending is not None:
+                        kind = str(pending.get("kind") or "").strip()
+                        pending_source_role = str(
+                            pending.get("source_role") or ""
+                        ).strip().upper()
+                        target_role = str(pending.get("target_role") or "").strip().upper()
+                        handoff = str(pending.get("handoff") or "").strip()
+                        turn = int(pending.get("turn") or 0)
+                        repair_attempt = int(pending.get("repair_attempt") or 0)
+                        validation_error = str(
+                            pending.get("validation_error") or ""
+                        ).strip()
+                        if (
+                            kind not in {"report_repair", "route_repair"}
+                            or pending_source_role != source_role
+                            or target_role != source_role
+                            or not handoff
+                            or turn < 1
+                            or repair_attempt < 1
+                            or not validation_error
+                        ):
+                            raise RuntimeError(
+                                "autonomous execution budget repair continuation is incomplete"
+                            )
+                        locked_route = str(
+                            pending.get("locked_route") or ""
+                        ).strip().upper()
+                        locked_handoff = str(
+                            pending.get("locked_handoff") or ""
+                        ).strip()
+                        if kind == "report_repair" and (
+                            not locked_route or not locked_handoff
+                        ):
+                            raise RuntimeError(
+                                "autonomous execution budget report repair lost its locked decision"
+                            )
+                        renewed = self._renew_execution_budget(state)
+                        child = self._append_hop(
+                            state,
+                            source_role=source_role,
+                            target_role=target_role,
+                            handoff=handoff,
+                            kind=kind,
+                            turn=turn,
+                            repair_attempt=repair_attempt,
+                            validation_error=validation_error,
+                        )
+                        if kind == "report_repair":
+                            child["locked_route"] = locked_route
+                            child["locked_handoff"] = locked_handoff
+                        after_role = target_role
+                    else:
+                        routed_role = str(hop.get("route") or "").strip().upper()
+                        handoff = str(
+                            hop.get("report_path") or hop.get("expected_report_path") or ""
+                        ).strip()
+                        if routed_role not in state.get("roles", {}) or not handoff:
+                            raise RuntimeError(
+                                "autonomous execution budget block lost its persisted route decision"
+                            )
+                        renewed = self._renew_execution_budget(state)
+                        child = self._append_hop(
+                            state,
+                            source_role=source_role,
+                            target_role=routed_role,
+                            handoff=handoff,
+                        )
+                        after_role = routed_role
+                    result = {
+                        "outcome": "continued",
+                        "action": "renew_execution_budget",
+                        "reason_code": None,
+                        "reason": "Explicit operator Resume renewed the autonomous execution budget.",
+                        "next_safe_action": None,
+                        "postcondition": "child_hop_appended",
+                        "before": before,
+                        "after": command_snapshot(state, role=after_role),
+                        "budget_epoch": renewed["epoch"],
                         "child_hop_id": child["hop_id"],
                     }
                     resume_completed = True
@@ -2488,6 +3340,7 @@ class CDPAWorker:
                             "consecutive self-route guard lost its persisted route handoff"
                         )
                     before = command_snapshot(baseline, role=source_role)
+                    self._renew_execution_budget(state)
                     child = self._append_hop(
                         state,
                         source_role=source_role,
@@ -2643,13 +3496,29 @@ class CDPAWorker:
                     state["active_action"] = "rate_limit_cooldown"
                     result = {"deferred": True, "reason": "rate_limit_cooldown"}
                 else:
-                    acquired = await actions.restart(
-                        state,
-                        role,
-                        known_automated_draft=(
-                            str(hop.get("prompt") or "") if hop is not None else None
-                        ) or None,
+                    solo_exact_url = (
+                        str((hop or {}).get("conversation_url") or "").strip()
+                        or str(state["roles"][role].get("page_url") or "").strip()
                     )
+                    restart_exact = getattr(actions, "restart_exact", None)
+                    if (
+                        str(state.get("workflow_mode") or "team").strip().lower() == "solo"
+                        and solo_exact_url
+                        and callable(restart_exact)
+                    ):
+                        acquired = await restart_exact(
+                            state,
+                            role,
+                            url=solo_exact_url,
+                        )
+                    else:
+                        acquired = await actions.restart(
+                            state,
+                            role,
+                            known_automated_draft=(
+                                str(hop.get("prompt") or "") if hop is not None else None
+                            ) or None,
+                        )
                     self._record_acquired(state, role, acquired)
                     state["roles"][role]["constructor_sent_generation"] = None
                     if blocked_restart:
@@ -2662,11 +3531,30 @@ class CDPAWorker:
                         hop["state"] = "abandoned"
                         hop["abandon_reason"] = abandon_reason
                         hop["timestamps"]["abandoned_at"] = utc_now()
+                        restart_source = hop
+                        hops_by_id = {
+                            int(item.get("hop_id") or 0): item
+                            for item in state.get("hops") or []
+                            if isinstance(item, Mapping)
+                        }
+                        for _ in range(len(hops_by_id)):
+                            if str(restart_source.get("kind") or "") not in {
+                                "route_repair",
+                                "report_repair",
+                            }:
+                                break
+                            parent = hops_by_id.get(int(restart_source.get("parent_hop_id") or 0))
+                            if not isinstance(parent, Mapping):
+                                break
+                            restart_source = parent
+                        restart_handoff = str(
+                            restart_source.get("handoff") or hop["handoff"]
+                        )
                         new_hop = self._append_hop(
                             state,
                             source_role=role,
                             target_role=role,
-                            handoff=str(hop["handoff"]),
+                            handoff=restart_handoff,
                             kind="role_restart",
                         )
                         state["block_code"] = None
@@ -2898,6 +3786,19 @@ class CDPAWorker:
                         reason=route_reason,
                         kind="control",
                     )
+            elif action == "archive_worktree":
+                if manifest_path is None:
+                    raise RuntimeError("worktree archival requires a manifest path")
+                saved = self._apply_worktree_archive_control(
+                    state,
+                    manifest_path,
+                    control,
+                )
+                state.clear()
+                state.update(saved)
+                if persisted_result is not None:
+                    persisted_result.append(True)
+                return True
             elif action == "clear_team":
                 cleanup = state.setdefault("cleanup", {})
                 if cleanup.get("state") == "CLEARED":
@@ -2955,7 +3856,39 @@ class CDPAWorker:
                 elif cleanup.get("state") == "CLEARING":
                     if manifest_path is None:
                         raise RuntimeError("cleanup continuation requires a manifest path")
-                    await self._continue_cleanup(state, actions, manifest_path)
+
+                    def reset_for_explicit_retry(current: dict[str, Any]) -> dict[str, Any]:
+                        current_cleanup = current.setdefault("cleanup", {})
+                        self._reset_cleanup_retry_gate(current_cleanup)
+                        current_cleanup["control_id"] = control_id
+                        current_control = next(
+                            (
+                                item
+                                for item in current.get("controls") or []
+                                if isinstance(item, dict)
+                                and item.get("control_id") == control_id
+                            ),
+                            None,
+                        )
+                        if current_control is None:
+                            raise RuntimeError("Clear Team control is no longer present")
+                        current_control["status"] = "cleanup_pending"
+                        current_control["result"] = {
+                            "phase": current_cleanup.get("phase"),
+                            "explicit_retry": True,
+                        }
+                        current_control["applied_at"] = utc_now()
+                        return current
+
+                    saved = self.store.update(manifest_path, reset_for_explicit_retry)
+                    state.clear()
+                    state.update(saved)
+                    await self._continue_cleanup(
+                        state,
+                        actions,
+                        manifest_path,
+                        force_retry=True,
+                    )
                     if persisted_result is not None:
                         persisted_result.append(True)
                     return True
@@ -3025,7 +3958,7 @@ class CDPAWorker:
             control_id = control.get("control_id")
             control["command_state"] = "REJECTED"
             if (
-                action == "clear_team"
+                action in {"clear_team", "archive_worktree"}
                 and manifest_path is not None
                 and isinstance(control_id, int)
             ):
@@ -3033,7 +3966,7 @@ class CDPAWorker:
                     manifest_path,
                     control_id,
                     detail,
-                    action="clear_team",
+                    action=action,
                 )
                 state.clear()
                 state.update(saved)
@@ -3085,6 +4018,102 @@ class CDPAWorker:
                 persisted_result.append(True)
         return True
 
+    @staticmethod
+    def _execution_budget(state: dict[str, Any]) -> dict[str, Any]:
+        existing = state.get("execution_budget")
+        if isinstance(existing, dict):
+            epoch = existing.get("epoch")
+            limit = existing.get("limit")
+            charged = existing.get("charged_hop_ids")
+            if (
+                isinstance(epoch, int)
+                and not isinstance(epoch, bool)
+                and epoch >= 1
+                and isinstance(limit, int)
+                and not isinstance(limit, bool)
+                and limit >= 1
+                and isinstance(charged, list)
+                and all(
+                    isinstance(item, int) and not isinstance(item, bool) and item >= 1
+                    for item in charged
+                )
+                and len(set(charged)) == len(charged)
+            ):
+                return existing
+        charged_hop_ids = sorted(
+            {
+                int(hop["hop_id"])
+                for hop in state.get("hops") or ()
+                if isinstance(hop, Mapping)
+                and isinstance(hop.get("hop_id"), int)
+                and not isinstance(hop.get("hop_id"), bool)
+                and int(hop["hop_id"]) >= 1
+            }
+        )
+        budget = {
+            "epoch": 1,
+            "limit": _AUTONOMOUS_EXECUTION_LIMIT,
+            "charged_hop_ids": charged_hop_ids,
+            "renewed_at": None,
+        }
+        state["execution_budget"] = budget
+        return budget
+
+    @classmethod
+    def _execution_budget_exhausted(cls, state: dict[str, Any]) -> bool:
+        budget = cls._execution_budget(state)
+        return len(budget["charged_hop_ids"]) >= int(budget["limit"])
+
+    @staticmethod
+    def _pending_budget_continuation(
+        state: Mapping[str, Any], hop: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        explicit = hop.get("budget_continuation")
+        if isinstance(explicit, Mapping):
+            return dict(explicit)
+        hop_id = hop.get("hop_id")
+        for event in reversed(state.get("route_timeline") or []):
+            if not isinstance(event, Mapping) or event.get("hop_id") != hop_id:
+                continue
+            kind = str(event.get("kind") or "").strip()
+            if kind not in {"report_repair", "route_repair"}:
+                return None
+            role = str(hop.get("target_role") or "").strip().upper()
+            continuation = {
+                "kind": kind,
+                "source_role": role,
+                "target_role": role,
+                "handoff": kind.replace("_", " "),
+                "turn": int(hop.get("turn") or 0),
+                "repair_attempt": int(hop.get("repair_attempt") or 0) + 1,
+                "validation_error": str(
+                    hop.get("validation_error") or event.get("error") or ""
+                ),
+            }
+            if kind == "report_repair":
+                continuation["locked_route"] = str(
+                    hop.get("validation_route") or hop.get("route") or ""
+                ).strip().upper()
+                continuation["locked_handoff"] = str(
+                    hop.get("validation_handoff")
+                    or hop.get("expected_report_path")
+                    or ""
+                ).strip()
+            return continuation
+        return None
+
+    @classmethod
+    def _renew_execution_budget(cls, state: dict[str, Any]) -> dict[str, Any]:
+        previous = cls._execution_budget(state)
+        renewed = {
+            "epoch": int(previous["epoch"]) + 1,
+            "limit": int(previous["limit"]),
+            "charged_hop_ids": [],
+            "renewed_at": utc_now(),
+        }
+        state["execution_budget"] = renewed
+        return renewed
+
     def _append_hop(
         self,
         state: dict[str, Any],
@@ -3098,6 +4127,10 @@ class CDPAWorker:
         validation_error: str | None = None,
     ) -> dict[str, Any]:
         target_role = str(target_role).strip().upper()
+        if self._execution_budget_exhausted(state):
+            raise RuntimeError(
+                "autonomous execution budget exhausted; explicit operator Resume is required"
+            )
         if target_role not in state["roles"]:
             raise RouteContractError(
                 f"route {target_role!r} is not selected for this task"
@@ -3156,6 +4189,9 @@ class CDPAWorker:
             "errors": [],
         }
         state.setdefault("hops", []).append(hop)
+        budget = self._execution_budget(state)
+        if hop_id not in budget["charged_hop_ids"]:
+            budget["charged_hop_ids"].append(hop_id)
         state["active_hop_id"] = hop_id
         state["active_role"] = target_role
         state["active_action"] = "queued"
@@ -3199,6 +4235,32 @@ class CDPAWorker:
             return False
         if record is None:
             return True
+        if hop.get("rebuild_prompt_after_relocation") is True:
+            validation_hop = dict(hop)
+            validation_hop["state"] = "sending"
+            if self._is_pristine_preboundary_sending_record(
+                state, validation_hop, record
+            ):
+                return True
+            intent = hop.get("prompt_rebind_intent")
+            if isinstance(intent, Mapping):
+                intended_prompt = str(intent.get("prompt") or "")
+                intended_sha = str(intent.get("prompt_sha256") or "")
+                if intended_prompt and intended_sha == _sha(intended_prompt):
+                    intended_hop = dict(validation_hop)
+                    intended_hop["prompt"] = intended_prompt
+                    intended_hop["prompt_sha256"] = intended_sha
+                    if self._is_pristine_preboundary_sending_record(
+                        state, intended_hop, record
+                    ):
+                        return True
+            self._block(
+                state,
+                "relocated pre_send request is no longer provably pristine; refusing to rebuild or send",
+                code="pre_send_request_recovery_required",
+                retryable=False,
+            )
+            return False
         self._block(
             state,
             f"pre_send hop already has durable request identity in status {record.status.value}; exact request recovery is required before any send",
@@ -3235,7 +4297,7 @@ class CDPAWorker:
             state["active_action"] = "rate_limit_cooldown"
             return None
         try:
-            acquired = await actions.acquire(state, role)
+            acquired = await actions.acquire(state, role, clean_for_send=True)
             await self._dismiss_known_rate_limit_on_existing(acquired)
             return acquired
         except RoleOwnershipError as exc:
@@ -3270,7 +4332,7 @@ class CDPAWorker:
             except TimeoutError:
                 return None
             try:
-                return await actions.acquire(state, role)
+                return await actions.acquire(state, role, clean_for_send=True)
             except UnsafePageStateError as retry_exc:
                 if str(retry_exc).strip().casefold() == "page is already responding":
                     state["active_action"] = "reconcile_page_response"
@@ -3591,6 +4653,7 @@ class CDPAWorker:
                     role,
                     source_conversation_id=donor["conversation_id"],
                     assistant_message_id=donor["assistant_message_id"],
+                    clean_for_send=True,
                 )
                 await self._reject_foreign_durable_branch_owner(state, role, acquired)
             except BranchTargetUnresolvedError as exc:
@@ -3614,7 +4677,12 @@ class CDPAWorker:
         if unavailable_donors and not saw_transient:
             # Account-local inaccessibility must not invalidate donors usable by peers.
             # No task Send has occurred: continue the SAME request in fresh context.
-            acquired = await actions.fresh_chat(state, role, url="https://chatgpt.com/")
+            acquired = await actions.fresh_chat(
+                state,
+                role,
+                url="https://chatgpt.com/",
+                clean_for_send=True,
+            )
             role_record["context_source"] = "fresh_fallback"
             role_record["bootstrap_context_recovery"] = {
                 "endpoint_id": self._execution_endpoint_id(state, role) or self.store.endpoint_id_for(state),
@@ -3639,10 +4707,15 @@ class CDPAWorker:
             return None
         if str(current.get("prewarm_prompt") or "").strip():
             state["active_action"] = "bootstrap_regenerate"
+            # Global bootstrap prewarm is not a task-owned admission. Do not hold
+            # the endpoint admission gate across its Send/response wait; the
+            # bootstrap-specific prepare lock already serializes that work.
+            self._release_endpoint_admission()
             regenerated = await self._regenerate_bootstrap_donor(
                 state, current, actions
             )
             if regenerated is not None and regenerated.get("donors"):
+                await self._acquire_endpoint_admission(state, role)
                 return await self._acquire_workflow_role(state, role, actions)
             return None
         self._mark_bootstrap_unavailable(state, current)
@@ -3661,7 +4734,38 @@ class CDPAWorker:
         if self._attachment_files_for_generation(state, role) is None:
             return
         independent = state.get("independent") if is_independent_task(state) else None
-        if isinstance(independent, dict) and independent.get("temporary_chat") is True:
+        solo_existing_url = (
+            not isinstance(independent, Mapping)
+            and str(state.get("workflow_mode") or "team").strip().lower() == "solo"
+            and str(hop.get("kind") or "") == "task"
+            and bool(str(hop.get("conversation_url") or "").strip())
+            and not bool(state["roles"][role].get("page_id"))
+        )
+        if solo_existing_url:
+            candidate_url = str(hop["conversation_url"])
+            owner = self._foreign_durable_conversation_owner(
+                state,
+                role,
+                candidate_url,
+            )
+            if owner is not None:
+                owner_task, owner_physical, owner_team = owner
+                self._block(
+                    state,
+                    "Solo conversation is already owned by "
+                    f"{owner_task}/{owner_physical}/{owner_team}",
+                    code="conversation_owned_by_other_task",
+                    retryable=False,
+                )
+                return
+            acquired = await actions.adopt_conversation(
+                state,
+                role,
+                url=candidate_url,
+            )
+            hop["conversation_url"] = acquired.url
+            await self._dismiss_known_rate_limit_on_existing(acquired)
+        elif isinstance(independent, dict) and independent.get("temporary_chat") is True:
             if hop.get("kind") == "independent_cycle":
                 acquired = await actions.locate_owned(state, role)
                 if acquired is None:
@@ -3692,7 +4796,10 @@ class CDPAWorker:
                     state,
                     role,
                     url="https://chatgpt.com/?temporary-chat=true",
+                    clean_for_send=True,
                 )
+            else:
+                acquired = await actions.acquire(state, role, clean_for_send=True)
             await self._dismiss_known_rate_limit_on_existing(acquired)
         elif not isinstance(independent, Mapping) and (state.get("context_policy") == "fresh" or hop.get("kind") == "execution_recovery"):
             acquired = await actions.locate_owned(state, role)
@@ -3704,9 +4811,12 @@ class CDPAWorker:
                     state,
                     role,
                     url="https://chatgpt.com/",
+                    clean_for_send=True,
                 )
                 if state.get("context_policy") == "fresh":
                     state["roles"][role]["context_source"] = "fresh"
+            else:
+                acquired = await actions.acquire(state, role, clean_for_send=True)
             await self._dismiss_known_rate_limit_on_existing(acquired)
         elif (
             isinstance(independent, dict)
@@ -3747,6 +4857,24 @@ class CDPAWorker:
         preparation = await self.role_controller.run(
             self, state, hop, acquired, actions, phase="pre_send", wait_ms=0,
         )
+        if solo_existing_url and preparation.reason == "response_in_progress":
+            now = datetime.now(timezone.utc)
+            start_wait_budget(
+                hop["wait"],
+                timeout_seconds=self.config.response_timeout_seconds,
+                now=now,
+            )
+            hop["state"] = "waiting"
+            hop["timestamps"]["waiting_at"] = now.isoformat()
+            hop["adopted_existing_response"] = True
+            state["started_at"] = state.get("started_at") or now.isoformat()
+            state["status"] = "RUNNING"
+            state["kanban_column"] = _column_for(role)
+            state["active_action"] = "wait_response"
+            return
+        if solo_existing_url and preparation.reason == "ready":
+            acquired = await actions.acquire(state, role, clean_for_send=True)
+            self._record_acquired(state, role, acquired)
         if preparation.reason != "ready":
             return
         role_record = state["roles"][role]
@@ -3773,8 +4901,13 @@ class CDPAWorker:
                 ),
                 conversation_generation=generation,
             )
-            hop["prompt"] = built.text
-            hop["prompt_sha256"] = _sha(built.text)
+            prompt = built.text
+            if hop.get("recovery_of_request_id"):
+                recovery_handoff = str(hop.get("handoff") or "").strip()
+                if recovery_handoff:
+                    prompt += "\n\n" + recovery_handoff
+            hop["prompt"] = prompt
+            hop["prompt_sha256"] = _sha(prompt)
             hop["expected_report_path"] = None
             hop["state"] = "sending"
             hop["timestamps"]["sending_at"] = utc_now()
@@ -3786,6 +4919,31 @@ class CDPAWorker:
             state["started_at"] = state.get("started_at") or utc_now()
             state["status"] = "RUNNING"
             state["kanban_column"] = INDEPENDENT_COLUMN
+            state["active_action"] = "send"
+            return
+        if str(state.get("workflow_mode") or "team").strip().lower() == "solo":
+            continuation = (
+                str(hop.get("kind") or "") != "task"
+                or bool(str(hop.get("conversation_url") or "").strip())
+            )
+            built = self.prompts.build_solo(
+                task_name=str(state.get("task_title") or state["task_text"]).splitlines()[0],
+                logical_role=role,
+                goal=task_goal_for_hop(state, int(hop["hop_id"])),
+                continuation=continuation,
+            )
+            prompt = built.text
+            hop["prompt"] = prompt
+            hop["prompt_sha256"] = _sha(prompt)
+            hop["expected_report_path"] = None
+            hop["state"] = "sending"
+            hop["timestamps"]["sending_at"] = utc_now()
+            role_record["turn"] = max(
+                int(role_record.get("turn") or 0), int(hop["turn"])
+            )
+            state["started_at"] = state.get("started_at") or utc_now()
+            state["status"] = "RUNNING"
+            state["kanban_column"] = _column_for(role)
             state["active_action"] = "send"
             return
         report_repository, report_plans_root = _workflow_report_roots(self.config, state)
@@ -3805,6 +4963,10 @@ class CDPAWorker:
         )
         workflow_definitions = task_workflow_definitions(state, self.config)
         workflow_definition = workflow_definitions[role]
+        if hop.get("rebuild_prompt_after_relocation") is True and not hop.get("context_recovery_snapshot"):
+            hop["context_recovery_snapshot"] = self._build_execution_recovery_snapshot(
+                state, hop, reason="pristine pre-boundary request relocated to a new conversation",
+            )
         bootstrap_inherited = (
             bool(workflow_definition["is_system"])
             and role_record.get("context_source")
@@ -3812,8 +4974,28 @@ class CDPAWorker:
             and generation == 1
         )
         allowed_routes = tuple(workflow_definitions) + ("PAUSE", "DONE")
+        if hop.get("kind") in {"route_repair", "report_repair"} and (
+            acquired.new_chat or (acquired.created and role_record.get("last_endpoint_id"))
+        ):
+            hop["context_recovery_snapshot"] = self._build_execution_recovery_snapshot(
+                state, hop, reason="repair continuation acquired a new browser conversation",
+            )
+        bounded_context = ""
+        if hop.get("context_recovery_snapshot"):
+            bounded_context = (
+                "Inspect the existing workspace, reports, checkpoints and Git state. "
+                "Continue only unfinished work; do not repeat completed irreversible actions.\n"
+                "RECOVERY_SNAPSHOT\n"
+                + json.dumps(hop["context_recovery_snapshot"], ensure_ascii=False, sort_keys=True)
+            )
+            prewarm = (role_record.get("bootstrap_context_recovery") or {}).get("prewarm_context")
+            if prewarm:
+                bounded_context += (
+                    "\n\nReusable bootstrap instructions (conversation history is unavailable):\n"
+                    + str(prewarm)
+                )
         if hop.get("kind") == "route_repair":
-            prompt = self.prompts.repair(
+            repair_prompt = self.prompts.repair(
                 task_id=str(state["task_id"]),
                 team=str(state["team"]),
                 physical_role=str(hop["physical_role"]),
@@ -3823,6 +5005,7 @@ class CDPAWorker:
                 report_mode=_report_mode(state),
                 allowed_routes=allowed_routes,
             )
+            prompt = (bounded_context + "\n\n" if bounded_context else "") + repair_prompt
             included = False
         elif hop.get("kind") == "report_repair":
             locked_route = str(hop.get("locked_route") or "").strip().upper()
@@ -3831,15 +5014,23 @@ class CDPAWorker:
                 raise RouteContractError(
                     "report repair handoff no longer matches the expected role report"
                 )
-            prompt = self.prompts.report_repair(
-                task_id=str(state["task_id"]),
-                team=str(state["team"]),
-                physical_role=str(hop["physical_role"]),
-                turn=int(hop["turn"]),
-                route=locked_route,
-                handoff=locked_handoff,
-                validation_error=str(hop["validation_error"]),
+            repair_sections = [
+                self.prompts.filesystem_scope(str(state["repository"]), expected)
+            ]
+            if bounded_context:
+                repair_sections.append(bounded_context)
+            repair_sections.append(
+                self.prompts.report_repair(
+                    task_id=str(state["task_id"]),
+                    team=str(state["team"]),
+                    physical_role=str(hop["physical_role"]),
+                    turn=int(hop["turn"]),
+                    route=locked_route,
+                    handoff=locked_handoff,
+                    validation_error=str(hop["validation_error"]),
+                )
             )
+            prompt = "\n\n".join(repair_sections)
             included = False
         else:
             built = self.prompts.build(
@@ -3863,24 +5054,67 @@ class CDPAWorker:
                 constructor_text=str(workflow_definition["system_prompt"]),
                 is_system_role=bool(workflow_definition["is_system"]),
                 bootstrap_inherited=bootstrap_inherited,
+                bounded_context=bounded_context or None,
             )
             prompt = built.text
             included = built.constructor_included
-        if hop.get("kind") == "report_repair":
-            prompt += "\n\n" + self.prompts.filesystem_scope(str(state["repository"]), expected)
-        if hop.get("kind") in {"route_repair", "report_repair"} and (
-            acquired.new_chat or (acquired.created and role_record.get("last_endpoint_id"))
-        ):
-            hop["context_recovery_snapshot"] = self._build_execution_recovery_snapshot(
-                state, hop, reason="repair continuation acquired a new browser conversation",
-            )
-        if hop.get("context_recovery_snapshot"):
-            prompt += ("\n\nInspect the existing workspace, reports, checkpoints and Git state. "
-                       "Continue only unfinished work; do not repeat completed irreversible actions.\nRECOVERY_SNAPSHOT\n"
-                       + json.dumps(hop["context_recovery_snapshot"], ensure_ascii=False, sort_keys=True))
-            prewarm = (role_record.get("bootstrap_context_recovery") or {}).get("prewarm_context")
-            if prewarm:
-                prompt += "\n\nReusable bootstrap instructions (conversation history is unavailable):\n" + str(prewarm)
+        if hop.get("rebuild_prompt_after_relocation") is True:
+            ledger_path = str(hop.get("ledger_path") or "").strip()
+            request_id = str(hop.get("request_id") or "").strip()
+            if not ledger_path or not request_id:
+                raise DurableRequestError("relocated pristine request has no durable identity")
+            source_context = {
+                "task_id": state["task_id"], "team": state["team"],
+                "hop_id": hop["hop_id"], "manifest": state["manifest_path"],
+            }
+            role_prompt_hash = _sha(str(workflow_definition["system_prompt"]))
+            intent = {
+                "request_id": request_id,
+                "role": str(hop["physical_role"]),
+                "prompt": prompt,
+                "prompt_sha256": _sha(prompt),
+                "source_context": source_context,
+                "role_prompt_hash": role_prompt_hash,
+            }
+            existing_intent = hop.get("prompt_rebind_intent")
+            if existing_intent is not None and existing_intent != intent:
+                raise DurableRequestError("relocated request rebind intent changed after persistence")
+            if existing_intent is None:
+                hop_id = hop["hop_id"]
+                def persist_rebind_intent(current_state: dict[str, Any]) -> dict[str, Any]:
+                    current_hop = next(
+                        (item for item in current_state.get("hops") or [] if item.get("hop_id") == hop_id),
+                        None,
+                    )
+                    if (
+                        not isinstance(current_hop, dict)
+                        or str(current_hop.get("request_id") or "") != request_id
+                        or str(current_hop.get("state") or "") not in {"sending", "pre_send"}
+                        or current_hop.get("receipt") is not None
+                    ):
+                        raise DurableRequestError("relocated request state changed before rebind intent persistence")
+                    prior = current_hop.get("prompt_rebind_intent")
+                    if prior is not None and prior != intent:
+                        raise DurableRequestError("relocated request has conflicting persisted rebind intent")
+                    current_hop["prompt_rebind_intent"] = intent
+                    return current_state
+                self.store.update(str(state["manifest_path"]), persist_rebind_intent)
+                hop["prompt_rebind_intent"] = intent
+            durable = RequestLedger(ledger_path)
+            current = durable.peek(request_id)
+            intended_hop = dict(hop)
+            intended_hop.update(state="sending", prompt=prompt, prompt_sha256=intent["prompt_sha256"])
+            if not self._is_pristine_preboundary_sending_record(state, intended_hop, current):
+                if current is None or current.status not in {RequestStatus.NEW, RequestStatus.PROMPT_SET} or current.attempts != 0:
+                    raise DurableRequestError("relocated request is no longer pristine")
+                durable.rebind_pristine(
+                    request_id,
+                    role=intent["role"],
+                    prompt=prompt,
+                    source_context=source_context,
+                    role_prompt_hash=role_prompt_hash,
+                )
+            hop["rebuild_prompt_after_relocation"] = False
         hop["prompt"] = prompt
         hop["prompt_sha256"] = _sha(prompt)
         hop["expected_report_path"] = expected
@@ -3917,8 +5151,23 @@ class CDPAWorker:
             files = self._attachment_files_for_generation(state, role)
             if files is None:
                 return
-        acquired = await self._owned_or_block(state, role, actions)
+        admitted: list[bool] = []
+        acquired = await self._owned_or_block(state, role, actions, admitted=admitted)
         if acquired is None:
+            return
+        if hop.get("rebuild_prompt_after_relocation") is True:
+            current = ledger.peek(str(hop["request_id"]))
+            if current is None:
+                hop["rebuild_prompt_after_relocation"] = False
+            else:
+                if not self._is_pristine_preboundary_sending_record(state, hop, current):
+                    raise DurableRequestError("relocated request is no longer pristine")
+                hop["state"] = "pre_send"
+                hop["relocated_pre_send_at"] = utc_now()
+                state["active_action"] = "prepare_send"
+                return
+        if admitted:
+            # Persist the recovered binding before crossing the Send boundary.
             return
         await self._dismiss_known_rate_limit_on_existing(acquired)
         if is_independent_task(state):
@@ -4261,6 +5510,14 @@ class CDPAWorker:
                 raise ValueError("report repair response must not be empty")
             return
         role = str(hop["target_role"])
+        if str(state.get("workflow_mode") or "team").strip().lower() == "solo":
+            parse_route_response(
+                response.text,
+                source_role=role,
+                allowed_routes=("PAUSE", "DONE"),
+                allow_non_plan_done=True,
+            )
+            return
         parse_role_response(
             response.text,
             source_role=role,
@@ -4587,12 +5844,24 @@ class CDPAWorker:
         manifest_path: Path,
         transport_baseline: dict[str, Any] | None = None,
     ) -> None:
-        self._start_wait_budget_from_sent(hop)
+        if hop.get("receipt"):
+            self._start_wait_budget_from_sent(hop)
+        elif (
+            parse_time((hop.get("wait") or {}).get("started_at")) is None
+            or parse_time((hop.get("wait") or {}).get("deadline_at")) is None
+        ):
+            raise RuntimeError("receiptless waiting hop is missing its existing wait budget")
         self._reconcile_hop_conversation_identity(state, hop)
-        acquired = await self._owned_or_block(state, str(hop["target_role"]), actions)
-        if acquired is None:
+        admitted: list[bool] = []
+        acquired = await self._owned_or_block(
+            state, str(hop["target_role"]), actions, admitted=admitted
+        )
+        if acquired is None or admitted:
+            # A reopened page is persisted before ordinary response observation resumes.
             return
         await self.role_controller.run(self, state, hop, acquired, actions)
+        if hop.get("state") == "responded" and not is_independent_task(state):
+            self._responded(state, hop)
 
 
 
@@ -4701,6 +5970,8 @@ class CDPAWorker:
         reason: str,
         kind: str,
     ) -> dict[str, int]:
+        if str(state.get("workflow_mode") or "team").strip().lower() == "solo":
+            raise RuntimeError("Route PLAN is unavailable for Solo Task")
         if state.get("status") in TERMINAL:
             raise RuntimeError("cannot route a terminal task to PLAN")
         if str(hop.get("state") or "") in IN_FLIGHT:
@@ -4778,6 +6049,25 @@ class CDPAWorker:
                 "error": validation_error,
             }
         )
+        if self._execution_budget_exhausted(state):
+            hop["budget_continuation"] = {
+                "kind": "report_repair",
+                "source_role": role,
+                "target_role": role,
+                "handoff": "report repair",
+                "turn": int(hop["turn"]),
+                "repair_attempt": attempt,
+                "validation_error": validation_error,
+                "locked_route": decision.route,
+                "locked_handoff": decision.handoff,
+            }
+            self._block(
+                state,
+                "Autonomous execution budget exhausted before report repair; explicit operator Resume is required.",
+                code=_AUTONOMOUS_EXECUTION_BUDGET_BLOCK_CODE,
+                retryable=False,
+            )
+            return
         repair = self._append_hop(
             state,
             source_role=role,
@@ -4828,7 +6118,24 @@ class CDPAWorker:
                 "error": validation_error,
             }
         )
-        self._append_hop(
+        if self._execution_budget_exhausted(state):
+            hop["budget_continuation"] = {
+                "kind": "route_repair",
+                "source_role": role,
+                "target_role": role,
+                "handoff": "route repair",
+                "turn": int(hop["turn"]),
+                "repair_attempt": attempt,
+                "validation_error": validation_error,
+            }
+            self._block(
+                state,
+                "Autonomous execution budget exhausted before route repair; explicit operator Resume is required.",
+                code=_AUTONOMOUS_EXECUTION_BUDGET_BLOCK_CODE,
+                retryable=False,
+            )
+            return
+        repair = self._append_hop(
             state,
             source_role=role,
             target_role=role,
@@ -4838,96 +6145,6 @@ class CDPAWorker:
             repair_attempt=attempt,
             validation_error=validation_error,
         )
-
-    @staticmethod
-    def _self_route_reset_hop_id(state: Mapping[str, Any]) -> int:
-        boundary = 1
-        for revision in state.get("goal_revisions") or ():
-            if not isinstance(revision, Mapping):
-                continue
-            applies_from = revision.get("applies_from_hop_id")
-            if isinstance(applies_from, int) and not isinstance(applies_from, bool):
-                boundary = max(boundary, applies_from)
-        for control in state.get("controls") or ():
-            if not isinstance(control, Mapping) or control.get("action") != "resume":
-                continue
-            origin = str(control.get("origin") or "operator").strip().lower()
-            if origin != "operator":
-                continue
-            result = control.get("result")
-            if not isinstance(result, Mapping):
-                continue
-            before = result.get("before")
-            after = result.get("after")
-            outcome = str(result.get("outcome") or "").strip().lower()
-            status = str(control.get("status") or "").strip().lower()
-            if (
-                isinstance(before, Mapping)
-                and str(before.get("status") or "").upper() == "PAUSED"
-                and status == "applied"
-                and outcome in {"continued", "applied"}
-            ):
-                hop_id = before.get("active_hop_id")
-                if isinstance(hop_id, int) and not isinstance(hop_id, bool):
-                    boundary = max(boundary, hop_id)
-            if (
-                isinstance(before, Mapping)
-                and str(before.get("block_code") or "")
-                == _CONSECUTIVE_SELF_ROUTE_BLOCK_CODE
-                and status == "applied"
-                and outcome == "continued"
-                and isinstance(after, Mapping)
-            ):
-                hop_id = after.get("active_hop_id")
-                if isinstance(hop_id, int) and not isinstance(hop_id, bool):
-                    boundary = max(boundary, hop_id)
-        return boundary
-
-    @classmethod
-    def _consecutive_self_route_streak(
-        cls, state: Mapping[str, Any]
-    ) -> tuple[str | None, int]:
-        boundary = cls._self_route_reset_hop_id(state)
-        hops = {
-            hop.get("hop_id"): hop
-            for hop in state.get("hops") or ()
-            if isinstance(hop, Mapping)
-        }
-        streak_role: str | None = None
-        streak = 0
-        for event in state.get("route_timeline") or ():
-            if not isinstance(event, Mapping) or event.get("kind"):
-                continue
-            hop_id = event.get("hop_id")
-            if (
-                isinstance(hop_id, bool)
-                or not isinstance(hop_id, int)
-                or hop_id < boundary
-            ):
-                continue
-            source_hop = hops.get(hop_id)
-            if not isinstance(source_hop, Mapping) or str(source_hop.get("kind") or "") not in {
-                "task",
-                "handoff",
-                "report_repair",
-            }:
-                continue
-            source_role = str(event.get("source_role") or "").strip().upper()
-            route = str(event.get("route") or "").strip().upper()
-            if not source_role or not route:
-                continue
-            if route == "DONE":
-                return None, 0
-            if source_role != route:
-                streak_role = None
-                streak = 0
-                continue
-            if streak_role == source_role:
-                streak += 1
-            else:
-                streak_role = source_role
-                streak = 1
-        return streak_role, streak
 
     def _responded(self, state: dict[str, Any], hop: dict[str, Any]) -> None:
         if is_independent_task(state):
@@ -4948,6 +6165,57 @@ class CDPAWorker:
             state["block_reason"] = None
             return
         role = str(hop["target_role"])
+        if str(state.get("workflow_mode") or "team").strip().lower() == "solo":
+            try:
+                decision = parse_route_response(
+                    str(hop.get("response") or ""),
+                    source_role=role,
+                    allowed_routes=("PAUSE", "DONE"),
+                    allow_non_plan_done=True,
+                )
+            except (RouteContractError, ValueError) as exc:
+                self._repair_route(state, hop, exc)
+                return
+            self._complete_request_response(hop)
+            hop.update(
+                {
+                    "route": decision.route,
+                    "routed_handoff": decision.handoff,
+                    "state": "routed",
+                }
+            )
+            hop["timestamps"]["routed_at"] = utc_now()
+            state.setdefault("route_timeline", []).append(
+                {
+                    "at": utc_now(),
+                    "hop_id": hop["hop_id"],
+                    "source_role": role,
+                    "route": decision.route,
+                    "handoff": decision.handoff,
+                }
+            )
+            state["roles"][role]["status"] = "idle"
+            state["block_code"] = None
+            state["block_retryable"] = False
+            state["block_reason"] = None
+            state["pause_reason"] = None
+            if decision.route == "DONE":
+                state["status"] = "DONE"
+                state["terminal_state"] = "DONE"
+                state["kanban_column"] = "DONE_STOPPED"
+                state["completed_at"] = utc_now()
+                state["last_role_activity_at"] = state["completed_at"]
+                state["active_role"] = None
+                state["active_hop_id"] = None
+                state["active_action"] = "done"
+                return
+            state["status"] = "PAUSED"
+            state["kanban_column"] = "PAUSED"
+            state["active_role"] = role
+            state["active_hop_id"] = hop["hop_id"]
+            state["active_action"] = "paused"
+            state["pause_reason"] = decision.handoff
+            return
         response_mode = _report_mode(state)
         legacy_inline = response_mode == "inline"
         decision = None
@@ -5112,19 +6380,14 @@ class CDPAWorker:
             state["active_hop_id"] = hop["hop_id"]
             state["active_action"] = "paused"
             return
-        streak_role, streak = self._consecutive_self_route_streak(state)
-        if (
-            str(decision.route).strip().upper() == role.strip().upper()
-            and streak_role == role.strip().upper()
-            and streak >= _CONSECUTIVE_SELF_ROUTE_LIMIT
-        ):
+        if self._execution_budget_exhausted(state):
             self._block(
                 state,
                 (
-                    f"Consecutive self-route limit reached for role {streak_role}: "
-                    f"streak {streak}; explicit operator Resume is required to continue."
+                    "Autonomous execution budget exhausted after preserving the valid report "
+                    "and route decision; explicit operator Resume is required before another execution."
                 ),
-                code=_CONSECUTIVE_SELF_ROUTE_BLOCK_CODE,
+                code=_AUTONOMOUS_EXECUTION_BUDGET_BLOCK_CODE,
                 retryable=False,
             )
             return
@@ -5255,6 +6518,7 @@ class CDPAWorker:
             if self._rate_limit_gate_active(state=state):
                 state["active_action"] = "rate_limit_cooldown"
                 return None
+            await self._acquire_endpoint_admission(state, role)
             acquired = await actions.reopen(state, role)
         await self._dismiss_known_rate_limit_on_existing(acquired)
         if expected_page_id and str(acquired.page_id) != expected_page_id:
@@ -5293,7 +6557,8 @@ class CDPAWorker:
             for key in ("timeout_refreshed", "timeout_status_checked", "timeout_status"):
                 wait.pop(key, None)
         role = str(hop["target_role"])
-        acquired = await self._owned_or_block(state, role, actions)
+        admitted: list[bool] = []
+        acquired = await self._owned_or_block(state, role, actions, admitted=admitted)
         if state.get("active_hop_id") != hop.get("hop_id") and state.get("status") != "BLOCKED":
             self._finish_resume_control(
                 state, control, outcome="continued", action="recover_execution",
@@ -5307,6 +6572,17 @@ class CDPAWorker:
                 reason_code=str(state.get("block_code") or "role_offline"),
                 reason=str(state.get("block_reason") or "Saved conversation is unavailable."),
                 next_safe_action="Restore the saved conversation, then Resume.",
+            )
+            return
+        if admitted:
+            self._finish_resume_control(
+                state,
+                control,
+                outcome="continued",
+                action="reopen_saved_tab",
+                reason_code=None,
+                reason="The exact saved role tab was reopened and durably rebound before observation.",
+                postcondition="tab_reopened",
             )
             return
         decision = await self.role_controller.run(self, state, hop, acquired, actions, wait_ms=0)
@@ -5503,6 +6779,144 @@ class CDPAWorker:
                 return False
         return True
 
+    async def _restart_pristine_resume_role(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        control: dict[str, Any],
+        actions: CDPATabActions,
+        *,
+        reason: str,
+    ) -> None:
+        """Last safe Resume fallback before Send: replace the role context, not the request."""
+        role = str(hop["target_role"])
+        if state.get("attachments"):
+            self._require_resume_recovery(
+                state,
+                control,
+                action="restart_role_fallback",
+                reason_code="preboundary_context_unrecoverable",
+                reason="The pristine pre-Send role owns attachments and cannot be replaced safely.",
+                next_safe_action="Restore the exact attachment-owning page before Resume.",
+            )
+            return
+        await self._acquire_endpoint_admission(state, role)
+        try:
+            acquired = await actions.restart(
+                state,
+                role,
+                known_automated_draft=str(hop.get("prompt") or "") or None,
+            )
+        except RateLimitBlockedError as exc:
+            await self._enter_rate_limit_cooldown(state, actions, exc)
+            self._apply_rate_limit_to_state(state, hop)
+            self._finish_resume_control(
+                state,
+                control,
+                outcome="continued",
+                action="defer_tab_open",
+                reason_code=None,
+                reason="Role restart is paused for the request-rate-limit cooldown.",
+                postcondition="tab_open_deferred",
+            )
+            return
+        except (ComposerConflictError, ManualInputPendingError) as exc:
+            self._require_resume_recovery(
+                state,
+                control,
+                action="restart_role_fallback",
+                reason_code="manual_composer_conflict",
+                reason=sanitize_exception(exc),
+                next_safe_action="Resolve the manual composer or attachments before Resume.",
+            )
+            return
+        except Exception as exc:
+            new_chat = getattr(actions, "new_chat", None)
+            if not callable(new_chat):
+                self._require_resume_recovery(
+                    state,
+                    control,
+                    action="restart_role_fallback",
+                    reason_code="preboundary_context_unrecoverable",
+                    reason=sanitize_exception(exc),
+                    next_safe_action="Restore the role context or create a new role chat, then Resume.",
+                )
+                return
+            try:
+                acquired = await new_chat(state, role)
+            except (ComposerConflictError, ManualInputPendingError) as nested:
+                self._require_resume_recovery(
+                    state,
+                    control,
+                    action="new_chat_fallback",
+                    reason_code="manual_composer_conflict",
+                    reason=sanitize_exception(nested),
+                    next_safe_action="Resolve the manual composer or attachments before Resume.",
+                )
+                return
+            except Exception as nested:
+                self._require_resume_recovery(
+                    state,
+                    control,
+                    action="new_chat_fallback",
+                    reason_code="preboundary_context_unrecoverable",
+                    reason=sanitize_exception(nested),
+                    next_safe_action="Restore a usable role context, then Resume.",
+                )
+                return
+
+        request_id = str(hop.get("request_id") or "").strip()
+        ledger_path = str(hop.get("ledger_path") or "").strip()
+        if request_id and ledger_path:
+            ledger = RequestLedger(ledger_path)
+            record = ledger.peek(request_id)
+            if record is not None:
+                if record.status not in {RequestStatus.NEW, RequestStatus.PROMPT_SET} or record.attempts != 0:
+                    raise RuntimeError("Resume restart fallback requires a pristine pre-Send request")
+                ledger.update(
+                    request_id,
+                    status=RequestStatus.FAILED_FINAL,
+                    error="abandoned before Send by Resume role restart",
+                )
+
+        self._record_acquired(state, role, acquired)
+        state["roles"][role]["constructor_sent_generation"] = None
+        old_hop_id = int(hop["hop_id"])
+        hop["state"] = "abandoned"
+        hop["abandon_reason"] = sanitize_text(reason, max_chars=1200)
+        hop.setdefault("timestamps", {})["abandoned_at"] = utc_now()
+        child = self._append_hop(
+            state,
+            source_role=role,
+            target_role=role,
+            handoff=str(hop.get("handoff") or "Resume role restart"),
+            kind="role_restart",
+        )
+        state["block_code"] = None
+        state["block_retryable"] = False
+        state["block_reason"] = None
+        state["pause_reason"] = None
+        state.setdefault("route_timeline", []).append(
+            {
+                "at": utc_now(),
+                "hop_id": old_hop_id,
+                "source_role": role,
+                "route": role,
+                "kind": "resume_role_restart",
+                "new_hop_id": child["hop_id"],
+                "reason": sanitize_text(reason, max_chars=1200),
+            }
+        )
+        self._finish_resume_control(
+            state,
+            control,
+            outcome="continued",
+            action="restart_role_fallback",
+            reason_code=None,
+            reason="Resume exhausted equivalent pre-Send recovery and restarted the role safely.",
+            postcondition="child_hop_appended",
+        )
+
     async def _recover_pristine_preboundary_sending(
         self,
         state: dict[str, Any],
@@ -5518,6 +6932,12 @@ class CDPAWorker:
         postcondition = "ownership_confirmed_before_send"
         explicit_fresh = state.get("context_policy") == "fresh"
         temporary_recovery = state.get("conversation_mode") == "temporary"
+        if (
+            temporary_recovery
+            and hop.get("rebuild_prompt_after_relocation") is True
+            and not role_record.get("temporary_document_id")
+        ):
+            acquired = None
         proven_operator_fresh = False
         if acquired is None:
             if state.get("attachments"):
@@ -5538,15 +6958,14 @@ class CDPAWorker:
                 proven_operator_fresh = True
             elif exact_donor:
                 try:
-                    donor = normalize_bootstrap_donor(role_record.get("bootstrap_source_donor"))
+                    donor_candidates = [normalize_bootstrap_donor(role_record.get("bootstrap_source_donor"))]
                 except Exception:
-                    self._require_resume_recovery(
+                    await self._restart_pristine_resume_role(
                         state,
+                        hop,
                         control,
-                        action="none",
-                        reason_code="preboundary_context_unrecoverable",
+                        actions,
                         reason="The recorded bootstrap donor for the lost pre-boundary role is invalid.",
-                        next_safe_action="Restore the exact recorded bootstrap donor before Resume.",
                     )
                     return
             else:
@@ -5558,13 +6977,12 @@ class CDPAWorker:
                     or role_record.get("bootstrap_source_donor") is not None
                     or (generation != 0 and not proven_operator_fresh)
                 ):
-                    self._require_resume_recovery(
+                    await self._restart_pristine_resume_role(
                         state,
+                        hop,
                         control,
-                        action="none",
-                        reason_code="preboundary_context_unrecoverable",
-                        reason="The lost pristine pre-boundary role is not the legacy donorless generation-zero case.",
-                        next_safe_action="Restore the exact recorded pre-send context before Resume.",
+                        actions,
+                        reason="The lost pristine pre-boundary role cannot prove an equivalent reusable context.",
                     )
                     return
                 if not proven_operator_fresh:
@@ -5577,22 +6995,20 @@ class CDPAWorker:
                             if current_default_id is not None
                             else None
                         )
-                    candidates = (
+                    donor_candidates = (
                         self._bootstrap_donor_candidates(state, bootstrap)
                         if bootstrap is not None
                         else []
                     )
-                    if not candidates:
-                        self._require_resume_recovery(
+                    if not donor_candidates:
+                        await self._restart_pristine_resume_role(
                             state,
+                            hop,
                             control,
-                            action="none",
-                            reason_code="preboundary_context_unrecoverable",
+                            actions,
                             reason="The lost pristine pre-boundary role has no current bootstrap donor available.",
-                            next_safe_action="Restore an enabled bootstrap donor before Resume.",
                         )
                         return
-                    donor = candidates[0]
                     # The recorded donor is validated only when the browser performs
                     # the bounded branch/reacquire operation below. Resume must not
                     # fetch a full conversation graph as a preflight.
@@ -5608,6 +7024,7 @@ class CDPAWorker:
                     postcondition="tab_open_deferred",
                 )
                 return
+            await self._acquire_endpoint_admission(state, role)
             if proven_operator_fresh:
                 try:
                     if explicit_fresh or temporary_recovery:
@@ -5662,60 +7079,52 @@ class CDPAWorker:
                     )
                     return
             if not proven_operator_fresh:
-                try:
-                    acquired = await actions.branch_from_anchor(
+                branch_errors: list[str] = []
+                acquired = None
+                for donor in donor_candidates:
+                    try:
+                        acquired = await actions.branch_from_anchor(
+                            state,
+                            role,
+                            source_conversation_id=donor["conversation_id"],
+                            assistant_message_id=donor["assistant_message_id"],
+                        )
+                        break
+                    except RateLimitBlockedError as exc:
+                        await self._enter_rate_limit_cooldown(state, actions, exc)
+                        self._apply_rate_limit_to_state(state, hop)
+                        self._finish_resume_control(
+                            state,
+                            control,
+                            outcome="continued",
+                            action="defer_tab_open",
+                            reason_code=None,
+                            reason="New tab creation is paused for the request-rate-limit cooldown.",
+                            postcondition="tab_open_deferred",
+                        )
+                        return
+                    except (ComposerConflictError, ManualInputPendingError) as exc:
+                        self._require_resume_recovery(
+                            state,
+                            control,
+                            action="reacquire_preboundary_role",
+                            reason_code="manual_composer_conflict",
+                            reason=sanitize_exception(exc),
+                            next_safe_action="Resolve the manual composer or attachments before Resume.",
+                        )
+                        return
+                    except (BranchTargetUnresolvedError, BranchBootstrapError) as exc:
+                        branch_errors.append(sanitize_exception(exc))
+                        continue
+                if acquired is None:
+                    await self._restart_pristine_resume_role(
                         state,
-                        role,
-                        source_conversation_id=donor["conversation_id"],
-                        assistant_message_id=donor["assistant_message_id"],
-                    )
-                except RateLimitBlockedError as exc:
-                    await self._enter_rate_limit_cooldown(state, actions, exc)
-                    self._apply_rate_limit_to_state(state, hop)
-                    self._finish_resume_control(
-                        state,
+                        hop,
                         control,
-                        outcome="continued",
-                        action="defer_tab_open",
-                        reason_code=None,
-                        reason="New tab creation is paused for the request-rate-limit cooldown.",
-                        postcondition="tab_open_deferred",
-                    )
-                    return
-                except (ComposerConflictError, ManualInputPendingError) as exc:
-                    self._require_resume_recovery(
-                        state,
-                        control,
-                        action="reacquire_preboundary_role",
-                        reason_code="manual_composer_conflict",
-                        reason=sanitize_exception(exc),
-                        next_safe_action="Resolve the manual composer or attachments before Resume.",
-                    )
-                    return
-                except BranchTargetUnresolvedError as exc:
-                    self._require_resume_recovery(
-                        state,
-                        control,
-                        action="reacquire_preboundary_role",
-                        reason_code="branch_target_unresolved",
-                        reason=sanitize_exception(exc),
-                        next_safe_action=(
-                            "Inspect the provisional bootstrap branch target; "
-                            "do not fan out or retry this Resume automatically."
-                        ),
-                    )
-                    return
-                except BranchBootstrapError as exc:
-                    self._require_resume_recovery(
-                        state,
-                        control,
-                        action="reacquire_preboundary_role",
-                        reason_code="preboundary_context_unrecoverable",
-                        reason=sanitize_exception(exc),
-                        next_safe_action=(
-                            "Restore the exact recorded bootstrap donor before Resume."
-                            if exact_donor
-                            else "Restore the current bootstrap donor before Resume."
+                        actions,
+                        reason=(
+                            "All safe bootstrap donor recovery attempts failed: "
+                            + "; ".join(branch_errors[-3:])
                         ),
                     )
                     return
@@ -5734,6 +7143,10 @@ class CDPAWorker:
         )
         if int(role_record.get("conversation_generation") or 0) != generation:
             raise RuntimeError("pre-boundary role replacement changed conversation generation")
+        if temporary_recovery and (acquired.created or acquired.new_chat):
+            role_record["temporary_document_id"] = await self._temporary_document_token(
+                acquired.client, create=True
+            )
         hop["conversation_url"] = acquired.url
         state["status"] = "RUNNING"
         state["kanban_column"] = _column_for(role)
@@ -5759,6 +7172,8 @@ class CDPAWorker:
         actions: CDPATabActions,
         ledger: RequestLedger,
         record: Any,
+        *,
+        persist_admission: Callable[[], None] | None = None,
     ) -> None:
         if record.files:
             self._require_resume_recovery(
@@ -5799,6 +7214,7 @@ class CDPAWorker:
                 postcondition="tab_open_deferred",
             )
             return
+        await self._acquire_endpoint_admission(state, role)
         try:
             acquired = await actions.branch_from_anchor(
                 state,
@@ -5859,6 +7275,10 @@ class CDPAWorker:
             session_id_before=getattr(snapshot, "session_id", None),
             error=_SENDING_CONTINUATION_STARTED,
         )
+        if persist_admission is not None:
+            persist_admission()
+        else:
+            self._release_endpoint_admission()
         self._arm_passive_request_observer(state, hop, acquired.client)
         try:
             receipt = await self._run_automated_send(
@@ -6103,11 +7523,13 @@ class CDPAWorker:
         hop: dict[str, Any],
         control: dict[str, Any],
         actions: CDPATabActions,
+        *,
+        persist_admission: Callable[[], None] | None = None,
     ) -> None:
         ledger = RequestLedger(str(hop.get("ledger_path") or ""))
         ledger_exists = ledger.path.exists()
         record = ledger.get(str(hop.get("request_id") or "")) if ledger_exists else None
-        if record is None and ledger_exists:
+        if record is None:
             await self._recover_pristine_preboundary_sending(
                 state, hop, control, actions
             )
@@ -6331,7 +7753,13 @@ class CDPAWorker:
                 for prefix in _PROVEN_ATOMIC_NONACCEPTANCE_ERRORS
             ):
                 await self._recover_lost_sending_nonacceptance(
-                    state, hop, control, actions, ledger, record
+                    state,
+                    hop,
+                    control,
+                    actions,
+                    ledger,
+                    record,
+                    persist_admission=persist_admission,
                 )
                 return
             if self._endpoint_pool is not None:
@@ -6410,6 +7838,23 @@ class CDPAWorker:
                 reason_code=None,
                 reason="The transcript proves that the durable SENDING request was already accepted.",
                 postcondition="generation_progress",
+            )
+            return
+
+        if str(record.error or "").startswith(_SENDING_CONTINUATION_STARTED):
+            self._require_resume_recovery(
+                state,
+                control,
+                action="none",
+                reason_code="sending_provenance_ambiguous",
+                reason=(
+                    "The bounded continuation was durably marked started, but no positive "
+                    "acceptance provenance is available; automatic Send replay is unsafe."
+                ),
+                next_safe_action=(
+                    "Preserve the exact page/request and restore positive acceptance provenance; "
+                    "do not Send again."
+                ),
             )
             return
 
@@ -6552,11 +7997,16 @@ class CDPAWorker:
         state: dict[str, Any],
         control: dict[str, Any],
         actions: CDPATabActions,
+        *,
+        persist_admission: Callable[[], None] | None = None,
     ) -> None:
         hop = _active_hop(state)
         hop_state = str(hop.get("state") or "")
         try:
             if hop_state == "pre_send":
+                await self._acquire_endpoint_admission(
+                    state, str(hop["target_role"])
+                )
                 before_hop = command_snapshot(state, role=str(hop["target_role"]))
                 await self._pre_send(state, hop, actions)
                 after_hop = command_snapshot(state, role=str(hop["target_role"]))
@@ -6584,7 +8034,13 @@ class CDPAWorker:
                 )
                 return
             if hop_state == "sending":
-                await self._recover_resume_sending(state, hop, control, actions)
+                await self._recover_resume_sending(
+                    state,
+                    hop,
+                    control,
+                    actions,
+                    persist_admission=persist_admission,
+                )
                 return
             if hop_state == "sent":
                 self._start_wait_budget_from_sent(hop)
@@ -6595,6 +8051,46 @@ class CDPAWorker:
                 return
             if hop_state == "waiting":
                 await self._recover_resume_waiting(state, hop, control, actions)
+                return
+            if (
+                hop_state == "routed"
+                and str(state.get("workflow_mode") or "team").strip().lower()
+                == "solo"
+                and str(hop.get("route") or "").strip().upper() == "PAUSE"
+            ):
+                role = str(hop["target_role"]).strip().upper()
+                handoff = str(
+                    hop.get("routed_handoff")
+                    or state.get("pause_reason")
+                    or "Continue from the current state."
+                ).strip()
+                child = self._append_hop(
+                    state,
+                    source_role=role,
+                    target_role=role,
+                    handoff=handoff,
+                    kind="solo_resume",
+                )
+                durable_url = str(
+                    hop.get("conversation_url")
+                    or state["roles"][role].get("page_url")
+                    or ""
+                ).strip()
+                if durable_url:
+                    child["conversation_url"] = durable_url
+                state["status"] = "RUNNING"
+                state["kanban_column"] = _column_for(role)
+                state["pause_reason"] = None
+                state["active_action"] = "queued"
+                self._finish_resume_control(
+                    state,
+                    control,
+                    outcome="continued",
+                    action="resume_solo_role",
+                    reason_code=None,
+                    reason="Solo PAUSE resumed on the same role and durable conversation.",
+                    postcondition="child_hop_appended",
+                )
                 return
             if hop_state == "responded":
                 old_hop_id = state.get("active_hop_id")
@@ -6788,6 +8284,10 @@ class CDPAWorker:
                     )
                     state.clear()
                     state.update(saved)
+                    await self._release_blocked_workflow_tabs(
+                        saved,
+                        CDPATabActions(browser_context, self.config),
+                    )
                     return saved
                 requested_control = any(
                     isinstance(item, Mapping) and item.get("status") == "requested"
@@ -6820,10 +8320,45 @@ class CDPAWorker:
                         if state.get("status") != "BLOCKED":
                             self._block(state, "No safe execution relocation path: reconcile request and page-owned effects.",
                                         code="execution_recovery_requires_reconciliation", retryable=True)
-                        return self._persist_transport_result(path, transport_baseline, state)
+                        saved = self._persist_transport_result(path, transport_baseline, state)
+                        await self._release_blocked_workflow_tabs(
+                            saved,
+                            CDPATabActions(browser_context, self.config),
+                        )
+                        return saved
+                if endpoint_id is not None and state != transport_baseline:
+                    saved_endpoint_state = self._persist_transport_result(
+                        path, transport_baseline, state
+                    )
+                    transport_baseline = saved_endpoint_state
+                    state = json.loads(
+                        json.dumps(saved_endpoint_state, ensure_ascii=False, default=str)
+                    )
                 actions = CDPATabActions(browser_context, self.config)
+                if state.get("status") == "BLOCKED":
+                    await self._release_blocked_workflow_tabs(state, actions)
                 if state.get("cleanup", {}).get("state") == "CLEARING":
-                    await self._continue_cleanup(state, actions, path)
+                    requested_clear = next(
+                        (
+                            item
+                            for item in state.get("controls") or []
+                            if isinstance(item, Mapping)
+                            and item.get("status") == "requested"
+                            and item.get("action") == "clear_team"
+                        ),
+                        None,
+                    )
+                    if requested_clear is not None:
+                        persisted_control: list[bool] = []
+                        await self._apply_control(
+                            state,
+                            actions,
+                            path,
+                            scheduling_tasks=scheduling_tasks,
+                            persisted_result=persisted_control,
+                        )
+                    else:
+                        await self._continue_cleanup(state, actions, path)
                     saved = self.store.load(path)
                     self._sync_control_commands(saved)
                     return saved
@@ -6845,6 +8380,20 @@ class CDPAWorker:
                 resumed_control = None
                 resume_baseline: dict[str, Any] | None = None
                 persisted_control: list[bool] = []
+                if pending_action in {"open_tab", "restart_role", "new_chat"}:
+                    control_role = str(
+                        (pending_control or {}).get("role")
+                        or state.get("active_role")
+                        or "PLAN"
+                    ).upper()
+                    control_endpoint_id = (
+                        self._execution_endpoint_id(state, control_role) or endpoint_id
+                    )
+                    await self._acquire_endpoint_admission(
+                        state,
+                        control_role,
+                        endpoint_id=control_endpoint_id,
+                    )
                 if await self._apply_control(
                     state,
                     actions,
@@ -6891,6 +8440,7 @@ class CDPAWorker:
                     )
                     if (
                         not state.get("cleanup", {}).get("cleared_at")
+                        and self._cleanup_retry_due(state.get("cleanup", {}))
                         and cleanup_eligible(
                             state,
                             idle_seconds=self.config.cleanup_terminal_idle_seconds,
@@ -6922,7 +8472,26 @@ class CDPAWorker:
                     return state
                 if resumed_control is not None:
                     assert resume_baseline is not None
-                    await self._recover_resume_control(state, resumed_control, actions)
+
+                    def persist_resume_admission() -> None:
+                        nonlocal resume_baseline
+                        assert resume_baseline is not None
+                        persisted = self._persist_control_result(
+                            path,
+                            resume_baseline,
+                            state,
+                            control_id=int(resumed_control["control_id"]),
+                            action="resume",
+                        )
+                        resume_baseline = persisted
+                        self._release_endpoint_admission()
+
+                    await self._recover_resume_control(
+                        state,
+                        resumed_control,
+                        actions,
+                        persist_admission=persist_resume_admission,
+                    )
                     saved = self._persist_control_result(
                         path,
                         resume_baseline,
@@ -6940,6 +8509,9 @@ class CDPAWorker:
                 completed_hop_id: int | None = None
                 try:
                     if hop["state"] == "pre_send":
+                        await self._acquire_endpoint_admission(
+                            state, str(hop["target_role"])
+                        )
                         await self._pre_send(state, hop, actions)
                     elif hop["state"] == "sending":
                         await self._sending(state, hop, actions)
@@ -7012,6 +8584,7 @@ class CDPAWorker:
                 saved = self._persist_transport_result(path, transport_baseline, state)
                 state.clear()
                 state.update(saved)
+                await self._release_blocked_workflow_tabs(saved, actions)
                 if completed_hop_id is not None:
                     self._schedule_repository_project(saved, completed_hop_id, browser_context)
                 return saved
@@ -7062,9 +8635,15 @@ class CDPAWorker:
                 )
                 state.clear()
                 state.update(saved)
+                await self._release_blocked_workflow_tabs(
+                    saved,
+                    CDPATabActions(browser_context, self.config),
+                )
                 return saved
             except Exception:
                 raise
+        finally:
+            self._release_endpoint_admission()
 
     def _activate_independent_agent_command(
         self,
@@ -7579,6 +9158,7 @@ class CDPAWorker:
                     "tags": independent_tags(independent.get("trigger_settings")),
                     "max_cycles": int(independent.get("max_cycles") or 0),
                     "cycle": int(independent.get("cycle") or 0),
+                    "browser_endpoint_id": independent.get("browser_endpoint_id"),
                     "tab_open": bool(
                         isinstance((state.get("roles") or {}).get(INDEPENDENT_ROLE), Mapping)
                         and (state.get("roles") or {})[INDEPENDENT_ROLE].get("online")
@@ -7632,11 +9212,24 @@ class CDPAWorker:
         if not force and now - self._last_heartbeat_at < self.config.heartbeat_seconds:
             return
         self._last_heartbeat_at = now
+        source_drift = self._refresh_source_drift()
         self.runtime_db.put_snapshot(
             "worker",
             {
                 "pid": os.getpid(),
                 "heartbeat_at": utc_now(),
+                "started_at": self._worker_started_at,
+                "lease": {
+                    "acquired": self._worker_lease_acquired_at is not None,
+                    "acquired_at": self._worker_lease_acquired_at,
+                    "owner_pid": os.getpid() if self._worker_lease_acquired_at else None,
+                },
+                "source_identity": {
+                    "fingerprint": self._source_identity.get("fingerprint"),
+                    "captured_at": self._source_identity.get("captured_at"),
+                },
+                "source_drift": source_drift,
+                "reload_required": bool(source_drift.get("drifted")),
                 "degraded": self.runtime_degraded,
                 "task_count": len(self.registry.tasks_by_id) if self.registry else 0,
                 "browser_connected": self._browser_connected,
@@ -7849,7 +9442,37 @@ class CDPAWorker:
         return any(
             str(item.get("endpoint_id") or "") == endpoint_id
             for item in self._running_executions()
-        )
+        ) or self._browser_endpoint_has_unresolved_execution(endpoint_id)
+
+    def _browser_endpoint_has_unresolved_execution(self, endpoint_id: str) -> bool:
+        """Protect draining endpoints from durable execution evidence, not UI cache state."""
+        if self.registry is None:
+            return False
+        for state in self.registry.tasks_by_id.values():
+            try:
+                hop = _active_hop(state)
+            except RuntimeError:
+                continue
+            hop_state = str(hop.get("state") or "")
+            if hop_state not in {"sending", "sent", "waiting", "responded"}:
+                continue
+            referenced_endpoint = str(hop.get("browser_endpoint_id") or "").strip() or self._execution_endpoint_id(state)
+            if referenced_endpoint != endpoint_id:
+                continue
+            ledger_path = str(hop.get("ledger_path") or "").strip()
+            request_id = str(hop.get("request_id") or "").strip()
+            record = None
+            if ledger_path and request_id:
+                try:
+                    record = RequestLedger(ledger_path).peek(request_id)
+                except Exception:
+                    return True
+            if hop_state == "sending" and self._is_pristine_preboundary_sending_record(state, hop, record):
+                continue
+            if record is not None and record.status in {RequestStatus.COMPLETED, RequestStatus.FAILED_FINAL}:
+                continue
+            return True
+        return False
 
     def _finalize_drained_endpoints(self) -> list[str]:
         finalized: list[str] = []
@@ -8126,8 +9749,14 @@ class CDPAWorker:
                         upload_paths=tuple(payload.get("upload_paths") or ()),
                         bootstrap=bootstrap,
                         browser_endpoint_id=payload.get("browser_endpoint_id") or None,
+                        required_browser_endpoint_id=(
+                            payload.get("required_browser_endpoint_id") or None
+                        ),
                         conversation_mode=payload.get("conversation_mode") or None,
                         context_policy=payload.get("context_policy") or None,
+                        workflow_mode=str(payload.get("workflow_mode") or "team"),
+                        goal=payload.get("goal"),
+                        conversation_url=payload.get("conversation_url") or None,
                         external_command_id=command_id,
                     )
                 self._publish_command_state(state)
@@ -8180,6 +9809,7 @@ class CDPAWorker:
                     temporary_chat=(
                         payload["temporary_chat"] if "temporary_chat" in payload else None
                     ),
+                    browser_endpoint_id=payload.get("browser_endpoint_id") or None,
                     external_command_id=command_id,
                 )
                 self._publish_command_state(state)
@@ -8272,6 +9902,11 @@ class CDPAWorker:
                         if payload.get("instruction") is not None
                         else None
                     ),
+                    required_browser_endpoint_id=(
+                        str(payload.get("required_browser_endpoint_id"))
+                        if payload.get("required_browser_endpoint_id") is not None
+                        else None
+                    ),
                     external_command_id=command_id,
                 )
                 self._publish_command_state(state)
@@ -8358,27 +9993,31 @@ class CDPAWorker:
                 current = self._command_task_state(task_id)
                 if current is None:
                     raise ValueError(f"task does not exist: {task_id}")
-                state = self.store.update_independent_agent(
-                    current["manifest_path"],
-                    enabled=payload.get("enabled") if "enabled" in payload else None,
-                    display_name=payload.get("display_name"),
-                    system_prompt=payload.get("system_prompt"),
-                    trigger_settings=(
+                settings_kwargs = {
+                    "enabled": payload.get("enabled") if "enabled" in payload else None,
+                    "display_name": payload.get("display_name"),
+                    "system_prompt": payload.get("system_prompt"),
+                    "trigger_settings": (
                         payload.get("trigger_settings")
                         if "trigger_settings" in payload
                         else None
                     ),
-                    max_cycles=(
+                    "max_cycles": (
                         int(payload["max_cycles"])
                         if "max_cycles" in payload
                         else None
                     ),
-                    new_chat_next_job=(
+                    "new_chat_next_job": (
                         payload.get("new_chat_next_job")
                         if "new_chat_next_job" in payload
                         else None
                     ),
-                    external_command_id=command_id,
+                    "external_command_id": command_id,
+                }
+                if "browser_endpoint_id" in payload:
+                    settings_kwargs["browser_endpoint_id"] = payload.get("browser_endpoint_id")
+                state = self.store.update_independent_agent(
+                    current["manifest_path"], **settings_kwargs
                 )
                 self._publish_command_state(state)
                 result = {"task_id": state["task_id"], "status": state["status"]}
@@ -8555,6 +10194,7 @@ class CDPAWorker:
                     waiting_order=waiting_order,
                     browser_pages=normalized.get("pages", ()),
                     browser_connected=normalized.get("connected"),
+                    endpoint_connected=normalized.get("endpoint_connected"),
                     repository_allowed_roots=self.config.repository_allowed_roots,
                 )
                 for task in tasks
@@ -8601,9 +10241,23 @@ class CDPAWorker:
             endpoint_id = str(item.get("endpoint_id") or "")
             inventory = by_id.get(endpoint_id)
             endpoint_pages = list((inventory or {}).get("pages") or ())
+            observed_page_ids = {
+                str(page.get("page_id") or "").strip()
+                for page in endpoint_pages
+                if isinstance(page, Mapping) and str(page.get("page_id") or "").strip()
+            }
+            running_executions = [
+                execution
+                for execution in item.get("running_executions") or ()
+                if isinstance(execution, Mapping)
+                and str(execution.get("page_id") or "").strip() in observed_page_ids
+            ]
             item["connected"] = inventory is not None
             item["page_count"] = len(endpoint_pages)
             item["pages"] = endpoint_pages
+            item["running_executions"] = running_executions
+            item["active_count"] = len(running_executions)
+            item["available_slots"] = max(0, int(item.get("capacity") or 0) - len(running_executions))
             if item.get("management_mode") == "managed-local":
                 item.update(self.managed_browsers.process_state(endpoint_id))
             else:
@@ -8621,6 +10275,11 @@ class CDPAWorker:
             "pages": pages,
             "default_endpoint_id": runtime_snapshot.get("default_endpoint_id"),
             "endpoints": endpoints,
+            "endpoint_connected": {
+                str(item.get("endpoint_id") or ""): bool(item.get("connected"))
+                for item in endpoints
+                if str(item.get("endpoint_id") or "")
+            },
         }
         self._last_browser_inventory_at = time.time()
         self._last_browser_page_count = len(pages)
@@ -8676,6 +10335,7 @@ class CDPAWorker:
                 waiting_order=waiting_order,
                 browser_pages=(self._browser_projection or {}).get("pages", ()),
                 browser_connected=(self._browser_projection or {}).get("connected"),
+                endpoint_connected=(self._browser_projection or {}).get("endpoint_connected"),
                 repository_allowed_roots=self.config.repository_allowed_roots,
             )
             for task_id in sorted(projection_ids)
@@ -8761,10 +10421,15 @@ class CDPAWorker:
             if not isinstance(binding, Mapping):
                 self._ambient_next_probe_at[key] = now + 5
                 continue
-            if self.registry is not None and binding.get("taskId"):
-                owner = self.registry.tasks_by_id.get(str(binding["taskId"]))
+            if self.registry is not None:
+                task_id = str(binding.get("taskId") or "").strip()
+                if not task_id:
+                    continue
+                owner = self.registry.tasks_by_id.get(task_id)
                 if not isinstance(owner, Mapping):
                     continue  # Another worker's or unrelated tab is never our automation surface.
+                if str(owner.get("status") or "").upper() in TERMINAL:
+                    continue
                 retired = False
                 for hop in owner.get("hops", []):
                     if not isinstance(hop, Mapping) or hop.get("state") != "abandoned":
@@ -8937,8 +10602,51 @@ class CDPAWorker:
                     selected_endpoint = endpoint_id
                     selected_context = browser_context
                     if endpoint_pool is not None:
-                        affinity = self._role_endpoint_affinity(state)
-                        if affinity is None and state.get("active_hop_id") == 1:
+                        independent = state.get("independent") if isinstance(state.get("independent"), Mapping) else None
+                        active_event = (
+                            independent.get("active_event")
+                            if independent is not None
+                            and isinstance(independent.get("active_event"), Mapping)
+                            else None
+                        )
+                        event_required_endpoint = (
+                            str(active_event.get("required_browser_endpoint_id") or "").strip() or None
+                            if active_event is not None
+                            else None
+                        )
+                        pinned_endpoint = (
+                            str(independent.get("browser_endpoint_id") or "").strip() or None
+                            if independent is not None
+                            else None
+                        )
+                        workflow_required_endpoint = (
+                            str(state.get("required_browser_endpoint_id") or "").strip() or None
+                            if independent is None
+                            else None
+                        )
+                        required_endpoint = (
+                            event_required_endpoint
+                            or pinned_endpoint
+                            or workflow_required_endpoint
+                        )
+                        previous_endpoint = self._execution_endpoint_id(state)
+                        current_hop = next((item for item in state.get("hops", []) if item.get("hop_id") == state.get("active_hop_id")), {})
+                        crossed = current_hop.get("state") in {"sent", "waiting", "responded"} or (
+                            current_hop.get("state") == "sending"
+                            and self._sending_hop_durable_boundary_state(current_hop) != "preboundary"
+                        )
+                        previous_page_observed = self._execution_page_observed(state, previous_endpoint)
+                        # Accepted/ambiguous Send ownership outranks a pre-execution hard
+                        # placement requirement. A missing page may recover on a peer only
+                        # when no explicit required-endpoint contract would conflict with
+                        # the already-accepted exact execution.
+                        previous_page_usable = previous_page_observed or (
+                            crossed and required_endpoint is not None
+                        )
+                        affinity = required_endpoint or self._role_endpoint_affinity(state)
+                        if required_endpoint is None and affinity is not None and not self._execution_page_observed(state, affinity):
+                            affinity = None
+                        if affinity is None and not crossed and state.get("active_hop_id") == 1:
                             affinity = str(state.get("browser_endpoint_id") or "") or None
                         running_others = [
                             item
@@ -8948,19 +10656,17 @@ class CDPAWorker:
                         selected_endpoint = endpoint_pool.select_endpoint(
                             running_others,
                             affinity_endpoint_id=affinity,
+                            hard_affinity=required_endpoint is not None,
                             cooldown_scopes=self._active_rate_limit_scopes(),
                             reservations=reservations,
+                            excluded_endpoint_ids=(previous_endpoint,) if crossed and not previous_page_usable and previous_endpoint else (),
                         )
-                        previous_endpoint = self._execution_endpoint_id(state)
-                        current_hop = next((item for item in state.get("hops", []) if item.get("hop_id") == state.get("active_hop_id")), {})
-                        crossed = current_hop.get("state") in {"sent", "waiting", "responded"} or (
-                            current_hop.get("state") == "sending"
-                            and self._sending_hop_durable_boundary_state(current_hop) != "preboundary"
-                        )
+                        if required_endpoint is not None and selected_endpoint != required_endpoint:
+                            selected_endpoint = None
                         protected = any(item.get("task_id") == task_id for item in durable_running)
                         previous_ready = next((item for item in endpoint_pool.snapshot()["endpoints"] if item["endpoint_id"] == previous_endpoint and item["chatgpt_ready"]), None)
-                        if previous_endpoint in contexts and previous_ready and (
-                            crossed or (protected and previous_ready["rate_limit_scope"] not in self._active_rate_limit_scopes())
+                        if previous_endpoint in contexts and previous_page_usable and (
+                            crossed or (previous_ready and protected and previous_ready["rate_limit_scope"] not in self._active_rate_limit_scopes())
                         ):
                             # Receiving/reconciling an existing request is not a new allocation.
                             selected_endpoint = previous_endpoint
@@ -9127,25 +10833,28 @@ class CDPAWorker:
 
 async def _run(config: CDPAConfig) -> None:
     worker = CDPAWorker(config)
-    worker.hydrate_runtime()
-    endpoint_pool = EndpointPool(
-        worker.store.endpoints,
-        retry_delay=max(1.0, min(15.0, config.worker_poll_seconds * 2)),
-    )
-    worker._endpoint_pool = endpoint_pool
-    command_task = asyncio.create_task(worker.run_command_loop())
-    heartbeat_task = asyncio.create_task(worker._heartbeat_loop())
-    try:
-        await worker.run_pool_forever(endpoint_pool)
-    finally:
-        command_task.cancel()
-        heartbeat_task.cancel()
-        await asyncio.gather(command_task, heartbeat_task, return_exceptions=True)
-        for task in tuple(worker._browser_command_tasks):
-            task.cancel()
-        await asyncio.gather(*worker._browser_command_tasks, return_exceptions=True)
-        await endpoint_pool.close()
-        worker.runtime_db.close()
+    lease_path = (config.repository_root / ".runtime" / "worker-scheduler.lock").resolve()
+    with exclusive_file_lock(lease_path, blocking=True, poll_seconds=0.1):
+        worker._worker_lease_acquired_at = utc_now()
+        worker.hydrate_runtime()
+        endpoint_pool = EndpointPool(
+            worker.store.endpoints,
+            retry_delay=max(1.0, min(15.0, config.worker_poll_seconds * 2)),
+        )
+        worker._endpoint_pool = endpoint_pool
+        command_task = asyncio.create_task(worker.run_command_loop())
+        heartbeat_task = asyncio.create_task(worker._heartbeat_loop())
+        try:
+            await worker.run_pool_forever(endpoint_pool)
+        finally:
+            command_task.cancel()
+            heartbeat_task.cancel()
+            await asyncio.gather(command_task, heartbeat_task, return_exceptions=True)
+            for task in tuple(worker._browser_command_tasks):
+                task.cancel()
+            await asyncio.gather(*worker._browser_command_tasks, return_exceptions=True)
+            await endpoint_pool.close()
+            worker.runtime_db.close()
 
 
 def main(argv: list[str] | None = None) -> int:

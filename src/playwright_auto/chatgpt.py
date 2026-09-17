@@ -4675,26 +4675,56 @@ class ChatGPTPage:
         *,
         force: bool = False,
         expected_text: str | None = None,
+        discard_attachments: bool = False,
         timeout_ms: int | None = None,
     ) -> None:
         timeout = timeout_ms or self.timeout_ms
         async with self.mutation_guard():
-            snapshot = await self._interaction_snapshot(timeout_ms=timeout)
+            snapshot = await self._interaction_snapshot(
+                timeout_ms=timeout,
+                allow_attachments=discard_attachments,
+            )
             existing = snapshot.composer_text.strip()
-            if not existing:
-                self._owned_composer_text = None
-                return
             if expected_text is not None and not visible_text_matches(existing, expected_text):
                 raise ComposerConflictError(
                     "composer no longer matches the text expected by this workflow"
                 )
-            if not force and not visible_text_matches(existing, self._owned_composer_text):
+            if existing and not force and not visible_text_matches(existing, self._owned_composer_text):
                 raise ComposerConflictError(
                     "composer contains unowned/manual input; refusing to clear"
                 )
-            await clear_composer(self.page, timeout_ms=timeout)
+            if discard_attachments and snapshot.attachment_markers:
+                removed = await self.page.evaluate(
+                    """() => {
+                      const visible = (element) => Boolean(
+                        element && (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
+                      );
+                      const composer = [...document.querySelectorAll('[contenteditable="true"][role="textbox"]')]
+                        .find(visible) || null;
+                      const host = composer?.closest('form') || composer?.parentElement || null;
+                      if (!host) return 0;
+                      let removed = 0;
+                      for (const element of host.querySelectorAll('button,[role="button"]')) {
+                        if (!visible(element)) continue;
+                        const label = [
+                          element.getAttribute?.('aria-label') || '',
+                          element.getAttribute?.('data-testid') || '',
+                          element.innerText || '',
+                        ].join(' ').toLowerCase();
+                        if (label.includes('remove file') || label.includes('remove attachment')) {
+                          element.click();
+                          removed += 1;
+                        }
+                      }
+                      return removed;
+                    }"""
+                )
+                if not int(removed or 0):
+                    raise ComposerConflictError("composer attachments could not be discarded")
+            if existing:
+                await clear_composer(self.page, timeout_ms=timeout)
             post = await self.assert_ownership()
-            if not post.composer_empty:
+            if not post.composer_empty or (discard_attachments and post.attachment_markers):
                 raise ComposerConflictError("composer did not become empty")
             self._owned_composer_text = None
 

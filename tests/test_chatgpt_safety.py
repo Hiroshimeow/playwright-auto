@@ -214,6 +214,43 @@ def test_manual_composer_is_not_overwritten(monkeypatch):
         asyncio.run(client.set_text("workflow prompt"))
 
 
+def test_force_clear_can_discard_target_text_and_attachments(monkeypatch):
+    dirty = snapshot(
+        composer_text="stale target draft",
+        state=ChatGPTState.DRAFT,
+        attachments=("stale.txt",),
+    )
+    page = DummyPage(dirty)
+    client = ChatGPTPage(page)
+    client.binding = PageBinding("page-1", "DEV")
+    clear_calls = []
+    evaluate_calls = []
+
+    async def interaction_snapshot(*, timeout_ms, allow_attachments=False):
+        assert allow_attachments is True
+        return dirty
+
+    async def clean_ownership():
+        return replace(dirty, composer_text="", attachment_markers=(), state=ChatGPTState.NEW_CHAT)
+
+    async def discard_attachments(_expression, arg=None):
+        evaluate_calls.append(arg)
+        return 1
+
+    async def clear_text(_page, **_kwargs):
+        clear_calls.append(True)
+
+    client._interaction_snapshot = interaction_snapshot
+    client.assert_ownership = clean_ownership
+    page.evaluate = discard_attachments
+    monkeypatch.setattr(chatgpt, "clear_composer", clear_text)
+
+    asyncio.run(client.clear(force=True, discard_attachments=True))
+
+    assert evaluate_calls == [None]
+    assert clear_calls == [True]
+
+
 def test_new_chat_refuses_to_discard_draft(monkeypatch):
     page = DummyPage(snapshot(composer_text="manual draft", state=ChatGPTState.DRAFT))
     client = ChatGPTPage(page)

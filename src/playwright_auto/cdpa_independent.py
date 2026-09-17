@@ -34,6 +34,7 @@ _TRIGGER_LEARNING_FILES = {
     "interval": "learning_interval.md",
     "daily": "learning_interval.md",
     "check_all": "learning_interval.md",
+    "operational_anomaly": "learning_task_state.md",
     "task_done": "learning_task_done.md",
     "role_completed": "learning_role_completed.md",
     "team_state": "learning_task_state.md",
@@ -43,7 +44,7 @@ _TRIGGER_LEARNING_FILES = {
 }
 BUILTIN_MAINTAINERS_PROMPT = """# Maintainers
 
-You are the built-in Recovery independent agent. Use the shared independent-agent runtime and `@mcp-g8`; do not behave as a workflow role, coordinator, scheduler, or sidecar.
+You are the built-in Recovery independent agent. Use the shared independent-agent runtime and `@mcp-g8` or `@mcp-thinkbook`; do not behave as a workflow role, coordinator, scheduler, or sidecar.
 
 For the exact blocked target in the trigger context:
 
@@ -60,7 +61,7 @@ Preserve explicit operator Pause, Clear Team, Restart, New Chat, and Delete deci
 `PROBLEM.md` is the concrete defect ledger. Trigger learning is shared by trigger type, not by agent identity, and contains only reusable operating/code philosophy. Use `uv run python -m playwright_auto.cdpa_learning --repository <repository-root>` with JSON fields `trigger`, `disposition`, `old_text`, and `new_text` for trigger-learning edits.
 """.strip()
 
-BUILTIN_MONITOR_PROMPT = """You are the built-in Monitor independent agent using the shared one-agent task engine inside the CDPA single-operator local runtime system. Monitor operational flow only: stalled work, unexpected blocking, offline ownership, queue/dependency drift, repeated recovery, and failure to reach the next expected state. Review the exact interval, task-DONE, role-completion, team-state, CHECK_ALL, or Run-now trigger context. Report evidence-backed progress and blockers. Do not invent product-policy, compliance, generic privacy/security, packaging, or hypothetical deployment release gates. Use independent_activate_agent to activate Maintainers by immutable name only for a genuine unexpected recovery incident, and use independent_continue or independent_complete explicitly. Do not create a second scheduler, queue, event store, coordinator, or routing path, and never emit action JSON for the worker to parse."""
+BUILTIN_MONITOR_PROMPT = """You are the built-in Monitor independent agent using the shared one-agent task engine inside the CDPA single-operator local runtime system. Monitor operational flow only: stalled work, unexpected blocking, offline ownership, queue/dependency drift, repeated recovery, and failure to reach the next expected state. Review the exact operational-anomaly, interval, task-DONE, role-completion, team-state, CHECK_ALL, or Run-now trigger context. Report evidence-backed progress and blockers. Do not invent product-policy, compliance, generic privacy/security, packaging, or hypothetical deployment release gates. Use independent_activate_agent to activate Maintainers by immutable name only for a genuine unexpected recovery incident, and use independent_continue or independent_complete explicitly. Do not create a second scheduler, queue, event store, coordinator, or routing path, and never emit action JSON for the worker to parse."""
 
 INDEPENDENT_OUTCOMES = frozenset(
     {"SUCCESS", "NO_ACTION", "REPAIR_REQUIRED", "OPERATOR_REQUIRED"}
@@ -74,6 +75,15 @@ _RECOVERY_WAITING_CODES = frozenset(
         "queue_rebind_failed",
         "team_owner_conflict",
         "dependency_operational_failure",
+    }
+)
+_OPERATIONAL_ANOMALY_CODES = _RECOVERY_WAITING_CODES | frozenset(
+    {
+        "role_offline",
+        "role_ownership_ambiguous",
+        "unexpected_error",
+        "pre_send_request_recovery_required",
+        "bootstrap_prewarm_recovery_required",
     }
 )
 _ALLOWED_TRIGGER_KEYS = frozenset(
@@ -481,6 +491,14 @@ def normalize_event(value: Any) -> dict[str, Any]:
     }
     if value.get("instruction") is not None:
         event["instruction"] = normalize_manual_instruction(value.get("instruction"))
+    if value.get("required_browser_endpoint_id") is not None:
+        required_endpoint = value.get("required_browser_endpoint_id")
+        if (
+            not isinstance(required_endpoint, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", required_endpoint) is None
+        ):
+            raise ValueError("required_browser_endpoint_id must be a durable endpoint identifier")
+        event["required_browser_endpoint_id"] = required_endpoint
     if event["target_hop_id"] is not None and (
         isinstance(event["target_hop_id"], bool)
         or not isinstance(event["target_hop_id"], int)
@@ -654,6 +672,34 @@ def _operator_caused_terminal_or_pause(state: Mapping[str, Any]) -> bool:
     return bool(applied)
 
 
+def _operational_anomaly_event(source: Mapping[str, Any]) -> dict[str, Any] | None:
+    status = str(source.get("status") or "").upper()
+    code = str(source.get("block_code") or source.get("waiting_code") or "").lower()
+    if status not in {"BLOCKED", "WAITING"} or code not in _OPERATIONAL_ANOMALY_CODES:
+        return None
+    if _operator_caused_terminal_or_pause(source):
+        return None
+    occurred_at = _event_time(source)
+    if not occurred_at:
+        return None
+    signature = normalized_failure_signature(source)
+    hop = _active_hop(source)
+    task_id = str(source.get("task_id") or "")
+    hop_id = hop.get("hop_id") if isinstance(hop, Mapping) else None
+    return normalize_event(
+        {
+            "event_key": f"operational-anomaly:{task_id}:{occurred_at}:{hop_id or 0}:{code}:{signature.rsplit(':', 1)[-1]}",
+            "trigger_type": "operational_anomaly",
+            "occurred_at": occurred_at,
+            "target_team": source.get("team"),
+            "target_task_id": task_id,
+            "target_role": source.get("active_role") or (hop.get("target_role") if isinstance(hop, Mapping) else None),
+            "target_hop_id": hop_id,
+            "failure_signature": signature,
+        }
+    )
+
+
 def _recovery_event(
     source: Mapping[str, Any],
     occurrence_counts: Mapping[str, Any],
@@ -671,7 +717,11 @@ def _recovery_event(
     if _operator_caused_terminal_or_pause(source):
         return None
     code = str(source.get("block_code") or source.get("waiting_code") or "").lower()
-    if code == "consecutive_self_route_limit":
+    if code in {
+        "autonomous_execution_budget_exhausted",
+        "consecutive_self_route_limit",
+        "no_progress_route_cycle",
+    }:
         return None
     signature = normalized_failure_signature(source)
     team = str(source.get("team") or "")
@@ -787,6 +837,10 @@ def canonical_independent_events(
             continue
         source_team = str(source.get("team") or "")
         dependency_team_matches = not settings["teams"] or source_team in settings["teams"]
+        if settings["check_all"] and dependency_team_matches:
+            anomaly = _operational_anomaly_event(source)
+            if anomaly is not None:
+                events.append(anomaly)
         if settings["recovery"] and recovery_warmed and dependency_team_matches:
             event = _recovery_event(source, occurrence_counts, now=current)
             if event is not None:
@@ -987,6 +1041,7 @@ def claim_oldest_event(
     if event is None:
         return candidate
     independent["active_event"] = event
+    independent["board_projection_hidden_at"] = None
     independent["cycle"] = 1
     independent["completion_request"] = None
     independent["continuation_request"] = None

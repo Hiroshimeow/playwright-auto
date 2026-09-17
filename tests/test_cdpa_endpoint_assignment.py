@@ -43,6 +43,30 @@ def test_explicit_browser_selection_accepts_registry_shorthand(tmp_path):
         store.create_task("Unknown browser", browser_endpoint_id="9302")
 
 
+def test_workflow_required_browser_is_canonical_hard_affinity_and_immutable(tmp_path):
+    store, endpoints = stores(tmp_path)
+    required = endpoints.add("9202")
+    other = endpoints.add("9212")
+    task = store.create_task(
+        "Gmail child",
+        required_browser_endpoint_id="localhost:9202",
+    )
+
+    assert task["required_browser_endpoint_id"] == required["endpoint_id"]
+    with pytest.raises(ValueError, match="not registered"):
+        store.create_task(
+            "Unknown Gmail browser",
+            required_browser_endpoint_id="9302",
+        )
+    with pytest.raises(ValueError, match="immutable"):
+        store.update(
+            task["manifest_path"],
+            lambda state: state.update(
+                required_browser_endpoint_id=other["endpoint_id"]
+            ),
+        )
+
+
 def test_exact_team_new_work_can_choose_a_different_endpoint(tmp_path):
     store, endpoints = stores(tmp_path)
     first = store.create_task("First task", task_id="first", requested_team="alpha")
@@ -153,6 +177,154 @@ def test_replacement_keeps_conversation_mode_without_endpoint_ownership_semantic
     )["replacement"]
     assert replacement["team"] == original["team"]
     assert replacement["conversation_mode"] == original["conversation_mode"]
+
+
+def test_independent_explicit_endpoint_is_durable_and_configurable_while_idle(tmp_path):
+    store, endpoints = stores(tmp_path)
+    pool_default = endpoints.resolve()
+    pinned = endpoints.add("9212")
+    agent = store.create_independent_agent(
+        "Pinned watcher",
+        system_prompt="Inspect only.",
+        browser_endpoint_id="9212",
+    )
+    assert agent["browser_endpoint_id"] == pinned["endpoint_id"]
+    assert agent["independent"]["browser_endpoint_id"] == pinned["endpoint_id"]
+    assert agent["roles"]["AGENT"]["browser_endpoint_id"] == pinned["endpoint_id"]
+
+    other = endpoints.add("9202")
+    configured = store.update_independent_agent(
+        agent["manifest_path"], browser_endpoint_id="9202"
+    )
+    assert configured["browser_endpoint_id"] == other["endpoint_id"]
+    assert configured["independent"]["browser_endpoint_id"] == other["endpoint_id"]
+    assert configured["roles"]["AGENT"]["browser_endpoint_id"] == other["endpoint_id"]
+
+    cleared = store.update_independent_agent(
+        agent["manifest_path"], browser_endpoint_id=None
+    )
+    assert cleared["browser_endpoint_id"] == pool_default["endpoint_id"]
+    assert cleared["independent"]["browser_endpoint_id"] is None
+    assert cleared["roles"]["AGENT"]["browser_endpoint_id"] == pool_default["endpoint_id"]
+
+
+def test_independent_manual_run_browser_requirement_is_job_scoped(tmp_path):
+    store, endpoints = stores(tmp_path)
+    required = endpoints.add("9202")
+    agent = store.create_independent_agent(
+        "Pool manager",
+        system_prompt="Inspect only.",
+        trigger_settings={"interval_minutes": 30},
+    )
+
+    running = store.run_independent_now(
+        agent["manifest_path"],
+        instruction="Read Gmail before dispatching.",
+        required_browser_endpoint_id="localhost:9202",
+    )
+
+    assert running["independent"]["browser_endpoint_id"] is None
+    assert (
+        running["independent"]["active_event"]["required_browser_endpoint_id"]
+        == required["endpoint_id"]
+    )
+    with pytest.raises(ValueError, match="manual"):
+        store.run_independent_now(
+            agent["manifest_path"],
+            trigger_type="check_all",
+            required_browser_endpoint_id=required["endpoint_id"],
+        )
+
+    def mark_responded(state):
+        hop = next(
+            item
+            for item in state["hops"]
+            if item.get("hop_id") == state.get("active_hop_id")
+        )
+        hop["state"] = "responded"
+        hop["response"] = "Gmail dispatch completed."
+        hop["response_sha256"] = "a" * 64
+        return state
+
+    store.update(running["manifest_path"], mark_responded)
+    released = store.complete_independent_task(
+        running["manifest_path"],
+        outcome="SUCCESS",
+        summary="Gmail dispatch completed.",
+    )
+    assert released["independent"]["active_event"] is None
+    assert released["independent"]["browser_endpoint_id"] is None
+    assert released["independent"]["close_tab_when_idle"] is True
+
+    next_run = store.run_independent_now(
+        released["manifest_path"],
+        instruction="Dispatch a non-Gmail task.",
+    )
+    assert "required_browser_endpoint_id" not in next_run["independent"]["active_event"]
+    assert next_run["independent"]["browser_endpoint_id"] is None
+
+
+def test_independent_endpoint_clear_refuses_active_job(tmp_path):
+    store, endpoints = stores(tmp_path)
+    pinned = endpoints.add("9212")
+    agent = store.create_independent_agent(
+        "Pinned watcher",
+        system_prompt="Inspect only.",
+        browser_endpoint_id=pinned["endpoint_id"],
+    )
+    agent = store.run_independent_now(agent["manifest_path"])
+    with pytest.raises(ValueError, match="active job"):
+        store.update_independent_agent(agent["manifest_path"], browser_endpoint_id=None)
+
+
+def test_independent_endpoint_config_refuses_to_move_owned_live_tab(tmp_path):
+    store, endpoints = stores(tmp_path)
+    pinned = endpoints.add("9212")
+    agent = store.create_independent_agent(
+        "Pinned watcher",
+        system_prompt="Inspect only.",
+        browser_endpoint_id=pinned["endpoint_id"],
+    )
+    other = endpoints.add("9202")
+    store.update(
+        agent["manifest_path"],
+        lambda state: state["roles"]["AGENT"].update(
+            page_id="owned", page_url="https://chatgpt.com/c/owned", online=True
+        ),
+    )
+    with pytest.raises(ValueError, match="live tab"):
+        store.update_independent_agent(
+            agent["manifest_path"], browser_endpoint_id=other["endpoint_id"]
+        )
+    with pytest.raises(ValueError, match="live tab"):
+        store.update_independent_agent(agent["manifest_path"], browser_endpoint_id=None)
+
+
+def test_independent_endpoint_clear_allows_verified_idle_closed_tab_with_saved_identity(tmp_path):
+    store, endpoints = stores(tmp_path)
+    pinned = endpoints.add("9212")
+    agent = store.create_independent_agent(
+        "Pinned watcher",
+        system_prompt="Inspect only.",
+        browser_endpoint_id=pinned["endpoint_id"],
+    )
+    saved_url = "https://chatgpt.com/c/saved"
+
+    def mark_verified_closed(state):
+        state["roles"]["AGENT"].update(
+            page_id="saved-page",
+            page_url=saved_url,
+            online=False,
+        )
+        state["independent"]["idle_tab_closed_at"] = "2026-09-14T00:00:00+00:00"
+        return state
+
+    store.update(agent["manifest_path"], mark_verified_closed)
+    cleared = store.update_independent_agent(agent["manifest_path"], browser_endpoint_id=None)
+
+    assert cleared["independent"]["browser_endpoint_id"] is None
+    assert cleared["roles"]["AGENT"]["page_id"] == "saved-page"
+    assert cleared["roles"]["AGENT"]["page_url"] == saved_url
 
 
 def test_independent_generation_uses_current_endpoint_capacity_and_keeps_mode_policy(tmp_path):

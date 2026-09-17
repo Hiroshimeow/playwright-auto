@@ -64,7 +64,9 @@ def _prepare_pause_response(tmp_path: Path, *, task_id: str, role: str):
     report = tmp_path / str(hop["expected_report_path"])
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(
-        f"# {role} pause report\n\nExact resume condition is recorded for {task_id}.\n",
+        f"# {role} pause report\n\n## Evidence\n"
+        f"- Inspected external prerequisite for {task_id}: `prerequisite=operator_input`.\n"
+        "- `block_code=external_input`; `resume_condition=external_input_provided`.\n",
         encoding="utf-8",
     )
     hop["response"] = json.dumps(
@@ -122,10 +124,11 @@ def test_missing_pause_report_repairs_artifact_without_changing_pause_route(tmp_
     report = tmp_path / handoff
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(
-        "# PLAN pause report\n\nPrerequisite: operator provides the external input.\n",
+        "# PLAN pause report\n\n## Evidence\n"
+        "block_code=external_input\n"
+        "resume_condition=external_input_provided\n",
         encoding="utf-8",
     )
-    # A report-repair turn may not revise an already accepted lifecycle decision.
     repair["response"] = json.dumps({"route": "PLAN", "handoff": handoff})
     repair["state"] = "responded"
 
@@ -138,6 +141,27 @@ def test_missing_pause_report_repairs_artifact_without_changing_pause_route(tmp_
         item.get("kind") == "handoff" and item.get("target_role") == "PLAN"
         for item in state["hops"][1:]
     )
+
+
+def test_pause_accepts_typed_blocker_evidence_without_markdown_list(tmp_path: Path):
+    _store, state, worker, _path, source = _prepare_pause_response(
+        tmp_path, task_id="task-pause-plain-typed-evidence", role="DEV"
+    )
+    report = tmp_path / str(source["expected_report_path"])
+    report.write_text(
+        "# DEV pause report\n\n"
+        "## Evidence\n"
+        "block_code=workspace_unavailable\n"
+        "resume_condition=workspace_access_restored\n",
+        encoding="utf-8",
+    )
+
+    worker._responded(state, source)
+
+    assert source["state"] == "routed"
+    assert source["route"] == "PAUSE"
+    assert state["status"] == "PAUSED"
+    assert state["active_hop_id"] == source["hop_id"]
 
 
 def test_invalid_pause_handoff_uses_existing_route_repair(tmp_path: Path):
@@ -325,9 +349,7 @@ def test_pause_prompt_contract_is_shared_and_plan_never_self_routes_to_wait():
     for path in guides:
         text = path.read_text(encoding="utf-8")
         assert "PLAN|DEV|TEST|REVIEW|AUDIT|PAUSE|DONE" in text
-        assert "concrete external/manual prerequisite" in text
-        assert "exact resume condition" in text
-        assert "must not be used" in text
+        assert "Return exactly one valid JSON object" in text
 
     for path in (
         root / "prompts/cdpa/PLAN.md",

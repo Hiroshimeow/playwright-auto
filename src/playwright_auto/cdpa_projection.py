@@ -15,6 +15,7 @@ from .cdpa_dependencies import dependency_parent_ids
 from .cdpa_independent import independent_tags, is_independent_task
 from .cdpa_safety import sanitize_text, sanitize_value
 from .cdpa_team import (
+    dispatch_order_key,
     exact_team_ready_waiters,
     exact_team_reuse_eligible,
     exact_team_waiter_order_key,
@@ -181,6 +182,7 @@ def _public_hop(hop: Mapping[str, Any]) -> dict[str, Any]:
         "turn": hop.get("turn"),
         "input": _public_text(hop.get("prompt"), max_chars=None),
         "handoff": _public_handoff(hop.get("handoff")),
+        "expected_report": _public_handoff(hop.get("expected_report_path")),
     }
 
 
@@ -224,6 +226,7 @@ def _roles(
     raw: Mapping[str, Any],
     browser_pages: Sequence[Mapping[str, Any]],
     browser_connected: bool | None,
+    endpoint_connected: Mapping[str, bool] | None = None,
 ) -> list[dict[str, Any]]:
     pages: dict[tuple[str | None, str], Mapping[str, Any]] = {}
     candidates: dict[str, list[Mapping[str, Any]]] = {}
@@ -246,12 +249,19 @@ def _roles(
         page = None
         if page_id:
             page = pages.get((lookup_endpoint, page_id))
-            if page is None and lookup_endpoint is not None:
+            if page is None and lookup_endpoint is not None and endpoint_connected is None:
                 page = pages.get((None, page_id))
-            if page is None and role_endpoint is None and len(candidates.get(page_id, ())) == 1:
+            if page is None and lookup_endpoint is None and len(candidates.get(page_id, ())) == 1:
                 page = candidates[page_id][0]
-        if browser_connected is False:
+        endpoint_observed = lookup_endpoint is not None and endpoint_connected is not None
+        if endpoint_observed and lookup_endpoint not in endpoint_connected:
             online: bool | None = None
+        elif endpoint_observed and not endpoint_connected[lookup_endpoint]:
+            online = None
+        elif endpoint_observed:
+            online = bool((page or {}).get("online"))
+        elif browser_connected is False:
+            online = None
         elif browser_connected is True:
             online = bool((page or {}).get("online"))
         else:
@@ -343,13 +353,27 @@ def _surface(
         str(item.get("replaces_task_id") or "") == task_id for item in tasks
     )
     status = str(raw.get("status") or "INBOX").upper()
+    independent = raw.get("independent")
+    if (
+        isinstance(independent, Mapping)
+        and independent.get("board_projection_hidden_at")
+        and not independent.get("deleted_at")
+    ):
+        return ("off_board", "hidden")
     if browser_connected is False:
         return (
             ("offline_recoverable", "unknown")
             if replaced or status in TERMINAL
             else ("active", "unknown")
         )
-    online = any(bool(role.get("online")) for role in roles)
+    online = any(role.get("online") is True for role in roles)
+    unknown = any(role.get("online") is None for role in roles)
+    if not online and unknown:
+        return (
+            ("offline_recoverable", "unknown")
+            if replaced or status in TERMINAL
+            else ("active", "unknown")
+        )
     if replaced or status in TERMINAL:
         return ("offline_recoverable", "terminal_tab_present") if online else ("history", "terminal")
     return ("active", "online") if online else ("offline_recoverable", "offline")
@@ -453,6 +477,7 @@ def _report_rows(
     source_task_id: str | None = None,
     generation: int | None = None,
     repository_allowed_roots: Sequence[str | Path] = (),
+    recover_routed_hops: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     task_id = str(public_task_id or raw.get("task_id") or "")
     source_id = str(source_task_id or raw.get("task_id") or "")
@@ -461,7 +486,46 @@ def _report_rows(
     task_text = str(raw.get("task_text") or "")
     public: list[dict[str, Any]] = []
     private: dict[str, dict[str, Any]] = {}
-    for index, report in enumerate(raw.get("reports") or [], start=1):
+    source_reports = [
+        dict(report)
+        for report in raw.get("reports") or []
+        if isinstance(report, Mapping)
+    ]
+    if recover_routed_hops:
+        represented = {
+            (
+                str(report.get("path") or ""),
+                str(report.get("role") or ""),
+                str(report.get("physical_role") or ""),
+                _int_or_zero(report.get("turn")),
+            )
+            for report in source_reports
+        }
+        for hop in raw.get("hops") or []:
+            if not isinstance(hop, Mapping) or str(hop.get("state") or "") != "routed":
+                continue
+            report_path = str(hop.get("report_path") or "").strip()
+            if not report_path:
+                continue
+            role = str(hop.get("target_role") or "")
+            physical_role = str(hop.get("physical_role") or "")
+            turn = _int_or_zero(hop.get("turn"))
+            key = (report_path, role, physical_role, turn)
+            if key in represented:
+                continue
+            timestamps = hop.get("timestamps") if isinstance(hop.get("timestamps"), Mapping) else {}
+            source_reports.append({
+                "report_id": f"hop-{hop.get('hop_id')}",
+                "path": report_path,
+                "sha256": hop.get("report_sha256"),
+                "size": hop.get("report_size"),
+                "role": role,
+                "physical_role": physical_role,
+                "turn": hop.get("turn"),
+                "created_at": timestamps.get("routed_at"),
+            })
+            represented.add(key)
+    for index, report in enumerate(source_reports, start=1):
         if not isinstance(report, Mapping):
             continue
         original_id = str(report.get("report_id") or index)
@@ -967,6 +1031,7 @@ def build_task_projection(
     waiting_order: Mapping[str, Mapping[str, Any]] | None = None,
     browser_pages: Sequence[Mapping[str, Any]] = (),
     browser_connected: bool | None = None,
+    endpoint_connected: Mapping[str, bool] | None = None,
     repository_allowed_roots: Sequence[str | Path] = (),
 ) -> TaskProjection:
     task_id = str(raw.get("task_id") or "")
@@ -981,7 +1046,7 @@ def build_task_projection(
         None,
     )
     updated_at = str(raw.get("updated_at") or raw.get("created_at") or "")
-    roles = _roles(raw, browser_pages, browser_connected)
+    roles = _roles(raw, browser_pages, browser_connected, endpoint_connected)
     surface, availability = _surface(raw, tasks, roles, browser_connected)
     independent = raw.get("independent") if isinstance(raw.get("independent"), Mapping) else None
     if independent is not None:
@@ -989,7 +1054,9 @@ def build_task_projection(
     else:
         independent_history = []
         reports, report_private = _report_rows(
-            raw, repository_allowed_roots=repository_allowed_roots
+            raw,
+            repository_allowed_roots=repository_allowed_roots,
+            recover_routed_hops=True,
         )
     maintenance_reports, maintenance_private = _maintenance_reports(raw)
     timeline = _timeline(raw)
@@ -1056,6 +1123,31 @@ def build_task_projection(
         for role in roles
         if role.get("browser_endpoint_id")
     ))
+    stop_reason = _public_text(raw.get("stop_reason"), max_chars=500) or None
+    waiting_code = str(waiting.get("reason") or raw.get("waiting_reason") or "").lower()
+    stop_code = str(stop_reason or "").lower()
+    if status == "PAUSED":
+        lifecycle_kind = "operator_paused"
+        lifecycle_label = "Paused by operator"
+    elif status == "WAITING" and "dependency" in waiting_code:
+        lifecycle_kind = "dependency_blocked"
+        lifecycle_label = "Blocked by dependency"
+    elif status == "WAITING" and waiting.get("reason") == "browser_pool":
+        lifecycle_kind = "capacity_wait"
+        lifecycle_label = "Waiting for browser capacity"
+    elif status == "STOPPED" and any(word in stop_code for word in ("supersed", "abandon", "obsolete")):
+        lifecycle_kind = "superseded"
+        lifecycle_label = "Superseded / abandoned"
+    elif status == "STOPPED":
+        lifecycle_kind = "stopped"
+        lifecycle_label = "Stopped"
+    else:
+        lifecycle_kind = None
+        lifecycle_label = None
+    if not browser_endpoint_ids:
+        requested_endpoint = str(raw.get("browser_endpoint_id") or "").strip()
+        if requested_endpoint:
+            browser_endpoint_ids = [requested_endpoint]
     summary = {
         "task_id": task_id,
         "team": team,
@@ -1065,6 +1157,11 @@ def build_task_projection(
         "active_role": raw.get("active_role"),
         "active_hop_id": raw.get("active_hop_id"),
         "active_action": raw.get("active_action"),
+        "requested_browser_endpoint_id": (
+            None
+            if independent is not None
+            else str(raw.get("browser_endpoint_id") or "").strip() or None
+        ),
         "browser_endpoint_ids": browser_endpoint_ids,
         "created_at": str(raw.get("created_at") or "") or None,
         "started_at": str(raw.get("started_at") or "") or None,
@@ -1088,6 +1185,9 @@ def build_task_projection(
         "availability": availability,
         "primary_problem": problem,
         "waiting_reason": public_waiting_reason,
+        "stop_reason": stop_reason,
+        "lifecycle_kind": lifecycle_kind,
+        "lifecycle_label": lifecycle_label,
         "block_code": raw.get("block_code"),
         "queue_position": queue.get("position"),
         "queue_length": queue.get("length"),
@@ -1110,6 +1210,39 @@ def build_task_projection(
                 ),
             }
         )
+    if independent is None and (
+        status == "INBOX" or (status == "WAITING" and waiting.get("reason") == "browser_pool")
+    ):
+        browser_queue = sorted(
+            (
+                item
+                for item in tasks
+                if not is_independent_task(item)
+                and (
+                    str(item.get("status") or "").upper() == "INBOX"
+                    or (
+                        str(item.get("status") or "").upper() == "WAITING"
+                        and isinstance(item.get("waiting"), Mapping)
+                        and item["waiting"].get("reason") == "browser_pool"
+                    )
+                )
+            ),
+            key=dispatch_order_key,
+        )
+        browser_ids = [str(item.get("task_id") or "") for item in browser_queue]
+        if task_id in browser_ids:
+            summary["queue_position"] = browser_ids.index(task_id) + 1
+            summary["queue_length"] = len(browser_ids)
+            summary["queue_reason"] = (
+                summary.get("waiting_reason")
+                if waiting.get("reason") == "browser_pool"
+                else "Queued for browser worker admission"
+            )
+            summary["queue_since"] = (
+                waiting.get("since")
+                if waiting.get("reason") == "browser_pool"
+                else raw.get("created_at")
+            )
     if independent is not None:
         active_event = (
             independent.get("active_event")
@@ -1145,6 +1278,7 @@ def build_task_projection(
             "generation": _int_or_zero(independent.get("agent_generation")),
             "enabled": bool(independent.get("enabled")),
             "deleted_at": str(independent.get("deleted_at") or "") or None,
+            "board_visible": not bool(independent.get("board_projection_hidden_at")),
             "trigger_type": str(active_event.get("trigger_type") or "") or None,
             "target_team": str(active_event.get("target_team") or "") or None,
             "target_task_id": str(active_event.get("target_task_id") or "") or None,
@@ -1152,6 +1286,7 @@ def build_task_projection(
             "check_count": _int_or_zero(active_event.get("check_count")),
             "cycle": _int_or_zero(independent.get("cycle")),
             "max_cycles": _int_or_zero(independent.get("max_cycles")),
+            "browser_endpoint_id": str(independent.get("browser_endpoint_id") or "") or None,
             "tags": independent_tags(independent.get("trigger_settings")),
             "tab_open": bool(
                 isinstance((raw.get("roles") or {}).get("AGENT"), Mapping)
@@ -1272,6 +1407,20 @@ def build_task_projection(
             else {}
         ),
         "cleanup": _public_value(dict(raw.get("cleanup") or {})),
+        "worktree_archive": _public_value(
+            {
+                key: raw["worktree_archive"].get(key)
+                for key in (
+                    "state",
+                    "head",
+                    "branch",
+                    "evidence_root",
+                    "prepared_at",
+                    "archived_at",
+                )
+                if isinstance(raw.get("worktree_archive"), Mapping)
+            }
+        ),
         "attachments": [
             {"name": str(item.get("name") or Path(str(item.get("path") or "")).name)}
             for item in raw.get("attachments") or []

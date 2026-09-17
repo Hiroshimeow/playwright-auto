@@ -179,6 +179,94 @@ def test_projection_splits_public_and_private_data(tmp_path: Path):
     assert "secret-value" not in public
 
 
+def test_projection_exposes_worktree_archive_lifecycle_without_repository_path(tmp_path: Path):
+    raw = raw_task(tmp_path)
+    raw["status"] = "DONE"
+    raw["terminal_state"] = "DONE"
+    raw["cleanup"] = {"state": "CLEARED", "verified_empty_at": "2026-09-15T00:00:00+00:00"}
+    raw["worktree_archive"] = {
+        "state": "PREPARED",
+        "repository": str(tmp_path / "private-task-worktree"),
+        "head": "a" * 40,
+        "branch": None,
+        "preservation_ref": "refs/cdpa/worktree-archive/task-a",
+        "evidence_root": ".plan/alpha",
+        "prepared_at": "2026-09-15T00:01:00+00:00",
+        "archived_at": None,
+    }
+
+    projection = build_task_projection(raw, tasks=[raw])
+
+    archive = projection.detail["worktree_archive"]
+    assert archive == {
+        "state": "PREPARED",
+        "head": "a" * 40,
+        "branch": None,
+        "evidence_root": ".plan/alpha",
+        "prepared_at": "2026-09-15T00:01:00+00:00",
+        "archived_at": None,
+    }
+    public = json.dumps({"summary": projection.summary, "detail": projection.detail})
+    assert "private-task-worktree" not in public
+    assert "preservation_ref" not in archive
+    assert projection.detail["control_eligibility"]["archive_worktree"]["eligible"] is True
+
+
+def test_projection_recovers_historical_routed_reports_and_deduplicates_indexed_rows(tmp_path: Path):
+    raw = raw_task(tmp_path)
+    indexed_path = tmp_path / ".plan" / "alpha" / "alpha-plan_turn1_task-a.md"
+    indexed_body = indexed_path.read_bytes()
+    dev_path = tmp_path / ".plan" / "alpha" / "alpha-dev_turn2_task-a.md"
+    dev_path.write_text("DEV historical report", encoding="utf-8")
+    dev_body = dev_path.read_bytes()
+    raw["reports"] = [{
+        "report_id": "indexed-plan",
+        "path": str(indexed_path.relative_to(tmp_path)),
+        "sha256": hashlib.sha256(indexed_body).hexdigest(),
+        "size": len(indexed_body),
+        "role": "PLAN",
+        "physical_role": "alpha-plan",
+        "turn": 1,
+        "created_at": "2026-07-25T00:01:00+00:00",
+    }]
+    raw["hops"] = [
+        {
+            "hop_id": 1,
+            "state": "routed",
+            "target_role": "PLAN",
+            "physical_role": "alpha-plan",
+            "turn": 1,
+            "report_path": str(indexed_path.relative_to(tmp_path)),
+            "report_sha256": hashlib.sha256(indexed_body).hexdigest(),
+            "report_size": len(indexed_body),
+            "timestamps": {"routed_at": "2026-07-25T00:01:30+00:00"},
+        },
+        {
+            "hop_id": 2,
+            "state": "routed",
+            "target_role": "DEV",
+            "physical_role": "alpha-dev",
+            "turn": 2,
+            "report_path": str(dev_path.relative_to(tmp_path)),
+            "report_sha256": hashlib.sha256(dev_body).hexdigest(),
+            "report_size": len(dev_body),
+            "timestamps": {"routed_at": "2026-07-25T00:02:30+00:00"},
+        },
+    ]
+
+    projection = build_task_projection(raw, tasks=[raw])
+
+    assert projection.summary["has_reports"] is True
+    assert [(item["report_id"], item["role"], item["turn"]) for item in projection.detail["reports"]] == [
+        ("indexed-plan", "PLAN", 1),
+        ("hop-2", "DEV", 2),
+    ]
+    assert projection.detail["reports"][0]["created_at"] == "2026-07-25T00:01:00+00:00"
+    assert projection.detail["reports"][1]["created_at"] == "2026-07-25T00:02:30+00:00"
+    assert projection.private["reports"]["hop-2"]["sha256"] == hashlib.sha256(dev_body).hexdigest()
+    assert projection.private["reports"]["hop-2"]["size"] == len(dev_body)
+
+
 def test_projection_exposes_only_canonical_chat_url_even_when_it_matches_private_page_url(tmp_path: Path):
     task = raw_task(tmp_path)
     exact = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111"
@@ -350,13 +438,18 @@ def test_projection_legacy_report_fallback_fails_closed(tmp_path: Path):
             allowed=(control,),
         ),
     ]
-    symlink_projection = projected(
-        task_text=declared,
-        report_path=".plan/alpha/symlink.md",
-        make_file=True,
-        symlink=True,
-    )
-    cases.append(symlink_projection)
+    try:
+        symlink_projection = projected(
+            task_text=declared,
+            report_path=".plan/alpha/symlink.md",
+            make_file=True,
+            symlink=True,
+        )
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != 1314:
+            raise
+    else:
+        cases.append(symlink_projection)
 
     for projection in cases:
         public = projection.detail["reports"][0]
@@ -579,6 +672,60 @@ def test_waiting_order_projects_dependency_levels_and_shared_frontiers():
     assert all(record["intervention"] is None for record in order.values())
 
 
+def test_browser_dispatch_queue_projection_excludes_dependency_waiters(tmp_path: Path):
+    dependency = raw_task(tmp_path / "dependency")
+    dependency.update(task_id="dependency", status="WAITING", created_at="2026-07-24T00:00:00+00:00")
+    dependency["waiting"] = {"reason": "dependency", "since": dependency["created_at"]}
+
+    inbox = raw_task(tmp_path / "inbox")
+    inbox.update(task_id="zzz-old", status="INBOX", created_at="2026-07-24T00:00:01+00:00")
+    inbox["browser_endpoint_id"] = "requested-1"
+
+    capacity = raw_task(tmp_path / "capacity")
+    capacity.update(task_id="aaa-new", status="WAITING", created_at="2026-07-24T00:00:02+00:00")
+    capacity["waiting"] = {"reason": "browser_pool", "since": capacity["created_at"]}
+    capacity["waiting_reason"] = "Waiting for pinned endpoint capacity."
+
+    tasks = [dependency, capacity, inbox]
+    inbox_projection = build_task_projection(inbox, tasks=tasks)
+    capacity_projection = build_task_projection(capacity, tasks=tasks)
+
+    assert inbox_projection.summary["queue_position"] == 1
+    assert inbox_projection.summary["queue_length"] == 2
+    assert inbox_projection.summary["queue_reason"] == "Queued for browser worker admission"
+    assert inbox_projection.summary["queue_since"] == inbox["created_at"]
+    assert capacity_projection.summary["queue_position"] == 2
+    assert capacity_projection.summary["queue_length"] == 2
+    assert capacity_projection.summary["queue_reason"] == capacity_projection.summary["waiting_reason"]
+    assert capacity_projection.summary["queue_since"] == capacity["waiting"]["since"]
+
+
+def test_browser_dispatch_queue_projection_is_fifo_across_urgent_repairs(tmp_path: Path):
+    normal = raw_task(tmp_path / "normal")
+    normal.update(
+        task_id="zzz-normal-old",
+        status="INBOX",
+        created_at="2026-07-24T00:00:01+00:00",
+    )
+
+    repair = raw_task(tmp_path / "repair")
+    repair.update(
+        task_id="aaa-repair-new",
+        status="INBOX",
+        created_at="2026-07-24T00:00:02+00:00",
+        priority="urgent_repair",
+    )
+
+    tasks = [repair, normal]
+    normal_projection = build_task_projection(normal, tasks=tasks)
+    repair_projection = build_task_projection(repair, tasks=tasks)
+
+    assert normal_projection.summary["queue_position"] == 1
+    assert repair_projection.summary["queue_position"] == 2
+    assert normal_projection.summary["queue_length"] == 2
+    assert repair_projection.summary["queue_length"] == 2
+
+
 
 
 
@@ -660,7 +807,8 @@ def test_projection_summary_is_compact_and_deterministic(tmp_path: Path):
         "running_since", "active_role_running_elapsed_seconds", "active_role_running_since",
         "elapsed_end_at",
         "availability", "primary_problem", "waiting_reason", "block_code",
-        "queue_position", "queue_length", "waiting_order", "roles", "browser_endpoint_ids", "has_reports", "task_title",
+        "stop_reason", "lifecycle_kind", "lifecycle_label",
+        "queue_position", "queue_length", "queue_reason", "queue_since", "waiting_order", "roles", "requested_browser_endpoint_id", "browser_endpoint_ids", "has_reports", "task_title",
         "version", "projection_sha256",
     }
 
@@ -851,3 +999,108 @@ def test_role_projection_matches_composite_endpoint_and_page_identity(tmp_path: 
     role = projection.detail["roles"][0]
     assert role["online"] is False
     assert role["chat_url"] == "https://chatgpt.com/c/a"
+
+
+def test_role_projection_marks_known_disconnected_endpoint_unknown(tmp_path: Path):
+    task = raw_task(tmp_path)
+    task["browser_endpoint_id"] = "endpoint-a"
+    task["roles"]["DEV"].update(browser_endpoint_id="endpoint-a", page_id="shared-page")
+    projection = build_task_projection(
+        task, tasks=[task], browser_connected=True,
+        endpoint_connected={"endpoint-a": False, "endpoint-b": True},
+        browser_pages=[{"endpoint_id": "endpoint-b", "page_id": "shared-page", "online": True}],
+    )
+    assert projection.detail["roles"][0]["online"] is None
+
+
+def test_role_projection_missing_assigned_endpoint_in_connection_map_is_unknown(tmp_path: Path):
+    task = raw_task(tmp_path)
+    task["browser_endpoint_id"] = "endpoint-a"
+    task["roles"]["DEV"].update(browser_endpoint_id="endpoint-a", page_id="shared-page")
+    projection = build_task_projection(
+        task, tasks=[task], browser_connected=True,
+        endpoint_connected={"endpoint-b": True},
+        browser_pages=[{"endpoint_id": "endpoint-b", "page_id": "shared-page", "online": True}],
+    )
+    assert projection.detail["roles"][0]["online"] is None
+
+
+def test_role_projection_known_connected_endpoint_without_page_is_offline(tmp_path: Path):
+    task = raw_task(tmp_path)
+    task["browser_endpoint_id"] = "endpoint-a"
+    task["roles"]["DEV"].update(browser_endpoint_id="endpoint-a", page_id="missing")
+    projection = build_task_projection(
+        task, tasks=[task], browser_connected=True,
+        endpoint_connected={"endpoint-a": True}, browser_pages=[],
+    )
+    assert projection.detail["roles"][0]["online"] is False
+
+
+def test_projection_partial_endpoint_disconnect_has_unknown_summary_availability(tmp_path: Path):
+    task = raw_task(tmp_path)
+    task["browser_endpoint_id"] = "endpoint-a"
+    task["roles"]["DEV"].update(browser_endpoint_id="endpoint-a", page_id="missing")
+    projection = build_task_projection(
+        task, tasks=[task], browser_connected=True,
+        endpoint_connected={"endpoint-a": False, "endpoint-b": True}, browser_pages=[],
+    )
+    assert projection.detail["roles"][0]["online"] is None
+    assert projection.summary["availability"] == "unknown"
+    assert projection.surface == "active"
+
+
+def test_projection_keeps_requested_endpoint_when_active_role_runs_elsewhere(tmp_path: Path):
+    task = raw_task(tmp_path)
+    task["browser_endpoint_id"] = "endpoint-requested"
+    task["roles"]["DEV"]["browser_endpoint_id"] = "endpoint-actual"
+
+    projection = build_task_projection(task, tasks=[task])
+
+    assert projection.summary["requested_browser_endpoint_id"] == "endpoint-requested"
+    assert projection.summary["browser_endpoint_ids"] == ["endpoint-actual"]
+    assert projection.detail["requested_browser_endpoint_id"] == "endpoint-requested"
+
+
+def test_projection_exposes_sanitized_expected_report_for_active_hop(tmp_path: Path):
+    raw = raw_task(tmp_path)
+    raw["hops"][1]["expected_report_path"] = ".plan/alpha/alpha-dev_turn2_task-a.md"
+
+    projection = build_task_projection(raw, tasks=[raw])
+
+    assert projection.detail["active_hop"]["expected_report"] == "alpha-dev_turn2_task-a.md"
+    assert projection.detail["active_input"]["expected_report"] == "alpha-dev_turn2_task-a.md"
+    assert projection.detail["role_inputs"]["DEV"]["expected_report"] == "alpha-dev_turn2_task-a.md"
+
+
+def test_projection_classifies_paused_dependency_and_superseded_lifecycle(tmp_path: Path):
+    paused = raw_task(tmp_path)
+    paused["status"] = "PAUSED"
+    paused["kanban_column"] = "PAUSED"
+    paused_projection = build_task_projection(paused, tasks=[paused])
+    assert paused_projection.summary["lifecycle_kind"] == "operator_paused"
+
+    waiting = raw_task(tmp_path)
+    waiting["status"] = "WAITING"
+    waiting["kanban_column"] = "WAITING"
+    waiting["waiting_reason"] = "Waiting for dependencies: parent-a"
+    waiting["waiting"] = {"reason": "dependency", "since": "2026-07-25T00:00:00+00:00"}
+    waiting_projection = build_task_projection(waiting, tasks=[waiting])
+    assert waiting_projection.summary["lifecycle_kind"] == "dependency_blocked"
+
+    stopped = raw_task(tmp_path)
+    stopped["status"] = "STOPPED"
+    stopped["kanban_column"] = "STOPPED"
+    stopped["stop_reason"] = "Superseded by replacement task"
+    stopped_projection = build_task_projection(stopped, tasks=[stopped])
+    assert stopped_projection.summary["lifecycle_kind"] == "superseded"
+    assert stopped_projection.summary["lifecycle_label"] == "Superseded / abandoned"
+
+
+def test_projection_keeps_active_role_ownership_unknown_when_browser_disconnected(tmp_path: Path):
+    raw = raw_task(tmp_path)
+
+    projection = build_task_projection(raw, tasks=[raw], browser_pages=(), browser_connected=False)
+
+    active_role = next(role for role in projection.summary["roles"] if role["logical_role"] == "DEV")
+    assert active_role["online"] is None
+    assert projection.summary["availability"] == "unknown"

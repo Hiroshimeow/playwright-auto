@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 from pathlib import Path
@@ -7,7 +8,12 @@ from pathlib import Path
 from playwright_auto.cdpa_worker import _active_hop
 from playwright_auto.chatgpt import MessageSnapshot
 from playwright_auto.durable import RequestLedger, RequestStatus
-from test_cdpa_worker import _prepare_sent_waiting_task
+from test_cdpa_worker import (
+    FakeActions,
+    RecordingCDPASendActions,
+    RecordingCDPASendClient,
+    _prepare_sent_waiting_task,
+)
 
 
 def _git_repo(path: Path) -> Path:
@@ -47,7 +53,13 @@ def test_completed_durable_response_is_consumed_before_cross_endpoint_recovery(t
     handoff = str(hop["expected_report_path"])
     report = tmp_path / handoff
     report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text("# completed PLAN work\n", encoding="utf-8")
+    report.write_text(
+        "# completed PLAN work\n\n"
+        "## Evidence\n"
+        f"- Inspected durable response for `report_path={handoff}`.\n"
+        "- `send_attempts=1` -> completed response consumed without replay.\n",
+        encoding="utf-8",
+    )
     response = MessageSnapshot(
         "assistant",
         "assistant-completed",
@@ -72,6 +84,48 @@ def test_completed_durable_response_is_consumed_before_cross_endpoint_recovery(t
     assert child["target_role"] == "TEST"
     record = ledger.get(completed["request_id"])
     assert record is not None and record.status is RequestStatus.COMPLETED
+    assert record.attempts == 1
+
+
+def test_recovery_final_send_payload_and_persisted_receipt_stay_bounded(tmp_path: Path):
+    store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-bounded-recovery-send"
+    )
+    state["task_text"] = "ORIGINAL_TASK_DETAIL " * 5000
+    old_endpoint = store.endpoints.resolve()["endpoint_id"]
+    new_endpoint = store.endpoints.add("9202")["endpoint_id"]
+    role = state["roles"]["PLAN"]
+    role.update(
+        browser_endpoint_id=old_endpoint,
+        page_id="old-page",
+        page_url="https://chatgpt.com/c/old",
+        online=False,
+    )
+
+    assert worker._prepare_cross_endpoint_recovery(
+        state, new_endpoint, reason="old endpoint offline"
+    ) is True
+    recovery = _active_hop(state)
+
+    class RecoveryActions(FakeActions):
+        async def locate_owned(self, current_state, current_role):
+            return await self.acquire(current_state, current_role)
+
+    asyncio.run(worker._pre_send(state, recovery, RecoveryActions()))
+    prompt = str(recovery["prompt"])
+
+    assert len(prompt) <= 24000
+    assert prompt.count("ORIGINAL_TASK_DETAIL") < 100
+    role["page_id"] = "page-PLAN"
+    role["page_url"] = "https://chatgpt.com/c/cdpa-send"
+    client = RecordingCDPASendClient(task_id=state["task_id"], team=state["team"])
+    asyncio.run(worker._sending(state, recovery, RecordingCDPASendActions(client)))
+
+    record = RequestLedger(recovery["ledger_path"]).get(recovery["request_id"])
+    assert client.send_calls == [prompt]
+    assert recovery["receipt"]["prompt"] == prompt
+    assert record is not None
+    assert record.rendered_prompt == prompt
     assert record.attempts == 1
 
 

@@ -177,6 +177,8 @@ def test_retry_queues_continuation_but_does_not_block_presend():
     current = snapshot(retry_visible=True)
     assert step(current, {}).action is Action.REPAIR
     assert step(current, {}, phase="pre_send").reason == "ready"
+    dirty = snapshot(composer_text="stale target draft", attachment_markers=("stale.txt",))
+    assert step(dirty, {}, phase="pre_send").reason == "ready"
 
 
 def test_draft_prevents_repair_not_result_observation():

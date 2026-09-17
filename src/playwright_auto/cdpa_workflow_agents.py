@@ -135,8 +135,13 @@ def task_workflow_definitions(
         result[route_key] = definition
     if list(result) != list(roles):
         raise ValueError("workflow_agents keys must exactly match task role order")
-    if "PLAN" not in result:
+    workflow_mode = str(state.get("workflow_mode") or "team").strip().lower()
+    if workflow_mode not in {"team", "solo"}:
+        raise ValueError("workflow_mode must be team or solo")
+    if workflow_mode == "team" and "PLAN" not in result:
         raise ValueError("workflow task must include PLAN")
+    if workflow_mode == "solo" and len(result) != 1:
+        raise ValueError("solo workflow task must include exactly one role")
     return result
 
 
@@ -292,11 +297,16 @@ class WorkflowAgentCatalog:
                 self._load_unlocked(), route_key, include_deleted=include_deleted
             )
 
-    def resolve(self, route_keys: Sequence[str]) -> dict[str, dict[str, Any]]:
+    def resolve(
+        self,
+        route_keys: Sequence[str],
+        *,
+        require_plan: bool = True,
+    ) -> dict[str, dict[str, Any]]:
         requested = [validate_workflow_route_key(item) for item in route_keys]
         if len(set(requested)) != len(requested):
             raise ValueError("workflow roles must not contain duplicates")
-        if "PLAN" not in requested:
+        if require_plan and "PLAN" not in requested:
             raise ValueError("roles must include PLAN")
         with exclusive_file_lock(self.lock_path):
             value = self._load_unlocked()

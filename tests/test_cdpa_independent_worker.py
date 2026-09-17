@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from playwright_auto.cdpa_actions import AcquiredRole
 from playwright_auto.cdpa_config import load_cdpa_config
 from playwright_auto.cdpa_independent import (
@@ -14,6 +16,8 @@ from playwright_auto.cdpa_independent import (
 )
 from playwright_auto.cdpa_store import TaskStore
 from playwright_auto.cdpa_worker import CDPAWorker, _active_hop
+from playwright_auto.chatgpt import MessageBaseline, PageBinding, SendReceipt, prompt_digest
+from playwright_auto.durable import RequestLedger, RequestStatus
 
 from test_cdpa_core import write_config
 from test_cdpa_worker import FakeActions, ready_client
@@ -121,6 +125,65 @@ def test_temporary_independent_pre_send_opens_exact_fresh_url_and_ignores_saved_
     assert hop["state"] == "sending"
 
 
+def test_reacquired_independent_tab_invalidates_verified_idle_close_before_affinity_change(
+    tmp_path: Path,
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    pinned = store.endpoints.add("9212")
+    other = store.endpoints.add("9202")
+    agent = store.create_independent_agent(
+        "Pinned idle agent",
+        system_prompt="Inspect only.",
+        browser_endpoint_id=pinned["endpoint_id"],
+    )
+    saved_url = "https://chatgpt.com/c/saved-idle"
+
+    def mark_verified_closed(state):
+        state["roles"]["AGENT"].update(
+            page_id="saved-idle-page",
+            page_url=saved_url,
+            online=False,
+        )
+        state["independent"]["idle_tab_closed_at"] = "2026-09-14T00:00:00+00:00"
+        return state
+
+    closed = store.update(agent["manifest_path"], mark_verified_closed)
+    worker = CDPAWorker(config, store=store)
+    worker._record_acquired(
+        closed,
+        "AGENT",
+        AcquiredRole(
+            client=SimpleNamespace(),
+            page_id="reopened-idle-page",
+            url=saved_url,
+            created=False,
+            new_chat=False,
+        ),
+    )
+    reopened = store.save(closed["manifest_path"], closed)
+
+    assert reopened["roles"]["AGENT"]["online"] is True
+    assert reopened["independent"]["idle_tab_closed_at"] is None
+    with pytest.raises(ValueError, match="live tab"):
+        store.update_independent_agent(
+            reopened["manifest_path"],
+            browser_endpoint_id=other["endpoint_id"],
+        )
+
+    def mark_verified_closed_again(state):
+        state["roles"]["AGENT"]["online"] = False
+        state["independent"]["idle_tab_closed_at"] = "2026-09-14T00:01:00+00:00"
+        return state
+
+    reclosed = store.update(reopened["manifest_path"], mark_verified_closed_again)
+    moved = store.update_independent_agent(
+        reclosed["manifest_path"],
+        browser_endpoint_id=other["endpoint_id"],
+    )
+    assert moved["independent"]["browser_endpoint_id"] == other["endpoint_id"]
+
+
 def test_temporary_independent_continuation_reuses_current_owned_chat(tmp_path: Path):
     _config, store, _blocked, state, worker = setup_agent(tmp_path)
     state["independent"]["temporary_chat"] = True
@@ -173,6 +236,108 @@ def test_temporary_independent_continuation_reuses_current_owned_chat(tmp_path: 
     assert current_role["page_id"] == "temporary-page"
     assert current_role["page_url"] == "https://chatgpt.com/c/current-temporary"
     assert current_role["conversation_generation"] == 1
+
+
+def test_independent_accepted_send_cross_endpoint_recovery_uses_valid_job_kind_without_replay(
+    tmp_path: Path,
+):
+    _config, store, _blocked, state, worker = setup_agent(tmp_path)
+    state["independent"]["temporary_chat"] = True
+    old_endpoint = store.endpoints.resolve()["endpoint_id"]
+    new_endpoint = store.endpoints.add("9202")["endpoint_id"]
+    role = state["roles"]["AGENT"]
+    role.update(
+        browser_endpoint_id=old_endpoint,
+        page_id="lost-independent-page",
+        page_url="https://chatgpt.com/",
+        online=False,
+        conversation_generation=1,
+    )
+    hop = _active_hop(state)
+    original_request_id = hop["request_id"]
+    prompt = "accepted independent prompt"
+    baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
+    receipt = SendReceipt(
+        prompt=prompt,
+        prompt_sha256=prompt_digest(prompt),
+        binding=PageBinding("lost-independent-page", hop["physical_role"]),
+        baseline=baseline,
+        attempts=1,
+        accepted_via="user_message_identity",
+        session_id_before=None,
+        user_message_id="accepted-independent-user",
+        user_turn_id="accepted-independent-turn",
+    )
+    ledger = RequestLedger(hop["ledger_path"])
+    record = ledger.begin(
+        role=hop["physical_role"],
+        prompt=prompt,
+        request_id=original_request_id,
+        render_request_marker=False,
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=receipt.binding,
+        baseline=baseline,
+    )
+    ledger.update(
+        record.request_id,
+        status=RequestStatus.SENT,
+        accepted_at=1.0,
+        receipt=receipt.to_dict(),
+    )
+    hop.update(
+        prompt=prompt,
+        prompt_sha256=prompt_digest(prompt),
+        receipt=receipt.to_dict(),
+        state="waiting",
+        browser_endpoint_id=old_endpoint,
+    )
+
+    assert worker._prepare_cross_endpoint_recovery(
+        state,
+        new_endpoint,
+        reason="accepted independent endpoint lost",
+    ) is True
+
+    old_hop = state["hops"][0]
+    recovery = _active_hop(state)
+    assert old_hop["state"] == "abandoned"
+    assert old_hop["request_id"] == original_request_id
+    assert old_hop["receipt"] == receipt.to_dict()
+    assert recovery["kind"] == "independent_job"
+    assert recovery["recovery_of_request_id"] == original_request_id
+    assert recovery["request_id"] != original_request_id
+    assert role["browser_endpoint_id"] == new_endpoint
+    persisted = store.save(state["manifest_path"], state)
+    recovery = _active_hop(persisted)
+
+    class RecoveryActions(FakeActions):
+        async def locate_owned(self, *_args, **_kwargs):
+            return None
+
+        async def fresh_chat(self, current, logical_role, *, url):
+            assert url == "https://chatgpt.com/?temporary-chat=true"
+            return AcquiredRole(
+                client=ready_client(current, logical_role),
+                page_id="recovery-independent-page",
+                url=url,
+                created=True,
+                new_chat=True,
+            )
+
+    asyncio.run(worker._pre_send(persisted, recovery, RecoveryActions()))
+
+    assert recovery["state"] == "sending"
+    assert "RECOVERY_SNAPSHOT" in recovery["prompt"]
+    assert original_request_id in recovery["prompt"]
+    assert "do not replay the prior accepted prompt" in recovery["prompt"].lower()
+    original_record = ledger.get(original_request_id)
+    assert original_record is not None
+    assert original_record.status is RequestStatus.SENT
+    assert original_record.attempts == 1
 
 
 def test_independent_pre_send_uses_shared_prompt_without_route_contract(tmp_path: Path):

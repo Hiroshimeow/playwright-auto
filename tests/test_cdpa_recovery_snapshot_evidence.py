@@ -57,8 +57,29 @@ def test_snapshot_records_latest_effective_goal_and_validation_errors(tmp_path):
     hop['validation_error'] = 'last report failed test evidence check'
     snapshot = worker._build_execution_recovery_snapshot(state, hop, reason='offline')
     assert snapshot['task']['goal'] == 'Finish only the remaining verification'
-    assert snapshot['task']['original_task'] == state['task_text']
+    assert 'original_task' not in snapshot['task']
+    assert snapshot['task']['task_text_ref'].endswith('#task_text')
     assert snapshot['validation']['error'] == hop['validation_error']
+
+
+def test_large_recovery_snapshot_has_hard_total_bound_and_references_task_text(tmp_path):
+    _, state, worker, _, hop, _, _ = _prepare_sent_waiting_task(tmp_path, task_id='large-recovery-snapshot')
+    state['task_text'] = 'ORIGINAL_TASK_DETAIL ' * 5000
+    hop['response'] = 'ASSISTANT_PROGRESS ' * 5000
+    hop['wait']['last_assistant_progress'] = {'text': 'PROGRESS_DETAIL ' * 5000}
+
+    snapshot = worker._build_execution_recovery_snapshot(state, hop, reason='endpoint unavailable')
+    encoded = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+
+    assert len(encoded) <= 12000
+    assert encoded.count('ORIGINAL_TASK_DETAIL') < 60
+    assert 'original_task' not in snapshot['task']
+    assert snapshot['task']['task_text_ref'].endswith('#task_text')
+    assert len(snapshot['task']['goal']) <= 1000
+    assert snapshot['send_provenance']['classification'] == 'accepted_or_ambiguous'
+    receipt = snapshot['send_provenance']['receipt']
+    assert receipt is not None
+    assert {'prompt_sha256', 'binding', 'user_message_id', 'user_turn_id', 'attempts'} <= set(receipt)
 
 
 def test_last_useful_progress_is_bounded_and_survives_a_lost_document():

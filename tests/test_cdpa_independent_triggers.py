@@ -8,6 +8,7 @@ import pytest
 from playwright_auto.cdpa_independent import (
     canonical_independent_events,
     claim_oldest_event,
+    record_consumed_event,
     validate_trigger_settings,
 )
 
@@ -367,3 +368,60 @@ def test_role_completed_respects_selected_teams_and_preserves_global_and_dedup()
         for item in global_events
         if item["trigger_type"] == "role_completed"
     ] == ["task-foreign-role", "task-wanted-role"]
+
+
+def test_monitor_emits_fixable_operational_anomaly_without_waiting_for_check_all():
+    current = agent(name="Monitor", recovery=False)
+    current["independent"]["trigger_settings"] = validate_trigger_settings(
+        {"interval_minutes": 30, "check_all": True}
+    )
+    target = workflow(
+        "task-offline",
+        team="offline-team",
+        status="BLOCKED",
+        updated_at="2026-09-14T03:00:00+00:00",
+        block_code="role_offline",
+        block_reason="offline-team-dev tab is offline",
+    )
+    target["blocked_at"] = "2026-09-14T03:00:00+00:00"
+    target["request_ledger"] = {"request_id": "req-1", "state": "accepted", "send_count": 1}
+    before = deepcopy(target)
+
+    events = canonical_independent_events(
+        current,
+        [target, current],
+        now=datetime.fromisoformat("2026-09-14T03:00:01+00:00"),
+    )
+
+    anomalies = [item for item in events if item["trigger_type"] == "operational_anomaly"]
+    assert len(anomalies) == 1
+    assert anomalies[0]["target_task_id"] == "task-offline"
+    assert target == before
+
+
+def test_consumed_operational_anomaly_dedupes_while_check_all_remains_fallback():
+    current = agent(name="Monitor", recovery=False)
+    current["independent"]["trigger_settings"] = validate_trigger_settings(
+        {"interval_minutes": 30, "check_all": True}
+    )
+    target = workflow(
+        "task-queue-error",
+        team="queue-team",
+        status="WAITING",
+        updated_at="2026-09-14T03:00:00+00:00",
+    )
+    target.update(
+        waiting_code="queue_release_failed",
+        waiting_reason="queue release failed",
+        waiting={"reason": "queue_release_failed", "since": "2026-09-14T03:00:00+00:00"},
+    )
+    now = datetime.fromisoformat("2026-09-14T03:30:00+00:00")
+    first = canonical_independent_events(current, [target, current], now=now)
+    anomaly = next(item for item in first if item["trigger_type"] == "operational_anomaly")
+
+    seen = deepcopy(current)
+    record_consumed_event(seen["independent"], anomaly)
+    second = canonical_independent_events(seen, [target, seen], now=now)
+
+    assert not [item for item in second if item["trigger_type"] == "operational_anomaly"]
+    assert [item for item in second if item["trigger_type"] == "check_all"]
