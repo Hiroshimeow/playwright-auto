@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import random
 import re
 import time
@@ -28,6 +29,7 @@ ROLE_STORAGE_KEY = "playwright-auto:role"
 PAGE_ID_STORAGE_KEY = "playwright-auto:page-id"
 TASK_ID_STORAGE_KEY = "playwright-auto:task-id"
 TEAM_STORAGE_KEY = "playwright-auto:team"
+BINDING_ID_STORAGE_KEY = "playwright-auto:binding-id"
 ATTACHMENT_OWNERSHIP_WINDOW_KEY = "__playwrightAutoAttachmentOwnershipV1"
 
 SELECTORS = {
@@ -1272,6 +1274,9 @@ class WaitProbe:
     response_activity_tail: str
     response_activity_turn_id: str | None
     retry_visible: bool = False
+    last_user_text: str = ""
+    assistant_text: str = ""
+    response_activity_text: str = ""
 
     @property
     def composer_empty(self) -> bool:
@@ -1323,6 +1328,9 @@ class WaitProbe:
             "response_activity_tail": self.response_activity_tail,
             "response_activity_turn_id": self.response_activity_turn_id,
             "retry_visible": self.retry_visible,
+            "last_user_text": self.last_user_text,
+            "assistant_text": self.assistant_text,
+            "response_activity_text": self.response_activity_text,
         }
 
     @property
@@ -2758,7 +2766,10 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
           const retry = firstVisible('[data-testid="regenerate-thread-error-button"]');
           const activeResponse = latest('[data-streaming-response-status]');
           const lastUser = latest('[data-message-author-role="user"][data-message-id]');
-          const lastAssistant = latest('[data-message-author-role="assistant"][data-message-id]');
+          const assistantNodes = [...document.querySelectorAll('[data-message-author-role="assistant"][data-message-id]')]
+            .filter(visible);
+          const lastAssistant = assistantNodes.filter((element) => textShape(element).length > 0).at(-1)
+            || assistantNodes.at(-1) || null;
           const userIdentity = identity(lastUser);
           const assistantIdentity = identity(lastAssistant);
           const assistantShape = textShape(lastAssistant);
@@ -2866,6 +2877,9 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             response_activity_length: activityShape.length,
             response_activity_tail: activityShape.tail,
             response_activity_turn_id: activeResponse?.closest('[data-turn-id]')?.getAttribute('data-turn-id') || null,
+            last_user_text: boundedText(lastUser, 12000),
+            assistant_text: boundedText(lastAssistant, 24000),
+            response_activity_text: boundedText(activeResponse, 24000),
           };
           };
           const transitionSignature = (probe) => JSON.stringify([
@@ -3048,6 +3062,9 @@ async def inspect_chatgpt_wait_probe(
         response_activity_tail=str(raw.get("response_activity_tail") or ""),
         response_activity_turn_id=(str(raw["response_activity_turn_id"]) if raw.get("response_activity_turn_id") else None),
         retry_visible=bool(raw.get("retry_visible")),
+        last_user_text=str(raw.get("last_user_text") or ""),
+        assistant_text=str(raw.get("assistant_text") or ""),
+        response_activity_text=str(raw.get("response_activity_text") or ""),
     )
 
 
@@ -3395,6 +3412,69 @@ class ChatGPTPage:
             "full_snapshot_reasons": {},
         }
 
+    async def observe_session_tool_capability(
+        self, *, requirement: Mapping[str, Any], phase: str
+    ) -> dict[str, Any]:
+        """Observe the exact owned page, without sending a probe or trusting chat prose.
+
+        The current web UI exposes composer controls, not a session-bound MCP
+        device/operation authorization attestation. Report that real limitation;
+        never echo requested device/account/operations as observed READY evidence.
+        """
+        from datetime import datetime, timezone
+        from urllib.parse import urlsplit
+
+        snapshot = await self.assert_ownership()
+        base = {
+            **dict(requirement),
+            "status": "unknown", "target_device_id": None,
+            "principal_scope": None, "project_binding": None,
+            "required_operations": [],
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "session_revision": "",
+            "evidence_ref": "live_page_dom:session_target_operations_unobservable",
+            "reason_code": "session_tool_visibility_unknown",
+        }
+        try:
+            live = await asyncio.wait_for(self.page.evaluate("""() => ({
+                url: location.href,
+                time_origin: performance.timeOrigin,
+                ready: document.readyState,
+                composer_present: !!document.querySelector('#prompt-textarea'),
+                controls: [...document.querySelectorAll('form button, form [role="button"]')]
+                  .filter(e => e.getClientRects().length)
+                  .slice(0,40).map(e => ({
+                    testid: e.getAttribute('data-testid'),
+                    label: (e.getAttribute('aria-label') || '').slice(0,120)
+                  }))
+            })"""), timeout=min(self.timeout_ms / 1000, 5.0))
+        except Exception as exc:
+            base["reason_detail"] = f"Exact page probe failed: {type(exc).__name__}; no capability evidence was assumed."
+            return base
+        if not isinstance(live, Mapping):
+            base["reason_detail"] = "Exact page probe returned no structured DOM observation."
+            return base
+        observed_url = str(live.get("url") or "")
+        path = urlsplit(observed_url).path
+        base["conversation_id"] = path if path.startswith('/c/') else f"WEB:{snapshot.page_id}"
+        origin = live.get("time_origin")
+        base["session_revision"] = f"{snapshot.page_id}:{origin}" if origin is not None else ""
+        if observed_url != str(snapshot.url):
+            base["reason_detail"] = "Page navigated during observation; exact-session capability is unknown."
+            return base
+        if snapshot.requires_login:
+            base["status"] = "unavailable"
+            base["reason_code"] = "tool_authorization_failed"
+            base["reason_detail"] = "The exact owned page requires authentication."
+            return base
+        base["reason_detail"] = (
+            f"Owned page observed during {phase}; composer_present={bool(live.get('composer_present'))}. "
+            "The observed web UI provides no authenticated session-bound connector function list, "
+            "stable target device, account/project scope or operation grants. Composer labels, "
+            "conversation text and external gateway health are not authorization evidence."
+        )
+        return base
+
     def _remove_frontend_identity_listener(self) -> None:
         listener = self._frontend_identity_listener
         self._frontend_identity_listener = None
@@ -3674,7 +3754,11 @@ class ChatGPTPage:
         )
         if assistant_changed and not probe.stop_visible and not probe.transport_active:
             return "assistant_changed_without_transport"
-        if (time.monotonic() - self._wait_full_snapshot_at) * 1000 >= safety_interval_ms:
+        if (
+            safety_interval_ms is not None
+            and safety_interval_ms > 0
+            and (time.monotonic() - self._wait_full_snapshot_at) * 1000 >= safety_interval_ms
+        ):
             return "safety_interval"
         return None
 
@@ -3725,7 +3809,7 @@ class ChatGPTPage:
         *,
         force_full: bool = False,
         probe_wait_ms: int = 0,
-        safety_interval_ms: int = 600_000,
+        safety_interval_ms: int | None = None,
     ) -> ChatGPTSnapshot:
         return await asyncio.wait_for(
             self._wait_snapshot_within_budget(
@@ -3743,7 +3827,7 @@ class ChatGPTPage:
         *,
         force_full: bool = False,
         probe_wait_ms: int = 0,
-        safety_interval_ms: int = 600_000,
+        safety_interval_ms: int | None = None,
     ) -> ChatGPTSnapshot:
         key = self._wait_key(receipt)
         if key != self._wait_receipt_key:
@@ -3788,6 +3872,43 @@ class ChatGPTPage:
                     values=values,
                     detail=("initial probe" if previous_probe is None else None),
                 )
+            if probe.last_user_message_id and probe.last_user_text:
+                append_live_event(
+                    "TRANSCRIPT", "message",
+                    page_url=probe.url, page_id=probe.page_id, role=probe.page_role,
+                    task_id=probe.page_task_id, team=probe.page_team,
+                    values={
+                        "author": "user", "message_id": probe.last_user_message_id,
+                        "turn_id": probe.last_user_turn_id, "text": probe.last_user_text,
+                        "text_length": len(probe.last_user_text), "complete": True,
+                    },
+                )
+            if probe.last_assistant_message_id and probe.assistant_text:
+                append_live_event(
+                    "TRANSCRIPT", "message",
+                    page_url=probe.url, page_id=probe.page_id, role=probe.page_role,
+                    task_id=probe.page_task_id, team=probe.page_team,
+                    values={
+                        "author": "assistant", "message_id": probe.last_assistant_message_id,
+                        "turn_id": probe.last_assistant_turn_id, "text": probe.assistant_text,
+                        "text_length": probe.assistant_text_length,
+                        "complete": not (probe.stop_visible or probe.transport_active),
+                    },
+                )
+            elif probe.response_activity_turn_id and probe.response_activity_text:
+                append_live_event(
+                    "TRANSCRIPT", "message",
+                    page_url=probe.url, page_id=probe.page_id, role=probe.page_role,
+                    task_id=probe.page_task_id, team=probe.page_team,
+                    values={
+                        "author": "assistant",
+                        "message_id": "activity:" + probe.response_activity_turn_id,
+                        "turn_id": probe.response_activity_turn_id,
+                        "text": probe.response_activity_text,
+                        "text_length": probe.response_activity_length,
+                        "complete": False,
+                    },
+                )
         except (AuthenticationRequiredError, PageOwnershipError):
             raise
         except Exception:
@@ -3806,6 +3927,42 @@ class ChatGPTPage:
             self._wait_metrics["full_snapshots"] += 1
             reasons = self._wait_metrics["full_snapshot_reasons"]
             reasons[reason] = int(reasons.get(reason, 0)) + 1
+            latest_assistant_message_id = next(
+                (
+                    item.message_id
+                    for item in reversed(full.messages)
+                    if item.role == "assistant" and str(item.text or "").strip()
+                ),
+                None,
+            )
+            for message in tuple(full.messages)[-24:]:
+                text = str(message.text or "")
+                if not text.strip():
+                    continue
+                append_live_event(
+                    "TRANSCRIPT", "message",
+                    page_url=full.url, page_id=full.page_id, role=full.page_role,
+                    task_id=full.page_task_id, team=full.page_team,
+                    values={
+                        "author": message.role, "message_id": message.message_id,
+                        "turn_id": message.turn_id, "text": text[:24000],
+                        "text_length": len(text),
+                        "complete": not (
+                            message.role == "assistant"
+                            and (
+                                (
+                                    full.response_activity_turn_id
+                                    and message.turn_id == full.response_activity_turn_id
+                                )
+                                or (
+                                    not full.response_activity_turn_id
+                                    and full.stop_visible
+                                    and message.message_id == latest_assistant_message_id
+                                )
+                            )
+                        ),
+                    },
+                )
             if probe is None:
                 self._wait_probe = WaitProbe(
                     url=full.url,
@@ -3835,6 +3992,9 @@ class ChatGPTPage:
                     response_activity_length=full.response_activity_length,
                     response_activity_tail=full.response_activity_text[-160:],
                     response_activity_turn_id=full.response_activity_turn_id,
+                    last_user_text=next((item.text[:12000] for item in reversed(full.messages) if item.role == "user"), ""),
+                    assistant_text=next((item.text[:24000] for item in reversed(full.messages) if item.role == "assistant" and str(item.text or "").strip()), ""),
+                    response_activity_text=full.response_activity_text[:24000],
                 )
             else:
                 self._wait_probe = probe
@@ -4092,7 +4252,13 @@ class ChatGPTPage:
         while time.monotonic() < deadline:
             try:
                 last_snapshot = await self.assert_ownership()
-            except PageOwnershipError:
+            except (
+                PageOwnershipError,
+                AuthenticationRequiredError,
+                ComposerConflictError,
+                ManualInputPendingError,
+                ChoicePromptBlockedError,
+            ):
                 raise
             except Exception as exc:
                 last_error = exc
@@ -4130,6 +4296,13 @@ class ChatGPTPage:
                 f"choice prompt is still pending: {list(last_snapshot.choice_prompt_labels)!r}"
             )
         if last_error is not None:
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+            if isinstance(last_error, (TimeoutError, PlaywrightTimeoutError)):
+                raise type(last_error)(
+                    "clean-ready check failed after transient timeout: "
+                    f"{type(last_error).__name__}: {last_error}"
+                ) from last_error
             raise RuntimeError(
                 f"clean-ready check failed after transient errors: "
                 f"{type(last_error).__name__}: {last_error}"
@@ -4295,12 +4468,16 @@ class ChatGPTPage:
         role: str,
         task_id: str,
         team: str,
+        binding_id: str | None = None,
     ) -> ChatGPTSnapshot:
         """Restore an exact closed-tab identity on its reopened conversation page."""
         page_id = str(page_id).strip()
         role = validate_page_role(role)
         task_id = str(task_id).strip()
         team = str(team).strip()
+        binding_id = str(binding_id or "").strip() or None
+        if binding_id is not None and len(binding_id) > 256:
+            raise ValueError("binding_id must be at most 256 characters")
         if not page_id or len(page_id) > 256:
             raise ValueError("page_id must contain 1-256 characters")
         if not task_id or len(task_id) > 256:
@@ -4309,17 +4486,19 @@ class ChatGPTPage:
             raise ValueError("team must match [A-Za-z0-9][A-Za-z0-9_-]{0,63}")
         async with self.mutation_guard():
             await self.page.evaluate(
-                """([roleKey, pageIdKey, taskIdKey, teamKey, windowNamePrefix,
-                       role, pageId, taskId, team]) => {
+                """([roleKey, pageIdKey, taskIdKey, teamKey, bindingIdKey, windowNamePrefix,
+                       role, pageId, taskId, team, bindingId]) => {
                   sessionStorage.setItem(roleKey, role);
                   sessionStorage.setItem(pageIdKey, pageId);
                   sessionStorage.setItem(taskIdKey, taskId);
                   sessionStorage.setItem(teamKey, team);
+                  if (bindingId) sessionStorage.setItem(bindingIdKey, bindingId);
                   window.name = windowNamePrefix + JSON.stringify({
                     role,
                     pageId,
                     taskId,
                     team,
+                    bindingId: bindingId || sessionStorage.getItem(bindingIdKey) || null,
                   });
                 }""",
                 [
@@ -4327,11 +4506,13 @@ class ChatGPTPage:
                     PAGE_ID_STORAGE_KEY,
                     TASK_ID_STORAGE_KEY,
                     TEAM_STORAGE_KEY,
+                    BINDING_ID_STORAGE_KEY,
                     WINDOW_NAME_PREFIX,
                     role,
                     page_id,
                     task_id,
                     team,
+                    binding_id,
                 ],
             )
             self.binding = PageBinding(page_id, role)
@@ -4352,10 +4533,14 @@ class ChatGPTPage:
         task_id: str,
         team: str,
         *,
+        binding_id: str | None = None,
         timeout_ms: int | None = None,
     ) -> dict[str, str]:
         task_id = str(task_id).strip()
         team = str(team).strip()
+        binding_id = str(binding_id or "").strip() or None
+        if binding_id is not None and len(binding_id) > 256:
+            raise ValueError("binding_id must be at most 256 characters")
         if not task_id or len(task_id) > 256:
             raise ValueError("task_id must contain 1-256 characters")
         if not _TEAM_PATTERN.fullmatch(team):
@@ -4363,7 +4548,11 @@ class ChatGPTPage:
         timeout = timeout_ms or self.timeout_ms
         async with self.mutation_guard():
             snapshot = await self.assert_ownership()
-            if snapshot.page_task_id == task_id and snapshot.page_team == team:
+            if (
+                snapshot.page_task_id == task_id
+                and snapshot.page_team == team
+                and binding_id is None
+            ):
                 return {"task_id": task_id, "team": team}
             if snapshot.manual_input_pending:
                 raise ComposerConflictError(
@@ -4371,7 +4560,7 @@ class ChatGPTPage:
                 )
             self._assert_interaction_safe(snapshot)
             write_result = await self.page.evaluate(
-                """([taskIdKey, taskId, teamKey, team, windowNamePrefix]) => {
+                """([taskIdKey, taskId, teamKey, team, bindingIdKey, bindingId, windowNamePrefix]) => {
                   const visible = (element) => Boolean(
                     element && (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
                   );
@@ -4415,6 +4604,7 @@ class ChatGPTPage:
                   }
                   sessionStorage.setItem(taskIdKey, taskId);
                   sessionStorage.setItem(teamKey, team);
+                  if (bindingId) sessionStorage.setItem(bindingIdKey, bindingId);
                   let binding = {};
                   if (window.name?.startsWith(windowNamePrefix)) {
                     try {
@@ -4428,6 +4618,7 @@ class ChatGPTPage:
                     pageId: binding.pageId || sessionStorage.getItem('playwright-auto:page-id'),
                     taskId,
                     team,
+                    bindingId: bindingId || sessionStorage.getItem(bindingIdKey) || null,
                   });
                   return {written: true};
                 }""",
@@ -4436,6 +4627,8 @@ class ChatGPTPage:
                     task_id,
                     TEAM_STORAGE_KEY,
                     team,
+                    BINDING_ID_STORAGE_KEY,
+                    binding_id,
                     WINDOW_NAME_PREFIX,
                 ],
             )
@@ -4826,6 +5019,8 @@ class ChatGPTPage:
         allow_responding: bool = True,
         timeout_ms: int | None = None,
     ) -> None:
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
         timeout = timeout_ms or self.timeout_ms
         async with self.mutation_guard():
             before = await self.assert_ownership(require_binding=self.binding is not None)
@@ -4833,8 +5028,89 @@ class ChatGPTPage:
                 raise UnsafePageStateError("refusing to refresh an active response")
             if before.manual_input_pending:
                 raise ComposerConflictError("refresh would discard a manual draft or attachments")
-            await refresh_page(self.page, timeout_ms=timeout)
-            await self.assert_ownership(require_binding=self.binding is not None)
+            observation_timeout = max(min(timeout, 2_000), 1) / 1000
+            before_document = await asyncio.wait_for(
+                self.page.evaluate(
+                    """() => ({
+                        url: location.href,
+                        time_origin: performance.timeOrigin,
+                        ready_state: document.readyState
+                    })"""
+                ),
+                timeout=observation_timeout,
+            )
+            try:
+                await refresh_page(self.page, timeout_ms=timeout)
+            except (TimeoutError, PlaywrightTimeoutError) as reload_error:
+                async def verify_committed_reload() -> bool:
+                    after = await self.assert_ownership(
+                        require_binding=self.binding is not None
+                    )
+                    after_document = await self.page.evaluate(
+                        """() => ({
+                            url: location.href,
+                            time_origin: performance.timeOrigin,
+                            ready_state: document.readyState
+                        })"""
+                    )
+                    exact_identity = (
+                        after.page_id == before.page_id
+                        and after.page_role == before.page_role
+                        and after.page_task_id == before.page_task_id
+                        and after.page_team == before.page_team
+                        and after.session_id == before.session_id
+                        and after.url == before.url
+                    )
+                    before_origin = (
+                        before_document.get("time_origin")
+                        if isinstance(before_document, Mapping)
+                        else None
+                    )
+                    after_origin = (
+                        after_document.get("time_origin")
+                        if isinstance(after_document, Mapping)
+                        else None
+                    )
+                    origins_valid = (
+                        isinstance(before_origin, (int, float))
+                        and not isinstance(before_origin, bool)
+                        and math.isfinite(float(before_origin))
+                        and isinstance(after_origin, (int, float))
+                        and not isinstance(after_origin, bool)
+                        and math.isfinite(float(after_origin))
+                    )
+                    committed = (
+                        origins_valid
+                        and after_document.get("url") == before_document.get("url")
+                        and after_origin != before_origin
+                    )
+                    usable = (
+                        str(after_document.get("ready_state") or "")
+                        in {"interactive", "complete"}
+                        and not after.requires_login
+                        and (
+                            after.composer_present
+                            or after.stop_visible
+                            or bool(after.messages)
+                            or after.choice_prompt_pending
+                        )
+                    )
+                    return exact_identity and committed and usable
+
+                try:
+                    verified = await asyncio.wait_for(
+                        verify_committed_reload(), timeout=observation_timeout
+                    )
+                except (TimeoutError, PlaywrightTimeoutError) as post_error:
+                    raise reload_error from post_error
+                except (PageOwnershipError, AuthenticationRequiredError):
+                    raise reload_error
+                except Exception as post_error:
+                    raise reload_error from post_error
+                if not verified:
+                    raise reload_error
+            else:
+                await self.assert_ownership(require_binding=self.binding is not None)
             self._owned_composer_text = None
 
     async def _wait_send_acceptance(
@@ -5049,13 +5325,83 @@ class ChatGPTPage:
                     last_error = exc
                     if attempt >= max_attempts or not recovery_reload:
                         break
-                    await refresh_page(self.page, timeout_ms=timeout)
-                    recovered = await self.assert_ownership()
-                    acceptance = await self._wait_send_acceptance(
-                        baseline,
-                        prompt,
-                        timeout_ms=min(timeout, 1_500),
+                    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+                    # Already under mutation_guard: calling refresh() would deadlock.
+                    # A timed-out reload may have committed; reconcile only exact
+                    # acceptance in that new document, never authorize another click.
+                    recovery_before = await self.assert_ownership()
+                    recovered_text = normalize_visible_text(recovery_before.composer_text)
+                    if recovered_text not in {"", normalize_visible_text(prompt)} or recovery_before.attachment_markers:
+                        raise ComposerConflictError(
+                            "reload would discard manual input or attachments"
+                        ) from exc
+                    probe = """() => ({url: location.href,
+                        time_origin: performance.timeOrigin,
+                        ready_state: document.readyState})"""
+                    probe_timeout = max(min(timeout, 2_000), 1) / 1000
+                    document_before = await asyncio.wait_for(
+                        self.page.evaluate(probe), timeout=probe_timeout
                     )
+                    try:
+                        await refresh_page(self.page, timeout_ms=timeout)
+                    except (TimeoutError, PlaywrightTimeoutError) as reload_error:
+                        async def reconcile_committed_acceptance():
+                            recovered = await self.assert_ownership()
+                            document_after = await self.page.evaluate(probe)
+                            if not isinstance(document_before, Mapping) or not isinstance(document_after, Mapping):
+                                return None
+                            origins = (document_before.get("time_origin"), document_after.get("time_origin"))
+                            if not all(
+                                isinstance(value, (int, float)) and not isinstance(value, bool)
+                                and math.isfinite(float(value)) for value in origins
+                            ) or origins[0] == origins[1]:
+                                return None
+                            if (document_before.get("url") != recovery_before.url
+                                    or document_after.get("url") != recovered.url
+                                    or document_after.get("ready_state") not in {"interactive", "complete"}
+                                    or recovered.requires_login):
+                                return None
+                            if any(
+                                getattr(recovered, field) != getattr(before, field)
+                                or getattr(recovery_before, field) != getattr(before, field)
+                                for field in ("page_id", "page_role", "page_task_id", "page_team")
+                            ):
+                                return None
+                            candidate = unique_new_user_message(recovered.messages, baseline)
+                            if candidate is None or not visible_text_matches(candidate.text, prompt):
+                                return None
+                            # Only the existing provisional new-chat identity may
+                            # canonicalize, and only with the exact new user turn.
+                            for prior in (before, recovery_before):
+                                exact = recovered.url == prior.url and recovered.session_id == prior.session_id
+                                canonicalized = (
+                                    str(prior.session_id or "").startswith("WEB:")
+                                    and urlparse(prior.url).hostname == urlparse(recovered.url).hostname
+                                    and urlparse(prior.url).path in {"", "/"}
+                                    and urlparse(recovered.url).path.startswith("/c/")
+                                    and recovered.session_id == extract_session_id(recovered.url)
+                                )
+                                if not (exact or canonicalized):
+                                    return None
+                            return recovered, ("exact_user_message", candidate)
+
+                        try:
+                            reconciled = await asyncio.wait_for(
+                                reconcile_committed_acceptance(), timeout=probe_timeout
+                            )
+                        except Exception as post_error:
+                            raise reload_error from post_error
+                        if reconciled is None:
+                            raise reload_error
+                        recovered, acceptance = reconciled
+                    else:
+                        recovered = await self.assert_ownership()
+                        acceptance = await self._wait_send_acceptance(
+                            baseline,
+                            prompt,
+                            timeout_ms=min(timeout, 1_500),
+                        )
                     if acceptance is not None:
                         accepted_via, accepted_user = acceptance
                         return SendReceipt(
@@ -5086,6 +5432,9 @@ class ChatGPTPage:
                         )
                     except ComposerConflictError as conflict:
                         raise conflict from exc
+                    # A missing post-reload user turn is not proof of rejection.
+                    # Preserve ambiguity for durable reconciliation, never click twice.
+                    break
 
             raise SendRecoveryError(
                 f"send failed after {max_attempts} exact attempt(s): "
@@ -5221,9 +5570,7 @@ class ChatGPTPage:
                     assistant_fingerprint != before_assistant_fingerprint
                 )
                 activity_progress = any(activity) and activity != before_activity
-                transport_active = bool(
-                    current.stop_visible or current.response_activity_turn_id
-                )
+                transport_active = bool(current.stop_visible)
                 if transport_active or assistant_progress or activity_progress:
                     self.invalidate_wait_cache()
                     return {

@@ -525,6 +525,20 @@ a.role-url-action { display: inline-flex; align-items: center; }
 .live-audit-identity strong { font-size: .75rem; }
 .live-audit-identity span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 500 .6rem/1.25 ui-monospace, SFMono-Regular, Consolas, monospace; }
 .live-audit-help { margin: 0; color: var(--muted-strong); font-size: .64rem; line-height: 1.45; }
+.live-transcript-list { display: grid; gap: .55rem; }
+.live-transcript-message { min-width: 0; padding: .62rem .7rem; border: 1px solid var(--line); border-radius: 9px; background: #0a0f15; }
+.live-transcript-message.transcript-user { border-left: 3px solid #53657a; }
+.live-transcript-message.transcript-assistant { border-left: 3px solid #788ba3; }
+.live-transcript-head { display: flex; align-items: center; gap: .55rem; margin-bottom: .4rem; }
+.live-transcript-head strong { font-size: .62rem; letter-spacing: .04em; }
+.live-transcript-head time { margin-left: auto; color: var(--muted); font-size: .58rem; white-space: nowrap; }
+.transcript-state { padding: .08rem .28rem; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: .52rem; }
+.transcript-state.streaming { color: #c6a768; }
+.live-transcript-text { margin: 0; max-height: 34rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 500 .66rem/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; color: var(--text); }
+.live-transcript-truncated { margin: .35rem 0 0; font-size: .56rem; }
+.live-audit-signals { border-top: 1px solid var(--line); padding-top: .5rem; }
+.live-audit-signals > summary { cursor: pointer; color: var(--muted-strong); font-size: .64rem; font-weight: 650; }
+.live-audit-signals-body { display: grid; gap: .55rem; padding-top: .55rem; }
 .live-legend { display: flex; gap: .35rem; flex-wrap: wrap; }
 .live-source { display: inline-flex; align-items: center; gap: .28rem; min-height: 20px; padding: .12rem .36rem; border: 1px solid currentColor; border-radius: 999px; font-size: .54rem; font-weight: 800; letter-spacing: .05em; }
 .live-source b { min-width: 1.3em; color: var(--text); font-size: .56rem; font-variant-numeric: tabular-nums; text-align: right; }

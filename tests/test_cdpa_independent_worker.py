@@ -104,7 +104,8 @@ def test_temporary_independent_pre_send_opens_exact_fresh_url_and_ignores_saved_
         async def new_chat(self, *_args, **_kwargs):
             raise AssertionError("temporary chat must use the exact temporary URL")
 
-        async def fresh_chat(self, current, logical_role, *, url):
+        async def fresh_chat(self, current, logical_role, *, url, clean_for_send=False):
+            assert clean_for_send is True
             self.fresh_urls.append(url)
             record = current["roles"][logical_role]
             acquired = await FakeActions.acquire(self, current, logical_role)
@@ -318,7 +319,8 @@ def test_independent_accepted_send_cross_endpoint_recovery_uses_valid_job_kind_w
         async def locate_owned(self, *_args, **_kwargs):
             return None
 
-        async def fresh_chat(self, current, logical_role, *, url):
+        async def fresh_chat(self, current, logical_role, *, url, clean_for_send=False):
+            assert clean_for_send is True
             assert url == "https://chatgpt.com/?temporary-chat=true"
             return AcquiredRole(
                 client=ready_client(current, logical_role),
@@ -333,7 +335,7 @@ def test_independent_accepted_send_cross_endpoint_recovery_uses_valid_job_kind_w
     assert recovery["state"] == "sending"
     assert "RECOVERY_SNAPSHOT" in recovery["prompt"]
     assert original_request_id in recovery["prompt"]
-    assert "do not replay the prior accepted prompt" in recovery["prompt"].lower()
+    assert "never replay the accepted original request" in recovery["prompt"].lower()
     original_record = ledger.get(original_request_id)
     assert original_record is not None
     assert original_record.status is RequestStatus.SENT

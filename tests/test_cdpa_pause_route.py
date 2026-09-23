@@ -316,6 +316,55 @@ def test_runtime_resume_command_finishes_when_role_pause_control_is_applied(
     assert source_record.attempts == 1
 
 
+def test_recovery_resume_releases_routed_team_pause_after_report_repair(tmp_path: Path):
+    _store, state, worker, _path, source = _prepare_pause_response(
+        tmp_path, task_id="task-routed-pause-recovery", role="PLAN"
+    )
+    worker._responded(state, source)
+    assert state["status"] == "PAUSED"
+    assert source["state"] == "routed"
+    assert source["route"] == "PAUSE"
+    source_request_id = source["request_id"]
+    source_handoff = source["report_path"]
+
+    # Reproduce the live race: the report/route is already durably valid, but an
+    # earlier recovery attempt left the task operationally BLOCKED before Resume
+    # reaches the recovery controller.
+    state["status"] = "BLOCKED"
+    state["kanban_column"] = "BLOCKED"
+    state["block_code"] = "execution_recovery_requires_reconciliation"
+    state["block_retryable"] = False
+    state["block_reason"] = "reconcile request and page-owned effects"
+    state["active_action"] = "blocked"
+    control = {
+        "control_id": 1,
+        "action": "resume",
+        "role": "PLAN",
+        "origin": "operator",
+        "status": "recovering",
+        "result": {"before": None},
+    }
+
+    asyncio.run(worker._recover_resume_control(state, control, FakeActions()))
+
+    child = _active_hop(state)
+    old_record = RequestLedger(source["ledger_path"]).get(source_request_id)
+    assert control["status"] == "applied"
+    assert control["result"]["action"] == "release_role_pause"
+    assert control["result"]["postcondition"] == "child_hop_appended"
+    assert state["status"] == "RUNNING"
+    assert state["block_code"] is None
+    assert child["parent_hop_id"] == source["hop_id"]
+    assert child["source_role"] == "PLAN"
+    assert child["target_role"] == "PLAN"
+    assert child["handoff"] == source_handoff
+    assert child["state"] == "pre_send"
+    assert old_record is not None
+    assert old_record.status is RequestStatus.COMPLETED
+    assert old_record.attempts == 1
+    assert RequestLedger(child["ledger_path"]).peek(child["request_id"]) is None
+
+
 def test_non_operator_resume_cannot_release_role_pause(tmp_path: Path):
     store, state, worker, path, source = _prepare_pause_response(
         tmp_path, task_id="task-role-pause-agent-resume", role="PLAN"

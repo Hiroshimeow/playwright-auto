@@ -6,9 +6,9 @@ import {
 } from "./store.js?v=20260914-goal2-ops-v1";
 import {renderBoard, refreshElapsed} from "./views/board.js?v=20260915-operator-ux-v1";
 import {renderBrowserManager, renderBrowserScope, syncCreateBrowserOptions, creationUsesTemporary} from "./views/browsers.js?v=20260915-endpoint-all-v1";
-import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260915-report-context-integrate-v1";
+import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260923-live-transcript-v1";
 import {renderHistory} from "./views/history.js";
-import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20260915-report-context-integrate-v1";
+import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20260923-live-transcript-v1";
 import {renderRuntime} from "./views/runtime.js?v=20260906-listen-controls-v1";
 import {
   applyReuseRoleSelection, renderCreateActions, renderResume, renderWorkflowAgentOptions,
@@ -269,51 +269,23 @@ function showCreateValidation(message = "") {
 }
 
 async function loadBootstrapOptions() {
-  try {
-    const response = await client.request("bootstraps", "/api/bootstraps");
-    if (response.notModified) return;
-    const data = response.data || {};
-    const items = Array.isArray(data.items) ? data.items : [];
-    const options = [new Option("None / Fresh context", "")];
-    for (const item of items) {
-      const option = new Option(item.name || item.bootstrap_id, item.bootstrap_id);
-      option.title = item.description || "";
-      options.push(option);
-    }
-    options.push(new Option("Create bootstrap inline…", INLINE_BOOTSTRAP_VALUE));
-    roots.bootstrapSelect.replaceChildren(...options);
-    bootstrapDefaultId = String(data.default_id || "");
-    roots.bootstrapSelect.value = [...roots.bootstrapSelect.options].some(
-      option => option.value === bootstrapDefaultId,
-    ) ? bootstrapDefaultId : "";
-    syncBootstrapInlineFields();
-    updateCreateSummary();
-  } catch (error) {
-    bootstrapDefaultId = "";
-    roots.bootstrapSelect.replaceChildren(
-      new Option("None / Fresh context", ""),
-      new Option("Create bootstrap inline…", INLINE_BOOTSTRAP_VALUE),
-    );
-    syncBootstrapInlineFields();
-    toast(error.message);
-  }
+  bootstrapDefaultId = "";
+  roots.bootstrapSelect.replaceChildren(new Option("Fresh context", ""));
+  roots.bootstrapSelect.value = "";
+  roots.bootstrapSelect.disabled = true;
+  roots.bootstrapInline.hidden = true;
+  updateCreateSummary();
 }
 
 function syncBootstrapInlineFields() {
-  const solo = createWorkflowMode() === "solo";
-  const temporary = !solo && creationUsesTemporary(state, roots.browserEndpointSelect.value, roots.form.elements.temporary.checked);
-  if (temporary) roots.bootstrapSelect.value = "";
-  roots.bootstrapSelect.disabled = solo || temporary;
-  roots.bootstrapSelect.title = solo
-    ? "Solo Task uses its selected conversation directly"
-    : temporary ? "Temporary chats use fresh context; persistent bootstrap branching is unavailable" : "";
-  roots.bootstrapInline.hidden = solo || temporary || roots.bootstrapSelect.value !== INLINE_BOOTSTRAP_VALUE;
+  roots.bootstrapSelect.value = "";
+  roots.bootstrapSelect.disabled = true;
+  roots.bootstrapSelect.title = "Bootstrap branching is temporarily disabled; workflow tasks use Fresh context.";
+  roots.bootstrapInline.hidden = true;
 }
 
 function resetBootstrapSelection() {
-  roots.bootstrapSelect.value = [...roots.bootstrapSelect.options].some(
-    option => option.value === bootstrapDefaultId,
-  ) ? bootstrapDefaultId : "";
+  roots.bootstrapSelect.value = "";
   syncBootstrapInlineFields();
 }
 
@@ -1018,7 +990,7 @@ export async function loadLiveAudit() {
   const detail = state.selectedDetail;
   if (!taskId || !detail || detail.task_mode === "independent" || selectedDetailTab(state) !== "live") return null;
   const role = selectedRole(state);
-  const suffix = role ? `?limit=100&role=${encodeURIComponent(role)}` : "?limit=100";
+  const suffix = role ? `?limit=300&role=${encodeURIComponent(role)}` : "?limit=300";
   const scope = liveScopeKey(taskId, role);
   const key = `live:${scope}`;
   if (!state.liveEventsByScope.has(scope)) {
@@ -1763,31 +1735,6 @@ roots.form.addEventListener("submit", event => {
     body.roles = selectedWorkflowRoles();
     if (browserEndpointId) body.browser_endpoint_id = browserEndpointId;
     if (values.get("temporary") === "on") body.temporary = true;
-    const bootstrapId = String(values.get("bootstrap_id") || "");
-    if (bootstrapId === INLINE_BOOTSTRAP_VALUE) {
-      const bootstrapNewId = String(values.get("bootstrap_new_id") || "").trim();
-      const bootstrapName = String(values.get("bootstrap_new_name") || "").trim();
-      const bootstrapSource = String(values.get("bootstrap_new_source") || "").trim() || null;
-      const bootstrapPrewarm = String(values.get("bootstrap_new_prewarm_prompt") || "").trim() || null;
-      const bootstrapMaxBackups = Number(values.get("bootstrap_new_max_backups") || 7);
-      if (!bootstrapNewId || !bootstrapName) {
-        showCreateValidation("Inline bootstrap ID and name are required.");
-        return;
-      }
-      if (!bootstrapSource && !bootstrapPrewarm) {
-        showCreateValidation("Inline bootstrap requires a source or prewarm prompt.");
-        return;
-      }
-      body.bootstrap_definition = {
-        bootstrap_id: bootstrapNewId,
-        name: bootstrapName,
-        source: bootstrapSource,
-        prewarm_prompt: bootstrapPrewarm,
-        max_backups: bootstrapMaxBackups,
-      };
-    } else {
-      body.bootstrap_id = bootstrapId || null;
-    }
     if (reuseTeam) body.reuse_team = reuseTeam;
     else if (requestedTeam) body.requested_team = requestedTeam;
   }

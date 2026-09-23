@@ -32,8 +32,17 @@ class TemporaryWorkflowActions(FakeActions):
         self.owned = owned
         self.fresh_urls = []
 
-    async def acquire(self, *_args, **_kwargs):
-        raise AssertionError("temporary workflow must not use persistent acquisition")
+    async def acquire(self, state, role, *, clean_for_send=False):
+        assert self.owned, "temporary workflow must reuse only the owned generation"
+        assert clean_for_send is True
+        record = state["roles"][role]
+        return AcquiredRole(
+            client=ready_client(state, role),
+            page_id=str(record["page_id"]),
+            url=str(record["page_url"]),
+            created=False,
+            new_chat=False,
+        )
 
     async def reopen(self, *_args, **_kwargs):
         raise AssertionError("temporary workflow must not reopen a saved conversation")
@@ -50,7 +59,8 @@ class TemporaryWorkflowActions(FakeActions):
             new_chat=False,
         )
 
-    async def fresh_chat(self, state, role, *, url):
+    async def fresh_chat(self, state, role, *, url, clean_for_send=False):
+        assert clean_for_send is True
         self.fresh_urls.append(url)
         record = state["roles"][role]
         return AcquiredRole(
@@ -95,7 +105,7 @@ def test_workflow_temporary_same_generation_reuses_owned_tab(tmp_path: Path):
     assert hop["state"] == "sending"
 
 
-def test_cross_endpoint_accepted_temporary_recovery_starts_new_temporary_generation(tmp_path: Path):
+def test_cross_endpoint_accepted_temporary_recovery_waits_for_same_team_endpoint(tmp_path: Path):
     store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-temp-cross-endpoint"
     )
@@ -113,21 +123,12 @@ def test_cross_endpoint_accepted_temporary_recovery_starts_new_temporary_generat
 
     assert worker._prepare_cross_endpoint_recovery(
         state, new_endpoint, reason="temporary endpoint offline"
-    ) is True
-    recovery = _active_hop(state)
-    actions = TemporaryWorkflowActions()
+    ) is False
 
-    asyncio.run(worker._pre_send(state, recovery, actions))
-
-    assert state["hops"][0]["state"] == "abandoned"
-    assert state["hops"][0]["request_id"] == original_request_id
-    assert recovery["request_id"] != original_request_id
-    assert recovery["kind"] == "execution_recovery"
-    assert "RECOVERY_SNAPSHOT" in recovery["handoff"]
-    assert actions.fresh_urls == [TEMPORARY_CHAT_URL]
-    assert role["browser_endpoint_id"] == new_endpoint
-    assert role["page_url"] == TEMPORARY_CHAT_URL
-    assert recovery["state"] == "sending"
+    assert _active_hop(state)["request_id"] == original_request_id
+    assert role["browser_endpoint_id"] == old_endpoint
+    assert state["status"] == "WAITING"
+    assert state["waiting_code"] == "team_endpoint_unavailable"
 
 
 def test_same_endpoint_pristine_temporary_resume_starts_new_temporary_generation(tmp_path: Path):
@@ -135,7 +136,11 @@ def test_same_endpoint_pristine_temporary_resume_starts_new_temporary_generation
         tmp_path, task_id="task-temp-pristine-resume"
     )
     state["conversation_mode"] = "temporary"
-    state["context_policy"] = "bootstrap"
+    state["context_policy"] = "fresh"
+    state.pop("bootstrap", None)
+    role = state["roles"]["PLAN"]
+    role["context_source"] = "fresh"
+    role.pop("bootstrap_source_donor", None)
     original_request_id = hop["request_id"]
 
     class Actions(TemporaryWorkflowActions):

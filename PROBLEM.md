@@ -82,8 +82,9 @@ This file is not a chronological incident log. Track one entry per stable root c
 
 ### P-022 — CHECK_ALL independent jobs cannot bind the single incident they select
 
-- **Status:** `OPEN`
+- **Status:** `IN_PROGRESS`
 - **Priority:** `MEDIUM`
+- **Owner:** `cdpa-checkall-target-bind-repair-20260923` / `cdpa-idem-02a69c83e9229b3ed26e30ee` (created 2026-09-23 on endpoint 9212, Temporary Chat, explicit completed dependency `cdpa-idem-60990fd38da99fbf5ee07d4f`).
 - **Root cause:** a canonical `check_all` event is activated with `target_task_id: null`, but `_queue_independent_task_control()` requires the requested target to equal the active event target and `_create_independent_repair_command()` rejects an active event without a target. The Resumer contract requires scanning all tasks, selecting exactly one incident, then using those two commands; the runtime provides no durable one-time claim/bind transition for that selection.
 - **Concrete evidence:** Resumer event `check-all:resumer:991949` started at `2026-07-31T14:30:00Z` with no target. It selected task `cdpa-idem-593e2ebe2e10a6f96d24d9a0`, which is `BLOCKED` on PLAN hop 60 with `accepted_user_provenance_ambiguous`. The owned conversation contains a newer explicit operator steering turn and a complete assistant route to DEV, while the accepted hop-60 user turn is absent from the current branch. Resume/retry would re-enter the obsolete receipt boundary, and the only independent control/repair APIs reject the selected task before any action because the active CHECK_ALL event remains targetless.
 - **Impact:** a periodic whole-runtime watchdog can detect and diagnose the highest-priority incident but cannot safely recover it or create the required deduplicated repair task. The job must escalate to the operator even when the evidence and desired target are unambiguous.
@@ -100,12 +101,13 @@ This file is not a chronological incident log. Track one entry per stable root c
 - **Required correction:** completion should preserve enabled state when the identity has a recurring trigger configured (`recovery` or interval/check-all recurrence), regardless of a one-off manual Run-now event. A truly manual-only identity should still auto-pause. Keep the same manifest, event history, exactly-once receipt and no successor generation.
 - **Next verification:** configure a Recovery agent, invoke one manual Run-now job, complete it, and prove it returns to enabled `WAITING`; then prove a manual-only agent still pauses. Repeat for interval/check-all agents and verify no duplicate event claim after worker restart.
 
-### P-038 — Shared-profile concurrency policy: maximum 2 workflow teams RUNNING
+### P-038 — Shared-profile concurrency policy: per-endpoint browser capacity
 
-- **Status:** `OPERATOR POLICY ACTIVE — USE EXISTING DEPENDENCIES/QUEUE, NO NEW SCHEDULER`
-- **Confirmed operational invariant (2026-08-11):** allow at most **2 workflow task teams in `RUNNING`** on the shared ChatGPT profile. Three workflow teams are materially more likely to hit rate limits, especially when one workflow creates additional verification/fix work.
-- **Unit:** workflow team, not role count. `WAITING`, `BLOCKED`, `PAUSED`, `DONE`, and `STOPPED` do not consume a RUNNING slot.
-- **Operating method:** use the existing dependency/queue machinery to serialize new verification and fix work. Do not create another scheduler, queue, sidecar, or generalized concurrency subsystem.
+- **Status:** `SUPERSEDED 2026-09-18 — PER-ENDPOINT CAPACITY IS AUTHORITATIVE`
+- **Superseded rule:** the 2026-08-11 maximum of two workflow teams `RUNNING` globally is no longer active policy.
+- **Current invariant:** browser capacity is independent per endpoint. Endpoints 9202, 9212, and 9222 each allow at most **2 active/reserved execution slots**; there is no global two-team limiter.
+- **Capacity ownership:** a pre-page execution lease/reservation consumes its selected endpoint slot until the scheduling task releases it. Dependency waits consume no endpoint slot.
+- **Operating method:** use the existing endpoint admission, dependency, and queue machinery. Do not create another scheduler, queue, sidecar, or generalized concurrency subsystem.
 - **Fix-task rule:** every fix task created from a problem verification must have an explicit dependency and must commit its own production fix so the change can be traced or reverted.
 - **Verification-task rule:** verify the defect against current source/runtime first. If the old failure no longer exists, or the impact is operationally negligible/too narrow, update `PROBLEM.md` and do not create a fix task.
 
@@ -172,9 +174,9 @@ These are **not accepted CDPA requirements and not evidence-backed defects**. Th
 
 The governing constraint for all candidates is simplification: do not integrate three new frameworks. Prefer a small primitive that replaces existing CDPA complexity. If a candidate cannot delete/consolidate current logic or produce measurable operational value, do not build it.
 
-### P-039 � Endpoint-offline stale capacity can strand an accepted wait_response turn
+### P-039 � Endpoint-offline stale capacity can strand an accepted wait_response turn
 
-- **Status:** `REPAIR DISPATCHED � 2026-09-14`
+- **Status:** `REPAIR DISPATCHED � 2026-09-14`
 - **Incident evidence:** `cdpa-idem-a2102d82f7639bf6a0ce0f7c` requested browser 9202 but PLAN executed on endpoint 9222. Its PLAN send was accepted and showed response activity. After the controller/process recovered, the existing PLAN result was consumed at 2026-09-14T02:37:32Z and the task advanced to DEV without replay. DEV hop 2 was then accepted at 2026-09-14T02:38:03Z and also showed response activity. The operator-reported browser projection simultaneously showed 9222 with `page_count=0` but stale `active_count=2` after that endpoint went offline.
 - **Non-replay decision:** no Resume/Retry/re-send was issued against either accepted turn. The active DEV owner remains `cdpa-idem-a2102d82f7639bf6a0ce0f7c` in `E:\git-project\playwright-auto-multicdp-goal4-resume-repair-20260914`.
 - **Deduplication boundary:** the existing task is intentionally scoped to the Windows manifest `os.replace` persistence failure and explicitly excludes duplicate lease machinery. Endpoint placement/capacity reconciliation is therefore a separate root cause, not another copy of that repair.

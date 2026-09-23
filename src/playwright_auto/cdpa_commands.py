@@ -168,6 +168,9 @@ def command_snapshot(state: Mapping[str, Any], *, role: str | None = None) -> di
         ),
         "conversation_generation": role_record.get("conversation_generation"),
         "receipt_sha256": _sha_json(receipt) if isinstance(receipt, Mapping) else None,
+        "required_browser_endpoint_id": (
+            str(state.get("required_browser_endpoint_id") or "").strip() or None
+        ),
         "block_code": str(state.get("block_code") or "") or None,
     }
 
@@ -611,6 +614,7 @@ _WORKFLOW_CONTROL_ACTIONS = (
     "new_chat",
     "open_tab",
     "route_plan",
+    "release_required_browser_endpoint",
     "stop",
     "clear_team",
     "archive_worktree",
@@ -663,8 +667,8 @@ def workflow_control_eligibility(
         return {"eligible": False, "reason": reason, "role": selected_role}
 
     if normalized_action == "pause":
-        return yes() if status in {"INBOX", "RUNNING"} else no(
-            "Pause is available only for INBOX or RUNNING work."
+        return yes() if status in {"INBOX", "RUNNING", "BLOCKED"} else no(
+            "Pause is available only for INBOX or RUNNING work, or BLOCKED work."
         )
     if normalized_action == "resume":
         if status in _WORKFLOW_TERMINAL:
@@ -677,6 +681,7 @@ def workflow_control_eligibility(
         if hop is None:
             return no("Resume requires an active durable hop.")
         return yes()
+
     if normalized_action == "retry":
         if status != "BLOCKED":
             return no("Retry hop is available only for BLOCKED work.")
@@ -719,6 +724,16 @@ def workflow_control_eligibility(
             return no("Route PLAN cannot bypass an execution-renewal boundary; Resume is required.")
         if hop_state in _WORKFLOW_IN_FLIGHT:
             return no("Route PLAN cannot abandon an in-flight Send; use Resume.")
+        return yes()
+    if normalized_action == "release_required_browser_endpoint":
+        if status in _WORKFLOW_TERMINAL:
+            return no("Terminal work cannot release a required browser endpoint.")
+        if not str(state.get("required_browser_endpoint_id") or "").strip():
+            return no("No hard required browser endpoint is present.")
+        if hop is None:
+            return no("Release requires an active durable hop.")
+        if hop_state != "pre_send":
+            return no("Release requires the active hop to be exactly pre_send.")
         return yes()
     if normalized_action == "stop":
         return no("Stop is invalid for terminal work.") if status in _WORKFLOW_TERMINAL else yes()

@@ -1,126 +1,186 @@
-# AGENTS.md
+# CDPA Agent Guide
 
-These instructions apply to the entire repository.
+This repository is the CDPA control plane. Repository source and durable runtime state are authoritative. Preserve unrelated dirty/untracked work.
 
-## Primary task entrypoint
+## 1. Normal task intake
 
-After a free-form discussion becomes an actionable task, read this file and `LEARNING.md`, then submit the task through `cdpa` instead of directly editing the repository. The direct chat coordinator owns this intake step: once clarification is sufficient, normalize the request into one complete normal workflow task and submit it directly. Do not put Manual Dispatcher or an Independent Agent in the critical path merely to re-dispatch the same request.
+When discussion becomes actionable, submit one normal workflow task directly through `cdpa`.
 
-```bash
-cdpa "<complete task with scope, constraints, acceptance evidence, and repository path>"
+```powershell
+cdpa "<complete task: repository/worktree, goal, constraints, acceptance evidence>"
 ```
 
-Normal workflow intake does not depend on any enabled Independent Agent. Independent Agents are reserved for supervision, recovery, monitoring, and other explicit agent jobs. Leave execution endpoint placement to the existing worker/pool unless the user explicitly requests a specific endpoint; intake should not consume a browser slot or pin capacity just to dispatch.
+That is the default command. Do not put Manual Dispatcher or an Independent Agent in the critical path merely to re-dispatch normal work.
 
-Optional task-start controls:
+Prefer task text over flags. Put the target repository/worktree path in the task text; the API infers it. Use `--repository` only when inference is impossible or must be overridden.
 
-```bash
-cdpa "<task>" --team <team-name>
-cdpa "<task>" --new plan,dev,review
-cdpa "<task>" --new-all
-cdpa "<task>" --bootstrap <id>
-cdpa "<task>" --fresh
+### Optional flags
+
+Use only when the request actually requires them:
+
+```powershell
+cdpa "<task>" --team readable-name
+cdpa "<task>" --depends-on <parent-task-id>
+cdpa "<task>" --browser <endpoint>
+cdpa "<task>" --upload <file>
+cdpa "<task>" --temp
+```
+
+- `--team`: optional readable base name. Omit by default.
+- `--depends-on`: durable dependency. Repeat only for real dependencies.
+- `--browser`: pins the entire workflow team to one explicit endpoint/account. Omit for normal pool placement.
+- `--upload`: explicit file context.
+- `--temp`: forces Temporary Chat when the selected endpoint is not already temporary by default.
+
+Do not use public bootstrap flags. New workflow tasks always start with Fresh context. Bootstrap branching is temporarily disabled.
+
+Resume an existing exact team with:
+
+```powershell
 cdpa --team <exact-existing-team>
 ```
 
-- With task text, `--team` requests a readable team base. If occupied, allocation appends `2`, `3`, and so on.
-- Without task text, `cdpa --team <exact-existing-team>` resumes that team's one nonterminal durable task. It must preserve the same task ID, manifest, active hop, request ID, turn, report history, and route-repair state; it never allocates a suffix or creates a manifest.
-- Taskless resume fails closed when the exact team is missing, terminal-only, corrupt, or has duplicate nonterminal manifests. An exact existing-team identifier is validated without normalization, lowercasing, sanitization, or truncation; allocated suffixes are part of the identity. Exact-team resume validates every raw catalog entry associated by key, declared team, or path, rejects malformed values/keys/paths/types and duplicate path claims, and compares all canonical index fields (`manifest_path`, `task_id`, `team`, `team_suffix`, `status`, `updated_at`) exactly against the manifest before selection and again inside the manifest lock. Corrupt metadata or state is never repaired or mutated implicitly. `--new` and `--new-all` are invalid in resume mode.
-- Resume is only a durable continuation request. It continues the existing autonomous route chain until PLAN returns DONE; a one-turn helper response is not workflow completion.
-- `--new role1,role2` starts those roles with a new tab or New Chat exactly once for the task.
-- `--new-all` applies that rule lazily to every role PLAN later selects.
-- Bootstrap selection follows the task's primary MCP execution surface, never the CDPA host/browser: `mcp-g8` -> `g8-bootstrap`; `mcp-thinkbook` -> `thinkbook-bootstrap`; `mcp-docker` / a5 -> `a5docker-bootstrap`. For a multi-MCP task, select the bootstrap for the primary execution MCP. Use `--bootstrap <id>` for an explicit bootstrap or `--fresh` for Fresh context; omitting both preserves the enabled-default behavior. Resume preserves the task's existing bootstrap and must not change it.
-- `cdpa` creates the task and returns immediately. Progress and controls live on the Kanban dashboard.
+Resume preserves the same task, team, endpoint, active hop, request identity, and report history.
 
-## Multi-browser operator model
+## 2. One team = one browser endpoint
 
-- Registered CDP endpoints form one shared browser-capacity pool. Endpoint IDs are durable configuration identities; a live page is identified by `(endpoint_id, page_id)`. Workflow `--browser` / dashboard **Initial browser** is an initial placement preference, not permanent ownership: pristine pre-Send work may move when capacity requires it, while accepted or ambiguous Send remains bound to the exact execution until reconciled.
-- Independent-agent `cdpa independent create ... --browser <endpoint>` and `cdpa independent config <task-id> --browser <endpoint>` set durable browser affinity. A pinned independent agent waits in `WAITING/browser_pool` when that endpoint is unavailable, full, draining, or cooling down instead of silently relocating for capacity. Accepted/ambiguous execution recovery remains stricter than affinity and follows the exact durable Send provenance.
-- Dependencies are global by task ID, not browser-local. A task on one endpoint may depend on a task executing on another endpoint; endpoint filtering in the dashboard is only a view. Before a role is actually placed, the requested endpoint is shown; after placement, the role's actual endpoint wins.
-- `--temp` forces Temporary Chat with Fresh context. Persistent workflow conversations may use the configured bootstrap policy. Independent agents default to a fresh Temporary Chat per job; `--persistent-chat` reuses persistent conversation context instead. Losing an ephemeral conversation mid-job still fails closed rather than replaying accepted work.
-- Each endpoint has a `rate_limit_scope`; endpoints sharing the same scope share cooldown. The default scope is endpoint-local. Cooldown blocks new mutations/allocations for that scope but does not authorize replay or destroy owned tabs.
-- Supported durable workflow controls are Resume, Change goal, Route PLAN, Retry only for structured retryable blocks, Pause, Stop, Restart role, New chat, Open tab, and Clear team. Use dashboard/API controls rather than manual browser steering or manifest edits.
+A workflow team uses one browser endpoint/account for its lifetime.
 
-## Task-writing contract
+- When `--browser` is omitted, the pool chooses a usable endpoint once at first placement.
+- After first placement, the selected endpoint is durably pinned for every role in that team.
+- PLAN/DEV/REVIEW/TEST/AUDIT must not independently migrate to different endpoints.
+- If the pinned endpoint is full, cooling down, offline, or unavailable, the task waits. It does not spill roles onto another endpoint.
+- An explicit `--browser` pins the team immediately.
 
-A submitted task must state:
+The endpoint registry owns endpoint defaults. In particular, an endpoint with `temporary_default=true` makes an unoverridden workflow Temporary when that endpoint is selected.
 
-1. exact repository/worktree;
-2. requested outcome;
-3. scope and explicit non-goals;
-4. constraints such as no commit/push or preservation of dirty files;
-5. required tests, runtime checks, screenshots, logs, or other evidence;
-6. completion authority and expected final report.
+## 3. Temporary Chat
 
-Do not prescribe a large implementation when the task can state behavior and acceptance criteria. PLAN chooses the smallest suitable team.
+Temporary workflows are intentionally minimal:
 
-## CDPA workflow invariants
+- Fresh context only.
+- No bootstrap.
+- No automatic F5/reload recovery. Reload may destroy the temporary document identity.
+- Recovery uses the exact durable role/page/conversation state or waits for operator action.
+- Persistent Project grouping is skipped for Temporary chats.
 
-- PLAN is the entry role and the final reporting role.
-- PLAN lazily selects and routes only the roles needed for the task: DEV, TEST, REVIEW, and AUDIT.
-- Normal same-logical-role self-routing is limited to three consecutive accepted decisions; reaching the limit blocks autonomous continuation until an explicit operator Resume.
-- REVIEW or AUDIT may declare implementation work clean, but must route back to PLAN for the final report.
-- Only PLAN may mark the task DONE.
-- Explicit task-level completion authority governs final closure. When the user authorizes autonomous continuation until executable acceptance is green, any reproducible, fixable in-scope FAIL/INCOMPLETE remains legal work: PLAN must route the smallest authorized follow-up role instead of `DONE`. `PAUSE` is only for a concrete external/manual prerequisite no authorized in-task role can change. Worker role-scope completion is not global task completion; final closure remains PLAN-only.
-- For persistent workflow creation, omit `bootstrap_id` to use the enabled default bootstrap; `bootstrap_id: null` explicitly selects Fresh context. Effective Temporary mode includes the endpoint default, always uses Fresh context, and rejects an explicit bootstrap. Persistent bootstrap acquisition uses direct `/branch/{source_conversation_id}/{assistant_message_id}`, never a DOM-menu fallback.
-- Independent agents are normal manifest-backed CDPA tasks with `task_mode="independent"`, one `AGENT` role, one exact team, one conversation, no workflow routing, and no route JSON. The task itself is the standby/active job holder; do not add another scheduler, queue, event store, coordinator, or sidecar.
-- Independent-agent creation and configuration are supported through the CLI as well as the dashboard. Agents and automation should prefer `cdpa independent create ... --dependency-team <exact-team>` and `cdpa independent config <task-id> --dependency-team <exact-team>` when the intended scope is known. Repeat `--dependency-team` (or comma-separate values) for multiple teams; use `--clear-dependency-teams` only when intentionally restoring an unrestricted team scope. Do not rely on system-prompt wording such as “only work on team X” as a substitute for trigger dependency configuration: prompt filtering happens after a job/request has already been claimed, while `trigger_settings.teams` filters team-driven canonical events before activation and avoids wasted requests.
-- Each independent agent is one long-lived identity with internal jobs, never a workflow-lane card or terminal agent lifecycle. The worker claims the oldest eligible canonical event, sends the saved system prompt plus the shared independent rule once per conversation generation, accepts plain Markdown, and waits for an explicit `independent_continue` or `independent_complete` command. Completion releases the job on the same manifest: one-shot jobs pause, while Interval and Recovery jobs remain enabled and return to WAITING. No successor generation is created.
-- `cycle` is the current turn within one exact active event and target only. Every new manual instruction, interval slot, workflow event, or blocked target starts at turn 1; continuation increments only for that same event. `max_cycles` is Max turns per job, defaults to `0`, and `0` means unlimited. Changing it during an active job resets that same event to turn 1 at the durable response boundary and records `RESET_BY_SETTINGS` without replaying an accepted send.
-- Maintainers and Monitor are built-in identities on the same engine. At most one enabled independent agent may own the Recovery trigger globally; Recovery adds the immutable visible `Recovery` tag without changing the chosen name. A newly created or enabled Recovery owner waits one minute, claims only tasks continuously BLOCKED for three minutes, processes oldest first one at a time, waits at least one minute between released targets, and does not reclaim the same target for three minutes. Monitor uses interval, completion, role, team-state, CHECK_ALL, and Run-now triggers. Custom independent agents use the same creation and trigger machinery; team-member mode is not implemented.
-- Worker controls persist immutable command snapshots and explicit origin (`operator`, `independent_agent`, `worker`, or `repair_task`). An independent-agent target control is valid only for its active canonical event. Explicit operator Pause/Restart/New Chat/Clear Team/Delete remains authoritative. Independent agents do not use Stop-current-job or STOPPED/DONE states: Reset is the force-release escape hatch that safely consumes/releases the active event, clears job ownership and pending completion/continuation/block state, retains the latest conversation URL, records History, then returns to WAITING when enabled or PAUSED when disabled. Delete is the only operation that removes the identity.
-- Dependency manifests persist only `depends_on_task_ids`; children are derived. Independent agents create or reuse normal repair tasks through `independent_create_repair`. `CONTINUE_IN_PARALLEL` leaves safe work running. `HOLD_FOR_REPAIR` appends the repair dependency, moves the affected task to WAITING, preserves its exact hop/request/receipt/report provenance, and releases the same hop after repair DONE.
-- Repair requests remain repository-bounded and root-cause deduplicated: root cause/reason ≤1200 characters, reproduction ≤2400, 1–8 allowlisted source areas, 1–16 one-line required tests ≤300 characters each, and an optional one-paragraph lesson ≤600. Validation occurs before task or dependency mutation. The worker never parses repair/action instructions from assistant prose.
-- Exact role tabs retain task/team ownership, but CDP endpoints are shared execution capacity, not permanent task/team owners. New work uses `--team <base>` with suffix allocation when occupied; taskless `--team <exact-existing-team>` resumes the existing task. Public `--reuse-team` is removed; internal safe rebind compatibility does not restore that CLI option.
-- Workflow role reports are file-only for new operational tasks, including cross-workspace execution. Legacy nonterminal inline responses may be drained only through the bounded compatibility path without replaying an accepted send; continued workflow operation returns to file mode.
-- Upload identities are captured at task creation. Before a new upload/send, validate and upload the same immutable byte snapshot once per role conversation generation; pre-send source drift fails closed. After an exact request crosses the irreversible Send boundary, recover from the exact durable request ledger without rereading mutable source bytes or duplicating upload/Send.
-- Dashboard attachment projections expose sanitized filename, size, MIME type, and hash prefix only; raw attachment paths or contents must never enter the dashboard payload.
-- After a send is accepted, consume only a new assistant message after the persisted pre-send baseline. Do not re-validate the already-sent user prompt from rendered DOM text.
-- Parse and validate the assistant route JSON and report. A malformed route is repaired in the same live tab with compact identity, validation error, shared guide, workspace scope, and the worker-computed exact expected report path, at most three times. Do not resend the original task, handoff, or constructor. If the repair needs a new conversation, append the bounded durable recovery snapshot and continue only unfinished work.
-- While no valid response has been accepted, track the latest assistant/transport activity signature and F5 only after the configured `response.refresh_after_seconds` interval (default 600 seconds) without progress while the composer is empty. Stop may be visible or may have disappeared behind transport timeout UI. Persist refresh timing, activity signature/last-change time, and pre-refresh assistant identities; never click Retry or Regenerate.
-- Complete a hop only after one valid route JSON object and its report validate and the candidate is unchanged across at least two samples. Invalid output while Stop or transport UI is active remains waiting; route repair is allowed only for a clean, inactive candidate that stays malformed through the stability grace period.
-- A valid non-DONE route repeats the same cycle in the requested next role: reuse exactly one matching role tab, otherwise open one tab, assign its physical role, bind team/task identity, and send the next handoff.
-- Normal agent prompts use one allowlisted envelope only: `title`, `task-id`, `team`, physical `role`, physical `source-role`, `turn`, `workspace`, logical `allowed-routes`, `goal`, and exact `handoff`. The constructor is included only on the first conversation generation; the shared response guide is included on every normal prompt and surfaces the worker-computed exact expected report path as the authoritative output path. Team rosters and redundant metadata stay internal in normal prompts. Execution recovery and new-conversation repair may include the bounded persisted recovery snapshot with workspace, reports, checkpoints, Git evidence, request/send provenance, and previous endpoint/page identity; it must prohibit original-request replay. The durable transport must send that exact agent-facing text and must not append request markers or IDs.
-- Browser actions preserve durable request identity and never blindly resend an ambiguous in-flight prompt. CDP disconnects isolate the affected endpoint; pool exhaustion is `WAITING` with reason `browser_pool`, not `BLOCKED`. A proven pristine pre-Send request may relocate with unchanged task/hop/request identity. After accepted or ambiguous Send, reconcile the exact execution first; when unavailable, queue an `execution_recovery` child with durable context without replaying the original request. Before exhausting the response budget, perform a final bounded provenance-aware read and route/report validation.
-- Before any automatic recovery refresh, persist the visible pre-refresh assistant message/turn identities and content fingerprints. After refresh or worker restart, those responses remain stale even if the DOM assigns new IDs. Recovery may refresh once under policy; it must never click Retry or Regenerate. Temporary URLs are not reopen anchors: a lost document creates a new Temporary generation carrying the recovery snapshot, never a replay of the accepted prompt.
-- Physical role names are team-scoped: `<team-base>-plan`, `<team-base>-dev`, `<team-base>-test`, `<team-base>-review`, and `<team-base>-audit`; append the team slot only on collision, for example `prompt-design-plan2`. Logical ownership is the unique physical-role + team + task tuple; physical page identity is `(endpoint_id, page_id)`. `page_id` is replaceable runtime metadata, except that an accepted in-flight receipt remains strictly bound to its persisted page. Duplicate exact owners fail closed before mutation.
-- Persist the accepted user message/turn identity for every markerless send. Long prompts may be collapsed behind `Show more`; rendered text is never authoritative post-acceptance provenance. After F5/rehydration, either persisted non-empty message ID or turn ID may prove the same accepted user request; when durable identity exists, never fall back to visible-text matching. A legacy receipt may be upgraded only from exactly one post-baseline user message and must never trigger another send.
-- Resume rechecks the existing hop in the same worker boundary and reports the resulting state. Retry is available only for an explicitly structured retryable block; it is not a substitute for Resume, ownership repair, manual-composer resolution, or ambiguous-send recovery.
-- Clear Team is a durable idempotent lifecycle. Nonterminal clear requires confirmation and a fail-closed duplicate/inspection preflight before irreversible mutation. Once `CLEARING` is persisted, nonterminal work is durably abandoned and transitioned to STOPPED with no active hop before Stop/close attempts. Persist `stop_pending`, `close_pending`, `closing`, and `verify_pending`; count only tabs observed closed, then require a clean zero-match exact-owner verification before `CLEARED` and persist `verified_empty_at`. Inspection or verification uncertainty preserves `CLEARING` and the concrete error for worker restart. Clearing a DONE or STOPPED task preserves that terminal result and all reports.
-- The dashboard separates active work, `OFFLINE / RECOVERABLE`, and `History / Reports`; CDP disconnection is shown as unknown availability rather than false offline state. A terminal or `CLEARED` task remains recoverable while any exact assigned-role tab is still observed and moves to History only after connected observation proves zero matches. The create form uses non-empty task text for creation and empty task text plus an exact team for durable resume. Polling uses keyed in-place DOM updates.
-- Task discovery, direct load, exact-team resume, and atomic writes apply one strict primary-manifest validator: unique canonical filename from `task_slug`, exact three-part layout, full required task-state types, configured role/physical-role identity, hop/request/active-pointer consistency, self-declared path/team/task, and matching catalog key/metadata. Raw catalog validation is total for the requested exact team: non-object entries, malformed keys, missing/relative/out-of-root paths, missing team/task fields, invalid suffix/status/timestamp types, key/path/team/task mismatches, duplicate path claims, and any canonical catalog-to-manifest value mismatch fail before any manifest or catalog write. Validate proposed state before replacement. Malformed canonical-layout JSON remains diagnostic reservation state even without the catalog: reserve only its directory task ID and affected team suffix, while unrelated teams remain allocatable. Schema-shaped evidence, copied/partial manifests, request ledgers, locks, temporary files, and mismatched catalog entries never enter worker/dashboard task loops.
-- Tabs without a role are free tabs. CDPA must not route to, reuse, or clean them.
+Do not add periodic refresh logic to Temporary workflows.
 
-## CDPA operator intervention playbook
+## 4. Role/page ownership
 
-Before inventing an orchestration workaround, inspect the task manifest/projection in the dashboard and use the existing CDPA dashboard/API controls. Browser/manual steering and manifest edits are not substitutes for these durable controls; manifest writes remain worker/dashboard-owned. The workflow invariants above remain authoritative for send ownership, routing, cleanup, and completion.
+Normal Send/Resume admission is exact-role scoped.
 
-- **Resume / exact-team Resume** — dashboard task `Resume` uses control action `resume`; exact-team dashboard/CLI continuation uses `POST /api/tasks/resume` with `{"team":"<exact-team>"}` or `cdpa --team <exact-existing-team>`. Both enter the dedicated durable resume path. Use Resume to release an operator/role PAUSE, the consecutive-self-route guard, or another recoverable continuation boundary while preserving durable task/team identity and history. Resume is not Retry, does not create a new task, and does not replace the task bootstrap.
-- **Change Goal / instruction injection** — dashboard `Change goal` or `POST /api/tasks/<task_id>/goal` with `goal` and optional `expected_task_version`. This is the supported way to add authorized clarification or evolve scope for the same durable workflow task. It is workflow-only and accepted only while the task is `RUNNING`; the store records a durable goal revision with `applies_from_hop_id = active_hop_id + 1`. Therefore it does **not** rewrite the prompt already accepted for the current hop; `CDPAWorker` selects the revised goal only when constructing a later applicable hop. For a PAUSED task that needs new instruction: **Resume -> Change goal while RUNNING -> let the current hop checkpoint/route -> Resume again if the next hop is paused/guarded**. Do not edit manifests or manually steer the browser to inject instructions. If the requested work is genuinely a separate goal rather than clarification/scope evolution of the same durable task, create a new task instead.
-- **Route PLAN** — dashboard `Route PLAN` or `POST /api/tasks/<task_id>/controls` with `{"action":"route_plan","reason":"..."}`. Use it when a non-PLAN active role should hand control back to PLAN for operator-driven replanning. It cannot cross an in-flight send boundary, cannot bypass the consecutive-self-route guard (Resume is required there), and is meaningless/rejected when PLAN is already active.
-- **Retry vs Resume** — dashboard `Retry hop` / control action `retry` is valid only when the task is explicitly `BLOCKED` with `block_retryable=true`. Never use Retry as generic continuation, as a PAUSE release, or for ambiguous/accepted-send recovery; those cases use Resume and the existing reconciliation path.
-- **Lifecycle/browser controls** — send workflow controls through `POST /api/tasks/<task_id>/controls`. `Pause` parks only `INBOX`/`RUNNING` work; `Stop` is terminal (`STOPPED`), not a temporary pause. `Restart role` replaces/restarts a selected role context, and `New chat` resets that role's conversation only at a safe send boundary; both refuse in-flight or ambiguous durable-send cases and direct the operator to Resume instead. `Open tab` is controlled ownership recovery for an assigned role, not a new task or a send bypass. Independent-agent `Close tab` closes exact-owned AGENT tabs only when no request is in flight (`sending`/`sent`/`waiting`). `Clear team` (`clear_team`) is destructive, idempotent exact-team cleanup: nonterminal work requires explicit confirmation, cleanup is persisted/restartable and fails closed until exact-owned tabs verify empty, and clearing terminal work preserves its terminal result/reports.
-- **New-role, creation, dependencies, bootstrap** — `--new role1,role2` and `--new-all` are one-task lazy new-tab/New-Chat selection controls, not task reset semantics. Use task text with `--team <base>` for new work, or taskless `--team <exact-team>` for Resume. `--browser` selects an initial endpoint preference, not permanent ownership; `--temp` forces Temporary/Fresh context. `--depends-on <task-id>` adds parent dependencies and may be repeated or comma-separated; when intentional, the dashboard/API dependency-release path is `POST /api/tasks/<task_id>/parents/<parent_task_id>/remove`. For `--bootstrap <id>`, `--fresh`, and the `mcp-g8` / `mcp-thinkbook` / `mcp-docker` bootstrap mapping, use the task-start guidance in **Primary task entrypoint** above rather than duplicating those invariants here.
-- **Independent-agent operator controls** — dashboard `Run task` (the `independent_run_now` path) sends `POST /api/independent-agents/<task_id>/run` with `trigger_type:"manual"` and optional manual `instruction`. The API also provides `/continue`, `/complete`, `/reset`, and `/settings`; Continue/Complete are durably queued until an active response can be continued/finalized, while Reset clears the active job without turning it into workflow `Stop`. Dashboard `Pause`/`Enable` and `Settings`, plus CLI `cdpa independent config <task-id> --enable|--disable ...`, are the supported enable/disable/config path. Operator actions are authoritative: repair creation refuses to override operator Pause/Stop or pending operator lifecycle controls; the separate `/control` endpoint is limited to agent-originated, current-event-scoped supported actions against the active target task.
+Each new role has an immutable `binding_id`. Runtime ownership is anchored by:
 
-## Shared files
+- task-level browser endpoint,
+- exact `page_id`,
+- role `binding_id`,
+- `task_id` and physical role as durable owner metadata.
 
-- Global editable policy: `cdpa.yaml` at repository root.
-- Durable task manifest: `.plan/<team>/<task-id>/<task-title-slug>.json`.
-- One independent report per role turn:
-  `.plan/<team>/<physical-role>_turn<N>_<task-id>.md`.
-- A route handoff references the exact report path instead of embedding a full report.
-- Only the worker/dashboard writes task manifests. Workflow agents write only their own role-report file in the execution repository at the exact `.plan/<team>/<physical-role>_turn<N>_<task-id>.md` path.
-- Every newly formed team must read `LEARNING.md` before planning or implementation.
-- Every role reads `LEARNING.md`. Before routing DONE, PLAN performs exactly one bounded learning pass over the newest relevant completion evidence for the task—at minimum the latest implementation/review evidence available, not merely the immediate handoff—plus the current `LEARNING.md`. It chooses exactly one disposition: `ADDED`, `REVISED`, or `NONE`, with 0-3 concise reusable lessons maximum. `NONE` is valid when nothing genuinely new is general, actionable, and evidence-backed. For `ADDED`/`REVISED`, PLAN rejects task-specific/transient material, checks exact and semantic duplicate guidance, revises existing guidance instead of appending equivalents, and mutates root `LEARNING.md` only through `uv run python -m playwright_auto.cdpa_learning --repository <repository-root>` with one guarded JSON request containing `disposition`, `old_text`, and `new_text`; generic file mutation is forbidden. After success PLAN must read back `LEARNING.md` and verify the intended change. A conflict/failure is reported concretely and never handed to a second writer. The final PLAN report contains `## Learning` with disposition, evidence sources, and the applied change or the reason for `NONE`/failure. The worker never invents lessons.
-- PLAN remains the normal workflow owner for repository-root `LEARNING.md`; this final PLAN pass is the continuous-learning mechanism, so normal task completion requires neither a dedicated learning independent agent nor a post-DONE model pass. Independent agents instead share concise trigger-keyed principles under repository-local `.learning/learning_<trigger>.md`; files are created only when a trigger has evidence-backed reusable guidance. Concrete defects, task IDs, timestamps, stack traces, and incident chronology stay in `PROBLEM.md`. Trigger-learning edits use the same `playwright_auto.cdpa_learning` command with the additional `trigger` field and retain repository containment, bounded UTF-8 size, exact-current-content precondition, sanitization, duplicate checks, atomic replacement, fsync, and read-back verification.
+`team`, `task_id`, role, page ID, and conversation URL remain useful audit evidence, but unrelated ChatGPT tabs are not an admission dependency.
 
-## Engineering rules
+### Critical rule
 
-- Preserve unrelated dirty work.
-- Prefer existing primitives and the standard library; do not add a second orchestration engine, database, WebSocket, generic DSL, or dependency without demonstrated need. The only production orchestration path is `cdpa`/dashboard → `TaskStore` → `CDPAWorker`; do not restore the retired AgentFlow CLI or its independent runtime state bridge.
-- Keep storage, routing, prompt construction, response policy, browser actions, worker orchestration, and dashboard controls as replaceable modules with narrow interfaces.
-- Keep selectors and timing/response conditions out of flow-control code.
-- Use TDD for non-trivial behavior, then independent correctness review and a ponytail pass.
-- Never commit, push, merge, reset, stash, or switch branches unless the user explicitly requests it.
-- Never call `browser.close()` on the persistent CDP browser.
+Normal Send, Resume, Wait, and Route must never scan or snapshot every ChatGPT tab on an endpoint.
+
+An unrelated or unbound ChatGPT tab that is slow, stale, or unreadable must not block another task.
+
+Global strict scanning is reserved for destructive operations that actually need global certainty, such as Clear Team / close-owned-tabs cleanup.
+
+Duplicate exact bindings or a conflict on the target role remain fail-closed.
+
+## 5. Send boundary
+
+Exactly-once Send protection remains mandatory.
+
+The normal sequence is:
+
+1. acquire/recover the exact role page;
+2. verify exact ownership;
+3. verify composer/attachments/transcript baseline;
+4. persist durable request identity;
+5. fill the exact draft;
+6. verify Send-ready state;
+7. click Send once;
+8. persist accepted user-message/turn identity;
+9. wait for and validate the response.
+
+Never solve ambiguous accepted-send state by blindly sending again.
+
+Manual drafts and attachments are operator-owned evidence and must not be overwritten.
+
+## 6. Context
+
+New workflow roles start Fresh. Reuse only the same role's own durable conversation when continuing that task.
+
+Bootstrap donors, source bootstrap URLs, cross-endpoint branching, and bootstrap prewarm are not part of normal workflow execution while bootstrap is disabled.
+
+Do not infer tool/device authority from a Windows/Linux path. Honor explicit task tool requirements and actual session capabilities.
+
+## 7. Projects
+
+For persistent workflow conversations, CDPA automatically groups each accepted conversation into the ChatGPT Project named for the execution repository on that endpoint/account.
+
+- Reuse an existing same-name Project on that account when present.
+- Otherwise create it.
+- Attach the conversation after accepted Send; do not wait until terminal routing.
+- Project grouping is organizational metadata. Failure to group must not block substantive work.
+
+Temporary chats are not added to persistent Projects.
+
+## 8. Workflow routing and reports
+
+Normal localized flow is:
+
+```text
+PLAN -> DEV -> REVIEW -> PLAN -> DONE
+```
+
+Add TEST/AUDIT only when the task actually needs them.
+
+Role responses follow the repository file-backed report contract under `.plan/<team>/...`. Preserve accepted Send provenance and report history across recovery.
+
+PLAN owns final workflow closure. Do not mark DONE with a known fixable in-scope regression.
+
+## 9. Operator controls
+
+Use supported durable controls rather than editing manifests or steering browser state manually:
+
+- Pause
+- Resume
+- Retry hop where explicitly retryable
+- Restart role
+- New chat
+- Open tab
+- Route PLAN
+- Change goal
+- Stop
+- Clear Team
+
+Resume is continuation of the same durable task, not a new task.
+
+## 10. Engineering rules
+
+Before editing this control repository:
+
+- inspect status/branch/diff;
+- read relevant current source and tests;
+- preserve every pre-existing dirty/untracked file;
+- do not reset, stash, clean, mass-revert, or overwrite unrelated changes;
+- prefer removal of duplicate gates/state machines over adding another recovery layer;
+- keep non-destructive hot paths local to the exact execution identity;
+- keep destructive cleanup fail-closed;
+- run focused regressions plus relevant broader tests;
+- run syntax checks and `git diff --check`.
+
+When code and old documentation disagree, current verified code plus this file are authoritative; update stale documentation in the same repair.
+
+<!-- HCUW:BEGIN -->
+## HCU Workflow (managed)
+
+For non-trivial engineering work, read `.hcuw/README.md` before editing.
+
+Repository-specific instructions, architecture, and accepted specs remain authoritative where they are more specific than generic HCU Workflow guidance. Do not edit `.hcuw/**` directly; update managed guidance with `hcuw update <repo-path>`.
+
+When a change adds or changes a capability, durable state, deterministic gate, long-lived process/service, dependency, provider boundary, or conceptual ownership, follow `.hcuw/workflows/CHANGE.md` and create a repository-owned spec when required.
+<!-- HCUW:END -->

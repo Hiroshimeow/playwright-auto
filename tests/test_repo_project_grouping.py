@@ -274,7 +274,7 @@ def test_grouping_collision_suffix_and_ambiguous_remote_fail_soft(tmp_path: Path
     monkeypatch.setattr(worker_module, "backend_create_project", must_not_create)
     asyncio.run(worker2._group_repository_project(repo, "c", object()))
     assert created_calls == []
-    assert repo not in store2.repository_projects()
+    assert store2.repository_projects() == {repo: "g-p-existing"}
 
 
 def test_advance_persists_before_schedule_and_done_is_eligible(tmp_path: Path, monkeypatch):
@@ -325,6 +325,49 @@ def test_advance_persists_before_schedule_and_done_is_eligible(tmp_path: Path, m
         ("persist", repository, "DONE"),
         ("schedule", repository, "DONE", "routed", "reused-conversation"),
     ]
+
+
+def test_waiting_route_same_tick_still_schedules_project_after_persist(tmp_path: Path, monkeypatch):
+    repository = str((tmp_path / "current-repo").resolve())
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-wait-route", repository=repository
+    )
+    enriched = replace(receipt, conversation_id="same-tick-conversation")
+    RequestLedger(hop["ledger_path"]).update(
+        hop["request_id"], receipt=enriched.to_dict()
+    )
+    hop["receipt"] = enriched.to_dict()
+    hop["state"] = "waiting"
+    report_relative = ".plan/alpha/alpha-plan_turn1_task-wait-route.md"
+    report = Path(repository) / report_relative
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("# PLAN report\n\nSame tick route.\n", encoding="utf-8")
+    hop["response"] = json.dumps({"route": "DONE", "handoff": report_relative})
+    state = store.save(path, state)
+    order = []
+    original_persist = worker._persist_transport_result
+
+    async def waiting(current, active_hop, _actions, _path, _baseline):
+        active_hop["state"] = "responded"
+        worker._responded(current, active_hop)
+
+    def persist(*args, **kwargs):
+        saved = original_persist(*args, **kwargs)
+        order.append(("persist", saved["status"]))
+        return saved
+
+    def schedule(saved, hop_id, _context):
+        completed = next(item for item in saved["hops"] if item["hop_id"] == hop_id)
+        order.append(("schedule", hop_id, completed["state"]))
+
+    monkeypatch.setattr(worker, "_waiting", waiting)
+    monkeypatch.setattr(worker, "_persist_transport_result", persist)
+    monkeypatch.setattr(worker, "_schedule_repository_project", schedule)
+
+    saved = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+
+    assert saved["status"] == "DONE"
+    assert order == [("persist", "DONE"), ("schedule", hop["hop_id"], "routed")]
 
 
 def test_reused_conversation_schedules_against_each_current_repository(tmp_path: Path, monkeypatch):
@@ -389,3 +432,42 @@ def test_schedule_filters_missing_receipt_and_route_repair_but_counts_report_rep
         await asyncio.sleep(0)
         assert not worker._repository_project_tasks
     asyncio.run(scenario())
+
+
+def test_schedule_uses_exact_role_page_url_when_receipt_conversation_id_is_missing(
+    tmp_path: Path, monkeypatch
+):
+    _store, worker = make_worker(tmp_path)
+    repository = str((tmp_path / "repo").resolve())
+    seen = []
+
+    async def grouped(repo, conversation_id, _context):
+        seen.append((repo, conversation_id))
+
+    monkeypatch.setattr(worker, "_group_repository_project", grouped)
+    state = {
+        "repository": repository,
+        "conversation_mode": "persistent",
+        "roles": {
+            "DEV": {
+                "page_url": "https://chatgpt.com/c/12345678-1234-4234-8234-123456789abc"
+            }
+        },
+        "hops": [{
+            "hop_id": 1,
+            "target_role": "DEV",
+            "state": "routed",
+            "kind": "handoff",
+            "receipt": {"conversation_id": None},
+        }],
+    }
+
+    async def scenario():
+        worker._schedule_repository_project(state, 1, object())
+        await asyncio.gather(*tuple(worker._repository_project_tasks))
+
+    asyncio.run(scenario())
+    assert seen == [(
+        repository,
+        "12345678-1234-4234-8234-123456789abc",
+    )]

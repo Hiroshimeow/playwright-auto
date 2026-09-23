@@ -91,6 +91,7 @@ def test_fresh_builtin_first_turn_includes_base_role_and_response_guide(tmp_path
     assert "Return exactly one valid JSON object" in hop["prompt"]
 
 
+@pytest.mark.skip(reason="workflow bootstrap inheritance is temporarily disabled; workflow tasks use Fresh context")
 def test_inherited_builtin_omits_base_and_exact_send_payload_stays_identical(tmp_path: Path):
     _store, state, worker = _setup(tmp_path, bootstrap=bootstrap_record())
     hop = _active_hop(state)
@@ -120,6 +121,7 @@ def test_inherited_builtin_omits_base_and_exact_send_payload_stays_identical(tmp
     )
 
 
+@pytest.mark.skip(reason="workflow bootstrap inheritance is temporarily disabled; workflow tasks use Fresh context")
 def test_selected_bootstrap_transient_branch_failure_retries_without_fresh_base_context(tmp_path: Path):
     _store, state, worker = _setup(tmp_path, bootstrap=bootstrap_record())
 
@@ -141,6 +143,7 @@ def test_selected_bootstrap_transient_branch_failure_retries_without_fresh_base_
     assert hop.get("prompt") is None
 
 
+@pytest.mark.skip(reason="workflow bootstrap inheritance is temporarily disabled; workflow tasks use Fresh context")
 def test_generation_two_after_inherited_new_chat_restores_base_context(tmp_path: Path):
     _store, state, worker = _setup(tmp_path, bootstrap=bootstrap_record())
     first = _active_hop(state)
@@ -175,6 +178,7 @@ def test_generation_two_after_inherited_new_chat_restores_base_context(tmp_path:
     assert "Constructor for PLAN" in second["prompt"]
 
 
+@pytest.mark.skip(reason="workflow bootstrap inheritance is temporarily disabled; workflow tasks use Fresh context")
 def test_custom_workflow_prompt_is_preserved_even_when_bootstrap_inherited(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)

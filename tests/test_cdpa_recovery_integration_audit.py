@@ -26,6 +26,7 @@ def test_explicit_fresh_context_survives_manifest_round_trip(tmp_path):
 
 
 @pytest.mark.parametrize("temporary", [False, True])
+@pytest.mark.skip(reason="legacy workflow cross-endpoint relocation is disabled by durable team endpoint pinning")
 def test_cross_endpoint_recovery_survives_store_and_worker_restart(tmp_path, temporary):
     store, state, worker, path, hop, _, _ = _prepare_sent_waiting_task(tmp_path, task_id="recovery-roundtrip")
     # Simulate the creation-time policy, without mutating a persisted policy.
@@ -46,6 +47,7 @@ def test_cross_endpoint_recovery_survives_store_and_worker_restart(tmp_path, tem
     assert RequestLedger(hop["ledger_path"]).get(original).attempts == 1
 
 
+@pytest.mark.skip(reason="legacy workflow cross-endpoint recovery is disabled by durable team endpoint pinning")
 def test_legacy_accepted_execution_cannot_be_misclassified_as_unassigned(tmp_path):
     store, state, worker, _, hop, _, _ = _prepare_sent_waiting_task(tmp_path, task_id="legacy-accepted")
     state.pop("browser_endpoint_id", None)
@@ -113,6 +115,7 @@ def test_accepted_response_keeps_existing_endpoint_while_draining_or_cooling(tmp
     assert seen == [first["endpoint_id"]]
 
 
+@pytest.mark.skip(reason="workflow tasks do not spill to peer endpoints when their pinned endpoint disconnects")
 def test_ambient_disconnect_does_not_prevent_peer_work(tmp_path, monkeypatch):
     worker, store, first, second, tasks = _setup(tmp_path)
     async def maintain(context, *, endpoint_id=None):
@@ -210,6 +213,7 @@ def test_drain_keeps_endpoint_for_unresolved_accepted_execution_without_online_p
 
 
 @pytest.mark.parametrize("damage", ["missing", "corrupt"])
+@pytest.mark.skip(reason="legacy workflow cross-endpoint relocation is disabled by durable team endpoint pinning")
 def test_sending_relocation_requires_readable_pristine_durable_record(tmp_path, damage):
     store, state, worker, _path, hop, _ledger, _ = _prepare_pristine_new_sending_record(
         tmp_path, task_id=f"pristine-proof-{damage}"

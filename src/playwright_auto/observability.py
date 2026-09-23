@@ -120,7 +120,13 @@ def append_live_event(
     }
     if _LIVE_EVENT_ENABLED:
         event_source = payload["source"]
-        if event_source in {"LISTEN", "CTRL"}:
+        if event_source in {"LISTEN", "CTRL", "TRANSCRIPT"}:
+            transcript_identity = None
+            if event_source == "TRANSCRIPT":
+                transcript_identity = (
+                    payload["values"].get("author"),
+                    payload["values"].get("turn_id") or payload["values"].get("message_id"),
+                )
             identity = (
                 event_source,
                 payload["kind"],
@@ -131,6 +137,7 @@ def append_live_event(
                 payload["team"],
                 payload["request_id"],
                 payload["generation"],
+                transcript_identity,
             )
             signature = json.dumps(
                 [payload["changes"], payload["values"], payload["detail"]],

@@ -16,9 +16,19 @@ class FreshActions(FakeActions):
         super().__init__()
         self.owned = owned
         self.fresh_urls = []
+        self.acquire_calls = []
 
-    async def acquire(self, *_args, **_kwargs):
-        raise AssertionError("explicit fresh policy must not use persistent bootstrap acquisition")
+    async def acquire(self, state, role, *, clean_for_send=False):
+        assert self.owned, "explicit fresh first allocation must use fresh_chat"
+        self.acquire_calls.append((role, clean_for_send))
+        record = state["roles"][role]
+        return AcquiredRole(
+            client=ready_client(state, role),
+            page_id=str(record["page_id"]),
+            url=str(record["page_url"]),
+            created=False,
+            new_chat=False,
+        )
 
     async def branch_from_anchor(self, *_args, **_kwargs):
         raise AssertionError("explicit fresh policy must not branch from a bootstrap donor")
@@ -38,7 +48,8 @@ class FreshActions(FakeActions):
             new_chat=False,
         )
 
-    async def fresh_chat(self, state, role, *, url):
+    async def fresh_chat(self, state, role, *, url, clean_for_send=False):
+        assert clean_for_send is True
         self.fresh_urls.append(url)
         record = state["roles"][role]
         return AcquiredRole(
@@ -70,6 +81,7 @@ def test_explicit_fresh_first_send_opens_plain_new_chat_without_bootstrap(tmp_pa
     asyncio.run(worker._pre_send(state, hop, actions))
 
     assert actions.fresh_urls == ["https://chatgpt.com/"]
+    assert actions.acquire_calls == []
     assert state["roles"]["PLAN"]["context_source"] == "fresh"
     assert hop["state"] == "sending"
 
@@ -89,7 +101,9 @@ def test_explicit_fresh_same_generation_reuses_owned_page(tmp_path: Path):
     asyncio.run(worker._pre_send(state, _active_hop(state), actions))
 
     assert actions.fresh_urls == []
+    assert actions.acquire_calls == [("PLAN", True)]
     assert role["page_id"] == "fresh-owned"
+    assert role["context_source"] == "fresh"
 
 
 def test_explicit_fresh_resume_never_rebases_to_default_bootstrap(tmp_path: Path):
@@ -119,7 +133,8 @@ def test_explicit_fresh_resume_never_rebases_to_default_bootstrap(tmp_path: Path
                 new_chat=True,
             )
 
-        async def fresh_chat(self, current, role, *, url):
+        async def fresh_chat(self, current, role, *, url, clean_for_send=False):
+            assert clean_for_send is True
             calls.append(("fresh_chat", url))
             record = current["roles"][role]
             return AcquiredRole(

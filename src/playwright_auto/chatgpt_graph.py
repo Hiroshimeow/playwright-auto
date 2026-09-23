@@ -43,6 +43,23 @@ def visible_text_matches(actual: Any, expected: Any) -> bool:
     return normalize_visible_text(actual) == normalize_visible_text(expected)
 
 
+def rendered_user_text_matches(actual: Any, expected: Any) -> bool:
+    """Compare a rendered ChatGPT user bubble to the prompt that produced it.
+
+    The rendered bubble collapses whitespace, omits Markdown code backticks, and may
+    append the UI-only Show more/Show less control label. This comparator is only
+    for post-Send transcript provenance; composer ownership keeps the stricter
+    visible_text_matches contract.
+    """
+    rendered = normalize_visible_text(actual).replace("`", "")
+    for suffix in (" Show more", " Show less"):
+        if rendered.endswith(suffix):
+            rendered = rendered[: -len(suffix)].rstrip()
+            break
+    expected_rendered = normalize_visible_text(expected).replace("`", "")
+    return rendered == expected_rendered
+
+
 @dataclass(frozen=True)
 class ResolvedAssistant:
     message_id: str

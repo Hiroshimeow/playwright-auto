@@ -152,10 +152,26 @@ class DashboardAPI:
         stale = timestamp is None or time.time() - timestamp > self.config.worker_stale_seconds
         source_drift = dict((worker or {}).get("source_drift") or {})
         reload_required = bool((worker or {}).get("reload_required"))
-        status = "OFFLINE" if worker is None else "STALE" if stale else "SOURCE_DRIFT" if reload_required else "HEALTHY"
+        runtime_ready = bool((worker or {}).get("runtime_ready", True))
+        command_loop_ready = bool((worker or {}).get("command_loop_ready", True))
+        ready = runtime_ready and command_loop_ready
+        status = (
+            "OFFLINE"
+            if worker is None
+            else "STALE"
+            if stale
+            else "SOURCE_DRIFT"
+            if reload_required
+            else "STARTING"
+            if not ready
+            else "HEALTHY"
+        )
         return {
             "worker_online": worker is not None and not stale,
             "worker_stale": stale,
+            "worker_ready": ready,
+            "worker_runtime_ready": runtime_ready,
+            "worker_command_loop_ready": command_loop_ready,
             "worker_heartbeat_at": heartbeat,
             "worker_status": status,
             "worker_source_drift": source_drift,
@@ -466,55 +482,37 @@ class DashboardAPI:
             normalized["context_policy"] = "fresh"
             return normalized
         if "required_browser_endpoint_id" in raw:
-            normalized["required_browser_endpoint_id"] = self._resolved_browser_endpoint_id(
+            required_endpoint = self._resolved_browser_endpoint_id(
                 raw.get("required_browser_endpoint_id")
             )
-        effective_temporary = raw.get("temporary") is True
-        if not effective_temporary:
-            try:
-                effective_temporary = bool(
-                    BrowserEndpointRegistry(self.config)
-                    .resolve(normalized.get("browser_endpoint_id"))
-                    .get("temporary_default")
-                )
-            except ValueError:
-                pass
-        definition = (
-            self._bootstrap_definition(raw.get("bootstrap_definition"))
-            if "bootstrap_definition" in raw
-            else None
-        )
-        if definition is not None:
-            if effective_temporary:
-                raise APIError(400, "invalid_request", "temporary workflows do not support bootstrap context")
-            requested_id = raw.get("bootstrap_id")
-            if requested_id not in {None, definition["bootstrap_id"]}:
+            selected_endpoint = normalized.get("browser_endpoint_id")
+            selected_resolved = (
+                self._resolved_browser_endpoint_id(selected_endpoint)
+                if selected_endpoint is not None
+                else None
+            )
+            if selected_resolved is not None and selected_resolved != required_endpoint:
                 raise APIError(
                     400,
                     "invalid_request",
-                    "bootstrap_id must match bootstrap_definition.bootstrap_id",
+                    "workflow team uses one endpoint; browser_endpoint_id and required_browser_endpoint_id must match",
                 )
-            normalized["bootstrap_id"] = definition["bootstrap_id"]
-            normalized["bootstrap_definition"] = definition
-        elif "bootstrap_id" not in raw:
-            normalized["bootstrap_id"] = None if effective_temporary else self._default_bootstrap_id()
-        elif raw.get("bootstrap_id") is None:
-            normalized["bootstrap_id"] = None
-        else:
-            bootstrap_id = raw.get("bootstrap_id")
-            if not isinstance(bootstrap_id, str) or not bootstrap_id.strip():
-                raise APIError(
-                    400,
-                    "invalid_request",
-                    "bootstrap_id must be a non-empty string or null",
-                )
-            normalized["bootstrap_id"] = bootstrap_id
-        if effective_temporary and normalized.get("bootstrap_id") is not None:
-            raise APIError(400, "invalid_request", "temporary workflows do not support bootstrap context")
-        if normalized.get("bootstrap_id") is not None:
-            normalized["context_policy"] = "bootstrap"
-        elif "bootstrap_id" in raw or effective_temporary:
-            normalized["context_policy"] = "fresh"
+            normalized["browser_endpoint_id"] = required_endpoint
+            normalized["required_browser_endpoint_id"] = required_endpoint
+        if raw.get("bootstrap_definition") is not None:
+            raise APIError(
+                400,
+                "invalid_request",
+                "bootstrap context is temporarily disabled; new workflow tasks always use Fresh context",
+            )
+        if raw.get("bootstrap_id") not in {None, ""}:
+            raise APIError(
+                400,
+                "invalid_request",
+                "bootstrap context is temporarily disabled; new workflow tasks always use Fresh context",
+            )
+        normalized["bootstrap_id"] = None
+        normalized["context_policy"] = "fresh"
         return normalized
 
     def normalize_workflow_agent_create(
@@ -604,7 +602,10 @@ class DashboardAPI:
         return payload
 
     def normalize_browser_endpoint_update(self, endpoint_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
-        allowed = {"cdp_url", "label", "is_default", "temporary_default", "rate_limit_scope", "max_active_tabs", "draining"}
+        allowed = {
+            "cdp_url", "label", "is_default", "temporary_default",
+            "rate_limit_scope", "max_active_tabs", "draining",
+        }
         unknown = set(raw) - allowed
         if unknown or not raw:
             raise APIError(400, "invalid_request", "browser settings contain unsupported or empty fields")
@@ -703,6 +704,26 @@ class DashboardAPI:
             raise APIError(400, "invalid_request", str(exc)) from exc
         return {"agent_name": agent_name, "target_task_id": target_task_id}
 
+    def normalize_independent_bind_target(
+        self, raw: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        allowed = {"event_key", "target_task_id"}
+        unknown = set(raw) - allowed
+        if unknown:
+            raise APIError(400, "invalid_request", f"unknown fields: {sorted(unknown)!r}")
+        event_key = str(raw.get("event_key") or "").strip()
+        if not event_key or len(event_key) > 1000:
+            raise APIError(
+                400,
+                "invalid_request",
+                "event_key must contain 1 to 1000 characters",
+            )
+        try:
+            target_task_id = validate_task_id(str(raw.get("target_task_id") or ""))
+        except ValueError as exc:
+            raise APIError(400, "invalid_request", str(exc)) from exc
+        return {"event_key": event_key, "target_task_id": target_task_id}
+
     def normalize_independent_repair(
         self, raw: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -746,6 +767,7 @@ class DashboardAPI:
             "open_tab",
             "new_chat",
             "route_plan",
+            "safe_restore",
         }
         if action not in allowed_actions:
             raise APIError(400, "invalid_request", "unsupported independent task control")
@@ -1117,13 +1139,17 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
         return value
 
     @staticmethod
-    def _limit(query: Mapping[str, list[str]], default: int = 50) -> int:
+    def _limit(
+        query: Mapping[str, list[str]], default: int = 50, *, maximum: int = 100
+    ) -> int:
         try:
             value = int(query.get("limit", [str(default)])[0])
         except ValueError as exc:
             raise APIError(400, "invalid_limit", "limit must be an integer") from exc
-        if not 1 <= value <= 100:
-            raise APIError(400, "invalid_limit", "limit must be between 1 and 100")
+        if not 1 <= value <= maximum:
+            raise APIError(
+                400, "invalid_limit", f"limit must be between 1 and {maximum}"
+            )
         return value
 
     def do_GET(self) -> None:
@@ -1299,7 +1325,7 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
             task_id = validate_task_id(parts[2])
             if db.get_task_version(task_id) is None:
                 raise APIError(404, "task_not_found", "task does not exist")
-            limit = self._limit(query, default=100)
+            limit = self._limit(query, default=100, maximum=1000)
             role = str(query.get("role", [""])[0] or "").strip().upper() or None
             if role is not None and not re.fullmatch(r"[A-Z][A-Z0-9_-]{0,63}", role):
                 raise APIError(400, "invalid_role", "role is invalid")
@@ -1461,6 +1487,9 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                 elif operation == "activate":
                     payload = app.normalize_independent_activation(raw)
                     kind = "independent_activate_agent"
+                elif operation == "bind":
+                    payload = app.normalize_independent_bind_target(raw)
+                    kind = "independent_bind_target"
                 elif operation == "repair":
                     payload = app.normalize_independent_repair(raw)
                     kind = "independent_create_repair"

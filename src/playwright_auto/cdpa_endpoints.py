@@ -17,6 +17,8 @@ _ENDPOINT_FIELDS = frozenset({
     "endpoint_id", "cdp_url", "label", "is_default", "temporary_default",
     "management_mode", "profile_path", "executable_path", "rate_limit_scope",
     "max_active_tabs", "draining", "removed",
+    # Accepted only so older registry records remain readable; ignored below.
+    "tool_capabilities", "tool_capabilities_configured", "tool_capability_bindings",
 })
 
 
@@ -237,7 +239,9 @@ class BrowserEndpointRegistry:
             existing = catalog["entries"].get(endpoint_id)
             if existing is None or existing["removed"]:
                 raise ValueError("unknown or removed browser endpoint")
-            updated = normalize_endpoint_record({**existing, **changes}, endpoint_id=endpoint_id)
+            updated = normalize_endpoint_record(
+                {**existing, **changes}, endpoint_id=endpoint_id
+            )
             if updated == existing:
                 return existing
             if updated["is_default"]:

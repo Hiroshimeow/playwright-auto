@@ -7,6 +7,7 @@ import os
 import re
 import time
 from contextlib import ExitStack, contextmanager
+from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
@@ -244,7 +245,7 @@ def replacement_continuation_text(
     target: Mapping[str, Any], recovery_instruction: str
 ) -> str:
     task_id = str(target.get("task_id") or "").strip()
-    original = str(target.get("task_text") or "").strip()
+    original = effective_task_goal(target).strip()
     repository = str(target.get("repository") or "").strip()
     instruction = str(recovery_instruction).strip()
     if not task_id or not original or not repository or not instruction:
@@ -574,12 +575,11 @@ class TaskStore(IndependentAgentStoreMixin):
         catalog_records = self._catalog_records_for_exact_team(catalog, team)
         candidate_paths: set[Path] = set(catalog_records)
         include_unreadable = not bool(catalog.get("entries"))
-        for path in self._filesystem_manifest_like_paths(
-            include_unreadable=include_unreadable
+        for path in self._filesystem_manifest_like_paths_for_team(
+            team,
+            include_unreadable=include_unreadable,
         ):
-            relative = path.relative_to(self.root.resolve())
-            if relative.parts and relative.parts[0] == team:
-                candidate_paths.add(path)
+            candidate_paths.add(path)
         if not candidate_paths:
             raise ValueError(f"no CDPA task exists for exact team {team!r}")
 
@@ -826,6 +826,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 "trigger",
                 "bootstrap",
                 "browser_pool",
+                "role_reconnect",
             }:
                 return "waiting reason is invalid"
             if waiting.get("reason") == "browser_pool" and (
@@ -1255,6 +1256,57 @@ class TaskStore(IndependentAgentStoreMixin):
                 # Benchmark snapshots and exported evidence may contain a complete
                 # manifest copy. They are not runtime sources unless their physical
                 # <team>/<task_id>/ directory matches the declared identity.
+                continue
+            candidates.append(candidate)
+        return sorted(set(candidates))
+
+    def _filesystem_manifest_like_paths_for_team(
+        self,
+        team: str,
+        *,
+        include_unreadable: bool | None = None,
+    ) -> list[Path]:
+        if not self.root.exists():
+            return []
+        root = self.root.resolve()
+        team_root = (root / team).resolve()
+        if not team_root.is_relative_to(root) or not team_root.exists():
+            return []
+        if include_unreadable is None:
+            include_unreadable = not self.catalog_path.exists()
+        candidates: list[Path] = []
+        for path in team_root.glob("*/*.json"):
+            if not path.is_file() or path.name == "requests.json" or path.name.endswith(".lock"):
+                continue
+            candidate = path.resolve()
+            try:
+                relative = candidate.relative_to(root)
+            except ValueError:
+                continue
+            if len(relative.parts) != 3 or relative.parts[0] != team:
+                continue
+            team_directory, task_directory, _filename = relative.parts
+            try:
+                value = json.loads(read_shared_text(path, encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                manifest_lock = candidate.with_suffix(candidate.suffix + ".lock")
+                if include_unreadable or manifest_lock.is_file():
+                    candidates.append(candidate)
+                continue
+            if not isinstance(value, Mapping):
+                continue
+            looks_like_manifest = value.get("schema_version") == SCHEMA_VERSION or {
+                "manifest_path",
+                "task_id",
+                "team",
+            }.issubset(value)
+            if not looks_like_manifest:
+                continue
+            declared_team = str(value.get("team") or "")
+            declared_task_id = str(value.get("task_id") or "")
+            if declared_team and declared_task_id and (
+                declared_team != team_directory or declared_task_id != task_directory
+            ):
                 continue
             candidates.append(candidate)
         return sorted(set(candidates))
@@ -1918,6 +1970,7 @@ class TaskStore(IndependentAgentStoreMixin):
         mutator: Callable[[dict[str, Any]], Mapping[str, Any] | None],
         *,
         expected_updated_at: str | None = None,
+        mutable_fields: frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
         self.root.mkdir(parents=True, exist_ok=True)
         with exclusive_file_lock(self.allocation_lock):
@@ -1943,9 +1996,16 @@ class TaskStore(IndependentAgentStoreMixin):
                     "conversation_mode",
                     "context_policy",
                 ):
-                    if field in original and candidate.get(field) != original[field]:
+                    if (
+                        field in original
+                        and candidate.get(field) != original[field]
+                        and field not in mutable_fields
+                    ):
                         raise ValueError(f"task {field} is immutable")
-                if "browser_endpoint_id" not in original and "browser_endpoint_id" in candidate:
+                if (
+                    "browser_endpoint_id" not in original
+                    and "browser_endpoint_id" in candidate
+                ):
                     if candidate["browser_endpoint_id"] != self.endpoint_id_for(original):
                         raise ValueError("legacy task browser_endpoint_id is immutable")
                 if before_dependencies != normalize_dependency_ids(
@@ -2001,6 +2061,20 @@ class TaskStore(IndependentAgentStoreMixin):
     ) -> dict[str, Any]:
         target = Path(path).expanduser().resolve()
         return self._mutate_manifest(target, mutator)
+
+    def update_for_control(
+        self,
+        path: str | Path,
+        action: str,
+        mutator: Callable[[dict[str, Any]], Mapping[str, Any] | None],
+    ) -> dict[str, Any]:
+        target = Path(path).expanduser().resolve()
+        mutable_fields = (
+            frozenset({"required_browser_endpoint_id"})
+            if str(action).strip().lower() == "release_required_browser_endpoint"
+            else frozenset()
+        )
+        return self._mutate_manifest(target, mutator, mutable_fields=mutable_fields)
 
     def begin_team_cleanup(
         self,
@@ -2221,6 +2295,28 @@ class TaskStore(IndependentAgentStoreMixin):
             scheduling_tasks, _errors = self.discover_with_errors()
         else:
             scheduling_tasks = list(tasks)
+        if state is not None:
+            current = state
+            status = str(current.get("status") or "").upper()
+            dependencies = normalize_dependency_ids(current.get("depends_on_task_ids"))
+            dependency_waiting_origin = self._is_dependency_waiting_state(current)
+            queue = current.get("queue")
+            queue_pending = (
+                isinstance(queue, Mapping)
+                and queue.get("reuse_team") is True
+                and queue.get("released_at") is None
+            )
+            if (
+                is_independent_task(current)
+                or status in TERMINAL
+                or status == "PAUSED"
+                or (
+                    not queue_pending
+                    and not dependencies
+                    and not (status == "WAITING" and dependency_waiting_origin)
+                )
+            ):
+                return current, False
         self.root.mkdir(parents=True, exist_ok=True)
         with exclusive_file_lock(self.allocation_lock):
             self._recover_phase4_replacement_unlocked()
@@ -2584,6 +2680,7 @@ class TaskStore(IndependentAgentStoreMixin):
             roles[logical] = {
                 "logical_role": logical,
                 "physical_role": physical_role(logical, base, suffix),
+                "binding_id": str(uuid4()),
                 "status": "pending" if logical == initial_role else "unallocated",
                 "turn": 0,
                 "page_id": None,
@@ -2964,6 +3061,8 @@ class TaskStore(IndependentAgentStoreMixin):
         normalized_bootstrap = (
             normalize_bootstrap_record(bootstrap) if bootstrap is not None else None
         )
+        if context_policy is None:
+            context_policy = "bootstrap" if normalized_bootstrap is not None else "fresh"
         if normalized_workflow_mode == "solo":
             if normalized_bootstrap is not None:
                 raise ValueError("solo workflow task does not support bootstrap context")
@@ -3057,6 +3156,13 @@ class TaskStore(IndependentAgentStoreMixin):
                 if required_browser_endpoint_id is not None
                 else None
             )
+            if required_endpoint is not None:
+                if browser_endpoint_id is None:
+                    endpoint = required_endpoint
+                elif required_endpoint["endpoint_id"] != endpoint["endpoint_id"]:
+                    raise ValueError(
+                        "workflow team uses one endpoint; browser endpoint and required endpoint must match"
+                    )
             if normalized_workflow_mode == "solo":
                 if (
                     required_endpoint is not None
@@ -3225,6 +3331,15 @@ class TaskStore(IndependentAgentStoreMixin):
                 workflow_mode=normalized_workflow_mode,
                 goal=normalized_goal,
                 conversation_url=normalized_conversation_url,
+            )
+            state["endpoint_pinned"] = bool(
+                normalized_workflow_mode == "solo"
+                or exact_reuse_team is not None
+                or browser_endpoint_id is not None
+                or required_endpoint is not None
+            )
+            state["conversation_mode_explicit"] = bool(
+                temporary or conversation_mode is not None
             )
             self._record_external_command(state, external_command_id)
             saved = self._save_unlocked(target, state)
@@ -3832,6 +3947,10 @@ class TaskStore(IndependentAgentStoreMixin):
     def create_or_gate_repair(
         self,
         request: RepairRequest | Mapping[str, Any],
+        *,
+        source_manifest_path: str | Path | None = None,
+        source_event_key: str | None = None,
+        require_affected_status: str | None = None,
     ) -> dict[str, Any]:
         repair_request = (
             request
@@ -3869,6 +3988,49 @@ class TaskStore(IndependentAgentStoreMixin):
             )
             if affected is None:
                 raise ValueError("affected repair task does not exist")
+
+            if source_manifest_path is not None:
+                expected_source_event = str(source_event_key or "").strip()
+                if not expected_source_event:
+                    raise ValueError("repair source_event_key is required with source_manifest_path")
+                source_path = Path(source_manifest_path).expanduser().resolve()
+                affected_path = Path(str(affected["manifest_path"])).expanduser().resolve()
+                with ExitStack() as stack:
+                    for manifest_path in sorted({source_path, affected_path}, key=str):
+                        stack.enter_context(exclusive_file_lock(self._lock_path(manifest_path)))
+                    source_current = self._load_current_manifest_unlocked(source_path)
+                    affected_current = self._load_current_manifest_unlocked(affected_path)
+                    self._assert_manifest_mutable_unlocked(source_path, source_current)
+                    self._assert_manifest_mutable_unlocked(affected_path, affected_current)
+                    if not is_independent_task(source_current):
+                        raise ValueError("repair source is not an independent task")
+                    independent = source_current.get("independent")
+                    active = (
+                        independent.get("active_event")
+                        if isinstance(independent, Mapping)
+                        else None
+                    )
+                    if not isinstance(active, Mapping):
+                        raise ValueError("repair source has no active independent job")
+                    if str(active.get("event_key") or "") != expected_source_event:
+                        raise ValueError("bound independent repair source event is stale")
+                    if str(active.get("trigger_type") or "").lower() not in {
+                        "interval",
+                        "check_all",
+                    }:
+                        raise ValueError("bound independent repair requires interval/check_all")
+                    if str(active.get("target_task_id") or "") != repair_request.affected_task_id:
+                        raise ValueError("bound independent repair target changed")
+                    if active.get("target_hop_id") != repair_request.affected_hop_id:
+                        raise ValueError("bound independent repair hop changed")
+                    if require_affected_status is not None and str(
+                        affected_current.get("status") or ""
+                    ).upper() != str(require_affected_status).upper():
+                        raise ValueError(
+                            f"affected repair task must remain {str(require_affected_status).upper()}"
+                        )
+                    affected = affected_current
+
             if (
                 Path(str(affected.get("repository") or "")).expanduser().resolve()
                 != affected_repository
@@ -4507,6 +4669,8 @@ class TaskStore(IndependentAgentStoreMixin):
         reuse_team: bool,
         rewire_children: bool,
         incident_id: str | None = None,
+        source_task_id: str | None = None,
+        source_event_key: str | None = None,
     ) -> dict[str, Any]:
         target_id = _validate_task_id(target_task_id)
         recovery_instruction = str(replacement_task).strip()
@@ -4515,12 +4679,16 @@ class TaskStore(IndependentAgentStoreMixin):
         incident = _optional_nonempty_string(incident_id, "incident_id")
         if incident is None:
             raise ValueError("replacement incident_id is required")
+        source_task = _optional_nonempty_string(source_task_id, "source_task_id")
+        source_event = _optional_nonempty_string(source_event_key, "source_event_key")
+        if (source_task is None) != (source_event is None):
+            raise ValueError("replacement source provenance requires both source fields")
         if not isinstance(reuse_team, bool) or not isinstance(rewire_children, bool):
             raise ValueError("replacement flags must be booleans")
         self.root.mkdir(parents=True, exist_ok=True)
         with exclusive_file_lock(self.allocation_lock):
             recovered = self._recover_phase4_replacement_unlocked()
-            if recovered is not None and (
+            if recovered is not None and source_task is None and (
                 recovered["replacement"].get("replaces_task_id") == target_id
                 and recovered["replacement"].get("replacement_incident_id") == incident
             ):
@@ -4557,6 +4725,47 @@ class TaskStore(IndependentAgentStoreMixin):
                             f"invalid CDPA task manifest in {manifest_path}: {error}"
                         )
                     manifests.append(dict(value))
+
+                if source_task is not None:
+                    source_state = next(
+                        (
+                            item
+                            for item in manifests
+                            if str(item.get("task_id") or "") == source_task
+                        ),
+                        None,
+                    )
+                    source_independent = (
+                        source_state.get("independent")
+                        if isinstance(source_state, Mapping)
+                        else None
+                    )
+                    active_event = (
+                        source_independent.get("active_event")
+                        if isinstance(source_independent, Mapping)
+                        else None
+                    )
+                    current_event_keys = (
+                        {
+                            str(event.get("event_key") or "")
+                            for event in canonical_independent_events(
+                                source_state, manifests
+                            )
+                        }
+                        if isinstance(source_state, Mapping)
+                        else set()
+                    )
+                    if (
+                        not isinstance(source_state, Mapping)
+                        or not is_independent_task(source_state)
+                        or not isinstance(active_event, Mapping)
+                        or str(active_event.get("event_key") or "") != source_event
+                        or str(active_event.get("target_task_id") or "") != target_id
+                        or source_event not in current_event_keys
+                    ):
+                        raise ValueError(
+                            "replacement source event is stale or targets different work"
+                        )
 
                 existing = next(
                     (
@@ -4711,6 +4920,10 @@ class TaskStore(IndependentAgentStoreMixin):
                         else None
                     ),
                     browser_endpoint_id=self.endpoint_id_for(target_state),
+                    required_browser_endpoint_id=(
+                        str(target_state.get("required_browser_endpoint_id") or "").strip()
+                        or None
+                    ),
                     conversation_mode=str(target_state.get("conversation_mode") or "persistent"),
                     context_policy=(
                         str(target_state.get("context_policy"))
@@ -5297,12 +5510,11 @@ class TaskStore(IndependentAgentStoreMixin):
             candidate_paths: set[Path] = set(catalog_records)
             include_unreadable = not bool(catalog.get("entries"))
 
-            for path in self._filesystem_manifest_like_paths(
-                include_unreadable=include_unreadable
+            for path in self._filesystem_manifest_like_paths_for_team(
+                team,
+                include_unreadable=include_unreadable,
             ):
-                relative = path.relative_to(self.root.resolve())
-                if relative.parts and relative.parts[0] == team:
-                    candidate_paths.add(path)
+                candidate_paths.add(path)
 
             if not candidate_paths:
                 raise ValueError(f"no CDPA task exists for exact team {team!r}")
@@ -5352,7 +5564,69 @@ class TaskStore(IndependentAgentStoreMixin):
                         )
                 loaded.append((target, dict(state), record))
 
-            all_tasks, _discovery_errors = self._discover_with_catalog_unlocked(catalog)
+            exact_states = [state for _path, state, _record in loaded]
+            if catalog.get("entries"):
+                dependency_ids = {
+                    dependency_id
+                    for state in exact_states
+                    for dependency_id in normalize_dependency_ids(
+                        state.get("depends_on_task_ids")
+                    )
+                }
+                all_tasks = list(exact_states)
+                exact_task_ids = {
+                    str(state.get("task_id") or "") for state in exact_states
+                }
+                for dependency_id in sorted(dependency_ids - exact_task_ids):
+                    matches = [
+                        (key, entry)
+                        for key, entry in catalog["entries"].items()
+                        if isinstance(entry, Mapping)
+                        and str(entry.get("task_id") or "") == dependency_id
+                    ]
+                    if not matches:
+                        continue
+                    if len(matches) != 1:
+                        raise ValueError(
+                            f"dependency task_id is ambiguous in catalog: {dependency_id}"
+                        )
+                    key, entry = matches[0]
+                    dependency_path = Path(
+                        str(entry.get("manifest_path") or "")
+                    ).expanduser().resolve()
+                    if not dependency_path.exists():
+                        raise ValueError(
+                            f"dependency catalog manifest is missing: {dependency_id}"
+                        )
+                    with exclusive_file_lock(self._lock_path(dependency_path)):
+                        try:
+                            dependency_state = json.loads(
+                                read_shared_text(dependency_path, encoding="utf-8")
+                            )
+                        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                            raise ValueError(
+                                f"dependency manifest is unreadable: {dependency_id}: "
+                                f"{type(exc).__name__}: {exc}"
+                            ) from exc
+                    if not isinstance(dependency_state, Mapping):
+                        raise ValueError(
+                            f"dependency manifest root must be an object: {dependency_id}"
+                        )
+                    error = self._manifest_value_error(
+                        dependency_path,
+                        dependency_state,
+                        catalog_key=str(key),
+                        catalog_entry=entry,
+                    )
+                    if error is not None:
+                        raise ValueError(
+                            f"dependency manifest is corrupt: {dependency_id}: {error}"
+                        )
+                    all_tasks.append(dict(dependency_state))
+            else:
+                # Legacy fallback only: repositories without a compact catalog must
+                # discover once so exact-team dependency readiness remains fail-closed.
+                all_tasks, _discovery_errors = self._discover_with_catalog_unlocked(catalog)
             barriers = [
                 item for item in loaded if is_team_availability_barrier(item[1])
             ]
@@ -5525,13 +5799,19 @@ class TaskStore(IndependentAgentStoreMixin):
         normalized_origin = str(origin or "operator").strip().lower()
         normalized_reason = str(reason or "").strip() or None
         if not is_independent_task(state):
-            eligibility = workflow_control_eligibility(
-                state,
-                action,
-                role=control_role,
-            )
-            if not eligibility["eligible"]:
-                raise ValueError(str(eligibility["reason"] or f"{action} is not eligible."))
+            if action == "safe_restore":
+                if normalized_origin != "independent_agent" or source_task is None:
+                    raise ValueError(
+                        "safe_restore is available only to an independent-agent target control"
+                    )
+            else:
+                eligibility = workflow_control_eligibility(
+                    state,
+                    action,
+                    role=control_role,
+                )
+                if not eligibility["eligible"]:
+                    raise ValueError(str(eligibility["reason"] or f"{action} is not eligible."))
         command_reason = normalized_reason or f"{action} requested"
         command = WorkerCommand.create(
             origin=normalized_origin,
@@ -5653,7 +5933,7 @@ class TaskStore(IndependentAgentStoreMixin):
         confirmed: bool = False,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
-        allowed = {"pause", "resume", "retry", "stop", "reset", "restart_role", "open_tab", "close_tab", "new_chat", "route_plan", "clear_team", "archive_worktree"}
+        allowed = {"pause", "resume", "retry", "stop", "reset", "restart_role", "open_tab", "close_tab", "new_chat", "route_plan", "release_required_browser_endpoint", "clear_team", "archive_worktree"}
         action = str(action).strip().lower()
         if action not in allowed:
             raise ValueError(f"unsupported control action {action!r}")
@@ -5669,6 +5949,10 @@ class TaskStore(IndependentAgentStoreMixin):
             )
 
         def mutate(state: dict[str, Any]) -> dict[str, Any]:
+            if is_independent_task(state) and action == "release_required_browser_endpoint":
+                raise ValueError(
+                    "Required browser endpoint release is available only for workflow tasks"
+                )
             if is_independent_task(state) and action == "stop":
                 raise ValueError("independent agents use Reset; Stop is not supported")
             if not is_independent_task(state) and action == "reset":

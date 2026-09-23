@@ -24,7 +24,7 @@ def handle(ctx: Context) -> Decision | None:
     if clicked is not None:
         signature, length = activity(ctx.snapshot)
         previous = wait.get("mcp_allow_activity_signature")
-        progressed = ctx.active or length > int(wait.get("mcp_allow_activity_length") or 0)
+        progressed = ctx.transport_active or length > int(wait.get("mcp_allow_activity_length") or 0)
         progressed = progressed or bool(previous and signature != previous)
         if progressed:
             for key in ("mcp_allow_clicked_at", "mcp_allow_post_click_refreshed",

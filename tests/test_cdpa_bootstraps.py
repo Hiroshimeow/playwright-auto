@@ -44,23 +44,18 @@ def test_missing_catalog_is_empty_without_creating_file(tmp_path: Path):
     assert not (tmp_path / ".runtime" / "cdpa-bootstraps.json").exists()
 
 
-def test_default_bootstrap_prefers_thinkbook_then_g8_then_legacy_fallback(tmp_path: Path):
+def test_default_bootstrap_uses_only_task_neutral_general_default(tmp_path: Path):
     catalog = BootstrapCatalog(tmp_path)
     catalog.upsert(valid_record("general-team-bootstrap"))
 
     assert resolve_default_bootstrap_id(catalog) == "general-team-bootstrap"
 
     catalog.upsert(valid_record("g8-bootstrap", name="G8 bootstrap"))
-    assert resolve_default_bootstrap_id(catalog) == "g8-bootstrap"
-
     catalog.upsert(valid_record("thinkbook-bootstrap", name="ThinkBook bootstrap"))
-    assert resolve_default_bootstrap_id(catalog) == "thinkbook-bootstrap"
-
-    catalog.disable("thinkbook-bootstrap")
-    assert resolve_default_bootstrap_id(catalog) == "g8-bootstrap"
-
-    catalog.disable("g8-bootstrap")
     assert resolve_default_bootstrap_id(catalog) == "general-team-bootstrap"
+
+    catalog.disable("general-team-bootstrap")
+    assert resolve_default_bootstrap_id(catalog) is None
 
 
 def test_normalize_legacy_bootstrap_record_migrates_to_unified_donor_defaults():
@@ -448,3 +443,50 @@ def test_source_url_or_uuid_normalization_is_canonical():
     assert normalize_bootstrap_source(f"https://www.chatgpt.com/c/{CONVERSATION_ID}?x=1") == CONVERSATION_ID
     with pytest.raises(ValueError):
         normalize_bootstrap_source("WEB:temporary")
+
+
+def test_endpoint_scoped_donors_are_canonical_and_distinct():
+    endpoint_a = "endpoint-a"
+    endpoint_b = "endpoint-b"
+    normalized = normalize_bootstrap_record(
+        donor_record(
+            donors=[
+                {
+                    "conversation_id": CONVERSATION_ID,
+                    "assistant_message_id": MESSAGE_ID,
+                    "endpoint_id": endpoint_a,
+                },
+                {
+                    "conversation_id": CONVERSATION_ID,
+                    "assistant_message_id": MESSAGE_ID,
+                    "endpoint_id": endpoint_b,
+                },
+            ]
+        )
+    )
+
+    assert normalized["donors"] == [
+        {
+            "conversation_id": CONVERSATION_ID,
+            "assistant_message_id": MESSAGE_ID,
+            "endpoint_id": endpoint_a,
+        },
+        {
+            "conversation_id": CONVERSATION_ID,
+            "assistant_message_id": MESSAGE_ID,
+            "endpoint_id": endpoint_b,
+        },
+    ]
+
+    with pytest.raises(ValueError, match="endpoint_id"):
+        normalize_bootstrap_record(
+            donor_record(
+                donors=[
+                    {
+                        "conversation_id": CONVERSATION_ID,
+                        "assistant_message_id": MESSAGE_ID,
+                        "endpoint_id": "bad endpoint",
+                    }
+                ]
+            )
+        )

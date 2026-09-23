@@ -336,7 +336,8 @@ def test_completed_job_closes_after_one_minute_and_next_trigger_reopens_saved_ur
             self.wake_calls = []
             self.events = []
 
-        async def acquire(self, _state, _role):
+        async def acquire(self, _state, _role, *, clean_for_send=False):
+            assert clean_for_send is True
             raise RoleOwnershipError("saved agent tab is offline", code="role_offline")
 
         async def reopen(
@@ -441,7 +442,8 @@ def test_temporary_completed_job_requests_immediate_close_and_next_trigger_is_fr
         async def reopen(self, *_args, **_kwargs):
             raise AssertionError("temporary agent must not reopen its saved UUID")
 
-        async def fresh_chat(self, current, logical_role, *, url):
+        async def fresh_chat(self, current, logical_role, *, url, clean_for_send=False):
+            assert clean_for_send is True
             self.fresh_urls.append(url)
             acquired = await FakeActions.acquire(self, current, logical_role)
             return type(acquired)(
@@ -537,8 +539,8 @@ def test_board_uses_operator_labels_run_task_and_restored_settings():
     assert 'body: {trigger_type: "manual", instruction}' in app
     assert '/api/independent-agents/${encodeURIComponent(taskId)}/reset' in app
     assert '.filter(item => !item.agent?.deleted_at)' in app
-    assert 'app.js?v=20260915-operator-ux-v1' in html
-    assert 'dashboard.css?v=20260915-operator-ux-v1' in html
+    assert 'app.js?v=20260923-live-transcript-v1' in html
+    assert 'dashboard.css?v=20260923-live-transcript-v1' in html
     assert 'function addEditedBrowserEndpoint(body, select, values)' in app
     assert 'if (selected !== initial) body.browser_endpoint_id = selected || null;' in app
     assert "new_chat_next_job" not in html[html.index('id="agent-settings-dialog"') :]

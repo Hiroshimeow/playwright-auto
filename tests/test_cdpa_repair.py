@@ -453,7 +453,7 @@ def test_repair_release_rearms_stale_terminal_wait_and_consumes_materialized_bac
     assert state["status"] == "RUNNING"
     assert routed["state"] == "routed"
     assert routed["response"] == response_text
-    assert routed["wait"]["controller_reason"] == "stable_current_result"
+    assert routed["wait"]["controller_reason"] == "valid_current_result"
     assert hop["state"] == "pre_send"
     assert hop["target_role"] == "REVIEW"
     assert calls == {"status": 0, "graph": 0, "locate": 1, "send": 0, "retry": 0, "restart": 0, "new_chat": 0}

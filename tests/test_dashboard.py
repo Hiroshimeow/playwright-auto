@@ -453,8 +453,8 @@ def test_notify_frontend_contract_reuses_secondary_report_path_and_preserves_his
     assert 'if (current.drawer === "history") renderHistory(roots.secondaryContent, current);' in app
     assert 'if (current.drawer === "notify") renderNotify(roots.secondaryContent, current);' in app
     assert 'if (view === "notify") delete roots.secondaryContent.dataset.secondaryView;' in app
-    cache_key = "20260915-report-context-integrate-v1"
-    assert '/assets/app.js?v=20260916-solo-task-v1' in html
+    cache_key = "20260923-live-transcript-v1"
+    assert f'/assets/app.js?v={cache_key}' in html
     assert f'./views/task_detail.js?v={cache_key}' in app
     assert f'./views/notify.js?v={cache_key}' in app
     assert f'./task_detail.js?v={cache_key}' in notify
@@ -670,7 +670,7 @@ def test_dashboard_exposes_role_urls_live_audit_and_page_level_quick_navigation(
     assert 'id="task-board"' in html
     assert 'id="task-workspace"' in html
     assert 'scrollIntoView({behavior: "smooth", block: "start"})' in app
-    assert '[["overview", "Overview"], ["live", "Live audit"], ["reports", `Reports ${model.coverage}`]]' in detail
+    assert '[["overview", "Overview"], ["live", "Live transcript"], ["reports", `Reports ${model.coverage}`]]' in detail
     assert 'copy.dataset.copyRoleUrl = role.chat_url' in detail
     assert 'open.href = role.chat_url' in detail
     assert 'id: "task-roles"' in detail
@@ -694,7 +694,7 @@ def test_dashboard_exposes_role_urls_live_audit_and_page_level_quick_navigation(
     assert 'select.setAttribute("aria-pressed", String(selected))' in detail
     assert 'label: "not allocated"' in detail
     assert '"No tab allocated"' in detail
-    assert 'DOM = observed page state' in detail
+    assert 'DOM: "Observed semantic page state"' in detail
     assert 'sourceCounts[source]' in detail
     assert '<strong>Live audit</strong><span>' not in html
     assert 'details.append(el("summary", "Details"))' in detail
@@ -850,26 +850,23 @@ def test_create_task_sections_summary_validation_and_agent_panel_dismissal_are_e
     assert 'data-workflow-agent-select' in html
     assert 'renderTriggerChoices' in app
 
-def test_create_task_bootstrap_select_load_submit_and_detail_are_explicit():
+def test_create_task_bootstrap_selection_is_disabled_and_legacy_detail_stays_visible():
     html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
     app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
 
     assert html.count('select name="bootstrap_id"') == 1
-    assert "None / Fresh context" in html
-    assert '"/api/bootstraps"' in app
+    assert '<option value="">Fresh context</option>' in html
     assert "loadBootstrapOptions" in app
-    assert "data.default_id" in app
-    assert "body.bootstrap_id" in app
+    assert 'roots.bootstrapSelect.replaceChildren(new Option("Fresh context", ""));' in app
+    assert "roots.bootstrapSelect.disabled = true;" in app
+    assert 'Bootstrap branching is temporarily disabled; workflow tasks use Fresh context.' in app
     assert 'data-bootstrap-inline' in html
-    assert 'name="bootstrap_new_id"' in html
-    assert 'name="bootstrap_new_name"' in html
-    assert 'name="bootstrap_new_source"' in html
-    assert 'name="bootstrap_new_prewarm_prompt"' in html
-    assert 'name="bootstrap_new_max_backups"' in html
-    assert "body.bootstrap_definition" in app
-    assert "source: bootstrapSource" in app
-    assert 'name="bootstrap_kind"' not in html
-    assert 'name="bootstrap_import_generated"' not in html
+    assert "roots.bootstrapInline.hidden = true;" in app
+    assert '"/api/bootstraps"' not in app
+    assert "body.bootstrap_id" not in app
+    assert "body.bootstrap_definition" not in app
+    assert 'name="bootstrap_new_id"' not in html
+    assert 'name="bootstrap_new_source"' not in html
     assert "renderBootstrapContext" in app
     assert "bootstrap_context" in app
     assert "terminal_assistant_message_id" not in app
@@ -1016,7 +1013,7 @@ def test_board_lane_materialization_keeps_commands_after_operational_lanes():
 
     # board.js and its importing entrypoint both get fresh cache identities.
     assert './views/board.js?v=20260915-operator-ux-v1' in app
-    assert '/assets/app.js?v=20260916-solo-task-v1' in html
+    assert '/assets/app.js?v=20260923-live-transcript-v1' in html
 
 
 def test_dashboard_compact_layout_contract_keeps_operational_content_visible():
@@ -1024,7 +1021,7 @@ def test_dashboard_compact_layout_contract_keeps_operational_content_visible():
     css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
 
     # CSS byte changes must publish under a new cache identity.
-    assert '/assets/dashboard.css?v=20260915-operator-ux-v1' in html
+    assert '/assets/dashboard.css?v=20260923-live-transcript-v1' in html
 
     # Endpoint scope is one compact equal-height topology; required operational
     # fields must not be hidden behind a fixed maximum card height.
@@ -1051,8 +1048,8 @@ def test_dashboard_dense_operator_layout_contract():
     css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
 
     # Published frontend bytes use a fresh cache identity through the changed import graph.
-    assert '/assets/dashboard.css?v=20260915-operator-ux-v1' in html
-    assert '/assets/app.js?v=20260916-solo-task-v1' in html
+    assert '/assets/dashboard.css?v=20260923-live-transcript-v1' in html
+    assert '/assets/app.js?v=20260923-live-transcript-v1' in html
     assert './views/board.js?v=20260915-operator-ux-v1' in app
     assert './views/browsers.js?v=20260915-endpoint-all-v1' in app
 

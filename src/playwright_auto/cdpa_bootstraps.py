@@ -20,7 +20,7 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _CHATGPT_HOSTS = frozenset({"chatgpt.com", "www.chatgpt.com"})
 _DEFAULT_MAX_BACKUPS = 7
 _MAX_BACKUPS = 32
-_DEFAULT_BOOTSTRAP_IDS = ("thinkbook-bootstrap", "g8-bootstrap", "general-team-bootstrap")
+_DEFAULT_BOOTSTRAP_IDS = ("general-team-bootstrap",)
 
 _NEW_REQUIRED_FIELDS = frozenset(
     {
@@ -38,7 +38,8 @@ _NEW_REQUIRED_FIELDS = frozenset(
     }
 )
 _NEW_OPTIONAL_INPUT_FIELDS = frozenset({"max_backups", "donors", "description", "enabled", "tags"})
-_NEW_ALLOWED_FIELDS = _NEW_REQUIRED_FIELDS
+# execution_scope is accepted only so old catalog records remain readable.
+_NEW_ALLOWED_FIELDS = _NEW_REQUIRED_FIELDS | frozenset({"execution_scope"})
 
 _LEGACY_REQUIRED_FIELDS = frozenset(
     {
@@ -172,14 +173,28 @@ def _normalize_fingerprints(value: Any) -> dict[str, str]:
 
 
 def normalize_bootstrap_donor(value: Mapping[str, Any]) -> dict[str, str]:
-    if not isinstance(value, MappingABC) or set(value) != {"conversation_id", "assistant_message_id"}:
-        raise ValueError("donor must contain exactly conversation_id and assistant_message_id")
-    return {
+    required = {"conversation_id", "assistant_message_id"}
+    allowed = required | {"endpoint_id"}
+    if (
+        not isinstance(value, MappingABC)
+        or not required.issubset(value)
+        or set(value) - allowed
+    ):
+        raise ValueError(
+            "donor must contain conversation_id and assistant_message_id with optional endpoint_id"
+        )
+    donor = {
         "conversation_id": _validate_uuid(value["conversation_id"], field="donor conversation_id"),
         "assistant_message_id": _validate_uuid(
             value["assistant_message_id"], field="donor assistant_message_id"
         ),
     }
+    if "endpoint_id" in value:
+        endpoint_id = value["endpoint_id"]
+        if not isinstance(endpoint_id, str) or _BOOTSTRAP_ID.fullmatch(endpoint_id) is None:
+            raise ValueError("donor endpoint_id must be a durable endpoint identifier")
+        donor["endpoint_id"] = endpoint_id
+    return donor
 
 
 def _normalize_max_backups(value: Any) -> int:
@@ -277,7 +292,14 @@ def normalize_bootstrap_record(value: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(raw_donors, list):
         raise ValueError("donors must be a list")
     donors = [normalize_bootstrap_donor(item) for item in raw_donors]
-    identities = [(item["conversation_id"], item["assistant_message_id"]) for item in donors]
+    identities = [
+        (
+            item["conversation_id"],
+            item["assistant_message_id"],
+            item.get("endpoint_id"),
+        )
+        for item in donors
+    ]
     if len(set(identities)) != len(identities):
         raise ValueError("donors must not contain duplicates")
     if len(donors) > max_backups:
@@ -338,8 +360,12 @@ def _normalize_catalog(value: Any) -> dict[str, Any]:
 
 
 def resolve_default_bootstrap_id(catalog: "BootstrapCatalog") -> str | None:
-    for bootstrap_id in _DEFAULT_BOOTSTRAP_IDS:
-        record = catalog.get(bootstrap_id)
+    records = {record["bootstrap_id"]: record for record in catalog.list()}
+    # Automatic selection is task-neutral. Specialized or scoped bootstraps are
+    # valid only when explicitly requested by the operator.
+    candidates = list(_DEFAULT_BOOTSTRAP_IDS)
+    for bootstrap_id in candidates:
+        record = records.get(bootstrap_id)
         if record is not None and record.get("enabled") is True:
             return bootstrap_id
     return None

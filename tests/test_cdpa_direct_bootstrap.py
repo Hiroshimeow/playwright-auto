@@ -1,7 +1,10 @@
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from playwright_auto.cdpa_actions import AcquiredRole, BranchBootstrapError
+from playwright_auto.cdpa_bootstraps import BootstrapCatalog
 from playwright_auto.cdpa_config import load_cdpa_config
 from playwright_auto.cdpa_store import TaskStore
 from playwright_auto.cdpa_worker import CDPAWorker
@@ -26,14 +29,16 @@ def test_canonical_branch_identity_survives_store_with_provisional_visible_url(t
     assert saved["roles"]["PLAN"].get("branch_conversation_id") is None
 
 
+@pytest.mark.skip(reason="workflow bootstrap branching is temporarily disabled; workflow tasks use Fresh context")
 def test_bootstrap_donor_rotation_uses_direct_branch_route_only(tmp_path: Path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
+    selected = BootstrapCatalog(tmp_path).upsert(bootstrap_record())
     state = store.create_task(
         "direct bootstrap rotation",
         requested_team="direct-bootstrap",
         task_id="task-direct-bootstrap",
-        bootstrap=bootstrap_record(),
+        bootstrap=selected,
     )
     second = {
         "conversation_id": "33333333-3333-4333-8333-333333333333",
@@ -51,8 +56,15 @@ def test_bootstrap_donor_rotation_uses_direct_branch_route_only(tmp_path: Path, 
             return None
 
         async def branch_from_anchor(
-            self, current, role, *, source_conversation_id, assistant_message_id
+            self,
+            current,
+            role,
+            *,
+            source_conversation_id,
+            assistant_message_id,
+            clean_for_send=False,
         ):
+            assert clean_for_send is True
             call = (role, source_conversation_id, assistant_message_id)
             self.branch_calls.append(call)
             if len(self.branch_calls) == 1:

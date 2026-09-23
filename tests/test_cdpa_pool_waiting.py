@@ -192,9 +192,9 @@ def test_capacity_enforced_during_concurrent_page_allocation(tmp_path, monkeypat
         finally:
             await pool.close()
     asyncio.run(run())
-    assert len(seen) == 4 and len(set(seen)) == 4
-    assert peaks == {first["endpoint_id"]: 2, second["endpoint_id"]: 2}
-    assert sum(store.load(task["manifest_path"])["status"] == "WAITING" for task in tasks) == 2
+    assert len(seen) == 2 and len(set(seen)) == 2
+    assert peaks == {first["endpoint_id"]: 2}
+    assert sum(store.load(task["manifest_path"])["status"] == "WAITING" for task in tasks) == 4
     assert worker._running_executions() == []
 
 

@@ -110,7 +110,7 @@ def test_dashboard_temporary_defaults_to_fresh_and_rejects_explicit_bootstrap(tm
     assert inherited["bootstrap_id"] is None
     assert inherited["context_policy"] == "fresh"
 
-    with pytest.raises(APIError, match="temporary.*bootstrap"):
+    with pytest.raises(APIError, match="bootstrap context is temporarily disabled"):
         api.normalize_create({
             "task": "invalid temporary bootstrap",
             "temporary": True,

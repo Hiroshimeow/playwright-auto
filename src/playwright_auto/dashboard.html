@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>CDPA Control Center</title>
-  <link rel="stylesheet" href="/assets/dashboard.css?v=20260915-operator-ux-v1">
+  <link rel="stylesheet" href="/assets/dashboard.css?v=20260923-live-transcript-v1">
 </head>
 <body>
   <header class="app-header">
@@ -36,7 +36,7 @@
             <p class="rail-group-title">Selected task</p>
             <button type="button" class="rail-link" data-task-jump="overview"><strong>Overview</strong></button>
             <button type="button" class="rail-link" data-task-jump="roles"><strong>Roles / tabs</strong></button>
-            <button type="button" class="rail-link" data-task-jump="live"><strong>Live audit</strong></button>
+            <button type="button" class="rail-link" data-task-jump="live"><strong>Live transcript</strong></button>
             <button type="button" class="rail-link" data-task-jump="timeline"><strong>Timeline</strong></button>
             <button type="button" class="rail-link" data-task-jump="reports"><strong>Reports</strong></button>
           </div>
@@ -120,18 +120,9 @@
             <div><p class="eyebrow">Task details</p><h3 id="create-task-details-title">What should the team deliver?</h3></div>
           </div>
           <label>Task<textarea name="task" rows="7" required placeholder="Describe the required result, constraints, and acceptance evidence."></textarea></label>
-          <label data-team-only>Bootstrap context<select name="bootstrap_id"><option value="">None / Fresh context</option><option value="__create_inline__">Create bootstrap inline…</option></select></label>
-          <div data-bootstrap-inline data-team-only hidden>
-            <div class="form-grid">
-              <label>Bootstrap ID<input name="bootstrap_new_id" autocomplete="off" placeholder="general-team-bootstrap-v2"></label>
-              <label>Name<input name="bootstrap_new_name" autocomplete="off" placeholder="General Team Bootstrap"></label>
-              <label>Source URL / UUID<input name="bootstrap_new_source" autocomplete="off" placeholder="Optional ChatGPT /c/... URL or UUID"></label>
-              <label>Max backups<input name="bootstrap_new_max_backups" type="number" min="1" max="32" value="7"></label>
-            </div>
-            <label>Prewarm prompt<textarea name="bootstrap_new_prewarm_prompt" rows="4" placeholder="Optional reusable bootstrap prompt"></textarea></label>
-            <p class="form-help">Provide a source, a prewarm prompt, or both. Inline creation is persisted by the same durable create-task command.</p>
-          </div>
-          <p class="form-help" data-team-only>The selected reusable context is used only for each workflow role's first allocation. Fresh must be selected explicitly.</p>
+          <label data-team-only hidden>Context<select name="bootstrap_id"><option value="">Fresh context</option></select></label>
+          <div data-bootstrap-inline data-team-only hidden></div>
+          <p class="form-help" data-team-only>Workflow roles start with Fresh context. Bootstrap branching is temporarily disabled.</p>
         </section>
 
         <section class="create-section" data-create-section="team-repository" data-team-only aria-labelledby="create-team-title">
@@ -370,6 +361,6 @@
   <datalist id="workflow-task-team-options"></datalist>
 
   <div id="toast" class="toast" hidden role="status"></div>
-  <script type="module" src="/assets/app.js?v=20260916-solo-task-v2"></script>
+  <script type="module" src="/assets/app.js?v=20260923-live-transcript-v1"></script>
 </body>
 </html>

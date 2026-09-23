@@ -708,10 +708,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Create or resume a durable CDPA task on a shared browser endpoint pool",
         epilog=(
-            "Workflow --browser is an initial placement preference; safe pre-Send work may use another endpoint, "
-            "while accepted or ambiguous Send stays bound to its exact execution. Dependencies are global across "
-            "browser endpoints. --temp forces Temporary Chat with Fresh context; Persistent workflows may use a "
-            "bootstrap. Endpoint rate-limit scope can group browsers into one cooldown domain. Supported dashboard/API "
+            "Each workflow team stays on one browser endpoint for its lifetime. Endpoint temporary_default decides "
+            "Temporary vs persistent mode unless --temp explicitly forces Temporary Chat. New workflow tasks always use "
+            "Fresh context; bootstrap is temporarily disabled. Dependencies remain global across endpoints. Supported dashboard/API "
             "controls include Resume, Change goal, Route PLAN, Retry for structured retryable blocks, Pause, Stop, "
             "Restart role, New chat, Open tab, and Clear team. Run `cdpa` or `cdpa start` for the runtime and `cdpa ui` "
             "to reopen the dashboard."
@@ -734,20 +733,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="optional exact ChatGPT /c/... URL to adopt for a Solo Task",
     )
-    bootstrap = parser.add_mutually_exclusive_group()
-    bootstrap.add_argument(
-        "--bootstrap",
-        dest="bootstrap_id",
-        default=_BOOTSTRAP_UNSET,
-        help="explicit bootstrap ID for a new task",
-    )
-    bootstrap.add_argument(
-        "--fresh",
-        dest="bootstrap_id",
-        action="store_const",
-        const=None,
-        help="start a new task with Fresh context instead of a bootstrap",
-    )
+    parser.set_defaults(bootstrap_id=_BOOTSTRAP_UNSET)
     parser.add_argument(
         "--temp",
         action="store_true",
@@ -756,12 +742,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--browser",
         default=None,
-        help="initial placement preference: browser endpoint ID, port, host:port, or CDP URL",
-    )
-    parser.add_argument(
-        "--require-browser",
-        default=None,
-        help="hard browser requirement for this workflow; waits instead of falling back before Send",
+        help="pin the whole workflow team to this browser endpoint ID, port, host:port, or CDP URL",
     )
     parser.add_argument(
         "--depends-on",
@@ -776,6 +757,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="file context to upload; repeat for multiple files",
     )
     parser.add_argument("--repository", default=None, help="task repository/worktree")
+    parser.add_argument(
+        "--control-repository",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--config",
         default=None,
@@ -822,7 +808,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.repository is not None
             else None
         )
-        control_repository = repository or Path.cwd().resolve()
+        control_repository = (
+            Path(args.control_repository).expanduser().resolve()
+            if args.control_repository is not None
+            else Path.cwd().resolve()
+        )
         config = load_cdpa_config(args.config, repository_root=control_repository)
         if args.task and args.task_option:
             raise ValueError("provide task text either positionally or with --task, not both")
@@ -835,7 +825,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 new_roles
                 or args.new_all
                 or args.temp
-                or args.require_browser is not None
                 or dependencies
                 or args.upload
                 or args.bootstrap_id is not _BOOTSTRAP_UNSET
@@ -857,12 +846,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 new_all=bool(args.new_all),
                 temporary=bool(args.temp),
                 browser_endpoint_id=args.browser,
-                required_browser_endpoint_id=args.require_browser,
                 depends_on_task_ids=dependencies,
                 upload_paths=tuple(
                     str(Path(path).expanduser().resolve()) for path in args.upload
                 ),
-                bootstrap_id=args.bootstrap_id,
                 workflow_mode="solo" if args.solo else "team",
                 solo_role=args.solo,
                 goal=args.goal,
@@ -872,18 +859,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             if not args.team:
                 raise ValueError("taskless resume requires --team <exact-existing-team>")
-            if args.bootstrap_id is not _BOOTSTRAP_UNSET:
-                raise ValueError("--bootstrap and --fresh are invalid in taskless resume mode")
             if (
                 args.temp
                 or args.browser is not None
-                or args.require_browser is not None
                 or args.solo is not None
                 or args.goal is not None
                 or args.conversation_url is not None
             ):
                 raise ValueError(
-                    "--temp, --browser, and --require-browser are invalid in taskless resume mode; "
+                    "--temp and --browser are invalid in taskless resume mode; "
                     "--solo, --goal, and --conversation-url are also invalid"
                 )
             if new_roles or args.new_all or dependencies or args.upload:

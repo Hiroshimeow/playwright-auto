@@ -85,7 +85,8 @@ def test_large_recovery_snapshot_has_hard_total_bound_and_references_task_text(t
 def test_last_useful_progress_is_bounded_and_survives_a_lost_document():
     wait = {}
     ctx = SimpleNamespace(snapshot=SimpleNamespace(messages=[SimpleNamespace(role='assistant',text='x'*12000,message_id='a1',turn_id='t1')]),
-        wait=wait, now=datetime.now(timezone.utc), policy=SimpleNamespace(response_stable_seconds=1,minimum_samples=2), phase='wait')
+        wait=wait, now=datetime.now(timezone.utc), policy=SimpleNamespace(response_stable_seconds=1,minimum_samples=2),
+        phase='wait', validation_error=None, candidate_stable=False)
     observe(ctx, None, None)
     assert len(wait['last_assistant_progress']['text']) == 8000
     assert wait['last_assistant_progress']['message_id'] == 'a1'

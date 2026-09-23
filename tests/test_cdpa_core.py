@@ -422,9 +422,8 @@ def test_constructor_is_once_per_generation_and_prompt_is_compact_allowlist(tmp_
     assert '"task-id"' not in later.text
     assert "Handoff: .plan/alpha/alpha-plan_turn1_task-a.md" in later.text
     assert "Goal: full task" in later.text
-    assert "Use @mcp-g8 or @mcp-docker on Linux, and @mcp-thinkbook on Windows." in later.text
+    assert "Use @mcp-g8 or @mcp-docker on Linux, and @mcp-thinkbook on Windows." not in later.text
     assert "Establish the root cause before changing or judging code; prefer the least invasive complete solution, never a smaller patch that leaves the cause intact." in later.text
-    assert "Do not claim tool or workspace access is unavailable until an actual tool call fails." in later.text
     assert "Work first." in later.text
     assert "block_code" in later.text
     assert "resume_condition" in later.text
@@ -437,7 +436,17 @@ def test_constructor_is_once_per_generation_and_prompt_is_compact_allowlist(tmp_
     ):
         assert forbidden not in first.text
 
-    assert repair == "Continue from this state!\nReturn exactly one valid JSON object"
+    assert repair.startswith(
+        "You are alpha-plan repairing the route response for alpha | task-a.\n"
+        "Turn: 1\n"
+        "Validation error: bad keys at .plan/<team>/<physical-role>_turn<N>_<task-id>.md\n"
+        "Expected report path: .plan/alpha/alpha-plan_turn1_task-a.md"
+    )
+    assert "Continue from the existing workspace/report state." in repair
+    assert "Return exactly one valid JSON object:" in repair
+    assert "Output exactly one JSON object and nothing else." in repair
+    assert "full task" not in repair
+    assert "Constructor for PLAN" not in repair
 
 
 def test_same_role_continuation_prompt_rejects_report_only_turn(tmp_path: Path):

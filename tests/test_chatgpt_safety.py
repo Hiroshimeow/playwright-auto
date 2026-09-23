@@ -4,6 +4,7 @@ from dataclasses import replace
 import pytest
 
 import playwright_auto.chatgpt as chatgpt
+from playwright_auto.chatgpt_graph import rendered_user_text_matches
 from playwright_auto.chatgpt import (
     AuthenticationRequiredError,
     ChatGPTPage,
@@ -791,3 +792,21 @@ def test_frontend_identity_parser_failure_cannot_retry_accepted_dom_send(monkeyp
         assert task is not None and await task is None
 
     asyncio.run(run())
+
+
+
+def test_rendered_user_text_match_allows_markdown_backticks_and_show_more_only():
+    expected = (
+        "PAUSE only after writing a valid report with "
+        "`block_code=...` and `resume_condition=...`. "
+        "Work first."
+    )
+    rendered = (
+        "PAUSE only after writing a valid report with "
+        "block_code=... and resume_condition=.... Work first. Show more"
+    )
+    assert rendered_user_text_matches(rendered, expected) is True
+    assert rendered_user_text_matches(
+        rendered.replace("Work first.", "Do something else."),
+        expected,
+    ) is False

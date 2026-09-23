@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import warnings
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
@@ -150,6 +151,43 @@ class CDPATabActions:
     def release_backend_stream_status(self, conversation_id: str) -> None:
         release_read_backend_stream_status(self.browser_context, conversation_id)
 
+    async def observe_session_tool_capability(
+        self,
+        *,
+        state: Mapping[str, Any],
+        role: str,
+        acquired: AcquiredRole,
+        requirement: Mapping[str, Any],
+        phase: str,
+    ) -> dict[str, Any]:
+        del state, role
+        observer = getattr(
+            acquired.client, "observe_session_tool_capability", None
+        )
+        if callable(observer):
+            value = await observer(
+                requirement=dict(requirement),
+                phase=str(phase),
+            )
+            if isinstance(value, Mapping):
+                return dict(value)
+        return {
+            **dict(requirement),
+            "status": "unknown",
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "session_revision": (
+                f"{requirement.get('conversation_id')}:"
+                f"{requirement.get('conversation_generation')}"
+            ),
+            "reason_code": "session_tool_visibility_unknown",
+            "evidence_ref": "chatgpt_session_capability_not_observable",
+            "target_device_id": None,
+            "principal_scope": None,
+            "project_binding": None,
+            "required_operations": [],
+            "reason_detail": "The acquired client has no production session capability observer.",
+        }
+
     async def _set_page_active(self, page: Any) -> None:
         try:
             session = await self.browser_context.new_cdp_session(page)
@@ -182,11 +220,13 @@ class CDPATabActions:
         manifest: Mapping[str, Any],
         logical_role: str,
     ) -> list[tuple[ChatGPTPage, Any]]:
+        """Match only cheap durable metadata; unrelated tabs never require a DOM snapshot."""
         role_record = manifest["roles"][logical_role]
         physical = str(role_record["physical_role"])
         team = str(manifest["team"])
         task_id = str(manifest["task_id"])
         recorded_page_id = str(role_record.get("page_id") or "").strip()
+        expected_binding_id = str(role_record.get("binding_id") or "").strip()
         exact: list[tuple[ChatGPTPage, Any]] = []
         reusable: list[tuple[int, tuple[ChatGPTPage, Any]]] = []
         reusable_rank = {
@@ -196,34 +236,34 @@ class CDPATabActions:
         for page in self.browser_context.pages:
             if page.is_closed() or not self._supported(page):
                 continue
+            metadata = await inspect_page_metadata(page)
+            page_id = str(metadata.get("page_id") or "")
+            role = str(metadata.get("role") or "")
+            if not page_id or role != physical:
+                continue
+            if expected_binding_id and metadata.get("binding_id") not in {None, expected_binding_id}:
+                continue
             client = ChatGPTPage(
                 page,
                 timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
             )
-            metadata = await inspect_page_metadata(page)
-            if metadata.get("page_id") and metadata.get("role"):
-                snapshot = SimpleNamespace(
-                    page_id=metadata.get("page_id"),
-                    page_role=metadata.get("role"),
-                    page_team=metadata.get("team"),
-                    page_task_id=metadata.get("task_id"),
-                    url=metadata.get("url") or str(page.url),
-                )
-            else:
-                try:
-                    snapshot = await client.snapshot()
-                except Exception:
-                    continue
-            if snapshot.page_role != physical or not snapshot.page_id:
-                continue
-            client.binding = PageBinding(str(snapshot.page_id), physical)
+            client.binding = PageBinding(page_id, physical)
+            snapshot = SimpleNamespace(
+                page_id=page_id,
+                page_role=role,
+                page_team=metadata.get("team"),
+                page_task_id=metadata.get("task_id"),
+                url=metadata.get("url") or str(page.url),
+            )
             item = (client, snapshot)
             if snapshot.page_team == team and snapshot.page_task_id == task_id:
+                if recorded_page_id and page_id != recorded_page_id:
+                    continue
                 exact.append(item)
             elif (
                 is_independent_task(manifest)
                 and recorded_page_id
-                and str(snapshot.page_id) == recorded_page_id
+                and page_id == recorded_page_id
                 and snapshot.page_team == team
             ):
                 reusable.append((-1, item))
@@ -243,8 +283,6 @@ class CDPATabActions:
                     f"multiple reusable terminal tabs match {physical!r} for team {team!r}"
                 )
             return best
-        if recorded_page_id:
-            return []
         return []
 
     async def acquire_global_role(
@@ -314,28 +352,36 @@ class CDPATabActions:
         manifest: Mapping[str, Any],
         logical_role: str,
     ) -> AcquiredRole | None:
-        """Locate the exact owned tab without falling back to a DOM snapshot."""
+        """Locate only the exact durable role binding; unrelated pages are ignored."""
         role_record = manifest["roles"][logical_role]
         physical = str(role_record["physical_role"])
         team = str(manifest["team"])
         task_id = str(manifest["task_id"])
+        recorded_page_id = str(role_record.get("page_id") or "").strip()
+        expected_binding_id = str(role_record.get("binding_id") or "").strip()
         matches: list[tuple[ChatGPTPage, Mapping[str, Any]]] = []
         for page in self.browser_context.pages:
             if page.is_closed() or not self._supported(page):
                 continue
             metadata = await inspect_page_metadata(page)
+            page_id = str(metadata.get("page_id") or "")
+            if not page_id:
+                continue
+            if recorded_page_id and page_id != recorded_page_id:
+                continue
+            if expected_binding_id and metadata.get("binding_id") not in {None, expected_binding_id}:
+                continue
             if (
                 metadata.get("role") != physical
                 or metadata.get("team") != team
                 or metadata.get("task_id") != task_id
-                or not metadata.get("page_id")
             ):
                 continue
             client = ChatGPTPage(
                 page,
                 timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
             )
-            client.binding = PageBinding(str(metadata["page_id"]), physical)
+            client.binding = PageBinding(page_id, physical)
             matches.append((client, metadata))
         if len(matches) > 1:
             raise RoleOwnershipError(
@@ -782,6 +828,7 @@ class CDPATabActions:
                     role=physical,
                     task_id=str(manifest["task_id"]),
                     team=str(manifest["team"]),
+                    binding_id=str(role_record.get("binding_id") or "") or None,
                 )
             else:
                 snapshot = await client.assert_ownership()
@@ -796,6 +843,7 @@ class CDPATabActions:
                         role=physical,
                         task_id=str(manifest["task_id"]),
                         team=str(manifest["team"]),
+                        binding_id=str(role_record.get("binding_id") or "") or None,
                     )
             if require_clean_ready:
                 await client.wait_until_clean_ready(timeout_ms=timeout)
@@ -846,7 +894,9 @@ class CDPATabActions:
                 )
             else:
                 await existing.client.prepare_task(task_id, force_new_chat=True)
-            await existing.client.bind_task_identity(task_id, team)
+            await existing.client.bind_task_identity(
+                task_id, team, binding_id=str(role_record.get("binding_id") or "") or None
+            )
             snapshot = await existing.client.assert_ownership()
             return AcquiredRole(
                 client=existing.client,
@@ -941,6 +991,7 @@ class CDPATabActions:
             await client.bind_task_identity(
                 str(manifest["task_id"]),
                 str(manifest["team"]),
+                binding_id=str(record.get("binding_id") or "") or None,
             )
             snapshot = await client.assert_ownership()
             if _reopenable_conversation_identity(snapshot.url) != expected:
@@ -972,12 +1023,13 @@ class CDPATabActions:
     ) -> AcquiredRole:
         logical_role = str(logical_role).upper()
         record = manifest["roles"][logical_role]
-        # A generation belongs to one role execution, not every role in its team.
+        # Fresh allocation only reconciles this exact role. Unrelated ChatGPT
+        # tabs on the same endpoint are not an admission dependency.
         role_scope = {**manifest, "roles": {logical_role: record}}
-        selected = await self.preflight_team(role_scope)
+        selected = await self.preflight_role(role_scope, logical_role)
         if selected:
             await self.close_team(role_scope, preflighted_pages=selected)
-            if await self.preflight_team(role_scope):
+            if await self.preflight_role(role_scope, logical_role):
                 raise TeamCloseError("fresh chat could not close the previous owned role tab")
         physical = str(record["physical_role"])
         await random_delay(action_delay_multiplier("open_tab"))
@@ -995,7 +1047,11 @@ class CDPATabActions:
                     client,
                     timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
                 )
-            await client.bind_task_identity(str(manifest["task_id"]), str(manifest["team"]))
+            await client.bind_task_identity(
+                str(manifest["task_id"]),
+                str(manifest["team"]),
+                binding_id=str(record.get("binding_id") or "") or None,
+            )
             snapshot = await client.assert_ownership()
             assert client.binding is not None
             await self._set_page_active(client.page)
@@ -1016,8 +1072,13 @@ class CDPATabActions:
         logical_role: str,
     ) -> AcquiredRole:
         acquired = await self.acquire(manifest, logical_role)
+        record = manifest["roles"][str(logical_role).upper()]
         await acquired.client.prepare_task(str(manifest["task_id"]), force_new_chat=True)
-        await acquired.client.bind_task_identity(str(manifest["task_id"]), str(manifest["team"]))
+        await acquired.client.bind_task_identity(
+            str(manifest["task_id"]),
+            str(manifest["team"]),
+            binding_id=str(record.get("binding_id") or "") or None,
+        )
         snapshot = await acquired.client.assert_ownership()
         return AcquiredRole(
             client=acquired.client,
@@ -1078,8 +1139,7 @@ class CDPATabActions:
                 "refresh",
                 action_delay_multiplier("refresh"),
             )
-            await refresh_page(
-                target.client.page,
+            await target.client.refresh(
                 timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
             )
             snapshot = await target.client.assert_ownership()
@@ -1169,7 +1229,68 @@ class CDPATabActions:
         )
         await acquired.client.page.bring_to_front()
 
-    async def preflight_team(self, manifest: Mapping[str, Any]) -> list[Any]:
+    async def preflight_role(
+        self,
+        manifest: Mapping[str, Any],
+        logical_role: str,
+    ) -> list[Any]:
+        """Non-destructive admission: inspect only exact cheap role bindings."""
+        role = str(logical_role).upper()
+        record = manifest["roles"][role]
+        physical = str(record["physical_role"])
+        team = str(manifest["team"])
+        task_id = str(manifest["task_id"])
+        recorded_page_id = str(record.get("page_id") or "").strip()
+        expected_binding_id = str(record.get("binding_id") or "").strip()
+        matches: list[Any] = []
+        for page in tuple(self.browser_context.pages):
+            if page.is_closed() or not self._supported(page):
+                continue
+            metadata = await inspect_page_metadata(page)
+            page_id = str(metadata.get("page_id") or "")
+            if not page_id:
+                continue
+            if expected_binding_id and metadata.get("binding_id") == expected_binding_id:
+                pass
+            elif recorded_page_id and page_id == recorded_page_id:
+                pass
+            elif (
+                not recorded_page_id
+                and metadata.get("role") == physical
+                and metadata.get("team") == team
+                and metadata.get("task_id") == task_id
+            ):
+                pass
+            else:
+                continue
+            if (
+                metadata.get("role") != physical
+                or metadata.get("team") != team
+                or metadata.get("task_id") != task_id
+            ):
+                raise RoleOwnershipError(
+                    f"exact role binding conflicts with durable owner for {physical!r}",
+                    code="role_ownership_conflict",
+                )
+            if expected_binding_id and metadata.get("binding_id") not in {None, expected_binding_id}:
+                raise RoleOwnershipError(
+                    f"exact role binding token conflicts for {physical!r}",
+                    code="role_ownership_conflict",
+                )
+            matches.append(page)
+        if len(matches) > 1:
+            raise RoleOwnershipError(
+                f"multiple exact bindings match {physical!r} for team {team!r} task {task_id!r}",
+                code="role_ownership_conflict",
+            )
+        return matches
+
+    async def preflight_team(
+        self,
+        manifest: Mapping[str, Any],
+        *,
+        allow_proven_unrelated_page_skip: bool = False,
+    ) -> list[Any]:
         team = str(manifest["team"])
         task_id = str(manifest["task_id"])
         assigned_roles = {
@@ -1184,9 +1305,39 @@ class CDPATabActions:
             for record in manifest.get("roles", {}).values()
             if isinstance(record, Mapping) and record.get("physical_role")
         }
+        durable_page_ids = {
+            page_id for page_id in recorded_page_ids.values() if page_id
+        }
         for page in tuple(self.browser_context.pages):
             if page.is_closed() or not self._supported(page):
                 continue
+            if allow_proven_unrelated_page_skip:
+                metadata_timeout = max(
+                    0.001,
+                    float(self.config.workspace_timeout_seconds),
+                )
+                try:
+                    metadata = await asyncio.wait_for(
+                        inspect_page_metadata(page),
+                        timeout=metadata_timeout,
+                    )
+                except Exception as exc:
+                    raise RoleOwnershipError(
+                        "cannot inspect supported ChatGPT page ownership metadata "
+                        "during scoped admission preflight: "
+                        f"{getattr(page, 'url', '<unknown>')!r}: "
+                        f"{type(exc).__name__}: {exc}",
+                        code="role_ownership_metadata_unavailable",
+                    ) from exc
+                if (
+                    metadata.get("page_id")
+                    and metadata.get("role")
+                    and metadata.get("team")
+                    and metadata.get("task_id")
+                    and metadata["team"] != team
+                    and str(metadata["page_id"]) not in durable_page_ids
+                ):
+                    continue
             client = ChatGPTPage(page)
             try:
                 snapshot = await client.snapshot()

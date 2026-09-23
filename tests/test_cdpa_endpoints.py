@@ -153,6 +153,24 @@ def test_endpoint_capacity_defaults_to_two_and_is_configurable(tmp_path):
     assert updated["max_active_tabs"] == 4
 
 
+def test_endpoint_loader_ignores_legacy_tool_capability_metadata(tmp_path):
+    catalog = registry(tmp_path)
+    endpoint = catalog.resolve()
+    raw = catalog.snapshot()
+    raw["entries"][endpoint["endpoint_id"]].update(
+        tool_capabilities=["md:g6"],
+        tool_capabilities_configured=True,
+        tool_capability_bindings={"md:g6": {"target_device_id": "legacy-device"}},
+    )
+
+    normalized = catalog._validate(raw)
+
+    loaded = normalized["entries"][endpoint["endpoint_id"]]
+    assert "tool_capabilities" not in loaded
+    assert "tool_capabilities_configured" not in loaded
+    assert "tool_capability_bindings" not in loaded
+
+
 @pytest.mark.parametrize("value", [0, -1, True, "2"])
 def test_endpoint_capacity_requires_a_positive_integer(tmp_path, value):
     catalog = registry(tmp_path)

@@ -28,11 +28,17 @@ def test_report_repair_repeats_exact_workspace_destination(tmp_path):
     from playwright_auto.cdpa_routes import expected_report_relative
     from playwright_auto.cdpa_worker import _active_hop
     from test_cdpa_worker import setup_task, FakeActions
-    config, _, state, worker = setup_task(tmp_path)
+
+    config, _store, state, worker = setup_task(tmp_path)
     hop = _active_hop(state)
     path = expected_report_relative(repository_root=tmp_path, plans_root=config.plans_root,
         team=state["team"], physical_role=hop["physical_role"], turn=hop["turn"], task_id=state["task_id"])
     hop.update(kind="report_repair", locked_route="DONE", locked_handoff=path, validation_error="report missing")
     asyncio.run(worker._pre_send(state, hop, FakeActions()))
-    assert str(tmp_path / path) in hop["prompt"]
+    absolute = str(tmp_path / path)
+    assert hop["prompt"].count(absolute) == 1
+    assert f"{path}/{path}" not in hop["prompt"]
     assert "CDPA_REPORT_REPAIR" in hop["prompt"]
+    assert hop["prompt"].count(f"Write the complete role report to exactly: {path}") == 1
+    assert "Authorized endpoint tools:" not in hop["prompt"]
+    assert "@mcp-thinkbook" not in hop["prompt"]

@@ -39,6 +39,7 @@ def test_metadata_inventory_uses_one_minimal_evaluation():
     assert "querySelector" not in script
     assert result == {
         "page_id": "page-1",
+        "binding_id": None,
         "url": "https://chatgpt.com/c/abc",
         "title": "ChatGPT",
         "role": "DEV",

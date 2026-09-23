@@ -1,17 +1,22 @@
 """One operational decision/execution path for waiting, Resume and pre-send recovery.
 
-Handlers do not send, click or create tasks. This controller performs at most one
-browser action per step, using the existing worker's persistence and routing.
+This controller performs at most one browser action per step, using the existing
+worker's persistence and routing.
 """
 from __future__ import annotations
 
 import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping
+from urllib.parse import parse_qs, urlsplit
 
 from ..cdpa_response import begin_refresh, finish_refresh, parse_time
-from . import allow, auth, dialog, draft, malformed, rate_limit, response, retry, timeout, ui_error
+from . import allow, response, timeout
 from .model import Action, Context, Decision, Policy
+
+
+_RATE_LIMIT_MARKERS = ("too many requests", "rate limit", "rate-limit", "request limit")
+_TEMPORARY_SAVE_OFFER = "Want to keep this chat? You can now save it to your history."
 
 
 class RoleController:
@@ -22,55 +27,114 @@ class RoleController:
         self, snapshot: Any, wait: dict[str, Any], *, receipt: Any = None,
         permission: Mapping[str, Any] | None = None,
         validate: Callable[[Any], None] | None = None, phase: str = "waiting",
-        network_status: str | None = None, now: datetime | None = None,
+        network_status: str | None = None, terminal_message_id: str | None = None,
+        now: datetime | None = None,
     ) -> Decision:
         ctx = Context(snapshot, wait, self.policy, now or datetime.now(timezone.utc),
                       permission, phase, network_status=network_status)
         wait["manual_draft_present"] = ctx.draft_present
-        for handler in (auth.handle, rate_limit.handle, dialog.handle):
-            decision = handler(ctx)
-            if decision is not None:
-                return self._remember(ctx, decision)
-        if phase == "waiting":
-            response.observe(ctx, getattr(receipt, "baseline", None), validate)
+        dialogs = tuple(getattr(snapshot, "blocking_dialogs", ()) or ())
+        dialog_text = " ".join(dialogs).lower()
+        if getattr(snapshot, "requires_login", False) or "session has expired" in dialog_text:
+            return self._remember(ctx, Decision(Action.BLOCK, "authentication_required"))
+        error_texts = tuple(getattr(snapshot, "error_texts", ()) or ())
+        if any(marker in str(text).lower() for text in (*dialogs, *error_texts) for marker in _RATE_LIMIT_MARKERS):
+            return self._remember(ctx, Decision(Action.COOLDOWN, "profile_rate_limit"))
+        if phase == "waiting" and terminal_message_id:
+            response.observe(
+                ctx,
+                getattr(receipt, "baseline", None),
+                validate,
+                terminal_message_id=terminal_message_id,
+            )
+            terminal_decision = response.handle(ctx)
+            if terminal_decision is not None:
+                return self._remember(ctx, terminal_decision)
+        blocking_dialogs = dialogs
+        if phase == "waiting" and parse_qs(urlsplit(str(getattr(snapshot, "url", ""))).query).get("temporary-chat") == ["true"]:
+            blocking_dialogs = tuple(
+                value for value in dialogs if " ".join(value.split()) != _TEMPORARY_SAVE_OFFER
+            )
+        if blocking_dialogs and not ctx.permission_present:
+            return self._remember(ctx, Decision(Action.WAIT, "blocking_dialog_wait"))
+        if getattr(snapshot, "choice_prompt_labels", ()) and not ctx.permission_present:
+            return self._remember(ctx, Decision(Action.WAIT, "choice_prompt_wait"))
+        if phase == "waiting" and not terminal_message_id:
+            response.observe(
+                ctx,
+                getattr(receipt, "baseline", None),
+                validate,
+                terminal_message_id=None,
+            )
             result_decision = response.handle(ctx)
             if result_decision is not None:
                 return self._remember(ctx, result_decision)
-
         timeout.observe(ctx)
         ready_at = parse_time(wait.get("refresh_ready_at"))
         if ready_at is not None and ctx.now < ready_at:
             return self._remember(ctx, Decision(Action.WAIT, "reload_settle"))
         wait.pop("refresh_ready_at", None)
 
+        if (
+            ctx.candidate is not None
+            and ctx.validation_error is None
+            and not ctx.candidate_stable
+        ):
+            return self._remember(ctx, Decision(Action.WAIT, "result_stability"))
+
         permission_decision = allow.handle(ctx)
         if permission_decision is not None:
             recovery = timeout.handle(ctx) if wait.get("mcp_allow_retry_at") else None
-            return self._remember(ctx, draft.protect(ctx, recovery or permission_decision))
+            decision = recovery or permission_decision
+            if ctx.draft_present and decision.action in {Action.REFRESH, Action.REPAIR}:
+                decision = Decision(Action.WAIT, "manual_draft_preserved")
+            return self._remember(ctx, decision)
 
         if phase == "history":
             return self._remember(ctx, Decision(Action.WAIT, "history_observation"))
 
         if phase == "pre_send":
-            if ctx.active:
+            if ctx.transport_active:
                 return self._remember(ctx, Decision(Action.WAIT, "response_in_progress"))
-            if getattr(snapshot, "error_texts", ()):
-                decision = ui_error.handle(ctx)
-                return self._remember(ctx, decision or Decision(Action.WAIT, "ui_error"))
+            if error_texts:
+                key = hashlib.sha256("|".join(error_texts).encode()).hexdigest()
+                if wait.get("ui_error_refreshed_key") != key:
+                    return self._remember(ctx, Decision(Action.REFRESH, "ui_error"))
+                return self._remember(ctx, Decision(Action.WAIT, "ui_error_waiting_for_composer"))
             reason = "ready" if ctx.composer_ready else "composer_pending"
             return self._remember(ctx, Decision(Action.WAIT, reason))
 
-        for handler in (retry.handle, malformed.handle, ui_error.handle):
-            decision = handler(ctx)
-            if decision is not None and decision.action is not Action.WAIT:
-                return self._remember(ctx, draft.protect(ctx, decision))
-        # Give a current candidate its normal two samples even at the deadline.
-        if ctx.candidate is not None and not ctx.candidate_stable and not ctx.active:
+        if ctx.candidate is not None and not ctx.candidate_stable:
             return self._remember(ctx, Decision(Action.WAIT, "result_stability"))
+
+        decision = None
+        if getattr(snapshot, "retry_visible", False) and ctx.composer_ready:
+            decision = Decision(Action.REPAIR, "ChatGPT Retry UI is visible; continue from the existing state")
+        # An invalid rendered candidate is not repaired immediately. Preserve it as
+        # evidence and let the normal ten-minute timeout -> reload -> status path
+        # decide whether continuation repair is actually required.
+        if decision is None and error_texts and not ctx.transport_active:
+            key = hashlib.sha256("|".join(error_texts).encode()).hexdigest()
+            if wait.get("ui_error_refreshed_key") != key:
+                decision = Decision(Action.REFRESH, "ui_error")
+            elif ctx.composer_ready:
+                decision = Decision(Action.REPAIR, "UI generation error; continue from this state")
+        if decision is not None:
+            if ctx.draft_present and decision.action in {Action.REFRESH, Action.REPAIR}:
+                decision = Decision(Action.WAIT, "manual_draft_preserved")
+            return self._remember(ctx, decision)
         decision = timeout.handle(ctx)
         if decision is not None:
-            return self._remember(ctx, draft.protect(ctx, decision))
-        return self._remember(ctx, Decision(Action.WAIT, "response_in_progress" if ctx.active else "wait_response"))
+            if ctx.draft_present and decision.action in {Action.REFRESH, Action.REPAIR}:
+                decision = Decision(Action.WAIT, "manual_draft_preserved")
+            return self._remember(ctx, decision)
+        return self._remember(
+            ctx,
+            Decision(
+                Action.WAIT,
+                "response_in_progress" if ctx.transport_active else "wait_response",
+            ),
+        )
 
     @staticmethod
     def _remember(ctx: Context, decision: Decision) -> Decision:
@@ -79,8 +143,9 @@ class RoleController:
         return decision
 
     async def run(self, worker, state, hop, acquired, actions, **kwargs) -> Decision:
+        from ..cdpa_actions import is_transient_page_lifecycle_error
+        from ..chatgpt import AuthenticationRequiredError, ComposerConflictError
         from ..connection import is_cdp_disconnect
-        from . import lifecycle
         wait = hop.setdefault("wait", {})
         retry_at = parse_time(wait.get("observation_retry_at"))
         if retry_at is not None and datetime.now(timezone.utc) < retry_at:
@@ -91,8 +156,17 @@ class RoleController:
         except Exception as exc:
             if is_cdp_disconnect(exc):
                 raise
-            result = lifecycle.handle(exc, wait)
-            if result is None:
+            if isinstance(exc, AuthenticationRequiredError):
+                result = Decision(Action.BLOCK, "authentication_required")
+            elif isinstance(exc, ComposerConflictError):
+                result = Decision(Action.WAIT, "manual_draft_preserved")
+            elif isinstance(exc, TimeoutError) or is_transient_page_lifecycle_error(exc):
+                wait["observation_retry_at"] = (
+                    datetime.now(timezone.utc) + timedelta(seconds=5)
+                ).isoformat()
+                wait["observation_error"] = type(exc).__name__
+                result = Decision(Action.WAIT, "page_lifecycle_recovery")
+            else:
                 raise
             if result.action is Action.BLOCK:
                 worker._block(state, result.reason, code=result.reason, retryable=True)
@@ -141,6 +215,24 @@ class RoleController:
             listen_values["response_message_id"] = str(network_response.get("message_id") or network_response.get("id") or "")
             listen_values["response_turn_id"] = str(network_response.get("turn_id") or "")
             listen_values["response_text_length"] = len(str(network_response.get("text") or ""))
+            transcript_text = str(network_response.get("text") or "")
+            transcript_message_id = str(network_response.get("message_id") or network_response.get("id") or "")
+            if transcript_message_id and transcript_text.strip():
+                append_live_event(
+                    "TRANSCRIPT", "message",
+                    page_url=str(snapshot.url), page_id=acquired.page_id,
+                    role=str(hop.get("physical_role") or hop.get("target_role")),
+                    task_id=str(state["task_id"]), team=str(state["team"]),
+                    request_id=str(hop.get("request_id") or ""),
+                    values={
+                        "author": "assistant",
+                        "message_id": transcript_message_id,
+                        "turn_id": str(network_response.get("turn_id") or "") or None,
+                        "text": transcript_text[:24000],
+                        "text_length": len(transcript_text),
+                        "complete": True,
+                    },
+                )
         if permission is not None:
             listen_values["permission_target"] = str(permission.get("target_message_id") or "")
         listen_signature = "|".join(f"{key}={value}" for key, value in sorted(listen_values.items()))
@@ -154,15 +246,24 @@ class RoleController:
             )
         # Live network final messages may precede DOM rendering. History/G2 never
         # supplies this slot, and missing network evidence never gates DOM.
-        if phase == "waiting" and network_response and not response.current_assistant(snapshot.messages, getattr(receipt, "baseline", None)):
+        terminal_message_id = None
+        if phase == "waiting" and isinstance(network_response, Mapping):
             from dataclasses import replace
             candidate = MessageSnapshot.from_dict(network_response)
-            snapshot = replace(snapshot, messages=(*snapshot.messages, candidate))
+            terminal_message_id = str(candidate.message_id or "") or None
+            existing_ids = {
+                str(getattr(message, "message_id", "") or "")
+                for message in snapshot.messages
+            }
+            if not terminal_message_id or terminal_message_id not in existing_ids:
+                snapshot = replace(snapshot, messages=(*snapshot.messages, candidate))
         previous = (wait.get("controller_decision"), wait.get("controller_reason"))
         decision = self.decide(
             snapshot, wait, receipt=receipt, permission=permission,
             validate=(lambda candidate: worker._validate_response_candidate(state, hop, candidate)),
-            phase=phase, network_status=evidence.get("status"),
+            phase=phase,
+            network_status=evidence.get("status"),
+            terminal_message_id=terminal_message_id,
         )
         if previous != (decision.action.value, decision.reason):
             append_live_event(
@@ -175,6 +276,21 @@ class RoleController:
                         "retry_visible": bool(getattr(snapshot, "retry_visible", False))},
             )
         state["active_action"] = "wait_response" if phase == "waiting" else "queued"
+        if decision.action is Action.REFRESH and state.get("conversation_mode") == "temporary":
+            # Temporary Chat documents are ephemeral. Reload can destroy the live
+            # document identity, so automatic F5 is never an allowed recovery.
+            if decision.reason == "malformed_result":
+                wait["invalid_refreshed_key"] = wait.get("result_seen_key")
+            elif decision.reason == "ui_error":
+                wait["ui_error_refreshed_key"] = hashlib.sha256(
+                    "|".join(getattr(snapshot, "error_texts", ()) or ()).encode()
+                ).hexdigest()
+            elif decision.reason == "response_timeout_recheck":
+                wait["timeout_refreshed"] = True
+            wait["temporary_refresh_suppressed_at"] = datetime.now(timezone.utc).isoformat()
+            wait["controller_decision"] = Action.WAIT.value
+            wait["controller_reason"] = f"temporary_no_refresh:{decision.reason}"
+            return Decision(Action.WAIT, f"temporary_no_refresh:{decision.reason}")
         if decision.action is Action.WAIT:
             if decision.reason.startswith("mcp_allow_"):
                 state["active_action"] = "wait_" + decision.reason

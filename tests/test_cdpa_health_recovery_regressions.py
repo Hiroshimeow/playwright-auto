@@ -59,7 +59,7 @@ def test_required_temporary_endpoint_ownership_persists_before_pre_send_and_rest
         worker.advance(path, SimpleNamespace(pages=[]), endpoint_id=required["endpoint_id"])
     )
 
-    assert task["browser_endpoint_id"] == default["endpoint_id"]
+    assert task["browser_endpoint_id"] == required["endpoint_id"]
     assert default["endpoint_id"] != required["endpoint_id"]
     assert seen == [(required["endpoint_id"], required["endpoint_id"])]
     assert result["roles"]["PLAN"]["browser_endpoint_id"] == required["endpoint_id"]

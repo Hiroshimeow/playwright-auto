@@ -138,6 +138,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return False
         return parsed.scheme == "https" and parsed.netloc == _PUBLIC_HOST
 
+    def _drain_rejected_request_body(self) -> None:
+        """Consume a small rejected body so Windows can deliver the HTTP response cleanly."""
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.close_connection = True
+            return
+        if size <= 0:
+            return
+        if size > 64 * 1024:
+            self.close_connection = True
+            return
+        remaining = size
+        while remaining:
+            chunk = self.rfile.read(min(remaining, 64 * 1024))
+            if not chunk:
+                self.close_connection = True
+                return
+            remaining -= len(chunk)
+
     def _session_is_valid(self) -> bool:
         parsed = cookies.SimpleCookie()
         try:
@@ -306,6 +326,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         public_request = self._is_public_request()
         if public_request:
             if self.command in _STATE_CHANGING_METHODS and not self._same_origin_request():
+                self._drain_rejected_request_body()
                 self._send(403)
                 return
             if not self.application.auth_password:

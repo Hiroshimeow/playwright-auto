@@ -25,6 +25,7 @@ from playwright_auto.chatgpt import (
     PageBinding,
     SendReceipt,
     StableMalformedResponseError,
+    UnsafePageStateError,
     capture_message_baseline,
 )
 from playwright_auto.cdpa_runtime_db import RuntimeDB
@@ -555,7 +556,7 @@ def test_resume_routes_valid_local_report_response_without_replay(tmp_path: Path
     assert recovered["team"] == original["team"]
 
 
-def test_resume_does_not_block_send_preparation_before_durable_boundary(tmp_path: Path):
+def test_resume_missing_ledger_after_pre_send_requires_reconciliation(tmp_path: Path):
     _config, store, state, worker = setup_task(
         tmp_path, task_id="task-resume-pre-durable-send"
     )
@@ -579,218 +580,49 @@ def test_resume_does_not_block_send_preparation_before_durable_boundary(tmp_path
     actions = FakeActions()
     asyncio.run(worker._recover_resume_control(state, control, actions))
 
-    assert state["status"] == "RUNNING"
-    assert state["block_code"] is None
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "durable_send_provenance_missing"
     assert _active_hop(state)["state"] == "sending"
-    assert actions.located_roles == ["PLAN"]
-    assert control["status"] == "applied"
-    assert control["result"]["outcome"] == "continued"
-    assert control["result"]["action"] == "confirm_preboundary_role"
-    assert control["result"]["postcondition"] == "ownership_confirmed_before_send"
+    assert actions.located_roles == []
+    assert control["status"] == "recovery_required"
+    assert control["result"]["outcome"] == "recovery_required"
+    assert control["result"]["reason_code"] == "durable_send_provenance_missing"
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]) is None
 
 
-def test_requested_resume_relocates_missing_ledger_sending_hop_to_required_temporary_endpoint(
-    tmp_path: Path, monkeypatch
-):
-    _config, store, _fixture_state, worker = setup_task(
-        tmp_path, task_id="task-resume-required-temp-fixture-owner"
+def test_workflow_create_rejects_split_browser_endpoints(tmp_path: Path):
+    _config, store, _fixture_state, _worker = setup_task(
+        tmp_path, task_id="task-split-endpoint-fixture-owner"
     )
     source_endpoint = store.endpoints.resolve()["endpoint_id"]
     target_endpoint = store.endpoints.add("9212")["endpoint_id"]
-    state = store.create_task(
-        "Recover missing-ledger temporary send on required endpoint",
-        requested_team="temp-required",
-        task_id="task-resume-required-temp-missing-ledger",
-        temporary=True,
-        browser_endpoint_id=source_endpoint,
-        required_browser_endpoint_id=target_endpoint,
+
+    with pytest.raises(ValueError, match="one endpoint"):
+        store.create_task(
+            "Reject split workflow endpoint",
+            requested_team="split-endpoint",
+            task_id="task-split-endpoint-rejected",
+            temporary=True,
+            browser_endpoint_id=source_endpoint,
+            required_browser_endpoint_id=target_endpoint,
+        )
+
+
+def test_workflow_resume_cannot_target_another_endpoint(tmp_path: Path):
+    _config, store, state, worker = setup_task(
+        tmp_path, task_id="task-no-cross-endpoint-resume"
     )
-    path = Path(state["manifest_path"])
-    hop = _active_hop(state)
-
-    class PreSendActions(FakeActions):
-        async def locate_owned(self, current_state, role):
-            record = current_state["roles"][role]
-            return AcquiredRole(
-                ready_client(current_state, role),
-                f"page-{record['physical_role']}",
-                "https://chatgpt.com/?temporary-chat=true",
-                False,
-                False,
-            )
-
-        async def acquire(self, current_state, role, **_kwargs):
-            return await self.locate_owned(current_state, role)
-
-    asyncio.run(worker._pre_send(state, hop, PreSendActions()))
-    request_id = hop["request_id"]
-    state["roles"]["PLAN"]["temporary_document_id"] = "old-9202-document"
-
-    async def temporary_document_token(_client, *, create=False):
-        return "new-9212-document"
-
-    monkeypatch.setattr(worker, "_temporary_document_token", temporary_document_token)
-
-    assert hop["state"] == "sending"
-    assert hop["browser_endpoint_id"] == source_endpoint
-    assert not Path(hop["ledger_path"]).exists()
-
-    state = store.save(path, state)
-    state = _queue_blocked_resume(
-        store,
-        state,
-        code="execution_recovery_requires_reconciliation",
-        reason="required endpoint differs before durable send intent exists",
-    )
-
-    class Actions:
-        def __init__(self):
-            self.fresh_urls = []
-
-        async def locate_owned(self, _state, _role):
-            return None
-
-        async def fresh_chat(self, _state, _role, *, url):
-            self.fresh_urls.append(url)
-            return AcquiredRole(SimpleNamespace(), "page-9212", url, True, True)
-
-    actions = Actions()
-    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
-
-    recovered = asyncio.run(
-        worker.advance(path, SimpleNamespace(pages=[]), endpoint_id=target_endpoint)
-    )
-
-    control = recovered["controls"][-1]
-    active = _active_hop(recovered)
-    role = recovered["roles"]["PLAN"]
-    assert control["status"] == "applied"
-    assert recovered["status"] == "RUNNING"
-    assert recovered["block_code"] is None
-    assert active["hop_id"] == hop["hop_id"]
-    assert active["request_id"] == request_id
-    assert active["state"] == "sending"
-    assert active["browser_endpoint_id"] == target_endpoint
-    assert role["browser_endpoint_id"] == target_endpoint
-    assert role["page_id"] == "page-9212"
-    assert role["page_url"] == "https://chatgpt.com/?temporary-chat=true"
-    assert role["temporary_document_id"] == "new-9212-document"
-    assert actions.fresh_urls == ["https://chatgpt.com/?temporary-chat=true"]
-    assert not Path(active["ledger_path"]).exists()
-
-    client = RecordingCDPASendClient(
-        task_id=recovered["task_id"], team=recovered["team"]
-    )
-    client.binding = PageBinding(role["page_id"], active["physical_role"])
-
-    class SendActions:
-        async def locate_owned(self, _state, _role):
-            return AcquiredRole(
-                client,
-                role["page_id"],
-                role["page_url"],
-                False,
-                False,
-            )
-
-    asyncio.run(worker._sending(recovered, active, SendActions()))
-    durable = RequestLedger(active["ledger_path"]).get(request_id)
-    assert active["request_id"] == request_id
-    assert active["rebuild_prompt_after_relocation"] is False
-    assert client.send_calls == [active["prompt"]]
-    assert durable is not None
-    assert durable.attempts == 1
-    assert durable.receipt is not None
-
-
-def test_required_temporary_relocation_rejects_existing_target_page_without_document_identity(
-    tmp_path: Path, monkeypatch
-):
-    _config, store, _fixture_state, worker = setup_task(
-        tmp_path, task_id="task-resume-required-temp-existing-fixture-owner"
-    )
-    source_endpoint = store.endpoints.resolve()["endpoint_id"]
+    source_endpoint = state["browser_endpoint_id"]
     target_endpoint = store.endpoints.add("9212")["endpoint_id"]
-    state = store.create_task(
-        "Reject stale target Temporary page after required endpoint relocation",
-        requested_team="temp-existing-target",
-        task_id="task-resume-required-temp-existing-target",
-        temporary=True,
-        browser_endpoint_id=source_endpoint,
-        required_browser_endpoint_id=target_endpoint,
-    )
-    path = Path(state["manifest_path"])
-    hop = _active_hop(state)
 
-    class PreSendActions(FakeActions):
-        async def locate_owned(self, current_state, role):
-            record = current_state["roles"][role]
-            return AcquiredRole(
-                ready_client(current_state, role),
-                f"page-{record['physical_role']}",
-                "https://chatgpt.com/?temporary-chat=true",
-                False,
-                False,
-            )
-
-        async def acquire(self, current_state, role, **_kwargs):
-            return await self.locate_owned(current_state, role)
-
-    asyncio.run(worker._pre_send(state, hop, PreSendActions()))
-    request_id = hop["request_id"]
-    state["roles"]["PLAN"]["temporary_document_id"] = "old-source-document"
-    state = store.save(path, state)
-    state = _queue_blocked_resume(
-        store,
+    assert worker._prepare_cross_endpoint_recovery(
         state,
-        code="execution_recovery_requires_reconciliation",
-        reason="required endpoint differs before durable send intent exists",
-    )
-
-    class Actions:
-        def __init__(self):
-            self.fresh_urls = []
-
-        async def locate_owned(self, _state, _role):
-            return AcquiredRole(
-                SimpleNamespace(),
-                "page-existing-9212",
-                "https://chatgpt.com/?temporary-chat=true",
-                False,
-                False,
-            )
-
-        async def fresh_chat(self, _state, _role, *, url):
-            self.fresh_urls.append(url)
-            return AcquiredRole(SimpleNamespace(), "page-fresh-9212", url, True, True)
-
-    async def temporary_document_token(client, *, create=False):
-        if create:
-            return "fresh-9212-document"
-        return None
-
-    actions = Actions()
-    monkeypatch.setattr(worker, "_temporary_document_token", temporary_document_token)
-    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
-
-    recovered = asyncio.run(
-        worker.advance(path, SimpleNamespace(pages=[]), endpoint_id=target_endpoint)
-    )
-
-    control = recovered["controls"][-1]
-    active = _active_hop(recovered)
-    role = recovered["roles"]["PLAN"]
-    assert control["status"] == "applied"
-    assert active["hop_id"] == hop["hop_id"]
-    assert active["request_id"] == request_id
-    assert active["state"] == "sending"
-    assert active["browser_endpoint_id"] == target_endpoint
-    assert role["browser_endpoint_id"] == target_endpoint
-    assert role["page_id"] == "page-fresh-9212"
-    assert role["temporary_document_id"] == "fresh-9212-document"
-    assert actions.fresh_urls == ["https://chatgpt.com/?temporary-chat=true"]
-    assert not Path(active["ledger_path"]).exists()
+        target_endpoint,
+        reason="target another endpoint",
+    ) is False
+    assert state["browser_endpoint_id"] == source_endpoint
+    assert state["status"] == "WAITING"
+    assert state["waiting_code"] == "team_endpoint_unavailable"
 
 
 def test_resume_failed_attachment_upload_reuses_same_request_and_owned_page(tmp_path: Path):
@@ -1011,12 +843,29 @@ def test_sending_boundary_classifier_uses_durable_evidence_not_hop_label(tmp_pat
 
 
 def _prepare_pristine_new_sending_record(tmp_path: Path, *, task_id: str):
-    _config, store, state, worker = setup_task(tmp_path, task_id=task_id)
-    path = Path(state["manifest_path"])
     donor = {
         "conversation_id": "11111111-1111-4111-8111-111111111111",
         "assistant_message_id": "22222222-2222-4222-8222-222222222222",
     }
+    bootstrap = BootstrapCatalog(tmp_path).upsert(
+        {
+            "bootstrap_id": "general-team-bootstrap",
+            "name": "General Team Bootstrap",
+            "description": "Reusable task-neutral context",
+            "source_conversation_id": donor["conversation_id"],
+            "prewarm_prompt": None,
+            "max_backups": 7,
+            "donors": [dict(donor)],
+            "enabled": True,
+            "tags": ["general"],
+            "created_at": "2026-08-06T00:00:00+00:00",
+            "updated_at": "2026-08-06T00:00:00+00:00",
+        }
+    )
+    _config, store, state, worker = setup_task(
+        tmp_path, task_id=task_id, bootstrap=bootstrap
+    )
+    path = Path(state["manifest_path"])
     role = state["roles"]["PLAN"]
     role.update(
         context_source="bootstrap_donor",
@@ -1027,19 +876,6 @@ def _prepare_pristine_new_sending_record(tmp_path: Path, *, task_id: str):
         online=True,
         status="active",
     )
-    state["bootstrap"] = {
-        "bootstrap_id": "general-team-bootstrap",
-        "name": "General Team Bootstrap",
-        "description": "Reusable task-neutral context",
-        "source_conversation_id": donor["conversation_id"],
-        "prewarm_prompt": None,
-        "max_backups": 7,
-        "donors": [dict(donor)],
-        "enabled": True,
-        "tags": ["general"],
-        "created_at": "2026-08-06T00:00:00+00:00",
-        "updated_at": "2026-08-06T00:00:00+00:00",
-    }
     hop = _active_hop(state)
     asyncio.run(worker._pre_send(state, hop, FakeActions()))
     assert hop["state"] == "sending"
@@ -1089,10 +925,11 @@ def _prepare_legacy_donorless_pristine_new(tmp_path: Path, *, task_id: str):
     role["bootstrap_source_donor"] = None
     role["conversation_generation"] = 0
     state["bootstrap"] = None
+    state["context_policy"] = "fresh"
     return store, state, worker, path, hop, ledger, donor
 
 
-def test_resume_legacy_donorless_pristine_new_uses_one_current_default_bootstrap_donor(tmp_path: Path):
+def test_resume_legacy_donorless_pristine_new_does_not_rebase_to_current_default_bootstrap(tmp_path: Path):
     _store, state, worker, _path, hop, ledger, donor = _prepare_legacy_donorless_pristine_new(
         tmp_path, task_id="task-resume-legacy-donorless"
     )
@@ -1138,12 +975,11 @@ def test_resume_legacy_donorless_pristine_new_uses_one_current_default_bootstrap
     current = ledger.get(original["request_id"])
     role = state["roles"]["PLAN"]
     assert actions.backend_calls == []
-    assert actions.branch_calls == [("PLAN", donor["conversation_id"], donor["assistant_message_id"])]
-    assert control["status"] == "applied"
-    assert control["result"]["postcondition"] == "ownership_reacquired_before_send"
-    assert state["active_action"] == "send"
-    assert role["page_id"] == "WEB:legacy-replacement"
-    assert role["page_id"] != "WEB:presend-lost"
+    assert actions.branch_calls == []
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "preboundary_context_unrecoverable"
+    assert state["active_action"] == "blocked"
+    assert role["page_id"] == "WEB:presend-lost"
     assert role["conversation_generation"] == original["generation"] == 0
     assert role["context_source"] is None
     assert role["bootstrap_source_donor"] is None
@@ -1173,7 +1009,7 @@ def test_resume_legacy_donorless_pristine_new_uses_one_current_default_bootstrap
 def test_resume_legacy_donorless_stops_on_bootstrap_safety_signal(
     tmp_path: Path, monkeypatch, error, reason_code
 ):
-    _store, state, worker, _path, hop, ledger, donor = _prepare_legacy_donorless_pristine_new(
+    _store, state, worker, _path, hop, ledger, donor = _prepare_pristine_new_sending_record(
         tmp_path, task_id=f"task-resume-{reason_code}"
     )
 
@@ -1212,12 +1048,36 @@ def test_resume_legacy_donorless_stops_on_bootstrap_safety_signal(
 def _prepare_operator_new_chat_pristine_sending(
     tmp_path: Path, *, task_id: str, empty_ledger: bool = False
 ):
-    store, state, worker, path, hop, ledger, donor = _prepare_legacy_donorless_pristine_new(
-        tmp_path, task_id=task_id
+    _config, store, state, worker = setup_task(tmp_path, task_id=task_id)
+    path = Path(state["manifest_path"])
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    assert hop["state"] == "sending"
+
+    constructor = worker_module.task_workflow_definitions(state, worker.config)["PLAN"][
+        "system_prompt"
+    ]
+    ledger = RequestLedger(hop["ledger_path"])
+    record = ledger.begin(
+        role=hop["physical_role"],
+        prompt=hop["prompt"],
+        source_context={
+            "task_id": state["task_id"],
+            "team": state["team"],
+            "hop_id": hop["hop_id"],
+            "manifest": state["manifest_path"],
+        },
+        role_prompt_hash=worker_module._sha(str(constructor)),
+        request_id=hop["request_id"],
+        render_request_marker=False,
     )
+    assert record.status is RequestStatus.NEW
+    assert record.attempts == 0
+
     role = state["roles"]["PLAN"]
     old_page_id = "WEB:operator-fresh-lost"
     role.update(
+        context_source="fresh",
         conversation_generation=1,
         page_id=old_page_id,
         page_url="https://chatgpt.com/",
@@ -1283,6 +1143,10 @@ def _prepare_operator_new_chat_pristine_sending(
             json.dumps({"version": RequestLedger.VERSION, "records": {}}),
             encoding="utf-8",
         )
+    donor = {
+        "conversation_id": "unused-fresh-context",
+        "assistant_message_id": "unused-fresh-context",
+    }
     return store, state, worker, path, _active_hop(state), ledger, donor
 
 
@@ -1312,6 +1176,7 @@ def test_resume_reacquires_proven_operator_new_chat_generation_one_before_send(
         def __init__(self):
             self.backend_calls = []
             self.restart_calls = []
+            self.fresh_calls = []
 
         async def locate_owned(self, _state, _role):
             return None
@@ -1320,15 +1185,19 @@ def test_resume_reacquires_proven_operator_new_chat_generation_one_before_send(
             self.backend_calls.append(conversation_id)
             raise AssertionError("proven fresh-context recovery must not depend on a bootstrap donor")
 
-        async def restart(self, _state, role, *, known_automated_draft=None):
-            self.restart_calls.append((role, known_automated_draft))
+        async def fresh_chat(self, _state, role, *, url, clean_for_send=False):
+            self.fresh_calls.append((role, url, clean_for_send))
             return AcquiredRole(
                 client=client,
                 page_id="WEB:operator-fresh-recovered",
-                url="https://chatgpt.com/",
+                url=url,
                 created=True,
                 new_chat=True,
             )
+
+        async def restart(self, _state, role, *, known_automated_draft=None):
+            self.restart_calls.append((role, known_automated_draft))
+            raise AssertionError("Fresh policy must not use persistent restart")
 
         async def branch_from_anchor(self, *_args, **_kwargs):
             raise AssertionError("proven fresh-context recovery must not branch from a donor")
@@ -1338,12 +1207,7 @@ def test_resume_reacquires_proven_operator_new_chat_generation_one_before_send(
     asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
 
     assert actions.backend_calls == []
-    assert actions.restart_calls == [("PLAN", original["prompt"])]
     assert client.send_calls == 0
-    assert control["status"] == "applied"
-    assert control["result"]["action"] == "reacquire_preboundary_role"
-    assert state["status"] == "RUNNING"
-    assert state["block_code"] is None
     assert state["task_id"] == original["task_id"]
     assert hop["hop_id"] == original["hop_id"]
     assert hop["request_id"] == original["request_id"]
@@ -1353,8 +1217,19 @@ def test_resume_reacquires_proven_operator_new_chat_generation_one_before_send(
     assert state["roles"]["PLAN"]["conversation_generation"] == original["generation"]
     current = ledger.get(original["request_id"])
     if empty_ledger:
+        assert actions.restart_calls == []
         assert current is None
+        assert control["status"] == "recovery_required"
+        assert control["result"]["reason_code"] == "durable_send_provenance_missing"
+        assert state["status"] == "BLOCKED"
+        assert state["block_code"] == "durable_send_provenance_missing"
     else:
+        assert actions.restart_calls == []
+        assert actions.fresh_calls == [("PLAN", "https://chatgpt.com/", True)]
+        assert control["status"] == "applied"
+        assert control["result"]["action"] == "reacquire_preboundary_role"
+        assert state["status"] == "RUNNING"
+        assert state["block_code"] is None
         assert current is not None
         assert current.status is RequestStatus.NEW
         assert current.attempts == 0
@@ -1452,7 +1327,7 @@ def test_resume_operator_new_chat_with_attachments_never_transfers_preboundary_o
 
     assert ledger.get(hop["request_id"]) is None
     assert control["status"] == "recovery_required"
-    assert control["result"]["reason_code"] == "preboundary_context_unrecoverable"
+    assert control["result"]["reason_code"] == "durable_send_provenance_missing"
 
 
 @pytest.mark.parametrize(
@@ -1499,8 +1374,8 @@ def test_resume_donorless_fallback_rejects_nonlegacy_role_context(
     assert record.attempts == 0
 
 
-def test_resume_legacy_donorless_failure_tries_all_donors_then_restarts_role(tmp_path: Path):
-    _store, state, worker, _path, hop, ledger, donor = _prepare_legacy_donorless_pristine_new(
+def test_resume_exact_selected_donor_failure_does_not_rebase_to_new_catalog_donor(tmp_path: Path):
+    _store, state, worker, _path, hop, ledger, donor = _prepare_pristine_new_sending_record(
         tmp_path, task_id="task-resume-donorless-bounded"
     )
     second = {
@@ -1549,8 +1424,8 @@ def test_resume_legacy_donorless_failure_tries_all_donors_then_restarts_role(tmp
     assert actions.backend_calls == []
     assert actions.branch_calls == [
         ("PLAN", donor["conversation_id"], donor["assistant_message_id"]),
-        ("PLAN", second["conversation_id"], second["assistant_message_id"]),
     ]
+    assert all(call[1] != second["conversation_id"] for call in actions.branch_calls)
     assert actions.restart_calls == [("PLAN", hop["prompt"])]
     assert control["status"] == "applied"
     assert control["result"]["action"] == "restart_role_fallback"
@@ -1698,7 +1573,7 @@ def test_resume_reacquires_lost_bootstrap_role_for_pristine_new_request(tmp_path
 
 
 
-def test_resume_reacquires_empty_ledger_dead_page_before_send_and_sends_once(tmp_path: Path):
+def test_resume_empty_ledger_dead_page_fails_closed_without_relocation_or_send(tmp_path: Path):
     _store, state, worker, _path, hop, ledger, donor = _prepare_pristine_new_sending_record(
         tmp_path, task_id="task-resume-empty-ledger-dead-page"
     )
@@ -1805,14 +1680,13 @@ def test_resume_reacquires_empty_ledger_dead_page_before_send_and_sends_once(tmp
     control = state["controls"][-1]
     asyncio.run(worker._recover_resume_sending(state, hop, control, actions))
 
-    assert actions.branch_calls == [
-        ("PLAN", donor["conversation_id"], donor["assistant_message_id"])
-    ]
+    assert actions.branch_calls == []
     assert client.send_calls == 0
-    assert control["status"] == "applied"
-    assert control["result"]["action"] == "reacquire_preboundary_role"
-    assert control["result"]["postcondition"] == "ownership_reacquired_before_send"
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "durable_send_provenance_missing"
     assert ledger.get(original["request_id"]) is None
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "durable_send_provenance_missing"
     assert state["task_id"] == original["task_id"]
     assert state["team"] == original["team"]
     assert hop["hop_id"] == original["hop_id"]
@@ -1823,19 +1697,10 @@ def test_resume_reacquires_empty_ledger_dead_page_before_send_and_sends_once(tmp
     assert state["roles"]["PLAN"]["conversation_generation"] == original["generation"]
     assert state["roles"]["PLAN"]["bootstrap_source_donor"] == original["donor"]
 
-    asyncio.run(worker._sending(state, hop, actions))
-
-    sent = ledger.get(original["request_id"])
-    assert sent is not None
-    assert sent.status is RequestStatus.SENT
-    assert sent.attempts == 1
-    assert client.send_calls == 1
-    assert hop["state"] == "sent"
-
 
 
 def test_reacquired_pristine_request_crosses_send_boundary_exactly_once(tmp_path: Path):
-    _store, state, worker, _path, hop, ledger, donor = _prepare_legacy_donorless_pristine_new(
+    _store, state, worker, _path, hop, ledger, donor = _prepare_pristine_new_sending_record(
         tmp_path, task_id="task-resume-pristine-send-once"
     )
 
@@ -1943,7 +1808,7 @@ def test_reacquired_pristine_request_crosses_send_boundary_exactly_once(tmp_path
     assert after_send.attempts == 1
     assert hop["state"] == "sent"
     assert hop["request_id"] == before_send.request_id
-    assert state["roles"]["PLAN"]["conversation_generation"] == 0
+    assert state["roles"]["PLAN"]["conversation_generation"] == 1
 
 
 
@@ -2099,8 +1964,10 @@ def test_preboundary_classifier_rejects_nonpristine_and_crossed_records(tmp_path
     assert worker._is_pristine_preboundary_sending_record(state, hop, completed) is False
 
 
-def _prepare_sending_record(tmp_path: Path, *, task_id: str):
-    _config, store, state, worker = setup_task(tmp_path, task_id=task_id)
+def _prepare_sending_record(tmp_path: Path, *, task_id: str, bootstrap=None):
+    _config, store, state, worker = setup_task(
+        tmp_path, task_id=task_id, bootstrap=bootstrap
+    )
     path = Path(state["manifest_path"])
     hop = _active_hop(state)
     asyncio.run(worker._pre_send(state, hop, FakeActions()))
@@ -2144,32 +2011,21 @@ def _prepare_lost_sending_record(tmp_path: Path, *, task_id: str, error: str | N
         tmp_path, task_id=task_id
     )
     donor = {
-        "conversation_id": "11111111-1111-4111-8111-111111111111",
-        "assistant_message_id": "22222222-2222-4222-8222-222222222222",
+        "conversation_id": "unused-fresh-context",
+        "assistant_message_id": "unused-fresh-context",
     }
     role = state["roles"]["PLAN"]
-    state["bootstrap"] = {
-        "bootstrap_id": "general-team-bootstrap",
-        "name": "General Team Bootstrap",
-        "description": "Reusable task-neutral context",
-        "source_conversation_id": donor["conversation_id"],
-        "prewarm_prompt": None,
-        "max_backups": 7,
-        "donors": [dict(donor)],
-        "enabled": True,
-        "tags": ["general"],
-        "created_at": "2026-08-06T00:00:00+00:00",
-        "updated_at": "2026-08-06T00:00:00+00:00",
-    }
     role.update(
-        context_source="bootstrap_donor",
-        bootstrap_source_donor=dict(donor),
+        context_source="fresh",
         conversation_generation=1,
         page_url="https://chatgpt.com/c/WEB:lost-sending",
         online=False,
         status="offline",
         last_error="page_missing",
     )
+    role.pop("bootstrap_source_donor", None)
+    state.pop("bootstrap", None)
+    state["context_policy"] = "fresh"
     hop["conversation_url"] = "https://chatgpt.com/c/WEB:lost-sending"
     ledger.update(
         hop["request_id"],
@@ -3095,14 +2951,14 @@ def test_lost_sending_atomic_nonacceptance_rebinds_same_request_and_sends_once(
     class Actions:
         def __init__(self):
             self.locate_calls = 0
-            self.branch_calls = []
+            self.fresh_calls = []
 
         async def locate_owned(self, _state, _role):
             self.locate_calls += 1
             return None
 
-        async def branch_from_anchor(self, _state, role, **kwargs):
-            self.branch_calls.append((role, kwargs))
+        async def fresh_chat(self, _state, role, *, url, clean_for_send=False):
+            self.fresh_calls.append((role, url, clean_for_send))
             return AcquiredRole(
                 client=client,
                 page_id=replacement_binding.page_id,
@@ -3117,15 +2973,7 @@ def test_lost_sending_atomic_nonacceptance_rebinds_same_request_and_sends_once(
 
     current = ledger.get(hop["request_id"])
     assert actions.locate_calls == 1
-    assert actions.branch_calls == [
-        (
-            "PLAN",
-            {
-                "source_conversation_id": donor["conversation_id"],
-                "assistant_message_id": donor["assistant_message_id"],
-            },
-        )
-    ]
+    assert actions.fresh_calls == [("PLAN", "https://chatgpt.com/", True)]
     assert client.send_calls == 1
     assert (state["task_id"], hop["hop_id"], hop["request_id"], hop["turn"]) == original
     assert state["roles"]["PLAN"]["conversation_generation"] == 1
@@ -3215,12 +3063,10 @@ def test_lost_sending_replacement_persists_admission_and_releases_gate_before_se
         async def locate_owned(self, _state, _role):
             return None
 
-        async def branch_from_anchor(self, _state, role, **kwargs):
+        async def fresh_chat(self, _state, role, *, url, clean_for_send=False):
             assert role == "PLAN"
-            assert kwargs == {
-                "source_conversation_id": donor["conversation_id"],
-                "assistant_message_id": donor["assistant_message_id"],
-            }
+            assert url == "https://chatgpt.com/"
+            assert clean_for_send is True
             return AcquiredRole(
                 client,
                 replacement_binding.page_id,
@@ -3288,19 +3134,17 @@ def test_lost_sending_bounded_continuation_failure_is_not_replayed(
 
     class Actions:
         def __init__(self):
-            self.branch_calls = 0
+            self.fresh_calls = 0
             self.locate_calls = 0
 
         async def locate_owned(self, *_args, **_kwargs):
             self.locate_calls += 1
             return None
 
-        async def branch_from_anchor(self, _state, _role, **kwargs):
-            self.branch_calls += 1
-            assert kwargs == {
-                "source_conversation_id": donor["conversation_id"],
-                "assistant_message_id": donor["assistant_message_id"],
-            }
+        async def fresh_chat(self, _state, _role, *, url, clean_for_send=False):
+            self.fresh_calls += 1
+            assert url == "https://chatgpt.com/"
+            assert clean_for_send is True
             return AcquiredRole(client, replacement_binding.page_id, snapshot.url, True, True)
 
     actions = Actions()
@@ -3321,7 +3165,7 @@ def test_lost_sending_bounded_continuation_failure_is_not_replayed(
     asyncio.run(worker._recover_resume_sending(state, hop, second_control, actions))
     second_record = ledger.get(hop["request_id"])
     assert second_control["result"]["reason_code"] == "sending_provenance_ambiguous"
-    assert actions.branch_calls == 1
+    assert actions.fresh_calls == 1
     assert client.send_calls == 1
     assert actions.locate_calls == 2
     assert second_record is not None
@@ -4232,3 +4076,90 @@ def test_route_plan_does_not_bypass_other_accepted_inflight_wait(tmp_path: Path)
     assert unchanged["active_hop_id"] == hop["hop_id"]
     assert len(unchanged["hops"]) == before_hops
     assert not unchanged.get("controls")
+
+
+
+def test_recovering_resume_control_survives_worker_restart_and_observes_active_page(
+    tmp_path: Path, monkeypatch
+):
+    _config, store, state, worker = setup_task(
+        tmp_path, task_id="task-resume-recovering-restart"
+    )
+    path = Path(state["manifest_path"])
+    endpoint_id = state["browser_endpoint_id"]
+    role = state["roles"]["PLAN"]
+    role.update(
+        browser_endpoint_id=endpoint_id,
+        page_id="WEB:recovering-active",
+        page_url="https://chatgpt.com/c/recovering-active",
+        online=True,
+        status="active",
+    )
+    state = _queue_blocked_resume(
+        store,
+        state,
+        code="unexpected_error",
+        reason="worker stopped while Resume was being recovered",
+    )
+    control = state["controls"][-1]
+    state["status"] = "RUNNING"
+    state["kanban_column"] = "PLAN"
+    state["active_action"] = "resuming"
+    state["block_code"] = None
+    state["block_retryable"] = False
+    state["block_reason"] = None
+    control["status"] = "recovering"
+    control["command_state"] = "RUNNING"
+    control["result"] = {
+        "outcome": "recovering",
+        "action": "none",
+        "reason_code": "resume_requested",
+        "reason": "Operator requested verified continuation.",
+        "postcondition": None,
+    }
+    state = store.save(path, state)
+
+    class Actions:
+        async def preflight_role(self, _state, _role):
+            return []
+
+        async def locate_owned(self, current_state, logical_role):
+            record = current_state["roles"][logical_role]
+            return AcquiredRole(
+                client=SimpleNamespace(),
+                page_id=record["page_id"],
+                url=record["page_url"],
+                created=False,
+                new_chat=False,
+            )
+
+        async def acquire(self, _state, _role, **_kwargs):
+            raise UnsafePageStateError("page is already responding")
+
+    actions = Actions()
+    fresh_worker = worker_module.CDPAWorker(worker.config, store=store)
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    recovered = asyncio.run(
+        fresh_worker.advance(
+            path,
+            SimpleNamespace(pages=[]),
+            endpoint_id=endpoint_id,
+        )
+    )
+
+    active = _active_hop(recovered)
+    resumed = recovered["controls"][-1]
+    assert recovered["status"] == "RUNNING", {
+        "status": recovered.get("status"),
+        "action": recovered.get("active_action"),
+        "block_code": recovered.get("block_code"),
+        "block_reason": recovered.get("block_reason"),
+        "control": resumed,
+    }
+    assert recovered["active_action"] == "wait_response"
+    assert active["state"] == "waiting"
+    assert active["observed_existing_response"] is True
+    assert resumed["status"] == "applied"
+    assert resumed["result"]["action"] == "observe_existing_response"
+    assert resumed["result"]["postcondition"] == "response_observation_started"

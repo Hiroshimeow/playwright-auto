@@ -1162,6 +1162,11 @@ def build_task_projection(
             if independent is not None
             else str(raw.get("browser_endpoint_id") or "").strip() or None
         ),
+        "required_browser_endpoint_id": (
+            None
+            if independent is not None
+            else str(raw.get("required_browser_endpoint_id") or "").strip() or None
+        ),
         "browser_endpoint_ids": browser_endpoint_ids,
         "created_at": str(raw.get("created_at") or "") or None,
         "started_at": str(raw.get("started_at") or "") or None,

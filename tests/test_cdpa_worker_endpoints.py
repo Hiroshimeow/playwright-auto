@@ -105,7 +105,7 @@ def test_running_execution_set_counts_only_current_protected_role(tmp_path):
 
     assert running == [
         {
-            "endpoint_id": second["endpoint_id"],
+            "endpoint_id": first["endpoint_id"],
             "task_id": active["task_id"],
             "team": active["team"],
             "role": "PLAN",
@@ -115,7 +115,7 @@ def test_running_execution_set_counts_only_current_protected_role(tmp_path):
     ]
 
 
-def test_pre_send_relocation_keeps_same_request_and_clears_old_page_binding(tmp_path):
+def test_pre_send_relocation_without_ledger_fails_closed_and_preserves_binding(tmp_path):
     worker, _store, first, second, tasks = _setup(tmp_path)
     state = copy.deepcopy(tasks[0])
     role = state["roles"]["PLAN"]
@@ -128,12 +128,28 @@ def test_pre_send_relocation_keeps_same_request_and_clears_old_page_binding(tmp_
     )
     request_id = _active_hop(state)["request_id"]
 
-    assert worker._prepare_execution_endpoint(state, second["endpoint_id"]) is True
+    assert worker._prepare_execution_endpoint(state, second["endpoint_id"]) is False
     assert _active_hop(state)["request_id"] == request_id
-    assert role["browser_endpoint_id"] == second["endpoint_id"]
-    assert role["page_id"] is None
-    assert role["page_url"] is None
-    assert role["online"] is False
+    assert role["browser_endpoint_id"] == first["endpoint_id"]
+    assert role["page_id"] == "old-page"
+    assert role["page_url"] == "https://chatgpt.com/"
+    assert role["online"] is True
+
+
+def test_initial_unbound_pre_send_stays_on_team_endpoint(tmp_path):
+    worker, _store, first, second, tasks = _setup(tmp_path)
+    state = copy.deepcopy(tasks[0])
+    hop = _active_hop(state)
+    role = state["roles"]["PLAN"]
+
+    assert hop["state"] == "pre_send"
+    assert not Path(hop["ledger_path"]).exists()
+    assert worker._execution_endpoint_id(state) == first["endpoint_id"]
+    assert worker._prepare_execution_endpoint(state, second["endpoint_id"]) is False
+    assert worker._prepare_execution_endpoint(state, first["endpoint_id"]) is True
+    assert role["browser_endpoint_id"] == first["endpoint_id"]
+    assert role.get("page_id") is None
+    assert hop["request_id"]
 
 
 def test_accepted_or_ambiguous_send_is_not_relocated_as_pristine_work(tmp_path):
@@ -161,7 +177,7 @@ def test_draining_endpoint_keeps_sending_hop_without_positive_pristine_evidence(
     assert worker._browser_endpoint_has_unresolved_execution(first["endpoint_id"]) is True
 
 
-def test_pool_cycle_uses_free_peer_when_initial_endpoint_capacity_is_full(tmp_path, monkeypatch):
+def test_pool_cycle_waits_when_team_endpoint_capacity_is_full(tmp_path, monkeypatch):
     worker, store, first, second, tasks = _setup(tmp_path)
     seen = []
 
@@ -189,9 +205,11 @@ def test_pool_cycle_uses_free_peer_when_initial_endpoint_capacity_is_full(tmp_pa
 
     asyncio.run(scenario())
 
-    assert len(seen) == 1
-    assert seen[0][1:] == ("9202", second["endpoint_id"])
-    assert store.load(tasks[0]["manifest_path"])["browser_endpoint_id"] == first["endpoint_id"]
+    assert seen == []
+    blocked = store.load(tasks[0]["manifest_path"])
+    assert blocked["browser_endpoint_id"] == first["endpoint_id"]
+    assert blocked["status"] == "WAITING"
+    assert blocked["waiting"]["reason"] == "browser_pool"
 
 
 def test_required_workflow_endpoint_waits_instead_of_falling_back_to_free_peer(tmp_path, monkeypatch):
@@ -242,6 +260,370 @@ def test_required_workflow_endpoint_waits_instead_of_falling_back_to_free_peer(t
     assert first["endpoint_id"] != required["endpoint_id"]
 
 
+def test_release_required_endpoint_control_allows_normal_allocator_peer_fallback(tmp_path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    peer = store.endpoints.resolve()
+    preferred = store.endpoints.add("9202")
+    task = store.create_task(
+        "release hard pin",
+        requested_team="release-hard-pin",
+        browser_endpoint_id=preferred["endpoint_id"],
+        required_browser_endpoint_id=preferred["endpoint_id"],
+    )
+    worker = CDPAWorker(config, store=store)
+
+    async def scenario():
+        pool = await _pool(store)
+        running = [
+            _execution(preferred["endpoint_id"], "busy-a"),
+            _execution(preferred["endpoint_id"], "busy-b"),
+        ]
+        assert pool.select_endpoint(
+            running,
+            affinity_endpoint_id=preferred["endpoint_id"],
+            hard_affinity=True,
+        ) is None
+
+        queued = store.request_control(
+            task["manifest_path"],
+            "release_required_browser_endpoint",
+            reason="preferred endpoint unavailable",
+        )
+        assert await worker._apply_control(
+            queued,
+            SimpleNamespace(),
+            Path(task["manifest_path"]),
+        ) is True
+        saved = store.load(task["manifest_path"])
+        assert saved["browser_endpoint_id"] == preferred["endpoint_id"]
+        assert "required_browser_endpoint_id" not in saved
+
+        assert pool.select_endpoint(
+            running,
+            affinity_endpoint_id=saved["browser_endpoint_id"],
+            hard_affinity=False,
+        ) == peer["endpoint_id"]
+        await pool.close()
+
+    asyncio.run(scenario())
+
+
+def test_pool_cycle_applies_required_endpoint_release_from_browser_pool_wait_without_allocation(
+    tmp_path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    peer = store.endpoints.resolve()
+    required = store.endpoints.add("9202")
+    task = store.create_task(
+        "release blocked hard pin",
+        requested_team="release-blocked-hard-pin",
+        browser_endpoint_id=required["endpoint_id"],
+        required_browser_endpoint_id=required["endpoint_id"],
+    )
+    worker = CDPAWorker(config, store=store)
+    worker.hydrate_runtime()
+    assert worker.registry is not None
+    worker.registry.update_task(task, now=0.0)
+    running = [
+        _execution(required["endpoint_id"], "busy-a"),
+        _execution(required["endpoint_id"], "busy-b"),
+    ]
+    advance_calls = []
+    original_advance = worker.advance
+
+    async def recording_advance(
+        path, context, *, scheduling_tasks=None, endpoint_id=None, **kwargs
+    ):
+        advance_calls.append((getattr(context, "name", None), endpoint_id))
+        return await original_advance(
+            path,
+            context,
+            scheduling_tasks=scheduling_tasks,
+            endpoint_id=endpoint_id,
+            **kwargs,
+        )
+
+    async def scenario():
+        pool = await _pool(store)
+        monkeypatch.setattr(worker, "_running_executions", lambda _tasks=None: running)
+        monkeypatch.setattr(worker, "advance", recording_advance)
+        monkeypatch.setattr(worker, "_maintain_ambient_page_automation", _noop)
+        monkeypatch.setattr(worker, "_refresh_rate_limit_cooldown", _noop)
+        monkeypatch.setattr(worker, "_close_idle_independent_tabs", _noop)
+
+        await worker.run_once_pool(pool)
+        waiting = store.load(task["manifest_path"])
+        assert waiting["status"] == "WAITING"
+        assert waiting["waiting"]["reason"] == "browser_pool"
+        assert waiting["required_browser_endpoint_id"] == required["endpoint_id"]
+        assert _active_hop(waiting)["state"] == "pre_send"
+        assert worker._execution_is_pristine_pre_send(waiting) is True
+        assert advance_calls == []
+
+        queued = store.request_control(
+            task["manifest_path"],
+            "release_required_browser_endpoint",
+            reason="required endpoint has no capacity",
+        )
+        worker.registry.update_task(queued, now=0.0)
+        await worker.run_once_pool(pool)
+
+        saved = store.load(task["manifest_path"])
+        control = saved["controls"][-1]
+        assert advance_calls == [(None, None)]
+        assert saved["browser_endpoint_id"] == required["endpoint_id"]
+        assert "required_browser_endpoint_id" not in saved
+        assert control["status"] == "applied"
+        assert control["command_state"] == "APPLIED"
+        assert control["result"]["postcondition"] == "required_browser_endpoint_released"
+        assert pool.select_endpoint(
+            running,
+            affinity_endpoint_id=saved["browser_endpoint_id"],
+            hard_affinity=False,
+        ) == peer["endpoint_id"]
+        await pool.close()
+
+    asyncio.run(scenario())
+
+
+def test_browser_dependent_control_does_not_bypass_required_endpoint_pool_wait(
+    tmp_path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    required = store.endpoints.add("9202")
+    task = store.create_task(
+        "keep browser control gated",
+        requested_team="browser-control-gated",
+        required_browser_endpoint_id=required["endpoint_id"],
+    )
+    worker = CDPAWorker(config, store=store)
+    worker.hydrate_runtime()
+    assert worker.registry is not None
+    worker.registry.update_task(task, now=0.0)
+    running = [
+        _execution(required["endpoint_id"], "busy-a"),
+        _execution(required["endpoint_id"], "busy-b"),
+    ]
+    advance_calls = []
+
+    async def recording_advance(path, context, *, scheduling_tasks=None, endpoint_id=None):
+        advance_calls.append((Path(path).name, getattr(context, "name", None), endpoint_id))
+        return store.load(path)
+
+    async def scenario():
+        pool = await _pool(store)
+        monkeypatch.setattr(worker, "_running_executions", lambda _tasks=None: running)
+        monkeypatch.setattr(worker, "advance", recording_advance)
+        monkeypatch.setattr(worker, "_maintain_ambient_page_automation", _noop)
+        monkeypatch.setattr(worker, "_refresh_rate_limit_cooldown", _noop)
+        monkeypatch.setattr(worker, "_close_idle_independent_tabs", _noop)
+
+        await worker.run_once_pool(pool)
+        waiting = store.load(task["manifest_path"])
+        assert waiting["status"] == "WAITING"
+        assert waiting["waiting"]["reason"] == "browser_pool"
+
+        queued = store.request_control(
+            task["manifest_path"],
+            "open_tab",
+            role="PLAN",
+            reason="browser-dependent control remains gated",
+        )
+        worker.registry.update_task(queued, now=0.0)
+        await worker.run_once_pool(pool)
+
+        saved = store.load(task["manifest_path"])
+        control = saved["controls"][-1]
+        assert advance_calls == []
+        assert saved["status"] == "WAITING"
+        assert saved["waiting"]["reason"] == "browser_pool"
+        assert saved["required_browser_endpoint_id"] == required["endpoint_id"]
+        assert control["status"] == "requested"
+        assert control["command_state"] == "PENDING"
+        await pool.close()
+
+    asyncio.run(scenario())
+
+
+def test_later_release_does_not_bypass_earlier_browser_dependent_control(
+    tmp_path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    required = store.endpoints.add("9202")
+    task = store.create_task(
+        "preserve mixed control order",
+        requested_team="mixed-control-order",
+        required_browser_endpoint_id=required["endpoint_id"],
+    )
+    worker = CDPAWorker(config, store=store)
+    worker.hydrate_runtime()
+    assert worker.registry is not None
+    worker.registry.update_task(task, now=0.0)
+    running = [
+        _execution(required["endpoint_id"], "busy-a"),
+        _execution(required["endpoint_id"], "busy-b"),
+    ]
+    advance_calls = []
+    original_advance = worker.advance
+
+    async def recording_advance(path, context, *, scheduling_tasks=None, endpoint_id=None):
+        advance_calls.append((getattr(context, "name", None), endpoint_id))
+        return await original_advance(
+            path,
+            context,
+            scheduling_tasks=scheduling_tasks,
+            endpoint_id=endpoint_id,
+        )
+
+    async def scenario():
+        pool = await _pool(store)
+        monkeypatch.setattr(worker, "_running_executions", lambda _tasks=None: running)
+        monkeypatch.setattr(worker, "advance", recording_advance)
+        monkeypatch.setattr(worker, "_maintain_ambient_page_automation", _noop)
+        monkeypatch.setattr(worker, "_refresh_rate_limit_cooldown", _noop)
+        monkeypatch.setattr(worker, "_close_idle_independent_tabs", _noop)
+
+        await worker.run_once_pool(pool)
+        waiting = store.load(task["manifest_path"])
+        assert waiting["status"] == "WAITING"
+        assert waiting["waiting"]["reason"] == "browser_pool"
+
+        first = store.request_control(
+            task["manifest_path"],
+            "open_tab",
+            role="PLAN",
+            reason="browser-dependent control queued first",
+        )
+        queued = store.request_control(
+            first["manifest_path"],
+            "release_required_browser_endpoint",
+            reason="release queued second",
+        )
+        worker.registry.update_task(queued, now=0.0)
+        await worker.run_once_pool(pool)
+
+        saved = store.load(task["manifest_path"])
+        open_control, release_control = saved["controls"][-2:]
+        assert advance_calls == []
+        assert saved["status"] == "WAITING"
+        assert saved["waiting"]["reason"] == "browser_pool"
+        assert saved["required_browser_endpoint_id"] == required["endpoint_id"]
+        assert (open_control["status"], open_control["command_state"]) == (
+            "requested",
+            "PENDING",
+        )
+        assert (release_control["status"], release_control["command_state"]) == (
+            "requested",
+            "PENDING",
+        )
+        await pool.close()
+
+    asyncio.run(scenario())
+
+
+def test_stale_endpointless_release_admission_cannot_execute_later_browser_control(
+    tmp_path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    required = store.endpoints.add("9202")
+    task = store.create_task(
+        "bind endpointless admission to release control",
+        requested_team="endpointless-control-race",
+        required_browser_endpoint_id=required["endpoint_id"],
+    )
+    worker = CDPAWorker(config, store=store)
+    worker.hydrate_runtime()
+    assert worker.registry is not None
+    worker.registry.update_task(task, now=0.0)
+    running = [
+        _execution(required["endpoint_id"], "busy-a"),
+        _execution(required["endpoint_id"], "busy-b"),
+    ]
+    original_advance = worker.advance
+    scheduled = []
+    raced = False
+
+    async def racing_advance(path, context, *, scheduling_tasks=None, endpoint_id=None, **kwargs):
+        nonlocal raced
+        scheduled.append((getattr(context, "name", None), endpoint_id))
+        if not raced:
+            raced = True
+
+            def reject_release(current):
+                release = next(
+                    item
+                    for item in current["controls"]
+                    if item.get("action") == "release_required_browser_endpoint"
+                    and item.get("status") == "requested"
+                )
+                release["status"] = "rejected"
+                release["command_state"] = "REJECTED"
+                release["result"] = "race: release withdrawn"
+                release["applied_at"] = "2026-09-18T00:00:00+00:00"
+                return current
+
+            updated = store.update(path, reject_release)
+            worker._remember_manifest(Path(path), updated)
+            worker.registry.update_task(updated, now=0.0)
+        return await original_advance(
+            path,
+            context,
+            scheduling_tasks=scheduling_tasks,
+            endpoint_id=endpoint_id,
+            **kwargs,
+        )
+
+    async def scenario():
+        pool = await _pool(store)
+        monkeypatch.setattr(worker, "_running_executions", lambda _tasks=None: running)
+        monkeypatch.setattr(worker, "advance", racing_advance)
+        monkeypatch.setattr(worker, "_maintain_ambient_page_automation", _noop)
+        monkeypatch.setattr(worker, "_refresh_rate_limit_cooldown", _noop)
+        monkeypatch.setattr(worker, "_close_idle_independent_tabs", _noop)
+
+        await worker.run_once_pool(pool)
+        waiting = store.load(task["manifest_path"])
+        assert waiting["status"] == "WAITING"
+        assert waiting["waiting"]["reason"] == "browser_pool"
+
+        release = store.request_control(
+            task["manifest_path"],
+            "release_required_browser_endpoint",
+            reason="release queued first",
+        )
+        queued = store.request_control(
+            release["manifest_path"],
+            "open_tab",
+            role="PLAN",
+            reason="browser-dependent control queued second",
+        )
+        worker.registry.update_task(queued, now=0.0)
+        await worker.run_once_pool(pool)
+
+        saved = store.load(task["manifest_path"])
+        release_control, open_control = saved["controls"][-2:]
+        assert scheduled == [(None, None)]
+        assert saved["status"] == "WAITING"
+        assert saved["waiting"]["reason"] == "browser_pool"
+        assert saved["required_browser_endpoint_id"] == required["endpoint_id"]
+        assert (release_control["status"], release_control["command_state"]) == (
+            "rejected",
+            "REJECTED",
+        )
+        assert (open_control["status"], open_control["command_state"]) == (
+            "requested",
+            "PENDING",
+        )
+        await pool.close()
+
+    asyncio.run(scenario())
+
+
 def test_required_endpoint_preserves_accepted_send_exact_execution(tmp_path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
@@ -286,7 +668,7 @@ def test_required_endpoint_preserves_accepted_send_exact_execution(tmp_path, mon
 
     asyncio.run(scenario())
 
-    assert seen == [("9222", first["endpoint_id"])]
+    assert seen == [("9202", required["endpoint_id"])]
 
 
 def test_manual_job_required_endpoint_waits_without_pinning_agent_identity(tmp_path, monkeypatch):
@@ -504,6 +886,101 @@ def test_same_endpoint_serializes_admission_and_overflow_auto_wakes(tmp_path, mo
     assert admitted[-1] == waiting_id
 
 
+def test_midcycle_rescan_admits_browser_pool_waiter_before_running_set_drains(
+    tmp_path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    endpoint = store.endpoints.resolve()
+    store.endpoints.update(endpoint["endpoint_id"], max_active_tabs=2)
+    tasks = [
+        store.create_task(
+            f"midcycle {index}",
+            task_id=f"midcycle-{index}",
+            requested_team=f"midcycle-team-{index}",
+            required_browser_endpoint_id=endpoint["endpoint_id"],
+        )
+        for index in range(3)
+    ]
+    worker = CDPAWorker(config, store=store)
+    worker.hydrate_runtime()
+    assert worker.registry is not None
+    for task in tasks:
+        worker.registry.update_task(task, now=0.0)
+
+    releases = {task["task_id"]: asyncio.Event() for task in tasks}
+    started = {task["task_id"]: asyncio.Event() for task in tasks}
+    start_counts = {task["task_id"]: 0 for task in tasks}
+    active = set()
+    peak_active = 0
+
+    async def advance(path, context, *, scheduling_tasks=None, endpoint_id=None):
+        nonlocal peak_active
+        state = store.load(path)
+        task_id = state["task_id"]
+        start_counts[task_id] += 1
+        active.add(task_id)
+        peak_active = max(peak_active, len(active))
+        started[task_id].set()
+        try:
+            await releases[task_id].wait()
+            return store.load(path)
+        finally:
+            active.remove(task_id)
+
+    async def wait_for_pool_wait(task):
+        deadline = asyncio.get_running_loop().time() + 2.0
+        while asyncio.get_running_loop().time() < deadline:
+            state = store.load(task["manifest_path"])
+            if (
+                state["status"] == "WAITING"
+                and (state.get("waiting") or {}).get("reason") == "browser_pool"
+            ):
+                return state
+            await asyncio.sleep(0.01)
+        raise AssertionError("overflow task did not enter WAITING/browser_pool")
+
+    async def scenario():
+        pool = await _pool(store)
+        monkeypatch.setattr(worker, "advance", advance)
+        monkeypatch.setattr(worker, "_maintain_ambient_page_automation", _noop)
+        monkeypatch.setattr(worker, "_refresh_rate_limit_cooldown", _noop)
+        monkeypatch.setattr(worker, "_close_idle_independent_tabs", _noop)
+
+        cycle = asyncio.create_task(worker.run_once_pool(pool))
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    started["midcycle-0"].wait(),
+                    started["midcycle-1"].wait(),
+                ),
+                timeout=2.0,
+            )
+            await wait_for_pool_wait(tasks[2])
+            assert not started["midcycle-2"].is_set()
+
+            releases["midcycle-0"].set()
+            await asyncio.wait_for(started["midcycle-2"].wait(), timeout=1.5)
+
+            assert not releases["midcycle-1"].is_set()
+            assert not cycle.done()
+            assert active == {"midcycle-1", "midcycle-2"}
+        finally:
+            for release in releases.values():
+                release.set()
+            await asyncio.wait_for(cycle, timeout=2.0)
+            await pool.close()
+
+    asyncio.run(scenario())
+
+    assert start_counts == {
+        "midcycle-0": 1,
+        "midcycle-1": 1,
+        "midcycle-2": 1,
+    }
+    assert peak_active == 2
+
+
 def test_different_endpoints_admit_concurrently(tmp_path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
@@ -576,6 +1053,56 @@ def test_different_endpoints_admit_concurrently(tmp_path, monkeypatch):
     assert all(store.load(task["manifest_path"])["status"] == "RUNNING" for task in tasks)
 
 
+def test_open_tab_reconciliation_uses_team_home_endpoint_not_stale_role_endpoint(tmp_path, monkeypatch):
+    worker, store, first, second, tasks = _setup(tmp_path)
+    task = tasks[0]
+
+    def bind_lost_plan_page(state):
+        role = state["roles"]["PLAN"]
+        role.update(
+            browser_endpoint_id=second["endpoint_id"],
+            page_id="lost-plan-page",
+            page_url="https://chatgpt.com/c/persisted-plan",
+            online=False,
+            status="pending",
+        )
+        state.update(
+            status="BLOCKED",
+            kanban_column="BLOCKED",
+            active_action="blocked",
+            block_code="execution_recovery_requires_reconciliation",
+        )
+
+    state = store.update(task["manifest_path"], bind_lost_plan_page)
+    state = store.request_control(
+        task["manifest_path"],
+        "open_tab",
+        role="PLAN",
+        reason="reconcile persisted PLAN conversation",
+        external_command_id="open-tab-original-endpoint",
+    )
+    worker.registry.update_task(state, now=0.0)
+    selected = []
+
+    async def fake_advance(path, _context, **kwargs):
+        selected.append(kwargs.get("endpoint_id"))
+        return store.load(path)
+
+    async def scenario():
+        pool = await _pool(store)
+        monkeypatch.setattr(worker, "advance", fake_advance)
+        monkeypatch.setattr(worker, "_maintain_ambient_page_automation", _noop)
+        monkeypatch.setattr(worker, "_refresh_rate_limit_cooldown", _noop)
+        monkeypatch.setattr(worker, "_close_idle_independent_tabs", _noop)
+        await worker.run_once_pool(pool)
+        await pool.close()
+
+    asyncio.run(scenario())
+
+    assert first["endpoint_id"] != second["endpoint_id"]
+    assert selected == [first["endpoint_id"]]
+
+
 def test_open_tab_controls_share_endpoint_admission_gate(tmp_path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
@@ -643,7 +1170,7 @@ def test_open_tab_controls_share_endpoint_admission_gate(tmp_path, monkeypatch):
     assert peak == 1
 
 
-def test_unbound_control_role_uses_selected_execution_endpoint_gate(tmp_path, monkeypatch):
+def test_unbound_control_role_cannot_escape_team_home_endpoint(tmp_path, monkeypatch):
     worker, store, first, second, tasks = _setup(tmp_path)
     controlled = store.request_control(
         tasks[0]["manifest_path"],
@@ -691,8 +1218,9 @@ def test_unbound_control_role_uses_selected_execution_endpoint_gate(tmp_path, mo
     )
 
     assert result is not None
-    assert observed == [second["endpoint_id"]]
+    assert observed == []
     assert first["endpoint_id"] != second["endpoint_id"]
+    assert result["browser_endpoint_id"] == first["endpoint_id"]
     assert worker._endpoint_admission_holds == {}
 
 
@@ -840,119 +1368,53 @@ def test_lost_page_recovery_reopen_shares_endpoint_admission_gate(tmp_path):
     assert worker._endpoint_admission_holds == {}
 
 
-def test_bootstrap_prewarm_releases_task_admission_gate_before_send(tmp_path, monkeypatch):
+def test_legacy_bootstrap_metadata_is_ignored_for_new_role_allocation(tmp_path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    catalog = BootstrapCatalog(tmp_path)
-    bootstrap = catalog.upsert(
+    store = TaskStore(config)
+    bootstrap = BootstrapCatalog(tmp_path).upsert(
         {
-            "bootstrap_id": "general-team-bootstrap",
-            "name": "General Team Bootstrap",
-            "description": "Reusable task-neutral context",
+            "bootstrap_id": "legacy-bootstrap",
+            "name": "Legacy Bootstrap",
+            "description": "Historical metadata only",
             "source_conversation_id": "11111111-1111-4111-8111-111111111111",
-            "prewarm_prompt": "Load reusable bootstrap context only.",
+            "prewarm_prompt": "Do not run",
             "max_backups": 7,
             "donors": [],
             "enabled": True,
-            "tags": ["general"],
+            "tags": [],
             "created_at": "2026-08-06T00:00:00+00:00",
             "updated_at": "2026-08-06T00:00:00+00:00",
         }
     )
-    store = TaskStore(config)
     state = store.create_task(
-        "regenerate bootstrap before admission",
-        task_id="bootstrap-admission-boundary",
-        requested_team="bootstrap-admission-boundary",
+        "legacy bootstrap metadata",
+        task_id="legacy-bootstrap-allocation",
+        requested_team="legacy-bootstrap-allocation",
         bootstrap=bootstrap,
     )
-    state["bootstrap_source_exhausted"] = True
     worker = CDPAWorker(config, store=store)
-    donor = {
-        "conversation_id": "33333333-3333-4333-8333-333333333333",
-        "assistant_message_id": "44444444-4444-4444-8444-444444444444",
-    }
-
-    class GlobalClient:
-        binding = SimpleNamespace(role="BOOTSTRAP")
-        page = SimpleNamespace(url=f"https://chatgpt.com/c/{donor['conversation_id']}")
-
-        async def new_chat(self, **_kwargs):
-            return "https://chatgpt.com/"
-
-        async def assert_ownership(self):
-            return SimpleNamespace(
-                page_role="BOOTSTRAP",
-                page_task_id=None,
-                page_team=None,
-                url=f"https://chatgpt.com/c/{donor['conversation_id']}",
-            )
+    calls = []
 
     class Actions:
         async def locate_owned(self, _state, _role):
             return None
 
-        async def acquire_global_role(self, physical_role, *, allow_create=True):
-            assert physical_role == "BOOTSTRAP"
-            assert allow_create is True
-            return AcquiredRole(
-                client=GlobalClient(),
-                page_id="bootstrap-global",
-                url="https://chatgpt.com/",
-                created=True,
-                new_chat=False,
-            )
-
-        async def branch_from_anchor(
-            self, _state, role, *, source_conversation_id, assistant_message_id
-        ):
-            current = asyncio.current_task()
-            assert current in worker._endpoint_admission_holds
-            assert role == "PLAN"
-            assert (source_conversation_id, assistant_message_id) == (
-                donor["conversation_id"],
-                donor["assistant_message_id"],
-            )
+        async def fresh_chat(self, _state, role, *, url, clean_for_send=False):
+            calls.append((role, url, clean_for_send))
             return AcquiredRole(
                 client=SimpleNamespace(),
-                page_id="task-branch",
-                url=f"https://chatgpt.com/c/{donor['conversation_id']}",
+                page_id="fresh-plan",
+                url="https://chatgpt.com/c/fresh-plan",
                 created=True,
                 new_chat=True,
             )
 
-    class FakeBlock:
-        def __init__(self, _prompt, **_kwargs):
-            pass
-
-        async def run(self, _context):
-            current = asyncio.current_task()
-            assert current not in worker._endpoint_admission_holds
-            return {
-                "receipt": {"conversation_id": donor["conversation_id"]},
-                "response": {
-                    "message_id": donor["assistant_message_id"],
-                    "role": "assistant",
-                    "turn_id": "55555555-5555-4555-8555-555555555555",
-                    "text": "bootstrap ready",
-                    "attachments": [],
-                },
-            }
-
-    monkeypatch.setattr(worker_module, "DurableSendBlock", FakeBlock)
-
-    async def scenario():
-        await worker._acquire_endpoint_admission(state, "PLAN")
-        try:
-            return await worker._acquire_workflow_role(state, "PLAN", Actions())
-        finally:
-            worker._release_endpoint_admission()
-
-    acquired = asyncio.run(scenario())
+    acquired = asyncio.run(worker._acquire_workflow_role(state, "PLAN", Actions()))
 
     assert acquired is not None
-    assert acquired.page_id == "task-branch"
-    assert state["roles"]["PLAN"]["context_source"] == "bootstrap_donor"
-    assert worker._endpoint_admission_holds == {}
+    assert acquired.page_id == "fresh-plan"
+    assert calls == [("PLAN", "https://chatgpt.com/", True)]
+    assert state["roles"]["PLAN"]["context_source"] == "fresh"
 
 
 def test_pool_exhaustion_waits_without_semantic_block(tmp_path, monkeypatch):
@@ -989,8 +1451,15 @@ def test_pool_exhaustion_waits_without_semantic_block(tmp_path, monkeypatch):
 
 
 def test_endpoint_disconnect_does_not_abort_peer_execution(tmp_path, monkeypatch):
-    worker, store, _first, _second, _tasks = _setup(tmp_path, task_count=2)
+    worker, store, _first, _second, _tasks = _setup(tmp_path, task_count=1)
     store.endpoints.update(_first["endpoint_id"], max_active_tabs=1)
+    peer = store.create_task(
+        "peer task",
+        task_id="task-1",
+        requested_team="team-1",
+        browser_endpoint_id=_second["endpoint_id"],
+    )
+    worker.registry.update_task(peer, now=0.0)
     seen = []
 
     async def scenario():
@@ -1016,16 +1485,18 @@ def test_endpoint_disconnect_does_not_abort_peer_execution(tmp_path, monkeypatch
     assert {context for _task_id, context in seen} == {"9222", "9202"}
 
 
-def test_same_team_roles_can_record_different_execution_endpoints(tmp_path):
+def test_same_team_roles_cannot_record_different_execution_endpoints(tmp_path):
     worker, _store, first, second, tasks = _setup(tmp_path)
     state = copy.deepcopy(tasks[0])
     state["roles"]["PLAN"]["browser_endpoint_id"] = first["endpoint_id"]
     state["active_role"] = "DEV"
     _active_hop(state)["target_role"] = "DEV"
 
-    assert worker._prepare_execution_endpoint(state, second["endpoint_id"]) is True
+    assert worker._prepare_execution_endpoint(state, second["endpoint_id"]) is False
+    assert worker._prepare_execution_endpoint(state, first["endpoint_id"]) is True
+    assert state["browser_endpoint_id"] == first["endpoint_id"]
     assert state["roles"]["PLAN"]["browser_endpoint_id"] == first["endpoint_id"]
-    assert state["roles"]["DEV"]["browser_endpoint_id"] == second["endpoint_id"]
+    assert state["roles"]["DEV"]["browser_endpoint_id"] == first["endpoint_id"]
 
 
 def test_pool_inventory_keeps_capacity_and_flattened_compatibility_view(tmp_path):
@@ -1042,7 +1513,12 @@ def test_pool_inventory_keeps_capacity_and_flattened_compatibility_view(tmp_path
                 "active_count": 2,
                 "capacity": 2,
                 "available_slots": 0,
-                "running_executions": [_execution(first["endpoint_id"], "a")],
+                "running_executions": [
+                    {
+                        **_execution(first["endpoint_id"], "a"),
+                        "page_id": None,
+                    }
+                ],
             },
             {
                 **second,
@@ -1065,10 +1541,238 @@ def test_pool_inventory_keeps_capacity_and_flattened_compatibility_view(tmp_path
     assert projection["default_endpoint_id"] == first["endpoint_id"]
     states = {item["endpoint_id"]: item for item in projection["endpoints"]}
     assert states[first["endpoint_id"]]["capacity"] == 2
-    assert states[first["endpoint_id"]]["active_count"] == 0
-    assert states[first["endpoint_id"]]["available_slots"] == 2
+    assert states[first["endpoint_id"]]["active_count"] == 1
+    assert states[first["endpoint_id"]]["available_slots"] == 1
+    assert states[first["endpoint_id"]]["running_executions"][0]["task_id"] == "a"
     assert states[first["endpoint_id"]]["pages"] == []
     assert states[second["endpoint_id"]]["health"] == "offline"
+
+
+def test_pool_inventory_keeps_durable_execution_when_page_observation_flickers(tmp_path):
+    worker, _store, first, _second, _tasks = _setup(tmp_path)
+    ctx = SimpleNamespace(pages=[])
+    endpoint_id = first["endpoint_id"]
+    worker._execution_leases["reserved"] = {
+        **_execution(endpoint_id, "reserved"),
+        "page_id": None,
+    }
+    stale = _execution(endpoint_id, "stale")
+
+    def runtime():
+        executions = worker._running_executions([])
+        executions.append(stale)
+        return {
+            "default_endpoint_id": endpoint_id,
+            "endpoints": [{
+                **first,
+                "health": "online",
+                "auth_state": "logged_in",
+                "chatgpt_ready": True,
+                "active_count": len(executions),
+                "capacity": 2,
+                "available_slots": max(0, 2 - len(executions)),
+                "running_executions": executions,
+            }],
+        }
+
+    asyncio.run(worker._publish_browser_pool_inventory({endpoint_id: ctx}, runtime()))
+    state = worker._browser_projection["endpoints"][0]
+    assert [item["task_id"] for item in state["running_executions"]] == ["reserved", "stale"]
+    assert state["running_executions"][0]["page_observed"] is True
+    assert state["running_executions"][1]["page_observed"] is False
+    assert state["active_count"] == 2
+    assert state["available_slots"] == 0
+
+    worker._execution_leases.pop("reserved")
+    asyncio.run(worker._publish_browser_pool_inventory({}, runtime()))
+    state = worker._browser_projection["endpoints"][0]
+    assert [item["task_id"] for item in state["running_executions"]] == ["stale"]
+    assert state["running_executions"][0]["page_observed"] is False
+    assert state["active_count"] == 1
+    assert state["available_slots"] == 1
+
+
+def test_same_task_page_less_lease_is_not_masked_by_stale_recorded_page(tmp_path):
+    worker, _store, first, _second, tasks = _setup(tmp_path)
+    state = copy.deepcopy(tasks[0])
+    state.update(status="RUNNING", active_role="PLAN")
+    state["roles"]["PLAN"].update(
+        browser_endpoint_id=first["endpoint_id"],
+        page_id="stale-page",
+        page_url="https://chatgpt.com/c/stale",
+        online=True,
+        status="active",
+    )
+    _active_hop(state)["state"] = "waiting"
+    worker._execution_leases[state["task_id"]] = {
+        "endpoint_id": first["endpoint_id"],
+        "task_id": state["task_id"],
+        "team": state["team"],
+        "role": "PLAN",
+        "request_id": _active_hop(state)["request_id"],
+        "page_id": None,
+    }
+    executions = worker._running_executions([state])
+    runtime = {
+        "default_endpoint_id": first["endpoint_id"],
+        "endpoints": [{
+            **first,
+            "health": "online",
+            "auth_state": "logged_in",
+            "chatgpt_ready": True,
+            "active_count": len(executions),
+            "capacity": 2,
+            "available_slots": max(0, 2 - len(executions)),
+            "running_executions": executions,
+        }],
+    }
+
+    asyncio.run(
+        worker._publish_browser_pool_inventory(
+            {first["endpoint_id"]: SimpleNamespace(pages=[])},
+            runtime,
+        )
+    )
+
+    endpoint = worker._browser_projection["endpoints"][0]
+    assert endpoint["active_count"] == 1
+    assert endpoint["available_slots"] == 1
+    assert [item["task_id"] for item in endpoint["running_executions"]] == [
+        state["task_id"]
+    ]
+    assert endpoint["running_executions"][0]["page_id"] is None
+
+
+def test_pool_cycle_publishes_page_less_lease_until_scheduling_task_finishes(
+    tmp_path, monkeypatch
+):
+    worker, store, first, second, _tasks = _setup(tmp_path, task_count=2)
+    store.endpoints.update(first["endpoint_id"], max_active_tabs=2)
+    store.endpoints.remove(second["endpoint_id"], has_nonterminal_tasks=True)
+    both_started = asyncio.Event()
+    releases = {"task-0": asyncio.Event(), "task-1": asyncio.Event()}
+    started = set()
+
+    async def scenario():
+        pool = await _pool(store)
+
+        async def advance(path, context, *, scheduling_tasks=None, endpoint_id=None):
+            state = store.load(path)
+            task_id = state["task_id"]
+            started.add(task_id)
+            if len(started) == 2:
+                both_started.set()
+            await releases[task_id].wait()
+            return state
+
+        async def wait_for_active_count(expected):
+            deadline = asyncio.get_running_loop().time() + 2.0
+            while asyncio.get_running_loop().time() < deadline:
+                snapshot = worker.runtime_db.get_snapshot("browser")
+                if snapshot is not None:
+                    endpoint = next(
+                        item
+                        for item in snapshot["payload"]["endpoints"]
+                        if item["endpoint_id"] == first["endpoint_id"]
+                    )
+                    if endpoint["active_count"] == expected:
+                        return endpoint
+                await asyncio.sleep(0.01)
+            raise AssertionError(f"browser projection did not reach active_count={expected}")
+
+        monkeypatch.setattr(worker, "advance", advance)
+        monkeypatch.setattr(worker, "_maintain_ambient_page_automation", _noop)
+        monkeypatch.setattr(worker, "_refresh_rate_limit_cooldown", _noop)
+        monkeypatch.setattr(worker, "_close_idle_independent_tabs", _noop)
+
+        cycle = asyncio.create_task(worker.run_once_pool(pool))
+        await both_started.wait()
+
+        active_endpoint = await wait_for_active_count(2)
+        assert active_endpoint["available_slots"] == 0
+        assert sorted(
+            item["task_id"] for item in active_endpoint["running_executions"]
+        ) == ["task-0", "task-1"]
+        assert all(
+            item["page_id"] is None for item in active_endpoint["running_executions"]
+        )
+
+        releases["task-0"].set()
+        partially_released = await wait_for_active_count(1)
+        assert partially_released["available_slots"] == 1
+        assert [item["task_id"] for item in partially_released["running_executions"]] == [
+            "task-1"
+        ]
+        assert set(worker._execution_leases) == {"task-1"}
+
+        releases["task-1"].set()
+        await cycle
+
+        released_endpoint = await wait_for_active_count(0)
+        assert released_endpoint["available_slots"] == 2
+        assert released_endpoint["running_executions"] == []
+        assert worker._execution_leases == {}
+        await pool.close()
+
+    asyncio.run(scenario())
+
+
+def test_pool_cycle_cancellation_clears_lease_and_marks_browser_capacity_unknown(
+    tmp_path, monkeypatch
+):
+    worker, store, _first, _second, _tasks = _setup(tmp_path)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def scenario():
+        pool = await _pool(store)
+
+        async def advance(path, context, *, scheduling_tasks=None, endpoint_id=None):
+            started.set()
+            await release.wait()
+            return store.load(path)
+
+        async def wait_for_active_lease():
+            deadline = asyncio.get_running_loop().time() + 2.0
+            while asyncio.get_running_loop().time() < deadline:
+                snapshot = worker.runtime_db.get_snapshot("browser")
+                if snapshot is not None and worker._execution_leases:
+                    payload = snapshot["payload"]
+                    for endpoint in payload.get("endpoints") or []:
+                        if endpoint.get("active_count") == 1:
+                            return payload
+                await asyncio.sleep(0.01)
+            raise AssertionError("browser projection did not publish active lease")
+
+        monkeypatch.setattr(worker, "advance", advance)
+        monkeypatch.setattr(worker, "_maintain_ambient_page_automation", _noop)
+        monkeypatch.setattr(worker, "_refresh_rate_limit_cooldown", _noop)
+        monkeypatch.setattr(worker, "_close_idle_independent_tabs", _noop)
+
+        cycle = asyncio.create_task(worker.run_once_pool(pool))
+        await started.wait()
+        active_payload = await wait_for_active_lease()
+        assert active_payload["connected"] is True
+
+        cycle.cancel()
+        try:
+            await cycle
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("cancelled pool cycle must propagate cancellation")
+
+        assert worker._execution_leases == {}
+        cancelled_snapshot = worker.runtime_db.get_snapshot("browser")
+        assert cancelled_snapshot is not None
+        cancelled_payload = cancelled_snapshot["payload"]
+        assert cancelled_payload["connected"] is False
+        assert cancelled_payload["page_count"] is None
+        assert cancelled_payload["pages"] == []
+        assert not cancelled_payload.get("endpoints")
+        await pool.close()
+
+    asyncio.run(scenario())
 
 
 def test_pool_inventory_contains_unverified_managed_process_state(tmp_path):
@@ -1161,3 +1865,29 @@ def test_rate_limit_cooldown_is_scoped_to_configured_account(tmp_path):
     assert worker._active_rate_limit_scopes() == {"account-x"}
     assert worker._rate_limit_gate_active(state=state_x) is True
     assert worker._rate_limit_gate_active(state=state_y) is False
+
+
+
+def test_unpinned_team_first_placement_pins_endpoint_and_inherits_temporary_default(tmp_path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    first = store.endpoints.resolve()
+    second = store.endpoints.add("9202", temporary_default=True)
+    state = store.create_task(
+        "default placement",
+        task_id="default-placement",
+        requested_team="default-placement",
+    )
+    worker = CDPAWorker(config, store=store)
+
+    assert state["endpoint_pinned"] is False
+    assert state["conversation_mode_explicit"] is False
+    assert worker._execution_endpoint_id(state) is None
+
+    assert worker._prepare_execution_endpoint(state, second["endpoint_id"]) is True
+    assert state["endpoint_pinned"] is True
+    assert state["browser_endpoint_id"] == second["endpoint_id"]
+    assert state["conversation_mode"] == "temporary"
+    assert state["context_policy"] == "fresh"
+
+    assert worker._prepare_execution_endpoint(state, first["endpoint_id"]) is False

@@ -808,7 +808,7 @@ def test_projection_summary_is_compact_and_deterministic(tmp_path: Path):
         "elapsed_end_at",
         "availability", "primary_problem", "waiting_reason", "block_code",
         "stop_reason", "lifecycle_kind", "lifecycle_label",
-        "queue_position", "queue_length", "queue_reason", "queue_since", "waiting_order", "roles", "requested_browser_endpoint_id", "browser_endpoint_ids", "has_reports", "task_title",
+        "queue_position", "queue_length", "queue_reason", "queue_since", "waiting_order", "roles", "requested_browser_endpoint_id", "required_browser_endpoint_id", "browser_endpoint_ids", "has_reports", "task_title",
         "version", "projection_sha256",
     }
 
@@ -1052,13 +1052,16 @@ def test_projection_partial_endpoint_disconnect_has_unknown_summary_availability
 def test_projection_keeps_requested_endpoint_when_active_role_runs_elsewhere(tmp_path: Path):
     task = raw_task(tmp_path)
     task["browser_endpoint_id"] = "endpoint-requested"
+    task["required_browser_endpoint_id"] = "endpoint-required"
     task["roles"]["DEV"]["browser_endpoint_id"] = "endpoint-actual"
 
     projection = build_task_projection(task, tasks=[task])
 
     assert projection.summary["requested_browser_endpoint_id"] == "endpoint-requested"
+    assert projection.summary["required_browser_endpoint_id"] == "endpoint-required"
     assert projection.summary["browser_endpoint_ids"] == ["endpoint-actual"]
     assert projection.detail["requested_browser_endpoint_id"] == "endpoint-requested"
+    assert projection.detail["required_browser_endpoint_id"] == "endpoint-required"
 
 
 def test_projection_exposes_sanitized_expected_report_for_active_hop(tmp_path: Path):

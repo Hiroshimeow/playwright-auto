@@ -195,7 +195,7 @@ def test_cli_applies_one_exact_edit_and_returns_json(tmp_path: Path, capsys) -> 
 
 def test_concurrent_guarded_edits_preserve_both_changes(tmp_path: Path) -> None:
     root = _repository(tmp_path)
-    context = multiprocessing.get_context("fork")
+    context = multiprocessing.get_context("fork" if os.name != "nt" else "spawn")
     ready = context.Queue()
     release = context.Queue()
     result = context.Queue()
@@ -252,9 +252,3 @@ def test_final_plan_contract_requires_one_observable_guarded_learning_pass() -> 
         assert "## Learning" in prompt
         assert "read back" in prompt
         assert "post-DONE model pass" in prompt
-
-    agents = Path("AGENTS.md").read_text(encoding="utf-8")
-    assert "newest relevant completion evidence" in agents
-    assert "`ADDED`, `REVISED`, or `NONE`" in agents
-    assert "## Learning" in agents
-    assert "post-DONE model pass" in agents

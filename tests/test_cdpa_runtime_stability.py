@@ -82,7 +82,7 @@ class _RateActions:
             new_chat=False,
         )
 
-    async def acquire(self, state, role):
+    async def acquire(self, state, role, **_kwargs):
         self.acquire_calls += 1
         return await self.locate_owned(state, role)
 
@@ -93,7 +93,7 @@ class _RespondingActions:
         self.acquire_calls = 0
         self.client = SimpleNamespace(wait_until_clean_ready=self.wait_until_clean_ready)
 
-    async def acquire(self, state, role):
+    async def acquire(self, state, role, **_kwargs):
         self.acquire_calls += 1
         if self.acquire_calls == 1:
             raise UnsafePageStateError("page is already responding")
@@ -296,6 +296,37 @@ def test_active_cooldown_waiting_hop_continues_local_dom_reconciliation_without_
 
 
 
+
+
+def test_builtin_seed_skips_full_seed_when_discovery_already_has_builtins(
+    tmp_path: Path, monkeypatch
+):
+    _config, store, _state, worker = _setup(tmp_path)
+    store.create_independent_agent(
+        "Maintainers",
+        system_prompt="Recover directly.",
+        task_id="agent-maintainers-g1",
+        trigger_settings={"recovery": True},
+        max_cycles=5,
+    )
+    store.create_independent_agent(
+        "Monitor",
+        system_prompt="Observe directly.",
+        task_id="agent-monitor-g1",
+        trigger_settings={"interval_minutes": 30, "check_all": True},
+        max_cycles=1,
+    )
+    discovered = store.discover()
+    calls: list[str] = []
+
+    def unexpected_seed(name: str, **_kwargs):
+        calls.append(name)
+        raise AssertionError("existing builtin must not trigger another full seed scan")
+
+    monkeypatch.setattr(store, "seed_independent_agent", unexpected_seed)
+
+    assert worker._ensure_builtin_independent_agents(discovered) is False
+    assert calls == []
 
 
 def test_builtin_seed_does_not_recreate_explicitly_stopped_agents(tmp_path: Path):
@@ -501,3 +532,131 @@ def test_expired_rate_limit_snapshot_restores_as_clear(tmp_path: Path):
     restarted._restore_rate_limit_cooldown()
     assert restarted._rate_limit_cooldown is None
     assert restarted._rate_limit_gate_active() is False
+
+
+def test_degraded_catalog_still_applies_exact_task_pause(tmp_path: Path):
+    _config, store, state, worker = _setup(tmp_path)
+    worker.runtime_degraded = True
+    worker.registry = None
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-pause-degraded",
+        idempotency_key="idem-pause-degraded",
+        kind="task_control",
+        task_id=state["task_id"],
+        expected_task_version=None,
+        payload={"action": "pause", "reason": "operator pause during degraded catalog"},
+    )
+
+    result = worker.dispatch_command_once()
+
+    assert result["status"] == "applied"
+    saved = store.load(state["manifest_path"])
+    assert saved["status"] == "PAUSED"
+    assert saved["pause_reason"] == "operator pause during degraded catalog"
+    control = saved["controls"][-1]
+    assert control["action"] == "pause"
+    assert control["status"] == "applied"
+    assert control["command_state"] == "APPLIED"
+    assert control["result"]["postcondition"] == "task_paused"
+
+def test_reload_catalog_runs_while_browser_cycle_is_active(tmp_path: Path, monkeypatch):
+    _config, _store, _state, worker = _setup(tmp_path)
+    worker.registry = SimpleNamespace(tasks_by_id={})
+    worker._browser_cycle_active = True
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-reload-active-cycle",
+        idempotency_key="idem-reload-active-cycle",
+        kind="reload_catalog",
+        task_id=None,
+        expected_task_version=None,
+        payload={},
+    )
+    monkeypatch.setattr(
+        worker,
+        "hydrate_runtime",
+        lambda **_kwargs: {"complete": True, "discovered_at": "now", "errors": []},
+    )
+
+    result = worker.dispatch_command_once()
+
+    assert result["status"] == "applied"
+    assert result["result"]["catalog"]["complete"] is True
+
+def test_blocked_workflow_pause_resume_restores_exact_block(tmp_path: Path):
+    _config, store, state, worker = _setup(tmp_path)
+    path = Path(state["manifest_path"])
+
+    def block(current):
+        current.update(
+            status="BLOCKED",
+            kanban_column="BLOCKED",
+            active_action="blocked",
+            block_code="unexpected_error",
+            block_retryable=False,
+            block_reason="synthetic block",
+        )
+        return current
+
+    blocked = store.update(path, block)
+    paused = store.request_control(path, "pause", reason="operator hold")
+    assert asyncio.run(worker._apply_control(paused, SimpleNamespace(), path)) is True
+    paused = store.load(path)
+
+    assert paused["status"] == "PAUSED"
+    assert paused["resume_status"] == "BLOCKED"
+    assert paused["resume_column"] == "BLOCKED"
+    assert paused["resume_action"] == "blocked"
+    assert paused["block_code"] == "unexpected_error"
+    assert paused["block_reason"] == "synthetic block"
+
+    resumed = store.request_control(path, "resume", reason="release operator hold")
+    assert asyncio.run(worker._apply_control(resumed, SimpleNamespace(), path)) is True
+    resumed = store.load(path)
+
+    assert resumed["status"] == "BLOCKED"
+    assert resumed["kanban_column"] == "BLOCKED"
+    assert resumed["active_action"] == "blocked"
+    assert resumed["block_code"] == "unexpected_error"
+    assert resumed["block_reason"] == "synthetic block"
+    assert resumed["pause_reason"] is None
+    assert "resume_status" not in resumed
+    assert "resume_action" not in resumed
+
+
+def test_pre_send_page_already_responding_is_observed_not_blocked(tmp_path: Path, monkeypatch):
+    _config, store, state, worker = _setup(tmp_path)
+    endpoint_id = state["browser_endpoint_id"]
+    state["endpoint_pinned"] = True
+    role = state["roles"]["PLAN"]
+    role.update(
+        browser_endpoint_id=endpoint_id,
+        page_id="page-live-response",
+        page_url="https://chatgpt.com/c/live-response",
+        online=True,
+        status="active",
+    )
+    path = Path(state["manifest_path"])
+    state = store.save(path, state)
+
+    actions = _RespondingActions(remains_active=True)
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    result = asyncio.run(
+        worker.advance(
+            path,
+            SimpleNamespace(pages=[]),
+            endpoint_id=endpoint_id,
+        )
+    )
+
+    assert result is not None
+    hop = _active_hop(result)
+    assert result["status"] == "RUNNING"
+    assert result["active_action"] == "wait_response"
+    assert result["block_code"] is None
+    assert hop["state"] == "waiting"
+    assert hop["observed_existing_response"] is True
+    assert hop["receipt"] is None
+    assert hop["wait"]["started_at"]
+    assert hop["wait"]["deadline_at"]
+    assert actions.acquire_calls == 1

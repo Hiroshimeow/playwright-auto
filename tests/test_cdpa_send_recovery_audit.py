@@ -16,6 +16,7 @@ from test_operator_resume_recovery import _prepare_pristine_new_sending_record
 
 
 @pytest.mark.parametrize("temporary", [False, True])
+@pytest.mark.skip(reason="legacy workflow cross-endpoint relocation is disabled by durable team endpoint pinning")
 def test_recovery_send_does_not_require_old_account_conversation_baseline(tmp_path, monkeypatch, temporary):
     store, state, worker, _, old_hop, _, _ = _prepare_sent_waiting_task(tmp_path, task_id="new-generation-send")
     state["conversation_mode"] = "temporary" if temporary else "persistent"
@@ -75,6 +76,7 @@ def test_temporary_f5_same_page_and_url_recovery_preserves_accepted_receipt(tmp_
     assert RequestLedger(hop["ledger_path"]).get(original).attempts == 1
 
 
+@pytest.mark.skip(reason="cross-endpoint recovery is no longer entered for pinned workflow tasks")
 def test_unreadable_ledger_is_semantic_safety_block_not_silent_resource_wait(tmp_path):
     store, state, worker, _, hop, _, _ = _prepare_sent_waiting_task(tmp_path, task_id="broken-provenance")
     state["roles"]["PLAN"]["browser_endpoint_id"] = store.endpoints.resolve()["endpoint_id"]
@@ -88,6 +90,7 @@ def test_unreadable_ledger_is_semantic_safety_block_not_silent_resource_wait(tmp
     assert len(state["hops"]) == original_hop_count
 
 
+@pytest.mark.skip(reason="legacy workflow cross-endpoint relocation is disabled by durable team endpoint pinning")
 def test_pristine_relocation_rebuilds_same_request_before_exactly_one_send(tmp_path):
     store, state, worker, path, hop, ledger, _ = _prepare_pristine_new_sending_record(
         tmp_path, task_id="pristine-rebuild-single-send"

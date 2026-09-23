@@ -550,7 +550,7 @@ function workflowTabs(detail, selectedTab) {
   const tabs = detailTabs(
     detail,
     selectedTab,
-    [["overview", "Overview"], ["live", "Live audit"], ["reports", `Reports ${model.coverage}`]],
+    [["overview", "Overview"], ["live", "Live transcript"], ["reports", `Reports ${model.coverage}`]],
     "Workflow task detail",
   );
   tabs.classList.add("workflow-detail-tabs");
@@ -640,7 +640,7 @@ function liveValue(value) {
 }
 
 function workflowLive(detail, selectedRole, liveState = {}) {
-  const section = detailCard("Live audit", {id: "task-live", className: "live-audit"});
+  const section = detailCard("Live transcript", {id: "task-live", className: "live-audit"});
   const role = selectedRole || detail.active_role || null;
   const selected = (detail.roles || []).find(item => item.logical_role === role) || null;
   const header = el("div", null, "live-audit-head");
@@ -665,90 +665,144 @@ function workflowLive(detail, selectedRole, liveState = {}) {
   section.append(header);
   section.append(el(
     "p",
-    "DOM = observed page state · LISTEN = response / transport signal · CTRL = controller transition · ACTION = browser / control action.",
+    "User-visible ChatGPT messages are captured from the exact owned page. Partial assistant text is updated in place; terminal Listen replaces it with the final text. Audit signals remain available below.",
     "live-audit-help",
   ));
+
+  const rawItems = liveState.items || [];
+  const transcript = new Map();
+  for (const event of rawItems) {
+    if (String(event.source || "").toUpperCase() !== "TRANSCRIPT") continue;
+    const values = event.values || {};
+    const messageId = String(values.message_id || "");
+    const author = String(values.author || "assistant").toLowerCase();
+    const messageText = String(values.text || "");
+    if (!messageId || !messageText) continue;
+    const transcriptKey = author + ":" + (values.turn_id ? "turn:" + values.turn_id : "message:" + messageId);
+    transcript.set(transcriptKey, {
+      author,
+      messageId,
+      turnId: values.turn_id || null,
+      text: messageText,
+      textLength: Number(values.text_length || messageText.length),
+      complete: values.complete !== false,
+      at: event.at,
+      atEpoch: Number(event.at_epoch || Date.parse(event.at || "") / 1000 || 0),
+    });
+  }
+  const messages = [...transcript.values()].sort((a, b) => a.atEpoch - b.atEpoch);
+
+  if (liveState.status === "loading" && !rawItems.length) {
+    section.append(el("p", "Loading live transcript…", "muted"));
+  } else if (!messages.length) {
+    section.append(el("p", "No transcript messages have been captured for this role yet.", "muted"));
+  } else {
+    const transcriptList = el("div", null, "live-transcript-list");
+    for (const message of messages) {
+      const card = el("article", null, "live-transcript-message transcript-" + message.author);
+      const head = el("div", null, "live-transcript-head");
+      const label = message.author === "user" ? "USER" : message.author.toUpperCase();
+      const time = el("time", timelineTime(message.at));
+      if (message.at) {
+        time.dateTime = message.at;
+        time.title = message.at;
+        time.dataset.timeAt = message.at;
+      }
+      head.append(
+        el("strong", label),
+        time,
+        el("span", message.complete ? "complete" : "streaming", "transcript-state " + (message.complete ? "complete" : "streaming")),
+      );
+      card.append(head, el("pre", message.text, "live-transcript-text"));
+      if (message.textLength > message.text.length) {
+        card.append(el(
+          "p",
+          "Showing " + message.text.length.toLocaleString() + " of " + message.textLength.toLocaleString() + " characters.",
+          "muted live-transcript-truncated",
+        ));
+      }
+      transcriptList.append(card);
+    }
+    section.append(transcriptList);
+  }
+
+  const auditItems = rawItems.filter(event => String(event.source || "").toUpperCase() !== "TRANSCRIPT");
+  const audit = el("details", null, "live-audit-signals");
+  audit.append(el("summary", "Audit signals · " + auditItems.length));
+  const auditBody = el("div", null, "live-audit-signals-body");
   const sourceHelp = {
     DOM: "Observed semantic page state",
     LISTEN: "Detected response or transport activity",
     CTRL: "Controller state transition",
     ACTION: "Browser or controller action",
   };
-  const rawItems = liveState.items || [];
   const sourceCounts = Object.create(null);
-  for (const event of rawItems) {
+  for (const event of auditItems) {
     const source = String(event.source || "EVENT").toUpperCase();
     sourceCounts[source] = (sourceCounts[source] || 0) + 1;
   }
   const legend = el("div", null, "live-legend");
   for (const source of ["DOM", "LISTEN", "CTRL", "ACTION"]) {
-    const chip = el("span", source, `live-source source-${source.toLowerCase()}`);
+    const chip = el("span", source, "live-source source-" + source.toLowerCase());
     chip.append(el("b", String(sourceCounts[source] || 0)));
     chip.title = sourceHelp[source];
     legend.append(chip);
   }
-  section.append(legend);
-
-  if (liveState.status === "loading" && !rawItems.length) {
-    section.append(el("p", "Loading live telemetry…", "muted"));
-    return section;
-  }
+  auditBody.append(legend);
   if (liveState.error) {
-    section.append(el("p", `Live telemetry unavailable: ${liveState.error}`, "live-error"));
+    auditBody.append(el("p", "Live telemetry unavailable: " + liveState.error, "live-error"));
   }
-  const items = [...rawItems].reverse();
-  if (!items.length) {
-    section.append(el("p", "No semantic DOM / Listen / controller events have been captured for this role yet.", "muted"));
-    return section;
-  }
-  const list = el("div", null, "live-event-list");
-  for (const event of items) {
-    const card = el("article", null, "live-event");
-    const top = el("div", null, "live-event-head");
-    const time = el("time", timelineTime(event.at));
-    if (event.at) {
-      time.dateTime = event.at;
-      time.title = event.at;
-      time.dataset.timeAt = event.at;
-    }
-    top.append(
-      time,
-      el("span", event.source || "EVENT", `live-source source-${String(event.source || "event").toLowerCase()}`),
-      el("strong", event.kind || "event"),
-    );
-    card.append(top);
-    const changes = event.changes && typeof event.changes === "object" ? Object.entries(event.changes) : [];
-    if (changes.length) {
-      const grid = el("dl", null, "live-change-grid");
-      for (const [field, change] of changes) {
-        grid.append(
-          el("dt", field),
-          el("dd", `${liveValue(change?.from)} → ${liveValue(change?.to)}`),
-        );
+  if (!auditItems.length) {
+    auditBody.append(el("p", "No audit signals have been captured for this role yet.", "muted"));
+  } else {
+    const list = el("div", null, "live-event-list");
+    for (const event of [...auditItems].reverse()) {
+      const card = el("article", null, "live-event");
+      const top = el("div", null, "live-event-head");
+      const time = el("time", timelineTime(event.at));
+      if (event.at) {
+        time.dateTime = event.at;
+        time.title = event.at;
+        time.dataset.timeAt = event.at;
       }
-      card.append(grid);
-    } else if (event.values && Object.keys(event.values).length) {
-      const grid = el("dl", null, "live-change-grid live-values-grid");
-      for (const [field, value] of Object.entries(event.values)) {
-        if (value === null || value === undefined || value === "") continue;
-        grid.append(el("dt", field), el("dd", liveValue(value)));
+      top.append(
+        time,
+        el("span", event.source || "EVENT", "live-source source-" + String(event.source || "event").toLowerCase()),
+        el("strong", event.kind || "event"),
+      );
+      card.append(top);
+      const changes = event.changes && typeof event.changes === "object" ? Object.entries(event.changes) : [];
+      if (changes.length) {
+        const grid = el("dl", null, "live-change-grid");
+        for (const [field, change] of changes) {
+          grid.append(el("dt", field), el("dd", liveValue(change?.from) + " → " + liveValue(change?.to)));
+        }
+        card.append(grid);
+      } else if (event.values && Object.keys(event.values).length) {
+        const grid = el("dl", null, "live-change-grid live-values-grid");
+        for (const [field, value] of Object.entries(event.values)) {
+          if (value === null || value === undefined || value === "") continue;
+          grid.append(el("dt", field), el("dd", liveValue(value)));
+        }
+        card.append(grid);
       }
-      card.append(grid);
+      const meta = [event.team, event.task_id, event.role, event.page_id, event.request_id]
+        .filter(Boolean).join(" · ");
+      if (meta || event.detail) {
+        const details = el("details", null, "live-event-details");
+        details.append(el("summary", "Details"));
+        const body = el("div", null, "live-event-details-body");
+        if (meta) body.append(el("p", meta, "live-event-meta"));
+        if (event.detail) body.append(el("p", event.detail, "live-event-detail"));
+        details.append(body);
+        card.append(details);
+      }
+      list.append(card);
     }
-    const meta = [event.team, event.task_id, event.role, event.page_id, event.request_id]
-      .filter(Boolean).join(" · ");
-    if (meta || event.detail) {
-      const details = el("details", null, "live-event-details");
-      details.append(el("summary", "Details"));
-      const body = el("div", null, "live-event-details-body");
-      if (meta) body.append(el("p", meta, "live-event-meta"));
-      if (event.detail) body.append(el("p", event.detail, "live-event-detail"));
-      details.append(body);
-      card.append(details);
-    }
-    list.append(card);
+    auditBody.append(list);
   }
-  section.append(list);
+  audit.append(auditBody);
+  section.append(audit);
   return section;
 }
 

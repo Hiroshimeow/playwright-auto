@@ -99,3 +99,53 @@ def test_hybrid_wait_wakes_on_network_without_detaching_listener():
         assert await observer.wait(0.005) is True
         assert observer.attached
     asyncio.run(run())
+
+
+def test_terminal_response_closes_stale_streaming_status():
+    page = Page()
+    observer = observer_for(page)
+    observer._on_request(
+        SimpleNamespace(method="POST", url="https://chatgpt.com/backend-api/f/conversation")
+    )
+    assert observer.observation()["status"] == "IS_STREAMING"
+
+    observer.publish(
+        {
+            "conversation_id": "chat",
+            "response": {
+                "role": "assistant",
+                "message_id": "answer",
+                "turn_id": "turn",
+                "text": '{"route":"REVIEW"}',
+                "actions": [],
+                "image_count": 0,
+            },
+        },
+        epoch=0,
+        source="network_chunk",
+    )
+
+    evidence = observer.observation()
+    assert evidence["status"] == "COMPLETE"
+    assert evidence["response"]["text"] == '{"route":"REVIEW"}'
+
+
+def test_explicit_failure_is_not_overwritten_by_terminal_response():
+    page = Page()
+    observer = observer_for(page)
+    observer.publish(
+        {
+            "status": "FAILURE",
+            "response": {
+                "role": "assistant",
+                "message_id": "answer",
+                "turn_id": "turn",
+                "text": '{"route":"REVIEW"}',
+                "actions": [],
+                "image_count": 0,
+            },
+        },
+        epoch=0,
+        source="test",
+    )
+    assert observer.observation()["status"] == "FAILURE"

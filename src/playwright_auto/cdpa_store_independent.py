@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +27,7 @@ from .cdpa_independent import (
     refresh_recovery_warmup_on_enable,
     validate_trigger_settings,
 )
+from .cdpa_commands import workflow_control_eligibility
 from .cdpa_safety import sanitize_text
 from .cdpa_store_common import TERMINAL, _validate_task_id, slugify, utc_now
 from .cdpa_team import physical_role
@@ -795,6 +797,195 @@ class IndependentAgentStoreMixin:
             return state
 
         return self.update(path, mutate)
+
+    def bind_independent_event_target(
+        self,
+        path: str | Path,
+        *,
+        event_key: str,
+        target_task_id: str,
+        external_command_id: str,
+    ) -> dict[str, Any]:
+        source_path = Path(path).expanduser().resolve()
+        expected_event_key = str(event_key or "").strip()
+        if not expected_event_key:
+            raise ValueError("event_key must not be empty")
+        target_id = _validate_task_id(target_task_id)
+        command_id = str(external_command_id or "").strip()
+        if not command_id:
+            raise ValueError("external command id must not be empty")
+
+        self.root.mkdir(parents=True, exist_ok=True)
+        with exclusive_file_lock(self.allocation_lock):
+            catalog = self._load_catalog_unlocked(reconcile=False)
+            target_paths = [
+                Path(str(entry.get("manifest_path") or "")).expanduser().resolve()
+                for entry in catalog.get("entries", {}).values()
+                if isinstance(entry, Mapping)
+                and str(entry.get("task_id") or "") == target_id
+            ]
+            if not target_paths:
+                raise ValueError("independent bind target does not exist")
+            if len(target_paths) != 1:
+                raise ValueError("independent bind target is ambiguous")
+            target_path = target_paths[0]
+
+            with ExitStack() as stack:
+                for manifest_path in sorted({source_path, target_path}, key=str):
+                    stack.enter_context(
+                        exclusive_file_lock(self._lock_path(manifest_path))
+                    )
+                source = self._load_current_manifest_unlocked(source_path)
+                target = self._load_current_manifest_unlocked(target_path)
+                self._assert_manifest_mutable_unlocked(source_path, source)
+                self._assert_manifest_mutable_unlocked(target_path, target)
+
+                if not is_independent_task(source):
+                    raise ValueError("bind source is not an independent task")
+                independent = source.get("independent")
+                active = (
+                    independent.get("active_event")
+                    if isinstance(independent, Mapping)
+                    else None
+                )
+                if not isinstance(active, dict):
+                    raise ValueError("bind source has no active independent job")
+
+                if command_id in source.get("applied_command_ids", []):
+                    if (
+                        str(active.get("event_key") or "") != expected_event_key
+                        or str(active.get("target_task_id") or "") != target_id
+                    ):
+                        raise ValueError(
+                            "replayed independent bind no longer matches the active event"
+                        )
+                    return source
+
+                if str(active.get("event_key") or "") != expected_event_key:
+                    raise ValueError("independent bind source event is stale")
+                if str(active.get("trigger_type") or "").lower() not in {
+                    "interval",
+                    "check_all",
+                }:
+                    raise ValueError(
+                        "only targetless interval/check_all events may bind a target"
+                    )
+                if str(active.get("target_task_id") or "").strip():
+                    raise ValueError("active independent event is already bound")
+
+                if is_independent_task(target):
+                    raise ValueError("independent bind target must be a workflow task")
+                if str(target.get("status") or "").upper() != "BLOCKED":
+                    raise ValueError("independent bind target is not currently blocked")
+                admission = workflow_control_eligibility(target, "resume")
+                if admission.get("eligible") is not True:
+                    raise ValueError(
+                        str(admission.get("reason") or "independent bind target is not actionable")
+                    )
+                target_hop_id = target.get("active_hop_id")
+                if not any(
+                    isinstance(hop, Mapping) and hop.get("hop_id") == target_hop_id
+                    for hop in target.get("hops") or ()
+                ):
+                    raise ValueError("independent bind target has no active durable hop")
+
+                active["target_task_id"] = target_id
+                active["target_hop_id"] = target_hop_id
+                active["target_team"] = target.get("team")
+                active["target_role"] = target.get("active_role")
+                self._record_external_command(source, command_id)
+                saved = self._save_unlocked(source_path, source)
+                self._catalog_saved_manifest_unlocked(saved)
+                return saved
+
+    def queue_bound_independent_control(
+        self,
+        path: str | Path,
+        *,
+        event_key: str,
+        target_task_id: str,
+        target_hop_id: int,
+        action: str,
+        role: str | None,
+        reason: str,
+        confirmed: bool,
+        external_command_id: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        source_path = Path(path).expanduser().resolve()
+        expected_event_key = str(event_key or "").strip()
+        if not expected_event_key:
+            raise ValueError("event_key must not be empty")
+        target_id = _validate_task_id(target_task_id)
+        command_id = str(external_command_id or "").strip()
+        if not command_id:
+            raise ValueError("external command id must not be empty")
+
+        self.root.mkdir(parents=True, exist_ok=True)
+        with exclusive_file_lock(self.allocation_lock):
+            catalog = self._load_catalog_unlocked(reconcile=False)
+            target_paths = [
+                Path(str(entry.get("manifest_path") or "")).expanduser().resolve()
+                for entry in catalog.get("entries", {}).values()
+                if isinstance(entry, Mapping)
+                and str(entry.get("task_id") or "") == target_id
+            ]
+            if len(target_paths) != 1:
+                raise ValueError("bound independent control target is missing or ambiguous")
+            target_path = target_paths[0]
+
+            with ExitStack() as stack:
+                for manifest_path in sorted({source_path, target_path}, key=str):
+                    stack.enter_context(exclusive_file_lock(self._lock_path(manifest_path)))
+                source = self._load_current_manifest_unlocked(source_path)
+                target = self._load_current_manifest_unlocked(target_path)
+                self._assert_manifest_mutable_unlocked(source_path, source)
+                self._assert_manifest_mutable_unlocked(target_path, target)
+
+                if not is_independent_task(source):
+                    raise ValueError("control source is not an independent task")
+                independent = source.get("independent")
+                active = (
+                    independent.get("active_event")
+                    if isinstance(independent, Mapping)
+                    else None
+                )
+                if not isinstance(active, Mapping):
+                    raise ValueError("control source has no active independent job")
+                if str(active.get("event_key") or "") != expected_event_key:
+                    raise ValueError("bound independent control source event is stale")
+                if str(active.get("trigger_type") or "").lower() not in {
+                    "interval",
+                    "check_all",
+                }:
+                    raise ValueError("bound independent control requires interval/check_all")
+                if str(active.get("target_task_id") or "") != target_id:
+                    raise ValueError("bound independent control target changed")
+                if active.get("target_hop_id") != target_hop_id:
+                    raise ValueError("bound independent control hop changed")
+                if is_independent_task(target):
+                    raise ValueError("bound independent control target must be a workflow task")
+                if str(target.get("status") or "").upper() != "BLOCKED":
+                    raise ValueError("bound periodic independent target is no longer blocked")
+                if target.get("active_hop_id") != target_hop_id:
+                    raise ValueError("independent control target hop is stale")
+
+                control = self._queue_control(
+                    target,
+                    action,
+                    role=role,
+                    reason=reason,
+                    confirmed=confirmed,
+                    origin="independent_agent",
+                    source_task_id=str(source.get("task_id") or ""),
+                    source_event_key=expected_event_key,
+                    external_command_id=command_id,
+                )
+                queued = self._save_unlocked(target_path, target)
+                self._catalog_saved_manifest_unlocked(queued)
+                self._record_external_command(source, command_id)
+                recorded = self._save_unlocked(source_path, source)
+                self._catalog_saved_manifest_unlocked(recorded)
+                return recorded, queued, dict(control)
 
     def record_independent_command(
         self,

@@ -29,7 +29,7 @@ class Decision:
 class Policy:
     allow_stable_seconds: float = 5.0
     post_allow_seconds: float = 5.0
-    response_stable_seconds: float = 1.0
+    response_stable_seconds: float = 5.0
     minimum_samples: int = 2
     timeout_seconds: float = 600.0
     reload_settle_seconds: float = 20.0
@@ -50,8 +50,20 @@ class Context:
     network_status: str | None = None
 
     @property
-    def active(self) -> bool:
-        return bool(getattr(self.snapshot, "stop_visible", False))
+    def transport_active(self) -> bool:
+        """Authoritative generation activity used for operational decisions.
+
+        response_activity_turn_id is intentionally excluded: it is DOM progress
+        evidence for audit/retry diagnostics, not proof that generation is live.
+        """
+        state = getattr(self.snapshot, "state", None)
+        state_value = str(getattr(state, "value", state) or "").lower()
+        return bool(
+            getattr(self.snapshot, "stop_visible", False)
+            or state_value == "responding"
+            or str(self.network_status or "").upper()
+            in {"IS_STREAMING", "IS_STOP_REQUESTED"}
+        )
 
     @property
     def permission_present(self) -> bool:
@@ -74,5 +86,5 @@ class Context:
         return bool(
             getattr(self.snapshot, "composer_present", False)
             and getattr(self.snapshot, "composer_editable", True)
-            and not self.active
+            and not self.transport_active
         )

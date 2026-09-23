@@ -429,3 +429,42 @@ def test_live_event_log_dedupes_unchanged_listen_and_ctrl_across_calls(tmp_path:
         ]
     finally:
         configure_live_event_log(old_log, enabled=old_enabled)
+
+
+def test_live_transcript_dedupes_same_message_but_keeps_partial_to_final_updates(tmp_path: Path):
+    old_log = live_event_log_path()
+    old_enabled = live_event_logging_enabled()
+    log = tmp_path / ".runtime" / "live-events.jsonl"
+    configure_live_event_log(log)
+    try:
+        common = {
+            "task_id": "task-transcript",
+            "team": "alpha",
+            "role": "alpha-dev",
+            "page_id": "page-1",
+            "page_url": "https://chatgpt.com/c/test",
+        }
+        partial = {
+            "author": "assistant",
+            "message_id": "answer-1",
+            "turn_id": "turn-1",
+            "text": "working",
+            "text_length": 7,
+            "complete": False,
+        }
+        append_live_event("TRANSCRIPT", "message", **common, values=partial)
+        append_live_event("TRANSCRIPT", "message", **common, values=partial)
+        append_live_event(
+            "TRANSCRIPT",
+            "message",
+            **common,
+            values={**partial, "text": "working done", "text_length": 12, "complete": True},
+        )
+        items = read_recent_live_events(log, task_id="task-transcript", role="DEV", limit=20)
+        transcript = [item for item in items if item["source"] == "TRANSCRIPT"]
+        assert len(transcript) == 2
+        assert transcript[0]["values"]["complete"] is False
+        assert transcript[1]["values"]["text"] == "working done"
+        assert transcript[1]["values"]["complete"] is True
+    finally:
+        configure_live_event_log(old_log, enabled=old_enabled)

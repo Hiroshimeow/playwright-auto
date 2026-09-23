@@ -16,8 +16,9 @@ def test_pytest_playwright_tmp_root_is_repo_owned():
     actual = Path(os.environ.get("TMPDIR", ".")).resolve()
 
     assert actual == expected
-    assert stat.S_IMODE(actual.stat().st_mode) == 0o700
-    assert not actual.is_relative_to(Path("/tmp"))
+    if os.name != "nt":
+        assert stat.S_IMODE(actual.stat().st_mode) == 0o700
+        assert not actual.is_relative_to(Path("/tmp"))
     assert actual != Path("/home/ayumi/Workspace/playwright-profile")
 
 

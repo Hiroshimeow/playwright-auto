@@ -75,6 +75,18 @@ class FakePage:
     def is_closed(self):
         return self.closed
 
+    async def evaluate(self, _script):
+        snap = self.snapshot_value
+        return {
+            "url": self.url,
+            "title": "",
+            "role": snap.page_role,
+            "page_id": snap.page_id,
+            "binding_id": getattr(snap, "page_binding_id", None),
+            "task_id": snap.page_task_id,
+            "team": snap.page_team,
+        }
+
     async def goto(self, url, **_kwargs):
         self.goto_calls.append(url)
         error = getattr(self, "goto_error", None)
@@ -143,8 +155,12 @@ class FakeClient:
             raise error
         return self.page.snapshot_value
 
-    async def restore_identity(self, *, page_id, role, task_id, team):
-        self.binding = SimpleNamespace(page_id=page_id, role=role)
+    async def restore_identity(self, *, page_id, role, task_id, team, binding_id=None):
+        self.binding = SimpleNamespace(
+            page_id=page_id,
+            role=role,
+            binding_id=binding_id,
+        )
         self.page.snapshot_value.page_id = page_id
         self.page.snapshot_value.page_role = role
         self.page.snapshot_value.page_task_id = task_id
@@ -195,7 +211,7 @@ class FakeClient:
         if discard_attachments:
             self.page.snapshot_value.attachment_markers = ()
 
-    async def bind_task_identity(self, task_id, team):
+    async def bind_task_identity(self, task_id, team, *, binding_id=None):
         self.bind_calls.append((task_id, team))
         self.events.append("bind")
         error = getattr(self.page, "bind_error", None)
@@ -203,7 +219,13 @@ class FakeClient:
             raise error
         self.page.snapshot_value.page_task_id = task_id
         self.page.snapshot_value.page_team = team
-        return {"task_id": task_id, "team": team}
+        if self.binding is not None:
+            self.binding = SimpleNamespace(
+                page_id=self.binding.page_id,
+                role=self.binding.role,
+                binding_id=binding_id,
+            )
+        return {"task_id": task_id, "team": team, "binding_id": binding_id}
 
     async def prepare_task(self, task_id, *, force_new_chat=False):
         self.prepare_calls.append((task_id, force_new_chat))
@@ -1082,6 +1104,9 @@ def test_branch_from_same_anchor_is_independent_of_closed_source_and_repeats_fre
             assistant_message_id=ASSISTANT_MESSAGE_ID,
         )
     )
+    second_conversation_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+    context.branch_backend_conversation_id = second_conversation_id
+    context.branch_canonical_url = f"https://chatgpt.com/c/{second_conversation_id}"
     second = asyncio.run(
         actions.branch_from_anchor(
             manifest(team="team-b", task_id="task-b", physical_role="team-b-review"),
@@ -1264,19 +1289,17 @@ def test_automatic_refresh_uses_reload_only_and_never_retry_control(tmp_path, mo
             events.append("ownership")
             return SimpleNamespace()
 
+        async def refresh(self, *, timeout_ms):
+            assert timeout_ms > 0
+            events.append("reload")
+
     async def fake_delay(target, action, multiplier):
         assert target is page
         assert action == "refresh"
         assert multiplier > 0
         events.append("delay")
 
-    async def fake_refresh(target, *, timeout_ms):
-        assert target is page
-        assert timeout_ms > 0
-        events.append("reload")
-
     monkeypatch.setattr(actions_module, "action_delay", fake_delay)
-    monkeypatch.setattr(actions_module, "refresh_page", fake_refresh)
     actions = CDPATabActions(FakeContext(), config)
     acquired = AcquiredRole(
         client=Client(),
@@ -1309,16 +1332,14 @@ def test_recovery_refresh_can_reload_exact_bound_page_after_transient_precheck_f
                 raise RuntimeError("Page.evaluate: Target crashed")
             return page.snapshot_value
 
+        async def refresh(self, *, timeout_ms):
+            assert timeout_ms > 0
+            events.append("reload")
+
     async def fake_delay(*_args, **_kwargs):
         events.append("delay")
 
-    async def fake_refresh(target, *, timeout_ms):
-        assert target is page
-        assert timeout_ms > 0
-        events.append("reload")
-
     monkeypatch.setattr(actions_module, "action_delay", fake_delay)
-    monkeypatch.setattr(actions_module, "refresh_page", fake_refresh)
     actions = CDPATabActions(FakeContext([page]), config)
     acquired = AcquiredRole(
         client=Client(),
@@ -1359,14 +1380,14 @@ def test_recovery_refresh_known_bad_observation_skips_precheck_with_one_budget(
             ownership_calls += 1
             return page.snapshot_value
 
+        async def refresh(self, *, timeout_ms):
+            assert timeout_ms > 0
+            await asyncio.Event().wait()
+
     async def fake_delay(*_args, **_kwargs):
         return None
 
-    async def hanging_refresh(*_args, **_kwargs):
-        await asyncio.Event().wait()
-
     monkeypatch.setattr(actions_module, "action_delay", fake_delay)
-    monkeypatch.setattr(actions_module, "refresh_page", hanging_refresh)
     actions = CDPATabActions(FakeContext([page]), config)
     acquired = AcquiredRole(
         client=Client(),
@@ -1598,7 +1619,7 @@ def test_terminal_team_reuse_rebinds_without_new_chat(tmp_path, monkeypatch):
 
 
 
-def test_exact_role_team_task_reconciles_despite_stale_recorded_page_id(tmp_path, monkeypatch):
+def test_exact_role_team_task_does_not_override_stale_durable_page_identity(tmp_path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     pages = [
         FakePage(page_id="terminal", role="PLAN", team="old-newest"),
@@ -1609,7 +1630,7 @@ def test_exact_role_team_task_reconciles_despite_stale_recorded_page_id(tmp_path
 
     matches = asyncio.run(actions._matching_clients(manifest(page_id="stale-page"), "PLAN"))
 
-    assert [snapshot.page_id for _client, snapshot in matches] == ["current"]
+    assert matches == []
 
 
 

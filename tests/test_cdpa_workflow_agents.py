@@ -152,9 +152,8 @@ def test_worker_custom_hop_uses_snapshotted_prompt_and_dynamic_routes(tmp_path: 
     asyncio.run(worker._pre_send(state, hop, FakeActions()))
 
     assert "CUSTOM_WORKER_PROMPT_MARKER" in hop["prompt"]
-    envelope_text = hop["prompt"].split("TURN_CONTEXT\n", 1)[1]
-    envelope, _ = json.JSONDecoder().raw_decode(envelope_text)
-    assert envelope["allowed-routes"] == ["PLAN", "REVIEW", route_key, "PAUSE", "DONE"]
+    assert "TURN_CONTEXT" not in hop["prompt"]
+    assert f'"route":"PLAN|REVIEW|{route_key}"' in hop["prompt"]
     assert "PAUSE" not in state["roles"]
 
     decision = parse_route_response(

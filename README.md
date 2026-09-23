@@ -1,321 +1,279 @@
-# playwright-auto
+# Playwright Auto / CDPA
 
-Persistent Chromium automation over local CDP, with a durable CDPA workflow runtime and an optional interactive noVNC browser viewer.
+CDPA is a durable multi-agent workflow runner built on ChatGPT browser sessions. The control plane stores task state, exact Send provenance, role ownership, reports, dependencies, and browser-endpoint placement.
 
-## Runtime layout
+## Runtime
 
-| Surface | Default | Purpose |
+Default local services:
+
+| Service | Address | Purpose |
 |---|---|---|
-| Chromium CDP | `127.0.0.1:9222` | Automation transport; loopback only |
-| noVNC viewer | `0.0.0.0:9223` | Interactive view of the Xvfb desktop |
-| noVNC WebSocket | `127.0.0.1:9226` | Internal websockify bridge |
-| VNC backend | `127.0.0.1:5901` | Internal x11vnc endpoint |
-| CDPA dashboard | `0.0.0.0:9224` | Kanban, task controls, reports, runtime state |
-| CDPA API | `127.0.0.1:9225` | Projection reads and durable command mailbox |
-| Virtual display | `:100` | Chromium GUI display |
+| Dashboard | `http://127.0.0.1:9224` | Kanban, task detail, controls |
+| API | `http://127.0.0.1:9225` | Durable task/command API |
+| Browser endpoints | registry-managed | Shared ChatGPT execution capacity |
 
-The browser viewer and automation path are independent. CDPA/Playwright connects to CDP `9222`; noVNC only exposes the pixels, keyboard, and mouse of the Xvfb display.
+Start or reopen the local runtime:
 
-Do not call `browser.close()` on a browser obtained through `connect_over_cdp`; it closes the persistent Chromium process. Disconnect the Playwright client instead.
-
-## Linux prerequisites
-
-Required commands:
-
-- Python 3.11+
-- `uv`
-- Node.js + PM2
-- Chromium/Chrome
-- Xvfb + `xdpyinfo`
-- `x11vnc`
-- `nginx`
-- `curl` and `tar`
-
-Optional overrides:
-
-```bash
-export CHROMIUM_BIN=/path/to/chromium
-export XVFB_BIN=/path/to/Xvfb
-export X11VNC_BIN=/path/to/x11vnc
-export NGINX_BIN=/path/to/nginx
-export PLAYWRIGHT_PROFILE_DIR=/path/to/persistent-profile
-export PLAYWRIGHT_DISPLAY=:100
-export PLAYWRIGHT_VIEWER_PORT=9223
+```powershell
+cdpa start
+cdpa ui
 ```
 
-The default Chromium profile is `$HOME/Workspace/playwright-profile`. It is intentionally outside the repository so repository cleanup does not remove the logged-in browser profile.
+The browser endpoint registry is the source of truth for CDP addresses, capacity, rate-limit scope, and `temporary_default`.
 
-## Linux setup and start
+## Create a task
 
-Install Python dependencies and the pinned noVNC runtime:
+The normal command is intentionally small:
 
-```bash
-uv sync
-./scripts/install-novnc.sh
+```powershell
+cdpa "Repository/worktree: E:\git-project\my-project. Implement X. Preserve dirty work. Verify Y."
 ```
 
-`install-novnc.sh` installs noVNC `v1.7.0` and websockify `0.13.0` under `.runtime/`; nothing is installed system-wide by that script.
+For most tasks, stop there. CDPA allocates the team identity, chooses browser capacity, starts Fresh context, and persists the workflow.
 
-Start the services:
+The task text should contain:
 
-```bash
-pm2 start ecosystem.config.cjs
-pm2 save
+- target repository/worktree;
+- required outcome;
+- constraints that materially affect execution;
+- concrete acceptance evidence.
+
+### Optional overrides
+
+Use flags only when they represent real requirements:
+
+```powershell
+cdpa "<task>" --team my-feature
+cdpa "<task>" --depends-on <parent-task-id>
+cdpa "<task>" --browser 9212
+cdpa "<task>" --upload design.md
+cdpa "<task>" --temp
 ```
 
-Expected services:
+`--browser` pins the entire workflow team to that endpoint/account. It is not a per-role preference.
 
-```text
-playwright-display
-playwright-vnc
-playwright-novnc
-playwright-browser
-playwright-role-ui
-playwright-dashboard-api
-playwright-dashboard
-playwright-cdpa-worker
+`--temp` forces Temporary Chat. Normally it is unnecessary when the selected endpoint already has `temporary_default=true`.
+
+Bootstrap selection is temporarily disabled. New workflow tasks always use Fresh context.
+
+### Dependencies
+
+```powershell
+cdpa "Build parent" --team parent
+cdpa "Build child" --team child --depends-on <parent-task-id>
 ```
 
-Check them with:
+Dependency waits consume no browser slot.
 
-```bash
-pm2 status
-curl http://127.0.0.1:9222/json/version
-curl -I http://127.0.0.1:9223/
-curl http://127.0.0.1:9224/health
-uv run python scripts/smoke.py
-```
+### Resume
 
-The viewer path is:
+Resume the one nonterminal durable task for an exact team:
 
-```text
-Xvfb :100
-   ↓
-x11vnc 127.0.0.1:5901
-   ↓
-websockify 127.0.0.1:9226
-   ↓
-nginx/noVNC :9223
-   ↓
-browser viewer
-```
-
-The VNC and WebSocket backends stay on loopback. Port `9223` is the network-facing viewer. Keep it on a trusted network or put an appropriate access layer in front of it.
-
-## Persistent Chromium behavior
-
-`scripts/browser-gui.sh` starts Chromium on the Xvfb display with CDP bound to loopback. Chromium starts at `about:blank`; after CDP becomes ready the launcher opens the configured default URL through the DevTools HTTP endpoint. This avoids a native X11/VNC keyboard-input issue seen when ChatGPT is passed directly as Chromium's startup URL.
-
-Default URL:
-
-```bash
-export PLAYWRIGHT_DEFAULT_URL=https://chatgpt.com/
-```
-
-The persistent profile survives PM2/browser restarts. Restarting the viewer does not restart Chromium.
-
-## CDPA architecture
-
-CDPA is a single-operator durable workflow runtime around real ChatGPT browser tabs.
-
-```text
-Dashboard :9224
-    ↓ /api
-Loopback API :9225
-    ↓ durable command mailbox / SQLite projections
-CDPA worker
-    ↓
-TaskStore + .plan manifests/reports
-    ↓
-Persistent Chromium via CDP :9222
-```
-
-Important ownership rule: **the worker is the only process that mutates TaskStore workflow state or controls ChatGPT tabs.** The frontend/API only read projections and enqueue commands.
-
-Normal workflow roles are `PLAN`, `DEV`, `REVIEW`, `TEST`, and `AUDIT`. PLAN is the only normal role allowed to route a task to `DONE`.
-
-A task preserves:
-
-- task/team identity;
-- active hop and role;
-- exact request ID;
-- accepted-send receipt and user-message identity;
-- exact conversation URL and physical page binding;
-- reports and route history;
-- dependency/queue state;
-- operator-control provenance.
-
-Accepted sends are never intentionally replayed during recovery.
-
-### Operational role loop
-
-Normal workflow execution intentionally uses one short controller path:
-
-```text
-durable Send accepted once
-→ observe the exact owned page/conversation through DOM + passive Listen signals
-→ handle the operational blocker, if any
-→ accept the latest stable valid assistant result
-→ validate report + route
-→ route the next role
-```
-
-The accepted Send receipt is the non-replay boundary; after acceptance it is not a lineage/provenance gate for later conversation turns. Operator steering and ChatGPT Retry may legitimately change the current branch, so the controller evaluates the current stable result in the exact owned task/team/role conversation and never auto-clicks Retry or Regenerate.
-
-Full-conversation/history retrieval is optional information/recovery lookup only. It may enrich diagnostics or recovery but must not decide normal Send, blocker handling, result admission, Resume, or routing. If the page makes no operational progress for `response.refresh_after_seconds` (default `600` seconds), the bounded recovery action is F5/reload, never replaying an accepted Send; manual composer text or attachments suppress destructive recovery.
-
-Dashboard Live audit exposes the same operating path as four telemetry sources: `DOM` (semantic page changes), `LISTEN` (semantic transport/response signals), `CTRL` (controller decisions/transitions), and `ACTION` (browser/control actions).
-
-## Start CDPA directly
-
-```bash
-uv run playwright-dashboard-api --repository . --host 127.0.0.1 --port 9225 --config cdpa.yaml
-uv run playwright-dashboard --host 0.0.0.0 --port 9224 --config cdpa.yaml
-uv run cdpa-worker --repository . --config cdpa.yaml
-```
-
-The PM2 configuration starts the same three services for the repository runtime.
-
-Submit a task:
-
-```bash
-cdpa "Implement and verify the requested behavior"
-```
-
-Examples:
-
-```bash
-cdpa "Build parent" --team alpha
-cdpa "Build child" --team beta --depends-on <parent-task-id>
-cdpa "Continue with the same team context" --reuse-team alpha
-cdpa "Analyze these sources" --upload design.md
+```powershell
 cdpa --team <exact-existing-team>
 ```
 
-The dashboard provides durable controls such as Pause, Resume, Retry hop, Stop, Restart role, Open tab, New Chat, Route PLAN, Clear Team, and Change Goal. Controls are applied through the worker state machine rather than by direct frontend browser actions.
+This preserves task ID, endpoint, active hop, request ledger, conversation ownership, and report history.
 
-## Independent agents
+There is no public `--reuse-team` flow.
 
-Independent agents use the same manifest/task runtime but have one `AGENT` role instead of PLAN/DEV/REVIEW routing.
+## Browser placement
 
-Built-in agents include Maintainers and Monitor. The runtime supports trigger-driven jobs, run-now jobs, bounded continuation cycles, repair creation, and exact-target controls. Recovery controls carry source task/event provenance and are rejected when the canonical event is stale.
+### One workflow team, one endpoint
 
-Independent agents can also be created and configured from the CLI, which is the preferred control surface for another agent or automation when the intended team scope is already known. Team dependencies are runtime trigger filters, not prompt hints: a team-driven event outside `trigger_settings.teams` is rejected before the independent job activates, avoiding a browser/model request that would only discover “no work” after reading the prompt. An empty team list means unrestricted team scope for team-driven triggers, so specify dependencies whenever an agent is intended to serve only particular teams.
+Normal pool placement works in two stages:
 
-```bash
-# Create a Recovery agent scoped to two exact workflow teams.
-cdpa independent create \
-  --name "Scoped recovery" \
-  --system-prompt "Recover configured teams." \
-  --trigger recovery \
-  --dependency-team team-a \
-  --dependency-team team-b
+1. If no `--browser` is supplied, the pool chooses a usable endpoint once at first placement.
+2. That endpoint becomes the durable home of the whole team.
 
-# Replace the dependency scope while preserving the current trigger settings.
-cdpa independent config <independent-task-id> \
-  --dependency-team team-x \
-  --dependency-team team-y
+PLAN, DEV, REVIEW, TEST, and AUDIT do not independently move between browser endpoints.
 
-# Intentionally restore unrestricted team scope.
-cdpa independent config <independent-task-id> --clear-dependency-teams
+If the team endpoint later becomes full, cooling down, or unavailable, the task waits instead of moving another role to a different account/profile.
+
+An explicit `--browser` pins the team immediately.
+
+### Temporary defaults
+
+Endpoint configuration can set:
+
+```json
+{
+  "temporary_default": true
+}
 ```
 
-Run `cdpa independent create --help` or `cdpa independent config --help` for the complete trigger/configuration options.
+If an unpinned task is first placed on that endpoint, the task inherits Temporary mode unless the request explicitly forced another supported mode.
 
-A recurring independent agent returns to `WAITING / waiting_trigger` after its job. Operator Pause/Stop/Restart/New Chat/Clear Team remains authoritative.
+Temporary workflows:
 
-## Workflow agents
+- use Fresh context;
+- do not use bootstrap;
+- never perform automatic F5/reload recovery;
+- preserve the exact live temporary document or wait for recovery/operator action;
+- are not grouped into persistent ChatGPT Projects.
 
-Workflow-role definitions are configurable through the workflow-agent catalog. System routes remain stable route keys; custom workflow agents receive stable custom route keys and may be created, renamed, updated, or deleted through the supported control surface.
+## Ownership model
 
-## Reports and recovery
+Each workflow role receives an immutable `binding_id` when the task is created.
 
-Role responses use a file-backed report contract under `.plan/<team>/...`. Recovery distinguishes:
+Durable execution identity is centered on:
 
-- pre-acceptance preparation from an accepted Send boundary;
-- transport activity from a stable final assistant response;
-- response validation from report materialization;
-- operator intent from automatic recovery;
-- immediate release from durable root-cause repair.
-
-`PROBLEM.md` is the unresolved root-cause backlog. Once a repair/task is created from a problem and completed, remove that problem entry; durable operational rules belong in `LEARNING.md` or `.learning/`.
-
-## Dashboard authentication
-
-The public host guard reads the dashboard password from repository `.env`:
-
-```dotenv
-CDPA_DASHBOARD_PASSWORD=change-me
+```text
+team endpoint
+    +
+exact page_id
+    +
+role binding_id
+    +
+task_id / physical_role audit metadata
 ```
 
-The loopback API remains on `127.0.0.1:9225`. Public requests to the dashboard require the password session; the dashboard frontend proxies `/api` to the loopback API after authentication.
+Normal Send and Resume inspect only the exact role candidate. They do not full-scan every ChatGPT tab on the endpoint.
 
-## Browser roles
+This is deliberate: an unrelated ordinary ChatGPT tab may be stale or slow without affecting another task.
 
-List currently open ChatGPT role tabs:
+Strict global tab inspection is reserved for destructive cleanup such as Clear Team, where uncertainty must fail closed.
 
-```bash
-uv run playwright-roles --list
+## Exactly-once Send
+
+CDPA preserves the accepted-Send boundary with a durable request ledger.
+
+Conceptually:
+
+```text
+exact role page
+  -> ownership check
+  -> composer / attachment / transcript check
+  -> durable request
+  -> exact draft
+  -> Send once
+  -> accepted user-message identity
+  -> response
+  -> route/report
 ```
 
-Assign roles:
+A timeout on an unrelated page is not Send ambiguity.
 
-```bash
-uv run playwright-roles DEV REVIEW --tabs 1,2
+If an accepted Send is actually ambiguous, recovery must reconcile durable/backend evidence rather than replay the prompt.
+
+## Context
+
+New workflow tasks and newly allocated workflow roles use Fresh context.
+
+Bootstrap donor branching, bootstrap source URLs, and bootstrap prewarm are temporarily disabled for normal task execution. Historical bootstrap metadata may remain readable so old durable state is not corrupted.
+
+The same role may continue its own durable conversation during the same task.
+
+## ChatGPT Projects
+
+Persistent workflow conversations are grouped automatically by execution repository.
+
+For each endpoint/account CDPA:
+
+1. looks for an existing Project with the repository name;
+2. creates it when absent;
+3. attaches the conversation after accepted Send.
+
+Project grouping is organizational metadata and never blocks substantive execution.
+
+Temporary chats are excluded.
+
+## Controls
+
+Use the dashboard/API controls instead of editing runtime manifests:
+
+- Pause
+- Resume
+- Retry hop when retryable
+- Restart role
+- New chat
+- Open tab
+- Route PLAN
+- Change goal
+- Stop
+- Clear Team
+
+Controls are processed by the durable worker state machine.
+
+## Workflow
+
+The default localized workflow is:
+
+```text
+PLAN -> DEV -> REVIEW -> PLAN -> DONE
 ```
 
-`playwright-role-ui` also provides the in-page role badge/control. Role ownership includes task/team/page identity so a runner fails closed if the physical tab or conversation no longer matches its lease.
+TEST or AUDIT are added only when required by the task.
 
-## Windows usage
+Reports are file-backed under:
 
-The Linux Xvfb/noVNC/PM2 viewer stack is not required on Windows. If Chrome/Chromium is already running with loopback CDP `9222`, install the CLI globally:
+```text
+.plan/<team>/...
+```
+
+PLAN owns final closure and the bounded learning pass.
+
+## Windows
+
+Install the CLI if needed:
 
 ```powershell
 uv tool install --force "git+https://github.com/Hiroshimeow/playwright-auto.git@develop"
 uv tool update-shell
 ```
 
-Then, from the target repository:
+From the control repository, the local wrapper uses the local source/runtime:
 
 ```powershell
-cd E:\python_project\target-repository
-cdpa
+cd E:\git-project\playwright-auto-multicdp
+cdpa "Repository/worktree: E:\git-project\target. Implement and verify the requested behavior."
 ```
 
-Submit work from another terminal:
+`--repository` means the task target repository only. It is not the CDPA control repository.
+
+For routine task creation, prefer putting the repository path in the task text and omit `--repository`.
+
+## Direct runtime commands
+
+For development/debugging of the control plane:
 
 ```powershell
-cdpa "Implement and verify the requested behavior"
+uv run playwright-dashboard-api --repository . --host 127.0.0.1 --port 9225 --config cdpa.yaml
+uv run cdpa-worker --repository . --config cdpa.yaml
 ```
 
-Useful commands:
-
-```powershell
-cdpa start
-cdpa ui
-cdpa --team <exact-team-name>
-cdpa start --repository E:\python_project\target-repository
-```
-
-`Ctrl+C` stops the local CDPA frontend/API/worker started by the CLI; it does not close the existing browser on `9222`.
-
-## Headless mode
-
-Do not run GUI and headless Chromium simultaneously with the same profile.
-
-```bash
-pm2 stop playwright-browser playwright-vnc playwright-novnc playwright-display
-uv run playwright-auto start --headless
-uv run playwright-auto status
-uv run playwright-auto stop
-```
+Do not launch duplicate API/worker instances on the same runtime database.
 
 ## Development verification
 
-```bash
-uv run python -m compileall -q src tests
-uv run pytest -q
+At minimum after control-plane changes:
+
+```powershell
+python -m py_compile <changed Python modules>
+python -m pytest -q <focused tests>
 git diff --check
 ```
 
-For browser/runtime changes, also verify the real persistent CDP instance and exact task/hop/page ownership before claiming acceptance.
+For ownership/placement changes, include regressions proving:
+
+- unrelated tabs cannot block normal Send/Resume;
+- destructive cleanup remains strict;
+- one team remains on one endpoint;
+- unpinned first placement becomes durably pinned;
+- `temporary_default` is inherited at first placement;
+- Temporary workflows do not refresh;
+- exact accepted Send is never replayed;
+- Project auto-grouping reuses or creates the endpoint-local Project and attaches the conversation.
+
+## Design rule
+
+Prefer fewer gates.
+
+A gate belongs on the smallest identity/boundary whose failure it protects:
+
+- exact role ownership -> exact role;
+- Send provenance -> exact request;
+- endpoint capacity -> team endpoint;
+- destructive cleanup -> global strict scan.
+
+Do not make unrelated tabs, unrelated roles, or another endpoint prerequisites for ordinary work.

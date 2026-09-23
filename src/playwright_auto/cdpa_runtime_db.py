@@ -29,6 +29,7 @@ COMMAND_KINDS = frozenset(
         "independent_reset",
         "independent_settings",
         "independent_activate_agent",
+        "independent_bind_target",
         "independent_create_repair",
         "independent_task_control",
         "resume_team",

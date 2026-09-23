@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "replay_id": "replay_v4",
+  "codex_version": "codex-cli 0.154.0",
+  "codex_user_config_sha256": "7a5ce74a1f62935734a687a396a7a51abc8ef9e7ca254a5de9a7bce8a4885c52",
+  "flags": [
+    "--ephemeral",
+    "--ignore-rules",
+    "--sandbox read-only",
+    "--skip-git-repo-check",
+    "-C <isolated-empty-temp-dir>",
+    "--json"
+  ],
+  "user_config_purpose": "authentication/default model only; project rules ignored; accepted traces contain no tool invocation",
+  "tool_policy": "reject any item.completed whose item.type is not agent_message",
+  "proposer_meta_count": 16,
+  "accepted_trace_count": 24,
+  "observed_tool_invocations": 0,
+  "transport_warning_events": 0,
+  "harness_script_sha256": {
+    "runner": "1fb97757ce6eac374188ed542892af4c4e57f0adf1c0e039e0560c70f371befe",
+    "case_helper": "57f33c62b45ca451da186968a2411bbaeea27ed072150edf32f8ad9e87571ed6",
+    "finalizer": "6e24a4bf45de6defbefbb8e3cdeea62ab841fcc70df5f1ae58d8c42aec2b70f5"
+  }
+}

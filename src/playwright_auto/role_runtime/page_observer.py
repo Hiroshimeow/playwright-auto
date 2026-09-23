@@ -300,10 +300,17 @@ class PageObserver:
         if value.get("mixed_conversations") or (candidate and current and not current.startswith("WEB:") and candidate != current):
             self.metrics["other_conversation"] += 1
             return
-        if value.get("status"):
-            self.status = str(value["status"])
+        explicit_status = str(value.get("status") or "")
+        if explicit_status:
+            self.status = explicit_status
         if value.get("response"):
+            # listen.extract() only emits `response` for a terminal assistant
+            # message (end_turn / finished_successfully). Some ChatGPT streams do
+            # not carry a separate COMPLETE status frame, so leaving the request-
+            # start IS_STREAMING marker behind would wedge the controller forever.
             self.response = dict(value["response"])
+            if self.status in {None, "", "IS_STREAMING"}:
+                self.status = "COMPLETE"
         for message in value.get("messages") or ():
             if isinstance(message, Mapping):
                 message_id = message.get("id")

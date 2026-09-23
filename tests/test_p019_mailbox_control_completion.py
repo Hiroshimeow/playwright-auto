@@ -145,6 +145,148 @@ def test_waiting_stop_mailbox_tracks_durable_control_and_restart_replay(
     assert calls == {"constructed": 1, "locate": 1, "stop": 1, "transport": 0}
 
 
+def test_stop_supersedes_stale_requested_controls_without_reawakening_work(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config, store, task, worker = _standalone_task(
+        tmp_path, task_id="p019-stop-supersedes-stale"
+    )
+    path = Path(task["manifest_path"])
+
+    def make_blocked_with_accepted_receipt(current):
+        current["status"] = "BLOCKED"
+        current["kanban_column"] = "BLOCKED"
+        current["block_code"] = "route_validation_exhausted"
+        current["block_retryable"] = True
+        current["block_reason"] = "historical blocked workflow"
+        current["active_action"] = "blocked"
+        hop = next(
+            item
+            for item in current["hops"]
+            if item["hop_id"] == current["active_hop_id"]
+        )
+        hop["receipt"] = {
+            "accepted": True,
+            "accepted_via": "user_message_identity",
+            "user_message_id": "historical-accepted-user",
+        }
+        return current
+
+    blocked = store.update(path, make_blocked_with_accepted_receipt)
+    worker.hydrate_runtime()
+    historical_hop = next(
+        item
+        for item in blocked["hops"]
+        if item["hop_id"] == blocked["active_hop_id"]
+    )
+    historical_request_id = historical_hop["request_id"]
+    historical_receipt = dict(historical_hop["receipt"])
+    calls = _guard(monkeypatch)
+
+    _enqueue_control(
+        worker,
+        blocked,
+        command_id="cmd-p019-stale-resume",
+        action="resume",
+    )
+    assert worker.dispatch_command_once()["status"] == "running"
+    worker.runtime_db.require_command_recovery(
+        "cmd-p019-stale-resume",
+        error="Resume cannot run because the worker heartbeat is stale.",
+        result={
+            "outcome": "recovery_required",
+            "action": "none",
+            "reason_code": "stale_worker",
+            "reason": "Resume cannot run because the worker heartbeat is stale.",
+        },
+    )
+
+    current = store.load(path)
+    _enqueue_control(
+        worker,
+        current,
+        command_id="cmd-p019-stale-restart",
+        action="restart_role",
+    )
+    assert worker.dispatch_command_once()["status"] == "running"
+
+    current = store.load(path)
+    _enqueue_control(
+        worker,
+        current,
+        command_id="cmd-p019-terminal-stop",
+        action="stop",
+    )
+    assert worker.dispatch_command_once()["status"] == "running"
+
+    queued = store.load(path)
+    assert [item["action"] for item in queued["controls"]] == [
+        "resume",
+        "restart_role",
+        "stop",
+    ]
+    assert [item["status"] for item in queued["controls"]] == [
+        "requested",
+        "requested",
+        "requested",
+    ]
+
+    stopped = asyncio.run(
+        worker.advance(
+            path,
+            SimpleNamespace(pages=[]),
+            scheduling_tasks=store.discover(),
+        )
+    )
+
+    assert stopped["status"] == "STOPPED"
+    assert stopped["terminal_state"] == "STOPPED"
+    assert stopped["active_role"] is None
+    assert stopped["active_hop_id"] is None
+    assert [item["status"] for item in stopped["controls"]] == [
+        "recovery_required",
+        "rejected",
+        "applied",
+    ]
+    assert stopped["controls"][0]["result"]["reason_code"] == "stale_worker"
+    assert stopped["controls"][1]["result"]["reason_code"] == "superseded_by_stop"
+    assert stopped["controls"][2]["result"]["stopped_response"] is False
+
+    preserved_hop = next(
+        item for item in stopped["hops"] if item["hop_id"] == blocked["active_hop_id"]
+    )
+    assert preserved_hop["request_id"] == historical_request_id
+    assert preserved_hop["receipt"] == historical_receipt
+
+    resume_command = worker.runtime_db.get_command("cmd-p019-stale-resume")
+    restart_command = worker.runtime_db.get_command("cmd-p019-stale-restart")
+    stop_command = worker.runtime_db.get_command("cmd-p019-terminal-stop")
+    assert resume_command["status"] == "recovery_required"
+    assert resume_command["result"]["reason_code"] == "stale_worker"
+    assert restart_command["status"] == "failed"
+    assert restart_command["result"]["reason_code"] == "superseded_by_stop"
+    assert stop_command["status"] == "applied"
+    assert calls == {
+        "constructed": 1,
+        "locate": 1,
+        "stop": 1,
+        "transport": 0,
+    }
+
+    assert worker.runtime_db.requeue_running_commands() == 0
+    restarted = CDPAWorker(config, store=store)
+    restarted.hydrate_runtime()
+    assert restarted.dispatch_command_once() is None
+    replayed = store.load(path)
+    assert replayed["status"] == "STOPPED"
+    assert [item["status"] for item in replayed["controls"]] == [
+        "recovery_required",
+        "rejected",
+        "applied",
+    ]
+
+
 def test_standalone_pause_mailbox_reports_applied_and_restart_replay_is_idempotent(
     tmp_path: Path,
     monkeypatch,

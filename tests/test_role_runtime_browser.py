@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from playwright_auto.chatgpt import ChatGPTPage, PageBinding, SendReceipt, MessageBaseline, prompt_digest
-from playwright_auto.role_runtime import Action, RoleController
+from playwright_auto.role_runtime import Action, Decision, RoleController
 from test_chatgpt_mcp_permission import _with_page
 from test_operational_contract import snapshot
 
@@ -25,6 +25,9 @@ def environment(client):
     worker = SimpleNamespace(
         _validate_response_candidate=lambda *_: None,
         _queue_format_repair=lambda _state, _hop, _response, error: _state.update(repair=str(error)),
+        _capture_passive_remote_report_if_available=lambda *_: None,
+        _record_response=lambda _state, _hop, response: _hop.update(response=response.text, state="responded"),
+        _release_stream_status_slot=lambda *_: None,
     )
     acquired = SimpleNamespace(client=client, page_id="page-1")
     return state, hop, worker, acquired
@@ -133,3 +136,46 @@ def test_retry_repair_goes_through_binding_and_real_send_without_retry_click(mon
           ">Send</button>
         </form></main>
     """, run))
+
+
+
+def test_temporary_workflow_never_executes_automatic_refresh(monkeypatch):
+    class Client:
+        refreshed = False
+
+        async def install_page_observer(self):
+            return None
+
+        def page_observation(self):
+            return {}
+
+        async def refresh(self):
+            self.refreshed = True
+            raise AssertionError("Temporary Chat must never auto-refresh")
+
+    client = Client()
+    state, hop, worker, acquired = environment(client)
+    state["conversation_mode"] = "temporary"
+    controller = RoleController()
+    monkeypatch.setattr(
+        controller,
+        "decide",
+        lambda *_args, **_kwargs: Decision(Action.REFRESH, "response_timeout_recheck"),
+    )
+
+    result = asyncio.run(
+        controller.run(
+            worker,
+            state,
+            hop,
+            acquired,
+            None,
+            snapshot=snapshot(),
+            wait_ms=0,
+        )
+    )
+
+    assert result.action is Action.WAIT
+    assert result.reason == "temporary_no_refresh:response_timeout_recheck"
+    assert client.refreshed is False
+    assert hop["wait"]["timeout_refreshed"] is True

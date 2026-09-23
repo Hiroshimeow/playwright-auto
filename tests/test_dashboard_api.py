@@ -127,7 +127,7 @@ def test_api_module_has_no_taskstore_worker_or_browser_imports():
     )
 
 
-def test_bootstrap_api_filters_anchor_ids_and_create_payload_is_optional(tmp_path: Path):
+def test_bootstrap_catalog_is_read_only_for_new_tasks(tmp_path: Path):
     _config, db, server, thread = start_api(tmp_path)
     catalog = BootstrapCatalog(tmp_path)
     base = {
@@ -143,105 +143,44 @@ def test_bootstrap_api_filters_anchor_ids_and_create_payload_is_optional(tmp_pat
         "source_fingerprints": {},
     }
     catalog.upsert({**base, "bootstrap_id": "general-team-bootstrap", "enabled": True})
-    catalog.upsert(
-        {
-            **base,
-            "bootstrap_id": "disabled-bootstrap",
-            "name": "Disabled",
-            "conversation_id": "33333333-3333-4333-8333-333333333333",
-            "terminal_assistant_message_id": "44444444-4444-4444-8444-444444444444",
-            "enabled": False,
-        }
-    )
     try:
         status, _headers, body = request(server, "GET", "/api/bootstraps")
         assert status == 200
-        payload = json.loads(body)
-        assert payload == {
-            "items": [
-                {
-                    "bootstrap_id": "general-team-bootstrap",
-                    "name": "General Team Bootstrap",
-                    "description": "Reusable task-neutral context",
-                    "tags": ["general"],
-                }
-            ],
-            "default_id": "general-team-bootstrap",
-        }
-        serialized = body.decode()
-        assert base["conversation_id"] not in serialized
-        assert base["terminal_assistant_message_id"] not in serialized
+        assert json.loads(body)["items"][0]["bootstrap_id"] == "general-team-bootstrap"
+        assert base["conversation_id"] not in body.decode()
 
-        common = {"task": "bootstrap payload", "repository": str(tmp_path)}
+        common = {"task": "fresh task", "repository": str(tmp_path)}
         status, _headers, data = request(
-            server,
-            "POST",
-            "/api/tasks",
-            body=common,
-            headers={"Idempotency-Key": "default-bootstrap-payload"},
+            server, "POST", "/api/tasks", body=common,
+            headers={"Idempotency-Key": "fresh-default"},
         )
         assert status == 202
         command = db.get_command(json.loads(data)["command_id"])
-        assert command["payload"]["bootstrap_id"] == "general-team-bootstrap"
+        assert command["payload"]["bootstrap_id"] is None
+        assert command["payload"]["context_policy"] == "fresh"
 
-        status, _headers, data = request(
-            server,
-            "POST",
-            "/api/tasks",
-            body={**common, "task": "named payload", "bootstrap_id": "general-team-bootstrap"},
-            headers={"Idempotency-Key": "bootstrap-payload"},
+        status, _headers, _data = request(
+            server, "POST", "/api/tasks",
+            body={**common, "task": "named bootstrap", "bootstrap_id": "general-team-bootstrap"},
+            headers={"Idempotency-Key": "named-bootstrap-disabled"},
         )
-        assert status == 202
-        command = db.get_command(json.loads(data)["command_id"])
-        assert command["payload"]["bootstrap_id"] == "general-team-bootstrap"
+        assert status == 400
 
-        status, _headers, data = request(
-            server,
-            "POST",
-            "/api/tasks",
-            body={**common, "task": "fresh payload", "bootstrap_id": None},
-            headers={"Idempotency-Key": "fresh-payload"},
-        )
-        assert status == 202
-        assert db.get_command(json.loads(data)["command_id"])["payload"]["bootstrap_id"] is None
-
-        status, _headers, data = request(
-            server,
-            "POST",
-            "/api/tasks",
+        status, _headers, _data = request(
+            server, "POST", "/api/tasks",
             body={
                 **common,
-                "task": "inline bootstrap payload",
+                "task": "inline bootstrap",
                 "bootstrap_definition": {
                     "bootstrap_id": "inline-bootstrap",
                     "name": "Inline Bootstrap",
-                    "source": "https://chatgpt.com/c/55555555-5555-4555-8555-555555555555",
-                    "prewarm_prompt": "Keep this context reusable.",
+                    "prewarm_prompt": "unused",
                     "max_backups": 5,
                 },
             },
-            headers={"Idempotency-Key": "inline-bootstrap-payload"},
+            headers={"Idempotency-Key": "inline-bootstrap-disabled"},
         )
-        assert status == 202
-        inline = db.get_command(json.loads(data)["command_id"])["payload"]
-        assert inline["bootstrap_id"] == "inline-bootstrap"
-        assert inline["bootstrap_definition"] == {
-            "bootstrap_id": "inline-bootstrap",
-            "name": "Inline Bootstrap",
-            "source_conversation_id": "55555555-5555-4555-8555-555555555555",
-            "prewarm_prompt": "Keep this context reusable.",
-            "max_backups": 5,
-        }
-
-        for index, invalid in enumerate(("", "   ", 7, [], {})):
-            status, _headers, _data = request(
-                server,
-                "POST",
-                "/api/tasks",
-                body={**common, "task": f"invalid bootstrap {index}", "bootstrap_id": invalid},
-                headers={"Idempotency-Key": f"invalid-bootstrap-{index}"},
-            )
-            assert status == 400
+        assert status == 400
     finally:
         server.shutdown()
         thread.join(timeout=5)
@@ -398,6 +337,13 @@ def test_task_live_endpoint_filters_semantic_events_by_role(tmp_path: Path):
         assert len(payload["items"]) == 1
         assert payload["items"][0]["source"] == "DOM"
         assert payload["items"][0]["team"] == "alpha"
+        status, _headers, body = request(
+            server,
+            "GET",
+            "/api/tasks/task-a/live?limit=300&role=PLAN",
+        )
+        assert status == 200
+        assert len(json.loads(body)["items"]) == 1
     finally:
         configure_live_event_log(old_live_log, enabled=old_live_enabled)
         server.shutdown()
@@ -840,6 +786,42 @@ def test_independent_create_accepts_initial_triggers_and_preserves_idempotency(
         thread.join(timeout=5)
 
 
+def test_independent_bind_endpoint_queues_exact_event_and_target(tmp_path: Path):
+    _config, db, server, thread = start_api(tmp_path)
+    body = {
+        "event_key": "check-all:monitor:42",
+        "target_task_id": "workflow-target",
+    }
+    headers = {"Idempotency-Key": "bind-periodic-target"}
+    try:
+        status, _headers, data = request(
+            server,
+            "POST",
+            "/api/independent-agents/agent-source/bind",
+            body=body,
+            headers=headers,
+        )
+        assert status == 202
+        first = json.loads(data)
+        command = db.get_command(first["command_id"])
+        assert command["kind"] == "independent_bind_target"
+        assert command["task_id"] == "agent-source"
+        assert command["payload"] == body
+
+        status, _headers, data = request(
+            server,
+            "POST",
+            "/api/independent-agents/agent-source/bind",
+            body=body,
+            headers=headers,
+        )
+        assert status == 202
+        assert json.loads(data) == first
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
 def test_report_uses_exact_hashed_private_locator(tmp_path: Path):
     report = tmp_path / ".plan" / "alpha" / "report.md"
     report.parent.mkdir(parents=True)
@@ -898,6 +880,31 @@ def test_maintenance_report_keeps_control_repo_absolute_locator_for_cross_repo_t
     assert api.report_bytes("task-a", "incident-1", maintenance=True) == b"maintenance evidence"
 
 
+def test_workflow_controls_api_enqueues_required_endpoint_release(tmp_path: Path):
+    _config, db, server, thread = start_api(tmp_path)
+    try:
+        status, _headers, data = request(
+            server,
+            "POST",
+            "/api/tasks/task-a/controls",
+            body={
+                "action": "release_required_browser_endpoint",
+                "reason": "preferred endpoint unavailable",
+            },
+            headers={"Idempotency-Key": "release-required-endpoint-key"},
+        )
+        assert status == 202
+        queued = json.loads(data)
+        command = db.get_command(queued["command_id"])
+        assert command["kind"] == "task_control"
+        assert command["task_id"] == "task-a"
+        assert command["payload"]["action"] == "release_required_browser_endpoint"
+        assert command["payload"]["reason"] == "preferred endpoint unavailable"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
 def test_change_goal_endpoint_enqueues_strict_idempotent_command(tmp_path: Path):
     _config, db, server, thread = start_api(tmp_path)
     headers = {"Idempotency-Key": "goal-key"}
@@ -938,6 +945,17 @@ def test_create_normalizes_explicit_temp_and_browser_overrides(tmp_path: Path):
 
     with pytest.raises(APIError, match="temporary"):
         api.normalize_create({"task": "bad temp", "temporary": "true"})
+
+
+def test_create_keeps_soft_browser_endpoint_task_neutral_without_bootstrap_inference(tmp_path: Path):
+    config = load_cdpa_config(None, repository_root=tmp_path)
+    api = DashboardAPI(config)
+
+    payload = api.normalize_create({"task": "placed task", "browser_endpoint_id": "9202"})
+
+    assert payload["browser_endpoint_id"] == "9202"
+    assert payload["bootstrap_id"] is None
+    assert payload["context_policy"] == "fresh"
 
 
 def test_system_status_uses_cross_platform_disk_usage(tmp_path, monkeypatch):

@@ -35,10 +35,13 @@ def _generation_zero_prompt(config, *, workspace: Path, role: str) -> str:
         conversation_generation=0,
     )
     assert built.constructor_included is True
-    route_contract = "|".join(allowed_routes)
+    prompt_routes = tuple(
+        item for item in allowed_routes if item != "PAUSE" and (item != "DONE" or role == "PLAN")
+    )
+    route_contract = "|".join(prompt_routes)
     assert f'"route":"{route_contract}"' in built.text
     assert f'"handoff":"{expected_report_path}"' in built.text
-    assert f"Write the complete non-empty role report to exactly: `{expected_report_path}`" in built.text
+    assert f"Write the complete report to exactly: {expected_report_path}" in built.text
     return built.text
 
 
@@ -70,20 +73,17 @@ def test_generation_zero_workflow_prompts_build_from_selected_asset_tree(
         assert config.constructor_paths[role].read_text(encoding="utf-8").strip() in text
 
 
-def test_agents_documents_goal_closure_and_explicit_bootstrap_selection():
+def test_agents_documents_minimal_fresh_one_endpoint_contract():
     agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
 
-    assert "Explicit task-level completion authority governs final closure" in agents
-    assert "fixable in-scope" in agents
-    assert "PLAN must route the smallest authorized follow-up role instead of `DONE`" in agents
-    assert "role-scope completion" in agents
-    assert "`mcp-g8` -> `g8-bootstrap`" in agents
-    assert "`mcp-thinkbook` -> `thinkbook-bootstrap`" in agents
-    assert "`mcp-docker` / a5 -> `a5docker-bootstrap`" in agents
-    assert "primary execution MCP" in agents
-    assert "CDPA host/browser" in agents
-    assert "--bootstrap <id>" in agents
-    assert "--fresh" in agents
+    assert "cdpa \"<complete task: repository/worktree, goal, constraints, acceptance evidence>\"" in agents
+    assert "one browser endpoint/account for its lifetime" in agents
+    assert "Fresh context" in agents
+    assert "Bootstrap branching is temporarily disabled" in agents
+    assert "Normal Send, Resume, Wait, and Route must never scan or snapshot every ChatGPT tab" in agents
+    assert "Transient" not in agents or "Temporary" in agents
+    assert "--bootstrap <id>" not in agents
+    assert "--fresh" not in agents
 
 
 @pytest.mark.parametrize("prompt_root", (LOCAL_PROMPTS, PACKAGED_PROMPTS))
@@ -101,6 +101,7 @@ def test_runtime_prompt_assets_use_concise_functional_role_contract(prompt_root:
     combined = "\n".join(prompts.values()).lower()
     assert "years experience" not in combined
     assert "world-class" not in combined
+    assert "3-5 minutes" in combined
     assert max(len(text.splitlines()) for text in prompts.values()) <= 24
 
 

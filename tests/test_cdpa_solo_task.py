@@ -895,6 +895,6 @@ def test_create_task_ui_exposes_team_and_solo_without_is_running():
     assert 'data-create-section="team-repository" data-team-only' in html
     assert 'data-solo-browser-slot' in html
     assert "roots.soloBrowserSlot.append(roots.browserEndpointField)" in app
-    assert '/assets/app.js?v=20260916-solo-task-v2' in html
+    assert '/assets/app.js?v=20260923-live-transcript-v1' in html
     assert "is_running" not in html.casefold()
     assert "is_running" not in app.casefold()

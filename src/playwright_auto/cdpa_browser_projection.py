@@ -13,6 +13,7 @@ _STORAGE_SCRIPT = """() => {
     title: document.title,
     role: read('playwright-auto:role'),
     page_id: read('playwright-auto:page-id'),
+    binding_id: read('playwright-auto:binding-id'),
     task_id: read('playwright-auto:task-id'),
     team: read('playwright-auto:team')
   };
@@ -54,6 +55,7 @@ async def inspect_page_metadata(page: Any) -> dict[str, Any]:
     url = _safe_url(raw.get("url") or getattr(page, "url", ""))
     return {
         "page_id": str(raw.get("page_id") or "") or None,
+        "binding_id": str(raw.get("binding_id") or "") or None,
         "url": url,
         "title": str(raw.get("title") or "")[:200],
         "role": str(raw.get("role") or "") or None,

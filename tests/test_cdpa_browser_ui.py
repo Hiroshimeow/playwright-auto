@@ -37,19 +37,24 @@ def test_browser_ui_exposes_execution_entries_and_preserves_dirty_fields():
 
 def test_changed_browser_module_graph_uses_fresh_cache_identity_for_changed_modules():
     from playwright_auto.dashboard import DASHBOARD_HTML_PATH
-    previous_key = "?v=20260914-goal2-ops-v1"
-    queue_key = "?v=20260914-goal5-queue-truth-v1"
+
+    topology_key = "?v=20260914-goal2-ops-v1"
+    board_key = "?v=20260915-operator-ux-v1"
+    browsers_key = "?v=20260915-endpoint-all-v1"
+    live_key = "?v=20260923-live-transcript-v1"
     app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
     html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
     notify = (ASSET_ROOT / "views/notify.js").read_text(encoding="utf-8")
     board = (ASSET_ROOT / "views/board.js").read_text(encoding="utf-8")
     browsers = (ASSET_ROOT / "views/browsers.js").read_text(encoding="utf-8")
     detail = (ASSET_ROOT / "views/task_detail.js").read_text(encoding="utf-8")
-    assert f'"./views/board.js{queue_key}"' in app
-    for module in ("store.js", "views/browsers.js", "views/task_detail.js", "views/notify.js"):
-        assert f'"./{module}{previous_key}"' in app
-    assert f'"./task_detail.js{previous_key}"' in notify
+
+    assert f'"./views/board.js{board_key}"' in app
+    assert f'"./views/browsers.js{browsers_key}"' in app
+    assert f'"./views/task_detail.js{live_key}"' in app
+    assert f'"./views/notify.js{live_key}"' in app
+    assert f'"./task_detail.js{live_key}"' in notify
     for source in (board, browsers, detail):
-        assert f'"./topology.js{previous_key}"' in source
-    assert f'/assets/app.js{queue_key}' in html
-    assert f'/assets/dashboard.css{previous_key}' in html
+        assert f'"./topology.js{topology_key}"' in source
+    assert f'/assets/app.js{live_key}' in html
+    assert f'/assets/dashboard.css{live_key}' in html
