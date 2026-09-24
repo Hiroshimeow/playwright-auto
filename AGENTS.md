@@ -176,11 +176,23 @@ Before editing this control repository:
 When code and old documentation disagree, current verified code plus this file are authoritative; update stale documentation in the same repair.
 
 <!-- HCUW:BEGIN -->
-## HCU Workflow (managed)
+## HCUW (managed)
 
-For non-trivial engineering work, read `.hcuw/README.md` before editing.
+For non-trivial engineering work, use the repository-local `hcu-work` skill:
+`.agents/skills/hcu-work/SKILL.md`.
 
-Repository-specific instructions, architecture, and accepted specs remain authoritative where they are more specific than generic HCU Workflow guidance. Do not edit `.hcuw/**` directly; update managed guidance with `hcuw update <repo-path>`.
+Read `.hcu/profile.md` and `.hcu/rules.md` once per agent session. If
+`.hcu/rules.md` does not exist, initialize it before substantive work by
+following `hcu-work`.
 
-When a change adds or changes a capability, durable state, deterministic gate, long-lived process/service, dependency, provider boundary, or conceptual ownership, follow `.hcuw/workflows/CHANGE.md` and create a repository-owned spec when required.
+When the user asks to change durable engineering policy or when HCUW reports
+rule drift, use:
+`.agents/skills/hcu-rules/SKILL.md`.
+
+After the files are loaded, do not repeatedly reload them every turn unless they
+changed. Repository-specific instructions, explicit user constraints, accepted
+specs, tests, and implementation truth remain authoritative.
+
+HCUW owns only this marked block. Existing AGENTS.md content before and after
+the block is preserved.
 <!-- HCUW:END -->
