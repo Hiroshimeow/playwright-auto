@@ -55,6 +55,8 @@ def rendered_user_text_matches(actual: Any, expected: Any) -> bool:
     for suffix in (" Show more", " Show less"):
         if rendered.endswith(suffix):
             rendered = rendered[: -len(suffix)].rstrip()
+            if rendered.endswith(" …"):
+                rendered = rendered[:-2].rstrip()
             break
     expected_rendered = normalize_visible_text(expected).replace("`", "")
     return rendered == expected_rendered

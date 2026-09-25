@@ -2,6 +2,7 @@
 import asyncio
 
 from playwright_auto.chatgpt import inspect_chatgpt_page, inspect_chatgpt_wait_probe
+from playwright_auto.chatgpt_graph import rendered_user_text_matches
 from test_chatgpt_mcp_permission import _with_page
 
 
@@ -55,6 +56,13 @@ def test_semantic_turn_dom_without_legacy_message_attributes_is_observable():
           <form><div contenteditable="true" role="textbox"></div></form>
         </main>
     ''', run))
+
+
+def test_rendered_user_text_match_ignores_collapsed_ellipsis_control():
+    assert rendered_user_text_matches(
+        "workflow prompt … Show more",
+        "workflow prompt",
+    )
 
 
 def test_wait_probe_reinstalls_current_reader_over_stale_page_function():
