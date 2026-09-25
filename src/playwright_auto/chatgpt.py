@@ -1111,10 +1111,13 @@ class SendReceipt:
             raise ValueError("send receipt attempts must be 1 or 2")
         accepted_via = str(value["accepted_via"])
         allowed_acceptance = {
-            "exact_user_message",
-            "user_message_identity",
-            "listen_streaming",
-            "stop_button",
+            "exact_user_message",  # legacy receipt
+            "user_message_identity",  # legacy receipt
+            "listen_streaming",  # legacy receipt; never emitted by current Send
+            "stop_button",  # legacy receipt
+            "assistant_message",
+            "response_activity_turn",
+            "assistant_activity",
         }
         if accepted_via.startswith("post_reload:"):
             recovered_signal = accepted_via.split(":", 1)[1]
@@ -5144,29 +5147,40 @@ class ChatGPTPage:
     async def _wait_send_acceptance(
         self,
         baseline: MessageBaseline,
-        prompt: str,
+        pre_send: ChatGPTSnapshot,
         *,
         timeout_ms: int,
     ) -> tuple[str, MessageSnapshot | None] | None:
         deadline = time.monotonic() + timeout_ms / 1000
+        stop_seen = False
+        assistant_signal: str | None = None
+        accepted_user: MessageSnapshot | None = None
+        baseline_activity, _ = response_activity_signature(pre_send, baseline)
+        baseline_activity_turn_id = str(pre_send.response_activity_turn_id or "")
         while time.monotonic() < deadline:
             snapshot = await self.assert_ownership()
-            candidate = unique_new_user_message(snapshot.messages, baseline)
-            if candidate is not None:
-                signal = (
-                    "exact_user_message"
-                    if normalize_visible_text(candidate.text) == normalize_visible_text(prompt)
-                    else "user_message_identity"
-                )
-                return signal, candidate
-            try:
-                listen_status = str(
-                    self.page_observation().get("status") or ""
-                ).upper()
-            except Exception:
-                listen_status = ""
-            if listen_status == "IS_STREAMING":
-                return "listen_streaming", None
+            stop_seen = stop_seen or bool(snapshot.stop_visible)
+            accepted_user = accepted_user or unique_new_user_message(
+                snapshot.messages, baseline
+            )
+            assistants = new_assistant_turns(snapshot.messages, baseline)
+            if any(
+                message.message_id and message.message_id not in baseline.message_ids
+                for message in assistants
+            ):
+                assistant_signal = "assistant_message"
+            else:
+                activity_turn_id = str(snapshot.response_activity_turn_id or "")
+                if activity_turn_id and activity_turn_id != baseline_activity_turn_id:
+                    assistant_signal = "response_activity_turn"
+                else:
+                    activity, activity_length = response_activity_signature(
+                        snapshot, baseline
+                    )
+                    if activity_length > 0 and activity != baseline_activity:
+                        assistant_signal = "assistant_activity"
+            if stop_seen and assistant_signal is not None:
+                return assistant_signal, accepted_user
             await asyncio.sleep(0.05)
         return None
 
@@ -5307,6 +5321,8 @@ class ChatGPTPage:
                         expected_attachment_count=expected_count,
                         expected_attachment_names=expected_names,
                     )
+                    pre_send = await self.assert_ownership()
+                    baseline = capture_message_baseline(pre_send.messages)
                     # Reset LISTEN generation state immediately before this one Send.
                     try:
                         await self.install_page_observer()
@@ -5332,12 +5348,12 @@ class ChatGPTPage:
                     self._owned_composer_text = None
                     acceptance = await self._wait_send_acceptance(
                         baseline,
-                        prompt,
-                        timeout_ms=min(timeout, 2_000),
+                        pre_send,
+                        timeout_ms=60_000,
                     )
                     if acceptance is None:
                         raise SendRecoveryError(
-                            "send click produced no accepted user-message or LISTEN streaming evidence"
+                            "send click produced no Stop + new assistant-output evidence within 60 seconds"
                         )
                     accepted_via, accepted_user = acceptance
                     try:
@@ -5348,13 +5364,8 @@ class ChatGPTPage:
                         # Send is already proven; stale-composer cleanup must not
                         # turn a running role back into a send failure.
                         pass
-                    if wait_for_stop and accepted_via != "listen_streaming":
-                        # Non-CDPA callers may still request an explicit visible generation wait.
-                        snapshot = await self.assert_ownership()
-                        if not new_assistant_turns(snapshot.messages, baseline):
-                            await self.page.locator(SELECTORS["stop"]).wait_for(
-                                state="visible", timeout=timeout
-                            )
+                    # Send acceptance already requires observing Stop after the click,
+                    # so callers do not need a second Stop wait here.
                     return SendReceipt(
                         prompt=prompt,
                         prompt_sha256=prompt_digest(prompt),
@@ -5447,10 +5458,12 @@ class ChatGPTPage:
                         recovered, acceptance = reconciled
                     else:
                         recovered = await self.assert_ownership()
-                        acceptance = await self._wait_send_acceptance(
-                            baseline,
-                            prompt,
-                            timeout_ms=min(timeout, 1_500),
+                        candidate = unique_new_user_message(recovered.messages, baseline)
+                        acceptance = (
+                            ("exact_user_message", candidate)
+                            if candidate is not None
+                            and visible_text_matches(candidate.text, prompt)
+                            else None
                         )
                     if acceptance is not None:
                         accepted_via, accepted_user = acceptance

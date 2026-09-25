@@ -1045,6 +1045,8 @@ def test_retry_ui_queues_format_repair_without_retry_click(tmp_path: Path):
     _store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-retry-format-repair"
     )
+    ledger = RequestLedger(hop["ledger_path"])
+    assert ledger.get(hop["request_id"]).status is RequestStatus.SENT
     worker._queue_format_repair(
         state,
         hop,
@@ -1055,6 +1057,9 @@ def test_retry_ui_queues_format_repair_without_retry_click(tmp_path: Path):
     assert repair["kind"] == "route_repair"
     assert repair["target_role"] == hop["target_role"]
     assert repair["turn"] == hop["turn"]
+    original = ledger.get(hop["request_id"])
+    assert original.status is RequestStatus.SENT
+    assert original.response is None
 
 
 def test_worker_passive_listener_remains_attached_across_rearms(tmp_path: Path):
@@ -1704,6 +1709,14 @@ def test_reused_cdpa_role_waits_for_hydrated_history_before_send(tmp_path: Path)
             "hop_id": 0,
             "target_role": "PLAN",
             "receipt": {"accepted_via": "user_message_identity"},
+            "response_record": {
+                "role": "assistant",
+                "message_id": "a-old",
+                "turn_id": "t-old",
+                "text": "older answer",
+                "actions": [],
+                "image_count": 0,
+            },
         },
     )
     history = (
@@ -1763,6 +1776,14 @@ def test_reused_cdpa_role_persistent_empty_history_blocks_retryably_preboundary(
             "hop_id": 0,
             "target_role": "PLAN",
             "receipt": {"accepted_via": "user_message_identity"},
+            "response_record": {
+                "role": "assistant",
+                "message_id": "a-old",
+                "turn_id": "t-old",
+                "text": "older answer",
+                "actions": [],
+                "image_count": 0,
+            },
         },
     )
     client = RecordingCDPASendClient(task_id=state["task_id"], team=state["team"])
@@ -1777,6 +1798,46 @@ def test_reused_cdpa_role_persistent_empty_history_blocks_retryably_preboundary(
     assert record.attempts == 0
     assert record.baseline is None
     assert client.send_calls == []
+
+
+def test_repair_after_accepted_send_without_response_does_not_require_old_transcript(
+    tmp_path: Path,
+):
+    _, _, state, worker = setup_task(tmp_path, task_id="task-repair-no-response-history")
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    state["hops"].insert(
+        0,
+        {
+            "hop_id": 0,
+            "target_role": "PLAN",
+            "receipt": {"accepted_via": "assistant_activity"},
+            "response": None,
+            "response_record": None,
+        },
+    )
+
+    class Client(RecordingCDPASendClient):
+        def __init__(self):
+            super().__init__(task_id=state["task_id"], team=state["team"])
+            self.require_history = []
+
+        async def send(
+            self,
+            text,
+            *,
+            require_existing_conversation_baseline=False,
+            **kwargs,
+        ):
+            self.require_history.append(require_existing_conversation_baseline)
+            return await super().send(text, **kwargs)
+
+    client = Client()
+    asyncio.run(worker._sending(state, hop, RecordingCDPASendActions(client)))
+
+    assert client.require_history == [False]
+    assert len(client.send_calls) == 1
+    assert state["block_code"] is None
 
 
 def test_missing_local_file_report_preserves_route_and_queues_report_repair(tmp_path: Path):

@@ -674,9 +674,14 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
                 error=f"{type(exc).__name__}: {exc}",
             )
             raise
+        assistant_output_acceptance = receipt.accepted_via in {
+            "assistant_message",
+            "response_activity_turn",
+            "assistant_activity",
+        }
         if (
             not self.render_request_marker
-            and receipt.accepted_via != "listen_streaming"
+            and not assistant_output_acceptance
             and not receipt.user_message_id
             and not receipt.user_turn_id
         ):

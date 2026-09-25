@@ -6324,7 +6324,7 @@ class CDPAWorker:
                 task_workflow_definitions(state, self.config)[role]["system_prompt"]
             )
         generation = int(state["roles"][role].get("conversation_generation") or 0)
-        prior_accepted_role_turn = not hop.get("generation_started_here", False) and any(
+        prior_completed_role_turn = not hop.get("generation_started_here", False) and any(
             isinstance(item, Mapping)
             and item.get("hop_id") != hop.get("hop_id")
             and str(item.get("target_role") or "").upper() == role
@@ -6332,6 +6332,17 @@ class CDPAWorker:
             and item.get("browser_endpoint_id", hop.get("browser_endpoint_id")) == hop.get("browser_endpoint_id")
             and isinstance(item.get("receipt"), Mapping)
             and bool(item.get("receipt"))
+            and (
+                str(item.get("response") or "").strip()
+                or (
+                    isinstance(item.get("response_record"), Mapping)
+                    and str(item["response_record"].get("role") or "") == "assistant"
+                    and (
+                        str(item["response_record"].get("text") or "").strip()
+                        or int(item["response_record"].get("image_count") or 0) > 0
+                    )
+                )
+            )
             for item in state.get("hops") or []
         )
         self._arm_passive_request_observer(state, hop, acquired.client)
@@ -6350,7 +6361,7 @@ class CDPAWorker:
             request_id=str(hop["request_id"]),
             render_request_marker=False,
             wait_for_response=False,
-            require_existing_conversation_baseline=prior_accepted_role_turn,
+            require_existing_conversation_baseline=prior_completed_role_turn,
             response_timeout_ms=None,
         )
         try:
@@ -6846,15 +6857,26 @@ class CDPAWorker:
             )
         response = hop.get("response_record")
         if not isinstance(response, Mapping):
+            text = str(hop.get("response") or "")
+            if not text.strip():
+                return
             identity = hop.get("message_identity") if isinstance(hop.get("message_identity"), Mapping) else {}
             response = {
                 "role": "assistant",
                 "message_id": str(identity.get("message_id") or ""),
                 "turn_id": identity.get("turn_id"),
-                "text": str(hop.get("response") or ""),
+                "text": text,
                 "actions": [],
                 "image_count": 0,
             }
+        if (
+            str(response.get("role") or "") != "assistant"
+            or (
+                not str(response.get("text") or "").strip()
+                and int(response.get("image_count") or 0) <= 0
+            )
+        ):
+            return
         ledger.update(
             record.request_id,
             status=RequestStatus.COMPLETED,
@@ -6888,13 +6910,13 @@ class CDPAWorker:
         response: MessageSnapshot | None,
         error: BaseException,
     ) -> None:
-        candidate = response or MessageSnapshot("assistant", "", None, "", ())
-        self._record_response(
-            state,
-            hop,
-            candidate,
-            validation_error=str(error),
-        )
+        if response is not None:
+            self._record_response(
+                state,
+                hop,
+                response,
+                validation_error=str(error),
+            )
         self._repair_route(state, hop, error)
 
 
@@ -9148,41 +9170,6 @@ class CDPAWorker:
             )
             return
 
-        install_observer = getattr(acquired.client, "install_page_observer", None)
-        if callable(install_observer):
-            await install_observer()
-        read_observation = getattr(acquired.client, "page_observation", None)
-        listen_status = ""
-        if callable(read_observation):
-            evidence = read_observation()
-            if isinstance(evidence, Mapping):
-                listen_status = str(evidence.get("status") or "").upper()
-        if listen_status == "IS_STREAMING":
-            receipt = SendReceipt(
-                prompt=record.rendered_prompt,
-                prompt_sha256=_sha(record.rendered_prompt),
-                binding=record.binding,
-                baseline=record.baseline,
-                attempts=min(2, max(1, int(record.attempts or 1))),
-                accepted_via="listen_streaming",
-                session_id_before=record.session_id_before,
-            )
-            self._record_resume_send_acceptance(state, hop, ledger, record, receipt)
-            try:
-                await acquired.client.clear_exact_owned_composer(record.rendered_prompt)
-            except Exception:
-                pass
-            self._finish_resume_control(
-                state,
-                control,
-                outcome="continued",
-                action="observe_progress",
-                reason_code=None,
-                reason="LISTEN streaming proves that the durable SENDING request is active.",
-                postcondition="generation_progress",
-            )
-            return
-
         if str(record.error or "").startswith(_SENDING_CONTINUATION_STARTED):
             self._require_resume_recovery(
                 state,
@@ -9211,8 +9198,8 @@ class CDPAWorker:
                 action="none",
                 reason_code="sending_provenance_ambiguous",
                 reason=(
-                    "No matching user turn or LISTEN streaming signal proves this SENDING "
-                    "request is active; automatic Send replay is unsafe."
+                    "No durable user-turn or accepted assistant-output provenance proves this "
+                    "SENDING request was accepted; automatic Send replay is unsafe."
                 ),
                 next_safe_action="Preserve the exact page/request and do not Send again.",
             )

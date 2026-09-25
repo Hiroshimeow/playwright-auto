@@ -31,6 +31,9 @@ def make_snapshot(
     attachments=(),
     requires_login=False,
     state=ChatGPTState.WAITING_PROMPT,
+    response_activity_turn_id=None,
+    response_activity_text="",
+    response_activity_length=0,
 ):
     return ChatGPTSnapshot(
         url="https://chatgpt.com/c/test-session",
@@ -50,6 +53,9 @@ def make_snapshot(
         error_texts=(),
         messages=tuple(messages),
         choice_prompt_labels=tuple(choice_labels),
+        response_activity_turn_id=response_activity_turn_id,
+        response_activity_text=response_activity_text,
+        response_activity_length=response_activity_length,
     )
 
 
@@ -271,7 +277,7 @@ def test_send_acceptance_does_not_trust_unrelated_assistant_turn(monkeypatch):
     result = asyncio.run(
         bind(page)._wait_send_acceptance(
             receipt().baseline,
-            "expected prompt",
+            make_snapshot(),
             timeout_ms=5,
         )
     )
@@ -279,21 +285,112 @@ def test_send_acceptance_does_not_trust_unrelated_assistant_turn(monkeypatch):
     assert result is None
 
 
-def test_send_acceptance_uses_listen_streaming_without_stop(monkeypatch):
+def test_send_acceptance_requires_stop_plus_new_assistant_message(monkeypatch):
+    baseline = receipt().baseline
+    pre_send = make_snapshot()
+    page = SequencePage([
+        make_snapshot(stop_visible=True),
+        make_snapshot(
+            stop_visible=False,
+            messages=(MessageSnapshot("assistant", "a-new", "t-new", "working", ()),),
+        ),
+    ])
+    install_sequence(monkeypatch, page)
+
+    result = asyncio.run(
+        bind(page)._wait_send_acceptance(
+            baseline,
+            pre_send,
+            timeout_ms=120,
+        )
+    )
+
+    assert result[0] == "assistant_message"
+
+
+def test_send_acceptance_requires_stop_plus_new_response_activity_turn(monkeypatch):
+    baseline = receipt().baseline
+    pre_send = make_snapshot(response_activity_turn_id="old-turn")
+    page = SequencePage([
+        make_snapshot(
+            stop_visible=True,
+            response_activity_turn_id="new-turn",
+            response_activity_text="working",
+            response_activity_length=7,
+        )
+    ])
+    install_sequence(monkeypatch, page)
+
+    result = asyncio.run(
+        bind(page)._wait_send_acceptance(baseline, pre_send, timeout_ms=20)
+    )
+
+    assert result[0] == "response_activity_turn"
+
+
+def test_send_acceptance_requires_stop_plus_new_activity_identity(monkeypatch):
+    baseline = receipt().baseline
+    pre_send = make_snapshot(response_activity_text="old", response_activity_length=3)
+    page = SequencePage([
+        make_snapshot(
+            stop_visible=True,
+            response_activity_text="new output",
+            response_activity_length=10,
+        )
+    ])
+    install_sequence(monkeypatch, page)
+
+    result = asyncio.run(
+        bind(page)._wait_send_acceptance(baseline, pre_send, timeout_ms=20)
+    )
+
+    assert result[0] == "assistant_activity"
+
+
+def test_send_acceptance_rejects_disappearing_stale_activity(monkeypatch):
+    baseline = receipt().baseline
+    pre_send = make_snapshot(response_activity_text="old", response_activity_length=3)
+    page = SequencePage([make_snapshot(stop_visible=True)])
+    install_sequence(monkeypatch, page)
+
+    result = asyncio.run(
+        bind(page)._wait_send_acceptance(baseline, pre_send, timeout_ms=5)
+    )
+
+    assert result is None
+
+
+def test_send_acceptance_rejects_listen_streaming_without_dom_pair(monkeypatch):
+    baseline = receipt().baseline
+    pre_send = make_snapshot()
     page = SequencePage([make_snapshot(stop_visible=False)])
     install_sequence(monkeypatch, page)
     client = bind(page)
     client.page_observation = lambda: {"status": "IS_STREAMING"}
 
     result = asyncio.run(
-        client._wait_send_acceptance(
-            receipt().baseline,
-            "expected prompt",
-            timeout_ms=5,
-        )
+        client._wait_send_acceptance(baseline, pre_send, timeout_ms=5)
     )
 
-    assert result == ("listen_streaming", None)
+    assert result is None
+
+
+def test_send_acceptance_rejects_assistant_output_without_stop(monkeypatch):
+    baseline = receipt().baseline
+    pre_send = make_snapshot()
+    page = SequencePage([
+        make_snapshot(
+            stop_visible=False,
+            messages=(MessageSnapshot("assistant", "a-new", "t-new", "done", ()),),
+        )
+    ])
+    install_sequence(monkeypatch, page)
+
+    result = asyncio.run(
+        bind(page)._wait_send_acceptance(baseline, pre_send, timeout_ms=5)
+    )
+
+    assert result is None
 
 
 def test_page_health_distinguishes_auth_and_empty_snapshot(monkeypatch):
