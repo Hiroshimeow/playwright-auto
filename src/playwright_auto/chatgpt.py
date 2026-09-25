@@ -2763,21 +2763,57 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             const value = (element?.innerText || element?.textContent || '').replace(/\s+/g, ' ').trim();
             return {length: value.length, tail: value.slice(-160)};
           };
+          const semanticTurns = () => {
+            const counts = {user: 0, assistant: 0};
+            const turns = [];
+            for (const heading of document.querySelectorAll('main h4')) {
+              const label = (heading.textContent || '').replace(/\s+/g, ' ').trim();
+              const role = label === 'You said:' ? 'user' : label === 'ChatGPT said:' ? 'assistant' : null;
+              if (!role || !heading.parentElement) continue;
+              const element = heading.parentElement;
+              const raw = (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
+              const body = raw.startsWith(label) ? raw.slice(label.length).trim() : raw;
+              turns.push({
+                role,
+                element,
+                messageId: `DOM:${role}:${counts[role]++}`,
+                text: body,
+              });
+            }
+            return turns;
+          };
 
           const composer = firstVisible('[contenteditable="true"][role="textbox"]');
           const composerRoot = composer?.closest('form') || composer?.closest('[data-testid="composer"]') || null;
           const stop = firstVisible('button[data-testid="stop-button"], button[aria-label*="Stop"]');
           const retry = firstVisible('[data-testid="regenerate-thread-error-button"]');
           const activeResponse = latest('[data-streaming-response-status]');
+          const semantic = semanticTurns();
+          const semanticUser = semantic.filter((turn) => turn.role === 'user').at(-1) || null;
+          const semanticAssistant = semantic.filter((turn) => turn.role === 'assistant').at(-1) || null;
           const lastUser = latest('[data-message-author-role="user"][data-message-id]');
           const assistantNodes = [...document.querySelectorAll('[data-message-author-role="assistant"][data-message-id]')]
             .filter(visible);
           const lastAssistant = assistantNodes.filter((element) => textShape(element).length > 0).at(-1)
             || assistantNodes.at(-1) || null;
-          const userIdentity = identity(lastUser);
-          const assistantIdentity = identity(lastAssistant);
-          const assistantShape = textShape(lastAssistant);
-          const activityShape = textShape(activeResponse);
+          const userIdentity = lastUser ? identity(lastUser) : {
+            messageId: semanticUser?.messageId || null,
+            turnId: null,
+          };
+          const assistantIdentity = lastAssistant ? identity(lastAssistant) : {
+            messageId: semanticAssistant?.messageId || null,
+            turnId: null,
+          };
+          const assistantText = lastAssistant ? boundedText(lastAssistant, 24000) : (semanticAssistant?.text || '');
+          const activityText = activeResponse ? boundedText(activeResponse, 24000) : (semanticAssistant?.text || '');
+          const assistantShape = {
+            length: assistantText.length,
+            tail: assistantText.slice(-160),
+          };
+          const activityShape = {
+            length: activityText.length,
+            tail: activityText.slice(-160),
+          };
           const errors = [...document.querySelectorAll('[role="alert"]')]
             .filter(visible).slice(-4).map((element) => boundedText(element, 240)).filter(Boolean);
           const dialogs = [...document.querySelectorAll('[role="dialog"], [data-testid^="modal-"]')]
@@ -2881,9 +2917,9 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             response_activity_length: activityShape.length,
             response_activity_tail: activityShape.tail,
             response_activity_turn_id: activeResponse?.closest('[data-turn-id]')?.getAttribute('data-turn-id') || null,
-            last_user_text: boundedText(lastUser, 12000),
-            assistant_text: boundedText(lastAssistant, 24000),
-            response_activity_text: boundedText(activeResponse, 24000),
+            last_user_text: lastUser ? boundedText(lastUser, 12000) : (semanticUser?.text || ''),
+            assistant_text: assistantText,
+            response_activity_text: activityText,
           };
           };
           const transitionSignature = (probe) => JSON.stringify([
@@ -3012,6 +3048,9 @@ async def inspect_chatgpt_wait_probe(
         await page.add_init_script(
             script=f"({_WAIT_PROBE_INSTALL_SCRIPT})({json.dumps(args, ensure_ascii=False)});"
         )
+        # A reconnect can attach to a document that still holds an older probe
+        # function. Install the current reader into the live document too.
+        await page.evaluate(_WAIT_PROBE_INSTALL_SCRIPT, args)
         _PAGE_WAIT_PROBE_INIT[page] = True
     use_wait = bool(
         previous_transition_signature and previous_probe is not None and wait_ms > 0
@@ -3230,7 +3269,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             .slice(0, 12);
 
           const chatRoot = document.querySelector('main') || document.body;
-          const messages = [...chatRoot.querySelectorAll('[data-message-author-role][data-message-id]')]
+          const legacyMessages = [...chatRoot.querySelectorAll('[data-message-author-role][data-message-id]')]
             .filter(visible)
             .map((element) => {
               const turn = element.closest('[data-turn-id]');
@@ -3248,18 +3287,42 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
                 image_count: imageCount,
               };
             });
+          const semanticCounts = {user: 0, assistant: 0};
+          const semanticMessages = [];
+          for (const heading of chatRoot.querySelectorAll('h4')) {
+            const label = (heading.textContent || '').replace(/\s+/g, ' ').trim();
+            const role = label === 'You said:' ? 'user' : label === 'ChatGPT said:' ? 'assistant' : null;
+            if (!role || !heading.parentElement) continue;
+            const element = heading.parentElement;
+            const rawText = text(element);
+            const body = rawText.startsWith(label) ? rawText.slice(label.length).trim() : rawText;
+            const actions = [...element.querySelectorAll('button[data-testid]')]
+              .filter(visible)
+              .map((button) => button.dataset.testid)
+              .filter(Boolean);
+            semanticMessages.push({
+              role,
+              message_id: `DOM:${role}:${semanticCounts[role]++}`,
+              turn_id: null,
+              text: body,
+              actions: [...new Set(actions)],
+              image_count: [...element.querySelectorAll('img')].filter(visible).length,
+            });
+          }
+          const messages = legacyMessages.length ? legacyMessages : semanticMessages;
 
           const activeResponse = [...chatRoot.querySelectorAll('[data-streaming-response-status]')]
             .filter(visible)
             .at(-1) || null;
-          const responseActivityText = text(activeResponse);
+          const semanticAssistant = semanticMessages.filter((message) => message.role === 'assistant').at(-1) || null;
+          const responseActivityText = activeResponse ? text(activeResponse) : (semanticAssistant?.text || '');
           const responseActivityStructure = activeResponse
             ? [...activeResponse.querySelectorAll('[data-testid]')]
                 .filter(visible)
                 .map((element) => element.getAttribute('data-testid') || '')
                 .filter(Boolean)
                 .join('|')
-            : '';
+            : (semanticAssistant ? 'semantic-assistant' : '');
           const responseActivityTurnId = activeResponse
             ?.closest('[data-turn-id]')
             ?.getAttribute('data-turn-id') || null;
@@ -5165,7 +5228,9 @@ class ChatGPTPage:
             )
             assistants = new_assistant_turns(snapshot.messages, baseline)
             if any(
-                message.message_id and message.message_id not in baseline.message_ids
+                message.message_id
+                and not message.message_id.startswith("DOM:")
+                and message.message_id not in baseline.message_ids
                 for message in assistants
             ):
                 assistant_signal = "assistant_message"
