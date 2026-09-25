@@ -254,7 +254,18 @@ def _next_requested_control(state: Mapping[str, Any]) -> dict[str, Any] | None:
         for item in state.get("controls") or []
         if isinstance(item, dict) and item.get("status") == "requested"
     ]
-    if not is_independent_task(state):
+    if is_independent_task(state):
+        reset = next(
+            (
+                item
+                for item in reversed(requested)
+                if str(item.get("action") or "") == "reset"
+            ),
+            None,
+        )
+        if reset is not None:
+            return reset
+    else:
         stop = next(
             (item for item in requested if str(item.get("action") or "") == "stop"),
             None,
@@ -272,6 +283,11 @@ def _control_can_run_endpointless(
     action = str(control.get("action") or "").strip().lower()
     if action in _ENDPOINTLESS_CONTROL_ACTIONS:
         return True
+    if action == "reset" and is_independent_task(state):
+        role = str(state.get("active_role") or INDEPENDENT_ROLE)
+        record = (state.get("roles") or {}).get(role)
+        if isinstance(record, Mapping) and not record.get("page_id") and not record.get("page_url"):
+            return True
     if action != "resume" or state.get("active_hop_id") is None:
         return False
     try:
@@ -2287,8 +2303,31 @@ class CDPAWorker:
         sent_at = parse_time((hop.get("timestamps") or {}).get("sent_at"))
         if sent_at is None:
             raise RuntimeError("sent hop is missing its accepted send timestamp")
+        wait = hop["wait"]
+        sent_key = sent_at.isoformat()
+        # Arm the response-recovery clock exactly once for each accepted Send.
+        # Legacy waits without the marker keep a valid post-Send timer, but any
+        # pre-Send timestamp is stale and must be reset to the accepted Send.
+        armed_for = wait.get("response_recovery_armed_for_sent_at")
+        progress_at = parse_time(wait.get("controller_progress_at"))
+        stale_pre_send_clock = progress_at is None or progress_at < sent_at
+        if armed_for != sent_key and stale_pre_send_clock:
+            for key in (
+                "controller_progress_at",
+                "controller_state",
+                "controller_state_since",
+                "timeout_refreshed",
+                "timeout_status_checked",
+                "timeout_status",
+                "refresh_ready_at",
+                "controller_last_refresh_at",
+            ):
+                wait.pop(key, None)
+            wait["controller_progress_at"] = sent_key
+        if armed_for != sent_key:
+            wait["response_recovery_armed_for_sent_at"] = sent_key
         start_wait_budget(
-            hop["wait"],
+            wait,
             timeout_seconds=self.config.response_timeout_seconds,
             now=sent_at,
         )
@@ -2499,6 +2538,13 @@ class CDPAWorker:
             hop, expected_conversation, expected_page_id, _ = (
                 self._active_recovery_context(state, role)
             )
+            ownership_retry_at = parse_time((hop.get("wait") or {}).get("ownership_retry_at"))
+            if ownership_retry_at is not None and datetime.now(timezone.utc) < ownership_retry_at:
+                state["status"] = "RUNNING"
+                state["active_action"] = "wait_role_recovery"
+                return None
+            if ownership_retry_at is not None:
+                hop.setdefault("wait", {}).pop("ownership_retry_at", None)
             acquired = await actions.locate_owned(state, role)
             temporary = state.get("conversation_mode") == "temporary"
             if temporary:
@@ -2596,6 +2642,15 @@ class CDPAWorker:
         except Exception as exc:
             if is_cdp_disconnect(exc):
                 raise
+            if is_transient_page_lifecycle_error(exc):
+                wait = hop.setdefault("wait", {})
+                wait["ownership_retry_at"] = (
+                    datetime.now(timezone.utc) + timedelta(seconds=5)
+                ).isoformat()
+                wait["ownership_retry_error"] = sanitize_exception(exc)
+                state["status"] = "RUNNING"
+                state["active_action"] = "wait_role_recovery"
+                return None
             code = _role_ownership_block_code(exc) or "role_ownership_ambiguous"
             self._block(state, exc, code=code, retryable=False)
             return None
@@ -3362,7 +3417,7 @@ class CDPAWorker:
                 after_control,
                 path=f"controls[{control_id}]",
             )
-            if action == "stop":
+            if action in {"stop", "reset"}:
                 before_controls = {
                     item.get("control_id"): item
                     for item in before.get("controls") or []
@@ -3610,10 +3665,33 @@ class CDPAWorker:
             record["last_activity_at"] = utc_now()
             return {"closed_tabs": closed}
         if action == "reset":
-            acquired = await actions.locate_owned(state, role)
+            role_record = (state.get("roles") or {}).get(role) or {}
+            has_owned_page = bool(role_record.get("page_id") or role_record.get("page_url"))
+            acquired = await actions.locate_owned(state, role) if has_owned_page else None
             stopped_response = (
                 await actions.stop_if_active(acquired) if acquired is not None else False
             )
+            reset_id = control.get("control_id")
+            if isinstance(reset_id, int):
+                for prior in state.get("controls") or []:
+                    if not isinstance(prior, dict):
+                        continue
+                    prior_id = prior.get("control_id")
+                    if (
+                        isinstance(prior_id, int)
+                        and prior_id < reset_id
+                        and prior.get("status") == "requested"
+                    ):
+                        prior["status"] = "rejected"
+                        prior["command_state"] = "REJECTED"
+                        prior["result"] = {
+                            "outcome": "rejected",
+                            "action": str(prior.get("action") or ""),
+                            "reason_code": "superseded_by_reset",
+                            "reason": "Superseded by a later explicit independent-agent Reset.",
+                            "postcondition": "superseded_by_reset",
+                        }
+                        prior["applied_at"] = utc_now()
             event = independent.get("active_event")
             if not isinstance(event, Mapping):
                 return {"reset": False, "reason": "no active job"}
@@ -5506,6 +5584,13 @@ class CDPAWorker:
     ) -> None:
         if not self._pre_send_request_identity_is_safe(state, hop):
             return
+        retry_at = parse_time((hop.get("wait") or {}).get("pre_send_retry_at"))
+        if retry_at is not None and datetime.now(timezone.utc) < retry_at:
+            state["status"] = "RUNNING"
+            state["active_action"] = "queued"
+            return
+        if retry_at is not None:
+            hop.setdefault("wait", {}).pop("pre_send_retry_at", None)
         if (hop.get("preboundary_recovery") or {}).get("phase") == "recovery_required":
             # Acquisition did not return a binding; never implicitly allocate again.
             return
@@ -5605,7 +5690,20 @@ class CDPAWorker:
             else:
                 try:
                     acquired = await actions.acquire(state, role, clean_for_send=True)
-                except (TimeoutError, PlaywrightTimeoutError) as exc:
+                except Exception as exc:
+                    if (
+                        not isinstance(exc, (TimeoutError, PlaywrightTimeoutError))
+                        and is_transient_page_lifecycle_error(exc)
+                    ):
+                        hop.setdefault("wait", {})["pre_send_retry_at"] = (
+                            datetime.now(timezone.utc) + timedelta(seconds=5)
+                        ).isoformat()
+                        hop["wait"]["pre_send_retry_error"] = sanitize_exception(exc)
+                        state["status"] = "RUNNING"
+                        state["active_action"] = "queued"
+                        return
+                    if not isinstance(exc, (TimeoutError, PlaywrightTimeoutError)):
+                        raise
                     if is_cdp_disconnect(exc):
                         raise
                     if not self._pre_send_request_identity_is_safe(state, hop):
@@ -5651,7 +5749,20 @@ class CDPAWorker:
         else:
             try:
                 acquired = await self._acquire_workflow_role(state, role, actions)
-            except (TimeoutError, PlaywrightTimeoutError) as exc:
+            except Exception as exc:
+                if (
+                    not isinstance(exc, (TimeoutError, PlaywrightTimeoutError))
+                    and is_transient_page_lifecycle_error(exc)
+                ):
+                    hop.setdefault("wait", {})["pre_send_retry_at"] = (
+                        datetime.now(timezone.utc) + timedelta(seconds=5)
+                    ).isoformat()
+                    hop["wait"]["pre_send_retry_error"] = sanitize_exception(exc)
+                    state["status"] = "RUNNING"
+                    state["active_action"] = "queued"
+                    return
+                if not isinstance(exc, (TimeoutError, PlaywrightTimeoutError)):
+                    raise
                 if is_cdp_disconnect(exc):
                     raise
                 if not self._pre_send_request_identity_is_safe(state, hop):
@@ -6260,6 +6371,14 @@ class CDPAWorker:
                 state,
                 str(exc),
                 code="conversation_transcript_not_ready",
+                retryable=True,
+            )
+            return
+        except ComposerConflictError as exc:
+            self._block(
+                state,
+                sanitize_exception(exc),
+                code="manual_composer_conflict",
                 retryable=True,
             )
             return
@@ -7640,6 +7759,35 @@ class CDPAWorker:
         # Resume an accepted request by observing the saved conversation. A new
         # operator prompt/Retry is valid; no original-user or backend proof is needed.
         if not isinstance(hop.get("receipt"), Mapping):
+            if hop.get("kind") in {"route_repair", "report_repair"}:
+                ledger = RequestLedger(str(hop["ledger_path"]))
+                record = ledger.peek(str(hop["request_id"]))
+                pristine_repair = (
+                    record is None
+                    or (
+                        int(getattr(record, "attempts", 0) or 0) == 0
+                        and getattr(record, "receipt", None) is None
+                    )
+                )
+                if pristine_repair:
+                    hop["state"] = "pre_send"
+                    hop.setdefault("timestamps", {}).pop("waiting_at", None)
+                    state["status"] = "RUNNING"
+                    state["kanban_column"] = _column_for(str(hop["target_role"]))
+                    state["active_action"] = "queued"
+                    state["block_code"] = None
+                    state["block_retryable"] = False
+                    state["block_reason"] = None
+                    self._finish_resume_control(
+                        state,
+                        control,
+                        outcome="continued",
+                        action="restore_repair_presend",
+                        reason_code=None,
+                        reason="Pristine repair hop restored to pre-send; no accepted Send exists.",
+                        postcondition="repair_presend_restored",
+                    )
+                    return
             self._require_resume_recovery(
                 state, control, action="none", reason_code="accepted_send_receipt_missing",
                 reason="The durable Send receipt is missing.",
@@ -8985,6 +9133,10 @@ class CDPAWorker:
                 user_turn_id=accepted_user.turn_id,
             )
             self._record_resume_send_acceptance(state, hop, ledger, record, receipt)
+            try:
+                await acquired.client.clear_exact_owned_composer(record.rendered_prompt)
+            except Exception:
+                pass
             self._finish_resume_control(
                 state,
                 control,
@@ -8992,6 +9144,41 @@ class CDPAWorker:
                 action="observe_progress",
                 reason_code=None,
                 reason="The transcript proves that the durable SENDING request was already accepted.",
+                postcondition="generation_progress",
+            )
+            return
+
+        install_observer = getattr(acquired.client, "install_page_observer", None)
+        if callable(install_observer):
+            await install_observer()
+        read_observation = getattr(acquired.client, "page_observation", None)
+        listen_status = ""
+        if callable(read_observation):
+            evidence = read_observation()
+            if isinstance(evidence, Mapping):
+                listen_status = str(evidence.get("status") or "").upper()
+        if listen_status == "IS_STREAMING":
+            receipt = SendReceipt(
+                prompt=record.rendered_prompt,
+                prompt_sha256=_sha(record.rendered_prompt),
+                binding=record.binding,
+                baseline=record.baseline,
+                attempts=min(2, max(1, int(record.attempts or 1))),
+                accepted_via="listen_streaming",
+                session_id_before=record.session_id_before,
+            )
+            self._record_resume_send_acceptance(state, hop, ledger, record, receipt)
+            try:
+                await acquired.client.clear_exact_owned_composer(record.rendered_prompt)
+            except Exception:
+                pass
+            self._finish_resume_control(
+                state,
+                control,
+                outcome="continued",
+                action="observe_progress",
+                reason_code=None,
+                reason="LISTEN streaming proves that the durable SENDING request is active.",
                 postcondition="generation_progress",
             )
             return
@@ -9010,6 +9197,24 @@ class CDPAWorker:
                     "Preserve the exact page/request and restore positive acceptance provenance; "
                     "do not Send again."
                 ),
+            )
+            return
+
+        proven_nonacceptance = any(
+            str(record.error or "").startswith(prefix)
+            for prefix in _PROVEN_ATOMIC_NONACCEPTANCE_ERRORS
+        )
+        if not proven_nonacceptance:
+            self._require_resume_recovery(
+                state,
+                control,
+                action="none",
+                reason_code="sending_provenance_ambiguous",
+                reason=(
+                    "No matching user turn or LISTEN streaming signal proves this SENDING "
+                    "request is active; automatic Send replay is unsafe."
+                ),
+                next_safe_action="Preserve the exact page/request and do not Send again.",
             )
             return
 
@@ -12421,7 +12626,18 @@ class CDPAWorker:
                         kwargs["expected_endpointless_control"] = endpointless_control
                     if task_id in self._execution_leases:
                         continue
-                    if selected_endpoint is not None:
+                    canonical_status = str(state.get("status") or "").upper()
+                    if selected_endpoint is not None and canonical_status not in TERMINAL:
+                        # Runtime-registry snapshots can lag a terminal manifest while
+                        # cleanup is still due. Capacity is a physical execution lease,
+                        # so confirm the canonical task status before publishing LOAD.
+                        latest = self.store.load(path)
+                        canonical_status = str(latest.get("status") or "").upper()
+                    consumes_capacity = (
+                        selected_endpoint is not None
+                        and canonical_status not in TERMINAL
+                    )
+                    if consumes_capacity:
                         hop = next((item for item in state.get("hops", []) if item.get("hop_id") == state.get("active_hop_id")), {})
                         self._execution_leases[task_id] = {
                             "endpoint_id": selected_endpoint, "task_id": task_id, "team": str(state.get("team") or ""),
@@ -12432,7 +12648,7 @@ class CDPAWorker:
                     )
                     running[task] = (task_id, path, selected_endpoint)
                     active_ids.add(task_id)
-                    if endpoint_pool is not None and selected_endpoint is not None:
+                    if endpoint_pool is not None and consumes_capacity:
                         reservations[selected_endpoint] = (
                             reservations.get(selected_endpoint, 0) + 1
                         )

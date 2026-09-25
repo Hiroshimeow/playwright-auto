@@ -453,7 +453,7 @@ def test_notify_frontend_contract_reuses_secondary_report_path_and_preserves_his
     assert 'if (current.drawer === "history") renderHistory(roots.secondaryContent, current);' in app
     assert 'if (current.drawer === "notify") renderNotify(roots.secondaryContent, current);' in app
     assert 'if (view === "notify") delete roots.secondaryContent.dataset.secondaryView;' in app
-    cache_key = "20260923-live-transcript-v1"
+    cache_key = "20260925-live-audit-ux-v3"
     assert f'/assets/app.js?v={cache_key}' in html
     assert f'./views/task_detail.js?v={cache_key}' in app
     assert f'./views/notify.js?v={cache_key}' in app
@@ -652,8 +652,9 @@ def test_task_goal_blocks_dedupe_and_disclosure_state_contract_is_keyed():
     assert '"task-disclosure-preview"' in detail
     assert '"Show more"' in detail
     assert '"Show less"' in detail
-    assert 'sameTask ? new Set' in detail
-    assert 'querySelectorAll("details[data-disclosure-key][open]")' in detail
+    assert 'const knownDisclosureKeys = new Set' in detail
+    assert 'previousDetails.filter(details => details.open)' in detail
+    assert 'if (knownDisclosureKeys.has(details.dataset.disclosureKey))' in detail
     assert 'details.open = openDisclosureKeys.has(details.dataset.disclosureKey)' in detail
 
 
@@ -678,7 +679,15 @@ def test_dashboard_exposes_role_urls_live_audit_and_page_level_quick_navigation(
     assert 'id: "task-timeline"' in detail
     assert 'id: "task-reports"' in detail
     assert 'for (const source of ["DOM", "LISTEN", "CTRL", "ACTION"])' in detail
+    assert 'audit.dataset.disclosureKey = "live-audit-signals"' in detail
+    assert 'audit.open = true' in detail
+    assert 'currentLive.replaceWith(nextLive)' in detail
+    assert 'knownLiveKeys.has(details.dataset.disclosureKey)' in detail
+    assert 'message.author === "user" && message.text.length > 420' in detail
+    assert 'disclosure.dataset.disclosureKey = "transcript-" + (message.turnId || message.messageId)' in detail
     assert 'current.liveEventsByScope.set(scope, response.data.items || [])' in app
+    assert 'summary?.status === "RUNNING" ? summary.active_role : null' in app
+    assert 'selectTask(taskId, cached, preferredRole)' in app
     assert '.page-rail {' in css
     assert '.live-event-list {' in css
     assert '.role-url-actions {' in css
@@ -696,6 +705,12 @@ def test_dashboard_exposes_role_urls_live_audit_and_page_level_quick_navigation(
     assert '"No tab allocated"' in detail
     assert 'DOM: "Observed semantic page state"' in detail
     assert 'sourceCounts[source]' in detail
+    assert 'audit.dataset.disclosureKey = "live-audit-signals"' in detail
+    assert 'live-transcript-preview' in detail
+    assert 'currentLive.replaceWith(nextLive)' in detail
+    assert 'root.dataset.baseSignature === baseSignature' in detail
+    assert 'const preferredRole = summary?.status === "RUNNING" ? summary.active_role : null' in app
+    assert 'selectTask(taskId, cached, preferredRole)' in app
     assert '<strong>Live audit</strong><span>' not in html
     assert 'details.append(el("summary", "Details"))' in detail
     responsive = css.split("@media (max-width: 920px)", 1)[1].split("@media (max-width: 720px)", 1)[0]
@@ -1013,7 +1028,7 @@ def test_board_lane_materialization_keeps_commands_after_operational_lanes():
 
     # board.js and its importing entrypoint both get fresh cache identities.
     assert './views/board.js?v=20260915-operator-ux-v1' in app
-    assert '/assets/app.js?v=20260923-live-transcript-v1' in html
+    assert '/assets/app.js?v=20260925-live-audit-ux-v3' in html
 
 
 def test_dashboard_compact_layout_contract_keeps_operational_content_visible():
@@ -1021,7 +1036,7 @@ def test_dashboard_compact_layout_contract_keeps_operational_content_visible():
     css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
 
     # CSS byte changes must publish under a new cache identity.
-    assert '/assets/dashboard.css?v=20260923-live-transcript-v1' in html
+    assert '/assets/dashboard.css?v=20260925-live-audit-ux-v3' in html
 
     # Endpoint scope is one compact equal-height topology; required operational
     # fields must not be hidden behind a fixed maximum card height.
@@ -1048,8 +1063,8 @@ def test_dashboard_dense_operator_layout_contract():
     css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
 
     # Published frontend bytes use a fresh cache identity through the changed import graph.
-    assert '/assets/dashboard.css?v=20260923-live-transcript-v1' in html
-    assert '/assets/app.js?v=20260923-live-transcript-v1' in html
+    assert '/assets/dashboard.css?v=20260925-live-audit-ux-v3' in html
+    assert '/assets/app.js?v=20260925-live-audit-ux-v3' in html
     assert './views/board.js?v=20260915-operator-ux-v1' in app
     assert './views/browsers.js?v=20260915-endpoint-all-v1' in app
 

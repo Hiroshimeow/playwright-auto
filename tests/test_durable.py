@@ -478,6 +478,7 @@ def test_crash_resume_with_transcript_marker_waits_without_resend(tmp_path):
     )
     client = FakeDurableClient(
         snapshot(
+            text=record.rendered_prompt,
             messages=(
                 MessageSnapshot(
                     "user", "u1", "t1", record.rendered_prompt, ()

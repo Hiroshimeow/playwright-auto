@@ -6605,3 +6605,31 @@ def test_open_tab_recovers_receiptless_observed_response_tab_loss_to_presend_fre
     assert actions.fresh_calls == [("PLAN", "https://chatgpt.com/", True)]
     assert recovered["controls"][0]["status"] == "applied"
     assert recovered["controls"][0]["result"]["resumed"] is True
+
+
+def test_independent_reset_is_endpointless_only_without_owned_page():
+    state = {
+        "task_mode": "independent",
+        "active_role": "AGENT",
+        "active_hop_id": 1,
+        "roles": {"AGENT": {"page_id": None, "page_url": None}},
+        "hops": [{"hop_id": 1, "state": "pre_send"}],
+    }
+    control = {"control_id": 1, "action": "reset", "status": "requested"}
+    assert worker_module._control_can_run_endpointless(state, control) is True
+    state["roles"]["AGENT"]["page_id"] = "owned-page"
+    assert worker_module._control_can_run_endpointless(state, control) is False
+
+
+def test_independent_reset_supersedes_older_requested_resume():
+    state = {
+        "task_mode": "independent",
+        "controls": [
+            {"control_id": 1, "action": "resume", "status": "requested"},
+            {"control_id": 2, "action": "reset", "status": "requested"},
+        ],
+    }
+    selected = worker_module._next_requested_control(state)
+    assert selected is not None
+    assert selected["control_id"] == 2
+    assert selected["action"] == "reset"

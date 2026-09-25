@@ -433,10 +433,20 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
             if record.status is RequestStatus.SENDING:
                 if accepted_user is None:
                     self._raise_ambiguous(record, DurableRecoveryState.SENT_MARKER_MISSING)
-                if snapshot.manual_input_pending:
+                composer_text = str(snapshot.composer_text or "").strip()
+                if (
+                    composer_text
+                    and not visible_text_matches(composer_text, record.rendered_prompt)
+                ) or snapshot.attachment_markers:
                     self._raise_ambiguous(record, DurableRecoveryState.MANUAL_COMPOSER_DIRTY)
                 if identities:
                     _validate_upload_receipt(record, identities)
+            clear_owned = getattr(context.client, "clear_exact_owned_composer", None)
+            if callable(clear_owned):
+                try:
+                    await clear_owned(record.rendered_prompt)
+                except Exception:
+                    pass
             receipt = receipt_from_record(record, accepted_user=accepted_user)
             if record.status is RequestStatus.SENDING:
                 record = ledger.update(
@@ -666,6 +676,7 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
             raise
         if (
             not self.render_request_marker
+            and receipt.accepted_via != "listen_streaming"
             and not receipt.user_message_id
             and not receipt.user_turn_id
         ):

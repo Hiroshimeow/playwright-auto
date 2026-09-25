@@ -27,29 +27,60 @@ class RoleController:
         self, snapshot: Any, wait: dict[str, Any], *, receipt: Any = None,
         permission: Mapping[str, Any] | None = None,
         validate: Callable[[Any], None] | None = None, phase: str = "waiting",
-        network_status: str | None = None, terminal_message_id: str | None = None,
+        network_status: str | None = None, network_response: Any = None,
         now: datetime | None = None,
     ) -> Decision:
         ctx = Context(snapshot, wait, self.policy, now or datetime.now(timezone.utc),
                       permission, phase, network_status=network_status)
         wait["manual_draft_present"] = ctx.draft_present
         dialogs = tuple(getattr(snapshot, "blocking_dialogs", ()) or ())
+        error_texts = tuple(getattr(snapshot, "error_texts", ()) or ())
+
+        # After F5, wait for the page to settle before reading either response source.
+        ready_at = parse_time(wait.get("refresh_ready_at"))
+        if phase == "waiting" and ready_at is not None and ctx.now < ready_at:
+            return self._remember(ctx, Decision(Action.WAIT, "reload_settle"))
+        if ready_at is not None:
+            wait.pop("refresh_ready_at", None)
+
+        listen_pending = False
+        dom_pending = False
+        if phase == "waiting":
+            # Priority #1: terminal LISTEN response.
+            if network_response is not None:
+                response.observe_candidate(ctx, network_response, validate, source="listen")
+                listen_decision = response.handle(ctx)
+                if listen_decision is not None:
+                    return self._remember(ctx, listen_decision)
+                listen_pending = bool(
+                    ctx.candidate is not None
+                    and ctx.validation_error is None
+                    and not ctx.candidate_stable
+                )
+
+            # Priority #2: rendered DOM response.
+            response.observe(ctx, getattr(receipt, "baseline", None), validate)
+            dom_decision = response.handle(ctx)
+            if dom_decision is not None:
+                return self._remember(ctx, dom_decision)
+            dom_pending = bool(
+                ctx.candidate is not None
+                and ctx.validation_error is None
+                and not ctx.candidate_stable
+            )
+
+            # A complete-looking candidate must remain unchanged for five seconds.
+            if listen_pending or dom_pending:
+                return self._remember(ctx, Decision(Action.WAIT, "result_stability"))
+
+        # Only after both response sources fail to produce a routable result do UI
+        # interruption/recovery signals participate in the decision.
         dialog_text = " ".join(dialogs).lower()
         if getattr(snapshot, "requires_login", False) or "session has expired" in dialog_text:
             return self._remember(ctx, Decision(Action.BLOCK, "authentication_required"))
-        error_texts = tuple(getattr(snapshot, "error_texts", ()) or ())
         if any(marker in str(text).lower() for text in (*dialogs, *error_texts) for marker in _RATE_LIMIT_MARKERS):
             return self._remember(ctx, Decision(Action.COOLDOWN, "profile_rate_limit"))
-        if phase == "waiting" and terminal_message_id:
-            response.observe(
-                ctx,
-                getattr(receipt, "baseline", None),
-                validate,
-                terminal_message_id=terminal_message_id,
-            )
-            terminal_decision = response.handle(ctx)
-            if terminal_decision is not None:
-                return self._remember(ctx, terminal_decision)
+
         blocking_dialogs = dialogs
         if phase == "waiting" and parse_qs(urlsplit(str(getattr(snapshot, "url", ""))).query).get("temporary-chat") == ["true"]:
             blocking_dialogs = tuple(
@@ -59,21 +90,16 @@ class RoleController:
             return self._remember(ctx, Decision(Action.WAIT, "blocking_dialog_wait"))
         if getattr(snapshot, "choice_prompt_labels", ()) and not ctx.permission_present:
             return self._remember(ctx, Decision(Action.WAIT, "choice_prompt_wait"))
-        if phase == "waiting" and not terminal_message_id:
-            response.observe(
-                ctx,
-                getattr(receipt, "baseline", None),
-                validate,
-                terminal_message_id=None,
-            )
-            result_decision = response.handle(ctx)
-            if result_decision is not None:
-                return self._remember(ctx, result_decision)
-        timeout.observe(ctx)
-        ready_at = parse_time(wait.get("refresh_ready_at"))
-        if ready_at is not None and ctx.now < ready_at:
-            return self._remember(ctx, Decision(Action.WAIT, "reload_settle"))
-        wait.pop("refresh_ready_at", None)
+        if phase == "waiting":
+            timeout.observe(ctx)
+            if getattr(snapshot, "retry_visible", False):
+                retry_seen_at = parse_time(wait.get("retry_seen_at"))
+                if retry_seen_at is None:
+                    wait["retry_seen_at"] = ctx.now.isoformat()
+                elif (ctx.now - retry_seen_at).total_seconds() >= 5:
+                    return self._remember(ctx, Decision(Action.REPAIR, "retry_visible_stable"))
+            else:
+                wait.pop("retry_seen_at", None)
 
         if (
             ctx.candidate is not None
@@ -84,18 +110,15 @@ class RoleController:
 
         permission_decision = allow.handle(ctx)
         if permission_decision is not None:
-            recovery = timeout.handle(ctx) if wait.get("mcp_allow_retry_at") else None
-            decision = recovery or permission_decision
-            if ctx.draft_present and decision.action in {Action.REFRESH, Action.REPAIR}:
-                decision = Decision(Action.WAIT, "manual_draft_preserved")
-            return self._remember(ctx, decision)
+            return self._remember(ctx, permission_decision)
 
         if phase == "history":
             return self._remember(ctx, Decision(Action.WAIT, "history_observation"))
 
         if phase == "pre_send":
-            if ctx.transport_active:
-                return self._remember(ctx, Decision(Action.WAIT, "response_in_progress"))
+            # Streaming/Stop are recovery diagnostics, never authority to block a
+            # new hop. Pre-send only requires an editable composer after the
+            # response/UI interruption checks above.
             if error_texts:
                 key = hashlib.sha256("|".join(error_texts).encode()).hexdigest()
                 if wait.get("ui_error_refreshed_key") != key:
@@ -104,37 +127,10 @@ class RoleController:
             reason = "ready" if ctx.composer_ready else "composer_pending"
             return self._remember(ctx, Decision(Action.WAIT, reason))
 
-        if ctx.candidate is not None and not ctx.candidate_stable:
-            return self._remember(ctx, Decision(Action.WAIT, "result_stability"))
-
-        decision = None
-        if getattr(snapshot, "retry_visible", False) and ctx.composer_ready:
-            decision = Decision(Action.REPAIR, "ChatGPT Retry UI is visible; continue from the existing state")
-        # An invalid rendered candidate is not repaired immediately. Preserve it as
-        # evidence and let the normal ten-minute timeout -> reload -> status path
-        # decide whether continuation repair is actually required.
-        if decision is None and error_texts and not ctx.transport_active:
-            key = hashlib.sha256("|".join(error_texts).encode()).hexdigest()
-            if wait.get("ui_error_refreshed_key") != key:
-                decision = Decision(Action.REFRESH, "ui_error")
-            elif ctx.composer_ready:
-                decision = Decision(Action.REPAIR, "UI generation error; continue from this state")
-        if decision is not None:
-            if ctx.draft_present and decision.action in {Action.REFRESH, Action.REPAIR}:
-                decision = Decision(Action.WAIT, "manual_draft_preserved")
-            return self._remember(ctx, decision)
         decision = timeout.handle(ctx)
         if decision is not None:
-            if ctx.draft_present and decision.action in {Action.REFRESH, Action.REPAIR}:
-                decision = Decision(Action.WAIT, "manual_draft_preserved")
             return self._remember(ctx, decision)
-        return self._remember(
-            ctx,
-            Decision(
-                Action.WAIT,
-                "response_in_progress" if ctx.transport_active else "wait_response",
-            ),
-        )
+        return self._remember(ctx, Decision(Action.WAIT, "wait_response"))
 
     @staticmethod
     def _remember(ctx: Context, decision: Decision) -> Decision:
@@ -244,26 +240,20 @@ class RoleController:
                 task_id=str(state["task_id"]), team=str(state["team"]),
                 request_id=str(hop.get("request_id") or ""), values=listen_values,
             )
-        # Live network final messages may precede DOM rendering. History/G2 never
-        # supplies this slot, and missing network evidence never gates DOM.
-        terminal_message_id = None
-        if phase == "waiting" and isinstance(network_response, Mapping):
-            from dataclasses import replace
-            candidate = MessageSnapshot.from_dict(network_response)
-            terminal_message_id = str(candidate.message_id or "") or None
-            existing_ids = {
-                str(getattr(message, "message_id", "") or "")
-                for message in snapshot.messages
-            }
-            if not terminal_message_id or terminal_message_id not in existing_ids:
-                snapshot = replace(snapshot, messages=(*snapshot.messages, candidate))
+        # LISTEN response and rendered DOM remain independent sources. LISTEN is
+        # priority #1; it is never injected into the DOM snapshot.
+        listen_candidate = (
+            MessageSnapshot.from_dict(network_response)
+            if phase == "waiting" and isinstance(network_response, Mapping)
+            else None
+        )
         previous = (wait.get("controller_decision"), wait.get("controller_reason"))
         decision = self.decide(
             snapshot, wait, receipt=receipt, permission=permission,
             validate=(lambda candidate: worker._validate_response_candidate(state, hop, candidate)),
             phase=phase,
             network_status=evidence.get("status"),
-            terminal_message_id=terminal_message_id,
+            network_response=listen_candidate,
         )
         if previous != (decision.action.value, decision.reason):
             append_live_event(
@@ -321,6 +311,9 @@ class RoleController:
             worker._record_response(state, hop, decision.response)
             if receipt is not None:
                 worker._release_stream_status_slot(client, receipt)
+            clear_page_response = getattr(client, "clear_page_response_state", None)
+            if callable(clear_page_response):
+                clear_page_response()
             return decision
         raise AssertionError(f"unhandled operational action: {decision.action}")
 
@@ -371,16 +364,20 @@ class RoleController:
                 signature, length = allow.activity(snapshot)
                 wait.update(
                     mcp_allow_clicked_at=now.isoformat(),
+                    mcp_allow_clicked_target=str((permission or {}).get("target_message_id") or "__dom__"),
                     mcp_allow_activity_signature=signature,
                     mcp_allow_activity_length=length,
-                    controller_progress_at=now.isoformat(),
                 )
                 return Decision(Action.WAIT, "mcp_allow_handler_pending")
             for key in ("mcp_allow_seen_at", "mcp_allow_seen_target", "mcp_allow_retry_at", "mcp_allow_dispatch_error"):
                 wait.pop(key, None)
             signature, length = allow.activity(snapshot)
-            wait.update(mcp_allow_clicked_at=now.isoformat(), mcp_allow_activity_signature=signature,
-                        mcp_allow_activity_length=length, controller_progress_at=now.isoformat())
+            wait.update(
+                mcp_allow_clicked_at=now.isoformat(),
+                mcp_allow_clicked_target=str((permission or {}).get("target_message_id") or "__dom__"),
+                mcp_allow_activity_signature=signature,
+                mcp_allow_activity_length=length,
+            )
             clear = getattr(client, "clear_permission_action", None)
             if callable(clear):
                 clear()

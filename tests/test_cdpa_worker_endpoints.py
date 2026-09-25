@@ -1891,3 +1891,56 @@ def test_unpinned_team_first_placement_pins_endpoint_and_inherits_temporary_defa
     assert state["context_policy"] == "fresh"
 
     assert worker._prepare_execution_endpoint(state, first["endpoint_id"]) is False
+
+
+def test_pool_cycle_stale_registry_terminal_manifest_never_gets_capacity_lease(tmp_path, monkeypatch):
+    worker, store, first, second, tasks = _setup(tmp_path)
+    store.endpoints.remove(second["endpoint_id"], has_nonterminal_tasks=True)
+    path = Path(tasks[0]["manifest_path"])
+
+    def stop(current):
+        current["status"] = "STOPPED"
+        current["terminal_state"] = "STOPPED"
+        current["kanban_column"] = "DONE_STOPPED"
+        current["active_role"] = None
+        current["active_hop_id"] = None
+        current["active_action"] = "stopped"
+        return current
+
+    stopped = store.update(path, stop)
+    assert stopped["status"] == "STOPPED"
+    assert worker.registry.tasks_by_id["task-0"]["status"] != "STOPPED"
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def scenario():
+        pool = await _pool(store)
+
+        async def advance(path, context, *, scheduling_tasks=None, endpoint_id=None):
+            started.set()
+            await release.wait()
+            return store.load(path)
+
+        monkeypatch.setattr(worker, "advance", advance)
+        monkeypatch.setattr(worker, "_maintain_ambient_page_automation", _noop)
+        monkeypatch.setattr(worker, "_refresh_rate_limit_cooldown", _noop)
+        monkeypatch.setattr(worker, "_close_idle_independent_tabs", _noop)
+
+        cycle = asyncio.create_task(worker.run_once_pool(pool))
+        await started.wait()
+        await asyncio.sleep(0.05)
+        assert worker._execution_leases == {}
+        snapshot = worker.runtime_db.get_snapshot("browser")
+        assert snapshot is not None
+        endpoint = next(
+            item for item in snapshot["payload"]["endpoints"]
+            if item["endpoint_id"] == first["endpoint_id"]
+        )
+        assert endpoint["active_count"] == 0
+        assert endpoint["running_executions"] == []
+
+        release.set()
+        await cycle
+        await pool.close()
+
+    asyncio.run(scenario())

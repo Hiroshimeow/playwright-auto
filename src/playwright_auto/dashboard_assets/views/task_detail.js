@@ -713,7 +713,22 @@ function workflowLive(detail, selectedRole, liveState = {}) {
         time,
         el("span", message.complete ? "complete" : "streaming", "transcript-state " + (message.complete ? "complete" : "streaming")),
       );
-      card.append(head, el("pre", message.text, "live-transcript-text"));
+      card.append(head);
+      const collapseUser = message.author === "user" && message.text.length > 420;
+      if (collapseUser) {
+        const disclosure = el("details", null, "live-transcript-disclosure");
+        disclosure.dataset.disclosureKey = "transcript-" + (message.turnId || message.messageId);
+        const summary = el("summary", null, "live-transcript-summary");
+        summary.append(
+          el("pre", message.text, "live-transcript-text live-transcript-preview"),
+          el("span", "Show more", "live-transcript-more"),
+          el("span", "Show less", "live-transcript-less"),
+        );
+        disclosure.append(summary, el("pre", message.text, "live-transcript-text live-transcript-full"));
+        card.append(disclosure);
+      } else {
+        card.append(el("pre", message.text, "live-transcript-text"));
+      }
       if (message.textLength > message.text.length) {
         card.append(el(
           "p",
@@ -728,6 +743,8 @@ function workflowLive(detail, selectedRole, liveState = {}) {
 
   const auditItems = rawItems.filter(event => String(event.source || "").toUpperCase() !== "TRANSCRIPT");
   const audit = el("details", null, "live-audit-signals");
+  audit.dataset.disclosureKey = "live-audit-signals";
+  audit.open = true;
   audit.append(el("summary", "Audit signals · " + auditItems.length));
   const auditBody = el("div", null, "live-audit-signals-body");
   const sourceHelp = {
@@ -959,14 +976,57 @@ export function renderTaskDetail(
     root.scrollTop = 0;
     return;
   }
-  const signature = JSON.stringify([
-    detail.projection_sha256, detail.version, timeline, selectedRole,
-    selectedTab, reportRevision, liveState,
-    endpoints.map(endpoint => [endpoint.endpoint_id, endpoint.label, endpoint.health, endpoint.connected, endpoint.chatgpt_ready, endpoint.active_count, endpoint.capacity, endpoint.draining, endpoint.cooldown]),
+  const endpointSignature = endpoints.map(endpoint => [
+    endpoint.endpoint_id, endpoint.label, endpoint.health, endpoint.connected,
+    endpoint.chatgpt_ready, endpoint.active_count, endpoint.capacity,
+    endpoint.draining, endpoint.cooldown,
   ]);
+  const baseSignature = JSON.stringify([
+    detail.projection_sha256, detail.version, timeline, selectedRole,
+    selectedTab, reportRevision, endpointSignature,
+  ]);
+  const liveSignature = JSON.stringify(liveState);
+  const signature = JSON.stringify([baseSignature, liveSignature]);
   if (root.dataset.signature === signature) return;
   const sameTask = root.dataset.taskId === selectedTaskId;
   if (!sameTask) root._pendingRender = null;
+
+  // Live telemetry updates only the live panel. It must not behave like an F5
+  // of the task workspace and destroy tab/disclosure/scroll interaction state.
+  if (
+    sameTask
+    && selectedTab === "live"
+    && root.dataset.baseSignature === baseSignature
+    && root.dataset.liveSignature !== liveSignature
+  ) {
+    const currentLive = root.querySelector("#task-live");
+    if (currentLive) {
+      const selection = window.getSelection();
+      if (selection && !selection.isCollapsed && currentLive.contains(selection.anchorNode)) {
+        root._pendingRender = () => renderTaskDetail(
+          root, detail, timeline, selectedRole, selectedTaskId, status, error,
+          selectedTab, selectedReportUrl, reportBodies, reportRevision, liveState, endpoints,
+        );
+        return;
+      }
+      const previousLiveDetails = [...currentLive.querySelectorAll("details[data-disclosure-key]")];
+      const knownLiveKeys = new Set(previousLiveDetails.map(details => details.dataset.disclosureKey));
+      const openLiveKeys = new Set(
+        previousLiveDetails.filter(details => details.open).map(details => details.dataset.disclosureKey),
+      );
+      const nextLive = workflowLive(detail, selectedRole, liveState);
+      currentLive.replaceWith(nextLive);
+      for (const details of nextLive.querySelectorAll("details[data-disclosure-key]")) {
+        if (knownLiveKeys.has(details.dataset.disclosureKey)) {
+          details.open = openLiveKeys.has(details.dataset.disclosureKey);
+        }
+      }
+      root.dataset.signature = signature;
+      root.dataset.liveSignature = liveSignature;
+      return;
+    }
+  }
+
   const selection = window.getSelection();
   if (sameTask && selection && !selection.isCollapsed && root.contains(selection.anchorNode)) {
     root._pendingRender = () => renderTaskDetail(
@@ -975,16 +1035,26 @@ export function renderTaskDetail(
     );
     return;
   }
-  const openDisclosureKeys = sameTask ? new Set(
-    [...root.querySelectorAll("details[data-disclosure-key][open]")].map(details => details.dataset.disclosureKey),
-  ) : new Set();
+  const previousDetails = sameTask
+    ? [...root.querySelectorAll("details[data-disclosure-key]")]
+    : [];
+  const knownDisclosureKeys = new Set(previousDetails.map(details => details.dataset.disclosureKey));
+  const openDisclosureKeys = new Set(
+    previousDetails.filter(details => details.open).map(details => details.dataset.disclosureKey),
+  );
   const scroll = root.scrollTop;
   root.replaceChildren(build(detail, timeline, selectedRole, selectedTab, selectedReportUrl, reportBodies, liveState, endpoints));
-  for (const details of root.querySelectorAll("details[data-disclosure-key]")) {
-    details.open = openDisclosureKeys.has(details.dataset.disclosureKey);
+  if (sameTask) {
+    for (const details of root.querySelectorAll("details[data-disclosure-key]")) {
+      if (knownDisclosureKeys.has(details.dataset.disclosureKey)) {
+        details.open = openDisclosureKeys.has(details.dataset.disclosureKey);
+      }
+    }
   }
   root.className = "panel";
   root.dataset.signature = signature;
+  root.dataset.baseSignature = baseSignature;
+  root.dataset.liveSignature = liveSignature;
   root.dataset.taskId = detail.task_id;
   root.scrollTop = scroll;
 }

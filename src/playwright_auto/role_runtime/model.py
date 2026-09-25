@@ -86,5 +86,4 @@ class Context:
         return bool(
             getattr(self.snapshot, "composer_present", False)
             and getattr(self.snapshot, "composer_editable", True)
-            and not self.transport_active
         )

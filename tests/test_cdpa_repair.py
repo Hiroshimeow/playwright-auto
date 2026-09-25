@@ -468,6 +468,7 @@ def test_repair_release_rearms_once_when_terminal_continuation_is_still_missing(
     )
     snapshot = _accepted_user_only_snapshot(state, receipt)
     hop["wait"]["controller_state"] = "IDLE"
+    hop["wait"]["response_recovery_armed_for_sent_at"] = hop["timestamps"]["sent_at"]
     hop["wait"]["controller_progress_at"] = (
         datetime.now(timezone.utc)
         - timedelta(seconds=worker.role_controller.policy.timeout_seconds + 5)

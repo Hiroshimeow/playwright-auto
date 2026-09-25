@@ -24,14 +24,11 @@ def current_result(text="result", **kwargs):
 
 
 @pytest.mark.parametrize("source", ["hidden", "visible", "listen"])
-def test_allow_requires_five_seconds_for_every_source(source):
+def test_allow_is_handled_immediately_for_every_source(source):
     current = snapshot(mcp_permission_node_count=int(source == "hidden"),
                        mcp_permission_allow_count=int(source == "visible"))
     kwargs = {"permission": {"type": "allow", "target_message_id": "target", "remember_answer": True}} if source == "listen" else {}
-    wait = {}
-    assert step(current, wait, **kwargs).action is Action.WAIT
-    assert step(current, wait, 4.9, **kwargs).action is Action.WAIT
-    assert step(current, wait, 5, **kwargs).action is Action.ALLOW
+    assert step(current, {}, **kwargs).action is Action.ALLOW
 
 
 def test_temporary_save_offer_does_not_block_consuming_completed_response():
@@ -44,7 +41,9 @@ def test_temporary_save_offer_does_not_block_consuming_completed_response():
     assert step(current, {}, phase="pre_send").reason == "blocking_dialog_wait"
     other = current_result(blocking_dialogs=("Want to keep this chat? You can now save it to your history.", "Delete chat?"),
                            url="https://chatgpt.com/?temporary-chat=true")
-    assert step(other, {}).reason == "blocking_dialog_wait"
+    other_wait = {}
+    assert step(other, other_wait).reason == "result_stability"
+    assert step(other, other_wait, 5).action is Action.ACCEPT
 
 
 def test_valid_result_wins_over_permission_evidence_after_five_second_stability():
@@ -57,29 +56,32 @@ def test_valid_result_wins_over_permission_evidence_after_five_second_stability(
     assert result.response.text == "result"
 
 
-def test_allow_disappearance_alone_still_refreshes_after_five_seconds():
+def test_allow_disappearance_returns_to_normal_wait_without_refresh():
     current = snapshot()
-    signature, length = activity(current)
-    wait = {"mcp_allow_clicked_at": NOW.isoformat(), "mcp_allow_activity_signature": signature,
-            "mcp_allow_activity_length": length}
-    assert step(current, wait, 4.9).action is Action.WAIT
+    wait = {"mcp_allow_clicked_at": NOW.isoformat(), "mcp_allow_clicked_target": "target"}
     result = step(current, wait, 5)
-    assert result.action is Action.REFRESH
-    assert result.reason == "mcp_allow_no_ui_progress"
+    assert result.action is Action.WAIT
+    assert result.reason == "wait_response"
+    assert "mcp_allow_clicked_target" not in wait
 
 
-def test_stop_after_allow_is_progress_and_does_not_refresh():
+def test_stop_after_allow_does_not_trigger_early_refresh():
     current = snapshot(stop_visible=True)
-    wait = {"mcp_allow_clicked_at": NOW.isoformat()}
-    assert step(current, wait, 6).action is Action.WAIT
-    assert "mcp_allow_clicked_at" not in wait
+    wait = {"mcp_allow_clicked_at": NOW.isoformat(), "mcp_allow_clicked_target": "target"}
+    result = step(current, wait, 6)
+    assert result.action is Action.WAIT
+    assert result.reason == "wait_response"
 
 
-def test_failed_allow_handler_cannot_hide_timeout_timer():
+def test_stuck_allow_cannot_hide_timeout_timer():
     current = snapshot(mcp_permission_node_count=1)
-    wait = {"controller_state": "ALLOW", "controller_progress_at": NOW.isoformat(),
-            "mcp_allow_seen_at": NOW.isoformat(), "mcp_allow_retry_at": NOW.isoformat()}
-    assert step(current, wait, 605).action is Action.REFRESH
+    wait = {
+        "controller_state": "ALLOW",
+        "controller_progress_at": NOW.isoformat(),
+        "mcp_allow_clicked_target": "__dom__",
+    }
+    assert step(current, wait, 599).action is Action.WAIT
+    assert step(current, wait, 600).action is Action.REFRESH
 
 
 def test_failed_allow_with_no_dom_permission_clears_stale_network_evidence():
@@ -110,9 +112,9 @@ def test_failed_allow_with_no_dom_permission_clears_stale_network_evidence():
     assert "mcp_allow_retry_at" not in wait
 
 
-def test_failed_allow_with_real_dom_permission_refreshes_after_five_seconds():
+def test_failed_allow_with_real_dom_permission_waits_until_normal_timeout():
     current = snapshot(mcp_permission_node_count=1)
-    wait = {"mcp_allow_seen_at": NOW.isoformat(), "mcp_allow_seen_target": "target"}
+    wait = {}
     permission = {"type": "allow", "target_message_id": "target", "remember_answer": True}
 
     class Client:
@@ -125,17 +127,24 @@ def test_failed_allow_with_real_dom_permission_refreshes_after_five_seconds():
     assert result.action is Action.WAIT
     assert result.reason == "mcp_allow_handler_pending"
     clicked = datetime.fromisoformat(wait["mcp_allow_clicked_at"])
-    assert "mcp_allow_retry_at" not in wait
+    wait["controller_progress_at"] = clicked.isoformat()
 
     decision = RoleController().decide(
         current,
         wait,
         receipt=receipt(),
         permission=permission,
-        now=clicked + timedelta(seconds=5),
+        now=clicked + timedelta(seconds=599),
+    )
+    assert decision.action is Action.WAIT
+    decision = RoleController().decide(
+        current,
+        wait,
+        receipt=receipt(),
+        permission=permission,
+        now=clicked + timedelta(seconds=600),
     )
     assert decision.action is Action.REFRESH
-    assert decision.reason == "mcp_allow_no_ui_progress"
 
 
 def test_operator_continuation_accepts_current_result_without_original_user():
@@ -177,16 +186,34 @@ def test_incomplete_stream_is_not_repaired_until_stop_clears():
     assert step(current, wait, 5, validate=invalid).action is Action.WAIT
 
 
-def test_retry_queues_continuation_but_does_not_block_presend():
+def test_retry_ui_repairs_after_five_stable_seconds_and_does_not_block_presend():
     current = snapshot(retry_visible=True)
-    assert step(current, {}).action is Action.REPAIR
+    wait = {}
+    assert step(current, wait).reason == "wait_response"
+    assert step(current, wait, 4.9).action is Action.WAIT
+    decision = step(current, wait, 5)
+    assert decision.action is Action.REPAIR
+    assert decision.reason == "retry_visible_stable"
     assert step(current, {}, phase="pre_send").reason == "ready"
     dirty = snapshot(composer_text="stale target draft", attachment_markers=("stale.txt",))
     assert step(dirty, {}, phase="pre_send").reason == "ready"
 
 
-def test_draft_prevents_repair_not_result_observation():
-    assert step(snapshot(retry_visible=True, composer_text="my draft"), {}).reason == "manual_draft_preserved"
+def test_retry_stability_resets_when_retry_disappears():
+    wait = {}
+    step(snapshot(retry_visible=True), wait)
+    step(snapshot(), wait, 3)
+    assert "retry_seen_at" not in wait
+    assert step(snapshot(retry_visible=True), wait, 4).action is Action.WAIT
+    assert step(snapshot(retry_visible=True), wait, 9).action is Action.REPAIR
+
+
+def test_post_send_composer_does_not_block_retry_or_result_observation():
+    draft_wait = {}
+    step(snapshot(retry_visible=True, composer_text="my draft"), draft_wait)
+    decision = step(snapshot(retry_visible=True, composer_text="my draft"), draft_wait, 5)
+    assert decision.action is Action.REPAIR
+    assert decision.reason == "retry_visible_stable"
     current = current_result(composer_text="my draft")
     wait = {}
     step(current, wait)
@@ -202,36 +229,33 @@ def test_session_expiry_is_not_retry_recovery():
 def test_unknown_dialog_waits_but_permission_dialog_uses_allow_handler():
     assert step(snapshot(blocking_dialogs=("Unexpected dialog",)), {}).reason == "blocking_dialog_wait"
     current = snapshot(blocking_dialogs=("MCP permission",), mcp_permission_node_count=1)
-    assert step(current, {}).reason == "mcp_allow_stable"
+    assert step(current, {}).reason == "mcp_allow_ready"
 
 
 @pytest.mark.parametrize("stop", [False, True])
-def test_timeout_waits_five_seconds_after_ten_minutes_before_refresh(stop):
+def test_timeout_refreshes_at_ten_minutes_regardless_of_stop(stop):
     current = snapshot(stop_visible=stop)
     wait = {}
     step(current, wait)
     assert step(current, wait, 599).action is Action.WAIT
-    assert step(current, wait, 604).action is Action.WAIT
-    assert step(current, wait, 605).action is Action.REFRESH
+    assert step(current, wait, 600).action is Action.REFRESH
 
 
-def test_timeout_does_not_destroy_manual_draft():
+def test_post_send_composer_does_not_block_timeout_recovery():
     current = snapshot(composer_text="keep this")
     wait = {}
     step(current, wait)
-    assert step(current, wait, 605).reason == "manual_draft_preserved"
+    decision = step(current, wait, 605)
+    assert decision.action is Action.REFRESH
+    assert decision.reason == "response_timeout_recheck"
 
 
-def test_timeout_clock_resets_when_operational_state_changes():
+def test_timeout_clock_does_not_reset_when_operational_state_changes():
     wait = {}
     assert step(snapshot(), wait).action is Action.WAIT
     assert step(snapshot(), wait, 590).action is Action.WAIT
-    wait.update(timeout_status_checked=True, timeout_status="COMPLETE")
     assert step(snapshot(stop_visible=True), wait, 590).action is Action.WAIT
-    assert "timeout_status_checked" not in wait
-    assert "timeout_status" not in wait
-    assert step(snapshot(stop_visible=True), wait, 1194).action is Action.WAIT
-    assert step(snapshot(stop_visible=True), wait, 1195).action is Action.REFRESH
+    assert step(snapshot(stop_visible=True), wait, 600).action is Action.REFRESH
 
 
 def test_timeout_after_refresh_keeps_waiting_when_stop_is_still_visible():
@@ -315,17 +339,18 @@ def test_timeout_refresh_preserves_clock_until_post_reload_state_changes():
     assert wait["timeout_refreshed"] is True
 
 
-def test_valid_result_routes_during_reload_settle_after_stability_window():
+def test_valid_result_is_read_after_reload_settle_then_stabilized():
     current = current_result()
     wait = {"refresh_ready_at": (NOW + timedelta(seconds=20)).isoformat()}
     assert step(current, wait).reason == "reload_settle"
-    assert step(current, wait, 5).action is Action.ACCEPT
+    assert step(current, wait, 20).reason == "result_stability"
+    assert step(current, wait, 25).action is Action.ACCEPT
 
 
 def test_reload_settle_window_is_twenty_seconds():
     wait = {"refresh_ready_at": (NOW + timedelta(seconds=20)).isoformat()}
     assert step(snapshot(retry_visible=True), wait, 19).reason == "reload_settle"
-    assert step(snapshot(retry_visible=True), wait, 20).action is Action.REPAIR
+    assert step(snapshot(retry_visible=True), wait, 20).reason == "wait_response"
 
 
 def test_empty_assistant_placeholder_does_not_hide_completed_result():
@@ -342,12 +367,13 @@ def test_empty_assistant_placeholder_does_not_hide_completed_result():
 
 
 def test_terminal_listen_result_waits_five_seconds_before_accept():
-    current = current_result('{"route":"REVIEW"}')
+    current = snapshot()
+    listen = MessageSnapshot("assistant", "answer", "answer-turn", '{"route":"REVIEW"}', ())
     wait = {}
-    first = step(current, wait, terminal_message_id="answer")
+    first = step(current, wait, network_response=listen)
     assert first.action is Action.WAIT
-    assert wait["result_samples"] == 1
-    result = step(current, wait, 5, terminal_message_id="answer")
+    assert wait["listen_result_samples"] == 1
+    result = step(current, wait, 5, network_response=listen)
     assert result.action is Action.ACCEPT
     assert result.reason == "valid_current_result"
 
@@ -358,19 +384,20 @@ def test_choice_prompt_waits_instead_of_blocking_task():
     assert result.reason == "choice_prompt_wait"
 
 
-def test_terminal_valid_result_wins_before_dialog_and_choice_wait_gates():
-    current = current_result(
+def test_terminal_listen_result_wins_before_dialog_and_choice_wait_gates():
+    current = snapshot(
         blocking_dialogs=("Unexpected dialog",),
         choice_prompt_labels=("Continue",),
     )
+    listen = MessageSnapshot("assistant", "answer", "answer-turn", '{"route":"REVIEW"}', ())
     wait = {}
-    assert step(current, wait, terminal_message_id="answer").action is Action.WAIT
-    result = step(current, wait, 5, terminal_message_id="answer")
+    assert step(current, wait, network_response=listen).action is Action.WAIT
+    result = step(current, wait, 5, network_response=listen)
     assert result.action is Action.ACCEPT
     assert result.reason == "valid_current_result"
 
 
-def test_network_streaming_counts_as_active_even_without_stop_button():
+def test_stale_network_streaming_does_not_block_pre_send():
     result = RoleController().decide(
         snapshot(stop_visible=False),
         {},
@@ -380,7 +407,26 @@ def test_network_streaming_counts_as_active_even_without_stop_button():
         now=NOW,
     )
     assert result.action is Action.WAIT
-    assert result.reason == "response_in_progress"
+    assert result.reason == "ready"
+
+
+def test_listen_response_has_priority_over_dom_response():
+    dom = current_result('{"route":"DEV"}')
+    listen = MessageSnapshot("assistant", "listen-answer", "listen-turn", '{"route":"REVIEW"}', ())
+    wait = {}
+    assert step(dom, wait, network_response=listen).reason == "result_stability"
+    result = step(dom, wait, 5, network_response=listen)
+    assert result.action is Action.ACCEPT
+    assert result.response.message_id == "listen-answer"
+
+
+def test_dom_response_is_priority_two_when_listen_has_no_response():
+    dom = current_result('{"route":"DEV"}')
+    wait = {}
+    assert step(dom, wait).reason == "result_stability"
+    result = step(dom, wait, 5)
+    assert result.action is Action.ACCEPT
+    assert result.response.message_id == "answer"
 
 
 def test_stale_response_activity_turn_id_is_audit_evidence_not_presend_gate():

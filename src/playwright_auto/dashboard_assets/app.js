@@ -6,9 +6,9 @@ import {
 } from "./store.js?v=20260914-goal2-ops-v1";
 import {renderBoard, refreshElapsed} from "./views/board.js?v=20260915-operator-ux-v1";
 import {renderBrowserManager, renderBrowserScope, syncCreateBrowserOptions, creationUsesTemporary} from "./views/browsers.js?v=20260915-endpoint-all-v1";
-import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260923-live-transcript-v1";
+import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260925-live-audit-ux-v3";
 import {renderHistory} from "./views/history.js";
-import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20260923-live-transcript-v1";
+import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20260925-live-audit-ux-v3";
 import {renderRuntime} from "./views/runtime.js?v=20260906-listen-controls-v1";
 import {
   applyReuseRoleSelection, renderCreateActions, renderResume, renderWorkflowAgentOptions,
@@ -865,7 +865,7 @@ function render(current) {
 subscribe(render);
 installSelectionResume(roots.detail);
 
-function selectTask(taskId, cached = null) {
+function selectTask(taskId, cached = null, preferredRole = null) {
   const taskChanged = state.selectedTaskId !== taskId;
   if (taskChanged) selectedReportByTask.clear();
   commit(current => {
@@ -873,6 +873,7 @@ function selectTask(taskId, cached = null) {
     if (taskChanged || !current.selectedTaskJumpByTask.has(taskId)) {
       current.selectedTaskJumpByTask.set(taskId, "overview");
     }
+    if (preferredRole) current.selectedRoleByTask.set(taskId, preferredRole);
     current.selectedDetail = cached;
     current.selectedDetailStatus = cached ? "ready" : "loading";
     current.selectedDetailError = null;
@@ -1324,7 +1325,8 @@ roots.board.addEventListener("click", async event => {
     const cached = summary
       ? detailCacheGet(taskId, summary.version, summary.projection_sha256)
       : null;
-    selectTask(taskId, cached);
+    const preferredRole = summary?.status === "RUNNING" ? summary.active_role : null;
+    selectTask(taskId, cached, preferredRole);
     if (!cached) await loadTaskDetail(taskId);
   }
 });

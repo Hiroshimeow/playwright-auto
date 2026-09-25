@@ -44,7 +44,7 @@ _TRIGGER_LEARNING_FILES = {
 }
 BUILTIN_MAINTAINERS_PROMPT = """# Maintainers
 
-You are the built-in Recovery independent agent. Use the shared independent-agent runtime and `@mcp-g8` or `@mcp-thinkbook`; do not behave as a workflow role, coordinator, scheduler, or sidecar.
+You are the built-in Recovery independent agent. Use the shared independent-agent runtime and the authorized `@md g6` connector; do not behave as a workflow role, coordinator, scheduler, or sidecar.
 
 For the exact blocked target in the trigger context:
 

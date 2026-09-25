@@ -130,6 +130,37 @@ def test_terminal_response_closes_stale_streaming_status():
     assert evidence["response"]["text"] == '{"route":"REVIEW"}'
 
 
+def test_accept_boundary_clears_stale_response_status_and_old_epoch():
+    page = Page()
+    observer = observer_for(page)
+    observer._on_request(
+        SimpleNamespace(method="POST", url="https://chatgpt.com/backend-api/f/conversation")
+    )
+    observer.publish(
+        {
+            "conversation_id": "chat",
+            "response": {
+                "role": "assistant",
+                "message_id": "answer",
+                "turn_id": "turn",
+                "text": '{"route":"REVIEW"}',
+                "actions": [],
+                "image_count": 0,
+            },
+        },
+        epoch=0,
+        source="network_chunk",
+    )
+    assert observer.observation()["status"] == "COMPLETE"
+    observer.clear_response_state()
+    evidence = observer.observation()
+    assert evidence["status"] is None
+    assert evidence["response"] is None
+    assert evidence["messages"] == []
+    observer.publish({"status": "IS_STREAMING"}, epoch=0, source="network_chunk")
+    assert observer.observation()["status"] is None
+
+
 def test_explicit_failure_is_not_overwritten_by_terminal_response():
     page = Page()
     observer = observer_for(page)

@@ -313,11 +313,19 @@ def test_delete_idle_independent_agent_and_reject_builtin(tmp_path: Path):
         task_id="task-maintainers-delete-reject",
         external_command_id="cmd-create-maintainers-delete-reject",
     )
-    with pytest.raises(ValueError, match="built-in independent agents cannot be deleted"):
-        store.delete_independent_agent(
-            builtin["manifest_path"],
-            external_command_id="cmd-delete-maintainers-reject",
-        )
+    retired = store.delete_independent_agent(
+        builtin["manifest_path"],
+        external_command_id="cmd-delete-maintainers-reject",
+    )
+    recreated = store.create_independent_agent(
+        "Maintainers",
+        system_prompt="BUILTIN_PROMPT_V2",
+        trigger_settings={"recovery": True},
+    )
+    assert retired["status"] == "STOPPED"
+    assert retired["independent"]["deleted_at"]
+    assert recreated["independent"]["agent_generation"] == 2
+    assert recreated["independent"]["agent_key"] == "maintainers"
 
 
 def test_agents_snapshot_api_and_workflow_command_dispatch(tmp_path: Path):

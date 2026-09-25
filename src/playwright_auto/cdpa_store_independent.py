@@ -1779,8 +1779,6 @@ class IndependentAgentStoreMixin:
                     raise ValueError("task is not independent")
                 independent = current["independent"]
                 agent_key = str(independent.get("agent_key") or "")
-                if agent_key.casefold() in {"maintainers", "monitor"}:
-                    raise ValueError("built-in independent agents cannot be deleted")
                 if external_command_id in current.get("applied_command_ids", []):
                     return current
                 if independent.get("deleted_at"):

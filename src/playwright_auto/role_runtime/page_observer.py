@@ -341,6 +341,17 @@ class PageObserver:
         self.permission = None
         # Keep last identity so the body fallback cannot resurrect a chunk already dispatched.
 
+    def clear_response_state(self) -> None:
+        """Close the accepted generation so the next hop cannot inherit stale LISTEN state."""
+        self.epoch += 1
+        self.response = None
+        self.status = None
+        self.messages = []
+        self.permission = None
+        self._last_permission = None
+        self.streams.clear()
+        self.network_wake.set()
+
     async def wait(self, seconds: float = 5) -> bool:
         events = [self.dom_wake, self.network_wake]
         if any(event.is_set() for event in events):

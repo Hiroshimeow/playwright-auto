@@ -489,7 +489,7 @@ a.role-url-action { display: inline-flex; align-items: center; }
 .role-input-summary { display: flex; align-items: center; justify-content: space-between; gap: .75rem; padding: .55rem .15rem; cursor: pointer; list-style: none; }
 .role-input-summary::-webkit-details-marker { display: none; }
 .role-input-summary::after { content: "+"; color: var(--muted); font-size: .8rem; }
-.role-input-disclosure[open] .role-input-summary::after { content: "−"; }
+.role-input-disclosure[open] .role-input-summary::after { content: "âˆ’"; }
 .role-input-summary strong { font-size: .68rem; }
 .role-input-body { padding-top: .55rem; }
 .role-input-body .role-input { max-height: 420px; overflow: auto; }
@@ -497,7 +497,7 @@ a.role-url-action { display: inline-flex; align-items: center; }
 .bootstrap-context-disclosure > summary { display: flex; align-items: center; justify-content: space-between; gap: .75rem; cursor: pointer; list-style: none; }
 .bootstrap-context-disclosure > summary::-webkit-details-marker { display: none; }
 .bootstrap-context-disclosure > summary::after { content: "+"; color: var(--muted); }
-.bootstrap-context-disclosure[open] > summary::after { content: "−"; }
+.bootstrap-context-disclosure[open] > summary::after { content: "âˆ’"; }
 .bootstrap-context-body { display: grid; gap: .35rem; margin-top: .65rem; padding-top: .65rem; border-top: 1px solid var(--line); }
 .bootstrap-context-body p { margin: 0; color: var(--muted-strong); font-size: .66rem; line-height: 1.45; }
 .timeline-card .section-inline h3 { margin-bottom: 0; }
@@ -535,10 +535,29 @@ a.role-url-action { display: inline-flex; align-items: center; }
 .transcript-state { padding: .08rem .28rem; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: .52rem; }
 .transcript-state.streaming { color: #c6a768; }
 .live-transcript-text { margin: 0; max-height: 34rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 500 .66rem/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; color: var(--text); }
+.live-transcript-disclosure { margin: 0; }
+.live-transcript-disclosure > summary { list-style: none; cursor: pointer; }
+.live-transcript-disclosure > summary::-webkit-details-marker { display: none; }
+.live-transcript-preview {
+  display: -webkit-box;
+  max-height: none;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+.live-transcript-full { display: none; margin-top: .45rem; }
+.live-transcript-more,
+.live-transcript-less { display: inline-block; margin-top: .35rem; color: var(--accent); font-size: .58rem; font-weight: 700; }
+.live-transcript-less { display: none; }
+.live-transcript-disclosure[open] .live-transcript-preview,
+.live-transcript-disclosure[open] .live-transcript-more { display: none; }
+.live-transcript-disclosure[open] .live-transcript-full,
+.live-transcript-disclosure[open] .live-transcript-less { display: block; }
 .live-transcript-truncated { margin: .35rem 0 0; font-size: .56rem; }
-.live-audit-signals { border-top: 1px solid var(--line); padding-top: .5rem; }
-.live-audit-signals > summary { cursor: pointer; color: var(--muted-strong); font-size: .64rem; font-weight: 650; }
-.live-audit-signals-body { display: grid; gap: .55rem; padding-top: .55rem; }
+.live-audit-signals { overflow: hidden; border: 1px solid var(--line); border-radius: 9px; background: #090e14; }
+.live-audit-signals > summary { display: flex; align-items: center; min-height: 36px; padding: .52rem .66rem; cursor: pointer; color: var(--text); background: #0d131b; font-size: .64rem; font-weight: 750; letter-spacing: .01em; }
+.live-audit-signals[open] > summary { border-bottom: 1px solid var(--line); }
+.live-audit-signals-body { display: grid; gap: .55rem; padding: .6rem; }
 .live-legend { display: flex; gap: .35rem; flex-wrap: wrap; }
 .live-source { display: inline-flex; align-items: center; gap: .28rem; min-height: 20px; padding: .12rem .36rem; border: 1px solid currentColor; border-radius: 999px; font-size: .54rem; font-weight: 800; letter-spacing: .05em; }
 .live-source b { min-width: 1.3em; color: var(--text); font-size: .56rem; font-variant-numeric: tabular-nums; text-align: right; }

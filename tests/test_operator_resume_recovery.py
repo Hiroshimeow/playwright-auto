@@ -3419,7 +3419,7 @@ def test_crossed_durable_receipt_blocks_nonacceptance_replacement(tmp_path: Path
     assert current.receipt == crossed.to_dict()
 
 
-def test_exact_owned_sending_draft_is_accepted_once(tmp_path: Path, monkeypatch):
+def test_exact_owned_sending_draft_without_user_or_listen_evidence_is_not_resent(tmp_path: Path, monkeypatch):
     store, state, worker, path, hop, ledger, binding, baseline = _prepare_sending_record(
         tmp_path, task_id="task-resume-owned-draft"
     )
@@ -3479,13 +3479,12 @@ def test_exact_owned_sending_draft_is_accepted_once(tmp_path: Path, monkeypatch)
     recovered = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
 
     control = recovered["controls"][-1]
-    assert control["status"] == "applied"
-    assert control["result"]["action"] == "accept_owned_draft"
-    assert control["result"]["postcondition"] == "draft_accepted_once"
-    assert client.send_calls == 1
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "sending_provenance_ambiguous"
+    assert client.send_calls == 0
     record = ledger.get(hop["request_id"])
-    assert record.status is RequestStatus.SENT
-    assert record.receipt["user_message_id"] == "u-owned"
+    assert record.status is RequestStatus.SENDING
+    assert record.receipt is None
 
 
 

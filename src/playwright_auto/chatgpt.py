@@ -1113,6 +1113,7 @@ class SendReceipt:
         allowed_acceptance = {
             "exact_user_message",
             "user_message_identity",
+            "listen_streaming",
             "stop_button",
         }
         if accepted_via.startswith("post_reload:"):
@@ -4161,6 +4162,10 @@ class ChatGPTPage:
         from .role_runtime.page_observer import observer_for
         observer_for(self.page).clear_permission()
 
+    def clear_page_response_state(self) -> None:
+        from .role_runtime.page_observer import observer_for
+        observer_for(self.page).clear_response_state()
+
     async def conversation_info(self, *, refresh: bool = False) -> dict[str, Any] | None:
         """G2: optional cached information only; never called by role admission."""
         from .role_runtime.page_observer import observer_for
@@ -4921,6 +4926,29 @@ class ChatGPTPage:
                 raise ComposerConflictError("composer did not become empty")
             self._owned_composer_text = None
 
+    async def _clear_exact_owned_composer_locked(
+        self, expected_text: str, *, timeout_ms: int
+    ) -> bool:
+        snapshot = await self.assert_ownership()
+        existing = snapshot.composer_text.strip()
+        if not existing or not visible_text_matches(existing, expected_text):
+            return False
+        await set_composer_text(self.page, "", timeout_ms=timeout_ms)
+        post = await self.assert_ownership()
+        if post.composer_text.strip():
+            raise ComposerConflictError("owned composer did not become empty")
+        self._owned_composer_text = None
+        return True
+
+    async def clear_exact_owned_composer(
+        self, expected_text: str, *, timeout_ms: int | None = None
+    ) -> bool:
+        timeout = timeout_ms or self.timeout_ms
+        async with self.mutation_guard():
+            return await self._clear_exact_owned_composer_locked(
+                expected_text, timeout_ms=timeout
+            )
+
     async def new_chat(
         self,
         *,
@@ -5121,7 +5149,6 @@ class ChatGPTPage:
         timeout_ms: int,
     ) -> tuple[str, MessageSnapshot | None] | None:
         deadline = time.monotonic() + timeout_ms / 1000
-        stop_seen = False
         while time.monotonic() < deadline:
             snapshot = await self.assert_ownership()
             candidate = unique_new_user_message(snapshot.messages, baseline)
@@ -5132,10 +5159,15 @@ class ChatGPTPage:
                     else "user_message_identity"
                 )
                 return signal, candidate
-            stop_seen = stop_seen or snapshot.stop_visible
+            try:
+                listen_status = str(
+                    self.page_observation().get("status") or ""
+                ).upper()
+            except Exception:
+                listen_status = ""
+            if listen_status == "IS_STREAMING":
+                return "listen_streaming", None
             await asyncio.sleep(0.05)
-        if stop_seen:
-            return "stop_button", None
         return None
 
     async def _prepare_prompt_locked(
@@ -5145,42 +5177,46 @@ class ChatGPTPage:
         *,
         expected_attachment_count: int = 0,
         expected_attachment_names: Sequence[str] | None = None,
+        stable_seconds: float = 5.0,
     ) -> None:
         expected_names, expected_count = _expected_attachment_contract(
             expected_attachment_names, expected_attachment_count
         )
-        snapshot = await self._interaction_snapshot(
-            timeout_ms=timeout_ms,
-            allow_attachments=expected_count > 0,
-        )
-        _assert_expected_attachment_markers(
-            snapshot.attachment_markers,
-            expected_names=expected_names,
-            expected_count=expected_count,
-            message="attachment set does not match before send",
-        )
-        existing = snapshot.composer_text.strip()
-        if existing and not visible_text_matches(existing, prompt):
-            raise ComposerConflictError(
-                "composer changed or contains manual input before send"
+        deadline = time.monotonic() + timeout_ms / 1000
+        stable_since: float | None = None
+        while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("composer did not remain stable before send")
+            snapshot = await self._interaction_snapshot(
+                timeout_ms=timeout_ms,
+                allow_attachments=expected_count > 0,
             )
-        if not visible_text_matches(existing, prompt):
-            await set_composer_text(self.page, prompt, timeout_ms=timeout_ms)
-        fresh = await self._interaction_snapshot(
-            timeout_ms=timeout_ms,
-            allow_attachments=expected_count > 0,
-        )
-        _assert_expected_attachment_markers(
-            fresh.attachment_markers,
-            expected_names=expected_names,
-            expected_count=expected_count,
-            message="attachment set changed before send",
-        )
-        if not visible_text_matches(fresh.composer_text, prompt):
-            raise ComposerConflictError("exact prompt ownership was lost before send")
-        if not fresh.send_visible or not fresh.send_enabled:
-            raise UnsafePageStateError("Send button is not visible and enabled")
-        self._owned_composer_text = prompt
+            _assert_expected_attachment_markers(
+                snapshot.attachment_markers,
+                expected_names=expected_names,
+                expected_count=expected_count,
+                message="attachment set changed before send",
+            )
+            existing = snapshot.composer_text.strip()
+            if not existing:
+                await set_composer_text(self.page, prompt, timeout_ms=timeout_ms)
+                stable_since = None
+                continue
+            if not visible_text_matches(existing, prompt):
+                raise ComposerConflictError(
+                    "composer changed or contains manual input before send"
+                )
+            now = time.monotonic()
+            if stable_since is None:
+                stable_since = now
+            remaining = stable_seconds - (now - stable_since)
+            if remaining > 0:
+                await asyncio.sleep(min(0.1, remaining))
+                continue
+            if not snapshot.send_visible or not snapshot.send_enabled:
+                raise UnsafePageStateError("Send button is not visible and enabled")
+            self._owned_composer_text = prompt
+            return
 
     async def send(
         self,
@@ -5271,6 +5307,12 @@ class ChatGPTPage:
                         expected_attachment_count=expected_count,
                         expected_attachment_names=expected_names,
                     )
+                    # Reset LISTEN generation state immediately before this one Send.
+                    try:
+                        await self.install_page_observer()
+                        self.clear_page_response_state()
+                    except Exception:
+                        pass
                     # Passive network identity observation is armed around this same click.
                     self._arm_frontend_identity_observer()
                     # Ownership, safe page state, prompt, attachments, and click share one callback.
@@ -5295,11 +5337,19 @@ class ChatGPTPage:
                     )
                     if acceptance is None:
                         raise SendRecoveryError(
-                            "send click produced no accepted user-message or stop evidence"
+                            "send click produced no accepted user-message or LISTEN streaming evidence"
                         )
                     accepted_via, accepted_user = acceptance
-                    if wait_for_stop and accepted_via != "stop_button":
-                        # A completed very-fast response is also valid if exact provenance exists.
+                    try:
+                        await self._clear_exact_owned_composer_locked(
+                            prompt, timeout_ms=min(timeout, 5_000)
+                        )
+                    except Exception:
+                        # Send is already proven; stale-composer cleanup must not
+                        # turn a running role back into a send failure.
+                        pass
+                    if wait_for_stop and accepted_via != "listen_streaming":
+                        # Non-CDPA callers may still request an explicit visible generation wait.
                         snapshot = await self.assert_ownership()
                         if not new_assistant_turns(snapshot.messages, baseline):
                             await self.page.locator(SELECTORS["stop"]).wait_for(

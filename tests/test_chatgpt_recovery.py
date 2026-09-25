@@ -279,6 +279,23 @@ def test_send_acceptance_does_not_trust_unrelated_assistant_turn(monkeypatch):
     assert result is None
 
 
+def test_send_acceptance_uses_listen_streaming_without_stop(monkeypatch):
+    page = SequencePage([make_snapshot(stop_visible=False)])
+    install_sequence(monkeypatch, page)
+    client = bind(page)
+    client.page_observation = lambda: {"status": "IS_STREAMING"}
+
+    result = asyncio.run(
+        client._wait_send_acceptance(
+            receipt().baseline,
+            "expected prompt",
+            timeout_ms=5,
+        )
+    )
+
+    assert result == ("listen_streaming", None)
+
+
 def test_page_health_distinguishes_auth_and_empty_snapshot(monkeypatch):
     auth_page = SequencePage([make_snapshot(requires_login=True)])
     install_sequence(monkeypatch, auth_page)

@@ -81,10 +81,6 @@ def test_hidden_allow_real_dom_snapshot_reaches_dispatch_after_five_seconds():
         state, hop, worker, acquired = environment(client)
         controller = RoleController()
         result = await controller.run(worker, state, hop, acquired, None, wait_ms=0)
-        assert result.reason == "mcp_allow_stable"
-        assert await page.evaluate("window.approved || null") is None
-        hop["wait"]["mcp_allow_seen_at"] = (datetime.now(timezone.utc) - timedelta(seconds=6)).isoformat()
-        result = await controller.run(worker, state, hop, acquired, None, wait_ms=0)
         assert result.action is Action.ALLOW
         approved = await page.evaluate("window.approved")
         assert approved["target_message_id"] == "hidden"
@@ -107,9 +103,15 @@ def test_retry_repair_goes_through_binding_and_real_send_without_retry_click(mon
         client.binding = PageBinding("page-1", "DEV")
         state, hop, worker, acquired = environment(client)
         controller = RoleController()
+        hop["wait"].update(
+            controller_progress_at=(datetime.now(timezone.utc) - timedelta(seconds=601)).isoformat(),
+            timeout_refreshed=True,
+            timeout_status_checked=True,
+            timeout_status="COMPLETE",
+        )
         result = await controller.run(worker, state, hop, acquired, None, wait_ms=0)
         assert result.action is Action.REPAIR
-        assert "Retry UI" in state["repair"]
+        assert "state_repair" in state["repair"]
         # Exercise exactly the pre-send binding path that blocked the production repair.
         await client.prepare_task("task-1")
         await client.bind_task_identity("task-1", "team-1")

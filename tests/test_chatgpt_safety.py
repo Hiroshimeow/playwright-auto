@@ -215,6 +215,63 @@ def test_manual_composer_is_not_overwritten(monkeypatch):
         asyncio.run(client.set_text("workflow prompt"))
 
 
+def test_prepare_prompt_refills_empty_before_send(monkeypatch):
+    page = DummyPage(snapshot())
+    client = ChatGPTPage(page)
+    client.binding = PageBinding("page-1", "DEV")
+    states = iter(
+        (
+            snapshot(composer_text="", send_visible=True, send_enabled=True),
+            snapshot(composer_text="prompt", send_visible=True, send_enabled=True),
+        )
+    )
+    fills = []
+
+    async def interaction_snapshot(*, timeout_ms, allow_attachments=False):
+        return next(states)
+
+    async def fill(_page, text, timeout_ms=5_000):
+        fills.append(text)
+
+    client._interaction_snapshot = interaction_snapshot
+    monkeypatch.setattr(chatgpt, "set_composer_text", fill)
+
+    asyncio.run(
+        client._prepare_prompt_locked(
+            "prompt",
+            timeout_ms=1_000,
+            stable_seconds=0,
+        )
+    )
+
+    assert fills == ["prompt"]
+    assert client._owned_composer_text == "prompt"
+
+
+def test_prepare_prompt_pauses_on_different_composer():
+    page = DummyPage(snapshot())
+    client = ChatGPTPage(page)
+    client.binding = PageBinding("page-1", "DEV")
+
+    async def interaction_snapshot(*, timeout_ms, allow_attachments=False):
+        return snapshot(
+            composer_text="different text",
+            send_visible=True,
+            send_enabled=True,
+        )
+
+    client._interaction_snapshot = interaction_snapshot
+
+    with pytest.raises(ComposerConflictError, match="manual input"):
+        asyncio.run(
+            client._prepare_prompt_locked(
+                "prompt",
+                timeout_ms=1_000,
+                stable_seconds=0,
+            )
+        )
+
+
 def test_force_clear_can_discard_target_text_and_attachments(monkeypatch):
     dirty = snapshot(
         composer_text="stale target draft",

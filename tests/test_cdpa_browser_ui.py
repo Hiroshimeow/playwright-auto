@@ -41,7 +41,7 @@ def test_changed_browser_module_graph_uses_fresh_cache_identity_for_changed_modu
     topology_key = "?v=20260914-goal2-ops-v1"
     board_key = "?v=20260915-operator-ux-v1"
     browsers_key = "?v=20260915-endpoint-all-v1"
-    live_key = "?v=20260923-live-transcript-v1"
+    live_key = "?v=20260925-live-audit-ux-v3"
     app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
     html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
     notify = (ASSET_ROOT / "views/notify.js").read_text(encoding="utf-8")
