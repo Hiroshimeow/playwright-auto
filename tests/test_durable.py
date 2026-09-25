@@ -161,6 +161,30 @@ def run_block(block, client, variables=None):
     )
 
 
+def test_send_threads_response_timeout_into_acceptance_wait(tmp_path):
+    class TimeoutClient(FakeDurableClient):
+        def __init__(self):
+            super().__init__()
+            self.send_timeout_ms = None
+
+        async def send(self, text, **options):
+            self.send_timeout_ms = options.get("timeout_ms")
+            return await super().send(text, **options)
+
+    client = TimeoutClient()
+    run_block(
+        DurableSendBlock(
+            "timeout prompt",
+            ledger_path=tmp_path / "ledger.json",
+            wait_for_response=False,
+            response_timeout_ms=123_456,
+        ),
+        client,
+    )
+
+    assert client.send_timeout_ms == 123_456
+
+
 def test_reused_conversation_waits_for_hydrated_baseline_before_sending(tmp_path):
     history = (
         MessageSnapshot("user", "u-old", "t-old", "older prompt", ()),

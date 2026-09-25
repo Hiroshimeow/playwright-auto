@@ -6362,7 +6362,7 @@ class CDPAWorker:
             render_request_marker=False,
             wait_for_response=False,
             require_existing_conversation_baseline=prior_completed_role_turn,
-            response_timeout_ms=None,
+            response_timeout_ms=round(self.config.response_timeout_seconds * 1000),
         )
         try:
             async def perform_send() -> Any:

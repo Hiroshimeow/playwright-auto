@@ -656,6 +656,9 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
             send_ownership["expected_attachment_ownership_token"] = str(
                 validated_upload_receipt.ownership_token
             )
+        send_timeout: dict[str, Any] = {}
+        if self.response_timeout_ms is not None:
+            send_timeout["timeout_ms"] = int(self.response_timeout_ms)
         try:
             receipt = await context.client.send(
                 record.rendered_prompt,
@@ -664,6 +667,7 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
                 recovery_reload=self.recovery_reload,
                 expected_attachment_count=len(identities),
                 expected_attachment_names=expected_markers,
+                **send_timeout,
                 **send_ownership,
             )
         except Exception as exc:

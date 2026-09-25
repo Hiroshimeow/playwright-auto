@@ -1141,6 +1141,7 @@ class RecordingCDPASendClient:
         self.current = send_snapshot(task_id=task_id, team=team)
         self.set_calls = []
         self.send_calls = []
+        self.send_timeout_ms = []
 
     async def assert_ownership(self):
         return self.current
@@ -1167,8 +1168,10 @@ class RecordingCDPASendClient:
         expected_attachment_ownership_token=None,
         expected_attachment_count=0,
         expected_attachment_names=None,
+        timeout_ms=None,
     ):
         self.send_calls.append(text)
+        self.send_timeout_ms.append(timeout_ms)
         baseline = capture_message_baseline(self.current.messages)
         user = MessageSnapshot("user", "u1", "t1", text, ())
         self.current = send_snapshot(
@@ -1677,6 +1680,7 @@ def test_normal_cdpa_send_keeps_transport_identity_out_of_actual_payload(tmp_pat
 
     record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
     assert client.send_calls == [hop["prompt"]]
+    assert client.send_timeout_ms == [round(worker.config.response_timeout_seconds * 1000)]
     assert client.send_calls[0].startswith("You are PLAN for the team alpha | task-a:")
     assert hop["receipt"]["prompt"] == hop["prompt"]
     assert record is not None

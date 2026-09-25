@@ -5246,7 +5246,7 @@ class ChatGPTPage:
                         assistant_signal = "assistant_activity"
             if stop_seen and assistant_signal is not None:
                 return assistant_signal, accepted_user
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
         return None
 
     async def _prepare_prompt_locked(
@@ -5411,14 +5411,16 @@ class ChatGPTPage:
                         expected_attachment_names=expected_names,
                     )
                     self._owned_composer_text = None
+                    acceptance_timeout_ms = max(60_000, int(timeout))
                     acceptance = await self._wait_send_acceptance(
                         baseline,
                         pre_send,
-                        timeout_ms=60_000,
+                        timeout_ms=acceptance_timeout_ms,
                     )
                     if acceptance is None:
                         raise SendRecoveryError(
-                            "send click produced no Stop + new assistant-output evidence within 60 seconds"
+                            "send click produced no Stop + new assistant-output evidence within "
+                            f"{acceptance_timeout_ms / 1000:g} seconds"
                         )
                     accepted_via, accepted_user = acceptance
                     try:
