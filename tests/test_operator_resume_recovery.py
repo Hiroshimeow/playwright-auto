@@ -2006,6 +2006,68 @@ def _prepare_sending_record(tmp_path: Path, *, task_id: str, bootstrap=None):
     return store, state, worker, path, hop, ledger, binding, baseline
 
 
+def test_resume_raw_listen_streaming_does_not_promote_ambiguous_sending(tmp_path: Path):
+    store, state, worker, path, hop, ledger, binding, _baseline = _prepare_sending_record(
+        tmp_path, task_id="task-resume-ignore-listen-streaming"
+    )
+    state = _queue_blocked_resume(
+        store,
+        state,
+        code="sending_provenance_ambiguous",
+        reason="post-click acceptance is unproven",
+    )
+    hop = _active_hop(state)
+
+    snapshot = SimpleNamespace(
+        page_id=binding.page_id,
+        page_role=binding.role,
+        page_task_id=state["task_id"],
+        page_team=state["team"],
+        composer_text="",
+        attachment_markers=(),
+        blocking_dialogs=(),
+        messages=(),
+        send_enabled=False,
+        stop_visible=True,
+        session_id="exact",
+        url="https://chatgpt.com/c/exact",
+        conversation_url="https://chatgpt.com/c/exact",
+    )
+
+    class Client:
+        def __init__(self):
+            self.binding = binding
+
+        async def assert_ownership(self):
+            return snapshot
+
+        async def install_page_observer(self):
+            return None
+
+        def page_observation(self):
+            return {"status": "IS_STREAMING"}
+
+        async def clear_exact_owned_composer(self, *_args, **_kwargs):
+            return False
+
+    client = Client()
+
+    class Actions:
+        async def locate_owned(self, _state, _role):
+            return AcquiredRole(
+                client, binding.page_id, "https://chatgpt.com/c/exact", False, False
+            )
+
+    control = state["controls"][-1]
+    asyncio.run(worker._recover_resume_sending(state, hop, control, Actions()))
+
+    current = ledger.get(hop["request_id"])
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "sending_provenance_ambiguous"
+    assert current is not None and current.status is RequestStatus.SENDING
+    assert current.receipt is None
+
+
 def _prepare_lost_sending_record(tmp_path: Path, *, task_id: str, error: str | None):
     store, state, worker, path, hop, ledger, binding, baseline = _prepare_sending_record(
         tmp_path, task_id=task_id

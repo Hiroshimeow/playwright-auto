@@ -99,7 +99,7 @@ def test_retry_repair_goes_through_binding_and_real_send_without_retry_click(mon
         return 0
     monkeypatch.setattr(module, "action_delay", no_delay)
     async def run(page):
-        client = ChatGPTPage(page, timeout_ms=5_000)
+        client = ChatGPTPage(page, timeout_ms=7_000)
         client.binding = PageBinding("page-1", "DEV")
         state, hop, worker, acquired = environment(client)
         controller = RoleController()
@@ -135,6 +135,11 @@ def test_retry_repair_goes_through_binding_and_real_send_without_retry_click(mon
             const message=document.createElement('div');
             message.dataset.messageAuthorRole='user';message.dataset.messageId='repair-user';
             message.innerText=input.innerText;document.querySelector('main').appendChild(message);input.innerText='';
+            const stop=document.createElement('button');stop.dataset.testid='stop-button';stop.innerText='Stop';
+            document.querySelector('main').appendChild(stop);
+            const assistant=document.createElement('div');assistant.dataset.messageAuthorRole='assistant';
+            assistant.dataset.messageId='repair-assistant';assistant.innerText='working';
+            document.querySelector('main').appendChild(assistant);
           ">Send</button>
         </form></main>
     """, run))

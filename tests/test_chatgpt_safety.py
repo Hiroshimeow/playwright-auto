@@ -760,8 +760,10 @@ def test_post_reload_acceptance_reuses_same_frontend_identity_without_second_cli
         client = ChatGPTPage(page)
         client.binding = PageBinding("page-1", "DEV")
         acceptance_calls = 0
+        refreshed = False
 
-        async def fake_assert(self): return before
+        async def fake_assert(self):
+            return replace(before, messages=(accepted,)) if refreshed else before
         async def fake_prepare(self, *_args, **_kwargs): return None
         async def fake_accept(self, *_args, **_kwargs):
             nonlocal acceptance_calls
@@ -778,6 +780,8 @@ def test_post_reload_acceptance_reuses_same_frontend_identity_without_second_cli
             target.clicks += 1
             target.emit("response", Response())
         async def fake_refresh(_page, **_kwargs):
+            nonlocal refreshed
+            refreshed = True
             await asyncio.sleep(0)
         monkeypatch.setattr(chatgpt, "click_send_button", fake_click)
         monkeypatch.setattr(chatgpt, "refresh_page", fake_refresh)
@@ -787,7 +791,7 @@ def test_post_reload_acceptance_reuses_same_frontend_identity_without_second_cli
         assert receipt.conversation_id == "conversation-reload"
         assert receipt.attempts == 1
         assert page.clicks == 1
-        assert acceptance_calls == 2
+        assert acceptance_calls == 1
 
     asyncio.run(run())
 
