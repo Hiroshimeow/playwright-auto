@@ -468,3 +468,58 @@ def test_live_transcript_dedupes_same_message_but_keeps_partial_to_final_updates
         assert transcript[1]["values"]["complete"] is True
     finally:
         configure_live_event_log(old_log, enabled=old_enabled)
+
+
+def test_live_event_tail_reader_does_not_use_full_file_read_text(tmp_path: Path, monkeypatch):
+    import json
+
+    log = tmp_path / "large-live.jsonl"
+    lines = [
+        json.dumps({
+            "event_id": f"event-{index}",
+            "source": "DOM",
+            "kind": "wait_probe",
+            "task_id": "task-1" if index % 2 == 0 else "other",
+            "role": "alpha-dev",
+        })
+        for index in range(5000)
+    ]
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("full file read")),
+    )
+    items = read_recent_live_events(log, task_id="task-1", role="DEV", limit=5)
+
+    assert [item["event_id"] for item in items] == [
+        "event-4990", "event-4992", "event-4994", "event-4996", "event-4998",
+    ]
+
+
+def test_live_event_tail_reader_legacy_id_is_content_stable_and_partial_tail_is_safe(tmp_path: Path):
+    import json
+
+    log = tmp_path / "legacy-live.jsonl"
+    legacy = {
+        "source": "DOM",
+        "kind": "wait_probe",
+        "task_id": "task-1",
+        "role": "alpha-dev",
+        "values": {"stop_visible": False},
+    }
+    encoded = json.dumps(legacy, sort_keys=True)
+    log.write_text(encoded + "\n{partial", encoding="utf-8")
+
+    first = read_recent_live_events(log, task_id="task-1", role="DEV", limit=5)
+    assert len(first) == 1
+    legacy_id = first[0]["event_id"]
+    assert legacy_id.startswith("legacy-live-")
+
+    log.write_text(
+        json.dumps({"source": "CTRL", "task_id": "other"}) + "\n" + encoded + "\n",
+        encoding="utf-8",
+    )
+    second = read_recent_live_events(log, task_id="task-1", role="DEV", limit=5)
+    assert [item["event_id"] for item in second] == [legacy_id]

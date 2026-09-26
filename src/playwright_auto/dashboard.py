@@ -22,9 +22,9 @@ DASHBOARD_HTML_PATH = Path(__file__).with_name("dashboard.html")
 DASHBOARD_LOGIN_HTML_PATH = Path(__file__).with_name("dashboard_login.html")
 ASSET_ROOT = Path(__file__).with_name("dashboard_assets")
 _AUTH_ENV_NAME = "CDPA_DASHBOARD_PASSWORD"
+_PUBLIC_HOST_ENV_NAME = "CDPA_DASHBOARD_PUBLIC_HOST"
 _SESSION_COOKIE = "cdpa_session"
-_PUBLIC_HOST = "cdpa.hcu-lab.me"
-_PUBLIC_ORIGIN = f"https://{_PUBLIC_HOST}"
+_DEFAULT_PUBLIC_HOST = "cdpa.hcu-lab.me"
 _LOGIN_FAILURE_LIMIT = 5
 _LOGIN_FAILURE_WINDOW_SECONDS = 300
 _SESSION_TTL_SECONDS = 43200
@@ -44,12 +44,12 @@ _HOP_BY_HOP = frozenset(
 )
 
 
-def _load_dashboard_password(repository_root: Path) -> str | None:
+def _load_dashboard_env_value(repository_root: Path, name: str) -> str | None:
     try:
         lines = (repository_root / ".env").read_text(encoding="utf-8").splitlines()
     except OSError:
         return None
-    prefix = f"{_AUTH_ENV_NAME}="
+    prefix = f"{name}="
     for line in lines:
         stripped = line.strip()
         if stripped.startswith(prefix):
@@ -58,10 +58,27 @@ def _load_dashboard_password(repository_root: Path) -> str | None:
     return None
 
 
+def _load_dashboard_password(repository_root: Path) -> str | None:
+    return _load_dashboard_env_value(repository_root, _AUTH_ENV_NAME)
+
+
+def _load_dashboard_public_host(repository_root: Path) -> str:
+    value = _load_dashboard_env_value(repository_root, _PUBLIC_HOST_ENV_NAME)
+    return (value or _DEFAULT_PUBLIC_HOST).strip().casefold()
+
+
 class FrontendApplication:
-    def __init__(self, config: CDPAConfig, *, auth_password: str | None = None) -> None:
+    def __init__(
+        self,
+        config: CDPAConfig,
+        *,
+        auth_password: str | None = None,
+        public_host: str = _DEFAULT_PUBLIC_HOST,
+    ) -> None:
         self.config = config
         self.auth_password = auth_password or None
+        self.public_host = public_host.strip().casefold() or _DEFAULT_PUBLIC_HOST
+        self.public_origin = f"https://{self.public_host}"
         self.login_failures: dict[str, list[float]] = {}
         self.sessions: dict[str, float] = {}
         self.auth_lock = threading.Lock()
@@ -110,7 +127,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _is_public_request(self) -> bool:
         host = self.headers.get("Host", "").strip().casefold()
-        public_host = host == _PUBLIC_HOST or host.startswith(f"{_PUBLIC_HOST}:")
+        public_host = host == self.application.public_host or host.startswith(
+            f"{self.application.public_host}:"
+        )
         return public_host or bool(self.headers.get("Cf-Ray", "").strip())
 
     def _prune_auth_state_locked(self, now: float) -> None:
@@ -128,7 +147,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _same_origin_request(self) -> bool:
         origin = self.headers.get("Origin")
         if origin is not None:
-            return origin.strip() == _PUBLIC_ORIGIN
+            return origin.strip() == self.application.public_origin
         referer = self.headers.get("Referer")
         if not referer:
             return False
@@ -136,7 +155,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             parsed = urlsplit(referer.strip())
         except ValueError:
             return False
-        return parsed.scheme == "https" and parsed.netloc == _PUBLIC_HOST
+        return parsed.scheme == "https" and parsed.netloc == self.application.public_host
 
     def _drain_rejected_request_body(self) -> None:
         """Consume a small rejected body so Windows can deliver the HTTP response cleanly."""
@@ -290,16 +309,46 @@ class DashboardHandler(BaseHTTPRequestHandler):
             config.dashboard_api_port,
             timeout=10,
         )
+        response_started = False
         try:
             connection.request(self.command, self.path, body=body, headers=forwarded)
             response = connection.getresponse()
-            response_body = response.read()
             response_headers = {
                 name: value
                 for name, value in response.getheaders()
                 if name.casefold() not in _HOP_BY_HOP
             }
+            content_type = response_headers.pop("Content-Type", None)
+            response_headers.pop("Content-Length", None)
+            if str(content_type or "").lower().startswith("text/event-stream"):
+                if connection.sock is not None:
+                    connection.sock.settimeout(60)
+                self.send_response(response.status)
+                if content_type:
+                    self.send_header("Content-Type", content_type)
+                for name, value in response_headers.items():
+                    self.send_header(name, value)
+                self.end_headers()
+                response_started = True
+                while True:
+                    chunk = response.readline()
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                return
+            response_body = response.read()
+            self._send(
+                response.status,
+                response_body,
+                content_type=content_type,
+                headers=response_headers,
+            )
+        except (BrokenPipeError, ConnectionResetError):
+            return
         except (OSError, http.client.HTTPException) as exc:
+            if response_started:
+                return
             self._json(
                 503,
                 {
@@ -312,14 +361,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         finally:
             connection.close()
-        content_type = response_headers.pop("Content-Type", None)
-        response_headers.pop("Content-Length", None)
-        self._send(
-            response.status,
-            response_body,
-            content_type=content_type,
-            headers=response_headers,
-        )
 
     def _handle(self) -> None:
         path = urlsplit(self.path).path
@@ -400,9 +441,14 @@ def create_server(
     host: str = "0.0.0.0",
     port: int | None = None,
     auth_password: str | None = None,
+    public_host: str = _DEFAULT_PUBLIC_HOST,
 ) -> DashboardServer:
     server = DashboardServer((host, config.dashboard_port if port is None else port), DashboardHandler)
-    server.application = FrontendApplication(config, auth_password=auth_password)
+    server.application = FrontendApplication(
+        config,
+        auth_password=auth_password,
+        public_host=public_host,
+    )
     return server
 
 
@@ -420,6 +466,7 @@ def main(argv: list[str] | None = None) -> int:
         host=args.host,
         port=args.port,
         auth_password=_load_dashboard_password(repository_root),
+        public_host=_load_dashboard_public_host(repository_root),
     )
     try:
         server.serve_forever()

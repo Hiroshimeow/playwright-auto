@@ -1,14 +1,15 @@
 import {APIClient} from "./api.js";
 import {PollController} from "./polling.js";
+import {createLiveReducer, createLiveStreamController, shouldLiveStream} from "./live_stream.js?v=20260925-live-sse-v1";
 import {
   state, commit, subscribe, commandKey, persistViewState,
   detailCacheGet, detailCachePut, detailCacheInvalidate, pruneDetailCache,
 } from "./store.js?v=20260914-goal2-ops-v1";
 import {renderBoard, refreshElapsed} from "./views/board.js?v=20260915-operator-ux-v1";
 import {renderBrowserManager, renderBrowserScope, syncCreateBrowserOptions, creationUsesTemporary} from "./views/browsers.js?v=20260915-endpoint-all-v1";
-import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260925-live-audit-ux-v3";
+import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260925-live-sse-v1";
 import {renderHistory} from "./views/history.js";
-import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20260925-live-audit-ux-v3";
+import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20260925-live-sse-v1";
 import {renderRuntime} from "./views/runtime.js?v=20260906-listen-controls-v1";
 import {
   applyReuseRoleSelection, renderCreateActions, renderResume, renderWorkflowAgentOptions,
@@ -69,6 +70,24 @@ const roots = {
   toast: document.querySelector("#toast"),
 };
 const client = new APIClient(state.etags, state.inflight);
+const liveController = createLiveStreamController({
+  snapshotLoader: async scope => {
+    const response = await fetch(scope.snapshotUrl, {cache: "no-store"});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data?.error?.message || `${response.status} ${response.statusText}`);
+    return data;
+  },
+  onView: view => {
+    const scope = liveController.scopeKey;
+    if (!scope) return;
+    commit(current => {
+      current.liveEventsByScope.set(scope, view);
+      current.liveEventsStatusByScope.set(scope, view.status || "ready");
+      if (view.error) current.liveEventsErrorByScope.set(scope, view.error);
+      else current.liveEventsErrorByScope.delete(scope);
+    });
+  },
+});
 const activeStatuses = new Set(["submitting", "unknown", "queued", "running"]);
 const OVERLAY_STATE = "cdpaOverlay";
 const INLINE_BOOTSTRAP_VALUE = "__create_inline__";
@@ -648,15 +667,60 @@ function liveScopeKey(taskId, role) {
   return `${taskId}:${role || "all"}`;
 }
 
+function roleFocusMode(current, taskId = current.selectedTaskId) {
+  return taskId ? (current.roleFocusModeByTask.get(taskId) || "FOLLOW") : "FOLLOW";
+}
+
 function selectedLiveState(current) {
   const taskId = current.selectedTaskId;
   if (!taskId) return {};
   const scope = liveScopeKey(taskId, selectedRole(current));
+  const view = current.liveEventsByScope.get(scope);
+  const status = current.liveEventsStatusByScope.get(scope);
+  const error = current.liveEventsErrorByScope.get(scope);
+  if (view && !Array.isArray(view)) {
+    return {...view, status: status || view.status || "idle", error: error || view.error || null};
+  }
   return {
-    items: current.liveEventsByScope.get(scope) || [],
-    status: current.liveEventsStatusByScope.get(scope) || "idle",
-    error: current.liveEventsErrorByScope.get(scope) || null,
+    items: Array.isArray(view) ? view : [],
+    status: status || "idle",
+    error: error || null,
   };
+}
+
+function liveStreamScope(current = state) {
+  const taskId = current.selectedTaskId;
+  if (!taskId) return null;
+  const task = current.board.get(taskId)
+    || (current.selectedDetail?.task_id === taskId ? current.selectedDetail : null);
+  const role = selectedRole(current);
+  if (!shouldLiveStream({
+    hidden: document.hidden,
+    task,
+    selectedTab: selectedDetailTab(current),
+    focusMode: roleFocusMode(current, taskId),
+    selectedRole: role,
+  })) return null;
+  const query = role ? `?role=${encodeURIComponent(role)}` : "";
+  const snapshotQuery = role
+    ? `?limit=300&role=${encodeURIComponent(role)}`
+    : "?limit=300";
+  return {
+    key: liveScopeKey(taskId, role),
+    url: `/api/tasks/${encodeURIComponent(taskId)}/live/stream${query}`,
+    snapshotUrl: `/api/tasks/${encodeURIComponent(taskId)}/live${snapshotQuery}`,
+  };
+}
+
+function syncLiveStream() {
+  const scope = liveStreamScope(state);
+  liveController.sync(scope);
+  return scope;
+}
+
+function enterLiveView() {
+  const scope = syncLiveStream();
+  if (!scope && selectedDetailTab(state) === "live") loadLiveAudit();
 }
 
 function renderPageRail(current) {
@@ -867,19 +931,26 @@ installSelectionResume(roots.detail);
 
 function selectTask(taskId, cached = null, preferredRole = null) {
   const taskChanged = state.selectedTaskId !== taskId;
+  const summary = state.board.get(taskId);
+  const followRole = preferredRole
+    || (summary?.status === "RUNNING" ? summary.active_role : null);
   if (taskChanged) selectedReportByTask.clear();
   commit(current => {
     current.selectedTaskId = taskId;
     if (taskChanged || !current.selectedTaskJumpByTask.has(taskId)) {
       current.selectedTaskJumpByTask.set(taskId, "overview");
     }
-    if (preferredRole) current.selectedRoleByTask.set(taskId, preferredRole);
+    if (followRole) {
+      current.selectedRoleByTask.set(taskId, followRole);
+      current.roleFocusModeByTask.set(taskId, "FOLLOW");
+    }
     current.selectedDetail = cached;
     current.selectedDetailStatus = cached ? "ready" : "loading";
     current.selectedDetailError = null;
     current.timeline = cached?.timeline ? [...cached.timeline] : [];
     current.timelineCursor = null;
   });
+  syncLiveStream();
 }
 
 function beginDetailLoad(taskId) {
@@ -919,13 +990,17 @@ function applyDetail(taskId, detail) {
       ? cursorFor(current.timeline.length) : null;
     const available = detail.role_inputs || {};
     const existing = current.selectedRoleByTask.get(taskId);
-    if (!existing || (!available[existing] && !(detail.roles || []).some(role => role.logical_role === existing))) {
+    const follow = roleFocusMode(current, taskId) === "FOLLOW";
+    if (follow && detail.status === "RUNNING" && detail.active_role) {
+      current.selectedRoleByTask.set(taskId, detail.active_role);
+    } else if (!existing || (!available[existing] && !(detail.roles || []).some(role => role.logical_role === existing))) {
       const fallback = detail.active_role || Object.keys(available)[0] || detail.roles?.[0]?.logical_role || null;
       if (fallback) current.selectedRoleByTask.set(taskId, fallback);
     }
   });
   if (state.selectedIndependentTabByTask.get(taskId) === "reports") loadReports(detail);
-  if (state.selectedIndependentTabByTask.get(taskId) === "live") loadLiveAudit();
+  if (state.selectedIndependentTabByTask.get(taskId) === "live") enterLiveView();
+  else syncLiveStream();
   return true;
 }
 
@@ -939,8 +1014,19 @@ export async function loadBoard() {
       current.counts = response.data.counts;
       current.catalog = response.data.catalog;
       current.apiError = null;
+      const selected = current.selectedTaskId
+        ? current.board.get(current.selectedTaskId)
+        : null;
+      if (
+        selected?.status === "RUNNING"
+        && selected.active_role
+        && roleFocusMode(current, selected.task_id) === "FOLLOW"
+      ) {
+        current.selectedRoleByTask.set(selected.task_id, selected.active_role);
+      }
       pruneDetailCache(current.board.keys());
     });
+    syncLiveStream();
     const taskId = state.selectedTaskId;
     const summary = taskId ? state.board.get(taskId) : null;
     if (!summary) return;
@@ -1003,8 +1089,11 @@ export async function loadLiveAudit() {
   try {
     const response = await client.request(key, `/api/tasks/${encodeURIComponent(taskId)}/live${suffix}`);
     if (state.selectedTaskId !== taskId || selectedDetailTab(state) !== "live") return response.data;
+    const reducer = createLiveReducer();
+    reducer.applySnapshot(response.data.items || []);
+    const view = reducer.viewModel();
     commit(current => {
-      current.liveEventsByScope.set(scope, response.data.items || []);
+      current.liveEventsByScope.set(scope, view);
       current.liveEventsStatusByScope.set(scope, "ready");
       current.liveEventsErrorByScope.delete(scope);
     });
@@ -1211,7 +1300,7 @@ async function queueCommand({kind, taskId = "runtime", endpoint, body, label}) {
 }
 
 async function refresh() {
-  await Promise.all([loadBoard(), loadRuntime(), fetchAgents(), pollCommands(), loadLiveAudit()]);
+  await Promise.all([loadBoard(), loadRuntime(), fetchAgents(), pollCommands()]);
 }
 
 function overlayName() {
@@ -1374,7 +1463,8 @@ roots.detail.addEventListener("click", async event => {
       current.selectedTaskJumpByTask.set(taskId, tab);
     });
     if (tab === "reports") loadReports(state.selectedDetail);
-    if (tab === "live") loadLiveAudit();
+    if (tab === "live") enterLiveView();
+    else syncLiveStream();
     return;
   }
   const independent = event.target.closest("[data-independent-action]");
@@ -1427,11 +1517,32 @@ roots.detail.addEventListener("click", async event => {
     });
     return;
   }
+  const followActive = event.target.closest("[data-follow-active-role]");
+  if (followActive) {
+    const taskId = followActive.dataset.taskId;
+    const activeRole = state.selectedDetail?.active_role || state.board.get(taskId)?.active_role;
+    commit(current => {
+      current.roleFocusModeByTask.set(taskId, "FOLLOW");
+      if (activeRole) current.selectedRoleByTask.set(taskId, activeRole);
+    });
+    enterLiveView();
+    return;
+  }
   const role = event.target.closest("[data-role-select]");
   if (role) {
     selectedReportByTask.delete(role.dataset.taskId);
-    commit(current => { current.selectedRoleByTask.set(role.dataset.taskId, role.dataset.roleSelect); });
-    if (selectedDetailTab(state) === "live") loadLiveAudit();
+    commit(current => {
+      current.selectedRoleByTask.set(role.dataset.taskId, role.dataset.roleSelect);
+      current.roleFocusModeByTask.set(role.dataset.taskId, "PINNED");
+    });
+    if (selectedDetailTab(state) === "live") enterLiveView();
+    else syncLiveStream();
+    return;
+  }
+  const jumpLatest = event.target.closest("[data-live-jump-latest]");
+  if (jumpLatest) {
+    roots.detail.scrollTop = roots.detail.scrollHeight;
+    jumpLatest.hidden = true;
     return;
   }
   const control = event.target.closest("[data-control]");
@@ -1523,7 +1634,8 @@ document.addEventListener("click", async event => {
       current.selectedTaskJumpByTask.set(current.selectedTaskId, target);
     });
     if (tab === "reports") loadReports(state.selectedDetail);
-    if (tab === "live") loadLiveAudit();
+    if (tab === "live") enterLiveView();
+    else syncLiveStream();
     requestAnimationFrame(() => {
       const id = target === "roles" ? "task-roles"
         : target === "timeline" ? "task-timeline"
@@ -1990,7 +2102,12 @@ const elapsedTimer = setInterval(() => {
   refreshElapsed(roots.board);
   refreshTimelineTimes(roots.detail);
 }, 1000);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) syncLiveStream();
+  else enterLiveView();
+});
 window.addEventListener("beforeunload", () => {
+  liveController.close();
   clearInterval(elapsedTimer);
   clearTimeout(viewSaveTimer);
   persistViewState();

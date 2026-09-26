@@ -17,7 +17,7 @@ from playwright_auto.cdpa_projection import TaskProjection
 from playwright_auto.cdpa_runtime_db import RuntimeDB
 from playwright_auto.cdpa_store import TaskStore
 from playwright_auto.cdpa_worker import CDPAWorker
-from playwright_auto.dashboard_api import APIError, DashboardAPI, create_server
+from playwright_auto.dashboard_api import APIError, DashboardAPI, DashboardAPIHandler, create_server
 from playwright_auto.observability import (
     action_event_log_path,
     append_action_event,
@@ -348,6 +348,90 @@ def test_task_live_endpoint_filters_semantic_events_by_role(tmp_path: Path):
         configure_live_event_log(old_live_log, enabled=old_live_enabled)
         server.shutdown()
         thread.join(timeout=5)
+
+
+def test_task_live_stream_sends_ready_then_incremental_event(tmp_path: Path):
+    _config, _db, server, thread = start_api(tmp_path)
+    old_live_log = live_event_log_path()
+    old_live_enabled = live_event_logging_enabled()
+    log = tmp_path / ".runtime" / "live-events.jsonl"
+    configure_live_event_log(log)
+    connection = http.client.HTTPConnection(
+        "127.0.0.1", server.server_address[1], timeout=5,
+    )
+    try:
+        connection.request("GET", "/api/tasks/task-a/live/stream?role=DEV")
+        response = connection.getresponse()
+        assert response.status == 200
+        assert response.headers["Content-Type"] == "text/event-stream"
+        assert response.headers["Cache-Control"] == "no-cache, no-transform"
+        assert response.headers["X-Accel-Buffering"] == "no"
+
+        ready_lines = [response.readline().decode() for _ in range(3)]
+        assert ready_lines[0] == "event: stream.ready\n"
+        ready = json.loads(ready_lines[1].removeprefix("data: "))
+        assert ready["seq"] == 0
+        assert ready_lines[2] == "\n"
+
+        append_live_event(
+            "CTRL",
+            "state_transition",
+            role="alpha-dev",
+            task_id="task-a",
+            team="alpha",
+            values={"active_action": "wait_response"},
+        )
+
+        lines = []
+        while len(lines) < 4:
+            line = response.readline().decode()
+            assert line
+            lines.append(line)
+            if line == "\n" and any(item.startswith("data: ") for item in lines):
+                break
+        assert lines[0].startswith("id: " + ready["stream_epoch"] + ":1")
+        assert "event: audit.append\n" in lines
+        payload_line = next(item for item in lines if item.startswith("data: "))
+        payload = json.loads(payload_line.removeprefix("data: "))
+        assert payload["seq"] == 1
+        assert payload["source"] == "CTRL"
+        assert payload["task_id"] == "task-a"
+    finally:
+        connection.close()
+        configure_live_event_log(old_live_log, enabled=old_live_enabled)
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_task_live_stream_unsubscribes_when_headers_fail(tmp_path: Path, monkeypatch):
+    def fail_headers(_handler):
+        raise BrokenPipeError("client disconnected before SSE headers completed")
+
+    monkeypatch.setattr(DashboardAPIHandler, "end_headers", fail_headers)
+    _config, _db, server, thread = start_api(tmp_path)
+    connection = http.client.HTTPConnection(
+        "127.0.0.1", server.server_address[1], timeout=5,
+    )
+    try:
+        with pytest.raises(
+            (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError, OSError)
+        ):
+            connection.request("GET", "/api/tasks/task-a/live/stream?role=DEV")
+            connection.getresponse()
+
+        hub = server.application.live_stream_hub
+        for _ in range(100):
+            if not hub.subscribers and not hub.follower.active:
+                break
+            threading.Event().wait(0.01)
+        assert not hub.subscribers
+        assert hub.follower.active is False
+    finally:
+        connection.close()
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
 
 
 def test_board_etag_304_and_worker_offline_last_known_good(tmp_path: Path):

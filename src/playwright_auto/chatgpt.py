@@ -4252,9 +4252,11 @@ class ChatGPTPage:
         from .role_runtime.page_observer import observer_for
         return observer_for(self.page).observation()
 
-    async def wait_for_page_observation(self, *, timeout_ms: int = 5_000) -> bool:
+    async def wait_for_page_observation(
+        self, *, timeout_ms: int = 5_000, dom_only: bool = False
+    ) -> bool:
         from .role_runtime.page_observer import observer_for
-        return await observer_for(self.page).wait(timeout_ms / 1000)
+        return await observer_for(self.page).wait(timeout_ms / 1000, dom_only=dom_only)
 
     def clear_permission_action(self) -> None:
         from .role_runtime.page_observer import observer_for
@@ -5252,20 +5254,22 @@ class ChatGPTPage:
         expected_prompt: str | None = None,
     ) -> tuple[str, MessageSnapshot | None] | None:
         deadline = time.monotonic() + timeout_ms / 1000
-        stop_seen = False
-        assistant_signal: str | None = None
         accepted_user: MessageSnapshot | None = None
         baseline_activity, _ = response_activity_signature(pre_send, baseline)
         baseline_activity_turn_id = str(pre_send.response_activity_turn_id or "")
-        while time.monotonic() < deadline:
+        baseline_activity_structure = str(pre_send.response_activity_structure or "")
+        fallback_probe_ms = 250
+        while True:
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                return None
+            wait_ms = max(1, min(fallback_probe_ms, math.ceil(remaining_seconds * 1000)))
+            await self.wait_for_page_observation(timeout_ms=wait_ms, dom_only=True)
             snapshot = await self.assert_ownership()
-            stop_seen = stop_seen or bool(snapshot.stop_visible)
             candidate = unique_new_user_message(snapshot.messages, baseline)
-            # An exact unique new user turn is authoritative proof of Send acceptance.
-            # When expected_prompt is given, the candidate text must match the sent
-            # prompt to prevent accepting an unrelated manual user turn.
-            # Stop + assistant evidence is the supplemental fallback when user identity
-            # is unavailable (e.g. markerless sends or delayed DOM hydration).
+            # Preserve exact user-turn acceptance when it is available. Response-bound
+            # DOM evidence also proves the confirmed click was accepted without requiring
+            # prompt text, message identity, conversation identity, or a Stop control.
             if candidate is not None:
                 if expected_prompt is None or rendered_user_text_matches(candidate.text, expected_prompt):
                     accepted_user = candidate
@@ -5277,21 +5281,21 @@ class ChatGPTPage:
                 and message.message_id not in baseline.message_ids
                 for message in assistants
             ):
-                assistant_signal = "assistant_message"
-            else:
-                activity_turn_id = str(snapshot.response_activity_turn_id or "")
-                if activity_turn_id and activity_turn_id != baseline_activity_turn_id:
-                    assistant_signal = "response_activity_turn"
-                else:
-                    activity, activity_length = response_activity_signature(
-                        snapshot, baseline
-                    )
-                    if activity_length > 0 and activity != baseline_activity:
-                        assistant_signal = "assistant_activity"
-            if stop_seen and assistant_signal is not None:
-                return assistant_signal, accepted_user
-            await asyncio.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-        return None
+                return "assistant_message", accepted_user
+            activity_turn_id = str(snapshot.response_activity_turn_id or "")
+            if activity_turn_id and activity_turn_id != baseline_activity_turn_id:
+                return "response_activity_turn", accepted_user
+            activity, activity_length = response_activity_signature(snapshot, baseline)
+            activity_structure = str(snapshot.response_activity_structure or "")
+            if (
+                activity_length > 0 and activity != baseline_activity
+            ) or (
+                activity_structure
+                and activity_structure != baseline_activity_structure
+            ):
+                return "assistant_activity", accepted_user
+            if snapshot.stop_visible:
+                return "stop_button", accepted_user
 
     async def _prepare_prompt_locked(
         self,
@@ -5471,7 +5475,7 @@ class ChatGPTPage:
                     )
                     if acceptance is None:
                         raise SendRecoveryError(
-                            "send click produced no Stop + new assistant-output evidence within "
+                            "send click produced no response-bound DOM evidence within "
                             f"{acceptance_timeout_ms / 1000:g} seconds"
                         )
                     accepted_via, accepted_user = acceptance
@@ -5483,8 +5487,7 @@ class ChatGPTPage:
                         # Send is already proven; stale-composer cleanup must not
                         # turn a running role back into a send failure.
                         pass
-                    # Send acceptance already requires observing Stop after the click,
-                    # so callers do not need a second Stop wait here.
+                    # Response-bound DOM evidence already proves this one click was accepted.
                     return SendReceipt(
                         prompt=prompt,
                         prompt_sha256=prompt_digest(prompt),

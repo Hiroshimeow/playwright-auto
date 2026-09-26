@@ -163,32 +163,59 @@ def read_recent_live_events(
     if limit < 1 or limit > 1000:
         raise ValueError("limit must be between 1 and 1000")
     target = Path(path) if path is not None else _LIVE_EVENT_LOG
-    if not target.exists():
-        return []
     expected_task = str(task_id or "").strip()
     expected_role = str(role or "").strip().upper()
     events: list[dict[str, Any]] = []
-    for line_number, line in enumerate(
-        target.read_text(encoding="utf-8", errors="replace").splitlines(), start=1
-    ):
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(value, dict):
-            continue
-        if expected_task and str(value.get("task_id") or "") != expected_task:
-            continue
-        if expected_role:
-            event_role = str(value.get("role") or "").strip().upper()
-            if event_role != expected_role and not event_role.endswith(f"-{expected_role}"):
-                continue
-        if not str(value.get("event_id") or "").strip():
-            value["event_id"] = (
-                f"legacy-live-{line_number}-{hashlib.sha256(line.encode('utf-8')).hexdigest()[:16]}"
-            )
-        events.append(value)
-    return events[-limit:]
+    chunk_size = 64 * 1024
+    try:
+        with open_shared_read(target) as handle:
+            handle.seek(0, os.SEEK_END)
+            cursor = handle.tell()
+            leading_fragment = b""
+            first_chunk = True
+            while cursor > 0 and len(events) < limit:
+                read_size = min(chunk_size, cursor)
+                cursor -= read_size
+                handle.seek(cursor)
+                chunk = handle.read(read_size)
+                data = chunk + leading_fragment
+                parts = data.split(b"\n")
+                if first_chunk and data and not data.endswith(b"\n"):
+                    parts.pop()
+                first_chunk = False
+                if cursor > 0:
+                    leading_fragment = parts.pop(0) if parts else data
+                else:
+                    leading_fragment = b""
+                for raw_line in reversed(parts):
+                    if len(events) >= limit:
+                        break
+                    raw_line = raw_line.rstrip(b"\r")
+                    if not raw_line:
+                        continue
+                    try:
+                        value = json.loads(raw_line.decode("utf-8", errors="replace"))
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(value, dict):
+                        continue
+                    if expected_task and str(value.get("task_id") or "") != expected_task:
+                        continue
+                    if expected_role:
+                        event_role = str(value.get("role") or "").strip().upper()
+                        if (
+                            event_role != expected_role
+                            and not event_role.endswith(f"-{expected_role}")
+                        ):
+                            continue
+                    if not str(value.get("event_id") or "").strip():
+                        digest = hashlib.sha256(raw_line).hexdigest()[:24]
+                        value["event_id"] = f"legacy-live-{digest}"
+                    events.append(value)
+    except FileNotFoundError:
+        return []
+    events.reverse()
+    return events
 
 
 def _empty_allow_summary() -> dict[str, Any]:

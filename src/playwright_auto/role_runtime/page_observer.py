@@ -352,8 +352,8 @@ class PageObserver:
         self.streams.clear()
         self.network_wake.set()
 
-    async def wait(self, seconds: float = 5) -> bool:
-        events = [self.dom_wake, self.network_wake]
+    async def wait(self, seconds: float = 5, *, dom_only: bool = False) -> bool:
+        events = [self.dom_wake] if dom_only else [self.dom_wake, self.network_wake]
         if any(event.is_set() for event in events):
             for event in events:
                 event.clear()

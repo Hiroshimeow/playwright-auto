@@ -648,6 +648,19 @@ function workflowLive(detail, selectedRole, liveState = {}) {
   identity.append(el("strong", role || "All roles"));
   identity.append(el("span", selected?.chat_url || "No conversation URL", "muted"));
   header.append(identity);
+  const liveControls = el("div", null, "live-stream-controls");
+  const follow = el("button", "Follow active role", "role-url-action");
+  follow.type = "button";
+  follow.dataset.followActiveRole = "";
+  follow.dataset.taskId = detail.task_id;
+  follow.disabled = detail.status !== "RUNNING" || !detail.active_role;
+  liveControls.append(follow);
+  const jumpLatest = el("button", "Jump to latest", "role-url-action live-jump-latest");
+  jumpLatest.type = "button";
+  jumpLatest.dataset.liveJumpLatest = "";
+  jumpLatest.hidden = true;
+  liveControls.append(jumpLatest);
+  header.append(liveControls);
   if (selected?.chat_url) {
     const actions = el("div", null, "role-url-actions");
     const open = el("a", "Open ↗", "role-url-action");
@@ -671,35 +684,45 @@ function workflowLive(detail, selectedRole, liveState = {}) {
 
   const rawItems = liveState.items || [];
   const transcript = new Map();
-  for (const event of rawItems) {
-    if (String(event.source || "").toUpperCase() !== "TRANSCRIPT") continue;
-    const values = event.values || {};
-    const messageId = String(values.message_id || "");
-    const author = String(values.author || "assistant").toLowerCase();
-    const messageText = String(values.text || "");
-    if (!messageId || !messageText) continue;
-    const transcriptKey = author + ":" + (values.turn_id ? "turn:" + values.turn_id : "message:" + messageId);
-    transcript.set(transcriptKey, {
-      author,
-      messageId,
-      turnId: values.turn_id || null,
-      text: messageText,
-      textLength: Number(values.text_length || messageText.length),
-      complete: values.complete !== false,
-      at: event.at,
-      atEpoch: Number(event.at_epoch || Date.parse(event.at || "") / 1000 || 0),
-    });
+  if (!Array.isArray(liveState.messages)) {
+    for (const event of rawItems) {
+      if (String(event.source || "").toUpperCase() !== "TRANSCRIPT") continue;
+      const values = event.values || {};
+      const messageId = String(values.message_id || "").trim();
+      const author = String(values.author || "assistant").toLowerCase();
+      const turnId = String(values.turn_id || "").trim();
+      const messageText = String(values.text || "");
+      const transcriptKey = messageId || (author && turnId ? author + ":" + turnId : "");
+      if (!transcriptKey || !messageText) continue;
+      transcript.set(transcriptKey, {
+        key: transcriptKey,
+        author,
+        messageId: messageId || null,
+        turnId: turnId || null,
+        text: messageText,
+        textLength: Number(values.text_length || messageText.length),
+        complete: values.complete !== false,
+        at: event.at,
+        atEpoch: Number(event.at_epoch || Date.parse(event.at || "") / 1000 || 0),
+      });
+    }
   }
-  const messages = [...transcript.values()].sort((a, b) => a.atEpoch - b.atEpoch);
+  const messages = Array.isArray(liveState.messages)
+    ? liveState.messages
+    : [...transcript.values()].sort((a, b) => a.atEpoch - b.atEpoch);
 
-  if (liveState.status === "loading" && !rawItems.length) {
-    section.append(el("p", "Loading live transcript…", "muted"));
+  const transcriptSlot = el("div", null, "live-transcript-slot");
+  transcriptSlot.dataset.liveTranscriptSlot = "";
+  if (liveState.status === "loading" && !rawItems.length && !messages.length) {
+    transcriptSlot.append(el("p", "Loading live transcript…", "muted"));
   } else if (!messages.length) {
-    section.append(el("p", "No transcript messages have been captured for this role yet.", "muted"));
+    transcriptSlot.append(el("p", "No transcript messages have been captured for this role yet.", "muted"));
   } else {
     const transcriptList = el("div", null, "live-transcript-list");
+    transcriptList.dataset.liveTranscriptList = "";
     for (const message of messages) {
       const card = el("article", null, "live-transcript-message transcript-" + message.author);
+      card.dataset.liveMessageKey = message.key || message.messageId || (message.author + ":" + message.turnId);
       const head = el("div", null, "live-transcript-head");
       const label = message.author === "user" ? "USER" : message.author.toUpperCase();
       const time = el("time", timelineTime(message.at));
@@ -717,7 +740,7 @@ function workflowLive(detail, selectedRole, liveState = {}) {
       const collapseUser = message.author === "user" && message.text.length > 420;
       if (collapseUser) {
         const disclosure = el("details", null, "live-transcript-disclosure");
-        disclosure.dataset.disclosureKey = "transcript-" + (message.turnId || message.messageId);
+        disclosure.dataset.disclosureKey = "transcript-" + (message.key || message.messageId || message.turnId);
         const summary = el("summary", null, "live-transcript-summary");
         summary.append(
           el("pre", message.text, "live-transcript-text live-transcript-preview"),
@@ -736,12 +759,18 @@ function workflowLive(detail, selectedRole, liveState = {}) {
           "muted live-transcript-truncated",
         ));
       }
+      card.dataset.liveSignature = JSON.stringify([
+        message.text, message.textLength, message.complete, message.at,
+      ]);
       transcriptList.append(card);
     }
-    section.append(transcriptList);
+    transcriptSlot.append(transcriptList);
   }
+  section.append(transcriptSlot);
 
-  const auditItems = rawItems.filter(event => String(event.source || "").toUpperCase() !== "TRANSCRIPT");
+  const auditItems = Array.isArray(liveState.audit)
+    ? liveState.audit
+    : rawItems.filter(event => String(event.source || "").toUpperCase() !== "TRANSCRIPT");
   const audit = el("details", null, "live-audit-signals");
   audit.dataset.disclosureKey = "live-audit-signals";
   audit.open = true;
@@ -761,6 +790,7 @@ function workflowLive(detail, selectedRole, liveState = {}) {
   const legend = el("div", null, "live-legend");
   for (const source of ["DOM", "LISTEN", "CTRL", "ACTION"]) {
     const chip = el("span", source, "live-source source-" + source.toLowerCase());
+    chip.dataset.liveSourceCount = source;
     chip.append(el("b", String(sourceCounts[source] || 0)));
     chip.title = sourceHelp[source];
     legend.append(chip);
@@ -773,8 +803,10 @@ function workflowLive(detail, selectedRole, liveState = {}) {
     auditBody.append(el("p", "No audit signals have been captured for this role yet.", "muted"));
   } else {
     const list = el("div", null, "live-event-list");
+    list.dataset.liveAuditList = "";
     for (const event of [...auditItems].reverse()) {
       const card = el("article", null, "live-event");
+      card.dataset.liveEventId = event.event_id || JSON.stringify([event.at, event.source, event.kind]);
       const top = el("div", null, "live-event-head");
       const time = el("time", timelineTime(event.at));
       if (event.at) {
@@ -821,6 +853,172 @@ function workflowLive(detail, selectedRole, liveState = {}) {
   audit.append(auditBody);
   section.append(audit);
   return section;
+}
+
+function directLiveChild(node, className) {
+  return [...node.children].find(child => child.classList.contains(className)) || null;
+}
+
+export function patchLiveMessageNode(currentNode, nextNode) {
+  currentNode.className = nextNode.className;
+  currentNode.dataset.liveMessageKey = nextNode.dataset.liveMessageKey;
+  currentNode.dataset.liveSignature = nextNode.dataset.liveSignature;
+
+  const currentHead = directLiveChild(currentNode, "live-transcript-head");
+  const nextHead = directLiveChild(nextNode, "live-transcript-head");
+  if (!currentHead || !nextHead) {
+    currentNode.replaceChildren(...nextNode.childNodes);
+    return;
+  }
+
+  const currentLabel = currentHead.querySelector("strong");
+  const nextLabel = nextHead.querySelector("strong");
+  if (currentLabel && nextLabel) currentLabel.textContent = nextLabel.textContent;
+
+  const currentTime = currentHead.querySelector("time");
+  const nextTime = nextHead.querySelector("time");
+  if (currentTime && nextTime) {
+    currentTime.textContent = nextTime.textContent;
+    currentTime.dateTime = nextTime.dateTime;
+    currentTime.title = nextTime.title;
+    if (nextTime.dataset.timeAt !== undefined) currentTime.dataset.timeAt = nextTime.dataset.timeAt;
+    else delete currentTime.dataset.timeAt;
+  }
+
+  const currentState = currentHead.querySelector(".transcript-state");
+  const nextState = nextHead.querySelector(".transcript-state");
+  if (currentState && nextState) {
+    currentState.textContent = nextState.textContent;
+    currentState.className = nextState.className;
+  }
+
+  const currentDisclosure = directLiveChild(currentNode, "live-transcript-disclosure");
+  const nextDisclosure = directLiveChild(nextNode, "live-transcript-disclosure");
+  const currentText = directLiveChild(currentNode, "live-transcript-text");
+  const nextText = directLiveChild(nextNode, "live-transcript-text");
+  if (currentDisclosure && nextDisclosure) {
+    currentDisclosure.dataset.disclosureKey = nextDisclosure.dataset.disclosureKey;
+    const currentPreview = currentDisclosure.querySelector(".live-transcript-preview");
+    const nextPreview = nextDisclosure.querySelector(".live-transcript-preview");
+    const currentFull = currentDisclosure.querySelector(".live-transcript-full");
+    const nextFull = nextDisclosure.querySelector(".live-transcript-full");
+    if (currentPreview && nextPreview) currentPreview.textContent = nextPreview.textContent;
+    if (currentFull && nextFull) currentFull.textContent = nextFull.textContent;
+  } else if (currentText && nextText) {
+    currentText.textContent = nextText.textContent;
+    currentText.className = nextText.className;
+  } else {
+    const currentBody = currentDisclosure || currentText;
+    const nextBody = nextDisclosure || nextText;
+    if (currentBody && nextBody) currentBody.replaceWith(nextBody);
+    else if (currentBody) currentBody.remove();
+    else if (nextBody) currentNode.append(nextBody);
+  }
+
+  const currentTruncated = directLiveChild(currentNode, "live-transcript-truncated");
+  const nextTruncated = directLiveChild(nextNode, "live-transcript-truncated");
+  if (currentTruncated && nextTruncated) {
+    currentTruncated.textContent = nextTruncated.textContent;
+    currentTruncated.className = nextTruncated.className;
+  } else if (currentTruncated) {
+    currentTruncated.remove();
+  } else if (nextTruncated) {
+    currentNode.append(nextTruncated);
+  }
+}
+
+export function reconcileLiveList(currentList, nextList, keyName) {
+  const existing = new Map(
+    [...currentList.children].map(node => [node.dataset[keyName], node]),
+  );
+  let cursor = currentList.firstChild;
+  for (const nextNode of [...nextList.children]) {
+    const key = nextNode.dataset[keyName];
+    let currentNode = existing.get(key);
+    if (currentNode) {
+      existing.delete(key);
+      if (
+        keyName === "liveMessageKey"
+        && currentNode.dataset.liveSignature !== nextNode.dataset.liveSignature
+      ) {
+        patchLiveMessageNode(currentNode, nextNode);
+      }
+    } else {
+      currentNode = nextNode;
+    }
+    if (currentNode !== cursor) currentList.insertBefore(currentNode, cursor);
+    cursor = currentNode.nextSibling;
+  }
+  for (const node of existing.values()) node.remove();
+}
+
+function patchWorkflowLive(root, currentLive, detail, selectedRole, liveState) {
+  const nextLive = workflowLive(detail, selectedRole, liveState);
+  const nearBottom = root.scrollHeight - root.scrollTop - root.clientHeight < 80;
+  const oldMessageCount = currentLive.querySelectorAll("[data-live-message-key]").length;
+  const oldAuditCount = currentLive.querySelectorAll("[data-live-event-id]").length;
+
+  const currentSlot = currentLive.querySelector("[data-live-transcript-slot]");
+  const nextSlot = nextLive.querySelector("[data-live-transcript-slot]");
+  const currentMessages = currentSlot?.querySelector("[data-live-transcript-list]");
+  const nextMessages = nextSlot?.querySelector("[data-live-transcript-list]");
+  if (currentSlot && nextSlot) {
+    if (currentMessages && nextMessages) {
+      reconcileLiveList(currentMessages, nextMessages, "liveMessageKey");
+    } else if (currentSlot.innerHTML !== nextSlot.innerHTML) {
+      currentSlot.replaceChildren(...nextSlot.childNodes);
+    }
+  }
+
+  const currentAudit = currentLive.querySelector(".live-audit-signals");
+  const nextAudit = nextLive.querySelector(".live-audit-signals");
+  if (currentAudit && nextAudit) {
+    const currentSummary = currentAudit.querySelector(":scope > summary");
+    const nextSummary = nextAudit.querySelector(":scope > summary");
+    if (currentSummary && nextSummary) currentSummary.textContent = nextSummary.textContent;
+    for (const chip of nextAudit.querySelectorAll("[data-live-source-count]")) {
+      const source = chip.dataset.liveSourceCount;
+      const currentChip = currentAudit.querySelector(`[data-live-source-count="${source}"]`);
+      if (currentChip) currentChip.querySelector("b").textContent = chip.querySelector("b").textContent;
+    }
+    const currentList = currentAudit.querySelector("[data-live-audit-list]");
+    const nextList = nextAudit.querySelector("[data-live-audit-list]");
+    if (currentList && nextList) {
+      reconcileLiveList(currentList, nextList, "liveEventId");
+    } else {
+      const currentBody = currentAudit.querySelector(".live-audit-signals-body");
+      const nextBody = nextAudit.querySelector(".live-audit-signals-body");
+      if (currentBody && nextBody) {
+        const wasOpen = currentAudit.open;
+        currentBody.replaceChildren(...nextBody.childNodes);
+        currentAudit.open = wasOpen;
+      }
+    }
+  }
+
+  const newMessageCount = currentLive.querySelectorAll("[data-live-message-key]").length;
+  const newAuditCount = currentLive.querySelectorAll("[data-live-event-id]").length;
+  const jump = currentLive.querySelector("[data-live-jump-latest]");
+  if (nearBottom) {
+    root.scrollTop = root.scrollHeight;
+    if (jump) jump.hidden = true;
+  } else if (jump && (newMessageCount > oldMessageCount || newAuditCount > oldAuditCount)) {
+    jump.hidden = false;
+  }
+}
+
+function scheduleWorkflowLivePatch(root, currentLive, detail, selectedRole, liveState, signature, liveSignature) {
+  root._pendingLiveState = {currentLive, detail, selectedRole, liveState, signature, liveSignature};
+  if (root._liveFrame) return;
+  root._liveFrame = requestAnimationFrame(() => {
+    root._liveFrame = null;
+    const pending = root._pendingLiveState;
+    root._pendingLiveState = null;
+    if (!pending || !pending.currentLive.isConnected) return;
+    patchWorkflowLive(root, pending.currentLive, pending.detail, pending.selectedRole, pending.liveState);
+    root.dataset.signature = pending.signature;
+    root.dataset.liveSignature = pending.liveSignature;
+  });
 }
 
 function workflowOverview(detail, timeline, selectedRole, endpoints) {
@@ -1009,20 +1207,9 @@ export function renderTaskDetail(
         );
         return;
       }
-      const previousLiveDetails = [...currentLive.querySelectorAll("details[data-disclosure-key]")];
-      const knownLiveKeys = new Set(previousLiveDetails.map(details => details.dataset.disclosureKey));
-      const openLiveKeys = new Set(
-        previousLiveDetails.filter(details => details.open).map(details => details.dataset.disclosureKey),
+      scheduleWorkflowLivePatch(
+        root, currentLive, detail, selectedRole, liveState, signature, liveSignature,
       );
-      const nextLive = workflowLive(detail, selectedRole, liveState);
-      currentLive.replaceWith(nextLive);
-      for (const details of nextLive.querySelectorAll("details[data-disclosure-key]")) {
-        if (knownLiveKeys.has(details.dataset.disclosureKey)) {
-          details.open = openLiveKeys.has(details.dataset.disclosureKey);
-        }
-      }
-      root.dataset.signature = signature;
-      root.dataset.liveSignature = liveSignature;
       return;
     }
   }

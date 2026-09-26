@@ -51,6 +51,34 @@ def start_upstream():
     return server, thread
 
 
+class SSEUpstreamHandler(__import__("http.server").server.BaseHTTPRequestHandler):
+    def log_message(self, _format, *_args):
+        return
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.end_headers()
+        self.wfile.write(b"event: stream.ready\ndata: {\"seq\":0}\n\n")
+        self.wfile.flush()
+        self.server.first_sent.set()  # type: ignore[attr-defined]
+        self.server.release.wait(timeout=5)  # type: ignore[attr-defined]
+        self.wfile.write(b"id: epoch:1\nevent: audit.append\ndata: {\"seq\":1}\n\n")
+        self.wfile.flush()
+
+
+def start_sse_upstream():
+    server = __import__("http.server").server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), SSEUpstreamHandler,
+    )
+    server.first_sent = threading.Event()
+    server.release = threading.Event()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
 def start_frontend(tmp_path: Path, *, api_port: int, auth_password: str | None = None):
     config = load_cdpa_config(None, repository_root=tmp_path)
     config = __import__("dataclasses").replace(config, dashboard_api_port=api_port)
@@ -144,6 +172,39 @@ def test_proxy_preserves_method_query_body_status_content_type_etag_and_idempote
             "idempotency": "same-key",
         }
     finally:
+        server.shutdown()
+        upstream.shutdown()
+        thread.join(timeout=5)
+        upstream_thread.join(timeout=5)
+
+
+def test_proxy_streams_sse_without_buffering_until_upstream_eof(tmp_path: Path):
+    upstream, upstream_thread = start_sse_upstream()
+    server, thread = start_frontend(tmp_path, api_port=upstream.server_address[1])
+    connection = http.client.HTTPConnection(
+        "127.0.0.1", server.server_address[1], timeout=5,
+    )
+    try:
+        connection.request("GET", "/api/tasks/task-a/live/stream?role=DEV")
+        response = connection.getresponse()
+        assert response.status == 200
+        assert response.headers["Content-Type"] == "text/event-stream"
+        assert response.headers["Cache-Control"] == "no-cache, no-transform"
+        assert "Content-Length" not in response.headers
+        assert upstream.first_sent.wait(timeout=1)
+
+        assert response.readline() == b"event: stream.ready\n"
+        assert response.readline() == b'data: {"seq":0}\n'
+        assert response.readline() == b"\n"
+
+        upstream.release.set()
+        assert response.readline() == b"id: epoch:1\n"
+        assert response.readline() == b"event: audit.append\n"
+        assert response.readline() == b'data: {"seq":1}\n'
+        assert response.readline() == b"\n"
+    finally:
+        connection.close()
+        upstream.release.set()
         server.shutdown()
         upstream.shutdown()
         thread.join(timeout=5)
@@ -453,7 +514,7 @@ def test_notify_frontend_contract_reuses_secondary_report_path_and_preserves_his
     assert 'if (current.drawer === "history") renderHistory(roots.secondaryContent, current);' in app
     assert 'if (current.drawer === "notify") renderNotify(roots.secondaryContent, current);' in app
     assert 'if (view === "notify") delete roots.secondaryContent.dataset.secondaryView;' in app
-    cache_key = "20260925-live-audit-ux-v3"
+    cache_key = "20260925-live-sse-v1"
     assert f'/assets/app.js?v={cache_key}' in html
     assert f'./views/task_detail.js?v={cache_key}' in app
     assert f'./views/notify.js?v={cache_key}' in app
@@ -681,11 +742,12 @@ def test_dashboard_exposes_role_urls_live_audit_and_page_level_quick_navigation(
     assert 'for (const source of ["DOM", "LISTEN", "CTRL", "ACTION"])' in detail
     assert 'audit.dataset.disclosureKey = "live-audit-signals"' in detail
     assert 'audit.open = true' in detail
-    assert 'currentLive.replaceWith(nextLive)' in detail
-    assert 'knownLiveKeys.has(details.dataset.disclosureKey)' in detail
+    assert 'currentLive.replaceWith(nextLive)' not in detail
+    assert 'scheduleWorkflowLivePatch(' in detail
+    assert 'reconcileLiveList(' in detail
     assert 'message.author === "user" && message.text.length > 420' in detail
-    assert 'disclosure.dataset.disclosureKey = "transcript-" + (message.turnId || message.messageId)' in detail
-    assert 'current.liveEventsByScope.set(scope, response.data.items || [])' in app
+    assert 'message.key || message.messageId || message.turnId' in detail
+    assert 'current.liveEventsByScope.set(scope, view)' in app
     assert 'summary?.status === "RUNNING" ? summary.active_role : null' in app
     assert 'selectTask(taskId, cached, preferredRole)' in app
     assert '.page-rail {' in css
@@ -707,7 +769,8 @@ def test_dashboard_exposes_role_urls_live_audit_and_page_level_quick_navigation(
     assert 'sourceCounts[source]' in detail
     assert 'audit.dataset.disclosureKey = "live-audit-signals"' in detail
     assert 'live-transcript-preview' in detail
-    assert 'currentLive.replaceWith(nextLive)' in detail
+    assert 'currentLive.replaceWith(nextLive)' not in detail
+    assert 'requestAnimationFrame(() =>' in detail
     assert 'root.dataset.baseSignature === baseSignature' in detail
     assert 'const preferredRole = summary?.status === "RUNNING" ? summary.active_role : null' in app
     assert 'selectTask(taskId, cached, preferredRole)' in app
@@ -1028,7 +1091,7 @@ def test_board_lane_materialization_keeps_commands_after_operational_lanes():
 
     # board.js and its importing entrypoint both get fresh cache identities.
     assert './views/board.js?v=20260915-operator-ux-v1' in app
-    assert '/assets/app.js?v=20260925-live-audit-ux-v3' in html
+    assert '/assets/app.js?v=20260925-live-sse-v1' in html
 
 
 def test_dashboard_compact_layout_contract_keeps_operational_content_visible():
@@ -1036,7 +1099,7 @@ def test_dashboard_compact_layout_contract_keeps_operational_content_visible():
     css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
 
     # CSS byte changes must publish under a new cache identity.
-    assert '/assets/dashboard.css?v=20260925-live-audit-ux-v3' in html
+    assert '/assets/dashboard.css?v=20260925-live-sse-v1' in html
 
     # Endpoint scope is one compact equal-height topology; required operational
     # fields must not be hidden behind a fixed maximum card height.
@@ -1063,8 +1126,8 @@ def test_dashboard_dense_operator_layout_contract():
     css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
 
     # Published frontend bytes use a fresh cache identity through the changed import graph.
-    assert '/assets/dashboard.css?v=20260925-live-audit-ux-v3' in html
-    assert '/assets/app.js?v=20260925-live-audit-ux-v3' in html
+    assert '/assets/dashboard.css?v=20260925-live-sse-v1' in html
+    assert '/assets/app.js?v=20260925-live-sse-v1' in html
     assert './views/board.js?v=20260915-operator-ux-v1' in app
     assert './views/browsers.js?v=20260915-endpoint-all-v1' in app
 
@@ -1251,4 +1314,435 @@ def test_health_dashboard_report_model_does_not_show_prior_turn_as_current():
         "current": None,
         "history": ["/dev-turn1"],
         "coverage": "0/1",
+    }
+
+
+def test_live_stream_reducer_uses_message_identity_and_listen_final_precedence():
+    module = (ASSET_ROOT / "live_stream.js").resolve().as_uri()
+    script = f"""
+      import {{ createLiveReducer }} from {json.dumps(module)};
+      const reducer = createLiveReducer();
+      reducer.applySnapshot([
+        {{
+          event_id: "dom-partial",
+          source: "TRANSCRIPT",
+          kind: "message",
+          at: "2026-09-25T00:00:01Z",
+          values: {{
+            author: "assistant", turn_id: "turn-1", text: "partial",
+            complete: false, projection_source: "dom",
+          }},
+        }},
+        {{
+          event_id: "listen-final",
+          source: "TRANSCRIPT",
+          kind: "message",
+          at: "2026-09-25T00:00:02Z",
+          values: {{
+            author: "assistant", message_id: "message-1", turn_id: "turn-1",
+            text: "final", complete: true, projection_source: "listen",
+          }},
+        }},
+        {{
+          event_id: "dom-late",
+          source: "TRANSCRIPT",
+          kind: "message",
+          at: "2026-09-25T00:00:03Z",
+          values: {{
+            author: "assistant", turn_id: "turn-1", text: "partial again",
+            complete: false, projection_source: "dom",
+          }},
+        }},
+      ]);
+      const view = reducer.viewModel();
+      console.log(JSON.stringify(view.messages.map(message => ({{
+        key: message.key,
+        messageId: message.messageId,
+        text: message.text,
+        authoritative: message.authoritative,
+      }}))));
+    """
+    result = __import__("subprocess").run(
+        ["node", "--input-type=module", "-e", script],
+        check=True, capture_output=True, text=True,
+    )
+    assert json.loads(result.stdout) == [{
+        "key": "message-1",
+        "messageId": "message-1",
+        "text": "final",
+        "authoritative": True,
+    }]
+
+
+def test_live_stream_reducer_preserves_distinct_real_message_ids_in_same_turn():
+    module = (ASSET_ROOT / "live_stream.js").resolve().as_uri()
+    script = f"""
+      import {{ createLiveReducer }} from {json.dumps(module)};
+      const reducer = createLiveReducer();
+      reducer.applySnapshot([
+        {{
+          event_id: "analysis-event",
+          source: "TRANSCRIPT",
+          kind: "message",
+          at: "2026-09-25T00:00:01Z",
+          values: {{
+            author: "assistant", message_id: "a1-analysis", turn_id: "t1",
+            text: "analysis", complete: true, projection_source: "dom",
+          }},
+        }},
+        {{
+          event_id: "final-event",
+          source: "TRANSCRIPT",
+          kind: "message",
+          at: "2026-09-25T00:00:02Z",
+          values: {{
+            author: "assistant", message_id: "a1-final", turn_id: "t1",
+            text: "final", complete: true, projection_source: "dom",
+          }},
+        }},
+      ]);
+      console.log(JSON.stringify(reducer.viewModel().messages.map(message => ({{
+        key: message.key,
+        messageId: message.messageId,
+        text: message.text,
+        turnId: message.turnId,
+      }}))));
+    """
+    result = __import__("subprocess").run(
+        ["node", "--input-type=module", "-e", script],
+        check=True, capture_output=True, text=True,
+    )
+    assert json.loads(result.stdout) == [
+        {
+            "key": "a1-analysis",
+            "messageId": "a1-analysis",
+            "text": "analysis",
+            "turnId": "t1",
+        },
+        {
+            "key": "a1-final",
+            "messageId": "a1-final",
+            "text": "final",
+            "turnId": "t1",
+        },
+    ]
+
+
+def test_live_stream_reducer_alias_is_unique_and_ambiguity_safe():
+    module = (ASSET_ROOT / "live_stream.js").resolve().as_uri()
+    script = f"""
+      import {{ createLiveReducer }} from {json.dumps(module)};
+      const event = (eventId, messageId, turnId, text) => ({{
+        event_id: eventId,
+        source: "TRANSCRIPT",
+        kind: "message",
+        values: {{
+          author: "assistant",
+          ...(messageId ? {{message_id: messageId}} : {{}}),
+          turn_id: turnId,
+          text,
+          complete: true,
+          projection_source: "dom",
+        }},
+      }});
+
+      const duplicate = createLiveReducer();
+      duplicate.applySnapshot([
+        event("d1", "a1", "t1", "real1"),
+        event("d2", null, "t1", "fallback"),
+        event("d3", "a1", "t1", "real2"),
+      ]);
+
+      const ambiguous = createLiveReducer();
+      ambiguous.applySnapshot([
+        event("a1", null, "t1", "fallback-first"),
+        event("a2", "a1-analysis", "t1", "analysis"),
+        event("a3", "a1-final", "t1", "final"),
+        event("a4", null, "t1", "fallback-late"),
+      ]);
+
+      const bounded = createLiveReducer();
+      const items = [];
+      for (let i = 0; i < 120; i += 1) {{
+        const turn = "turn-" + i;
+        items.push(event("b-" + i + "-fallback", null, turn, "fallback-" + i));
+        items.push(event("b-" + i + "-analysis", "analysis-" + i, turn, "analysis-" + i));
+        items.push(event("b-" + i + "-final", "final-" + i, turn, "final-" + i));
+      }}
+      bounded.applySnapshot(items);
+
+      console.log(JSON.stringify({{
+        duplicate: {{
+          order: duplicate.state.messageOrder,
+          mapSize: duplicate.state.messages.size,
+          messages: duplicate.viewModel().messages.map(message => ({{
+            key: message.key, messageId: message.messageId, text: message.text,
+          }})),
+        }},
+        ambiguous: {{
+          alias: ambiguous.state.turnAliases.get("assistant:t1"),
+          messages: ambiguous.viewModel().messages.map(message => ({{
+            key: message.key, messageId: message.messageId, text: message.text,
+          }})),
+        }},
+        bounded: {{
+          orderSize: bounded.state.messageOrder.length,
+          uniqueOrderSize: new Set(bounded.state.messageOrder).size,
+          mapSize: bounded.state.messages.size,
+          aliasSize: bounded.state.turnAliases.size,
+        }},
+      }}));
+    """
+    result = __import__("subprocess").run(
+        ["node", "--input-type=module", "-e", script],
+        check=True, capture_output=True, text=True,
+    )
+    assert json.loads(result.stdout) == {
+        "duplicate": {
+            "order": ["a1"],
+            "mapSize": 1,
+            "messages": [{"key": "a1", "messageId": "a1", "text": "real2"}],
+        },
+        "ambiguous": {
+            "alias": None,
+            "messages": [
+                {"key": "a1-analysis", "messageId": "a1-analysis", "text": "analysis"},
+                {"key": "a1-final", "messageId": "a1-final", "text": "final"},
+                {"key": "assistant:t1", "messageId": None, "text": "fallback-late"},
+            ],
+        },
+        "bounded": {
+            "orderSize": 100,
+            "uniqueOrderSize": 100,
+            "mapSize": 100,
+            "aliasSize": 50,
+        },
+    }
+
+
+def test_live_stream_reducer_detects_seq_gap_dedupes_and_bounds_memory():
+    module = (ASSET_ROOT / "live_stream.js").resolve().as_uri()
+    script = f"""
+      import {{ createLiveReducer }} from {json.dumps(module)};
+      const reducer = createLiveReducer();
+      reducer.applySnapshot([], {{epoch: "epoch-a", headSeq: 0}});
+      const first = reducer.applyEnvelope({{
+        type: "audit.append", stream_epoch: "epoch-a", seq: 1,
+        event_id: "audit-1", source: "DOM", kind: "wait_probe",
+      }});
+      const duplicate = reducer.applyEnvelope({{
+        type: "audit.append", stream_epoch: "epoch-a", seq: 1,
+        event_id: "audit-1", source: "DOM", kind: "wait_probe",
+      }});
+      const gap = reducer.applyEnvelope({{
+        type: "audit.append", stream_epoch: "epoch-a", seq: 3,
+        event_id: "audit-3", source: "DOM", kind: "wait_probe",
+      }});
+      const bounded = createLiveReducer();
+      const items = [];
+      for (let i = 0; i < 350; i += 1) {{
+        items.push({{
+          event_id: "audit-" + i, source: "DOM", kind: "wait_probe",
+          at: new Date(1700000000000 + i).toISOString(),
+        }});
+      }}
+      for (let i = 0; i < 130; i += 1) {{
+        items.push({{
+          event_id: "message-event-" + i, source: "TRANSCRIPT", kind: "message",
+          at: new Date(1800000000000 + i).toISOString(),
+          values: {{
+            author: "assistant", message_id: "message-" + i,
+            text: "m" + i, complete: true, projection_source: "listen",
+          }},
+        }});
+      }}
+      bounded.applySnapshot(items);
+      console.log(JSON.stringify({{
+        first, duplicate, gap,
+        resetRequired: reducer.state.resetRequired,
+        audit: bounded.viewModel().audit.length,
+        messages: bounded.viewModel().messages.length,
+        seen: bounded.state.seen.size,
+      }}));
+    """
+    result = __import__("subprocess").run(
+        ["node", "--input-type=module", "-e", script],
+        check=True, capture_output=True, text=True,
+    )
+    assert json.loads(result.stdout) == {
+        "first": True,
+        "duplicate": True,
+        "gap": False,
+        "resetRequired": True,
+        "audit": 300,
+        "messages": 100,
+        "seen": 480,
+    }
+
+
+def test_live_transcript_dom_reconcile_updates_existing_message_in_place():
+    http_server = __import__("http.server").server
+
+    class AssetHandler(http_server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=str(ASSET_ROOT), **kwargs)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = http_server.ThreadingHTTPServer(("127.0.0.1", 0), AssetHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            executable = Path(playwright.chromium.executable_path)
+            if not executable.is_file():
+                __import__("pytest").skip("Playwright Chromium is unavailable")
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                base = f"http://127.0.0.1:{server.server_address[1]}"
+                page.goto(base + "/")
+                result = page.evaluate(
+                    """async url => {
+                      const {reconcileLiveList} = await import(url);
+                      const currentList = document.createElement("div");
+                      const nextList = document.createElement("div");
+                      const current = document.createElement("article");
+                      current.dataset.liveMessageKey = "assistant:turn-1";
+                      current.dataset.liveSignature = "old";
+                      current.className = "live-transcript-message transcript-assistant";
+                      current.innerHTML = '<div class="live-transcript-head"><strong>ASSISTANT</strong><time data-time-at="2026-09-25T00:00:01Z">old time</time><span class="transcript-state streaming">streaming</span></div><pre class="live-transcript-text">ABCDEF</pre>';
+                      const next = document.createElement("article");
+                      next.dataset.liveMessageKey = "assistant:turn-1";
+                      next.dataset.liveSignature = "new";
+                      next.className = "live-transcript-message transcript-assistant";
+                      next.innerHTML = '<div class="live-transcript-head"><strong>ASSISTANT</strong><time data-time-at="2026-09-25T00:00:02Z">new time</time><span class="transcript-state complete">complete</span></div><pre class="live-transcript-text">ABXY</pre>';
+                      currentList.append(current);
+                      nextList.append(next);
+                      const originalCard = current;
+                      const originalState = current.querySelector(".transcript-state");
+                      reconcileLiveList(currentList, nextList, "liveMessageKey");
+                      return {
+                        sameCard: currentList.firstElementChild === originalCard,
+                        sameState: current.querySelector(".transcript-state") === originalState,
+                        text: current.querySelector(".live-transcript-text").textContent,
+                        state: originalState.textContent,
+                        stateClass: originalState.className,
+                        count: currentList.children.length,
+                      };
+                    }""",
+                    base + "/views/task_detail.js",
+                )
+            finally:
+                browser.close()
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+    assert result == {
+        "sameCard": True,
+        "sameState": True,
+        "text": "ABXY",
+        "state": "complete",
+        "stateClass": "transcript-state complete",
+        "count": 1,
+    }
+
+
+def test_live_stream_lifecycle_contract_is_follow_only_and_not_global_polling():
+    app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
+    module = (ASSET_ROOT / "live_stream.js").resolve().as_uri()
+    script = f"""
+      import {{ shouldLiveStream }} from {json.dumps(module)};
+      const task = {{status: "RUNNING", active_role: "DEV"}};
+      console.log(JSON.stringify([
+        shouldLiveStream({{hidden: false, task, selectedTab: "live", focusMode: "FOLLOW", selectedRole: "DEV"}}),
+        shouldLiveStream({{hidden: true, task, selectedTab: "live", focusMode: "FOLLOW", selectedRole: "DEV"}}),
+        shouldLiveStream({{hidden: false, task, selectedTab: "overview", focusMode: "FOLLOW", selectedRole: "DEV"}}),
+        shouldLiveStream({{hidden: false, task, selectedTab: "live", focusMode: "PINNED", selectedRole: "DEV"}}),
+        shouldLiveStream({{hidden: false, task, selectedTab: "live", focusMode: "FOLLOW", selectedRole: "REVIEW"}}),
+      ]));
+    """
+    result = __import__("subprocess").run(
+        ["node", "--input-type=module", "-e", script],
+        check=True, capture_output=True, text=True,
+    )
+    assert json.loads(result.stdout) == [True, False, False, False, False]
+    refresh = app.split("async function refresh()", 1)[1].split("\n}", 1)[0]
+    assert "loadLiveAudit()" not in refresh
+    assert 'current.roleFocusModeByTask.set(role.dataset.taskId, "PINNED")' in app
+    assert 'current.roleFocusModeByTask.set(taskId, "FOLLOW")' in app
+    assert 'document.addEventListener("visibilitychange"' in app
+    assert "liveController.close();" in app
+
+
+def test_live_stream_controller_buffers_bootstrap_keeps_one_source_and_ignores_stale_source():
+    module = (ASSET_ROOT / "live_stream.js").resolve().as_uri()
+    script = f"""
+      import {{ createLiveStreamController }} from {json.dumps(module)};
+      const sources = [];
+      const snapshots = [];
+      const views = [];
+      class FakeSource {{
+        constructor(url) {{
+          this.url = url;
+          this.closed = false;
+          this.listeners = new Map();
+          sources.push(this);
+        }}
+        addEventListener(name, callback) {{ this.listeners.set(name, callback); }}
+        emit(name, data) {{ this.listeners.get(name)?.({{data: JSON.stringify(data)}}); }}
+        close() {{ this.closed = true; }}
+      }}
+      let resolveSnapshot;
+      const controller = createLiveStreamController({{
+        snapshotLoader: scope => new Promise(resolve => {{
+          snapshots.push(scope.key);
+          resolveSnapshot = resolve;
+        }}),
+        onView: view => views.push(view),
+        eventSourceFactory: url => new FakeSource(url),
+      }});
+      const one = {{key: "task:DEV", url: "/stream/dev", snapshotUrl: "/snapshot/dev"}};
+      controller.sync(one);
+      controller.sync(one);
+      sources[0].emit("stream.ready", {{stream_epoch: "epoch", seq: 0}});
+      sources[0].emit("audit.append", {{
+        type: "audit.append", stream_epoch: "epoch", seq: 1,
+        event_id: "event-1", source: "DOM", kind: "wait_probe",
+      }});
+      resolveSnapshot({{items: []}});
+      await new Promise(resolve => setTimeout(resolve, 0));
+      const afterBootstrap = views.at(-1);
+
+      const old = sources[0];
+      const two = {{key: "task:REVIEW", url: "/stream/review", snapshotUrl: "/snapshot/review"}};
+      controller.sync(two);
+      old.emit("audit.append", {{
+        type: "audit.append", stream_epoch: "epoch", seq: 2,
+        event_id: "stale", source: "DOM", kind: "wait_probe",
+      }});
+      console.log(JSON.stringify({{
+        sourceCount: sources.length,
+        firstClosed: old.closed,
+        snapshots,
+        auditIds: afterBootstrap.audit.map(item => item.event_id),
+        currentScope: controller.scopeKey,
+      }}));
+      controller.close();
+    """
+    result = __import__("subprocess").run(
+        ["node", "--input-type=module", "-e", script],
+        check=True, capture_output=True, text=True,
+    )
+    assert json.loads(result.stdout) == {
+        "sourceCount": 2,
+        "firstClosed": True,
+        "snapshots": ["task:DEV"],
+        "auditIds": ["event-1"],
+        "currentScope": "task:REVIEW",
     }

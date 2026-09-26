@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import threading
@@ -36,6 +37,7 @@ from .cdpa_independent import (
 from .cdpa_routes import effective_report_mode
 from .cdpa_runtime_db import IdempotencyConflict, RuntimeDB, RuntimeDBError
 from .observability import mcp_allow_click_summary, read_recent_live_events
+from .live_stream import LiveEnvelope, LiveStreamHub
 from .cdpa_workflow_agents import (
     normalize_workflow_display_name,
     ordered_system_routes,
@@ -86,6 +88,7 @@ class DashboardAPI:
     ) -> None:
         self.config = config
         self.live_event_log = config.repository_root / ".runtime" / "live-events.jsonl"
+        self.live_stream_hub = LiveStreamHub(self.live_event_log)
         self.db = db or RuntimeDB(config.runtime_database)
         self.db.ensure_schema()
         self._system_lock = threading.Lock()
@@ -1152,6 +1155,60 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
             )
         return value
 
+    @staticmethod
+    def _live_role(query: Mapping[str, list[str]]) -> str | None:
+        role = str(query.get("role", [""])[0] or "").strip().upper() or None
+        if role is not None and not re.fullmatch(r"[A-Z][A-Z0-9_-]{0,63}", role):
+            raise APIError(400, "invalid_role", "role is invalid")
+        return role
+
+    def _write_sse(self, event_type: str, data: Mapping[str, Any], *, event_id: str | None = None) -> None:
+        lines: list[str] = []
+        if event_id:
+            lines.append(f"id: {event_id}")
+        lines.append(f"event: {event_type}")
+        lines.append(
+            "data: " + json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        )
+        self.wfile.write(("\n".join(lines) + "\n\n").encode("utf-8"))
+        self.wfile.flush()
+
+    def _stream_live(self, task_id: str, role: str | None) -> None:
+        hub = self.application.live_stream_hub
+        subscription, control = hub.subscribe(
+            task_id,
+            role,
+            last_event_id=self.headers.get("Last-Event-ID"),
+        )
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            if control is not None:
+                self._write_sse(str(control["type"]), control)
+            while not subscription.closed:
+                try:
+                    item = subscription.get(timeout=20.0)
+                except queue.Empty:
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+                    continue
+                if isinstance(item, LiveEnvelope):
+                    self._write_sse(
+                        item.type,
+                        item.as_data(),
+                        event_id=f"{item.stream_epoch}:{item.seq}",
+                    )
+                else:
+                    self._write_sse(str(item.get("type") or "stream.reset"), item)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+        finally:
+            hub.unsubscribe(subscription)
+
     def do_GET(self) -> None:
         try:
             self._get()
@@ -1321,14 +1378,22 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
             next_cursor = _cursor_encode(str(start + limit)) if start + limit < len(timeline) else None
             self._json(200, {"items": items, "next_cursor": next_cursor})
             return
+        if (
+            len(parts) == 5
+            and parts[:2] == ["api", "tasks"]
+            and parts[3:] == ["live", "stream"]
+        ):
+            task_id = validate_task_id(parts[2])
+            if db.get_task_version(task_id) is None:
+                raise APIError(404, "task_not_found", "task does not exist")
+            self._stream_live(task_id, self._live_role(query))
+            return
         if len(parts) == 4 and parts[:2] == ["api", "tasks"] and parts[3] == "live":
             task_id = validate_task_id(parts[2])
             if db.get_task_version(task_id) is None:
                 raise APIError(404, "task_not_found", "task does not exist")
             limit = self._limit(query, default=100, maximum=1000)
-            role = str(query.get("role", [""])[0] or "").strip().upper() or None
-            if role is not None and not re.fullmatch(r"[A-Z][A-Z0-9_-]{0,63}", role):
-                raise APIError(400, "invalid_role", "role is invalid")
+            role = self._live_role(query)
             items = read_recent_live_events(
                 app.live_event_log,
                 limit=limit,
@@ -1572,6 +1637,10 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
 class APIServer(ThreadingHTTPServer):
     daemon_threads = True
     application: DashboardAPI
+
+    def server_close(self) -> None:
+        self.application.live_stream_hub.close()
+        super().server_close()
 
 
 def create_server(

@@ -16,6 +16,7 @@ export const state = {
   selectedTaskId: saved.selectedTaskId || null,
   selectedEndpointId: saved.selectedEndpointId || "all",
   selectedRoleByTask: savedMap(saved.selectedRoleByTask),
+  roleFocusModeByTask: new Map(),
   selectedIndependentTabByTask: savedMap(saved.selectedIndependentTabByTask),
   selectedTaskJumpByTask: savedMap(saved.selectedTaskJumpByTask),
   selectedDetail: null,

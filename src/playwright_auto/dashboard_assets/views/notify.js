@@ -1,4 +1,4 @@
-import {reportBody, workflowReportModel} from "./task_detail.js?v=20260925-live-audit-ux-v3";
+import {reportBody, workflowReportModel} from "./task_detail.js?v=20260925-live-sse-v1";
 
 const NOTIFY_STATUSES = new Set(["DONE", "BLOCKED", "PAUSED", "STOPPED"]);
 
