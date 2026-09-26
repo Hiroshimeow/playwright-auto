@@ -12,7 +12,7 @@ def test_nested_workspace_report_does_not_resolve_from_parent_git_root(tmp_path)
     kwargs.update(workspace=str(nested), expected_report_path=".plan/alpha/PLAN_turn1_task-1.md")
     prompt = PromptBuilder(config).build(**kwargs).text
     assert str(nested / ".plan/alpha/PLAN_turn1_task-1.md") in prompt
-    assert "not its parent or Git's top-level directory" in prompt
+    assert f"Workspace: {nested} (resolve relative report paths here)" in prompt
 
 
 def test_remote_windows_workspace_report_is_unambiguous_on_any_worker_host(tmp_path):

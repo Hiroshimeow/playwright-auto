@@ -648,7 +648,6 @@ def receipt_from_record(
             return receipt
         return replace(
             receipt,
-            accepted_via="user_message_identity",
             user_message_id=accepted_user.message_id,
             user_turn_id=accepted_user.turn_id,
         )

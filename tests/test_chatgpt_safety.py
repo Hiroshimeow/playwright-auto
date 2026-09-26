@@ -110,6 +110,41 @@ def test_provenance_helpers_reject_old_and_non_exact_messages():
     assert [item.message_id for item in new_assistant_turns(current, baseline)] == ["a2"]
 
 
+
+def test_send_acceptance_timeout_does_not_inherit_client_timeout(monkeypatch):
+    import types
+
+    before = snapshot(send_visible=True, send_enabled=True)
+    accepted = MessageSnapshot("user", "u-new", "t-new", "prompt", ())
+    page = DummyPage(before)
+    client = ChatGPTPage(page, timeout_ms=7_200_000)
+    client.binding = PageBinding("page-1", "DEV")
+    observed_timeouts = []
+
+    async def fake_assert(self):
+        return before
+
+    async def fake_prepare(self, *_args, **_kwargs):
+        return None
+
+    async def fake_accept(self, *_args, timeout_ms, **_kwargs):
+        observed_timeouts.append(timeout_ms)
+        return ("exact_user_message", accepted)
+
+    async def fake_click(target, **_kwargs):
+        target.clicks += 1
+
+    client.assert_ownership = types.MethodType(fake_assert, client)
+    client._prepare_prompt_locked = types.MethodType(fake_prepare, client)
+    client._wait_send_acceptance = types.MethodType(fake_accept, client)
+    monkeypatch.setattr(chatgpt, "click_send_button", fake_click)
+
+    receipt = asyncio.run(client.send("prompt", wait_for_stop=False, max_attempts=1))
+
+    assert receipt.accepted_via == "exact_user_message"
+    assert observed_timeouts == [60_000]
+
+
 def test_send_reuses_hydrated_existing_conversation_baseline(monkeypatch):
     import types
 

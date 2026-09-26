@@ -34,14 +34,14 @@ def _generation_zero_prompt(config, *, workspace: Path, role: str) -> str:
         constructor_sent_generation=None,
         conversation_generation=0,
     )
-    assert built.constructor_included is True
+    assert built.constructor_included is False
     prompt_routes = tuple(
         item for item in allowed_routes if item != "PAUSE" and (item != "DONE" or role == "PLAN")
     )
     route_contract = "|".join(prompt_routes)
     assert f'"route":"{route_contract}"' in built.text
     assert f'"handoff":"{expected_report_path}"' in built.text
-    assert f"Write the complete report to exactly: {expected_report_path}" in built.text
+    assert f"Before replying, write a non-empty report to exactly: {expected_report_path}" in built.text
     return built.text
 
 
@@ -69,54 +69,57 @@ def test_generation_zero_workflow_prompts_build_from_selected_asset_tree(
     for role in CDPA_ROLES:
         assert config.constructor_paths[role] == (expected_prompts / f"{role}.md").resolve()
         text = _generation_zero_prompt(config, workspace=workspace, role=role)
-        assert base_context.read_text(encoding="utf-8").strip() in text
-        assert config.constructor_paths[role].read_text(encoding="utf-8").strip() in text
+        assert base_context.read_text(encoding="utf-8").strip() not in text
+        assert config.constructor_paths[role].read_text(encoding="utf-8").strip() not in text
+        assert "Goal: prompt contract goal" in text
+        assert "REPOSITORY_SKILLS" not in text
 
 
-def test_agents_documents_minimal_fresh_one_endpoint_contract():
+def test_agents_is_bootstrap_orientation_not_duplicate_rulebook():
     agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
 
     assert "cdpa \"<complete task: repository/worktree, goal, constraints, acceptance evidence>\"" in agents
+    assert ".agents/skills/hcu-work/SKILL.md" in agents
+    assert "hcuw fingerprint ." in agents
+    assert ".hcu/rules.md" in agents
     assert "one browser endpoint/account for its lifetime" in agents
-    assert "Fresh context" in agents
+    assert "Fresh" in agents
     assert "Bootstrap branching is temporarily disabled" in agents
-    assert "Normal Send, Resume, Wait, and Route must never scan or snapshot every ChatGPT tab" in agents
-    assert "Transient" not in agents or "Temporary" in agents
-    assert "--bootstrap <id>" not in agents
-    assert "--fresh" not in agents
+    assert "must never scan or snapshot every ChatGPT tab" in agents
+    assert len(agents) < 5000
 
 
 @pytest.mark.parametrize("prompt_root", (LOCAL_PROMPTS, PACKAGED_PROMPTS))
-def test_runtime_prompt_assets_use_concise_functional_role_contract(prompt_root: Path):
+def test_runtime_prompt_assets_use_concise_role_specific_contracts(prompt_root: Path):
     prompts = {
         role: (prompt_root / f"{role}.md").read_text(encoding="utf-8")
         for role in CDPA_ROLES
     }
+    base = (prompt_root / "BASE_CONTEXT.md").read_text(encoding="utf-8")
 
     assert "workflow decision-maker" in prompts["PLAN"]
     assert "production engineer" in prompts["DEV"]
     assert "high-precision reviewer" in prompts["REVIEW"]
     assert "verification engineer" in prompts["TEST"]
     assert "operational auditor" in prompts["AUDIT"]
-    combined = "\n".join(prompts.values()).lower()
-    assert "years experience" not in combined
-    assert "world-class" not in combined
-    assert "3-5 minutes" in combined
-    assert max(len(text.splitlines()) for text in prompts.values()) <= 24
+    assert "bounded backoff" in base
+    assert all("bounded backoff" not in text for text in prompts.values())
+    assert max(len(text.splitlines()) for text in prompts.values()) <= 18
+
+
+@pytest.mark.parametrize("name", ("BASE_CONTEXT.md", "PLAN.md", "DEV.md", "REVIEW.md", "TEST.md", "AUDIT.md", "RESPONSE_GUIDE.md"))
+def test_local_and_packaged_workflow_prompt_mirror_match(name: str):
+    assert (LOCAL_PROMPTS / name).read_bytes() == (PACKAGED_PROMPTS / name).read_bytes()
 
 
 @pytest.mark.parametrize("prompt_root", (LOCAL_PROMPTS, PACKAGED_PROMPTS))
 def test_final_plan_done_report_contract_is_status_first_vietnamese(prompt_root: Path):
     plan = (prompt_root / "PLAN.md").read_text(encoding="utf-8")
 
-    assert "# DONE — <task>" in plan
-    assert "**Kết quả:** ✅ PASS / ❌ FAIL / ⏸ PAUSED" in plan
-    assert "**Vận hành:** ✅ OK / ⚠️ DEGRADED / ❓ NOT VERIFIED" in plan
-    assert "**Rủi ro:** 🟢 NONE/LOW / 🟡 MEDIUM / 🔴 HIGH" in plan
-    assert "**Kiểm chứng:**" in plan
-    assert "**Cần làm tiếp:**" in plan
+    for label in ("Kết quả", "Vận hành", "Rủi ro", "Kiểm chứng", "Cần làm tiếp"):
+        assert label in plan
     assert "PASS WITH SIMPLIFICATION" in plan
-    assert "must not" in plan
+    assert "Do not use verdict labels" in plan
 
 
 @pytest.mark.parametrize("prompt_root", (LOCAL_PROMPTS, PACKAGED_PROMPTS))
@@ -125,23 +128,24 @@ def test_runtime_role_prompts_preserve_authorized_goal_closure_semantics(prompt_
     dev = (prompt_root / "DEV.md").read_text(encoding="utf-8")
     review = (prompt_root / "REVIEW.md").read_text(encoding="utf-8")
     test = (prompt_root / "TEST.md").read_text(encoding="utf-8")
+    audit = (prompt_root / "AUDIT.md").read_text(encoding="utf-8")
 
     assert "Explicit task-level completion authority controls final closure" in plan
-    assert "fixable in-scope" in plan
-    assert "do not route `DONE`" in plan
-    assert "smallest authorized follow-up role" in plan
+    assert "fixable in-scope" in plan and "do not route `DONE`" in plan
     assert "external/manual prerequisite" in plan
 
-    assert "DEV role-scope completion is not global task completion" in dev
-    assert "fixable in-scope" in dev
-    assert "`DONE` remains PLAN-only" in dev
+    assert "fixable in-scope failure" in dev
+    assert "checkpoint-commit only task-owned changes" in dev
+    assert "Route complete work to REVIEW" in dev
 
-    assert "REVIEW role-scope completion is not global task completion" in review
-    assert "confirmed fixable implementation blocker to DEV" in review
+    assert "confirmed fixable in-scope defect to DEV" in review
     assert "clean work directly to PLAN" in review
-    assert "`PAUSE`" in review and "external/manual prerequisite" in review
+    assert "creates no empty checkpoint commit" in review
 
-    assert "TEST role-scope completion is not global task completion" in test
     assert "fixable in-scope acceptance failure to DEV" in test
     assert "verified clean result to PLAN" in test
-    assert "`PAUSE`" in test and "external/manual prerequisite" in test
+    assert "creates no empty checkpoint commit" in test
+
+    assert "confirmed fixable defects to DEV" in audit
+    assert "clean evidence to PLAN" in audit
+    assert "creates no empty checkpoint commit" in audit

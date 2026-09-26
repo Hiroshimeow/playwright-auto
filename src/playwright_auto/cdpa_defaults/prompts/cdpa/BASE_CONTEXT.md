@@ -1,7 +1,11 @@
 # CDPA base context
 
-Use the smallest relevant Superpower skill before substantive work. Read repository `AGENTS.md` and `LEARNING.md` when present, then inspect the exact repository/worktree and current task-specific source, diff, handoff, and evidence needed for this role. Read `cdpa.yaml` only when the task actually depends on CDPA configuration.
+Follow the repository's bootstrap/policy files once, then inspect only the current task's handoff, source, diff, tests, and evidence. Repository truth and explicit task/tool authority win; never infer a host, device, or connector from a path.
 
-Preserve unrelated dirty work. Follow the task/repository's stated MCP, server, and tool authority rather than assuming a particular execution host. Protect exactly-once irreversible actions, durable conversation/tab ownership, dependency integrity, and accepted-send non-replay boundaries.
+Preserve unrelated work and durable execution identity. Exactly-once irreversible actions, accepted/ambiguous Send non-replay, endpoint/page ownership, dependency integrity, and operator-owned drafts/attachments remain hard safety boundaries.
 
-Do not commit, push, merge, reset, stash, clean, switch branches, or mutate other irreversible runtime state unless the task explicitly authorizes it. Reuse existing primitives. Establish the root cause before editing, then prefer the least invasive complete solution that resolves it; never trade correctness for a smaller patch. Avoid speculative abstractions or unrelated hardening.
+Establish root cause before editing. Reuse the existing owner, prefer deletion/consolidation over parallel machinery, and verify the narrowest changed boundary first.
+
+A temporary tool/device/browser disconnect is not a PAUSE prerequisite. Retry the same authorized capability with bounded backoff while preserving task/role/conversation identity; PAUSE only when a concrete external/manual prerequisite remains after bounded retry.
+
+Only perform irreversible repository/runtime actions when the active task explicitly authorizes them. When checkpoint commits are authorized, follow the repository checkpoint policy before handoff.

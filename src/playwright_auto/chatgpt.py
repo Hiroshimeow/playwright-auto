@@ -5411,7 +5411,7 @@ class ChatGPTPage:
                         expected_attachment_names=expected_names,
                     )
                     self._owned_composer_text = None
-                    acceptance_timeout_ms = max(60_000, int(timeout))
+                    acceptance_timeout_ms = 60_000
                     acceptance = await self._wait_send_acceptance(
                         baseline,
                         pre_send,

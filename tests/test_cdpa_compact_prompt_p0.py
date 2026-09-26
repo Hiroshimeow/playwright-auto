@@ -11,11 +11,44 @@ from test_cdpa_worker import FakeActions, setup_task
 
 
 FINAL_DIRECTIVE = "Work first. Write the report, then return exactly one valid route JSON object."
+ROOT = Path(__file__).resolve().parents[1]
+
+
 PLAN_CLOSURE_CUE = (
-    "PLAN_CLOSURE: Treat the handoff and accepted role reports as closure evidence. After a clean REVIEW and satisfied task acceptance with no concrete remaining in-scope work, "
-    "route DONE now. Do not route DEV merely because PLAN itself did not run tests, or for continued progression, closure preparation, or redundant validation. "
-    "If not routing DONE, identify a concrete unmet acceptance criterion or fixable defect from the current evidence."
+    "If acceptance is satisfied after clean REVIEW, route DONE; otherwise route the smallest role with concrete remaining work."
 )
+
+
+
+def test_first_turn_normal_prompt_is_goal_route_report_only(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    prompt = PromptBuilder(config).build(
+        task_title="Compact first turn",
+        task_id="task-first-turn",
+        team="alpha",
+        logical_role="PLAN",
+        physical_role="alpha-plan",
+        turn=1,
+        allowed_routes=("PLAN", "DEV", "REVIEW", "PAUSE", "DONE"),
+        workspace=str(ROOT),
+        source_physical_role=None,
+        handoff="Initial task intake; no prior role handoff.",
+        goal="Implement the compact prompt contract.",
+        expected_report_path=".plan/alpha/alpha-plan_turn1_task-first-turn.md",
+        constructor_sent_generation=None,
+        conversation_generation=0,
+    ).text
+
+    assert prompt.startswith("You are PLAN for the team alpha | task-first-turn:")
+    assert "Goal: Implement the compact prompt contract." in prompt
+    assert "Handoff: Initial task intake; no prior role handoff." in prompt
+    assert "Before replying, write a non-empty report to exactly: .plan/alpha/alpha-plan_turn1_task-first-turn.md" in prompt
+    assert '"handoff":".plan/alpha/alpha-plan_turn1_task-first-turn.md"' in prompt
+    assert "REPOSITORY_SKILLS" not in prompt
+    assert "Constructor for PLAN" not in prompt
+    assert "TEST_BASE_CONTEXT" not in prompt
+    assert "Establish the root cause before changing or judging code" not in prompt
+    assert len(prompt) <= 2200
 
 
 def test_windows_tool_authority_is_session_generic_without_path_guessing(tmp_path: Path):
@@ -36,7 +69,7 @@ def test_windows_tool_authority_is_session_generic_without_path_guessing(tmp_pat
         constructor_sent_generation=0,
         conversation_generation=0,
     ).text
-    assert "tools available in the current session" in prompt
+    assert "use only tools authorized by the current task/session" in prompt
     assert "@md device g6" not in prompt
     assert "mcp-thinkbook" not in prompt
     assert "mcp-g8" not in prompt
@@ -62,14 +95,14 @@ def test_linux_tool_authority_is_session_generic_without_path_guessing(tmp_path:
         conversation_generation=0,
     ).text
 
-    assert "tools available in the current session" in prompt
+    assert "use only tools authorized by the current task/session" in prompt
     assert "mcp-thinkbook" not in prompt
     assert "mcp-g8" not in prompt
     assert "mcp-docker" not in prompt
     assert "md:g6" not in prompt
 
 
-def test_long_continuation_preserves_exact_user_tool_literal_without_inference(tmp_path: Path):
+def test_long_continuation_uses_handoff_without_repeating_goal_tool_literal(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     literal = "@md g8"
     goal = "Continue the prior work. " + ("immutable evidence " * 500) + f" Require {literal}."
@@ -89,7 +122,9 @@ def test_long_continuation_preserves_exact_user_tool_literal_without_inference(t
         constructor_sent_generation=0,
         conversation_generation=1,
     ).text
-    assert literal in prompt
+    assert literal not in prompt
+    assert "Goal:" not in prompt
+    assert "Handoff: .plan/alpha/alpha-dev_turn1_task-long-tool-literal.md" in prompt
     assert "mcp-thinkbook" not in prompt
     assert "mcp-g6" not in prompt
     assert "mcp-docker" not in prompt
@@ -106,7 +141,7 @@ def test_explicit_md_g6_requirement_is_enforced_for_every_workflow_role(tmp_path
             team="alpha",
             logical_role=role,
             physical_role=f"alpha-{role.lower()}",
-            turn=2,
+            turn=1,
             allowed_routes=("PLAN", "DEV", "REVIEW", "TEST", "AUDIT", "DONE"),
             workspace=r"E:\\git-project\\playwright-auto-multicdp",
             source_physical_role="alpha-plan",
@@ -140,13 +175,13 @@ def test_worker_final_payload_preserves_all_explicit_literals_and_required_scope
     asyncio.run(worker._pre_send(state, hop, FakeActions()))
     prompt = hop["prompt"]
     expected = hop["expected_report_path"]
-    scope = worker.prompts.filesystem_scope(state["repository"], expected)
+    absolute_report = Path(state["repository"]) / expected
 
     for literal in ("@md g8", "@mcp-thinkbook", "md:g6", "@md device z99"):
         assert literal in prompt
     assert "EXPLICIT_TOOL_REQUIREMENTS" in prompt
-    assert scope in prompt
-    assert f"Write the complete report to exactly: {expected}" in prompt
+    assert str(absolute_report) in prompt
+    assert f"Before replying, write a non-empty report to exactly: {expected}" in prompt
     assert f'"handoff":"{expected}"' in prompt
     assert '"route":"PLAN|DEV|TEST|REVIEW|AUDIT|DONE"' in prompt
 
@@ -161,10 +196,10 @@ def test_explicit_literal_section_preserves_many_exact_tokens(tmp_path: Path):
         team="alpha",
         logical_role="DEV",
         physical_role="alpha-dev",
-        turn=2,
+        turn=1,
         allowed_routes=("PLAN", "DEV", "REVIEW"),
         workspace=str(tmp_path),
-        source_physical_role="alpha-dev",
+        source_physical_role=None,
         handoff=".plan/alpha/prior.md",
         goal=literals,
         expected_report_path=".plan/alpha/report.md",
@@ -198,26 +233,21 @@ def test_later_normal_prompt_is_human_first_and_compact(tmp_path: Path):
     ).text
 
     assert prompt.startswith("You are DEV for the team alpha | task-compact:")
-    assert len(prompt) <= 3000
+    assert len(prompt) <= 1800
+    assert "Goal:" not in prompt
     assert long_goal not in prompt
     assert long_title not in prompt
-    assert prompt.count("TITLE_DETAIL") < 20
-    assert prompt.count("IMMUTABLE_TASK_DETAIL") < 40
+    assert "IMMUTABLE_TASK_DETAIL" not in prompt
+    assert "Handoff: .plan/alpha/alpha-review_turn1_task-compact.md" in prompt
     assert "Constructor for DEV" not in prompt
     assert "TEST_BASE_CONTEXT" not in prompt
-    assert '"task-id"' not in prompt
-    assert '"team"' not in prompt
-    assert '"role"' not in prompt
-    assert '"source-role"' not in prompt
-    for forbidden in ("mcp-thinkbook", "mcp-g8", "mcp-docker", "md:g6", "fjp", "z99"):
-        assert forbidden not in prompt
-    assert "tools available in the current session" in prompt
-    assert "Establish the root cause before changing or judging code; prefer the least invasive complete solution, never a smaller patch that leaves the cause intact." in prompt
+    assert "REPOSITORY_SKILLS" not in prompt
+    assert "EXPLICIT_TOOL_REQUIREMENTS" not in prompt
+    assert "Establish the root cause before changing or judging code" not in prompt
     assert "TURN_CONTEXT" not in prompt
     assert "allowed-routes" not in prompt
     assert '"route":"PLAN|DEV|REVIEW"' in prompt
-    assert '"route":"PLAN|DEV|REVIEW|PAUSE|DONE"' not in prompt
-    assert "PAUSE is exceptional, not a normal route" in prompt
+    assert "PAUSE is exceptional:" in prompt
     assert prompt.count('{"route":"') == 1
     assert prompt.endswith(FINAL_DIRECTIVE)
 
@@ -246,5 +276,4 @@ def test_followup_plan_prompt_has_late_explicit_closure_cue(tmp_path: Path):
     assert PLAN_CLOSURE_CUE in prompt
     assert prompt.count('{"route":"') == 1
     assert len(prompt) <= 3200
-    assert prompt.index(FINAL_DIRECTIVE) < prompt.index("PLAN_CLOSURE")
     assert prompt.endswith(PLAN_CLOSURE_CUE)

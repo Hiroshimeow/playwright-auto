@@ -58,6 +58,47 @@ def snapshot(
     )
 
 
+def test_receipt_user_identity_enrichment_preserves_strong_acceptance_provenance(tmp_path: Path):
+    ledger = RequestLedger(tmp_path / "requests.json")
+    record = ledger.begin(
+        role="DEV",
+        prompt="exact prompt",
+        request_id="request-provenance",
+        render_request_marker=False,
+    )
+    baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
+    binding = PageBinding("page-1", "DEV")
+    receipt = SendReceipt(
+        prompt="exact prompt",
+        prompt_sha256=prompt_digest("exact prompt"),
+        binding=binding,
+        baseline=baseline,
+        attempts=1,
+        accepted_via="assistant_activity",
+        session_id_before="session-1",
+    )
+    record = ledger.update(
+        record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=binding,
+        baseline=baseline,
+    )
+    record = ledger.update(
+        record.request_id,
+        status=RequestStatus.SENT,
+        accepted_at=1.0,
+        receipt=receipt.to_dict(),
+    )
+    accepted_user = MessageSnapshot("user", "u-new", "t-new", "exact prompt", ())
+
+    enriched = durable_module.receipt_from_record(record, accepted_user=accepted_user)
+
+    assert enriched.accepted_via == "assistant_activity"
+    assert enriched.user_message_id == "u-new"
+    assert enriched.user_turn_id == "t-new"
+
+
 class FakeDurableClient:
     def __init__(self, current=None):
         self.binding = PageBinding("page-1", "DEV")
@@ -161,7 +202,7 @@ def run_block(block, client, variables=None):
     )
 
 
-def test_send_threads_response_timeout_into_acceptance_wait(tmp_path):
+def test_response_timeout_is_not_threaded_into_send_acceptance(tmp_path):
     class TimeoutClient(FakeDurableClient):
         def __init__(self):
             super().__init__()
@@ -182,7 +223,7 @@ def test_send_threads_response_timeout_into_acceptance_wait(tmp_path):
         client,
     )
 
-    assert client.send_timeout_ms == 123_456
+    assert client.send_timeout_ms is None
 
 
 def test_reused_conversation_waits_for_hydrated_baseline_before_sending(tmp_path):

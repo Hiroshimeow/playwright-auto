@@ -1360,7 +1360,7 @@ def test_pause_requested_after_accepted_send_survives_without_duplicate_send(
     assert len(client.send_calls) == 1
 
 
-def test_pre_send_lazily_acquires_only_plan_and_persists_constructor(tmp_path: Path):
+def test_pre_send_lazily_acquires_only_plan_with_compact_prompt(tmp_path: Path):
     _, _, state, worker = setup_task(tmp_path)
     hop = _active_hop(state)
 
@@ -1368,8 +1368,8 @@ def test_pre_send_lazily_acquires_only_plan_and_persists_constructor(tmp_path: P
 
     assert hop["state"] == "sending"
     assert hop["expected_report_path"] == ".plan/alpha/alpha-plan_turn1_task-a.md"
-    assert "Constructor for PLAN" in hop["prompt"]
-    assert "Write the complete report to exactly: .plan/alpha/alpha-plan_turn1_task-a.md" in hop["prompt"]
+    assert "Constructor for PLAN" not in hop["prompt"]
+    assert "Before replying, write a non-empty report to exactly: .plan/alpha/alpha-plan_turn1_task-a.md" in hop["prompt"]
     assert '"handoff":".plan/alpha/alpha-plan_turn1_task-a.md"' in hop["prompt"]
     assert ".plan/<team>/<physical-role>_turn<N>_<task-id>.md" not in hop["prompt"]
     assert hop["prompt"].startswith("You are PLAN for the team alpha | task-a:")
@@ -1382,10 +1382,10 @@ def test_pre_send_lazily_acquires_only_plan_and_persists_constructor(tmp_path: P
         if line.startswith('{"route":')
     )
     assert route_contract.split("|") == ["PLAN", "DEV", "TEST", "REVIEW", "AUDIT", "DONE"]
-    assert "PAUSE is exceptional, not a normal route" in hop["prompt"]
+    assert "PAUSE is exceptional:" in hop["prompt"]
     assert state["roles"]["PLAN"]["page_id"] == "page-alpha-plan"
     assert state["roles"]["DEV"]["status"] == "unallocated"
-    assert state["roles"]["PLAN"]["constructor_sent_generation"] == 0
+    assert state["roles"]["PLAN"]["constructor_sent_generation"] is None
 
 
 @pytest.mark.skip(reason="workflow bootstrap branching is temporarily disabled; workflow tasks use Fresh context")
@@ -1661,9 +1661,9 @@ def test_pre_send_limits_allowed_routes_to_selected_workflow_roles(tmp_path: Pat
     )
 
     assert route_contract.split("|") == ["PLAN", "REVIEW", "DONE"]
-    assert "PAUSE is exceptional, not a normal route" in hop["prompt"]
-    assert "Constructor for PLAN" in hop["prompt"]
-    assert f"Write the complete report to exactly: {report_path}" in hop["prompt"]
+    assert "PAUSE is exceptional:" in hop["prompt"]
+    assert "Constructor for PLAN" not in hop["prompt"]
+    assert f"Before replying, write a non-empty report to exactly: {report_path}" in hop["prompt"]
     assert f'"handoff":"{report_path}"' in hop["prompt"]
     assert "Handoff: Initial task intake; no prior role handoff." in hop["prompt"]
     assert ".plan/<team>/<physical-role>_turn<N>_<task-id>.md" not in hop["prompt"]
@@ -1680,7 +1680,7 @@ def test_normal_cdpa_send_keeps_transport_identity_out_of_actual_payload(tmp_pat
 
     record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
     assert client.send_calls == [hop["prompt"]]
-    assert client.send_timeout_ms == [round(worker.config.response_timeout_seconds * 1000)]
+    assert client.send_timeout_ms == [None]
     assert client.send_calls[0].startswith("You are PLAN for the team alpha | task-a:")
     assert hop["receipt"]["prompt"] == hop["prompt"]
     assert record is not None
@@ -3064,6 +3064,34 @@ def test_unresolved_complete_accepts_terminal_continuation_before_final_block(
     record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
     assert record.attempts == 1
     assert record.status is RequestStatus.COMPLETED
+    completed_receipt = SendReceipt.from_dict(record.receipt)
+    assert completed_receipt.accepted_via == receipt.accepted_via
+    assert completed_receipt.user_message_id == receipt.user_message_id
+    assert record.response == response.to_dict()
+
+
+def test_completed_semantic_assistant_preserves_recovery_send_provenance(tmp_path: Path):
+    _store, _state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-semantic-assistant-provenance"
+    )
+    response = MessageSnapshot(
+        "assistant",
+        "DOM:assistant:0",
+        None,
+        "completed semantic response",
+        (),
+    )
+    hop["response"] = response.text
+    hop["response_record"] = response.to_dict()
+
+    worker._complete_request_response(hop)
+
+    record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
+    assert record is not None and record.status is RequestStatus.COMPLETED
+    completed_receipt = SendReceipt.from_dict(record.receipt)
+    assert completed_receipt.accepted_via == receipt.accepted_via
+    assert completed_receipt.user_message_id == receipt.user_message_id
+    assert record.response == response.to_dict()
 
 
 def _mark_completed_refresh(hop: dict, *, seconds_ago: int) -> None:
@@ -3487,7 +3515,7 @@ def test_legacy_inline_pre_send_switches_to_file_before_prompt(
     asyncio.run(worker._pre_send(state, hop, FakeActions()))
 
     assert state["options"]["report_mode"] == "file"
-    assert "Write the complete report to exactly: .plan/alpha/alpha-plan_turn1_task-legacy-pre-send.md" in hop["prompt"]
+    assert "Before replying, write a non-empty report to exactly: .plan/alpha/alpha-plan_turn1_task-legacy-pre-send.md" in hop["prompt"]
     assert '"handoff":".plan/alpha/alpha-plan_turn1_task-legacy-pre-send.md"' in hop["prompt"]
     assert '"handoff":"INLINE"' not in hop["prompt"]
     assert hop["expected_report_path"] == ".plan/alpha/alpha-plan_turn1_task-legacy-pre-send.md"

@@ -80,15 +80,18 @@ def _setup(tmp_path: Path, *, bootstrap=None, roles=None):
     return store, state, CDPAWorker(config, store=store)
 
 
-def test_fresh_builtin_first_turn_includes_base_role_and_response_guide(tmp_path: Path):
+def test_fresh_builtin_first_turn_uses_compact_goal_route_report_contract(tmp_path: Path):
     _store, state, worker = _setup(tmp_path)
     hop = _active_hop(state)
 
     asyncio.run(worker._pre_send(state, hop, FakeActions()))
 
-    assert "TEST_BASE_CONTEXT" in hop["prompt"]
-    assert "Constructor for PLAN" in hop["prompt"]
+    assert "TEST_BASE_CONTEXT" not in hop["prompt"]
+    assert "Constructor for PLAN" not in hop["prompt"]
+    assert "Goal: Prompt compression task" in hop["prompt"]
+    assert "Follow repository AGENTS/HCUW when present" in hop["prompt"]
     assert "Return exactly one valid JSON object" in hop["prompt"]
+    assert "REPOSITORY_SKILLS" not in hop["prompt"]
 
 
 @pytest.mark.skip(reason="workflow bootstrap inheritance is temporarily disabled; workflow tasks use Fresh context")
@@ -215,19 +218,18 @@ def test_production_prompt_split_keeps_common_context_out_of_role_files():
     base = (root / "prompts" / "cdpa" / "BASE_CONTEXT.md").read_text(encoding="utf-8")
     guide = (root / "prompts" / "cdpa" / "RESPONSE_GUIDE.md").read_text(encoding="utf-8")
 
-    assert "Superpower" in base
-    assert "AGENTS.md" in base
-    assert "LEARNING.md" in base
-    assert "cdpa.yaml" in base and "only when" in base
-    assert "preserve" in base.lower() and "dirty" in base.lower()
+    assert "bootstrap/policy" in base
+    assert "explicit task/tool authority" in base
+    assert "bounded backoff" in base
+    assert "accepted/ambiguous Send non-replay" in base
 
     for role in ("PLAN", "DEV", "TEST", "REVIEW", "AUDIT"):
         text = (root / "prompts" / "cdpa" / f"{role}.md").read_text(encoding="utf-8")
-        assert "AGENTS.md" not in text
-        assert "Superpower" not in text
-        assert "cdpa.yaml" not in text
+        assert "hcu-work" not in text
+        assert "hcuw fingerprint" not in text
+        assert "bounded backoff" not in text
         if role == "PLAN":
-            assert "cdpa_learning" in text
+            assert "LEARNING.md" in text
         else:
             assert "LEARNING.md" not in text
 

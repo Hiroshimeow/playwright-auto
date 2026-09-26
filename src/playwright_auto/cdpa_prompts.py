@@ -260,16 +260,12 @@ class PromptBuilder:
         normalized = validate_workflow_route_key(role)
         continuation = ""
         if source_physical_role and str(source_physical_role).strip() == str(physical_role).strip():
-            continuation = f" Continue the previous {normalized} turn; do not restate it."
+            continuation = " Continue from the handoff; do not restate prior work."
         directive = "Work first." + continuation + " Write the report, then return exactly one valid route JSON object."
         if normalized == "PLAN":
-            directive += (
-                "\n\nPLAN_CLOSURE: Treat the handoff and accepted role reports as closure evidence. After a clean REVIEW and satisfied task acceptance with no concrete remaining in-scope work, "
-                "route DONE now. Do not route DEV merely because PLAN itself did not run tests, or for continued progression, closure preparation, or redundant validation. "
-                "If not routing DONE, identify a concrete unmet acceptance criterion or fixable defect from the current evidence."
-            )
+            directive += " If acceptance is satisfied after clean REVIEW, route DONE; otherwise route the smallest role with concrete remaining work."
         elif normalized == "REVIEW":
-            directive += " Clean work routes to PLAN; route DEV only for a concrete reproducible defect."
+            directive += " Clean work routes to PLAN; a concrete reproducible defect routes to DEV."
         return directive
 
     @staticmethod
@@ -310,59 +306,54 @@ class PromptBuilder:
             raise ValueError(f"workflow role {role!r} is not in allowed_routes")
         handoff = str(handoff).strip()
         original_goal = str(goal).strip()
-        goal = original_goal
-        if source_physical_role is not None and len(goal) > 700:
-            goal = " ".join(goal.split())[:700].rsplit(" ", 1)[0] + " ..."
         expected_report_path = (
             str(expected_report_path).strip()
             if expected_report_path is not None
             else self.naming_rule()
         )
-        if not handoff or not goal or not expected_report_path:
+        if not handoff or not original_goal or not expected_report_path:
             raise ValueError("handoff, goal, and expected_report_path must not be empty")
         generation = int(conversation_generation)
-        include = constructor_sent_generation != generation
+        turn_number = int(turn)
+        path_type = PureWindowsPath if PureWindowsPath(workspace).drive else PurePosixPath
+        report_destination = path_type(str(workspace).strip()) / expected_report_path
         prompt_routes = tuple(
             item
             for item in allowed
             if item != "PAUSE" and (item != "DONE" or role == "PLAN")
         )
+        context = [
+            f"Turn: {turn_number}",
+            f"Workspace: {str(workspace).strip()} (resolve relative report paths here)",
+        ]
+        if turn_number <= 1:
+            context.append(f"Goal: {original_goal}")
+        context.append(f"Handoff: {handoff}")
         sections = [
             f"You are {role} for the team {str(team).strip()} | {str(task_id).strip()}:",
-            f"Turn: {int(turn)}\nWorkspace: {str(workspace).strip()}\nGoal: {goal}\nHandoff: {handoff}",
+            "\n".join(context),
         ]
-        explicit_tools = _explicit_tool_section(
-            "\n".join(item for item in (original_goal, explicit_tool_text or "") if item)
-        )
-        if explicit_tools:
-            sections.append(explicit_tools)
-        repository_skills = _repository_skills_section(str(workspace).strip(), original_goal)
-        if repository_skills:
-            sections.append(repository_skills)
-        if include:
-            constructor = (
-                normalize_system_prompt(constructor_text)
-                if constructor_text is not None
-                else self.config.constructor_paths[role]
-                .read_text(encoding="utf-8")
-                .strip()
+        custom_constructor_included = False
+        if turn_number <= 1:
+            explicit_tools = _explicit_tool_section(
+                "\n".join(
+                    item for item in (original_goal, explicit_tool_text or "") if item
+                )
             )
-            if is_system_role and not bootstrap_inherited:
-                sections.append(self._base_context())
-            sections.append(constructor)
-        sections.append(self.tool_authority())
-        sections.append(self.filesystem_scope(str(workspace).strip(), expected_report_path))
+            if explicit_tools:
+                sections.append(explicit_tools)
+            if not is_system_role and constructor_text is not None:
+                sections.append(normalize_system_prompt(constructor_text))
+                custom_constructor_included = True
+        sections.append(
+            "Follow repository AGENTS/HCUW when present; use only tools authorized by the current task/session."
+        )
         if bounded_context:
             sections.append("RECOVERY_CONTEXT\n" + str(bounded_context).strip())
         sections.append(
-            "Inspect the handoff, current diff/source, and fresh evidence with the authorized tool now. "
-            "Preserve unrelated dirty work. Do not commit, push, merge, reset, stash, clean, or switch branches unless explicitly authorized. "
-            "Establish the root cause before changing or judging code; prefer the least invasive complete solution, never a smaller patch that leaves the cause intact."
-        )
-        sections.append(
             "REPORT\n"
-            f"Write the complete report to exactly: {expected_report_path}\n"
-            "The report must exist and contain concrete work evidence before routing."
+            f"Before replying, write a non-empty report to exactly: {expected_report_path}\n"
+            f"Absolute destination: {report_destination}"
         )
         sections.append(
             "ROUTE\n"
@@ -371,7 +362,7 @@ class PromptBuilder:
                 prompt_routes,
                 expected_report_path=expected_report_path,
             )
-            + "\nPAUSE is exceptional, not a normal route: use it only after an authorized tool/action actually fails on a concrete external/manual prerequisite, and only after writing a valid report with `block_code=...` and `resume_condition=...`."
+            + "\nPAUSE is exceptional: use it only for a concrete external/manual prerequisite, and include `block_code=...` plus `resume_condition=...` in the report."
         )
         sections.append(
             self.current_role_execution(
@@ -380,7 +371,9 @@ class PromptBuilder:
                 source_physical_role=source_physical_role,
             )
         )
-        return BuiltPrompt("\n\n".join(sections).strip(), include, generation)
+        return BuiltPrompt(
+            "\n\n".join(sections).strip(), custom_constructor_included, generation
+        )
 
     def build_solo(
         self,

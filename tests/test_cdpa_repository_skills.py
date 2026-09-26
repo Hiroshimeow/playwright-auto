@@ -114,16 +114,17 @@ def test_catalog_budget_keeps_selected_instructions_complete(tmp_path: Path):
     )
 
 
-def test_normal_prompt_exposes_compact_catalog_and_exact_named_selection(tmp_path: Path):
+def test_normal_prompt_does_not_serialize_repository_skill_catalog(tmp_path: Path):
     _write_skill(tmp_path, "cdpa-code-reducer", "Use when reducing CDPA implementation complexity.", body="SECRET REDUCTION BODY")
     builder = PromptBuilder(load_cdpa_config(None, repository_root=tmp_path))
 
     text = _normal_prompt(builder, tmp_path, "Apply cdpa-code-reducer to this implementation.")
 
-    assert "REPOSITORY_SKILLS" in text
-    assert "- cdpa-code-reducer: Use when reducing CDPA implementation complexity." in text
-    assert "Load .skills/cdpa-code-reducer/SKILL.md before substantive work." in text
+    assert "REPOSITORY_SKILLS" not in text
+    assert "- cdpa-code-reducer: Use when reducing CDPA implementation complexity." not in text
+    assert "Load .skills/cdpa-code-reducer/SKILL.md before substantive work." not in text
     assert "SECRET REDUCTION BODY" not in text
+    assert "Follow repository AGENTS/HCUW when present" in text
 
 
 def test_independent_and_solo_prompts_share_repository_skill_catalog(tmp_path: Path):

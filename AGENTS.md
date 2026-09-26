@@ -1,198 +1,49 @@
 # CDPA Agent Guide
 
-This repository is the CDPA control plane. Repository source and durable runtime state are authoritative. Preserve unrelated dirty/untracked work.
+CDPA is the durable control plane for browser-backed multi-agent workflows. Repository source plus durable runtime state are authoritative. Preserve unrelated dirty and untracked work.
 
-## 1. Normal task intake
+## Start here
 
-When discussion becomes actionable, submit one normal workflow task directly through `cdpa`.
+For non-trivial repository work:
+
+1. Read `.agents/skills/hcu-work/SKILL.md`.
+2. Read `.hcu/profile.md`, run `hcuw fingerprint .`, then read `.hcu/rules.md` once.
+3. If the HCU baseline or evidence fingerprint drifted, reconcile only affected policy with `.agents/skills/hcu-rules/SKILL.md`.
+4. Read `LEARNING.md` when present, then inspect only task-relevant source, tests, diff, handoff, and evidence.
+5. Load the smallest matching repository-local skill before substantive work.
+
+Do not repeatedly reload HCUW policy during the same session unless its files change. Explicit task constraints, repository-specific instructions, accepted specs, tests, and current implementation truth remain authoritative.
+
+## Normal CDPA task intake
+
+Submit ordinary work directly:
 
 ```powershell
 cdpa "<complete task: repository/worktree, goal, constraints, acceptance evidence>"
 ```
 
-That is the default command. Do not put Manual Dispatcher or an Independent Agent in the critical path merely to re-dispatch normal work.
-
-Prefer task text over flags. Put the target repository/worktree path in the task text; the API infers it. Use `--repository` only when inference is impossible or must be overridden.
-
-### Optional flags
-
-Use only when the request actually requires them:
-
-```powershell
-cdpa "<task>" --team readable-name
-cdpa "<task>" --depends-on <parent-task-id>
-cdpa "<task>" --browser <endpoint>
-cdpa "<task>" --upload <file>
-cdpa "<task>" --temp
-```
-
-- `--team`: optional readable base name. Omit by default.
-- `--depends-on`: durable dependency. Repeat only for real dependencies.
-- `--browser`: pins the entire workflow team to one explicit endpoint/account. Omit for normal pool placement.
-- `--upload`: explicit file context.
-- `--temp`: forces Temporary Chat when the selected endpoint is not already temporary by default.
-
-Do not use public bootstrap flags. New workflow tasks always start with Fresh context. Bootstrap branching is temporarily disabled.
-
-Resume an existing exact team with:
+Use optional flags only for real requirements (`--team`, `--depends-on`, `--browser`, `--upload`, `--temp`). Resume one exact existing team with:
 
 ```powershell
 cdpa --team <exact-existing-team>
 ```
 
-Resume preserves the same task, team, endpoint, active hop, request identity, and report history.
+New workflow tasks start Fresh. Bootstrap branching is temporarily disabled.
 
-## 2. One team = one browser endpoint
+## Execution model
 
-A workflow team uses one browser endpoint/account for its lifetime.
+One workflow team owns one browser endpoint/account for its lifetime. Roles do not independently migrate endpoints. Persistent roles may continue only their own durable conversation; Temporary workflows use Fresh context and never auto-reload because reload can destroy temporary document identity.
 
-- When `--browser` is omitted, the pool chooses a usable endpoint once at first placement.
-- After first placement, the selected endpoint is durably pinned for every role in that team.
-- PLAN/DEV/REVIEW/TEST/AUDIT must not independently migrate to different endpoints.
-- If the pinned endpoint is full, cooling down, offline, or unavailable, the task waits. It does not spill roles onto another endpoint.
-- An explicit `--browser` pins the team immediately.
+Normal Send, Resume, Wait, and Route are exact-execution-identity operations. They must never scan or snapshot every ChatGPT tab. Global strict inspection is reserved for destructive cleanup that actually requires global certainty.
 
-The endpoint registry owns endpoint defaults. In particular, an endpoint with `temporary_default=true` makes an unoverridden workflow Temporary when that endpoint is selected.
+Exactly-once Send is non-negotiable: persist request identity before the irreversible boundary, persist accepted provenance after it, and never resolve an accepted or ambiguous Send by blindly sending again. Manual drafts and attachments are operator-owned evidence.
 
-## 3. Temporary Chat
+Role reports are file-backed under `.plan/<team>/...`; the worker owns durable task state. PLAN alone may close the workflow with `DONE`.
 
-Temporary workflows are intentionally minimal:
+## Change discipline
 
-- Fresh context only.
-- No bootstrap.
-- No automatic F5/reload recovery. Reload may destroy the temporary document identity.
-- Recovery uses the exact durable role/page/conversation state or waits for operator action.
-- Persistent Project grouping is skipped for Temporary chats.
+Use the HCUW DIRECT / BOUNDED / SPEC scope that matches the change. Prefer the existing owner and remove duplicate paths instead of adding another gate, recovery layer, state store, or abstraction.
 
-Do not add periodic refresh logic to Temporary workflows.
+Before editing, inspect branch/status/diff and the owning source/tests. Establish root cause before bug repair. Run the narrowest proving checks first, then broader checks only where the changed boundary warrants them. Review the final diff and run `git diff --check`.
 
-## 4. Role/page ownership
-
-Normal Send/Resume admission is exact-role scoped.
-
-Each new role has an immutable `binding_id`. Runtime ownership is anchored by:
-
-- task-level browser endpoint,
-- exact `page_id`,
-- role `binding_id`,
-- `task_id` and physical role as durable owner metadata.
-
-`team`, `task_id`, role, page ID, and conversation URL remain useful audit evidence, but unrelated ChatGPT tabs are not an admission dependency.
-
-### Critical rule
-
-Normal Send, Resume, Wait, and Route must never scan or snapshot every ChatGPT tab on an endpoint.
-
-An unrelated or unbound ChatGPT tab that is slow, stale, or unreadable must not block another task.
-
-Global strict scanning is reserved for destructive operations that actually need global certainty, such as Clear Team / close-owned-tabs cleanup.
-
-Duplicate exact bindings or a conflict on the target role remain fail-closed.
-
-## 5. Send boundary
-
-Exactly-once Send protection remains mandatory.
-
-The normal sequence is:
-
-1. acquire/recover the exact role page;
-2. verify exact ownership;
-3. verify composer/attachments/transcript baseline;
-4. persist durable request identity;
-5. fill the exact draft;
-6. verify Send-ready state;
-7. click Send once;
-8. persist accepted user-message/turn identity;
-9. wait for and validate the response.
-
-Never solve ambiguous accepted-send state by blindly sending again.
-
-Manual drafts and attachments are operator-owned evidence and must not be overwritten.
-
-## 6. Context
-
-New workflow roles start Fresh. Reuse only the same role's own durable conversation when continuing that task.
-
-Bootstrap donors, source bootstrap URLs, cross-endpoint branching, and bootstrap prewarm are not part of normal workflow execution while bootstrap is disabled.
-
-Do not infer tool/device authority from a Windows/Linux path. Honor explicit task tool requirements and actual session capabilities.
-
-## 7. Projects
-
-For persistent workflow conversations, CDPA automatically groups each accepted conversation into the ChatGPT Project named for the execution repository on that endpoint/account.
-
-- Reuse an existing same-name Project on that account when present.
-- Otherwise create it.
-- Attach the conversation after accepted Send; do not wait until terminal routing.
-- Project grouping is organizational metadata. Failure to group must not block substantive work.
-
-Temporary chats are not added to persistent Projects.
-
-## 8. Workflow routing and reports
-
-Normal localized flow is:
-
-```text
-PLAN -> DEV -> REVIEW -> PLAN -> DONE
-```
-
-Add TEST/AUDIT only when the task actually needs them.
-
-Role responses follow the repository file-backed report contract under `.plan/<team>/...`. Preserve accepted Send provenance and report history across recovery.
-
-PLAN owns final workflow closure. Do not mark DONE with a known fixable in-scope regression.
-
-## 9. Operator controls
-
-Use supported durable controls rather than editing manifests or steering browser state manually:
-
-- Pause
-- Resume
-- Retry hop where explicitly retryable
-- Restart role
-- New chat
-- Open tab
-- Route PLAN
-- Change goal
-- Stop
-- Clear Team
-
-Resume is continuation of the same durable task, not a new task.
-
-## 10. Engineering rules
-
-Before editing this control repository:
-
-- inspect status/branch/diff;
-- read relevant current source and tests;
-- preserve every pre-existing dirty/untracked file;
-- do not reset, stash, clean, mass-revert, or overwrite unrelated changes;
-- prefer removal of duplicate gates/state machines over adding another recovery layer;
-- keep non-destructive hot paths local to the exact execution identity;
-- keep destructive cleanup fail-closed;
-- run focused regressions plus relevant broader tests;
-- run syntax checks and `git diff --check`.
-
-When code and old documentation disagree, current verified code plus this file are authoritative; update stale documentation in the same repair.
-
-<!-- HCUW:BEGIN -->
-## HCUW (managed)
-
-For non-trivial engineering work, use the repository-local `hcu-work` skill:
-`.agents/skills/hcu-work/SKILL.md`.
-
-Read `.hcu/profile.md` and `.hcu/rules.md` once per agent session. If
-`.hcu/rules.md` does not exist, initialize it before substantive work by
-following `hcu-work`.
-
-When the user asks to change durable engineering policy or when HCUW reports
-rule drift, use:
-`.agents/skills/hcu-rules/SKILL.md`.
-
-After the files are loaded, do not repeatedly reload them every turn unless they
-changed. Repository-specific instructions, explicit user constraints, accepted
-specs, tests, and implementation truth remain authoritative.
-
-HCUW owns only this marked block. Existing AGENTS.md content before and after
-the block is preserved.
-<!-- HCUW:END -->
+Do not reset, stash, clean, mass-revert, switch branches, push, release, or mutate unrelated runtime state without explicit authority. Commit only when the task/workflow authorizes a checkpoint; checkpoint rules live in `.hcu/rules.md` and the operator guide in `README.md`.

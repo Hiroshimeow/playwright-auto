@@ -376,7 +376,7 @@ def _prompt_kwargs(config, tmp_path: Path, **overrides):
     return value
 
 
-def test_constructor_is_once_per_generation_and_prompt_is_compact_allowlist(tmp_path: Path):
+def test_normal_prompt_is_compact_and_constructor_assets_are_not_injected(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     builder = PromptBuilder(config)
     first = builder.build(**_prompt_kwargs(config, tmp_path))
@@ -410,27 +410,31 @@ def test_constructor_is_once_per_generation_and_prompt_is_compact_allowlist(tmp_
     )
 
     assert first.text.startswith("You are PLAN for the team alpha | task-a:")
-    assert f"Turn: 1\nWorkspace: {tmp_path}\nGoal: full task\nHandoff: full task" in first.text
+    assert f"Turn: 1\nWorkspace: {tmp_path} (resolve relative report paths here)\nGoal: full task\nHandoff: full task" in first.text
+    assert first.constructor_included is False
+    assert later.constructor_included is False
+    assert restarted.constructor_included is False
     assert "TURN_CONTEXT" not in first.text
     assert "allowed-routes" not in first.text
-    assert "Constructor for PLAN" in first.text
+    assert "Constructor for PLAN" not in first.text
     assert "Constructor for DEV" not in later.text
-    assert "Constructor for PLAN" in restarted.text
+    assert "Constructor for PLAN" not in restarted.text
     assert '"source-role"' not in later.text
     assert '"team"' not in later.text
     assert '"role"' not in later.text
     assert '"task-id"' not in later.text
     assert "Handoff: .plan/alpha/alpha-plan_turn1_task-a.md" in later.text
     assert "Goal: full task" in later.text
-    assert "Use @mcp-g8 or @mcp-docker on Linux, and @mcp-thinkbook on Windows." not in later.text
-    assert "Establish the root cause before changing or judging code; prefer the least invasive complete solution, never a smaller patch that leaves the cause intact." in later.text
+    assert "REPOSITORY_SKILLS" not in later.text
+    assert "Establish the root cause before changing or judging code" not in later.text
+    assert "Follow repository AGENTS/HCUW when present" in later.text
     assert "Work first." in later.text
     assert "block_code" in later.text
     assert "resume_condition" in later.text
     assert ".plan/alpha/alpha-plan_turn1_task-a.md" not in first.text
     for forbidden in (
         "logical_role", "physical_role", "source_physical_role", "allowed_roles",
-        "team_members", "repository", "report_naming_rule", "controller_id",
+        "team_members", "report_naming_rule", "controller_id",
         "run_id", "request_id", "page_id", "prompt_sha256", "ledger_path",
         "created_at", "updated_at", "ROLE_REQUEST_ID",
     ):
@@ -464,7 +468,8 @@ def test_same_role_continuation_prompt_rejects_report_only_turn(tmp_path: Path):
         )
     ).text
 
-    assert "Continue the previous DEV turn; do not restate it." in prompt
+    assert "Continue from the handoff; do not restate prior work." in prompt
+    assert "Goal:" not in prompt
     assert prompt.rstrip().endswith("Write the report, then return exactly one valid route JSON object.")
 
 

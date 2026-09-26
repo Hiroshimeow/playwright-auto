@@ -195,7 +195,7 @@ Use the dashboard/API controls instead of editing runtime manifests:
 
 Controls are processed by the durable worker state machine.
 
-## Workflow
+## Workflow and HCUW
 
 The default localized workflow is:
 
@@ -203,13 +203,31 @@ The default localized workflow is:
 PLAN -> DEV -> REVIEW -> PLAN -> DONE
 ```
 
-TEST or AUDIT are added only when required by the task.
+TEST or AUDIT are opt-in when a runtime, restart, browser, destructive, environment-specific, cross-cutting, or otherwise unproven boundary needs independent evidence. PLAN alone may route `DONE`.
+
+Repository work uses HCUW as the durable engineering frame:
+
+1. Load `AGENTS.md`, `.agents/skills/hcu-work/SKILL.md`, `.hcu/profile.md`, run `hcuw fingerprint .`, and read `.hcu/rules.md` once.
+2. Resolve rule drift narrowly with `hcu-rules`; do not regenerate the rulebook wholesale.
+3. Use DIRECT for mechanical/local changes, BOUNDED for ordinary fixes/refactors/features, and SPEC only for non-obvious capability, durable lifecycle/state, ownership, recovery, public-contract, concurrency, irreversible-side-effect, or dependency-ordered work.
+4. For SPEC work, create only useful `.hcu/specs/<change>/spec.md`, `plan.md`, or `tasks.md`. Clarification/checklist/analyze steps are gates only when a concrete ambiguity or dependency justifies them.
+5. Debugging follows evidence -> root cause -> scoped fix -> focused validation. Do not convert incident workarounds into permanent architecture.
+
+Stable policy lives in `.hcu/rules.md`; this README explains operator usage; `AGENTS.md` only bootstraps agents; role prompts carry only role-specific execution contracts.
+
+Normal workflow composer payloads are intentionally compact. A role's first turn includes its identity, workspace, current goal, handoff, exact report destination, route contract, and response instruction. Later turns of that same role omit the full goal and generic bootstrap; they continue from the previous handoff/report plus the exact report/route contract. Repository skill catalogs and built-in role-constructor bodies are not serialized into normal workflow prompts; agents load repository guidance through AGENTS/HCUW and the available skill mechanism. A custom workflow agent still receives its own custom system prompt on its first role turn.
 
 Reports are file-backed under:
 
 ```text
 .plan/<team>/...
 ```
+
+### Checkpoint commits
+
+When the active task explicitly authorizes repository checkpointing, every role that changes task-owned repository files commits only those task-owned changes before handoff. REVIEW/TEST/AUDIT make no empty commits. Final PLAN requires task-owned repository changes committed and a clean worktree except explicitly allowed generated/runtime files.
+
+Checkpoint authority does not authorize push, merge, release, reset, stash, clean, branch switching, or touching unrelated work.
 
 PLAN owns final closure and the bounded learning pass.
 
