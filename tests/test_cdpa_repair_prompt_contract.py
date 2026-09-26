@@ -24,3 +24,5 @@ def test_route_repair_prompt_is_self_contained_for_new_conversation(tmp_path: Pa
     assert "exactly the two string keys route and handoff" in prompt
     assert "No markdown fence" in prompt
     assert "Do not redo completed substantive work" in prompt
+    assert "original task" not in prompt.lower()
+    assert len(prompt) <= 1400

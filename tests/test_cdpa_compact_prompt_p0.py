@@ -69,7 +69,7 @@ def test_windows_tool_authority_is_session_generic_without_path_guessing(tmp_pat
         constructor_sent_generation=0,
         conversation_generation=0,
     ).text
-    assert "use only tools authorized by the current task/session" in prompt
+    assert "use only tools authorized by the current task/session" not in prompt
     assert "@md device g6" not in prompt
     assert "mcp-thinkbook" not in prompt
     assert "mcp-g8" not in prompt
@@ -95,7 +95,7 @@ def test_linux_tool_authority_is_session_generic_without_path_guessing(tmp_path:
         conversation_generation=0,
     ).text
 
-    assert "use only tools authorized by the current task/session" in prompt
+    assert "Discover, load, and use the relevant skills for this responsibility." in prompt
     assert "mcp-thinkbook" not in prompt
     assert "mcp-g8" not in prompt
     assert "mcp-docker" not in prompt
@@ -130,69 +130,12 @@ def test_long_continuation_uses_handoff_without_repeating_goal_tool_literal(tmp_
     assert "mcp-docker" not in prompt
 
 
-def test_explicit_md_g6_requirement_is_enforced_for_every_workflow_role(tmp_path: Path):
+def test_first_turn_uses_goal_as_the_task_tool_contract_without_duplication(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    builder = PromptBuilder(config)
-
-    for role in ("PLAN", "DEV", "REVIEW", "TEST", "AUDIT"):
-        prompt = builder.build(
-            task_title="Exact G6 authority",
-            task_id="task-exact-g6",
-            team="alpha",
-            logical_role=role,
-            physical_role=f"alpha-{role.lower()}",
-            turn=1,
-            allowed_routes=("PLAN", "DEV", "REVIEW", "TEST", "AUDIT", "DONE"),
-            workspace=r"E:\\git-project\\playwright-auto-multicdp",
-            source_physical_role="alpha-plan",
-            handoff=".plan/alpha/prior.md",
-            goal="Use @md g6 for this repository/workspace.",
-            expected_report_path=f".plan/alpha/{role.lower()}.md",
-            constructor_sent_generation=0,
-            conversation_generation=0,
-        ).text
-
-        assert "EXPLICIT_TOOL_REQUIREMENTS" in prompt
-        assert "Preserve every exact user tool literal (ordered, deduplicated): @md g6" in prompt
-        assert "do not substitute another connector, device, host, or path-derived target" in prompt
-
-
-def test_worker_final_payload_preserves_all_explicit_literals_and_required_scope(tmp_path: Path):
-    _config, _store, state, worker = setup_task(
-        tmp_path, task_id="task-worker-long-tool-literals"
-    )
-    state["task_text"] = (
-        "Immutable request requires @md g8 and @mcp-thinkbook. "
-        + ("immutable task detail " * 500)
-    )
-    state["goal_revisions"] = [
-        {
-            "applies_from_hop_id": 1,
-            "goal": "Continue with md:g6 and @md device z99. " + ("current goal detail " * 500),
-        }
-    ]
-    hop = _active_hop(state)
-    asyncio.run(worker._pre_send(state, hop, FakeActions()))
-    prompt = hop["prompt"]
-    expected = hop["expected_report_path"]
-    absolute_report = Path(state["repository"]) / expected
-
-    for literal in ("@md g8", "@mcp-thinkbook", "md:g6", "@md device z99"):
-        assert literal in prompt
-    assert "EXPLICIT_TOOL_REQUIREMENTS" in prompt
-    assert str(absolute_report) in prompt
-    assert f"Before replying, write a non-empty report to exactly: {expected}" in prompt
-    assert f'"handoff":"{expected}"' in prompt
-    assert '"route":"PLAN|DEV|TEST|REVIEW|AUDIT|DONE"' in prompt
-
-
-def test_explicit_literal_section_preserves_many_exact_tokens(tmp_path: Path):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
-    literals = " ".join(f"@mcp-device-{index:03d}-" + ("x" * 40) for index in range(40))
-
+    goal = "Use @mcp-task-supplied for this exact repository/workspace."
     prompt = PromptBuilder(config).build(
-        task_title="Bounded literals",
-        task_id="task-bounded-literals",
+        task_title="Goal authority",
+        task_id="task-goal-authority",
         team="alpha",
         logical_role="DEV",
         physical_role="alpha-dev",
@@ -201,14 +144,14 @@ def test_explicit_literal_section_preserves_many_exact_tokens(tmp_path: Path):
         workspace=str(tmp_path),
         source_physical_role=None,
         handoff=".plan/alpha/prior.md",
-        goal=literals,
+        goal=goal,
         expected_report_path=".plan/alpha/report.md",
-        constructor_sent_generation=0,
-        conversation_generation=1,
+        constructor_text=(ROOT / "prompts" / "cdpa" / "DEV.md").read_text(encoding="utf-8"),
     ).text
 
-    assert "@mcp-device-000-" in prompt
-    assert "@mcp-device-039-" in prompt
+    assert f"Goal: {goal}" in prompt
+    assert prompt.count("@mcp-task-supplied") == 1
+    assert "EXPLICIT_TOOL_REQUIREMENTS" not in prompt
 
 
 def test_later_normal_prompt_is_human_first_and_compact(tmp_path: Path):
@@ -247,7 +190,9 @@ def test_later_normal_prompt_is_human_first_and_compact(tmp_path: Path):
     assert "TURN_CONTEXT" not in prompt
     assert "allowed-routes" not in prompt
     assert '"route":"PLAN|DEV|REVIEW"' in prompt
-    assert "PAUSE is exceptional:" in prompt
+    assert "Follow repository AGENTS/HCUW" not in prompt
+    assert "PAUSE is exceptional:" not in prompt
+    assert "use only tools authorized" not in prompt
     assert prompt.count('{"route":"') == 1
     assert prompt.endswith(FINAL_DIRECTIVE)
 

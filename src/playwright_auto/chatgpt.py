@@ -20,6 +20,7 @@ from .chatgpt_graph import (
     BackendSchemaError,
     BackendUnavailableError,
     normalize_visible_text,
+    rendered_user_text_matches,
     visible_text_matches,
 )
 from .observability import append_live_event, record_page_action
@@ -2521,9 +2522,30 @@ async def click_preferred_mcp_allow(
             return {method:'react_handler', target_message_id:chosen.target_message_id,
               remember_answer:chosen.remember_answer === true ? 'true' : 'false'};
           }
-          const conversation = [...document.querySelectorAll('button[aria-label^="Allow "][aria-label$=" for this conversation"]')]
-            .find(e => visible(e) && !e.disabled && e.getAttribute('aria-disabled') !== 'true');
-          if (conversation) { conversation.click(); return {method:'dom_click_conversation', target_message_id:'', remember_answer:'true'}; }
+          const conversationPattern = /^Allow\b.*\bconversation\b/i;
+          const conversationButtons = () => [...document.querySelectorAll('button,[role="menuitem"],[role="option"]')]
+            .filter(e => visible(e) && !e.disabled && e.getAttribute('aria-disabled') !== 'true' &&
+              conversationPattern.test(norm(e.innerText || e.textContent || e.getAttribute('aria-label'))));
+          const direct = conversationButtons();
+          if (direct.length === 1) { direct[0].click(); return {method:'dom_click_conversation', target_message_id:'', remember_answer:'true'}; }
+          const surfaces = [...document.querySelectorAll('[data-codex-approval-surface="true"]')].filter(visible);
+          if (surfaces.length === 1) {
+            const surface = surfaces[0];
+            const options = [...surface.querySelectorAll('button')].find(e => visible(e) && !e.disabled &&
+              e.getAttribute('aria-disabled') !== 'true' && norm(e.getAttribute('aria-label')) === 'Approval options');
+            const once = [...surface.querySelectorAll('button')].find(e => visible(e) && !e.disabled &&
+              e.getAttribute('aria-disabled') !== 'true' && /^Allow once\b/i.test(norm(e.innerText || e.textContent)));
+            if (options && once) {
+              options.click();
+              for (let i = 0; i < 20; i += 1) {
+                await new Promise(resolve => setTimeout(resolve, 50));
+                const candidates = conversationButtons();
+                if (candidates.length === 1) { candidates[0].click(); return {method:'dom_click_conversation_menu', target_message_id:'', remember_answer:'true'}; }
+                if (candidates.length > 1) { once.click(); return {method:'dom_click_once_fallback_ambiguous', target_message_id:'', remember_answer:'false'}; }
+              }
+              once.click(); return {method:'dom_click_once_fallback_missing', target_message_id:'', remember_answer:'false'};
+            }
+          }
           const plain = [...document.querySelectorAll('button')]
             .find(e => visible(e) && !e.disabled && e.getAttribute('aria-disabled') !== 'true' && norm(e.innerText || e.textContent) === 'Allow');
           if (plain) { plain.click(); return {method:'dom_click', target_message_id:'', remember_answer:'false'}; }
@@ -2830,9 +2852,17 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             return [textLabel, ariaLabel].find((label) => positiveChoice.test(label)) || '';
           };
           const normalizeLabel = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-          const mcpConversationAllow = /^Allow [^\r\n]+? for this conversation$/i;
+          const mcpConversationAllow = /^Allow\b.*\bconversation\b/i;
           const mcpPermissionNodes = [...document.querySelectorAll('button[aria-label]')]
             .filter((button) => mcpConversationAllow.test(normalizeLabel(button.getAttribute('aria-label'))));
+          const splitApprovalSurfaces = [...document.querySelectorAll('[data-codex-approval-surface="true"]')]
+            .filter(visible)
+            .filter((surface) => {
+              const buttons = [...surface.querySelectorAll('button')].filter((button) =>
+                visible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true');
+              return buttons.some((button) => /^Allow once\b/i.test(normalizeLabel(button.innerText || button.textContent))) &&
+                buttons.some((button) => normalizeLabel(button.getAttribute('aria-label')) === 'Approval options');
+            });
           const mcpPermissionGroups = [...document.querySelectorAll('button')]
             .map((primary) => {
               if (
@@ -2906,8 +2936,8 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             error_texts: errors,
             blocking_dialogs: dialogs,
             choice_prompt_labels: [...new Set(choices)],
-            mcp_permission_allow_count: mcpPermissionGroups.length,
-            mcp_permission_node_count: mcpPermissionNodes.length,
+            mcp_permission_allow_count: mcpPermissionGroups.length + splitApprovalSurfaces.length,
+            mcp_permission_node_count: mcpPermissionNodes.length + splitApprovalSurfaces.length,
             last_user_message_id: userIdentity.messageId,
             last_user_turn_id: userIdentity.turnId,
             last_assistant_message_id: assistantIdentity.messageId,
@@ -3377,11 +3407,13 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             attachment_markers: attachmentMarkers,
             choice_prompt_labels: [...new Set(choicePromptLabels)],
             error_present: Boolean(authCallbackError || alertError),
-            mcp_permission_node_count: [...document.querySelectorAll('button[aria-label]')]
-              .filter(b => /^Allow [^\r\n]+? for this conversation$/i.test((b.getAttribute('aria-label') || '').trim())).length,
+            mcp_permission_node_count: [...document.querySelectorAll('button')]
+              .filter(b => /^Allow\b.*\bconversation\b/i.test(text(b) || (b.getAttribute('aria-label') || '').trim())).length +
+              document.querySelectorAll('[data-codex-approval-surface="true"]').length,
             mcp_permission_allow_count: [...document.querySelectorAll('button')]
               .filter(b => visible(b) && !b.disabled && b.getAttribute('aria-disabled') !== 'true' &&
-                (text(b) === 'Allow' || /^Allow [^\r\n]+? for this conversation$/i.test((b.getAttribute('aria-label') || '').trim()))).length,
+                (text(b) === 'Allow' || /^Allow\b.*\bconversation\b/i.test(text(b) || (b.getAttribute('aria-label') || '').trim()))).length +
+              [...document.querySelectorAll('[data-codex-approval-surface="true"]')].filter(visible).length,
             retry_visible: Boolean(retry),
             error_texts: errorTexts,
             response_activity_text: responseActivityText,
@@ -4265,8 +4297,12 @@ class ChatGPTPage:
                   return [...document.querySelectorAll('button')].some((button) =>
                     visible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true' &&
                     (norm(button.innerText || button.textContent) === 'Allow' ||
-                     /^Allow [^\r\n]+? for this conversation$/i.test(norm(button.getAttribute('aria-label'))))
-                  );
+                     /^Allow\b.*\bconversation\b/i.test(norm(button.innerText || button.textContent || button.getAttribute('aria-label'))))
+                  ) || [...document.querySelectorAll('[data-codex-approval-surface="true"]')].some((surface) =>
+                    visible(surface) && [...surface.querySelectorAll('button')].some((button) =>
+                      visible(button) && /^Allow once\b/i.test(norm(button.innerText || button.textContent))) &&
+                    [...surface.querySelectorAll('button')].some((button) =>
+                      visible(button) && norm(button.getAttribute('aria-label')) === 'Approval options'));
                 }"""
             )
         )
@@ -5213,6 +5249,7 @@ class ChatGPTPage:
         pre_send: ChatGPTSnapshot,
         *,
         timeout_ms: int,
+        expected_prompt: str | None = None,
     ) -> tuple[str, MessageSnapshot | None] | None:
         deadline = time.monotonic() + timeout_ms / 1000
         stop_seen = False
@@ -5223,9 +5260,16 @@ class ChatGPTPage:
         while time.monotonic() < deadline:
             snapshot = await self.assert_ownership()
             stop_seen = stop_seen or bool(snapshot.stop_visible)
-            accepted_user = accepted_user or unique_new_user_message(
-                snapshot.messages, baseline
-            )
+            candidate = unique_new_user_message(snapshot.messages, baseline)
+            # An exact unique new user turn is authoritative proof of Send acceptance.
+            # When expected_prompt is given, the candidate text must match the sent
+            # prompt to prevent accepting an unrelated manual user turn.
+            # Stop + assistant evidence is the supplemental fallback when user identity
+            # is unavailable (e.g. markerless sends or delayed DOM hydration).
+            if candidate is not None:
+                if expected_prompt is None or rendered_user_text_matches(candidate.text, expected_prompt):
+                    accepted_user = candidate
+                    return "exact_user_message", accepted_user
             assistants = new_assistant_turns(snapshot.messages, baseline)
             if any(
                 message.message_id
@@ -5246,7 +5290,7 @@ class ChatGPTPage:
                         assistant_signal = "assistant_activity"
             if stop_seen and assistant_signal is not None:
                 return assistant_signal, accepted_user
-            await asyncio.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+            await asyncio.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         return None
 
     async def _prepare_prompt_locked(
@@ -5377,6 +5421,8 @@ class ChatGPTPage:
             assert self.binding is not None
             baseline = capture_message_baseline(before.messages)
             last_error: BaseException | None = None
+            dispatched_clicks = 0
+            click_outcome_ambiguous = False
 
             for attempt in range(1, max_attempts + 1):
                 try:
@@ -5397,25 +5443,31 @@ class ChatGPTPage:
                     # Passive network identity observation is armed around this same click.
                     self._arm_frontend_identity_observer()
                     # Ownership, safe page state, prompt, attachments, and click share one callback.
-                    await click_send_button(
-                        self.page,
-                        timeout_ms=timeout,
-                        expected_url=before.url,
-                        expected_page_id=self.binding.page_id,
-                        expected_role=self.binding.role,
-                        expected_task_id=owned_task_id,
-                        expected_team=owned_team,
-                        expected_prompt=prompt,
-                        expected_attachment_ownership_token=explicit_attachment_token,
-                        expected_attachment_count=expected_count,
-                        expected_attachment_names=expected_names,
-                    )
+                    try:
+                        await click_send_button(
+                            self.page,
+                            timeout_ms=timeout,
+                            expected_url=before.url,
+                            expected_page_id=self.binding.page_id,
+                            expected_role=self.binding.role,
+                            expected_task_id=owned_task_id,
+                            expected_team=owned_team,
+                            expected_prompt=prompt,
+                            expected_attachment_ownership_token=explicit_attachment_token,
+                            expected_attachment_count=expected_count,
+                            expected_attachment_names=expected_names,
+                        )
+                    except Exception:
+                        click_outcome_ambiguous = True
+                        raise
+                    dispatched_clicks += 1
                     self._owned_composer_text = None
                     acceptance_timeout_ms = 60_000
                     acceptance = await self._wait_send_acceptance(
                         baseline,
                         pre_send,
                         timeout_ms=acceptance_timeout_ms,
+                        expected_prompt=prompt,
                     )
                     if acceptance is None:
                         raise SendRecoveryError(
@@ -5497,7 +5549,7 @@ class ChatGPTPage:
                             ):
                                 return None
                             candidate = unique_new_user_message(recovered.messages, baseline)
-                            if candidate is None or not visible_text_matches(candidate.text, prompt):
+                            if candidate is None or not rendered_user_text_matches(candidate.text, prompt):
                                 return None
                             # Only the existing provisional new-chat identity may
                             # canonicalize, and only with the exact new user turn.
@@ -5529,7 +5581,7 @@ class ChatGPTPage:
                         acceptance = (
                             ("exact_user_message", candidate)
                             if candidate is not None
-                            and visible_text_matches(candidate.text, prompt)
+                            and rendered_user_text_matches(candidate.text, prompt)
                             else None
                         )
                     if acceptance is not None:
@@ -5566,8 +5618,14 @@ class ChatGPTPage:
                     # Preserve ambiguity for durable reconciliation, never click twice.
                     break
 
+            if click_outcome_ambiguous:
+                boundary = "send click dispatch outcome is ambiguous"
+            elif dispatched_clicks:
+                boundary = f"send acceptance is ambiguous after {dispatched_clicks} confirmed click(s)"
+            else:
+                boundary = "send failed before any click was dispatched"
             raise SendRecoveryError(
-                f"send failed after {max_attempts} exact attempt(s): "
+                f"{boundary}; no resend occurred: "
                 f"{type(last_error).__name__}: {last_error}"
             ) from last_error
 

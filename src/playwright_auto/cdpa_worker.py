@@ -5576,6 +5576,33 @@ class CDPAWorker:
         role_record.pop("bootstrap_context_recovery", None)
         return acquired
 
+    def _handle_pre_send_fresh_chat_timeout(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        exc: Exception,
+    ) -> None:
+        """Common handler for fresh_chat TimeoutError in _pre_send branches.
+
+        Sets preboundary_recovery and blocks the task.  The caller must return
+        immediately after this call; the page identity was not confirmed.
+        """
+        hop["preboundary_recovery"] = {
+            "phase": "recovery_required",
+            "stage": "acquisition",
+            "request_id": hop.get("request_id"),
+            "attempts": 0,
+            "last_failure": sanitize_exception(exc),
+            "last_failure_at": utc_now(),
+        }
+        self._block(
+            state,
+            "Pre-Send fresh allocation timed out without a returned binding; "
+            "exact owned-page reconciliation is required before another acquisition or Send.",
+            code="preboundary_acquisition_recovery_required",
+            retryable=False,
+        )
+
     async def _pre_send(
         self,
         state: dict[str, Any],
@@ -5643,12 +5670,20 @@ class CDPAWorker:
                 if self._rate_limit_gate_active(state=state):
                     state["active_action"] = "rate_limit_cooldown"
                     return
-                acquired = await actions.fresh_chat(
-                    state,
-                    role,
-                    url="https://chatgpt.com/?temporary-chat=true",
-                    clean_for_send=True,
-                )
+                try:
+                    acquired = await actions.fresh_chat(
+                        state,
+                        role,
+                        url="https://chatgpt.com/?temporary-chat=true",
+                        clean_for_send=True,
+                    )
+                except (TimeoutError, PlaywrightTimeoutError) as exc:
+                    if is_cdp_disconnect(exc):
+                        raise
+                    if not self._pre_send_request_identity_is_safe(state, hop):
+                        return
+                    self._handle_pre_send_fresh_chat_timeout(state, hop, exc)
+                    return
             await self._dismiss_known_rate_limit_on_existing(acquired)
         elif not isinstance(independent, Mapping) and state.get("conversation_mode") == "temporary":
             acquired = await actions.locate_owned(state, role)
@@ -5659,12 +5694,20 @@ class CDPAWorker:
                 if self._rate_limit_gate_active(state=state):
                     state["active_action"] = "rate_limit_cooldown"
                     return
-                acquired = await actions.fresh_chat(
-                    state,
-                    role,
-                    url="https://chatgpt.com/?temporary-chat=true",
-                    clean_for_send=True,
-                )
+                try:
+                    acquired = await actions.fresh_chat(
+                        state,
+                        role,
+                        url="https://chatgpt.com/?temporary-chat=true",
+                        clean_for_send=True,
+                    )
+                except (TimeoutError, PlaywrightTimeoutError) as exc:
+                    if is_cdp_disconnect(exc):
+                        raise
+                    if not self._pre_send_request_identity_is_safe(state, hop):
+                        return
+                    self._handle_pre_send_fresh_chat_timeout(state, hop, exc)
+                    return
             else:
                 acquired = await actions.acquire(state, role, clean_for_send=True)
             await self._dismiss_known_rate_limit_on_existing(acquired)
@@ -5674,12 +5717,20 @@ class CDPAWorker:
                 if self._rate_limit_gate_active(state=state):
                     state["active_action"] = "rate_limit_cooldown"
                     return
-                acquired = await actions.fresh_chat(
-                    state,
-                    role,
-                    url="https://chatgpt.com/",
-                    clean_for_send=True,
-                )
+                try:
+                    acquired = await actions.fresh_chat(
+                        state,
+                        role,
+                        url="https://chatgpt.com/",
+                        clean_for_send=True,
+                    )
+                except (TimeoutError, PlaywrightTimeoutError) as exc:
+                    if is_cdp_disconnect(exc):
+                        raise
+                    if not self._pre_send_request_identity_is_safe(state, hop):
+                        return
+                    self._handle_pre_send_fresh_chat_timeout(state, hop, exc)
+                    return
                 if state.get("context_policy") == "fresh":
                     state["roles"][role]["context_source"] = "fresh"
             elif (
@@ -6025,12 +6076,6 @@ class CDPAWorker:
                     route=locked_route,
                     handoff=locked_handoff,
                     validation_error=str(hop["validation_error"]),
-                    tool_intent_text="\n".join(
-                        (
-                            str(state.get("task_text") or ""),
-                            str(task_goal_for_hop(state, int(hop.get("hop_id") or 0))),
-                        )
-                    ),
                 )
             )
             prompt = "\n\n".join(repair_sections)
@@ -6058,7 +6103,6 @@ class CDPAWorker:
                 is_system_role=bool(workflow_definition["is_system"]),
                 bootstrap_inherited=bootstrap_inherited,
                 bounded_context=bounded_context or None,
-                explicit_tool_text=str(state.get("task_text") or ""),
             )
             prompt = built.text
             included = built.constructor_included
@@ -6363,6 +6407,10 @@ class CDPAWorker:
             wait_for_response=False,
             require_existing_conversation_baseline=prior_completed_role_turn,
             response_timeout_ms=None,
+            # Exactly-once: one click only; reload would destroy temporary doc identity and
+            # create an ambiguous second send. Reload is never safe for CDPA normal workflow.
+            max_attempts=1,
+            recovery_reload=False,
         )
         try:
             async def perform_send() -> Any:

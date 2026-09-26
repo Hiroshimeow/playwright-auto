@@ -439,3 +439,126 @@ def test_send_receipt_rejects_legacy_weak_acceptance_signal():
 
     with pytest.raises(ValueError, match="unsupported acceptance"):
         SendReceipt.from_dict(value)
+
+
+def test_unique_new_user_message_closes_acceptance_without_stop(monkeypatch):
+    """Fix C: A unique new user message is authoritative acceptance; stop/assistant are supplemental."""
+    baseline = receipt().baseline
+    pre_send = make_snapshot()
+    # Only a user message appears; stop_visible stays False; no assistant activity.
+    page = SequencePage([
+        make_snapshot(
+            stop_visible=False,
+            messages=(MessageSnapshot("user", "u-new", "t-new", "expected prompt", ()),),
+        )
+    ])
+    install_sequence(monkeypatch, page)
+
+    result = asyncio.run(
+        bind(page)._wait_send_acceptance(baseline, pre_send, timeout_ms=20)
+    )
+
+    assert result is not None, "Exact unique new user message must close acceptance"
+    accepted_via, accepted_user = result
+    assert accepted_via == "exact_user_message"
+    assert accepted_user is not None
+    assert accepted_user.message_id == "u-new"
+
+
+def test_send_error_reports_zero_clicks_when_prompt_preparation_fails(monkeypatch):
+    import playwright_auto.chatgpt as chatgpt_module
+    from playwright_auto.chatgpt import SendRecoveryError
+    from unittest.mock import AsyncMock
+
+    page = SequencePage([make_snapshot()])
+    install_sequence(monkeypatch, page)
+    client = bind(page)
+    client._prepare_prompt_locked = AsyncMock(side_effect=TimeoutError("composer timeout"))
+    click = AsyncMock()
+    monkeypatch.setattr(chatgpt_module, "click_send_button", click)
+
+    with pytest.raises(SendRecoveryError, match="failed before any click was dispatched; no resend occurred"):
+        asyncio.run(client.send("test prompt", max_attempts=1, recovery_reload=False))
+
+    click.assert_not_awaited()
+
+
+def test_send_error_reports_one_confirmed_click_when_acceptance_is_ambiguous(monkeypatch):
+    import playwright_auto.chatgpt as chatgpt_module
+    from playwright_auto.chatgpt import SendRecoveryError
+    from unittest.mock import AsyncMock
+
+    page = SequencePage([make_snapshot()])
+    install_sequence(monkeypatch, page)
+    client = bind(page)
+    client._prepare_prompt_locked = AsyncMock()
+    client._wait_send_acceptance = AsyncMock(return_value=None)
+    click = AsyncMock()
+    monkeypatch.setattr(chatgpt_module, "click_send_button", click)
+
+    with pytest.raises(SendRecoveryError, match="ambiguous after 1 confirmed click\\(s\\); no resend occurred"):
+        asyncio.run(client.send("test prompt", max_attempts=1, recovery_reload=False))
+
+    assert click.await_count == 1
+
+
+def test_send_acceptance_expected_prompt_rejects_mismatching_user_turn(monkeypatch):
+    """Safety: a unique new user turn whose text does not match expected_prompt is not accepted."""
+    baseline = receipt().baseline
+    pre_send = make_snapshot()
+    page = SequencePage([
+        make_snapshot(
+            stop_visible=False,
+            messages=(MessageSnapshot("user", "u-manual", "t-manual", "manual input", ()),),
+        )
+    ])
+    install_sequence(monkeypatch, page)
+
+    result = asyncio.run(
+        bind(page)._wait_send_acceptance(
+            baseline,
+            pre_send,
+            timeout_ms=20,
+            expected_prompt="expected prompt",
+        )
+    )
+
+    assert result is None, "Mismatching user turn must not be accepted as exact_user_message"
+
+
+@pytest.mark.parametrize(
+    ("rendered", "expected"),
+    [
+        ("expected prompt", "expected prompt"),
+        ("run pytest now", "run `pytest` now"),
+        ("long prompt … Show more", "long prompt"),
+    ],
+)
+def test_send_acceptance_expected_prompt_accepts_matching_user_turn(
+    monkeypatch, rendered, expected
+):
+    """Rendered transcript variants of the expected prompt are accepted immediately."""
+    baseline = receipt().baseline
+    pre_send = make_snapshot()
+    page = SequencePage([
+        make_snapshot(
+            stop_visible=False,
+            messages=(MessageSnapshot("user", "u-new", "t-new", rendered, ()),),
+        )
+    ])
+    install_sequence(monkeypatch, page)
+
+    result = asyncio.run(
+        bind(page)._wait_send_acceptance(
+            baseline,
+            pre_send,
+            timeout_ms=20,
+            expected_prompt=expected,
+        )
+    )
+
+    assert result is not None
+    accepted_via, accepted_user = result
+    assert accepted_via == "exact_user_message"
+    assert accepted_user is not None
+    assert accepted_user.message_id == "u-new"

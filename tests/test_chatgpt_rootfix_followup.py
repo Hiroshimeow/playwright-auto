@@ -268,7 +268,9 @@ def test_send_reload_timeout_reconciles_committed_document_without_second_click(
         ]),
     )
     client = client_with_page(page)
-    client.assert_ownership = AsyncMock(side_effect=[before, before, after])
+    # recovery_before (call 3) is the pre-reload state (same as before);
+    # reconcile_committed_acceptance (call 4) gets the post-reload state.
+    client.assert_ownership = AsyncMock(side_effect=[before, before, before, after])
     client._prepare_prompt_locked = AsyncMock()
     client._arm_frontend_identity_observer = lambda: None
     client._captured_conversation_id = lambda _user: None

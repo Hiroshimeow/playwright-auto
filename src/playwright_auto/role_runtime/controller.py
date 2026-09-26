@@ -227,6 +227,7 @@ class RoleController:
                         "text": transcript_text[:24000],
                         "text_length": len(transcript_text),
                         "complete": True,
+                        "projection_source": "listen",
                     },
                 )
         if permission is not None:

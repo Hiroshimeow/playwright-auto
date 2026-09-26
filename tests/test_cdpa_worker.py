@@ -1142,6 +1142,8 @@ class RecordingCDPASendClient:
         self.set_calls = []
         self.send_calls = []
         self.send_timeout_ms = []
+        self.send_max_attempts = []
+        self.send_recovery_reload = []
 
     async def assert_ownership(self):
         return self.current
@@ -1172,6 +1174,8 @@ class RecordingCDPASendClient:
     ):
         self.send_calls.append(text)
         self.send_timeout_ms.append(timeout_ms)
+        self.send_max_attempts.append(max_attempts)
+        self.send_recovery_reload.append(recovery_reload)
         baseline = capture_message_baseline(self.current.messages)
         user = MessageSnapshot("user", "u1", "t1", text, ())
         self.current = send_snapshot(
@@ -1368,7 +1372,7 @@ def test_pre_send_lazily_acquires_only_plan_with_compact_prompt(tmp_path: Path):
 
     assert hop["state"] == "sending"
     assert hop["expected_report_path"] == ".plan/alpha/alpha-plan_turn1_task-a.md"
-    assert "Constructor for PLAN" not in hop["prompt"]
+    assert hop["prompt"].count("Constructor for PLAN") == 1
     assert "Before replying, write a non-empty report to exactly: .plan/alpha/alpha-plan_turn1_task-a.md" in hop["prompt"]
     assert '"handoff":".plan/alpha/alpha-plan_turn1_task-a.md"' in hop["prompt"]
     assert ".plan/<team>/<physical-role>_turn<N>_<task-id>.md" not in hop["prompt"]
@@ -1382,10 +1386,10 @@ def test_pre_send_lazily_acquires_only_plan_with_compact_prompt(tmp_path: Path):
         if line.startswith('{"route":')
     )
     assert route_contract.split("|") == ["PLAN", "DEV", "TEST", "REVIEW", "AUDIT", "DONE"]
-    assert "PAUSE is exceptional:" in hop["prompt"]
+    assert "PAUSE requires an external/manual prerequisite" in hop["prompt"]
     assert state["roles"]["PLAN"]["page_id"] == "page-alpha-plan"
     assert state["roles"]["DEV"]["status"] == "unallocated"
-    assert state["roles"]["PLAN"]["constructor_sent_generation"] is None
+    assert state["roles"]["PLAN"]["constructor_sent_generation"] == 0
 
 
 @pytest.mark.skip(reason="workflow bootstrap branching is temporarily disabled; workflow tasks use Fresh context")
@@ -1661,8 +1665,8 @@ def test_pre_send_limits_allowed_routes_to_selected_workflow_roles(tmp_path: Pat
     )
 
     assert route_contract.split("|") == ["PLAN", "REVIEW", "DONE"]
-    assert "PAUSE is exceptional:" in hop["prompt"]
-    assert "Constructor for PLAN" not in hop["prompt"]
+    assert "PAUSE requires an external/manual prerequisite" in hop["prompt"]
+    assert hop["prompt"].count("Constructor for PLAN") == 1
     assert f"Before replying, write a non-empty report to exactly: {report_path}" in hop["prompt"]
     assert f'"handoff":"{report_path}"' in hop["prompt"]
     assert "Handoff: Initial task intake; no prior role handoff." in hop["prompt"]
@@ -6726,3 +6730,21 @@ def test_independent_reset_supersedes_older_requested_resume():
     assert selected is not None
     assert selected["control_id"] == 2
     assert selected["action"] == "reset"
+
+
+def test_normal_cdpa_send_uses_single_attempt_no_recovery_reload(tmp_path: Path):
+    """Fix A: Normal _pre_send DurableSendBlock must use max_attempts=1, recovery_reload=False."""
+    _, _, state, worker = setup_task(tmp_path, task_id="task-send-config")
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    client = RecordingCDPASendClient(task_id=state["task_id"], team=state["team"])
+
+    asyncio.run(worker._sending(state, hop, RecordingCDPASendActions(client)))
+
+    assert len(client.send_calls) == 1
+    assert client.send_max_attempts == [1], (
+        f"Normal CDPA send must use max_attempts=1, got {client.send_max_attempts}"
+    )
+    assert client.send_recovery_reload == [False], (
+        f"Normal CDPA send must use recovery_reload=False, got {client.send_recovery_reload}"
+    )

@@ -175,6 +175,7 @@ def test_solo_prompt_initial_and_continuation_are_minimal(tmp_path: Path):
     assert initial.text == (
         "You are REVIEW for the solo task Solo review.\n\n"
         "Goal: Check the patch\n\n"
+        "Discover, load, and use the relevant skills for this responsibility.\n\n"
         "Continue the work required by this task.\n\n"
         "ROUTE\n"
         "When complete, return exactly one JSON object using only:\n"
@@ -662,7 +663,7 @@ def test_solo_existing_idle_url_sends_only_continuation_prompt(tmp_path: Path, m
     assert hop["receipt"] is None
     assert clean_calls == [True]
     assert hop["prompt"].startswith("Continue from the current state.")
-    assert "Review only the current state" in hop["prompt"]
+    assert "Review only the current state" not in hop["prompt"]
     assert "You are REVIEW for the solo task" not in hop["prompt"]
 
 
@@ -895,6 +896,6 @@ def test_create_task_ui_exposes_team_and_solo_without_is_running():
     assert 'data-create-section="team-repository" data-team-only' in html
     assert 'data-solo-browser-slot' in html
     assert "roots.soloBrowserSlot.append(roots.browserEndpointField)" in app
-    assert '/assets/app.js?v=20260923-live-transcript-v1' in html
+    assert '/assets/app.js?v=20260925-live-sse-v1' in html
     assert "is_running" not in html.casefold()
     assert "is_running" not in app.casefold()

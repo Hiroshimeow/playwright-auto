@@ -90,6 +90,59 @@ def test_auto_allow_uses_listen_action_without_dom_permission_button():
     }
 
 
+def test_auto_allow_opens_split_options_and_selects_conversation_scope():
+    async def run(page):
+        client = ChatGPTPage(page, timeout_ms=5_000)
+        result = await client.auto_allow_mcp_permission()
+        return result, await page.evaluate("({once: window.__once || 0, conversation: window.__conversation || 0})")
+
+    result, clicks = asyncio.run(
+        _with_page(
+            """
+            <main>
+              <div data-codex-approval-surface="true">
+                <button onclick="window.__once=(window.__once||0)+1">Allow once</button>
+                <button aria-label="Approval options" onclick="
+                  const item=document.createElement('button');
+                  item.textContent='Allow md for this conversation';
+                  item.onclick=()=>window.__conversation=(window.__conversation||0)+1;
+                  document.body.appendChild(item);
+                "></button>
+              </div>
+            </main>
+            """,
+            run,
+        )
+    )
+
+    assert result["method"] == "dom_click_conversation_menu"
+    assert clicks == {"once": 0, "conversation": 1}
+
+
+def test_auto_allow_split_options_falls_back_to_allow_once_with_reason():
+    async def run(page):
+        client = ChatGPTPage(page, timeout_ms=5_000)
+        result = await client.auto_allow_mcp_permission()
+        return result, await page.evaluate("window.__once || 0")
+
+    result, clicks = asyncio.run(
+        _with_page(
+            """
+            <main>
+              <div data-codex-approval-surface="true">
+                <button onclick="window.__once=(window.__once||0)+1">Allow once</button>
+                <button aria-label="Approval options"></button>
+              </div>
+            </main>
+            """,
+            run,
+        )
+    )
+
+    assert result["method"] == "dom_click_once_fallback_missing"
+    assert clicks == 1
+
+
 def test_auto_allow_falls_back_to_plain_visible_allow_button():
     async def run(page):
         client = ChatGPTPage(page, timeout_ms=5_000)

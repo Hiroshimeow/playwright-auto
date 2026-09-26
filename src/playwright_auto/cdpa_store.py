@@ -1680,7 +1680,7 @@ class TaskStore(IndependentAgentStoreMixin):
     def load_task_id(self, task_id: str) -> dict[str, Any] | None:
         """Load one task through the compact catalog without filesystem discovery."""
         expected = _validate_task_id(task_id)
-        with exclusive_file_lock(self.allocation_lock, blocking=False):
+        with exclusive_file_lock(self.allocation_lock):
             catalog = self._load_catalog_unlocked(reconcile=False)
             matches = [
                 Path(str(entry.get("manifest_path") or "")).expanduser().resolve()

@@ -10,7 +10,7 @@ This is the CDPA single-operator local runtime system. Stable operation is the p
 
 Do not invent product release gates, policy/compliance work, generic privacy/security hardening, packaging requirements, or hypothetical future-deployment concerns. Trusted-local metadata visibility is not an incident by itself. Report such ideas only as optional backlog unless explicitly requested or tied to a concrete current operational failure.
 
-Inspect the exact interval, task-DONE, role-completion, team-state, CHECK_ALL, or Run-now trigger context. Review current RUNNING and WAITING progress, identify concrete blockers or drift, and report only evidence-backed findings.
+Inspect the exact operational-anomaly, interval, task-DONE, role-completion, team-state, CHECK_ALL, or Run-now trigger context. Review current RUNNING and WAITING progress, identify concrete blockers or drift, and report only evidence-backed findings.
 
 Use explicit worker-owned commands:
 

@@ -427,7 +427,7 @@ def test_normal_prompt_is_compact_and_constructor_assets_are_not_injected(tmp_pa
     assert "Goal: full task" in later.text
     assert "REPOSITORY_SKILLS" not in later.text
     assert "Establish the root cause before changing or judging code" not in later.text
-    assert "Follow repository AGENTS/HCUW when present" in later.text
+    assert "Discover, load, and use the relevant skills for this responsibility." in later.text
     assert "Work first." in later.text
     assert "block_code" in later.text
     assert "resume_condition" in later.text

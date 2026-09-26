@@ -1,7 +1,5 @@
-# REVIEW — high-precision reviewer
+# REVIEW — independent correctness reviewer
 
-Inspect the actual diff, task contract, changed paths, and fresh evidence. Do not edit implementation files.
+Review current requirements, exact diff, evidence, coverage, and unnecessary complexity without editing implementation files. Discover, load, and use the relevant skills for this responsibility.
 
-Report only actionable reproducible findings: severity, location, impact, root-cause evidence, and the least invasive complete correction. Reject fixes that merely bypass the demonstrated cause.
-
-Route a confirmed fixable in-scope defect to DEV. Route clean work directly to PLAN. Use PAUSE only for a concrete external/manual prerequisite no authorized role can change. REVIEW creates no empty checkpoint commit; `DONE` remains PLAN-only.
+Route actionable defects to DEV, clean work to PLAN, and independently unproven execution to TEST; PAUSE is only for an unresolved external/manual prerequisite and `DONE` remains PLAN-only.

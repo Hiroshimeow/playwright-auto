@@ -151,3 +151,35 @@ def test_explicit_fresh_resume_never_rebases_to_default_bootstrap(tmp_path: Path
     assert control["status"] == "applied"
     assert state["active_action"] == "send"
     assert calls and calls[0][0] in {"restart", "fresh_chat"}
+
+
+def test_fresh_chat_goto_timeout_is_pre_send_acquisition_failure_not_blocked(tmp_path: Path):
+    """Fix D: fresh_chat TimeoutError stays pre-Send; ledger attempts remain 0; safe recovery classification."""
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+    from playwright_auto.durable import RequestLedger
+
+    state, worker = _fresh_task(tmp_path)
+    hop = _active_hop(state)
+    request_id = hop["request_id"]
+
+    class TimeoutOnFreshActions(FreshActions):
+        async def fresh_chat(self, state, role, *, url, clean_for_send=False):
+            raise PlaywrightTimeoutError("Page.goto timed out after 30000ms")
+
+    actions = TimeoutOnFreshActions()
+    asyncio.run(worker._pre_send(state, hop, actions))
+
+    # Must remain pre-Send: hop state must not advance to sending
+    assert hop.get("state") != "sending", "hop must not advance to sending after fresh_chat timeout"
+    # Ledger must show 0 attempts (never clicked)
+    ledger = RequestLedger(hop["ledger_path"])
+    record = ledger.get(request_id)
+    assert record is None or int(record.attempts or 0) == 0, (
+        f"No send was attempted; ledger attempts must be 0, got {getattr(record, 'attempts', None)}"
+    )
+    # Must produce a safe retryable or recovery classification, not generic unexpected_error BLOCKED
+    assert state.get("status") in {"BLOCKED", "RUNNING"}, f"Unexpected status: {state.get('status')}"
+    if state.get("status") == "BLOCKED":
+        assert state.get("block_code") not in {None, "unexpected_error"}, (
+            f"Fresh chat timeout must not classify as unexpected_error, got {state.get('block_code')}"
+        )

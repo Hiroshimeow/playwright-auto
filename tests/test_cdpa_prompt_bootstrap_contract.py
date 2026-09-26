@@ -97,55 +97,37 @@ def test_runtime_prompt_assets_use_concise_role_specific_contracts(prompt_root: 
     }
     base = (prompt_root / "BASE_CONTEXT.md").read_text(encoding="utf-8")
 
-    assert "workflow decision-maker" in prompts["PLAN"]
-    assert "production engineer" in prompts["DEV"]
-    assert "high-precision reviewer" in prompts["REVIEW"]
-    assert "verification engineer" in prompts["TEST"]
-    assert "operational auditor" in prompts["AUDIT"]
-    assert "bounded backoff" in base
-    assert all("bounded backoff" not in text for text in prompts.values())
-    assert max(len(text.splitlines()) for text in prompts.values()) <= 18
+    assert "scope and workflow decision owner" in prompts["PLAN"]
+    assert "implementation owner" in prompts["DEV"]
+    assert "independent correctness reviewer" in prompts["REVIEW"]
+    assert "independent verification owner" in prompts["TEST"]
+    assert "independent operational/provenance auditor" in prompts["AUDIT"]
+    assert "required capability" in base
+    assert "historical tool" in base.lower()
+    assert "exact target" in base
+    for text in prompts.values():
+        assert "relevant skills" in text
+    assert max(len(text.splitlines()) for text in prompts.values()) <= 7
+    assert len(base.splitlines()) <= 14
 
 
-@pytest.mark.parametrize("name", ("BASE_CONTEXT.md", "PLAN.md", "DEV.md", "REVIEW.md", "TEST.md", "AUDIT.md", "RESPONSE_GUIDE.md"))
+@pytest.mark.parametrize("name", ("BASE_CONTEXT.md", "PLAN.md", "DEV.md", "REVIEW.md", "TEST.md", "AUDIT.md", "INDEPENDENT_RULE.md", "MONITOR.md", "RESPONSE_GUIDE.md"))
 def test_local_and_packaged_workflow_prompt_mirror_match(name: str):
     assert (LOCAL_PROMPTS / name).read_bytes() == (PACKAGED_PROMPTS / name).read_bytes()
 
 
 @pytest.mark.parametrize("prompt_root", (LOCAL_PROMPTS, PACKAGED_PROMPTS))
-def test_final_plan_done_report_contract_is_status_first_vietnamese(prompt_root: Path):
-    plan = (prompt_root / "PLAN.md").read_text(encoding="utf-8")
+def test_runtime_role_prompts_keep_only_identity_skill_and_route_contract(prompt_root: Path):
+    prompts = {
+        role: (prompt_root / f"{role}.md").read_text(encoding="utf-8")
+        for role in CDPA_ROLES
+    }
 
-    for label in ("Kết quả", "Vận hành", "Rủi ro", "Kiểm chứng", "Cần làm tiếp"):
-        assert label in plan
-    assert "PASS WITH SIMPLIFICATION" in plan
-    assert "Do not use verdict labels" in plan
-
-
-@pytest.mark.parametrize("prompt_root", (LOCAL_PROMPTS, PACKAGED_PROMPTS))
-def test_runtime_role_prompts_preserve_authorized_goal_closure_semantics(prompt_root: Path):
-    plan = (prompt_root / "PLAN.md").read_text(encoding="utf-8")
-    dev = (prompt_root / "DEV.md").read_text(encoding="utf-8")
-    review = (prompt_root / "REVIEW.md").read_text(encoding="utf-8")
-    test = (prompt_root / "TEST.md").read_text(encoding="utf-8")
-    audit = (prompt_root / "AUDIT.md").read_text(encoding="utf-8")
-
-    assert "Explicit task-level completion authority controls final closure" in plan
-    assert "fixable in-scope" in plan and "do not route `DONE`" in plan
-    assert "external/manual prerequisite" in plan
-
-    assert "fixable in-scope failure" in dev
-    assert "checkpoint-commit only task-owned changes" in dev
-    assert "Route complete work to REVIEW" in dev
-
-    assert "confirmed fixable in-scope defect to DEV" in review
-    assert "clean work directly to PLAN" in review
-    assert "creates no empty checkpoint commit" in review
-
-    assert "fixable in-scope acceptance failure to DEV" in test
-    assert "verified clean result to PLAN" in test
-    assert "creates no empty checkpoint commit" in test
-
-    assert "confirmed fixable defects to DEV" in audit
-    assert "clean evidence to PLAN" in audit
-    assert "creates no empty checkpoint commit" in audit
+    assert "only PLAN may route `DONE`" in prompts["PLAN"]
+    assert "Route complete work to REVIEW" in prompts["DEV"]
+    assert "Route actionable defects to DEV" in prompts["REVIEW"]
+    assert "Route fixable failures to DEV" in prompts["TEST"]
+    assert "Route confirmed source defects to DEV" in prompts["AUDIT"]
+    assert all("relevant skills" in text for text in prompts.values())
+    assert all("LEARNING.md" not in text for text in prompts.values())
+    assert all(len(text.split()) <= 65 for text in prompts.values())

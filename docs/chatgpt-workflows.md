@@ -74,7 +74,7 @@ cached completion
 per-request process lock
 ```
 
-A durable request never automatically re-clicks after entering `SENDING` unless the transcript proves that the exact marker was accepted.
+A durable request never automatically re-clicks after entering `SENDING`. Reconcile the exact request and transcript read-only; accepted or ambiguous evidence forbids replay, and only durable proof that the prior attempt was not applied may authorize a new bounded attempt.
 
 The idempotency key includes role, normalized prompt, `source_context`, role-prompt hash and file identities. Repeating the same inputs returns the cached request. When each loop iteration represents a distinct external job, include that stable job ID:
 
@@ -179,7 +179,7 @@ SendPromptBlock(
 
 For practical workflows prefer `DurableSendBlock`, which computes file identity and owns the upload/send state machine.
 
-Upload readiness requires the exact marker, expected attachment count, editable composer, no active response, and visible enabled Send. Transport tries a file input first and a bounded drag/drop payload fallback second.
+Upload readiness requires the exact marker, expected attachment count, editable composer, no active response, and visible enabled Send. Before the irreversible boundary, transport may try a file input first and a bounded drag/drop payload fallback second; after accepted or ambiguous upload/Send evidence, it must not repeat or substitute the action.
 
 ## Multi-role workspace
 

@@ -1,11 +1,11 @@
 # CDPA base context
 
-Follow the repository's bootstrap/policy files once, then inspect only the current task's handoff, source, diff, tests, and evidence. Repository truth and explicit task/tool authority win; never infer a host, device, or connector from a path.
+Current task instructions, durable runtime state, and current repository evidence are authoritative. Historical plans, reports, paths, OS hints, and historical tool names are evidence only unless the current task explicitly renews them.
 
-Preserve unrelated work and durable execution identity. Exactly-once irreversible actions, accepted/ambiguous Send non-replay, endpoint/page ownership, dependency integrity, and operator-owned drafts/attachments remain hard safety boundaries.
+Preserve unrelated work, exact task/request/target identity, and operator intent. Never replay an accepted or ambiguous Send or other irreversible action; reconcile the exact execution first.
 
-Establish root cause before editing. Reuse the existing owner, prefer deletion/consolidation over parallel machinery, and verify the narrowest changed boundary first.
+Distinguish required capability, preferred provider, exact target, and historical hint. Use only currently advertised and authorized tools. Never infer or arbitrarily substitute a connector, device, endpoint, account, workspace, credential, or target from path, OS, role, or stale prose.
 
-A temporary tool/device/browser disconnect is not a PAUSE prerequisite. Retry the same authorized capability with bounded backoff while preserving task/role/conversation identity; PAUSE only when a concrete external/manual prerequisite remains after bounded retry.
+If a tool/provider is unavailable, resolve the required capability against the exact target before PAUSE. Alternate paths are allowed only when current authority proves equivalent target, credentials, and side-effect semantics.
 
-Only perform irreversible repository/runtime actions when the active task explicitly authorizes them. When checkpoint commits are authorized, follow the repository checkpoint policy before handoff.
+Reuse the existing owner, establish root cause, keep changes bounded, and verify the narrowest changed boundary first. PAUSE requires a concrete external/manual prerequisite, checked candidates, why alternatives are invalid, and an observable resume condition.

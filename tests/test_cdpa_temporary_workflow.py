@@ -163,3 +163,56 @@ def test_same_endpoint_pristine_temporary_resume_starts_new_temporary_generation
     assert current is not None
     assert current.attempts == 0
     assert current.receipt is None
+
+
+def test_temporary_normal_send_uses_no_recovery_reload(tmp_path: Path):
+    """Fix B: Normal _pre_send for temporary workflow must configure max_attempts=1, recovery_reload=False.
+
+    This ensures temporary workflows cannot auto-reload from Send recovery via the normal send path.
+    Reload destroys temporary document identity (see AGENTS.md and Fix 5 in the RCA).
+    """
+    from test_cdpa_worker import RecordingCDPASendActions, RecordingCDPASendClient
+
+    _store, state, worker = _temporary_task(tmp_path, task_id="task-temp-send-config")
+    hop = _active_hop(state)
+    # First, run _pre_send to open the temporary page
+    actions = TemporaryWorkflowActions()
+    asyncio.run(worker._pre_send(state, hop, actions))
+    assert hop["state"] == "sending"
+
+    # Now run _sending with a recording client and verify max_attempts=1, recovery_reload=False
+    client = RecordingCDPASendClient(task_id=state["task_id"], team=state["team"])
+    asyncio.run(worker._sending(state, hop, RecordingCDPASendActions(client)))
+
+    assert len(client.send_calls) == 1
+    assert client.send_max_attempts == [1], (
+        f"Temporary send must use max_attempts=1 to prevent reload, got {client.send_max_attempts}"
+    )
+    assert client.send_recovery_reload == [False], (
+        f"Temporary send must use recovery_reload=False, got {client.send_recovery_reload}"
+    )
+
+
+def test_temporary_fresh_chat_goto_timeout_is_pre_send_not_blocked(tmp_path: Path):
+    """Fix D (temporary branch): fresh_chat TimeoutError for temporary workflow stays pre-Send."""
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+    from playwright_auto.durable import RequestLedger
+
+    _store, state, worker = _temporary_task(tmp_path, task_id="task-temp-fresh-timeout")
+    hop = _active_hop(state)
+    request_id = hop["request_id"]
+
+    class TimeoutOnFresh(TemporaryWorkflowActions):
+        async def fresh_chat(self, state, role, *, url, clean_for_send=False):
+            raise PlaywrightTimeoutError("Page.goto timed out after 30000ms")
+
+    asyncio.run(worker._pre_send(state, hop, TimeoutOnFresh()))
+
+    assert hop.get("state") != "sending"
+    ledger = RequestLedger(hop["ledger_path"])
+    record = ledger.get(request_id)
+    assert record is None or int(record.attempts or 0) == 0
+    if state.get("status") == "BLOCKED":
+        assert state.get("block_code") not in {None, "unexpected_error"}, (
+            f"Temporary fresh_chat timeout must not classify as unexpected_error"
+        )

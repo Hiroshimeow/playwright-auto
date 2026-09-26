@@ -87,9 +87,9 @@ def test_fresh_builtin_first_turn_uses_compact_goal_route_report_contract(tmp_pa
     asyncio.run(worker._pre_send(state, hop, FakeActions()))
 
     assert "TEST_BASE_CONTEXT" not in hop["prompt"]
-    assert "Constructor for PLAN" not in hop["prompt"]
+    assert "Constructor for PLAN" in hop["prompt"]
     assert "Goal: Prompt compression task" in hop["prompt"]
-    assert "Follow repository AGENTS/HCUW when present" in hop["prompt"]
+    assert "Discover, load, and use the relevant skills for this responsibility." in hop["prompt"]
     assert "Return exactly one valid JSON object" in hop["prompt"]
     assert "REPOSITORY_SKILLS" not in hop["prompt"]
 
@@ -218,20 +218,17 @@ def test_production_prompt_split_keeps_common_context_out_of_role_files():
     base = (root / "prompts" / "cdpa" / "BASE_CONTEXT.md").read_text(encoding="utf-8")
     guide = (root / "prompts" / "cdpa" / "RESPONSE_GUIDE.md").read_text(encoding="utf-8")
 
-    assert "bootstrap/policy" in base
-    assert "explicit task/tool authority" in base
-    assert "bounded backoff" in base
-    assert "accepted/ambiguous Send non-replay" in base
+    assert "current task" in base
+    assert "required capability" in base
+    assert "historical tool" in base.lower()
+    assert "accepted or ambiguous" in base
 
     for role in ("PLAN", "DEV", "TEST", "REVIEW", "AUDIT"):
         text = (root / "prompts" / "cdpa" / f"{role}.md").read_text(encoding="utf-8")
         assert "hcu-work" not in text
         assert "hcuw fingerprint" not in text
         assert "bounded backoff" not in text
-        if role == "PLAN":
-            assert "LEARNING.md" in text
-        else:
-            assert "LEARNING.md" not in text
+        assert "LEARNING.md" not in text
 
     assert '"route":"PLAN|DEV|TEST|REVIEW|AUDIT|PAUSE|DONE"' in guide
     assert "Only PLAN may use `DONE`" in guide
