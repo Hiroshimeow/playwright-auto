@@ -7951,10 +7951,14 @@ class CDPAWorker:
                 next_safe_action="Restore the receipt; do not resend accepted work.",
             )
             return
-        self._start_wait_budget_from_sent(hop)
+        missing_terminal_result_recovery = (
+            str(state.get("block_code") or "") == "response_without_terminal_result"
+        )
+        if not missing_terminal_result_recovery:
+            self._start_wait_budget_from_sent(hop)
         self._reconcile_hop_conversation_identity(state, hop)
         wait = hop["wait"]
-        if remaining_timeout_ms(wait) <= 0:
+        if remaining_timeout_ms(wait) <= 0 and not missing_terminal_result_recovery:
             wait["deadline_at"] = (datetime.now(timezone.utc) + timedelta(
                 seconds=self.config.response_timeout_seconds)).isoformat()
             for key in ("timeout_refreshed", "timeout_status_checked", "timeout_status"):
@@ -7975,6 +7979,29 @@ class CDPAWorker:
                 reason_code=str(state.get("block_code") or "role_offline"),
                 reason=str(state.get("block_reason") or "Saved conversation is unavailable."),
                 next_safe_action="Restore the saved conversation, then Resume.",
+            )
+            return
+        if missing_terminal_result_recovery:
+            self._queue_format_repair(
+                state,
+                hop,
+                None,
+                RouteContractError(
+                    "accepted execution produced no terminal result; recover the route "
+                    "from the existing workspace/report state without replaying the Send"
+                ),
+            )
+            self._finish_resume_control(
+                state,
+                control,
+                outcome="continued",
+                action="queue_route_repair",
+                reason_code=None,
+                reason=(
+                    "The accepted execution already exhausted terminal-result recovery; "
+                    "a route-only repair continuation was queued without replaying the Send."
+                ),
+                postcondition="route_repair_queued",
             )
             return
         if admitted:

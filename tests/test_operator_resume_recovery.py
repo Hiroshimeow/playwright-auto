@@ -160,6 +160,71 @@ def test_resume_pending_mcp_permission_hands_back_to_shared_controller(tmp_path:
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
 
 
+
+def test_resume_missing_terminal_result_block_queues_route_repair_without_timeout_extension(tmp_path: Path):
+    store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-resume-missing-terminal-result"
+    )
+    hop["conversation_url"] = "https://chatgpt.com/c/exact"
+    state["roles"]["PLAN"]["page_url"] = hop["conversation_url"]
+    now = datetime.now(timezone.utc)
+    hop["wait"].update(
+        controller_progress_at=(now - timedelta(seconds=601)).isoformat(),
+        deadline_at=(now - timedelta(seconds=1)).isoformat(),
+        timeout_refreshed=True,
+        timeout_status_checked=True,
+        timeout_status="COMPLETE",
+    )
+    state["status"] = "BLOCKED"
+    state["kanban_column"] = "BLOCKED"
+    state["block_code"] = "response_without_terminal_result"
+    state["block_retryable"] = False
+    state["block_reason"] = "accepted execution has no terminal result"
+
+    snapshot = _accepted_snapshot(receipt)
+
+    class Client:
+        async def wait_snapshot(self, _receipt, **_kwargs):
+            return snapshot
+
+    acquired = AcquiredRole(
+        Client(), receipt.binding.page_id, hop["conversation_url"], False, False
+    )
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            return acquired
+
+        async def reopen(self, *_args, **_kwargs):
+            raise AssertionError("exact owned page should be reused")
+
+    control = {
+        "control_id": 1,
+        "action": "resume",
+        "role": "PLAN",
+        "status": "recovering",
+        "result": {"before": None},
+    }
+    original_hop_id = hop["hop_id"]
+    original_request_id = hop["request_id"]
+
+    asyncio.run(worker._recover_resume_waiting(state, hop, control, Actions()))
+
+    original = next(item for item in state["hops"] if item["hop_id"] == original_hop_id)
+    repair = _active_hop(state)
+    assert original["state"] == "routed"
+    assert original["request_id"] == original_request_id
+    assert repair["kind"] == "route_repair"
+    assert repair["target_role"] == "PLAN"
+    assert "terminal result" in repair["validation_error"].lower()
+    assert state["status"] == "RUNNING"
+    assert state["block_code"] is None
+    assert control["status"] == "applied"
+    assert control["result"]["action"] == "queue_route_repair"
+    assert control["result"]["postcondition"] == "route_repair_queued"
+    assert RequestLedger(original["ledger_path"]).get(original_request_id).attempts == 1
+
+
 def test_resume_control_stays_recovering_until_verified_postcondition(tmp_path: Path):
     _config, store, state, worker = setup_task(tmp_path, task_id="task-resume-recovering")
     path = Path(state["manifest_path"])
