@@ -272,6 +272,28 @@ def test_set_composer_text_targets_actionable_composer_not_hidden_duplicate(monk
     """, run))
 
 
+def test_set_composer_text_hidden_first_real_actionability_and_exact_readback(monkeypatch):
+    from test_chatgpt_mcp_permission import _with_page
+
+    async def no_delay(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(chatgpt, "action_delay", no_delay)
+    monkeypatch.setattr(chatgpt, "record_page_action", no_delay)
+
+    async def run(page):
+        await chatgpt.set_composer_text(page, "line one\nline two", timeout_ms=800)
+        assert await page.locator("#live-composer").inner_text() == "line one\nline two"
+        assert await page.locator("#hidden-composer").inner_text() == "operator draft"
+
+    asyncio.run(_with_page("""
+        <main>
+          <div id="hidden-composer" contenteditable="true" role="textbox" style="display:none">operator draft</div>
+          <div id="live-composer" contenteditable="true" role="textbox"></div>
+        </main>
+    """, run))
+
+
 def test_prepare_prompt_refills_empty_before_send(monkeypatch):
     page = DummyPage(snapshot())
     client = ChatGPTPage(page)

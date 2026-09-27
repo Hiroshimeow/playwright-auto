@@ -6027,9 +6027,12 @@ class CDPAWorker:
         if hop.get("kind") in {"route_repair", "report_repair"} and (
             acquired.new_chat or (acquired.created and role_record.get("last_endpoint_id"))
         ):
-            hop["context_recovery_snapshot"] = self._build_execution_recovery_snapshot(
-                state, hop, reason="repair continuation acquired a new browser conversation",
-            )
+            if hop.get("kind") == "route_repair":
+                hop.pop("context_recovery_snapshot", None)
+            else:
+                hop["context_recovery_snapshot"] = self._build_execution_recovery_snapshot(
+                    state, hop, reason="repair continuation acquired a new browser conversation",
+                )
         bounded_context = ""
         if hop.get("context_recovery_snapshot"):
             bounded_context = (
@@ -6044,6 +6047,7 @@ class CDPAWorker:
                 # Keep donor/endpoint audit evidence, never re-inject abandoned instructions.
                 recovery_metadata.pop("prewarm_context", None)
         if hop.get("kind") == "route_repair":
+            bounded_context = ""  # Format repair never reintroduces the original goal or handoff.
             repair_prompt = self.prompts.repair(
                 task_id=str(state["task_id"]),
                 team=str(state["team"]),

@@ -1886,18 +1886,28 @@ async def set_composer_text(page: Any, text: str, timeout_ms: int = 5_000) -> No
     composer = page.locator(SELECTORS["composer"] + ":visible").first
     await composer.wait_for(state="visible", timeout=timeout_ms)
     if text:
-        await composer.fill(text)
-        await page.wait_for_function(
-            """([selector, expected]) => {
-              const element = [...document.querySelectorAll(selector)].find(node => node.getClientRects().length);
-              const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
-              return Boolean(element) && normalize(element.innerText) === expected;
-            }""",
-            arg=[SELECTORS["composer"], normalize_visible_text(text)],
-            timeout=timeout_ms,
-        )
-        await record_page_action(page, "composer_fill", "complete", detail=f"{len(text)} chars")
-        return
+        expected = normalize_visible_text(text)
+        async with asyncio.timeout(timeout_ms / 1000):
+            for attempt in range(2):
+                await clear_composer(page, timeout_ms=timeout_ms)
+                await composer.click()
+                await page.keyboard.insert_text(text)
+                try:
+                    await page.wait_for_function(
+                        """([selector, expected]) => {
+                          const element = [...document.querySelectorAll(selector)].find(node => node.getClientRects().length);
+                          const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+                          return Boolean(element) && normalize(element.innerText) === expected;
+                        }""",
+                        arg=[SELECTORS["composer"], expected],
+                        timeout=min(timeout_ms, 2_000),
+                    )
+                except Exception:
+                    if attempt == 0 and not visible_text_matches(await composer.inner_text(), text):
+                        continue
+                    raise
+                await record_page_action(page, "composer_fill", "complete", detail=f"{len(text)} chars")
+                return
     await clear_composer(page, timeout_ms=timeout_ms)
     await record_page_action(page, "composer_fill", "complete", detail="cleared")
 

@@ -313,11 +313,14 @@ class RoleController:
             wait["timeout_status"] = await worker._one_shot_stream_status(actions, receipt) if receipt else None
             return decision
         if decision.action is Action.REPAIR and decision.reason != "malformed_result":
+            retryable = decision.reason in {"retry_visible_stable", "stream_failure_recovery"}
             worker._block(
                 state,
-                "Accepted execution has no terminal result; exact response recovery is required before format repair.",
-                code="response_without_terminal_result",
-                retryable=False,
+                ("Provider Retry or stream failure requires operator recovery without replaying the accepted Send."
+                 if retryable else
+                 "Accepted execution has no terminal result; exact response recovery is required before format repair."),
+                code=decision.reason if retryable else "response_without_terminal_result",
+                retryable=retryable,
             )
             return decision
         if decision.action is Action.REPAIR:

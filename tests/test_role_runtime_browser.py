@@ -119,6 +119,41 @@ def test_no_terminal_result_timeout_does_not_queue_format_route_repair():
     assert hop["receipt"] == request().to_dict()
 
 
+def test_genuine_retry_and_stream_failure_remain_retryable_without_format_repair():
+    class Client:
+        async def install_page_observer(self):
+            return None
+
+        def page_observation(self):
+            return {}
+
+    for reason, evidence in (
+        ("retry_visible_stable", {"retry_visible": True}),
+        ("stream_failure_recovery", {}),
+    ):
+        state, hop, worker, acquired = environment(Client())
+        queued = []
+        worker._queue_format_repair = lambda *_: queued.append(True)
+        worker._block = lambda _state, message, **kwargs: _state.update(
+            block_reason=message, block_code=kwargs.get("code"), retryable=kwargs.get("retryable")
+        )
+        if reason == "retry_visible_stable":
+            hop["wait"]["retry_seen_at"] = (datetime.now(timezone.utc) - timedelta(seconds=6)).isoformat()
+        else:
+            hop["wait"].update(
+                controller_progress_at=(datetime.now(timezone.utc) - timedelta(seconds=601)).isoformat(),
+                timeout_refreshed=True, timeout_status_checked=True, timeout_status="FAILURE",
+            )
+        result = asyncio.run(RoleController().run(
+            worker, state, hop, acquired, None, snapshot=snapshot(**evidence), wait_ms=0,
+        ))
+        assert result.reason == reason
+        assert state["block_code"] == reason
+        assert state["retryable"] is True
+        assert queued == []
+        assert hop["receipt"] == request().to_dict()
+
+
 def test_hidden_allow_real_dom_snapshot_reaches_dispatch_after_five_seconds():
     async def run(page):
         client = ChatGPTPage(page, timeout_ms=5_000)

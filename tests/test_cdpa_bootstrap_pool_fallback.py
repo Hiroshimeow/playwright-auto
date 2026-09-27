@@ -66,7 +66,7 @@ def test_inaccessible_cross_account_donor_continues_same_pristine_hop_with_works
     )
 
 
-def test_new_generation_format_repair_contains_task_and_handoff_not_only_compact_nudge(tmp_path):
+def test_new_generation_format_repair_omits_substantive_goal_and_handoff(tmp_path):
     from test_cdpa_worker import FakeActions
     _config, _store, state, worker = setup_task(tmp_path, task_id="repair-lost-context")
     hop = _active_hop(state)
@@ -78,6 +78,7 @@ def test_new_generation_format_repair_contains_task_and_handoff_not_only_compact
     role["browser_endpoint_id"] = next_endpoint["endpoint_id"]
     role["context_source"] = "execution_recovery"
     asyncio.run(worker._pre_send(state, hop, FakeActions()))
-    assert state["task_text"] in hop["prompt"]
-    assert "Exact previous handoff" in hop["prompt"]
-    assert "RECOVERY_SNAPSHOT" in hop["prompt"]
+    assert "bad route" in hop["prompt"]
+    assert state["task_text"] not in hop["prompt"]
+    assert "Exact previous handoff" not in hop["prompt"]
+    assert "RECOVERY_SNAPSHOT" not in hop["prompt"]
