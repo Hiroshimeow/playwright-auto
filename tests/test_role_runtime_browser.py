@@ -196,7 +196,7 @@ def test_malformed_result_queues_exact_parser_error_with_original_receipt_intact
     assert hop["receipt"] == request().to_dict()
 
 
-def test_no_terminal_result_timeout_does_not_queue_format_route_repair():
+def test_no_terminal_result_timeout_queues_route_repair_without_replaying_send():
     class Client:
         async def install_page_observer(self):
             return None
@@ -206,7 +206,7 @@ def test_no_terminal_result_timeout_does_not_queue_format_route_repair():
 
     state, hop, worker, acquired = environment(Client())
     queued = []
-    worker._queue_format_repair = lambda *_: queued.append(True)
+    worker._queue_format_repair = lambda *_args: queued.append(_args)
     worker._block = lambda _state, reason, **kwargs: _state.update(block_reason=reason, block_code=kwargs.get("code"))
     hop["wait"].update(
         controller_progress_at=(datetime.now(timezone.utc) - timedelta(seconds=601)).isoformat(),
@@ -218,8 +218,10 @@ def test_no_terminal_result_timeout_does_not_queue_format_route_repair():
         worker, state, hop, acquired, None, snapshot=snapshot(error_texts=("provider failed",)), wait_ms=0,
     ))
     assert result.reason == "state_repair"
-    assert queued == []
-    assert state["block_code"] == "response_without_terminal_result"
+    assert len(queued) == 1
+    assert queued[0][2] is None
+    assert "terminal result" in str(queued[0][3]).lower()
+    assert "block_code" not in state
     assert hop["receipt"] == request().to_dict()
 
 
@@ -284,7 +286,7 @@ def test_hidden_allow_real_dom_snapshot_reaches_dispatch_after_five_seconds():
     """, run))
 
 
-def test_no_result_timeout_blocks_without_retry_click_or_new_send(monkeypatch):
+def test_no_result_timeout_queues_route_repair_without_retry_click_or_replay(monkeypatch):
     import playwright_auto.chatgpt as module
     async def no_delay(*args, **kwargs):
         return 0
@@ -305,8 +307,8 @@ def test_no_result_timeout_blocks_without_retry_click_or_new_send(monkeypatch):
         )
         result = await controller.run(worker, state, hop, acquired, None, wait_ms=0)
         assert result.action is Action.REPAIR
-        assert state["block_code"] == "response_without_terminal_result"
-        assert "repair" not in state
+        assert "block_code" not in state
+        assert "terminal result" in state["repair"].lower()
         assert hop["receipt"] == request().to_dict()
         assert await page.evaluate("window.retryClicks || 0") == 0
         assert await page.evaluate("window.sentPrompts || []") == []

@@ -325,12 +325,21 @@ class RoleController:
             return decision
         if decision.action is Action.REPAIR and decision.reason != "malformed_result":
             retryable = decision.reason in {"retry_visible_stable", "stream_failure_recovery"}
+            if decision.reason == "state_repair":
+                worker._queue_format_repair(
+                    state,
+                    hop,
+                    None,
+                    RouteContractError(
+                        "accepted execution produced no terminal result; recover the route "
+                        "from the existing workspace/report state without replaying the Send"
+                    ),
+                )
+                return decision
             worker._block(
                 state,
-                ("Provider Retry or stream failure requires operator recovery without replaying the accepted Send."
-                 if retryable else
-                 "Accepted execution has no terminal result; exact response recovery is required before format repair."),
-                code=decision.reason if retryable else "response_without_terminal_result",
+                "Provider Retry or stream failure requires operator recovery without replaying the accepted Send.",
+                code=decision.reason,
                 retryable=retryable,
             )
             return decision
