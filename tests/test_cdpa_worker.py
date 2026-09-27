@@ -2995,7 +2995,7 @@ def test_unresolved_complete_accepts_terminal_continuation_before_final_block(
                 "handoff": ".plan/alpha/alpha-plan_turn1_task-terminal-continuation-arrives.md",
             }
         ),
-        (),
+        ("copy-turn-action-button",),
     )
     snapshot = send_snapshot(
         messages=(
@@ -3013,7 +3013,7 @@ def test_unresolved_complete_accepts_terminal_continuation_before_final_block(
             "manual_input_pending": False,
             "response_activity_text": response.text,
             "response_activity_structure": "full",
-            "response_activity_turn_id": response.turn_id,
+            "response_activity_turn_id": None,
             "response_activity_length": len(response.text),
         }
     )
@@ -3594,7 +3594,7 @@ def test_accepted_legacy_inline_hop_drains_once_to_execution_repo_then_file(
         "a-legacy-inline",
         "ta-legacy-inline",
         _inline_response(route="DEV", body=body),
-        (),
+        ("copy-turn-action-button",),
     )
     snapshot = send_snapshot(
         messages=(MessageSnapshot("user", "u1", "t1", original_prompt, ()), response),
@@ -3814,7 +3814,7 @@ def test_cross_workspace_local_file_report_requires_execution_repository_artifac
         "a-cross-workspace",
         "ta-cross-workspace",
         json.dumps({"route": "DEV", "handoff": handoff}),
-        (),
+        ("copy-turn-action-button",),
     )
     snapshot = send_snapshot(
         messages=(MessageSnapshot("user", "u1", "t1", receipt.prompt, ()), response),

@@ -81,7 +81,10 @@ def test_signal_trace_records_network_transcript_and_decision_once(monkeypatch):
         "playwright_auto.role_runtime.signals.append_live_event",
         lambda source, kind, **kwargs: events.append((source, kind, kwargs)),
     )
-    wait = {}
+    wait = {
+        "bound_assistant_message_id": "assistant-1",
+        "bound_assistant_turn_id": "turn-1",
+    }
     frame = RoleSignals.from_sources(
         _snapshot(),
         {
@@ -120,6 +123,8 @@ def test_signal_trace_records_network_transcript_and_decision_once(monkeypatch):
     assert ctrl[0][2]["values"]["action"] == "accept"
     assert ctrl[0][2]["values"]["reason"] == "valid_result"
     assert transcript[0][2]["values"]["projection_source"] == "listen"
+    assert transcript[0][2]["values"]["message_id"] is None
+    assert transcript[0][2]["values"]["turn_id"] == "turn-1"
 
 
 def test_signal_trace_error_names_component_stage_without_payload(monkeypatch):
@@ -153,6 +158,52 @@ def test_signal_trace_error_names_component_stage_without_payload(monkeypatch):
         "error_type": "ValueError",
     }
     assert "secret provider payload" not in str(payload)
+
+
+def test_bound_dom_stream_keeps_one_logical_key_across_message_node_remount(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        "playwright_auto.role_runtime.signals.append_live_event",
+        lambda source, kind, **kwargs: events.append((source, kind, kwargs)),
+    )
+    frame = RoleSignals.from_sources(_snapshot(), {})
+    identity = SignalIdentity.from_snapshot(frame.snapshot, request_id="request-1")
+    wait = {
+        "bound_assistant_message_id": "node-1",
+        "bound_assistant_turn_id": "turn-stable",
+        "bound_assistant_progress": {
+            "message_id": "node-1",
+            "turn_id": "turn-stable",
+            "text": "partial",
+        },
+    }
+    record_cycle(
+        frame,
+        wait,
+        identity=identity,
+        phase="waiting",
+        previous_decision=(None, None),
+        decision=Decision(Action.WAIT, "result_stability"),
+    )
+    wait["bound_assistant_progress"] = {
+        "message_id": "node-2",
+        "turn_id": "turn-stable",
+        "text": "done",
+    }
+    record_cycle(
+        frame,
+        wait,
+        identity=identity,
+        phase="waiting",
+        previous_decision=(Action.WAIT.value, "result_stability"),
+        decision=Decision(Action.ACCEPT, "valid_bound_result"),
+    )
+
+    transcript = [event[2]["values"] for event in events if event[0] == "TRANSCRIPT"]
+    assert [(item["message_id"], item["turn_id"], item["complete"]) for item in transcript] == [
+        (None, "turn-stable", False),
+        (None, "turn-stable", True),
+    ]
 
 
 def test_signal_identity_prefers_snapshot_ownership():

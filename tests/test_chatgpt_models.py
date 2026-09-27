@@ -66,3 +66,38 @@ def test_send_receipt_round_trip_uses_extracted_model_types():
 
     assert restored == receipt
     assert type(restored) is chatgpt_models.SendReceipt
+
+
+def test_persistent_logical_baseline_ignores_virtualized_history_remount():
+    baseline = chatgpt_models.capture_message_baseline(
+        (), ("group:user:old", "group:assistant:old")
+    )
+    remounted_old = chatgpt_models.MessageSnapshot(
+        "user", "DOM:user:group:user:old", "group:user:old", "old manual history", ()
+    )
+    exact_new = chatgpt_models.MessageSnapshot(
+        "user", "u-new", "group:user:new", "automation prompt", ()
+    )
+
+    assert chatgpt_models.unique_new_user_message((remounted_old,), baseline) is None
+    assert chatgpt_models.unique_new_user_message(
+        (remounted_old, exact_new), baseline
+    ) == exact_new
+
+
+def test_capture_baseline_persists_rendered_turn_ids_without_extra_snapshot_metadata():
+    old = chatgpt_models.MessageSnapshot(
+        "user", "real-old-node", "stable-old-turn", "old history", ()
+    )
+
+    baseline = chatgpt_models.capture_message_baseline((old,))
+    remounted = chatgpt_models.MessageSnapshot(
+        "user", "DOM:user:stable-old-turn", "stable-old-turn", "old history", ()
+    )
+
+    assert "stable-old-turn" in baseline.logical_turn_ids
+    assert chatgpt_models.unique_new_user_message((remounted,), baseline) is None
+    assert (
+        chatgpt_models.MessageBaseline.from_dict(baseline.to_dict()).logical_turn_ids
+        == baseline.logical_turn_ids
+    )

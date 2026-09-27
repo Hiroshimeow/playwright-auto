@@ -321,6 +321,7 @@ def test_frontend_identity_observer_can_be_taken_before_late_response():
     class Response:
         request = Request()
         url = "https://chatgpt.com/backend-api/f/conversation"
+        status = 200
 
         async def body(self):
             return b'data: {"conversation_id":"c-late"}\n'
@@ -334,6 +335,7 @@ def test_frontend_identity_observer_can_be_taken_before_late_response():
         assert pending.done() is False
         listener = page.listeners["response"]
         listener(Response())
+        assert client._frontend_request_user_message_id == "u-late"
         assert await pending == {
             "observed_user_message_id": "u-late",
             "conversation_id": "c-late",
@@ -341,6 +343,78 @@ def test_frontend_identity_observer_can_be_taken_before_late_response():
         assert "response" not in page.listeners
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("status", [429, 500])
+def test_frontend_identity_observer_failed_post_is_not_send_acceptance(status):
+    import asyncio
+    import playwright_auto.chatgpt as cg
+
+    class Page:
+        def __init__(self):
+            self.listeners = {}
+
+        def on(self, event, callback):
+            self.listeners[event] = callback
+
+        def remove_listener(self, event, callback):
+            if self.listeners.get(event) is callback:
+                self.listeners.pop(event, None)
+
+        def off(self, event, callback):
+            self.remove_listener(event, callback)
+
+    class Request:
+        method = "POST"
+        post_data_json = {
+            "messages": [{"id": "u-failed", "author": {"role": "user"}}]
+        }
+
+    class Response:
+        request = Request()
+        url = "https://chatgpt.com/backend-api/f/conversation"
+
+        def __init__(self):
+            self.status = status
+
+        async def body(self):
+            return b'data: {"conversation_id":"c-failed"}\n'
+
+    async def scenario():
+        page = Page()
+        client = cg.ChatGPTPage(page)
+        client._arm_frontend_identity_observer()
+        pending = client.take_frontend_identity_task()
+        assert pending is not None
+        page.listeners["response"](Response())
+        assert await pending is None
+        assert client._frontend_request_user_message_id is None
+        assert "response" not in page.listeners
+
+    asyncio.run(scenario())
+
+
+def test_inspect_chatgpt_page_returns_persistent_logical_turn_ids():
+    import asyncio
+    import playwright_auto.chatgpt as cg
+
+    class Page:
+        url = "https://chatgpt.com/c/example"
+
+        async def evaluate(self, *_args):
+            return {
+                "url": self.url,
+                "logical_turn_ids": ["turn-old", "group:user:group-old"],
+                "messages": [],
+            }
+
+    snapshot = asyncio.run(cg.inspect_chatgpt_page(Page()))
+
+    assert snapshot.logical_turn_ids == ("turn-old", "group:user:group-old")
+    assert snapshot.to_dict()["logical_turn_ids"] == [
+        "turn-old",
+        "group:user:group-old",
+    ]
 
 
 def test_passive_observation_surfaces_jit_mcp_allow_action_from_sse():

@@ -634,7 +634,9 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
         validated_upload_receipt = (
             _validate_upload_receipt(record, identities) if identities else None
         )
-        baseline = capture_message_baseline(before_send.messages)
+        baseline = capture_message_baseline(
+            before_send.messages, before_send.logical_turn_ids
+        )
         record = ledger.update(
             record.request_id,
             status=RequestStatus.SENDING,

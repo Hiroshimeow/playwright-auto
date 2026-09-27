@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
@@ -80,6 +80,7 @@ class MessageBaseline:
     turn_ids: frozenset[str]
     assistant_turn_ids: frozenset[str]
     user_message_ids: frozenset[str]
+    logical_turn_ids: frozenset[str] = field(default_factory=frozenset)
 
     def to_dict(self) -> dict[str, list[str]]:
         return {
@@ -87,6 +88,7 @@ class MessageBaseline:
             "turn_ids": sorted(self.turn_ids),
             "assistant_turn_ids": sorted(self.assistant_turn_ids),
             "user_message_ids": sorted(self.user_message_ids),
+            "logical_turn_ids": sorted(self.logical_turn_ids),
         }
 
     @classmethod
@@ -99,6 +101,9 @@ class MessageBaseline:
             ),
             user_message_ids=frozenset(
                 str(item) for item in value.get("user_message_ids", [])
+            ),
+            logical_turn_ids=frozenset(
+                str(item) for item in value.get("logical_turn_ids", [])
             ),
         )
 
@@ -220,6 +225,7 @@ class ChatGPTSnapshot:
     response_activity_length: int = 0
     composer_ambiguous: bool = False
     composer_owner_source: str = ""
+    logical_turn_ids: tuple[str, ...] = ()
 
     @property
     def conversation_url(self) -> str | None:
@@ -258,6 +264,7 @@ class ChatGPTSnapshot:
             "response_activity_structure": self.response_activity_structure,
             "response_activity_turn_id": self.response_activity_turn_id,
             "response_activity_length": self.response_activity_length,
+            "logical_turn_ids": list(self.logical_turn_ids),
             "state": self.state.value,
             "requires_login": self.requires_login,
             "composer_present": self.composer_present,
@@ -357,7 +364,13 @@ class PageHealth:
         }
 
 
-def capture_message_baseline(messages: Sequence[MessageSnapshot]) -> MessageBaseline:
+def capture_message_baseline(
+    messages: Sequence[MessageSnapshot],
+    logical_turn_ids: Sequence[str] = (),
+) -> MessageBaseline:
+    persistent = frozenset(str(item) for item in logical_turn_ids if item) | frozenset(
+        str(message.turn_id) for message in messages if message.turn_id
+    )
     return MessageBaseline(
         message_ids=frozenset(message.message_id for message in messages),
         turn_ids=frozenset(message.turn_id for message in messages if message.turn_id),
@@ -369,6 +382,7 @@ def capture_message_baseline(messages: Sequence[MessageSnapshot]) -> MessageBase
         user_message_ids=frozenset(
             message.message_id for message in messages if message.role == "user"
         ),
+        logical_turn_ids=persistent,
     )
 
 
@@ -430,6 +444,7 @@ def unique_new_user_message(
         if message.role == "user"
         and message.message_id not in baseline.user_message_ids
         and message.message_id not in baseline.message_ids
+        and (not message.turn_id or message.turn_id not in baseline.logical_turn_ids)
     ]
     return candidates[0] if len(candidates) == 1 else None
 
@@ -447,6 +462,10 @@ def _receipt_user_index(
             message.role != "user"
             or message.message_id in receipt.baseline.user_message_ids
             or message.message_id in receipt.baseline.message_ids
+            or (
+                message.turn_id
+                and message.turn_id in receipt.baseline.logical_turn_ids
+            )
         ):
             continue
         if message_id or turn_id:
@@ -475,17 +494,61 @@ def bound_assistant_for_receipt(
     assistant_message_id: str | None = None,
     assistant_turn_id: str | None = None,
 ) -> tuple[MessageSnapshot | None, str | None]:
-    """Resolve exactly one assistant owned by the accepted receipt user.
-
-    The first assistant after the exact user binds the operation. A later user
-    before that bind is explicit foreign interleaving. Once bound, later turns
-    cannot redirect ownership.
-    """
+    """Resolve the one logical assistant response owned by the accepted user."""
     user_message_id = str(receipt.user_message_id or "").strip()
     user_turn_id = str(receipt.user_turn_id or "").strip()
     if not user_message_id and not user_turn_id:
         return None, "legacy_receipt_without_exact_user_identity"
 
+    bound_message_id = str(assistant_message_id or "").strip()
+    bound_turn_id = str(assistant_turn_id or "").strip()
+
+    # After the first exact U->A bind, persisted assistant identity is the
+    # operation authority. The receipt user may be virtualized out, and a
+    # renderer remount may replace message nodes while preserving the logical
+    # turn. Later conversation turns therefore do not participate in rebinding.
+    if bound_turn_id:
+        exact_message_matches = [
+            message
+            for message in messages
+            if message.role == "assistant"
+            and bound_message_id
+            and message.message_id == bound_message_id
+        ]
+        if len(exact_message_matches) > 1:
+            return None, "duplicate_bound_assistant_identity"
+        if exact_message_matches and exact_message_matches[0].turn_id != bound_turn_id:
+            return None, "incompatible_bound_assistant_identity"
+
+        matches = [
+            message
+            for message in messages
+            if message.role == "assistant" and message.turn_id == bound_turn_id
+        ]
+        if not matches:
+            return None, None
+        substantive = [
+            message
+            for message in matches
+            if message.text.strip() or message.image_count or message.actions
+        ]
+        if len(substantive) > 1:
+            return None, "duplicate_bound_assistant_identity"
+        if substantive:
+            return substantive[0], None
+        return matches[-1], None
+
+    if bound_message_id:
+        matches = [
+            message
+            for message in messages
+            if message.role == "assistant" and message.message_id == bound_message_id
+        ]
+        if len(matches) > 1:
+            return None, "duplicate_bound_assistant_identity"
+        return (matches[0], None) if matches else (None, None)
+
+    # Initial binding still requires the exact accepted user to be rendered.
     user_matches = [
         index
         for index, message in enumerate(messages)
@@ -500,43 +563,33 @@ def bound_assistant_for_receipt(
     if not user_matches:
         return None, None
 
-    bound_message_id = str(assistant_message_id or "").strip()
-    bound_turn_id = str(assistant_turn_id or "").strip()
-    tail = messages[user_matches[0] + 1 :]
-    if bound_message_id or bound_turn_id:
-        matches = [
-            message
-            for message in tail
-            if message.role == "assistant"
-            and (not bound_message_id or message.message_id == bound_message_id)
-            and (not bound_turn_id or message.turn_id == bound_turn_id)
-        ]
-        if len(matches) > 1:
-            return None, "duplicate_bound_assistant_identity"
-        if matches:
-            return matches[0], None
-        incompatible = any(
-            message.role == "assistant"
-            and (
-                (bound_message_id and message.message_id == bound_message_id)
-                or (bound_turn_id and message.turn_id == bound_turn_id)
-            )
-            for message in tail
-        )
-        if incompatible:
-            return None, "incompatible_bound_assistant_identity"
-        return None, None
-
-    for message in tail:
+    first_identity = ""
+    candidates: list[MessageSnapshot] = []
+    for message in messages[user_matches[0] + 1 :]:
         if message.role == "user":
-            return None, "foreign_user_before_bound_assistant"
+            if not first_identity:
+                return None, "foreign_user_before_bound_assistant"
+            break
         if message.role != "assistant":
             continue
         identity = message.turn_id or message.message_id
-        if identity in receipt.baseline.assistant_turn_ids:
+        if (
+            identity in receipt.baseline.assistant_turn_ids
+            or identity in receipt.baseline.logical_turn_ids
+        ):
             continue
-        return message, None
-    return None, None
+        if not first_identity:
+            first_identity = identity
+        elif identity != first_identity:
+            return None, "conflicting_unbound_assistant_identity"
+        candidates.append(message)
+
+    if not candidates:
+        return None, None
+    return next(
+        (message for message in reversed(candidates) if message.text.strip()),
+        candidates[-1],
+    ), None
 
 
 def all_assistant_turns_for_receipt(
@@ -551,7 +604,11 @@ def all_assistant_turns_for_receipt(
         if message.role != "assistant":
             continue
         identity = message.turn_id or message.message_id
-        if identity in receipt.baseline.assistant_turn_ids or identity in seen:
+        if (
+            identity in receipt.baseline.assistant_turn_ids
+            or identity in receipt.baseline.logical_turn_ids
+            or identity in seen
+        ):
             continue
         seen.add(identity)
         selected.append(message)
@@ -573,7 +630,11 @@ def assistant_turns_for_receipt(
         if message.role != "assistant":
             continue
         identity = message.turn_id or message.message_id
-        if identity in receipt.baseline.assistant_turn_ids or identity in seen:
+        if (
+            identity in receipt.baseline.assistant_turn_ids
+            or identity in receipt.baseline.logical_turn_ids
+            or identity in seen
+        ):
             continue
         seen.add(identity)
         selected.append(message)
@@ -589,7 +650,11 @@ def new_assistant_turns(
         if message.role != "assistant":
             continue
         identity = message.turn_id or message.message_id
-        if identity in baseline.assistant_turn_ids or identity in seen:
+        if (
+            identity in baseline.assistant_turn_ids
+            or identity in baseline.logical_turn_ids
+            or identity in seen
+        ):
             continue
         seen.add(identity)
         selected.append(message)

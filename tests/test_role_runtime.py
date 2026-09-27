@@ -376,14 +376,99 @@ def test_bound_assistant_remount_same_identity_keeps_binding():
     remounted = snapshot(messages=(
         MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
         MessageSnapshot(
-            "assistant", "answer", "answer-turn", "done",
+            "assistant", "answer-remounted", "answer-turn", "done",
             ("copy-turn-action-button",),
         ),
     ))
     assert step(remounted, wait, 1).action is Action.WAIT
     result = step(remounted, wait, 6)
     assert result.action is Action.ACCEPT
-    assert result.response.message_id == "answer"
+    assert result.response.message_id == "answer-remounted"
+    assert wait["bound_assistant_turn_id"] == "answer-turn"
+
+
+def test_bound_assistant_survives_receipt_user_virtualization():
+    wait = {}
+    first = snapshot(messages=(
+        MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
+        MessageSnapshot("assistant", "answer", "answer-turn", "part", ()),
+    ))
+    assert step(first, wait).action is Action.WAIT
+
+    virtualized = snapshot(messages=(
+        MessageSnapshot(
+            "assistant", "answer-remounted", "answer-turn", "done",
+            ("copy-turn-action-button",),
+        ),
+    ))
+    assert step(virtualized, wait, 1).action is Action.WAIT
+    result = step(virtualized, wait, 6)
+
+    assert result.action is Action.ACCEPT
+    assert result.response.message_id == "answer-remounted"
+    assert wait["bound_assistant_turn_id"] == "answer-turn"
+
+
+def test_bound_assistant_rejects_incompatible_reuse_of_persisted_message_node():
+    wait = {}
+    first = snapshot(messages=(
+        MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
+        MessageSnapshot("assistant", "answer", "answer-turn", "part", ()),
+    ))
+    assert step(first, wait).action is Action.WAIT
+
+    incompatible = snapshot(messages=(
+        MessageSnapshot(
+            "assistant", "answer", "different-turn", "wrong",
+            ("copy-turn-action-button",),
+        ),
+    ))
+    result = step(incompatible, wait, 1)
+
+    assert result.action is Action.BLOCK
+    assert result.reason == "incompatible_bound_assistant_identity"
+
+
+def test_duplicate_bound_assistant_message_identity_blocks_explicitly():
+    wait = {}
+    first = snapshot(messages=(
+        MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
+        MessageSnapshot("assistant", "answer", "answer-turn", "part", ()),
+    ))
+    assert step(first, wait).action is Action.WAIT
+
+    duplicated = snapshot(messages=(
+        MessageSnapshot("assistant", "answer", "answer-turn", "one", ()),
+        MessageSnapshot(
+            "assistant", "answer", "answer-turn", "two",
+            ("copy-turn-action-button",),
+        ),
+    ))
+    result = step(duplicated, wait, 1)
+
+    assert result.action is Action.BLOCK
+    assert result.reason == "duplicate_bound_assistant_identity"
+
+
+def test_duplicate_bound_logical_turn_blocks_even_with_distinct_message_nodes():
+    wait = {}
+    first = snapshot(messages=(
+        MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
+        MessageSnapshot("assistant", "answer", "answer-turn", "part", ()),
+    ))
+    assert step(first, wait).action is Action.WAIT
+
+    duplicated = snapshot(messages=(
+        MessageSnapshot("assistant", "answer-remount-1", "answer-turn", "one", ()),
+        MessageSnapshot(
+            "assistant", "answer-remount-2", "answer-turn", "two",
+            ("copy-turn-action-button",),
+        ),
+    ))
+    result = step(duplicated, wait, 1)
+
+    assert result.action is Action.BLOCK
+    assert result.reason == "duplicate_bound_assistant_identity"
 
 
 def test_duplicate_receipt_user_identity_blocks():
@@ -551,6 +636,15 @@ def test_bound_dom_response_finishes_without_listen_response():
     wait = {}
     assert step(dom, wait).reason == "result_stability"
     result = step(dom, wait, 5)
+    assert result.action is Action.ACCEPT
+    assert result.response.message_id == "answer"
+
+
+def test_stale_unrelated_listen_streaming_cannot_block_terminal_bound_dom():
+    dom = current_result('{"route":"DEV"}')
+    wait = {}
+    assert step(dom, wait, network_status="IS_STREAMING").reason == "result_stability"
+    result = step(dom, wait, 5, network_status="IS_STREAMING")
     assert result.action is Action.ACCEPT
     assert result.response.message_id == "answer"
 

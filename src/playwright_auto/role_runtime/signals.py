@@ -439,7 +439,13 @@ def record_cycle(
                 (bound_message_id and transcript.get("message_id") == bound_message_id)
                 or (bound_turn_id and transcript.get("turn_id") == bound_turn_id)
             ):
-                record_transcript(identity, transcript)
+                scoped = dict(transcript)
+                if bound_turn_id:
+                    scoped["message_id"] = None
+                    scoped["turn_id"] = bound_turn_id
+                elif bound_message_id:
+                    scoped["message_id"] = bound_message_id
+                record_transcript(identity, scoped)
 
     current_decision = (
         str(
@@ -455,12 +461,16 @@ def record_cycle(
     bound_progress = wait.get("bound_assistant_progress")
     if isinstance(bound_progress, Mapping):
         bound_text = str(bound_progress.get("text") or "")
+        bound_turn_id = str(wait.get("bound_assistant_turn_id") or "").strip()
+        bound_message_id = str(wait.get("bound_assistant_message_id") or "").strip()
         record_transcript(
             identity,
             {
                 "author": "assistant",
-                "message_id": bound_progress.get("message_id"),
-                "turn_id": bound_progress.get("turn_id"),
+                # Prefer the logical turn as the transcript key so renderer
+                # remounts cannot create a second operation response.
+                "message_id": None if bound_turn_id else (bound_message_id or None),
+                "turn_id": bound_turn_id or None,
                 "text": bound_text,
                 "text_length": len(bound_text),
                 "complete": current_decision[0] == "accept",

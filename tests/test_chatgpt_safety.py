@@ -1096,6 +1096,7 @@ def test_send_arms_nonblocking_frontend_identity_observer_before_single_click(mo
     class Response:
         url = "https://chatgpt.com/backend-api/f/conversation"
         request = Request()
+        status = 200
         def __init__(self, gate): self.gate = gate
         async def body(self):
             await self.gate.wait()
@@ -1161,6 +1162,7 @@ def test_sequential_send_clears_previous_frontend_identity_task(monkeypatch):
     class Response:
         url = "https://chatgpt.com/backend-api/f/conversation"
         request = Request()
+        status = 200
         async def body(self):
             return b'data: {"conversation_id":"conversation-1"}\n'
 
@@ -1230,6 +1232,7 @@ def test_post_reload_acceptance_reuses_same_frontend_identity_without_second_cli
     class Response:
         url = "https://chatgpt.com/backend-api/f/conversation"
         request = Request()
+        status = 200
         async def body(self):
             return b'data: {"conversation_id":"conversation-reload"}\n'
 
@@ -1300,6 +1303,7 @@ def test_frontend_identity_parser_failure_cannot_retry_accepted_dom_send(monkeyp
     class Response:
         url = "https://chatgpt.com/backend-api/f/conversation"
         request = Request()
+        status = 200
         async def body(self):
             raise RuntimeError("synthetic raw body failure")
 

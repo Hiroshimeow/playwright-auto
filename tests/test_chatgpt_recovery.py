@@ -474,12 +474,7 @@ def test_send_acceptance_accepts_exact_frontend_user_identity(monkeypatch):
     client = bind(page)
 
     async def exercise():
-        future = asyncio.get_running_loop().create_future()
-        future.set_result({
-            "observed_user_message_id": "network-user",
-            "conversation_id": "conversation-id",
-        })
-        client._frontend_identity_task = future
+        client._frontend_request_user_message_id = "network-user"
         return await client._wait_send_acceptance(
             receipt().baseline,
             make_snapshot(),
@@ -490,6 +485,31 @@ def test_send_acceptance_accepts_exact_frontend_user_identity(monkeypatch):
     accepted_via, accepted_user = asyncio.run(exercise())
     assert accepted_via == "user_message_identity"
     assert accepted_user.message_id == "network-user"
+
+
+def test_send_acceptance_ignores_body_identity_without_successful_response(monkeypatch):
+    page = SequencePage([make_snapshot()])
+    install_sequence(monkeypatch, page)
+    client = bind(page)
+
+    async def exercise():
+        future = asyncio.get_running_loop().create_future()
+        future.set_result(
+            {
+                "observed_user_message_id": "failed-network-user",
+                "conversation_id": "failed-conversation",
+            }
+        )
+        client._frontend_identity_task = future
+        return await client._wait_send_acceptance(
+            receipt().baseline,
+            make_snapshot(),
+            timeout_ms=20,
+            expected_prompt="expected prompt",
+        )
+
+    assert asyncio.run(exercise()) is None
+
 
 def test_page_health_distinguishes_auth_and_empty_snapshot(monkeypatch):
     auth_page = SequencePage([make_snapshot(requires_login=True)])

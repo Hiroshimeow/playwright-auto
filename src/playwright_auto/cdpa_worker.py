@@ -8714,7 +8714,9 @@ class CDPAWorker:
         binding = acquired.client.binding
         if binding is None:
             raise RuntimeError("bounded SENDING replacement has no page binding")
-        baseline = capture_message_baseline(snapshot.messages)
+        baseline = capture_message_baseline(
+            snapshot.messages, snapshot.logical_turn_ids
+        )
         self._record_acquired(
             state,
             role,
@@ -9354,7 +9356,9 @@ class CDPAWorker:
                 next_safe_action="Preserve the composer and resolve the manual-input mismatch.",
             )
             return
-        if capture_message_baseline(snapshot.messages) != record.baseline:
+        if capture_message_baseline(
+            snapshot.messages, snapshot.logical_turn_ids
+        ) != record.baseline:
             self._require_resume_recovery(
                 state,
                 control,

@@ -1991,18 +1991,34 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             .slice(0, 12);
 
           const chatRoot = document.querySelector('main') || document.body;
-          const logicalTurnId = (element) => {
-            const owner = element?.closest('[data-turn-id],[data-turn-key],[data-turn-id-container]');
-            if (!owner) return null;
-            return owner.getAttribute('data-turn-id')
-              || owner.getAttribute('data-turn-key')
-              || owner.getAttribute('data-turn-id-container')
-              || null;
+          const logicalTurnId = (element, role) => {
+            const turnId = element?.closest('[data-turn-id]')?.getAttribute('data-turn-id');
+            if (turnId) return turnId;
+            const groupKey = element?.closest('[data-turn-key]')?.getAttribute('data-turn-key');
+            if (groupKey && role) return `group:${role}:${groupKey}`;
+            return element?.closest('[data-turn-id-container]')
+              ?.getAttribute('data-turn-id-container') || null;
           };
+          const logicalTurnIds = new Set();
+          for (const turn of chatRoot.querySelectorAll('[data-turn-id]')) {
+            const value = turn.getAttribute('data-turn-id');
+            if (value) logicalTurnIds.add(value);
+          }
+          for (const container of chatRoot.querySelectorAll('[data-turn-id-container]')) {
+            const value = container.getAttribute('data-turn-id-container');
+            if (value) logicalTurnIds.add(value);
+          }
+          for (const group of chatRoot.querySelectorAll('[data-turn-key]')) {
+            const key = group.getAttribute('data-turn-key');
+            if (!key) continue;
+            logicalTurnIds.add(`group:user:${key}`);
+            logicalTurnIds.add(`group:assistant:${key}`);
+          }
           const legacyMessages = [...chatRoot.querySelectorAll('[data-message-author-role][data-message-id]')]
             .filter(visible)
             .map((element) => {
-              const turnId = logicalTurnId(element);
+              const role = element.getAttribute('data-message-author-role') || '';
+              const turnId = logicalTurnId(element, role);
               const actions = [...element.querySelectorAll('button[data-testid]')]
                 .filter(visible)
                 .map((button) => button.dataset.testid)
@@ -2030,7 +2046,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
               .filter(visible)
               .map((button) => button.dataset.testid)
               .filter(Boolean);
-            const semanticTurnId = logicalTurnId(element);
+            const semanticTurnId = logicalTurnId(element, role);
             const semanticOrdinal = semanticCounts[role]++;
             semanticMessages.push({
               role,
@@ -2055,7 +2071,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
                 .filter(Boolean)
                 .join('|')
             : (semanticAssistant ? 'semantic-assistant' : '');
-          const responseActivityTurnId = logicalTurnId(activeResponse);
+          const responseActivityTurnId = logicalTurnId(activeResponse, 'assistant');
 
           const requiresLogin = location.hostname === 'auth.openai.com' || Boolean(login);
           const authCallbackError = location.hostname === 'chatgpt.com' && location.pathname === '/auth/error';
@@ -2121,6 +2137,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             response_activity_text: responseActivityText,
             response_activity_structure: responseActivityStructure,
             response_activity_turn_id: responseActivityTurnId,
+            logical_turn_ids: [...logicalTurnIds],
             messages,
           };
         }
@@ -2163,6 +2180,9 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             else None
         ),
         response_activity_length=len(str(raw.get("response_activity_text") or "")),
+        logical_turn_ids=tuple(
+            str(value) for value in raw.get("logical_turn_ids") or [] if value
+        ),
         state=classify_chatgpt_state(raw_for_state),
         requires_login=bool(raw.get("requires_login")),
         composer_present=bool(raw.get("composer_present")),
@@ -2206,6 +2226,7 @@ class ChatGPTPage:
         self._owned_composer_text: str | None = None
         self._frontend_identity_task: asyncio.Future[dict[str, str] | None] | None = None
         self._frontend_identity_listener: Callable[[Any], None] | None = None
+        self._frontend_request_user_message_id: str | None = None
         self._wait_state = _page_wait_state(page)
         self._wait_metrics: dict[str, Any] = {
             "sparse_probes": 0,
@@ -2293,6 +2314,7 @@ class ChatGPTPage:
 
     def _reset_frontend_identity_observer(self) -> None:
         self._remove_frontend_identity_listener()
+        self._frontend_request_user_message_id = None
         future = self._frontend_identity_task
         self._frontend_identity_task = None
         if future is not None and not future.done():
@@ -2315,9 +2337,18 @@ class ChatGPTPage:
                     return
                 observed_user_message_id = _frontend_user_message_id(response.request)
                 self._remove_frontend_identity_listener()
-                if observed_user_message_id is None:
+                status = getattr(response, "status", None)
+                if (
+                    observed_user_message_id is None
+                    or not isinstance(status, int)
+                    or not 200 <= status < 300
+                ):
                     finish(None)
                     return
+                # Response headers tie this successful POST to the exact
+                # outgoing user identity. Body parsing remains asynchronous
+                # conversation-id enrichment and never gates Send acceptance.
+                self._frontend_request_user_message_id = observed_user_message_id
 
                 async def reduce_response() -> None:
                     finish(
@@ -3916,25 +3947,18 @@ class ChatGPTPage:
                 if expected_prompt is None or rendered_user_text_matches(candidate.text, expected_prompt):
                     accepted_user = candidate
                     return accepted("exact_user_message", accepted_user)
-            identity_task = self._frontend_identity_task
-            if identity_task is not None and identity_task.done():
-                try:
-                    identity = identity_task.result()
-                except Exception:
-                    identity = None
-                if isinstance(identity, Mapping):
-                    observed_user_message_id = _safe_identity_string(
-                        identity.get("observed_user_message_id")
-                    )
-                    if observed_user_message_id is not None:
-                        accepted_user = MessageSnapshot(
-                            role="user",
-                            message_id=observed_user_message_id,
-                            turn_id=None,
-                            text=expected_prompt or "",
-                            actions=(),
-                        )
-                        return accepted("user_message_identity", accepted_user)
+            observed_request_user = self._frontend_request_user_message_id
+            if observed_request_user is not None:
+                accepted_user = MessageSnapshot(
+                    role="user",
+                    message_id=observed_request_user,
+                    turn_id=None,
+                    text=expected_prompt or "",
+                    actions=(),
+                )
+                return accepted("user_message_identity", accepted_user)
+            # The body-reading future is enrichment only. It can finish after
+            # the stream and is never acceptance authority.
             # Assistant/activity/Stop are wake signals only. They do not prove
             # which user turn this Send created on a long-lived conversation.
 
@@ -4064,7 +4088,7 @@ class ChatGPTPage:
                 owned_task_id = explicit_task_id
                 owned_team = explicit_team
             assert self.binding is not None
-            baseline = capture_message_baseline(before.messages)
+            baseline = capture_message_baseline(before.messages, before.logical_turn_ids)
             last_error: BaseException | None = None
             dispatched_clicks = 0
             click_outcome_ambiguous = False
@@ -4078,7 +4102,9 @@ class ChatGPTPage:
                         expected_attachment_names=expected_names,
                     )
                     pre_send = await self.assert_ownership()
-                    baseline = capture_message_baseline(pre_send.messages)
+                    baseline = capture_message_baseline(
+                        pre_send.messages, pre_send.logical_turn_ids
+                    )
                     # Reset LISTEN generation state immediately before this one Send.
                     try:
                         await self.install_page_observer()
