@@ -674,14 +674,15 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
                 error=f"{type(exc).__name__}: {exc}",
             )
             raise
-        assistant_output_acceptance = receipt.accepted_via in {
+        dom_acceptance_without_user_identity = receipt.accepted_via in {
             "assistant_message",
             "response_activity_turn",
             "assistant_activity",
+            "stop_button",
         }
         if (
             not self.render_request_marker
-            and not assistant_output_acceptance
+            and not dom_acceptance_without_user_identity
             and not receipt.user_message_id
             and not receipt.user_turn_id
         ):

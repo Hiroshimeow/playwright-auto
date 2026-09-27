@@ -15,12 +15,17 @@ from typing import Any, Mapping
 from urllib.parse import urlparse
 
 from .listen import ConversationDecoder, conversation_id, extract, source_kind
+from .signals import SignalIdentity, record_signal_error
 
 _OBSERVERS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 DOM_SCRIPT = r"""(() => {
   if (window !== window.top || !['chatgpt.com','www.chatgpt.com'].includes(location.hostname)) return;
-  if (window.__CDPA_ROLE_DOM_V1__) return;
+  if (window.__CDPA_ROLE_DOM_V2__) return;
+  if (window.__CDPA_ROLE_DOM_V1__) {
+    try { window.__CDPA_ROLE_DOM_V1__.disconnect?.(); } catch (_) {}
+    window.__CDPA_ROLE_DOM_V1__ = null;
+  }
   let pending = false;
   const notify = () => {
     if (pending) return;
@@ -32,22 +37,24 @@ DOM_SCRIPT = r"""(() => {
     }, 50);
   };
   const start = () => {
-    if (window.__CDPA_ROLE_DOM_V1__ || !document.documentElement) return;
+    if (window.__CDPA_ROLE_DOM_V2__ || !document.documentElement) return;
+    const overlaySelector = '#playwright-auto-role-badge-v3,#playwright-auto-role-control-v1';
+    const mutationIsRelevant = (record) => {
+      const target = record.target.nodeType === 1 ? record.target : record.target.parentElement;
+      return target && !target.closest(overlaySelector) &&
+        (target.closest('main,form,[role="dialog"],[role="alert"]') ||
+         [...record.addedNodes].some(n => n.nodeType === 1 && n.matches('main,[role="dialog"],[role="alert"]')));
+    };
     const observer = new MutationObserver(records => {
-      if (records.some(r => {
-        const target = r.target.nodeType === 1 ? r.target : r.target.parentElement;
-        return target && !target.closest('#playwright-auto-role-badge-v3,#playwright-auto-role-control-v1') &&
-          (target.closest('main,form,[role="dialog"],[role="alert"]') ||
-           [...r.addedNodes].some(n => n.nodeType === 1 && n.matches('main,[role="dialog"],[role="alert"]')));
-      })) notify();
+      if (records.some(mutationIsRelevant)) notify();
     });
     observer.observe(document.documentElement, {subtree:true, childList:true, characterData:true,
       attributes:true, attributeFilter:['hidden','style','class','aria-label','aria-disabled',
-        'data-message-id','data-streaming-response-status','data-testid']});
+        'data-message-id','data-turn-id','data-streaming-response-status','data-testid']});
     document.addEventListener('input', notify, true);
     window.addEventListener('pageshow', notify);
+    window.__CDPA_ROLE_DOM_V2__ = observer;
     window.__CDPA_ROLE_DOM_V1__ = observer;
-    notify();
   };
   start();
   if (!document.documentElement) document.addEventListener('DOMContentLoaded', start, {once:true});
@@ -79,6 +86,8 @@ class PageObserver:
         self.streaming_supported = True
         self._handlers: list[tuple[str, Any]] = []
         self._last_permission = None
+        self._signal_identity = SignalIdentity(page_url=str(page.url or ""))
+        self._error_signatures: set[tuple[int, str, str]] = set()
 
     @property
     def page(self):
@@ -87,20 +96,44 @@ class PageObserver:
             raise RuntimeError("observed Page no longer exists")
         return page
 
+    def _trace_error(self, stage: str, error: BaseException) -> None:
+        signature = (self.epoch, str(stage), type(error).__name__)
+        if signature in self._error_signatures:
+            return
+        self._error_signatures.add(signature)
+        if len(self._error_signatures) > 64:
+            self._error_signatures = {
+                item for item in self._error_signatures if item[0] == self.epoch
+            }
+        record_signal_error(
+            self._signal_identity,
+            component="page_observer",
+            stage=stage,
+            error=error,
+        )
+
     def _spawn(self, coroutine):
         if self.closed:
             coroutine.close()
-            return
+            return None
         task = asyncio.create_task(coroutine)
         self.tasks.add(task)
+
         def done(item):
             self.tasks.discard(item)
-            if not item.cancelled():
-                try:
-                    item.result()
-                except Exception:
-                    self.metrics["observer_errors"] += 1
+            if item.cancelled():
+                return
+            try:
+                item.result()
+            except Exception as exc:
+                self.metrics["observer_errors"] += 1
+                self._trace_error("background_task", exc)
+
         task.add_done_callback(done)
+        return task
+
+    def _on_dom_wake(self) -> None:
+        self.dom_wake.set()
 
     def attach(self) -> None:
         if self.attached or self.closed:
@@ -123,10 +156,14 @@ class PageObserver:
                 return
             page = self.page
             try:
-                await page.expose_binding("__cdpaRoleWake", lambda *_args: self.dom_wake.set())
+                await page.expose_binding(
+                    "__cdpaRoleWake",
+                    lambda _source: self._on_dom_wake(),
+                )
             except Exception as exc:
                 # A reconnect may find the binding in this automation connection already.
                 if "already" not in str(exc).lower():
+                    self._trace_error("dom_binding_install", exc)
                     raise
             await page.add_init_script(DOM_SCRIPT)
             await page.evaluate(DOM_SCRIPT)
@@ -137,9 +174,10 @@ class PageObserver:
                 self.cdp.on("Network.loadingFinished", self._on_loaded)
                 self.cdp.on("Network.loadingFailed", self._on_failed)
                 await self.cdp.send("Network.enable", {"maxTotalBufferSize": 8_388_608, "maxResourceBufferSize": 2_097_152})
-            except Exception:
+            except Exception as exc:
                 self.metrics["streaming_unavailable"] += 1
                 self.streaming_supported = False
+                self._trace_error("cdp_network_install", exc)
             self.installed = True
 
     def _on_navigation(self, frame) -> None:
@@ -199,8 +237,9 @@ class PageObserver:
             for item in decoder.feed(body, final=True):
                 self.publish(item, epoch=epoch, source="response_body")
             self.metrics["parse_errors"] += decoder.errors
-        except (ValueError, TimeoutError):
+        except (ValueError, TimeoutError) as exc:
             self.metrics["parse_errors"] += 1
+            self._trace_error("response_body_decode", exc)
 
     def _on_cdp_response(self, params) -> None:
         response = params.get("response") or {}
@@ -219,6 +258,7 @@ class PageObserver:
             reply = await self.cdp.send("Network.streamResourceContent", {"requestId": request_id})
         except Exception as exc:
             self.metrics["stream_setup_failed"] += 1
+            self._trace_error("cdp_stream_setup", exc)
             if "not found" in str(exc).lower() or "wasn't found" in str(exc).lower():
                 self.streaming_supported = False
             self.streams.pop(request_id, None)
@@ -240,8 +280,9 @@ class PageObserver:
             for item in stream["decoder"].feed(data):
                 self.publish(item, epoch=stream["epoch"], source="network_chunk")
             self.metrics["stream_chunks"] += 1
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as exc:
             self.metrics["parse_errors"] += 1
+            self._trace_error("network_chunk_decode", exc)
 
     def _on_data(self, params) -> None:
         stream = self.streams.get(params.get("requestId"))
@@ -352,15 +393,19 @@ class PageObserver:
         self.streams.clear()
         self.network_wake.set()
 
-    async def wait(self, seconds: float = 5, *, dom_only: bool = False) -> bool:
-        events = [self.dom_wake] if dom_only else [self.dom_wake, self.network_wake]
+    async def wait(self, seconds: float = 5) -> bool:
+        events = (self.dom_wake, self.network_wake)
         if any(event.is_set() for event in events):
             for event in events:
                 event.clear()
             return True
         tasks = [asyncio.create_task(event.wait()) for event in events]
         try:
-            done, _ = await asyncio.wait(tasks, timeout=max(0, seconds), return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait(
+                tasks,
+                timeout=max(0, seconds),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
             for event in events:
                 event.clear()
             return bool(done)

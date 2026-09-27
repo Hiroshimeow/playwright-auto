@@ -6,6 +6,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Mapping
 
+from .signals import RoleSignals
+
 
 class Action(str, Enum):
     WAIT = "wait"
@@ -38,53 +40,41 @@ class Policy:
 
 @dataclass
 class Context:
-    snapshot: Any
+    signals: RoleSignals
     wait: dict[str, Any]
     policy: Policy
     now: datetime
-    permission: Mapping[str, Any] | None = None
     phase: str = "waiting"
     candidate: Any = None
     validation_error: str | None = None
     candidate_stable: bool = False
     candidate_key: str = ""
-    network_status: str | None = None
+
+    @property
+    def snapshot(self) -> Any:
+        return self.signals.snapshot
+
+    @property
+    def permission(self) -> Mapping[str, Any] | None:
+        return self.signals.permission
+
+    @property
+    def network_status(self) -> str | None:
+        return self.signals.network_status
 
     @property
     def transport_active(self) -> bool:
-        """Authoritative generation activity used for operational decisions.
-
-        response_activity_turn_id is intentionally excluded: it is DOM progress
-        evidence for audit/retry diagnostics, not proof that generation is live.
-        """
-        state = getattr(self.snapshot, "state", None)
-        state_value = str(getattr(state, "value", state) or "").lower()
-        return bool(
-            getattr(self.snapshot, "stop_visible", False)
-            or state_value == "responding"
-            or str(self.network_status or "").upper()
-            in {"IS_STREAMING", "IS_STOP_REQUESTED"}
-        )
+        """Current generation activity from the normalized role signal frame."""
+        return self.signals.transport_active
 
     @property
     def permission_present(self) -> bool:
-        return bool(
-            self.permission
-            or int(getattr(self.snapshot, "mcp_permission_node_count", 0) or 0)
-            or int(getattr(self.snapshot, "mcp_permission_allow_count", 0) or 0)
-        )
+        return self.signals.permission_present
 
     @property
     def draft_present(self) -> bool:
-        return bool(
-            str(getattr(self.snapshot, "composer_text", "") or "").strip()
-            or getattr(self.snapshot, "attachment_markers", ())
-            or int(getattr(self.snapshot, "attachment_count", 0) or 0)
-        )
+        return self.signals.draft_present
 
     @property
     def composer_ready(self) -> bool:
-        return bool(
-            getattr(self.snapshot, "composer_present", False)
-            and getattr(self.snapshot, "composer_editable", True)
-        )
+        return self.signals.composer_ready

@@ -14,6 +14,18 @@ from enum import Enum
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 from urllib.parse import urlparse
 
+from .chatgpt_backend import (
+    _STREAM_STATUS_CACHE_LIMIT,
+    _backend_context_state,
+    _backend_get_object,
+    _backend_session_token,
+    _safe_identity_string,
+    backend_create_project,
+    backend_projects,
+    backend_set_conversation_project,
+    backend_stream_status,
+    release_backend_stream_status,
+)
 from .chatgpt_graph import (
     BackendAuthError,
     BackendNotReadyError,
@@ -23,8 +35,15 @@ from .chatgpt_graph import (
     rendered_user_text_matches,
     visible_text_matches,
 )
-from .observability import append_live_event, record_page_action
+from .observability import record_page_action
 from .role_indicator import WINDOW_NAME_PREFIX, ensure_role_indicator
+from .role_runtime.signals import (
+    SignalIdentity,
+    record_full_snapshot,
+    record_probe,
+    record_send_acceptance,
+    record_signal_error,
+)
 
 ROLE_STORAGE_KEY = "playwright-auto:role"
 PAGE_ID_STORAGE_KEY = "playwright-auto:page-id"
@@ -45,14 +64,73 @@ SELECTORS = {
     "error_retry": '[data-testid="regenerate-thread-error-button"]',
 }
 
-_COMPOSER_OWNER_SELECTOR = (
-    ':is(div#prompt-textarea[contenteditable="true"][role="textbox"], '
-    '[data-testid="composer"] [contenteditable="true"][role="textbox"])'
-)
-_COMPOSER_FORM_SELECTOR = (
-    ':is(form:has(button[data-testid="send-button"], button[aria-label="Send prompt"]) '
-    '[contenteditable="true"][role="textbox"])'
-)
+# One owner decision is shared by editing, both DOM readers and Send.
+_COMPOSER_RESOLVER_JS = r"""() => {
+  const eligible = element => {
+    const style = getComputedStyle(element), rect = element.getBoundingClientRect();
+    return element.isConnected && element.isContentEditable &&
+      element.getAttribute('aria-disabled') !== 'true' && !element.closest('[inert]') &&
+      !element.closest('[data-message-author-role], [data-turn-id]') &&
+      style.visibility !== 'hidden' && style.visibility !== 'collapse' &&
+      style.display !== 'none' && style.pointerEvents !== 'none' &&
+      rect.width > 0 && rect.height > 0;
+  };
+  const tiers = [
+    ['owned', 'div#prompt-textarea[contenteditable="true"][role="textbox"], [data-testid="composer"] [contenteditable="true"][role="textbox"]'],
+    ['form', 'form:has(button[data-testid="send-button"], button[aria-label="Send prompt"]) [contenteditable="true"][role="textbox"]'],
+    ['generic', '[contenteditable="true"][role="textbox"]'],
+  ];
+  for (const [source, selector] of tiers) {
+    const nodes = [...document.querySelectorAll(selector)].filter(eligible);
+    if (nodes.length) {
+      return {
+        element: nodes.length === 1 ? nodes[0] : null,
+        ambiguous: nodes.length > 1,
+        source,
+        candidate_count: nodes.length,
+      };
+    }
+  }
+  return {element:null, ambiguous:false, source:'none', candidate_count:0};
+}"""
+
+_COMPOSER_REPLACE_TEXT_JS = r"""targetText => {
+  const resolve = __CDPA_COMPOSER_RESOLVER__;
+  const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
+  const result = (owner, status, text = null) => ({
+    status,
+    text,
+    owner_source: owner.source || 'none',
+    candidate_count: Number(owner.candidate_count || 0),
+  });
+  const owner = resolve();
+  if (owner.ambiguous) return result(owner, 'ambiguous');
+  const element = owner.element;
+  if (!element) return result(owner, 'missing');
+  const before = normalize(element.innerText);
+  element.focus();
+  const afterFocus = resolve();
+  if (!element.isConnected || afterFocus.element !== element) {
+    return result(afterFocus, 'owner_changed');
+  }
+  if (document.activeElement !== element && !element.contains(document.activeElement)) {
+    return result(afterFocus, 'focus_stolen', before);
+  }
+  if (normalize(element.innerText) !== before) {
+    return result(afterFocus, 'content_changed', normalize(element.innerText));
+  }
+  const expected = normalize(targetText);
+  if (before === expected) return result(afterFocus, 'unchanged', before);
+  const selection = document.getSelection(), range = document.createRange();
+  range.selectNodeContents(element);
+  selection.removeAllRanges();
+  selection.addRange(range);
+  // Native editing emits the editor's input events. Resolution, focus validation,
+  // mutation and readback stay in one callback, so no later keyboard event can
+  // be redirected to another editable node.
+  const edited = document.execCommand(targetText ? 'insertText' : 'delete', false, targetText);
+  return result(afterFocus, edited ? 'edited' : 'unsupported', normalize(element.innerText));
+}""".replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS)
 
 SHORTCUTS = {
     "send_or_stop": "Enter",
@@ -294,9 +372,6 @@ _PAGE_WAIT_STATES: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.Weak
 _PAGE_WAIT_PROBE_INIT: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
 _PAGE_AMBIENT_OBSERVATION_STATES: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
 _PAGE_PASSIVE_OBSERVATION_STATES: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
-_BACKEND_CONTEXT_STATES: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
-_STREAM_STATUS_CACHE_LIMIT = 32
-_STREAM_STATUS_TERMINAL = frozenset({"COMPLETE", "FAILURE"})
 _RATE_LIMIT_MARKERS = (
     "too many requests",
     "making requests too quickly",
@@ -335,229 +410,6 @@ def _page_wait_state(page: Any) -> dict[str, Any]:
 
 
 
-
-
-def _backend_context_state(context: Any) -> dict[str, Any]:
-    state = {"token": None, "stream_status": {}}
-    try:
-        existing = _BACKEND_CONTEXT_STATES.get(context)
-        if existing is not None:
-            return existing
-        _BACKEND_CONTEXT_STATES[context] = state
-        return state
-    except TypeError:
-        existing = getattr(context, "_playwright_auto_backend_state", None)
-        if isinstance(existing, dict):
-            return existing
-        try:
-            setattr(context, "_playwright_auto_backend_state", state)
-        except Exception:
-            pass
-        return state
-
-
-async def _backend_session_token(context: Any) -> str:
-    state = _backend_context_state(context)
-    token = state.get("token")
-    if isinstance(token, str) and token:
-        return token
-    try:
-        response = await context.request.get("https://chatgpt.com/api/auth/session")
-    except Exception:
-        raise BackendUnavailableError(0, "session") from None
-    status = int(getattr(response, "status", 0) or 0)
-    if status == 401:
-        raise BackendAuthError("backend session is unauthorized")
-    if status == 429 or status >= 500 or status < 200 or status >= 300:
-        raise BackendUnavailableError(status, "session")
-    try:
-        payload = await response.json()
-    except Exception:
-        raise BackendSchemaError("session response is not valid JSON") from None
-    if not isinstance(payload, Mapping):
-        raise BackendSchemaError("session response must be an object")
-    token = _safe_identity_string(payload.get("accessToken"), max_length=16_384)
-    if token is None:
-        raise BackendAuthError("backend session has no access token")
-    state["token"] = token
-    return token
-
-
-async def _backend_get_object(
-    context: Any,
-    path: str,
-    *,
-    category: str,
-    method: str = "get",
-    data: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    state = _backend_context_state(context)
-    token = await _backend_session_token(context)
-    for attempt in range(2):
-        try:
-            request = getattr(context.request, method)
-            kwargs: dict[str, Any] = {"headers": {"Authorization": f"Bearer {token}"}}
-            if data is not None:
-                kwargs["data"] = dict(data)
-            response = await request(f"https://chatgpt.com{path}", **kwargs)
-        except Exception:
-            raise BackendUnavailableError(0, category) from None
-        status = int(getattr(response, "status", 0) or 0)
-        if status == 401:
-            state["token"] = None
-            if attempt == 0:
-                token = await _backend_session_token(context)
-                continue
-            raise BackendAuthError(f"{category} remained unauthorized after one refresh")
-        if status == 404:
-            raise BackendNotReadyError(f"{category} is not ready")
-        if status == 429 or status >= 500 or status < 200 or status >= 300:
-            raise BackendUnavailableError(status, category)
-        try:
-            payload = await response.json()
-        except Exception:
-            raise BackendSchemaError(f"{category} response is not valid JSON") from None
-        if not isinstance(payload, Mapping):
-            raise BackendSchemaError(f"{category} response must be an object")
-        return dict(payload)
-    raise BackendAuthError(f"{category} authentication failed")
-
-
-def _prune_stream_status_cache(
-    stream_status: dict[str, Any],
-    *,
-    now: float,
-    reserve_for: str | None = None,
-) -> None:
-    if reserve_for is not None and reserve_for in stream_status:
-        return
-    target_size = _STREAM_STATUS_CACHE_LIMIT - (1 if reserve_for is not None else 0)
-    if len(stream_status) <= target_size:
-        return
-
-    removable: list[tuple[int, float, str]] = []
-    for conversation_id, raw_entry in stream_status.items():
-        if not isinstance(raw_entry, Mapping):
-            removable.append((0, 0.0, conversation_id))
-            continue
-        in_flight = raw_entry.get("in_flight")
-        if isinstance(in_flight, asyncio.Future) and not in_flight.done():
-            continue
-        payload = raw_entry.get("payload")
-        status = str(payload.get("status") or "") if isinstance(payload, Mapping) else ""
-        next_poll_at = float(raw_entry.get("next_poll_at") or 0.0)
-        if status in _STREAM_STATUS_TERMINAL:
-            priority = 0
-        elif next_poll_at <= now:
-            priority = 1
-        else:
-            continue
-        removable.append((priority, float(raw_entry.get("observed_at") or 0.0), conversation_id))
-
-    for _priority, _observed_at, conversation_id in sorted(removable):
-        if len(stream_status) <= target_size:
-            break
-        stream_status.pop(conversation_id, None)
-
-    if len(stream_status) > target_size:
-        raise BackendUnavailableError(0, "stream_status_slot_capacity")
-
-
-def release_backend_stream_status(context: Any, conversation_id: str) -> None:
-    exact_id = _safe_identity_string(conversation_id)
-    if exact_id is None:
-        return
-    state = _backend_context_state(context)
-    stream_status = state.setdefault("stream_status", {})
-    entry = stream_status.get(exact_id)
-    if isinstance(entry, Mapping):
-        in_flight = entry.get("in_flight")
-        if isinstance(in_flight, asyncio.Future) and not in_flight.done():
-            return
-    stream_status.pop(exact_id, None)
-
-
-async def backend_stream_status(context: Any, conversation_id: str) -> dict[str, Any]:
-    exact_id = _safe_identity_string(conversation_id)
-    if exact_id is None:
-        raise ValueError("conversation ID must be a bounded printable string")
-    state = _backend_context_state(context)
-    stream_status = state.setdefault("stream_status", {})
-    now = time.monotonic()
-    if exact_id not in stream_status:
-        _prune_stream_status_cache(stream_status, now=now, reserve_for=exact_id)
-    entry = stream_status.setdefault(exact_id, {})
-    cached = entry.get("payload")
-    if isinstance(cached, Mapping) and now < float(entry.get("next_poll_at") or 0.0):
-        return dict(cached)
-    in_flight = entry.get("in_flight")
-    if isinstance(in_flight, asyncio.Future) and not in_flight.done():
-        return dict(await asyncio.shield(in_flight))
-
-    async def poll() -> dict[str, Any]:
-        payload = await _backend_get_object(
-            context,
-            f"/backend-api/conversation/{exact_id}/stream_status",
-            category="stream_status",
-        )
-        status = payload.get("status")
-        if status not in {"IS_STREAMING", "COMPLETE", "FAILURE", "IS_STOP_REQUESTED"}:
-            raise BackendSchemaError("stream_status response has unknown status")
-        entry["payload"] = dict(payload)
-        entry["observed_at"] = time.monotonic()
-        entry["next_poll_at"] = time.monotonic() + 30.0
-        return dict(payload)
-
-    task = asyncio.create_task(poll())
-    entry["in_flight"] = task
-    try:
-        return dict(await asyncio.shield(task))
-    finally:
-        if entry.get("in_flight") is task:
-            entry["in_flight"] = None
-
-
-async def backend_projects(context: Any) -> list[dict[str, str]]:
-    payload = await _backend_get_object(
-        context, "/backend-api/gizmos/snorlax/sidebar?conversations_per_gizmo=0", category="projects"
-    )
-    items = payload.get("items")
-    if not isinstance(items, list):
-        raise BackendSchemaError("projects response is missing items")
-    projects: list[dict[str, str]] = []
-    for item in items:
-        gizmo = item.get("gizmo") if isinstance(item, Mapping) else None
-        gizmo = gizmo.get("gizmo") if isinstance(gizmo, Mapping) else None
-        display = gizmo.get("display") if isinstance(gizmo, Mapping) else None
-        project_id = gizmo.get("id") if isinstance(gizmo, Mapping) else None
-        name = display.get("name") if isinstance(display, Mapping) else None
-        if not isinstance(project_id, str) or not project_id.startswith("g-p-") or not isinstance(name, str):
-            raise BackendSchemaError("projects response has unknown item shape")
-        projects.append({"id": project_id, "name": name})
-    return projects
-
-
-async def backend_create_project(context: Any, name: str) -> str:
-    payload = await _backend_get_object(
-        context, "/backend-api/projects", category="project_create", method="post",
-        data={"name": name, "instructions": ""},
-    )
-    resource = payload.get("resource")
-    gizmo = resource.get("gizmo") if isinstance(resource, Mapping) else None
-    project_id = gizmo.get("id") if isinstance(gizmo, Mapping) else None
-    if not isinstance(project_id, str) or not project_id.startswith("g-p-"):
-        raise BackendSchemaError("project_create response is missing resource.gizmo.id")
-    return project_id
-
-
-async def backend_set_conversation_project(context: Any, conversation_id: str, project_id: str) -> None:
-    exact_id = _safe_identity_string(conversation_id)
-    if exact_id is None or not isinstance(project_id, str) or not project_id.startswith("g-p-"):
-        raise ValueError("conversation and Project IDs must be valid")
-    await _backend_get_object(
-        context, f"/backend-api/conversation/{exact_id}", category="project_membership",
-        method="patch", data={"gizmo_id": project_id},
-    )
 
 
 class ChatGPTState(str, Enum):
@@ -649,14 +501,6 @@ class MessageBaseline:
         )
 
 
-def _safe_identity_string(value: Any, *, max_length: int = 512) -> str | None:
-    if not isinstance(value, str) or not value or len(value) > max_length:
-        return None
-    if any(ord(char) < 32 or ord(char) == 127 for char in value):
-        return None
-    return value
-
-
 def _matches_frontend_conversation_response(response: Any) -> bool:
     try:
         request = response.request
@@ -669,24 +513,6 @@ def _matches_frontend_conversation_response(response: Any) -> bool:
         )
     except Exception:
         return False
-
-
-def _paged_conversation_id_from_response(response: Any) -> str | None:
-    try:
-        request = response.request
-        parsed = urlparse(str(response.url))
-        if (
-            str(request.method).upper() != "GET"
-            or parsed.scheme != "https"
-            or parsed.hostname not in {"chatgpt.com", "www.chatgpt.com"}
-        ):
-            return None
-        parts = [part for part in parsed.path.split("/") if part]
-        if len(parts) != 3 or parts[:2] != ["backend-api", "conversations"]:
-            return None
-        return _safe_identity_string(parts[2])
-    except Exception:
-        return None
 
 
 def _frontend_user_message_id(request: Any) -> str | None:
@@ -868,43 +694,6 @@ def _mcp_permission_action_from_message(value: Any) -> dict[str, Any] | None:
     return fallback
 
 
-def _mcp_permission_action_from_frontend_body(body: bytes | str) -> dict[str, Any] | None:
-    if isinstance(body, bytes):
-        try:
-            text = body.decode("utf-8")
-        except UnicodeDecodeError:
-            return None
-    elif isinstance(body, str):
-        text = body
-    else:
-        return None
-    fallback = None
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("data:"):
-            continue
-        payload = stripped[5:].strip()
-        if not payload or payload == "[DONE]":
-            continue
-        try:
-            decoded = json.loads(payload)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
-        messages = []
-        if isinstance(decoded, Mapping) and isinstance(decoded.get("message"), Mapping):
-            messages = [decoded["message"]]
-        elif isinstance(decoded, Mapping) and isinstance(decoded.get("messages"), list):
-            messages = decoded["messages"]
-        for message in messages:
-            action = _mcp_permission_action_from_message(message)
-            if action is None:
-                continue
-            if action.get("remember_answer") is True:
-                return action
-            fallback = action
-    return fallback
-
-
 def _reduce_frontend_conversation_observation_body(
     body: bytes | str, observed_user_message_id: str
 ) -> dict[str, Any] | None:
@@ -974,55 +763,6 @@ def _reduce_frontend_conversation_observation_body(
     return result
 
 
-def _reduce_paged_conversation_body(
-    body: bytes | str,
-    *,
-    conversation_id: str,
-    observed_user_message_id: str,
-) -> dict[str, Any] | None:
-    exact_conversation = _safe_identity_string(conversation_id)
-    exact_user = _safe_identity_string(observed_user_message_id)
-    if exact_conversation is None or exact_user is None:
-        return None
-    if isinstance(body, bytes):
-        try:
-            text = body.decode("utf-8")
-        except UnicodeDecodeError:
-            return None
-    elif isinstance(body, str):
-        text = body
-    else:
-        return None
-    try:
-        decoded = json.loads(text)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return None
-    if not isinstance(decoded, Mapping):
-        return None
-    messages = decoded.get("messages")
-    current_node = _safe_identity_string(decoded.get("current_node"))
-    if not isinstance(messages, list) or current_node is None:
-        return None
-    graph = _observed_linear_graph(
-        messages,
-        exact_user,
-        current_node=current_node,
-        require_user_in_values=True,
-    )
-    if graph is None:
-        return None
-    page_info = decoded.get("page_info")
-    has_more = bool(page_info.get("has_more")) if isinstance(page_info, Mapping) else False
-    continuation = decoded.get("context_truncation_continuation")
-    return {
-        "source": "paged_messages",
-        "coverage": "partial" if has_more or continuation not in {None, ""} else "complete",
-        "observed_user_message_id": exact_user,
-        "conversation_id": exact_conversation,
-        "graph": graph,
-    }
-
-
 def _reduce_frontend_conversation_body(
     body: bytes | str, observed_user_message_id: str
 ) -> dict[str, str] | None:
@@ -1067,18 +807,6 @@ async def _reduce_frontend_conversation_response(
     try:
         body = await response.body()
         return _reduce_frontend_conversation_body(body, observed_user_message_id)
-    except Exception:
-        return None
-
-
-async def _reduce_frontend_conversation_response_observation(
-    response: Any, observed_user_message_id: str
-) -> dict[str, Any] | None:
-    try:
-        body = await response.body()
-        return _reduce_frontend_conversation_observation_body(
-            body, observed_user_message_id
-        )
     except Exception:
         return None
 
@@ -1198,6 +926,8 @@ class ChatGPTSnapshot:
     response_activity_structure: str = ""
     response_activity_turn_id: str | None = None
     response_activity_length: int = 0
+    composer_ambiguous: bool = False
+    composer_owner_source: str = ""
 
     @property
     def conversation_url(self) -> str | None:
@@ -1241,6 +971,8 @@ class ChatGPTSnapshot:
             "composer_present": self.composer_present,
             "composer_editable": self.composer_editable,
             "composer_text": self.composer_text,
+            "composer_ambiguous": self.composer_ambiguous,
+            "composer_owner_source": self.composer_owner_source,
             "composer_empty": self.composer_empty,
             "send_visible": self.send_visible,
             "send_enabled": self.send_enabled,
@@ -1291,6 +1023,8 @@ class WaitProbe:
     last_user_text: str = ""
     assistant_text: str = ""
     response_activity_text: str = ""
+    composer_ambiguous: bool = False
+    composer_owner_source: str = ""
 
     @property
     def composer_empty(self) -> bool:
@@ -1313,94 +1047,6 @@ class WaitProbe:
             self.last_assistant_turn_id,
             self.response_activity_turn_id,
         )
-
-    def to_raw(self) -> dict[str, Any]:
-        return {
-            "url": self.url,
-            "page_role": self.page_role,
-            "page_id": self.page_id,
-            "page_task_id": self.page_task_id,
-            "page_team": self.page_team,
-            "requires_login": self.requires_login,
-            "composer_present": self.composer_present,
-            "composer_text": self.composer_text,
-            "attachment_count": self.attachment_count,
-            "stop_visible": self.stop_visible,
-            "transport_active": self.transport_active,
-            "error_texts": list(self.error_texts),
-            "blocking_dialogs": list(self.blocking_dialogs),
-            "choice_prompt_labels": list(self.choice_prompt_labels),
-            "mcp_permission_allow_count": self.mcp_permission_allow_count,
-            "mcp_permission_node_count": self.mcp_permission_node_count,
-            "last_user_message_id": self.last_user_message_id,
-            "last_user_turn_id": self.last_user_turn_id,
-            "last_assistant_message_id": self.last_assistant_message_id,
-            "last_assistant_turn_id": self.last_assistant_turn_id,
-            "assistant_text_length": self.assistant_text_length,
-            "assistant_text_tail": self.assistant_text_tail,
-            "response_activity_length": self.response_activity_length,
-            "response_activity_tail": self.response_activity_tail,
-            "response_activity_turn_id": self.response_activity_turn_id,
-            "retry_visible": self.retry_visible,
-            "last_user_text": self.last_user_text,
-            "assistant_text": self.assistant_text,
-            "response_activity_text": self.response_activity_text,
-        }
-
-    @property
-    def transition_signature(self) -> str:
-        return json.dumps(
-            [
-                self.url,
-                self.page_id,
-                self.page_role,
-                self.page_task_id,
-                self.page_team,
-                self.requires_login,
-                self.composer_present,
-                self.composer_text,
-                self.attachment_count,
-                self.stop_visible,
-                self.transport_active,
-                list(self.error_texts),
-                list(self.blocking_dialogs),
-                list(self.choice_prompt_labels),
-                self.mcp_permission_allow_count,
-                self.mcp_permission_node_count,
-                self.last_user_message_id,
-                self.last_user_turn_id,
-                self.last_assistant_message_id,
-                self.last_assistant_turn_id,
-                self.response_activity_turn_id,
-            ],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-
-
-def _wait_probe_live_values(probe: WaitProbe) -> dict[str, Any]:
-    return {
-        "requires_login": probe.requires_login,
-        "composer_present": probe.composer_present,
-        "composer_nonempty": bool(probe.composer_text.strip()),
-        "attachment_count": probe.attachment_count,
-        "stop_visible": probe.stop_visible,
-        "transport_active": probe.transport_active,
-        "retry_visible": probe.retry_visible,
-        "error_texts": list(probe.error_texts),
-        "blocking_dialogs": list(probe.blocking_dialogs),
-        "choice_prompt_labels": list(probe.choice_prompt_labels),
-        "mcp_permission_allow_count": probe.mcp_permission_allow_count,
-        "mcp_permission_node_count": probe.mcp_permission_node_count,
-        "last_user_message_id": probe.last_user_message_id,
-        "last_user_turn_id": probe.last_user_turn_id,
-        "last_assistant_message_id": probe.last_assistant_message_id,
-        "last_assistant_turn_id": probe.last_assistant_turn_id,
-        "assistant_text_length": probe.assistant_text_length,
-        "response_activity_length": probe.response_activity_length,
-        "response_activity_turn_id": probe.response_activity_turn_id,
-    }
-
 
 @dataclass(frozen=True)
 class PageHealth:
@@ -1867,92 +1513,85 @@ def recent_assistant_turns(
     return tuple(selected)
 
 
-async def _owned_composer_locator(page: Any, timeout_ms: int) -> Any:
-    generic = page.locator(SELECTORS["composer"] + ":visible")
-    generic_first = generic.first
-    await generic_first.wait_for(state="visible", timeout=timeout_ms)
-    owned = page.locator(_COMPOSER_OWNER_SELECTOR + ":visible")
-    count = getattr(owned, "count", None)
-    if not callable(count):
-        return generic_first
-    owned_count = await count()
-    if owned_count > 1:
-        raise ComposerConflictError("multiple eligible live composer owners")
-    if owned_count == 1:
-        return owned.first
-    form_owned = page.locator(_COMPOSER_FORM_SELECTOR + ":visible")
-    form_owned_count = await form_owned.count()
-    if form_owned_count > 1:
-        raise ComposerConflictError("multiple eligible live composer owners")
-    if form_owned_count == 1:
-        return form_owned.first
-    generic_count = await generic.count()
-    if generic_count != 1:
-        raise ComposerConflictError("composer ownership is ambiguous")
-    return generic_first
-
-
-async def _assert_composer_text(composer: Any, expected: str) -> None:
-    if not visible_text_matches(await composer.inner_text(), expected):
-        raise RuntimeError("composer text did not match expected value")
-
-
-async def _clear_composer_locator(composer: Any) -> None:
-    if not (await composer.inner_text()).strip():
-        return
-    await composer.press("Control+A")
-    await composer.press("Backspace")
-    await _assert_composer_text(composer, "")
+async def _replace_owned_composer_text(
+    page: Any, text: str, *, timeout_ms: int
+) -> None:
+    """Atomically resolve, focus, edit and verify the one owned composer."""
+    last_state = "status=unobserved source=unknown candidates=unknown"
+    try:
+        async with asyncio.timeout(timeout_ms / 1000):
+            mutation_retry_used = False
+            while True:
+                result = await page.evaluate(_COMPOSER_REPLACE_TEXT_JS, text)
+                status = str((result or {}).get("status") or "")
+                actual = str((result or {}).get("text") or "")
+                source = str((result or {}).get("owner_source") or "unknown")
+                candidate_count = int((result or {}).get("candidate_count") or 0)
+                last_state = (
+                    f"status={status or 'unknown'} source={source} "
+                    f"candidates={candidate_count}"
+                )
+                if status in {"edited", "unchanged"}:
+                    if visible_text_matches(actual, text):
+                        return
+                    if not mutation_retry_used and not actual.strip():
+                        mutation_retry_used = True
+                        await asyncio.sleep(0)
+                        continue
+                    raise ComposerConflictError(
+                        "composer text changed after native edit; refusing to replay "
+                        f"({last_state})"
+                    )
+                if status == "missing":
+                    await asyncio.sleep(0.05)
+                    continue
+                if status in {"owner_changed", "focus_stolen", "content_changed"}:
+                    if not mutation_retry_used:
+                        mutation_retry_used = True
+                        await asyncio.sleep(0)
+                        continue
+                    detail = {
+                        "owner_changed": "composer owner changed before edit",
+                        "focus_stolen": "composer focus was stolen before edit",
+                        "content_changed": "composer content changed before edit",
+                    }[status]
+                    raise ComposerConflictError(f"{detail} ({last_state})")
+                if status == "ambiguous":
+                    raise ComposerConflictError(
+                        f"multiple eligible live composer owners ({last_state})"
+                    )
+                if status == "unsupported":
+                    raise ComposerConflictError(
+                        f"browser refused native composer edit ({last_state})"
+                    )
+                raise ComposerConflictError(
+                    f"composer edit produced unexpected state ({last_state})"
+                )
+    except TimeoutError as exc:
+        raise TimeoutError(
+            f"composer fill timed out at composer_edit ({last_state})"
+        ) from exc
 
 
 async def clear_composer(page: Any, timeout_ms: int = 5_000) -> None:
-    """Clear the uniquely owned ProseMirror composer."""
-    composer = await _owned_composer_locator(page, timeout_ms)
-    await _clear_composer_locator(composer)
+    """Clear only the uniquely owned composer."""
+    await _replace_owned_composer_text(page, "", timeout_ms=timeout_ms)
 
 
 async def set_composer_text(page: Any, text: str, timeout_ms: int = 5_000) -> None:
-    await action_delay(
-        page,
-        "composer_fill",
-        action_delay_multiplier("composer_fill"),
-    )
+    await action_delay(page, "composer_fill", action_delay_multiplier("composer_fill"))
     await record_page_action(page, "composer_fill", "start", detail=f"{len(text)} chars")
-    composer = await _owned_composer_locator(page, timeout_ms)
-    if text:
-        expected = normalize_visible_text(text)
-        substep = "composer_clear"
-        try:
-            async with asyncio.timeout(timeout_ms / 1000):
-                for attempt in range(2):
-                    substep = "composer_clear"
-                    await _clear_composer_locator(composer)
-                    substep = "composer_click"
-                    await composer.click()
-                    evaluate = getattr(composer, "evaluate", None)
-                    if callable(evaluate):
-                        focused = await evaluate(
-                            "element => document.activeElement === element || element.contains(document.activeElement)"
-                        )
-                        if not focused:
-                            if attempt == 0:
-                                continue
-                            raise ComposerConflictError("composer focus was stolen before input")
-                    substep = "composer_insert"
-                    await page.keyboard.insert_text(text)
-                    substep = "composer_readback"
-                    try:
-                        await _assert_composer_text(composer, expected)
-                    except Exception:
-                        if attempt == 0 and not visible_text_matches(await composer.inner_text(), text):
-                            continue
-                        raise
-                    await record_page_action(page, "composer_fill", "complete", detail=f"{len(text)} chars")
-                    return
-        except TimeoutError as exc:
-            raise TimeoutError(f"composer fill timed out at {substep}") from exc
-    await clear_composer(page, timeout_ms=timeout_ms)
-    await record_page_action(page, "composer_fill", "complete", detail="cleared")
+    try:
+        await _replace_owned_composer_text(page, text, timeout_ms=timeout_ms)
+    except Exception as exc:
+        await record_page_action(
+            page,
+            "composer_fill",
+            "error",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    await record_page_action(page, "composer_fill", "complete", detail=f"{len(text)} chars")
 
 
 async def open_new_chat(page: Any, timeout_ms: int = 8_000) -> str:
@@ -1976,14 +1615,11 @@ async def open_new_chat(page: Any, timeout_ms: int = 8_000) -> str:
     if clicked:
         try:
             await page.wait_for_function(
-                """selector => {
-                  const composer = document.querySelector(selector);
+                """() => {
+                  const composer = (__CDPA_COMPOSER_RESOLVER__)().element;
                   return location.pathname === '/' && Boolean(composer) &&
-                    composer.getAttribute('contenteditable') === 'true' &&
-                    composer.getAttribute('aria-disabled') !== 'true' &&
                     !((composer.innerText || '').trim());
-                }""",
-                arg=SELECTORS["composer"],
+                }""".replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS),
                 timeout=timeout_ms,
             )
             await record_page_action(page, "new_chat", "complete", detail="dom")
@@ -1992,8 +1628,11 @@ async def open_new_chat(page: Any, timeout_ms: int = 8_000) -> str:
             pass
 
     await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
-    await page.locator(SELECTORS["composer"]).first.wait_for(
-        state="visible", timeout=timeout_ms
+    await page.wait_for_function(
+        """() => Boolean((__CDPA_COMPOSER_RESOLVER__)().element)"""
+        .replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS),
+        polling=50,
+        timeout=timeout_ms,
     )
     await record_page_action(page, "new_chat", "complete", detail="navigate")
     return "navigate"
@@ -2160,27 +1799,7 @@ async def click_send_button(
           const initialPageStateConflict = validatePageState();
           if (initialPageStateConflict) return initialPageStateConflict;
 
-          const eligibleComposer = (element) =>
-            visible(element) && enabled(element) && editable(element);
-          const findComposer = () => {
-            const owned = [...document.querySelectorAll(
-              'div#prompt-textarea[contenteditable="true"][role="textbox"], [data-testid="composer"] [contenteditable="true"][role="textbox"]'
-            )].filter(eligibleComposer);
-            if (owned.length !== 0) return owned.length === 1 ? owned[0] : null;
-            const formOwned = [...document.querySelectorAll(
-              'form [contenteditable="true"][role="textbox"]'
-            )].filter(eligibleComposer).filter((element) => {
-              const form = element.closest('form');
-              return Boolean(form?.querySelector(
-                'button[data-testid="send-button"], button[aria-label="Send prompt"]'
-              ));
-            });
-            if (formOwned.length !== 0) return formOwned.length === 1 ? formOwned[0] : null;
-            const generic = [...document.querySelectorAll(
-              '[contenteditable="true"][role="textbox"]'
-            )].filter(eligibleComposer);
-            return generic.length === 1 ? generic[0] : null;
-          };
+          const findComposer = () => (__CDPA_COMPOSER_RESOLVER__)().element;
           const composer = findComposer();
           if (!composer || (expectedPrompt !== null && text(composer) !== expectedPrompt)) {
             return {
@@ -2449,7 +2068,7 @@ async def click_send_button(
           }
           if (dispatchConflict) return dispatchConflict;
           return {ok: true, method: 'dom_click'};
-        }""",
+        }""".replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS),
         [
             normalized_prompt,
             list(expected_names) if expected_names is not None else None,
@@ -2673,9 +2292,12 @@ async def open_delete_chat_dialog(page: Any, timeout_ms: int = 8_000) -> str:
     await action_delay(page, "delete_dialog", DIALOG_DELAY_MULTIPLIER)
     await record_page_action(page, "delete_dialog", "click")
     await page.bring_to_front()
-    composer = page.locator(SELECTORS["composer"]).first
-    if await composer.is_visible():
-        await composer.click()
+    await page.evaluate(
+        """() => {
+          const composer = (__CDPA_COMPOSER_RESOLVER__)().element;
+          if (composer) composer.focus();
+        }""".replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS)
+    )
     await page.keyboard.press(SHORTCUTS["delete_chat"])
     await wait_for_delete_chat_dialog(page, timeout_ms=timeout_ms)
     await record_page_action(page, "delete_dialog", "complete", detail="keyboard")
@@ -2833,7 +2455,6 @@ async def assign_page_role(
 
 
 _WAIT_PROBE_READ_SCRIPT = "() => window.__PLAYWRIGHT_AUTO_WAIT_PROBE__?.() || null"
-_WAIT_PROBE_WAIT_SCRIPT = "([signature, timeoutMs, fallback]) => window.__PLAYWRIGHT_AUTO_WAIT_PROBE_WAIT__?.(signature, timeoutMs, fallback) || null"
 _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windowNamePrefix]) => {
           window.__PLAYWRIGHT_AUTO_WAIT_PROBE__ = () => {
           const visible = (element) => Boolean(
@@ -2875,7 +2496,8 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             return turns;
           };
 
-          const composer = firstVisible('[contenteditable="true"][role="textbox"]');
+          const composerOwner = (__CDPA_COMPOSER_RESOLVER__)();
+          const composer = composerOwner.element;
           const composerRoot = composer?.closest('form') || composer?.closest('[data-testid="composer"]') || null;
           const stop = firstVisible('button[data-testid="stop-button"], button[aria-label*="Stop"]');
           const retry = firstVisible('[data-testid="regenerate-thread-error-button"]');
@@ -2999,6 +2621,8 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             requires_login: location.hostname === 'auth.openai.com' || Boolean(firstVisible('[data-testid="login-button"]')),
             composer_present: Boolean(composer),
             composer_text: boundedText(composer, 512),
+            composer_ambiguous: Boolean(composerOwner.ambiguous),
+            composer_owner_source: composerOwner.source || 'none',
             attachment_count: attachmentCount,
             stop_visible: Boolean(stop),
             retry_visible: Boolean(retry),
@@ -3022,123 +2646,13 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             response_activity_text: activityText,
           };
           };
-          const transitionSignature = (probe) => JSON.stringify([
-            probe.url,
-            probe.page_id,
-            probe.page_role,
-            probe.page_task_id,
-            probe.page_team,
-            probe.requires_login,
-            probe.composer_present,
-            probe.composer_text,
-            probe.attachment_count,
-            probe.stop_visible,
-            probe.retry_visible,
-            probe.transport_active,
-            probe.error_texts,
-            probe.blocking_dialogs,
-            probe.choice_prompt_labels,
-            probe.mcp_permission_allow_count,
-            probe.mcp_permission_node_count,
-            probe.last_user_message_id,
-            probe.last_user_turn_id,
-            probe.last_assistant_message_id,
-            probe.last_assistant_turn_id,
-            probe.response_activity_turn_id,
-          ]);
-          window.__PLAYWRIGHT_AUTO_WAIT_PROBE_WAIT__ = (previous, timeoutMs, fallback) => new Promise((resolve) => {
-            let settled = false;
-            let debounce = null;
-            let observer = null;
-            let timer = null;
-            const root = document.documentElement || document;
-            const relevantSelector = [
-              'button[data-testid="stop-button"]',
-              'button[aria-label*="Stop"]',
-              '[data-testid="regenerate-thread-error-button"]',
-              '[data-streaming-response-status]',
-              '[data-message-author-role][data-message-id]',
-              '[contenteditable="true"][role="textbox"]',
-              '[role="alert"]',
-              '[role="dialog"]',
-              '[data-testid^="modal-"]',
-              'button[aria-label^="Allow "][aria-label$=" for this conversation"]',
-              '[data-filename]',
-              '[data-file-name]',
-            ].join(',');
-            const nodeIsRelevant = (node) => {
-              if (!(node instanceof Element)) return false;
-              return node.matches(relevantSelector) || Boolean(node.querySelector(relevantSelector));
-            };
-            const mutationIsRelevant = (mutation) => {
-              if (mutation.type === 'attributes') {
-                return [
-                  'data-streaming-response-status', 'data-message-id', 'data-turn-id',
-                  'contenteditable', 'aria-disabled', 'aria-label', 'data-testid', 'role',
-                  'data-filename', 'data-file-name',
-                ].includes(mutation.attributeName || '');
-              }
-              return [...mutation.addedNodes, ...mutation.removedNodes].some(nodeIsRelevant);
-            };
-            const finish = (probe) => {
-              if (settled) return;
-              settled = true;
-              if (debounce) clearTimeout(debounce);
-              if (timer) clearTimeout(timer);
-              if (observer) observer.disconnect();
-              root.removeEventListener('input', onInput, true);
-              resolve(probe);
-            };
-            const check = () => {
-              const probe = window.__PLAYWRIGHT_AUTO_WAIT_PROBE__();
-              if (transitionSignature(probe) !== previous) finish(probe);
-            };
-            const onInput = () => check();
-            observer = new MutationObserver((mutations) => {
-              if (!mutations.some(mutationIsRelevant)) return;
-              if (debounce) clearTimeout(debounce);
-              debounce = setTimeout(check, 50);
-            });
-            observer.observe(root, {
-              subtree: true,
-              childList: true,
-              attributes: true,
-              attributeFilter: [
-                'data-streaming-response-status', 'data-message-id', 'data-turn-id',
-                'contenteditable', 'aria-disabled', 'aria-label', 'data-testid', 'role',
-                'data-filename', 'data-file-name',
-              ],
-            });
-            root.addEventListener('input', onInput, true);
-            timer = setTimeout(() => {
-              const probe = window.__PLAYWRIGHT_AUTO_WAIT_PROBE__();
-              finish(transitionSignature(probe) === previous ? fallback : probe);
-            }, Math.max(0, Number(timeoutMs) || 0));
-            check();
-          });
-          if (!window.__PLAYWRIGHT_AUTO_DOM_OBSERVER__) {
-            window.__PLAYWRIGHT_AUTO_DOM_VERSION__ = Number(window.__PLAYWRIGHT_AUTO_DOM_VERSION__ || 0);
-            window.__PLAYWRIGHT_AUTO_DOM_OBSERVER__ = new MutationObserver(() => {
-              window.__PLAYWRIGHT_AUTO_DOM_VERSION__ += 1;
-            });
-            window.__PLAYWRIGHT_AUTO_DOM_OBSERVER__.observe(document.documentElement || document, {
-              subtree: true,
-              childList: true,
-              attributes: true,
-              attributeFilter: [
-                'data-streaming-response-status', 'data-message-id', 'data-turn-id',
-                'contenteditable', 'aria-disabled', 'aria-label', 'data-testid', 'role',
-              ],
-            });
-          }
           return true;
-        }"""
+        }""".replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS)
 
 
 async def inspect_chatgpt_wait_probe(
     page: Any,
     *,
-    previous_transition_signature: str | None = None,
     previous_probe: WaitProbe | None = None,
     wait_ms: int = 0,
 ) -> WaitProbe:
@@ -3152,16 +2666,25 @@ async def inspect_chatgpt_wait_probe(
         # function. Install the current reader into the live document too.
         await page.evaluate(_WAIT_PROBE_INSTALL_SCRIPT, args)
         _PAGE_WAIT_PROBE_INIT[page] = True
-    use_wait = bool(
-        previous_transition_signature and previous_probe is not None and wait_ms > 0
+
+    # PageObserver is the one page-lifetime wake source for real Playwright
+    # pages. Lightweight unit-test doubles may expose only evaluate/add_init_script;
+    # they keep the read-only probe path and do not create another observer.
+    observer_capable = all(
+        hasattr(page, name)
+        for name in ("on", "expose_binding", "add_init_script", "context")
     )
-    script = _WAIT_PROBE_WAIT_SCRIPT if use_wait else _WAIT_PROBE_READ_SCRIPT
-    argument = (
-        [previous_transition_signature, wait_ms, previous_probe.to_raw()]
-        if use_wait and previous_probe is not None
-        else None
-    )
-    raw = await page.evaluate(script, argument) if argument is not None else await page.evaluate(script)
+    if observer_capable:
+        from .role_runtime.page_observer import observer_for
+
+        observer = observer_for(page)
+        await observer.install()
+        if previous_probe is not None and wait_ms > 0:
+            await observer.wait(max(0, wait_ms) / 1000)
+    elif previous_probe is not None and wait_ms > 0:
+        await asyncio.sleep(max(0, wait_ms) / 1000)
+
+    raw = await page.evaluate(_WAIT_PROBE_READ_SCRIPT)
     if not isinstance(raw, dict):
         await page.evaluate(
             _WAIT_PROBE_INSTALL_SCRIPT,
@@ -3173,7 +2696,7 @@ async def inspect_chatgpt_wait_probe(
                 WINDOW_NAME_PREFIX,
             ],
         )
-        raw = await page.evaluate(script, argument) if argument is not None else await page.evaluate(script)
+        raw = await page.evaluate(_WAIT_PROBE_READ_SCRIPT)
     if not isinstance(raw, dict):
         raise RuntimeError("ChatGPT wait probe did not install")
     url = str(raw.get("url") or page.url)
@@ -3187,6 +2710,8 @@ async def inspect_chatgpt_wait_probe(
         requires_login=bool(raw.get("requires_login")),
         composer_present=bool(raw.get("composer_present")),
         composer_text=str(raw.get("composer_text") or ""),
+        composer_ambiguous=bool(raw.get("composer_ambiguous")),
+        composer_owner_source=str(raw.get("composer_owner_source") or ""),
         attachment_count=max(0, int(raw.get("attachment_count") or 0)),
         stop_visible=bool(raw.get("stop_visible")),
         transport_active=bool(raw.get("transport_active")),
@@ -3225,30 +2750,8 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
           const text = (element) => (element?.innerText || "").replace(/\s+/g, " ").trim();
           const firstVisible = (selector) => [...document.querySelectorAll(selector)].find(visible) || null;
 
-          const eligibleComposer = (element) => Boolean(
-            visible(element) && element.isContentEditable &&
-            element.getAttribute('aria-disabled') !== 'true'
-          );
-          const resolveComposer = () => {
-            const owned = [...document.querySelectorAll(
-              'div#prompt-textarea[contenteditable="true"][role="textbox"], [data-testid="composer"] [contenteditable="true"][role="textbox"]'
-            )].filter(eligibleComposer);
-            if (owned.length !== 0) return owned.length === 1 ? owned[0] : null;
-            const formOwned = [...document.querySelectorAll(
-              'form [contenteditable="true"][role="textbox"]'
-            )].filter(eligibleComposer).filter((element) => {
-              const form = element.closest('form');
-              return Boolean(form?.querySelector(
-                'button[data-testid="send-button"], button[aria-label="Send prompt"]'
-              ));
-            });
-            if (formOwned.length !== 0) return formOwned.length === 1 ? formOwned[0] : null;
-            const generic = [...document.querySelectorAll(
-              '[contenteditable="true"][role="textbox"]'
-            )].filter(eligibleComposer);
-            return generic.length === 1 ? generic[0] : null;
-          };
-          const composer = resolveComposer();
+          const composerOwner = (__CDPA_COMPOSER_RESOLVER__)();
+          const composer = composerOwner.element;
           const composerRoot = composer?.closest('form') || composer?.closest('[data-testid="composer"]') || document;
           const sendCandidates = [
             ...composerRoot.querySelectorAll('button,[role="button"]')
@@ -3490,6 +2993,8 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
               composer.getAttribute('aria-disabled') !== 'true'
             ),
             composer_text: text(composer),
+            composer_ambiguous: Boolean(composerOwner.ambiguous),
+            composer_owner_source: composerOwner.source || 'none',
             send_visible: Boolean(send),
             send_enabled: Boolean(
               send && !send.disabled && send.getAttribute('aria-disabled') !== 'true'
@@ -3514,7 +3019,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             messages,
           };
         }
-        """,
+        """.replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS),
         [
             ROLE_STORAGE_KEY,
             PAGE_ID_STORAGE_KEY,
@@ -3558,6 +3063,8 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
         composer_present=bool(raw.get("composer_present")),
         composer_editable=bool(raw.get("composer_editable")),
         composer_text=str(raw.get("composer_text") or ""),
+        composer_ambiguous=bool(raw.get("composer_ambiguous")),
+        composer_owner_source=str(raw.get("composer_owner_source") or ""),
         send_visible=bool(raw.get("send_visible")),
         send_enabled=bool(raw.get("send_enabled")),
         stop_visible=bool(raw.get("stop_visible")),
@@ -3980,6 +3487,8 @@ class ChatGPTPage:
             requires_login=probe.requires_login,
             composer_present=probe.composer_present,
             composer_text=probe.composer_text,
+            composer_ambiguous=probe.composer_ambiguous,
+            composer_owner_source=probe.composer_owner_source,
             stop_visible=probe.stop_visible,
             retry_visible=probe.retry_visible,
             mcp_permission_allow_count=probe.mcp_permission_allow_count,
@@ -4029,81 +3538,26 @@ class ChatGPTPage:
         try:
             probe = await inspect_chatgpt_wait_probe(
                 self.page,
-                previous_transition_signature=(
-                    previous_probe.transition_signature
-                    if previous_probe is not None
-                    else None
-                ),
                 previous_probe=previous_probe,
                 wait_ms=max(0, int(probe_wait_ms)),
             )
             self._wait_metrics["sparse_probes"] += 1
             self._assert_wait_probe_ownership(probe)
-            values = _wait_probe_live_values(probe)
-            previous_values = (
-                _wait_probe_live_values(previous_probe)
-                if previous_probe is not None
-                else {}
-            )
-            changes = {
-                field: {"from": previous_values.get(field), "to": value}
-                for field, value in values.items()
-                if previous_probe is None or previous_values.get(field) != value
-            }
-            if changes:
-                append_live_event(
-                    "DOM",
-                    "wait_probe",
-                    page_url=probe.url,
-                    page_id=probe.page_id,
-                    role=probe.page_role,
-                    task_id=probe.page_task_id,
-                    team=probe.page_team,
-                    changes=changes,
-                    values=values,
-                    detail=("initial probe" if previous_probe is None else None),
-                )
-            if probe.last_user_message_id and probe.last_user_text:
-                append_live_event(
-                    "TRANSCRIPT", "message",
-                    page_url=probe.url, page_id=probe.page_id, role=probe.page_role,
-                    task_id=probe.page_task_id, team=probe.page_team,
-                    values={
-                        "author": "user", "message_id": probe.last_user_message_id,
-                        "turn_id": probe.last_user_turn_id, "text": probe.last_user_text,
-                        "text_length": len(probe.last_user_text), "complete": True,
-                    },
-                )
-            if probe.last_assistant_message_id and probe.assistant_text:
-                append_live_event(
-                    "TRANSCRIPT", "message",
-                    page_url=probe.url, page_id=probe.page_id, role=probe.page_role,
-                    task_id=probe.page_task_id, team=probe.page_team,
-                    values={
-                        "author": "assistant", "message_id": probe.last_assistant_message_id,
-                        "turn_id": probe.last_assistant_turn_id, "text": probe.assistant_text,
-                        "text_length": probe.assistant_text_length,
-                        "complete": not (probe.stop_visible or probe.transport_active),
-                    },
-                )
-            elif probe.response_activity_turn_id and probe.response_activity_text:
-                append_live_event(
-                    "TRANSCRIPT", "message",
-                    page_url=probe.url, page_id=probe.page_id, role=probe.page_role,
-                    task_id=probe.page_task_id, team=probe.page_team,
-                    values={
-                        "author": "assistant",
-                        "message_id": "activity:" + probe.response_activity_turn_id,
-                        "turn_id": probe.response_activity_turn_id,
-                        "text": probe.response_activity_text,
-                        "text_length": probe.response_activity_length,
-                        "complete": False,
-                    },
-                )
+            record_probe(probe, previous_probe)
         except (AuthenticationRequiredError, PageOwnershipError):
             raise
-        except Exception:
+        except Exception as exc:
             self._wait_metrics["sparse_errors"] += 1
+            record_signal_error(
+                SignalIdentity(
+                    page_url=str(getattr(self.page, "url", "") or ""),
+                    page_id=(self.binding.page_id if self.binding else None),
+                    role=(self.binding.role if self.binding else None),
+                ),
+                component="chatgpt_wait",
+                stage="sparse_probe",
+                error=exc,
+            )
             probe = None
 
         reason = "sparse_error" if probe is None else self._wait_full_reason(
@@ -4118,42 +3572,7 @@ class ChatGPTPage:
             self._wait_metrics["full_snapshots"] += 1
             reasons = self._wait_metrics["full_snapshot_reasons"]
             reasons[reason] = int(reasons.get(reason, 0)) + 1
-            latest_assistant_message_id = next(
-                (
-                    item.message_id
-                    for item in reversed(full.messages)
-                    if item.role == "assistant" and str(item.text or "").strip()
-                ),
-                None,
-            )
-            for message in tuple(full.messages)[-24:]:
-                text = str(message.text or "")
-                if not text.strip():
-                    continue
-                append_live_event(
-                    "TRANSCRIPT", "message",
-                    page_url=full.url, page_id=full.page_id, role=full.page_role,
-                    task_id=full.page_task_id, team=full.page_team,
-                    values={
-                        "author": message.role, "message_id": message.message_id,
-                        "turn_id": message.turn_id, "text": text[:24000],
-                        "text_length": len(text),
-                        "complete": not (
-                            message.role == "assistant"
-                            and (
-                                (
-                                    full.response_activity_turn_id
-                                    and message.turn_id == full.response_activity_turn_id
-                                )
-                                or (
-                                    not full.response_activity_turn_id
-                                    and full.stop_visible
-                                    and message.message_id == latest_assistant_message_id
-                                )
-                            )
-                        ),
-                    },
-                )
+            record_full_snapshot(full)
             if probe is None:
                 self._wait_probe = WaitProbe(
                     url=full.url,
@@ -4165,6 +3584,8 @@ class ChatGPTPage:
                     requires_login=full.requires_login,
                     composer_present=full.composer_present,
                     composer_text=full.composer_text,
+                    composer_ambiguous=full.composer_ambiguous,
+                    composer_owner_source=full.composer_owner_source,
                     attachment_count=len(full.attachment_markers),
                     stop_visible=full.stop_visible,
                     transport_active=bool(full.response_activity_turn_id),
@@ -4345,10 +3766,10 @@ class ChatGPTPage:
         return observer_for(self.page).observation()
 
     async def wait_for_page_observation(
-        self, *, timeout_ms: int = 5_000, dom_only: bool = False
+        self, *, timeout_ms: int = 5_000
     ) -> bool:
         from .role_runtime.page_observer import observer_for
-        return await observer_for(self.page).wait(timeout_ms / 1000, dom_only=dom_only)
+        return await observer_for(self.page).wait(timeout_ms / 1000)
 
     def clear_permission_action(self) -> None:
         from .role_runtime.page_observer import observer_for
@@ -4767,10 +4188,13 @@ class ChatGPTPage:
                   );
                   const firstVisible = (selector) =>
                     [...document.querySelectorAll(selector)].find(visible) || null;
-                  const composer = firstVisible('[contenteditable="true"][role="textbox"]');
-                  if (!composer || composer.getAttribute('contenteditable') !== 'true' ||
-                      composer.getAttribute('aria-disabled') === 'true') {
-                    return {written: false, reason: 'composer_unavailable'};
+                  const owner = (__CDPA_COMPOSER_RESOLVER__)();
+                  const composer = owner.element;
+                  if (!composer) {
+                    return {
+                      written: false,
+                      reason: owner.ambiguous ? 'composer_ambiguous' : 'composer_unavailable',
+                    };
                   }
                   if (firstVisible('button[data-testid="stop-button"], button[aria-label*="Stop"]')) {
                     return {written: false, reason: 'active_response'};
@@ -4822,7 +4246,7 @@ class ChatGPTPage:
                     bindingId: bindingId || sessionStorage.getItem(bindingIdKey) || null,
                   });
                   return {written: true};
-                }""",
+                }""".replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS),
                 [
                     TASK_ID_STORAGE_KEY,
                     task_id,
@@ -4844,6 +4268,8 @@ class ChatGPTPage:
                 raise UnsafePageStateError("blocking dialog is open")
             if reason == "error_state":
                 raise UnsafePageStateError("page is in error state")
+            if reason == "composer_ambiguous":
+                raise ComposerConflictError("composer ownership is ambiguous")
             if reason == "composer_unavailable":
                 raise UnsafePageStateError("composer is not present and editable")
             if not bool((write_result or {}).get("written")):
@@ -5093,8 +4519,9 @@ class ChatGPTPage:
                       const visible = (element) => Boolean(
                         element && (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
                       );
-                      const composer = [...document.querySelectorAll('[contenteditable="true"][role="textbox"]')]
-                        .find(visible) || null;
+                      const owner = (__CDPA_COMPOSER_RESOLVER__)();
+                      if (owner.ambiguous) return -1;
+                      const composer = owner.element;
                       const host = composer?.closest('form') || composer?.parentElement || null;
                       if (!host) return 0;
                       let removed = 0;
@@ -5111,8 +4538,10 @@ class ChatGPTPage:
                         }
                       }
                       return removed;
-                    }"""
+                    }""".replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS)
                 )
+                if int(removed or 0) < 0:
+                    raise ComposerConflictError("composer ownership is ambiguous")
                 if not int(removed or 0):
                     raise ComposerConflictError("composer attachments could not be discarded")
             if existing:
@@ -5347,25 +4776,45 @@ class ChatGPTPage:
     ) -> tuple[str, MessageSnapshot | None] | None:
         deadline = time.monotonic() + timeout_ms / 1000
         accepted_user: MessageSnapshot | None = None
+        last_snapshot = pre_send
         baseline_activity, _ = response_activity_signature(pre_send, baseline)
         baseline_activity_turn_id = str(pre_send.response_activity_turn_id or "")
         baseline_activity_structure = str(pre_send.response_activity_structure or "")
+        baseline_stop_visible = bool(pre_send.stop_visible)
         fallback_probe_ms = 250
+
+        def accepted(
+            via: str, user: MessageSnapshot | None
+        ) -> tuple[str, MessageSnapshot | None]:
+            record_send_acceptance(
+                SignalIdentity.from_snapshot(last_snapshot),
+                last_snapshot,
+                outcome="accepted",
+                accepted_via=via,
+            )
+            return via, user
+
         while True:
             remaining_seconds = deadline - time.monotonic()
             if remaining_seconds <= 0:
+                record_send_acceptance(
+                    SignalIdentity.from_snapshot(last_snapshot),
+                    last_snapshot,
+                    outcome="timeout",
+                )
                 return None
             wait_ms = max(1, min(fallback_probe_ms, math.ceil(remaining_seconds * 1000)))
-            await self.wait_for_page_observation(timeout_ms=wait_ms, dom_only=True)
+            await self.wait_for_page_observation(timeout_ms=wait_ms)
             snapshot = await self.assert_ownership()
+            last_snapshot = snapshot
             candidate = unique_new_user_message(snapshot.messages, baseline)
             # Preserve exact user-turn acceptance when it is available. Response-bound
             # DOM evidence also proves the confirmed click was accepted without requiring
-            # prompt text, message identity, conversation identity, or a Stop control.
+            # prompt text or backend/listener identity.
             if candidate is not None:
                 if expected_prompt is None or rendered_user_text_matches(candidate.text, expected_prompt):
                     accepted_user = candidate
-                    return "exact_user_message", accepted_user
+                    return accepted("exact_user_message", accepted_user)
             assistants = new_assistant_turns(snapshot.messages, baseline)
             if any(
                 message.message_id
@@ -5373,10 +4822,10 @@ class ChatGPTPage:
                 and message.message_id not in baseline.message_ids
                 for message in assistants
             ):
-                return "assistant_message", accepted_user
+                return accepted("assistant_message", accepted_user)
             activity_turn_id = str(snapshot.response_activity_turn_id or "")
             if activity_turn_id and activity_turn_id != baseline_activity_turn_id:
-                return "response_activity_turn", accepted_user
+                return accepted("response_activity_turn", accepted_user)
             activity, activity_length = response_activity_signature(snapshot, baseline)
             activity_structure = str(snapshot.response_activity_structure or "")
             if (
@@ -5385,9 +4834,9 @@ class ChatGPTPage:
                 activity_structure
                 and activity_structure != baseline_activity_structure
             ):
-                return "assistant_activity", accepted_user
-            if snapshot.stop_visible:
-                return "stop_button", accepted_user
+                return accepted("assistant_activity", accepted_user)
+            if snapshot.stop_visible and not baseline_stop_visible:
+                return accepted("stop_button", accepted_user)
 
     async def _prepare_prompt_locked(
         self,
@@ -5770,9 +5219,11 @@ class ChatGPTPage:
                   const visible = (element) => Boolean(
                     element && (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
                   );
-                  const composer = [...document.querySelectorAll(
-                    '[contenteditable="true"][role="textbox"]'
-                  )].find(visible) || null;
+                  const owner = (__CDPA_COMPOSER_RESOLVER__)();
+                  if (owner.ambiguous) {
+                    return {clicked: false, reason: 'composer_ambiguous'};
+                  }
+                  const composer = owner.element;
                   const composerText = (composer?.innerText || '').replace(/\s+/g, ' ').trim();
                   const composerHost = composer?.closest('form') || composer?.parentElement || null;
                   const attachments = composerHost ? [...composerHost.querySelectorAll(
@@ -5798,7 +5249,7 @@ class ChatGPTPage:
                   }
                   retry.click();
                   return {clicked: true, reason: null};
-                }""",
+                }""".replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS),
                 [
                     ROLE_STORAGE_KEY,
                     PAGE_ID_STORAGE_KEY,
@@ -5816,9 +5267,9 @@ class ChatGPTPage:
                     if isinstance(click_result, Mapping)
                     else "retry_unavailable"
                 )
-                if reason == "composer_conflict":
+                if reason in {"composer_conflict", "composer_ambiguous"}:
                     raise ComposerConflictError(
-                        "Retry generation blocked by manual draft or attachments"
+                        "Retry generation blocked by manual draft, attachments, or ambiguous composer ownership"
                     )
                 if reason == "ownership_changed":
                     raise PageOwnershipError("exact ownership changed before Retry click")

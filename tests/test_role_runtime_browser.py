@@ -34,10 +34,14 @@ def environment(client):
 
 
 def test_listen_telemetry_emits_once_per_semantic_signal(monkeypatch):
-    import playwright_auto.observability as observability
+    import playwright_auto.role_runtime.signals as signal_module
 
     events = []
-    monkeypatch.setattr(observability, "append_live_event", lambda source, kind, **kwargs: events.append((source, kind, kwargs)))
+    monkeypatch.setattr(
+        signal_module,
+        "append_live_event",
+        lambda source, kind, **kwargs: events.append((source, kind, kwargs)),
+    )
 
     class Client:
         evidence = {
@@ -269,3 +273,68 @@ def test_temporary_workflow_never_executes_automatic_refresh(monkeypatch):
     assert result.reason == "temporary_no_refresh:response_timeout_recheck"
     assert client.refreshed is False
     assert hop["wait"]["timeout_refreshed"] is True
+
+
+def test_page_observer_only_wakes_on_dom_changes_without_semantic_transcript_logging(monkeypatch):
+    import playwright_auto.role_runtime.signals as signal_module
+
+    events = []
+    monkeypatch.setattr(
+        signal_module,
+        "append_live_event",
+        lambda source, kind, **kwargs: events.append((source, kind, kwargs)),
+    )
+
+    async def run(page):
+        async def serve(route):
+            await route.fulfill(status=200, content_type="text/html", body="""
+                <main>
+                  <section data-turn-id="turn-1">
+                    <div data-message-author-role="assistant" data-message-id="msg-1">
+                      <span id="assistant-text">A</span>
+                    </div>
+                  </section>
+                  <div contenteditable="true" role="textbox"></div>
+                </main>
+            """)
+
+        await page.context.route("https://chatgpt.com/**", serve)
+        await page.goto("https://chatgpt.com/c/live-transcript")
+        client = ChatGPTPage(page, timeout_ms=5_000)
+        await client.install_page_observer()
+
+        await page.evaluate("document.querySelector('#assistant-text').firstChild.data = 'AB'")
+        assert await client.wait_for_page_observation(timeout_ms=500) is True
+        assert not [event for event in events if event[0] == "TRANSCRIPT"]
+
+    asyncio.run(_with_page("<main></main>", run))
+
+
+def test_page_observer_replaces_legacy_dom_observer_on_live_page():
+    async def run(page):
+        async def serve(route):
+            await route.fulfill(status=200, content_type="text/html", body="""
+                <main>
+                  <section data-turn-id="turn-legacy">
+                    <div data-message-author-role="assistant" data-message-id="msg-legacy">ready</div>
+                  </section>
+                  <div contenteditable="true" role="textbox"></div>
+                </main>
+            """)
+
+        await page.context.route("https://chatgpt.com/**", serve)
+        await page.goto("https://chatgpt.com/c/live-legacy")
+        await page.evaluate("""() => {
+            sessionStorage.setItem('playwright-auto:role', 'DEV');
+            sessionStorage.setItem('playwright-auto:page-id', 'page-1');
+            sessionStorage.setItem('playwright-auto:task-id', 'task-1');
+            sessionStorage.setItem('playwright-auto:team', 'team-1');
+            window.__CDPA_ROLE_DOM_V1__ = {disconnect: () => { window.__legacyDisconnected = true; }};
+        }""")
+        client = ChatGPTPage(page, timeout_ms=5_000)
+        client.binding = PageBinding("page-1", "DEV")
+        await client.install_page_observer()
+        assert await page.evaluate("Boolean(window.__legacyDisconnected)") is True
+        assert await page.evaluate("Boolean(window.__CDPA_ROLE_DOM_V2__)") is True
+
+    asyncio.run(_with_page("<main></main>", run))

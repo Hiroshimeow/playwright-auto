@@ -6,6 +6,7 @@ import time
 import pytest
 
 import playwright_auto.chatgpt as chatgpt_module
+import playwright_auto.chatgpt_backend as backend_module
 from playwright_auto.cdpa_response import (
     begin_refresh,
     observe_response_activity,
@@ -27,6 +28,7 @@ from playwright_auto.chatgpt import (
     response_activity_signature,
     validate_page_role,
 )
+from playwright_auto.role_runtime.signals import transcript_messages
 
 
 def _activity_snapshot(
@@ -292,56 +294,6 @@ def test_frontend_natural_sse_reducer_keeps_only_exact_request_branch():
     assert graph["mapping"]["call1"]["message"]["recipient"] == "mcp-g8.write_file"
 
 
-def test_natural_paged_messages_reducer_accepts_observed_messages_schema_without_mapping():
-    import playwright_auto.chatgpt as cg
-
-    final_id = "08289956-8023-4063-823f-6436e0836d09"
-    body = json.dumps(
-        {
-            "messages": [
-                {
-                    "id": "historical",
-                    "author": {"role": "assistant"},
-                    "recipient": "all",
-                    "content": {"content_type": "text", "parts": ["old"]},
-                },
-                {
-                    "id": "u1",
-                    "author": {"role": "user"},
-                    "recipient": "all",
-                    "content": {"content_type": "text", "parts": ["current request"]},
-                },
-                {
-                    "id": final_id,
-                    "author": {"role": "assistant"},
-                    "recipient": "all",
-                    "content": {
-                        "content_type": "text",
-                        "parts": [
-                            '{"route":"TEST","handoff":".plan/cdpa-listen-controls-acceptance/cdpa-listen-controls-acceptance-dev_turn1_cdpa-idem-05059b42ae633eb49d7636cd.md"}'
-                        ],
-                    },
-                },
-            ],
-            "current_node": final_id,
-            "page_info": {"has_more": False},
-            "context_truncation_continuation": None,
-        }
-    )
-
-    observed = cg._reduce_paged_conversation_body(
-        body,
-        conversation_id="6a9d3b50-f82c-83e8-983e-2bef62ebde41",
-        observed_user_message_id="u1",
-    )
-
-    assert observed is not None
-    assert observed["source"] == "paged_messages"
-    assert observed["graph"]["current_node"] == final_id
-    assert list(observed["graph"]["mapping"]) == ["u1", final_id]
-    assert "historical" not in observed["graph"]["mapping"]
-
-
 def test_frontend_identity_observer_can_be_taken_before_late_response():
     import asyncio
     import playwright_auto.chatgpt as cg
@@ -594,7 +546,7 @@ def test_stream_status_shares_exact_conversation_freshness_and_inflight(monkeypa
         await release.wait()
         return {"status": "IS_STREAMING"}
 
-    monkeypatch.setattr(chatgpt_module, "_backend_get_object", fake_get)
+    monkeypatch.setattr(backend_module, "_backend_get_object", fake_get)
 
     async def scenario():
         first = asyncio.create_task(chatgpt_module.backend_stream_status(context, "conversation-1"))
@@ -629,7 +581,7 @@ def test_stream_status_cache_is_bounded_and_release_is_exact(monkeypatch):
     async def fake_get(_context, path, **_kwargs):
         return {"status": "COMPLETE", "path": path}
 
-    monkeypatch.setattr(chatgpt_module, "_backend_get_object", fake_get)
+    monkeypatch.setattr(backend_module, "_backend_get_object", fake_get)
 
     async def scenario():
         for index in range(64):
@@ -666,7 +618,7 @@ def test_stream_status_release_preserves_other_inflight_slot(monkeypatch):
             return {"status": "IS_STREAMING"}
         return {"status": "COMPLETE"}
 
-    monkeypatch.setattr(chatgpt_module, "_backend_get_object", fake_get)
+    monkeypatch.setattr(backend_module, "_backend_get_object", fake_get)
 
     async def scenario():
         pending = asyncio.create_task(
@@ -860,3 +812,129 @@ def test_full_conversation_graph_request_surfaces_are_removed():
     assert not hasattr(cg.ChatGPTPage, "backend_conversation")
     assert not hasattr(CDPATabActions, "backend_conversation")
     assert not hasattr(CDPATabActions, "backend_search_conversations")
+
+
+def test_wait_probe_activity_transcript_uses_turn_identity_without_synthetic_message_id():
+    probe = chatgpt_module.WaitProbe(
+        url="https://chatgpt.com/c/test",
+        session_id="test",
+        page_id="page-plan",
+        page_role="PLAN",
+        page_task_id="task-1",
+        page_team="team-1",
+        requires_login=False,
+        composer_present=True,
+        composer_text="",
+        attachment_count=0,
+        stop_visible=True,
+        transport_active=True,
+        error_texts=(),
+        blocking_dialogs=(),
+        choice_prompt_labels=(),
+        mcp_permission_allow_count=0,
+        mcp_permission_node_count=0,
+        last_user_message_id=None,
+        last_user_turn_id=None,
+        last_assistant_message_id=None,
+        last_assistant_turn_id=None,
+        assistant_text_length=0,
+        assistant_text_tail="",
+        response_activity_length=7,
+        response_activity_tail="working",
+        response_activity_turn_id="turn-live",
+        response_activity_text="working",
+    )
+
+    messages = transcript_messages(probe)
+
+    assert messages == ({
+        "author": "assistant",
+        "message_id": None,
+        "turn_id": "turn-live",
+        "text": "working",
+        "text_length": 7,
+        "complete": False,
+    },)
+
+
+def test_wait_probe_wait_wakes_on_assistant_character_data_change():
+    from test_chatgpt_mcp_permission import _with_page
+
+    async def run(page):
+        body = await page.locator("main").evaluate("node => node.outerHTML")
+
+        async def serve(route):
+            await route.fulfill(status=200, content_type="text/html", body=body)
+
+        await page.context.route("https://chatgpt.com/**", serve)
+        await page.goto("https://chatgpt.com/c/wait-probe")
+        first = await chatgpt_module.inspect_chatgpt_wait_probe(page)
+        pending = asyncio.create_task(chatgpt_module.inspect_chatgpt_wait_probe(
+            page,
+            previous_probe=first,
+            wait_ms=1_000,
+        ))
+        await asyncio.sleep(0.05)
+        await page.evaluate("document.querySelector('#assistant-text').firstChild.data = 'AB'")
+        second = await asyncio.wait_for(pending, timeout=0.5)
+        assert second.last_assistant_message_id == "msg-1"
+        assert second.last_assistant_turn_id == "turn-1"
+        assert second.assistant_text == "AB"
+        assert second.assistant_text_length == 2
+
+    asyncio.run(_with_page("""
+        <main>
+          <section data-turn-id="turn-1">
+            <div data-message-author-role="assistant" data-message-id="msg-1">
+              <span id="assistant-text">A</span>
+              <div data-streaming-response-status="streaming"></div>
+            </div>
+          </section>
+          <button data-testid="stop-button">Stop</button>
+          <div contenteditable="true" role="textbox"></div>
+        </main>
+    """, run))
+
+
+def test_wait_probe_activity_turn_does_not_rebind_unscoped_assistant_message():
+    probe = chatgpt_module.WaitProbe(
+        url="https://chatgpt.com/c/test",
+        session_id="test",
+        page_id="page-plan",
+        page_role="PLAN",
+        page_task_id="task-1",
+        page_team="team-1",
+        requires_login=False,
+        composer_present=True,
+        composer_text="",
+        attachment_count=0,
+        stop_visible=True,
+        transport_active=True,
+        error_texts=(),
+        blocking_dialogs=(),
+        choice_prompt_labels=(),
+        mcp_permission_allow_count=0,
+        mcp_permission_node_count=0,
+        last_user_message_id=None,
+        last_user_turn_id=None,
+        last_assistant_message_id="previous-msg",
+        last_assistant_turn_id=None,
+        assistant_text_length=8,
+        assistant_text_tail="previous",
+        response_activity_length=7,
+        response_activity_tail="working",
+        response_activity_turn_id="turn-live",
+        assistant_text="previous",
+        response_activity_text="working",
+    )
+
+    messages = transcript_messages(probe)
+
+    assert messages[-1] == {
+        "author": "assistant",
+        "message_id": None,
+        "turn_id": "turn-live",
+        "text": "working",
+        "text_length": 7,
+        "complete": False,
+    }

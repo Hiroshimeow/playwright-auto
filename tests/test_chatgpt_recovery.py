@@ -265,18 +265,18 @@ def test_wait_clean_ready_tolerates_transient_snapshot_error(monkeypatch):
     assert page.inspect_calls == 2
 
 
-def test_page_observer_dom_wait_ignores_network_and_consumes_dom_wake():
+def test_page_observer_wait_consumes_dom_or_network_wake():
     from playwright_auto.role_runtime.page_observer import PageObserver
 
     observer = PageObserver(type("Page", (), {"url": "https://chatgpt.com/c/test"})())
 
     async def exercise():
         observer.network_wake.set()
-        assert await observer.wait(0.001, dom_only=True) is False
+        assert await observer.wait(0.1) is True
+        assert observer.network_wake.is_set() is False
         observer.dom_wake.set()
-        assert await observer.wait(0.1, dom_only=True) is True
+        assert await observer.wait(0.1) is True
         assert observer.dom_wake.is_set() is False
-        assert observer.network_wake.is_set() is True
 
     asyncio.run(exercise())
 
@@ -300,7 +300,7 @@ def test_send_acceptance_rejects_generic_non_response_dom_change(monkeypatch):
     assert result is None
     assert client.wait_for_page_observation.await_count >= 1
     assert all(
-        call.kwargs.get("dom_only") is True
+        set(call.kwargs) == {"timeout_ms"}
         for call in client.wait_for_page_observation.await_args_list
     )
 
@@ -324,7 +324,7 @@ def test_send_acceptance_observer_wake_reads_owned_snapshot_immediately(monkeypa
     assert result is not None
     assert result[0] == "assistant_message"
     client.wait_for_page_observation.assert_awaited_once()
-    assert client.wait_for_page_observation.await_args.kwargs["dom_only"] is True
+    assert set(client.wait_for_page_observation.await_args.kwargs) == {"timeout_ms"}
     assert page.inspect_calls == 1
 
 
@@ -362,6 +362,23 @@ def test_send_acceptance_accepts_visible_stop_control(monkeypatch):
     )
 
     assert result[0] == "stop_button"
+
+
+def test_send_acceptance_rejects_preexisting_stop_control(monkeypatch):
+    baseline = receipt().baseline
+    pre_send = make_snapshot(stop_visible=True)
+    page = SequencePage([make_snapshot(stop_visible=True)])
+    install_sequence(monkeypatch, page)
+
+    result = asyncio.run(
+        bind(page)._wait_send_acceptance(
+            baseline,
+            pre_send,
+            timeout_ms=5,
+        )
+    )
+
+    assert result is None
 
 
 def test_send_acceptance_accepts_new_response_activity_turn_without_stop(monkeypatch):

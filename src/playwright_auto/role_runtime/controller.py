@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 from ..cdpa_response import begin_refresh, finish_refresh, parse_time
 from . import allow, response, timeout
 from .model import Action, Context, Decision, Policy
+from .signals import RoleSignals, SignalIdentity, record_cycle, record_signal_error
 
 
 _RATE_LIMIT_MARKERS = ("too many requests", "rate limit", "rate-limit", "request limit")
@@ -28,10 +29,24 @@ class RoleController:
         permission: Mapping[str, Any] | None = None,
         validate: Callable[[Any], None] | None = None, phase: str = "waiting",
         network_status: str | None = None, network_response: Any = None,
-        now: datetime | None = None,
+        now: datetime | None = None, signals: RoleSignals | None = None,
     ) -> Decision:
-        ctx = Context(snapshot, wait, self.policy, now or datetime.now(timezone.utc),
-                      permission, phase, network_status=network_status)
+        if signals is None:
+            signals = RoleSignals.from_sources(
+                snapshot,
+                {
+                    "permission_action": permission,
+                    "status": network_status,
+                },
+            )
+        snapshot = signals.snapshot
+        ctx = Context(
+            signals,
+            wait,
+            self.policy,
+            now or datetime.now(timezone.utc),
+            phase,
+        )
         wait["manual_draft_present"] = ctx.draft_present
         dialogs = tuple(getattr(snapshot, "blocking_dialogs", ()) or ())
         error_texts = tuple(getattr(snapshot, "error_texts", ()) or ())
@@ -133,6 +148,8 @@ class RoleController:
                 if wait.get("ui_error_refreshed_key") != key:
                     return self._remember(ctx, Decision(Action.REFRESH, "ui_error"))
                 return self._remember(ctx, Decision(Action.WAIT, "ui_error_waiting_for_composer"))
+            if ctx.signals.composer_ambiguous:
+                return self._remember(ctx, Decision(Action.WAIT, "composer_ambiguous"))
             reason = "ready" if ctx.composer_ready else "composer_pending"
             return self._remember(ctx, Decision(Action.WAIT, reason))
 
@@ -159,6 +176,19 @@ class RoleController:
         try:
             result = await self._run(worker, state, hop, acquired, actions, **kwargs)
         except Exception as exc:
+            record_signal_error(
+                SignalIdentity(
+                    page_url=str(getattr(acquired, "url", "") or ""),
+                    page_id=getattr(acquired, "page_id", None),
+                    role=str(hop.get("physical_role") or hop.get("target_role") or "") or None,
+                    task_id=str(state.get("task_id") or "") or None,
+                    team=str(state.get("team") or "") or None,
+                    request_id=str(hop.get("request_id") or "") or None,
+                ),
+                component="role_controller",
+                stage=str(kwargs.get("phase") or "waiting"),
+                error=exc,
+            )
             if is_cdp_disconnect(exc):
                 raise
             if isinstance(exc, AuthenticationRequiredError):
@@ -189,7 +219,6 @@ class RoleController:
     ) -> Decision:
         from ..chatgpt import MessageSnapshot, RateLimitBlockedError, SendReceipt
         from ..cdpa_routes import RouteContractError
-        from ..observability import append_live_event
 
         client = acquired.client
         wait = hop.setdefault("wait", {})
@@ -208,73 +237,47 @@ class RoleController:
                 snapshot = await client.assert_ownership()
         read = getattr(client, "page_observation", None)
         evidence = read() if callable(read) else {}
-        evidence = evidence if isinstance(evidence, Mapping) else {}
-        permission = evidence.get("permission_action")
-        permission = permission if isinstance(permission, Mapping) else None
-        # Emit only semantic Listen changes; raw chunks stay internal to the page observer.
-        network_response = evidence.get("response")
-        listen_values: dict[str, Any] = {}
-        if evidence.get("status"):
-            listen_values["status"] = str(evidence["status"])
-        if isinstance(network_response, Mapping):
-            listen_values["response_message_id"] = str(network_response.get("message_id") or network_response.get("id") or "")
-            listen_values["response_turn_id"] = str(network_response.get("turn_id") or "")
-            listen_values["response_text_length"] = len(str(network_response.get("text") or ""))
-            transcript_text = str(network_response.get("text") or "")
-            transcript_message_id = str(network_response.get("message_id") or network_response.get("id") or "")
-            if transcript_message_id and transcript_text.strip():
-                append_live_event(
-                    "TRANSCRIPT", "message",
-                    page_url=str(snapshot.url), page_id=acquired.page_id,
-                    role=str(hop.get("physical_role") or hop.get("target_role")),
-                    task_id=str(state["task_id"]), team=str(state["team"]),
-                    request_id=str(hop.get("request_id") or ""),
-                    values={
-                        "author": "assistant",
-                        "message_id": transcript_message_id,
-                        "turn_id": str(network_response.get("turn_id") or "") or None,
-                        "text": transcript_text[:24000],
-                        "text_length": len(transcript_text),
-                        "complete": True,
-                        "projection_source": "listen",
-                    },
-                )
-        if permission is not None:
-            listen_values["permission_target"] = str(permission.get("target_message_id") or "")
-        listen_signature = "|".join(f"{key}={value}" for key, value in sorted(listen_values.items()))
-        if listen_values and str(wait.get("live_listen_signature") or "") != listen_signature:
-            wait["live_listen_signature"] = listen_signature
-            append_live_event(
-                "LISTEN", "network_signal", page_url=str(snapshot.url), page_id=acquired.page_id,
-                role=str(hop.get("physical_role") or hop.get("target_role")),
-                task_id=str(state["task_id"]), team=str(state["team"]),
-                request_id=str(hop.get("request_id") or ""), values=listen_values,
-            )
-        # LISTEN response and rendered DOM remain independent sources. LISTEN is
-        # priority #1; it is never injected into the DOM snapshot.
+        signals = RoleSignals.from_sources(
+            snapshot, evidence if isinstance(evidence, Mapping) else {}
+        )
+        permission = signals.permission
+        # LISTEN response and rendered DOM remain independent response sources.
+        # Policy consumes one normalized signal frame; raw network chunks never leak in.
         listen_candidate = (
-            MessageSnapshot.from_dict(network_response)
-            if phase == "waiting" and isinstance(network_response, Mapping)
+            MessageSnapshot.from_dict(signals.network_response)
+            if phase == "waiting" and isinstance(signals.network_response, Mapping)
             else None
         )
         previous = (wait.get("controller_decision"), wait.get("controller_reason"))
         decision = self.decide(
-            snapshot, wait, receipt=receipt, permission=permission,
-            validate=(lambda candidate: worker._validate_response_candidate(state, hop, candidate)),
+            snapshot,
+            wait,
+            receipt=receipt,
+            validate=(
+                lambda candidate: worker._validate_response_candidate(
+                    state, hop, candidate
+                )
+            ),
             phase=phase,
-            network_status=evidence.get("status"),
             network_response=listen_candidate,
+            signals=signals,
         )
-        if previous != (decision.action.value, decision.reason):
-            append_live_event(
-                "CTRL", "role_decision", page_url=str(snapshot.url), page_id=acquired.page_id,
-                role=str(hop.get("physical_role") or hop.get("target_role")),
-                task_id=str(state["task_id"]), team=str(state["team"]),
-                request_id=str(hop.get("request_id") or ""),
-                values={"action": decision.action.value, "reason": decision.reason,
-                        "mcp_permission_node_count": int(getattr(snapshot, "mcp_permission_node_count", 0)),
-                        "retry_visible": bool(getattr(snapshot, "retry_visible", False))},
-            )
+        identity = SignalIdentity.from_snapshot(
+            snapshot,
+            request_id=str(hop.get("request_id") or "") or None,
+            page_id=acquired.page_id,
+            role=str(hop.get("physical_role") or hop.get("target_role")),
+            task_id=str(state["task_id"]),
+            team=str(state["team"]),
+        )
+        record_cycle(
+            signals,
+            wait,
+            identity=identity,
+            phase=phase,
+            previous_decision=previous,
+            decision=decision,
+        )
         state["active_action"] = "wait_response" if phase == "waiting" else "queued"
         if decision.action is Action.REFRESH and state.get("conversation_mode") == "temporary":
             # Temporary Chat documents are ephemeral. Reload can destroy the live
@@ -344,10 +347,24 @@ class RoleController:
     async def maintain_history(self, client, wait: dict) -> Decision:
         # History tabs only auto-Allow; they cannot enqueue work or route old results.
         probe = await client.read_wait_probe()
-        permission = client.page_observation().get("permission_action")
-        decision = self.decide(probe, wait, permission=permission, phase="history")
+        observation = client.page_observation()
+        signals = RoleSignals.from_sources(
+            probe, observation if isinstance(observation, Mapping) else {}
+        )
+        previous = (wait.get("controller_decision"), wait.get("controller_reason"))
+        decision = self.decide(probe, wait, phase="history", signals=signals)
+        record_cycle(
+            signals,
+            wait,
+            identity=SignalIdentity.from_snapshot(probe),
+            phase="history",
+            previous_decision=previous,
+            decision=decision,
+        )
         if decision.action is Action.ALLOW:
-            return await self.browser_action(client, probe, wait, permission, decision)
+            return await self.browser_action(
+                client, probe, wait, signals.permission, decision
+            )
         if decision.action is Action.REFRESH:
             return Decision(Action.WAIT, "history_observation")
         return decision

@@ -147,9 +147,16 @@ def test_send_acceptance_ignores_stale_response_activity_without_current_dom_evi
     assert accepted is None
 
 
-def test_send_acceptance_accepts_markerless_current_stop_button_without_listen():
+def test_send_acceptance_accepts_markerless_current_stop_button_without_listen(monkeypatch):
     import types
+    import playwright_auto.role_runtime.signals as signal_module
 
+    events = []
+    monkeypatch.setattr(
+        signal_module,
+        "append_live_event",
+        lambda source, kind, **kwargs: events.append((source, kind, kwargs)),
+    )
     before = snapshot()
     current = replace(before, stop_visible=True, state=ChatGPTState.RESPONDING)
     page = DummyPage(before)
@@ -176,6 +183,13 @@ def test_send_acceptance_accepts_markerless_current_stop_button_without_listen()
     )
 
     assert accepted == ("stop_button", None)
+    acceptance_events = [
+        event for event in events
+        if event[0:2] == ("SIGNAL", "send_acceptance")
+    ]
+    assert len(acceptance_events) == 1
+    assert acceptance_events[0][2]["values"]["accepted_via"] == "stop_button"
+    assert acceptance_events[0][2]["values"]["authority"] == "dom"
 
 
 def test_send_acceptance_timeout_does_not_inherit_client_timeout(monkeypatch):
@@ -453,7 +467,7 @@ def test_set_composer_text_recovers_from_detach_before_input_without_duplicate(m
     async def run(page):
         await page.evaluate("""() => {
           const composer = document.querySelector('#prompt-textarea');
-          composer.addEventListener('click', () => {
+          composer.addEventListener('focus', () => {
             if (window.__replaced) return;
             window.__replaced = true;
             const next = composer.cloneNode(false);
@@ -481,7 +495,7 @@ def test_set_composer_text_does_not_type_into_focus_stealing_editor(monkeypatch)
 
     async def run(page):
         await page.evaluate("""() => {
-          document.querySelector('#prompt-textarea').addEventListener('click', () => {
+          document.querySelector('#prompt-textarea').addEventListener('focus', () => {
             document.querySelector('#thief').focus();
           });
         }""")
@@ -518,6 +532,180 @@ def test_set_composer_text_hidden_first_real_actionability_and_exact_readback(mo
           <div id="live-composer" contenteditable="true" role="textbox"></div>
         </main>
     """, run))
+
+
+def test_set_composer_text_ignores_non_actionable_named_composer(monkeypatch):
+    from test_chatgpt_mcp_permission import _with_page
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(chatgpt, "action_delay", noop)
+    monkeypatch.setattr(chatgpt, "record_page_action", noop)
+
+    async def run(page):
+        await chatgpt.set_composer_text(page, "workflow prompt", timeout_ms=800)
+        assert await page.locator("#prompt-textarea").inner_text() == "stale"
+        assert await page.locator("#live").inner_text() == "workflow prompt"
+
+    asyncio.run(_with_page("""
+        <main>
+          <div data-testid="composer">
+            <div id="prompt-textarea" role="textbox" contenteditable="true"
+                 style="pointer-events:none">stale</div>
+          </div>
+          <form data-testid="composer">
+            <div id="live" role="textbox" contenteditable="true"></div>
+            <button type="submit" data-testid="send-button">Send</button>
+          </form>
+        </main>
+    """, run))
+
+
+def test_set_composer_text_ignores_prior_message_editor(monkeypatch):
+    from test_chatgpt_mcp_permission import _with_page
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(chatgpt, "action_delay", noop)
+    monkeypatch.setattr(chatgpt, "record_page_action", noop)
+
+    async def run(page):
+        await chatgpt.set_composer_text(page, "workflow prompt", timeout_ms=800)
+        assert await page.locator("#message-editor").inner_text() == "manual edit"
+        assert await page.locator("#live-composer").inner_text() == "workflow prompt"
+
+    asyncio.run(_with_page("""
+        <main>
+          <section data-turn-id="turn-1">
+            <div data-message-author-role="user">
+              <div id="message-editor" role="textbox" contenteditable="true">manual edit</div>
+            </div>
+          </section>
+          <div id="live-composer" role="textbox" contenteditable="true"></div>
+        </main>
+    """, run))
+
+
+def test_full_and_wait_probe_use_same_composer_owner():
+    from test_chatgpt_mcp_permission import _with_page
+
+    async def run(page):
+        full = await chatgpt.inspect_chatgpt_page(page)
+        probe = await chatgpt.inspect_chatgpt_wait_probe(page)
+        assert full.composer_present and probe.composer_present
+        assert full.composer_text == ""
+        assert probe.composer_text == ""
+        assert await page.locator("#other-editor").inner_text() == "operator draft"
+
+    asyncio.run(_with_page("""
+        <main>
+          <div id="other-editor" role="textbox" contenteditable="true">operator draft</div>
+          <form data-testid="composer">
+            <div id="prompt-textarea" role="textbox" contenteditable="true"></div>
+            <button type="submit" data-testid="send-button">Send</button>
+          </form>
+        </main>
+    """, run))
+
+
+def test_owned_composer_edit_emits_input_and_preserves_foreign_draft(monkeypatch):
+    from test_chatgpt_mcp_permission import _with_page
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(chatgpt, "action_delay", noop)
+    monkeypatch.setattr(chatgpt, "record_page_action", noop)
+
+    async def run(page):
+        await page.evaluate("""() => {
+          window.__composerInputs = 0;
+          document.querySelector('#prompt-textarea').addEventListener(
+            'input', () => window.__composerInputs += 1
+          );
+        }""")
+        await chatgpt.set_composer_text(page, "line one\nline two", timeout_ms=800)
+        assert await page.locator("#prompt-textarea").inner_text() == "line one\nline two"
+        assert await page.evaluate("window.__composerInputs") > 0
+        assert await page.locator("#other-editor").inner_text() == "operator draft"
+        await chatgpt.clear_composer(page, timeout_ms=800)
+        assert (await page.locator("#prompt-textarea").inner_text()).strip() == ""
+        assert await page.locator("#other-editor").inner_text() == "operator draft"
+
+    asyncio.run(_with_page("""
+        <main>
+          <div id="other-editor" role="textbox" contenteditable="true">operator draft</div>
+          <form data-testid="composer">
+            <div id="prompt-textarea" role="textbox" contenteditable="true"></div>
+            <button type="submit" data-testid="send-button">Send</button>
+          </form>
+        </main>
+    """, run))
+
+
+def test_set_composer_text_retries_when_first_native_edit_does_not_stick(monkeypatch):
+    class FlakyPage:
+        def __init__(self):
+            self.calls = 0
+
+        async def evaluate(self, _expression, text):
+            self.calls += 1
+            return {
+                "status": "edited",
+                "text": "" if self.calls == 1 else text,
+            }
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(chatgpt, "action_delay", noop)
+    monkeypatch.setattr(chatgpt, "record_page_action", noop)
+    page = FlakyPage()
+
+    asyncio.run(chatgpt.set_composer_text(page, "prompt", timeout_ms=10))
+
+    assert page.calls == 2
+
+
+def test_set_composer_text_waits_for_transiently_missing_owner(monkeypatch):
+    class LatePage:
+        def __init__(self):
+            self.calls = 0
+
+        async def evaluate(self, _expression, text):
+            self.calls += 1
+            if self.calls == 1:
+                return {"status": "missing", "text": None}
+            return {"status": "edited", "text": text}
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(chatgpt, "action_delay", noop)
+    monkeypatch.setattr(chatgpt, "record_page_action", noop)
+    page = LatePage()
+
+    asyncio.run(chatgpt.set_composer_text(page, "prompt", timeout_ms=200))
+
+    assert page.calls == 2
+
+
+def test_set_composer_text_timeout_identifies_preboundary_substep_without_prompt(monkeypatch):
+    class StalledPage:
+        async def evaluate(self, _expression, _text):
+            await asyncio.sleep(1)
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(chatgpt, "action_delay", noop)
+    monkeypatch.setattr(chatgpt, "record_page_action", noop)
+
+    with pytest.raises(TimeoutError, match="composer_edit") as error:
+        asyncio.run(chatgpt.set_composer_text(StalledPage(), "private prompt", timeout_ms=20))
+    assert "private prompt" not in str(error.value)
 
 
 def test_prepare_prompt_refills_empty_before_send(monkeypatch):
@@ -1176,3 +1364,43 @@ def test_rendered_user_text_match_allows_markdown_backticks_and_show_more_only()
         rendered.replace("Work first.", "Do something else."),
         expected,
     ) is False
+
+
+def test_composer_ambiguity_is_visible_in_both_dom_snapshots_and_blocks_edit(monkeypatch):
+    from test_chatgpt_mcp_permission import _with_page
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(chatgpt, "action_delay", noop)
+    monkeypatch.setattr(chatgpt, "record_page_action", noop)
+
+    async def run(page):
+        full = await chatgpt.inspect_chatgpt_page(page)
+        probe = await chatgpt.inspect_chatgpt_wait_probe(page)
+        assert full.composer_ambiguous is True
+        assert probe.composer_ambiguous is True
+        assert full.composer_owner_source == probe.composer_owner_source == "owned"
+        assert full.composer_present is False
+        assert probe.composer_present is False
+
+        with pytest.raises(
+            chatgpt.ComposerConflictError,
+            match=r"source=owned candidates=2",
+        ):
+            await chatgpt.set_composer_text(
+                page, "must not be written", timeout_ms=500
+            )
+        assert await page.locator("#a").inner_text() == ""
+        assert await page.locator("#b").inner_text() == ""
+
+    asyncio.run(_with_page("""
+        <main>
+          <div data-testid="composer">
+            <div id="a" role="textbox" contenteditable="true"></div>
+          </div>
+          <div data-testid="composer">
+            <div id="b" role="textbox" contenteditable="true"></div>
+          </div>
+        </main>
+    """, run))
