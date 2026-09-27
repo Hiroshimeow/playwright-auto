@@ -19,6 +19,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Sequence
+from urllib.parse import unquote, urlparse
+from uuid import UUID
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -366,6 +368,17 @@ def _recoverable_conversation_identity(value: Any) -> str | None:
     if identity is None or identity.rsplit("/", 1)[-1].startswith("WEB:"):
         return None
     return identity
+
+
+def _provisional_conversation_url(value: Any) -> bool:
+    try:
+        parsed = urlparse(str(value or ""))
+    except ValueError:
+        return False
+    return (parsed.hostname or "").lower() in {"chatgpt.com", "www.chatgpt.com"} and (
+        parsed.path.startswith("/c/")
+        and unquote(parsed.path.rsplit("/", 1)[-1]).lower().startswith("local-chatgpt:")
+    )
 
 
 def _role_ownership_block_code(error: BaseException) -> str | None:
@@ -2547,6 +2560,32 @@ class CDPAWorker:
                 hop.setdefault("wait", {}).pop("ownership_retry_at", None)
             acquired = await actions.locate_owned(state, role)
             temporary = state.get("conversation_mode") == "temporary"
+            receipt_payload = hop.get("receipt")
+            accepted_provisional = (
+                not temporary
+                and isinstance(receipt_payload, Mapping)
+                and _provisional_conversation_url(hop.get("conversation_url"))
+                and not receipt_payload.get("conversation_id")
+            )
+            if accepted_provisional:
+                # The local-chatgpt URL is a live-page hint, not a durable reopen address.
+                # Enrichment checks the exact receipt, page binding and accepted user turn.
+                if acquired is not None:
+                    try:
+                        receipt = SendReceipt.from_dict(receipt_payload)
+                        await self._discover_accepted_conversation_identity(state, hop, actions, receipt)
+                    except GraphIdentityError:
+                        pass
+                if _provisional_conversation_url(hop.get("conversation_url")):
+                    self._block(
+                        state,
+                        "Accepted Send has only a provisional local-chatgpt URL; canonical conversation identity "
+                        "was not proven on the exact owned page. Reopen is unsafe; preserve the accepted "
+                        "request and resolve identity from exact-page evidence or operator review.",
+                        code="accepted_conversation_identity_unresolved", retryable=False,
+                    )
+                    return None
+                expected_conversation = _recoverable_conversation_identity(hop.get("conversation_url"))
             if temporary:
                 token = state["roles"][role].get("temporary_document_id")
                 lost_document = bool(
@@ -6862,10 +6901,16 @@ class CDPAWorker:
                 "accepted conversation identity is unknown because exact local user provenance is absent"
             )
         conversation_id = str(snapshot.session_id or "").strip()
-        if not conversation_id:
+        if not conversation_id or _provisional_conversation_url(snapshot.url):
             raise GraphIdentityError(
                 "accepted conversation identity is unknown because the owned page is not a saved conversation"
             )
+        try:
+            canonical_id = str(UUID(conversation_id))
+        except ValueError as exc:
+            raise GraphIdentityError("accepted conversation has no canonical UUID") from exc
+        if canonical_id != conversation_id or _recoverable_conversation_identity(snapshot.url) != f"/c/{conversation_id}":
+            raise GraphIdentityError("accepted conversation URL does not prove its canonical identity")
         ledger.enrich_receipt_conversation_id(
             request_id,
             accepted_receipt=receipt,
