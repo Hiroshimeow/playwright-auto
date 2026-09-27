@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from playwright_auto.cdpa_actions import AcquiredRole
 from playwright_auto.cdpa_worker import _active_hop
 from playwright_auto.chatgpt import ComposerConflictError, PageOwnershipError
 from test_cdpa_worker import FakeActions, setup_task
@@ -104,3 +106,67 @@ def test_send_boundary_resets_stale_presend_recovery_clock(tmp_path):
     assert "timeout_status_checked" not in hop["wait"]
     assert "timeout_status" not in hop["wait"]
     assert "refresh_ready_at" not in hop["wait"]
+
+
+def test_route_repair_uses_clean_empty_composer_despite_stale_generation_error(tmp_path):
+    _config, _store, state, worker = setup_task(tmp_path)
+    hop = _active_hop(state)
+    hop["kind"] = "route_repair"
+    hop["validation_error"] = "accepted execution produced no terminal result"
+    role = state["roles"]["PLAN"]
+    role["page_id"] = "page-plan"
+    role["page_url"] = "https://chatgpt.com/c/exact"
+    role["conversation_generation"] = 1
+
+    snapshot = SimpleNamespace(
+        composer_present=True,
+        composer_editable=True,
+        composer_text="",
+        composer_empty=True,
+        send_enabled=True,
+        stop_visible=False,
+        manual_input_pending=False,
+        choice_prompt_pending=False,
+        choice_prompt_labels=(),
+        blocking_dialogs=(),
+        attachment_markers=(),
+        error_texts=("ChatGPT stream recovery polling timed out",),
+        retry_visible=True,
+        requires_login=False,
+        state=SimpleNamespace(value="error"),
+        url="https://chatgpt.com/c/exact",
+        page_id="page-plan",
+        page_role=role["physical_role"],
+        page_task_id=state["task_id"],
+        page_team=state["team"],
+    )
+
+    class Client:
+        async def assert_ownership(self):
+            return snapshot
+
+    acquired = AcquiredRole(
+        client=Client(),
+        page_id="page-plan",
+        url=snapshot.url,
+        created=False,
+        new_chat=False,
+    )
+    calls = []
+
+    class Actions(FakeActions):
+        async def locate_owned(self, *_args, **_kwargs):
+            calls.append("locate")
+            return acquired
+
+        async def acquire(self, *_args, **kwargs):
+            calls.append(("acquire", kwargs))
+            raise TimeoutError("ChatGPT tab did not become clean-ready within 15000 ms")
+
+    asyncio.run(worker._pre_send(state, hop, Actions()))
+
+    assert hop["state"] == "sending"
+    assert state["status"] == "RUNNING"
+    assert state["active_action"] == "send"
+    assert state.get("block_code") is None
+    assert calls == ["locate"]

@@ -5633,6 +5633,24 @@ class CDPAWorker:
         role_record.pop("bootstrap_context_recovery", None)
         return acquired
 
+    @staticmethod
+    def _route_repair_stale_error_send_ready(snapshot: Any) -> bool:
+        """Allow a route-only repair after a failed generation when the composer is clean."""
+        page_state = str(
+            getattr(getattr(snapshot, "state", None), "value", getattr(snapshot, "state", "")) or ""
+        ).lower()
+        return bool(
+            page_state == "error"
+            and getattr(snapshot, "composer_present", False)
+            and getattr(snapshot, "composer_editable", False)
+            and not str(getattr(snapshot, "composer_text", "") or "").strip()
+            and not tuple(getattr(snapshot, "attachment_markers", ()) or ())
+            and not getattr(snapshot, "stop_visible", False)
+            and not getattr(snapshot, "manual_input_pending", False)
+            and not getattr(snapshot, "choice_prompt_pending", False)
+            and not tuple(getattr(snapshot, "blocking_dialogs", ()) or ())
+        )
+
     def _handle_pre_send_fresh_chat_timeout(
         self,
         state: dict[str, Any],
@@ -5683,6 +5701,16 @@ class CDPAWorker:
         role = str(hop["target_role"])
         if self._attachment_files_for_generation(state, role) is None:
             return
+        route_repair_owned = None
+        route_repair_stale_error_ready = False
+        if str(hop.get("kind") or "") == "route_repair":
+            route_repair_owned = await actions.locate_owned(state, role)
+            if route_repair_owned is not None:
+                await self._dismiss_known_rate_limit_on_existing(route_repair_owned)
+                route_repair_snapshot = await route_repair_owned.client.assert_ownership()
+                route_repair_stale_error_ready = self._route_repair_stale_error_send_ready(
+                    route_repair_snapshot
+                )
         independent = state.get("independent") if is_independent_task(state) else None
         solo_existing_url = (
             not isinstance(independent, Mapping)
@@ -5691,7 +5719,9 @@ class CDPAWorker:
             and bool(str(hop.get("conversation_url") or "").strip())
             and not bool(state["roles"][role].get("page_id"))
         )
-        if solo_existing_url:
+        if route_repair_stale_error_ready:
+            acquired = route_repair_owned
+        elif solo_existing_url:
             candidate_url = str(hop["conversation_url"])
             owner = self._foreign_durable_conversation_owner(
                 state,
@@ -5906,10 +5936,14 @@ class CDPAWorker:
             hop["branch_conversation_id"] = state["roles"][role]["branch_conversation_id"]
         if state.get("conversation_mode") == "temporary":
             state["roles"][role]["temporary_document_id"] = await self._temporary_document_token(acquired.client, create=True)
-        preparation = await self.role_controller.run(
-            self, state, hop, acquired, actions, phase="pre_send", wait_ms=0,
-        )
-        if solo_existing_url and preparation.reason == "response_in_progress":
+        if route_repair_stale_error_ready:
+            preparation_reason = "ready"
+        else:
+            preparation = await self.role_controller.run(
+                self, state, hop, acquired, actions, phase="pre_send", wait_ms=0,
+            )
+            preparation_reason = preparation.reason
+        if solo_existing_url and preparation_reason == "response_in_progress":
             now = datetime.now(timezone.utc)
             start_wait_budget(
                 hop["wait"],
@@ -5924,10 +5958,10 @@ class CDPAWorker:
             state["kanban_column"] = _column_for(role)
             state["active_action"] = "wait_response"
             return
-        if solo_existing_url and preparation.reason == "ready":
+        if solo_existing_url and preparation_reason == "ready":
             acquired = await actions.acquire(state, role, clean_for_send=True)
             self._record_acquired(state, role, acquired)
-        if preparation.reason != "ready":
+        if preparation_reason != "ready":
             return
         role_record = state["roles"][role]
         generation = int(role_record.get("conversation_generation") or 0)
