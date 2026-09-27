@@ -1565,9 +1565,32 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
           };
           const firstVisible = (selector) => [...document.querySelectorAll(selector)].find(visible) || null;
           const latest = (selector) => [...document.querySelectorAll(selector)].filter(visible).at(-1) || null;
-          const identity = (element) => ({
-            messageId: element?.getAttribute('data-message-id') || null,
-            turnId: element?.closest('[data-turn-id]')?.getAttribute('data-turn-id') || null,
+          const logicalTurnId = (element, role) => {
+            const turnId = element?.closest('[data-turn-id]')?.getAttribute('data-turn-id');
+            if (turnId) return turnId;
+            const groupKey = element?.closest('[data-turn-key]')?.getAttribute('data-turn-key');
+            if (groupKey && role) return `group:${role}:${groupKey}`;
+            return element?.closest('[data-turn-id-container]')
+              ?.getAttribute('data-turn-id-container') || null;
+          };
+          const semanticMessageId = (element, role) => {
+            let owner = element?.closest('[data-chatgpt-search-message-ids]') || null;
+            if (!owner && role) {
+              const turn = element?.closest('[data-turn-key],[data-turn-id],[data-turn-id-container]');
+              const matches = turn ? [...turn.querySelectorAll(
+                '[data-chatgpt-search-unit-key][data-chatgpt-search-message-ids]'
+              )].filter((unit) => String(unit.getAttribute('data-chatgpt-search-unit-key') || '')
+                .endsWith(`:${role}`)) : [];
+              if (matches.length === 1) owner = matches[0];
+            }
+            const values = String(owner?.getAttribute('data-chatgpt-search-message-ids') || '')
+              .trim().split(/\s+/).filter(Boolean);
+            const unique = [...new Set(values)];
+            return unique.length === 1 ? unique[0] : null;
+          };
+          const identity = (element, role) => ({
+            messageId: element?.getAttribute('data-message-id') || semanticMessageId(element, role),
+            turnId: logicalTurnId(element, role),
           });
           const textShape = (element) => {
             const value = (element?.innerText || element?.textContent || '').replace(/\s+/g, ' ').trim();
@@ -1583,10 +1606,12 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
               const element = heading.parentElement;
               const raw = (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
               const body = raw.startsWith(label) ? raw.slice(label.length).trim() : raw;
+              const ordinal = counts[role]++;
               turns.push({
                 role,
                 element,
-                messageId: `DOM:${role}:${counts[role]++}`,
+                messageId: semanticMessageId(element, role) || `DOM:${role}:${ordinal}`,
+                turnId: logicalTurnId(element, role),
                 text: body,
               });
             }
@@ -1607,13 +1632,13 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             .filter(visible);
           const lastAssistant = assistantNodes.filter((element) => textShape(element).length > 0).at(-1)
             || assistantNodes.at(-1) || null;
-          const userIdentity = lastUser ? identity(lastUser) : {
+          const userIdentity = lastUser ? identity(lastUser, 'user') : {
             messageId: semanticUser?.messageId || null,
-            turnId: null,
+            turnId: semanticUser?.turnId || null,
           };
-          const assistantIdentity = lastAssistant ? identity(lastAssistant) : {
+          const assistantIdentity = lastAssistant ? identity(lastAssistant, 'assistant') : {
             messageId: semanticAssistant?.messageId || null,
-            turnId: null,
+            turnId: semanticAssistant?.turnId || null,
           };
           const assistantText = lastAssistant ? boundedText(lastAssistant, 24000) : (semanticAssistant?.text || '');
           const activityText = activeResponse ? boundedText(activeResponse, 24000) : (semanticAssistant?.text || '');
@@ -1737,7 +1762,7 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             assistant_text_tail: assistantShape.tail,
             response_activity_length: activityShape.length,
             response_activity_tail: activityShape.tail,
-            response_activity_turn_id: activeResponse?.closest('[data-turn-id]')?.getAttribute('data-turn-id') || null,
+            response_activity_turn_id: logicalTurnId(activeResponse, 'assistant'),
             last_user_text: lastUser ? boundedText(lastUser, 12000) : (semanticUser?.text || ''),
             assistant_text: assistantText,
             response_activity_text: activityText,
@@ -1999,6 +2024,39 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             return element?.closest('[data-turn-id-container]')
               ?.getAttribute('data-turn-id-container') || null;
           };
+          const semanticMessageId = (element, role) => {
+            let owner = element?.closest('[data-chatgpt-search-message-ids]') || null;
+            if (!owner && role) {
+              const turn = element?.closest('[data-turn-key],[data-turn-id],[data-turn-id-container]');
+              const matches = turn ? [...turn.querySelectorAll(
+                '[data-chatgpt-search-unit-key][data-chatgpt-search-message-ids]'
+              )].filter((unit) => String(unit.getAttribute('data-chatgpt-search-unit-key') || '')
+                .endsWith(`:${role}`)) : [];
+              if (matches.length === 1) owner = matches[0];
+            }
+            const values = String(owner?.getAttribute('data-chatgpt-search-message-ids') || '')
+              .trim().split(/\s+/).filter(Boolean);
+            const unique = [...new Set(values)];
+            return unique.length === 1 ? unique[0] : null;
+          };
+          const completedAriaAction = (value) => {
+            const label = String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            if (label === 'copy') return 'copy';
+            if (label === 'regenerate response') return 'regenerate';
+            if (['rate response', 'good response', 'bad response'].includes(label)) return 'feedback';
+            return '';
+          };
+          const messageActions = (element, scope = element) => {
+            const testIds = [...element.querySelectorAll('button[data-testid]')]
+              .filter(visible)
+              .map((button) => button.dataset.testid)
+              .filter(Boolean);
+            const ariaActions = [...scope.querySelectorAll('button[aria-label]')]
+              .filter(visible)
+              .map((button) => completedAriaAction(button.getAttribute('aria-label')))
+              .filter(Boolean);
+            return [...new Set([...testIds, ...ariaActions])];
+          };
           const logicalTurnIds = new Set();
           for (const turn of chatRoot.querySelectorAll('[data-turn-id]')) {
             const value = turn.getAttribute('data-turn-id');
@@ -2019,10 +2077,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             .map((element) => {
               const role = element.getAttribute('data-message-author-role') || '';
               const turnId = logicalTurnId(element, role);
-              const actions = [...element.querySelectorAll('button[data-testid]')]
-                .filter(visible)
-                .map((button) => button.dataset.testid)
-                .filter(Boolean);
+              const actions = messageActions(element);
               const imageCount = [...element.querySelectorAll('img')].filter(visible).length;
               return {
                 role: element.getAttribute('data-message-author-role') || '',
@@ -2042,18 +2097,18 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             const element = heading.parentElement;
             const rawText = text(element);
             const body = rawText.startsWith(label) ? rawText.slice(label.length).trim() : rawText;
-            const actions = [...element.querySelectorAll('button[data-testid]')]
-              .filter(visible)
-              .map((button) => button.dataset.testid)
-              .filter(Boolean);
+            const actionScope = role === 'assistant'
+              ? (element.closest('[data-turn-key],[data-turn-id],[data-turn-id-container]') || element)
+              : element;
+            const actions = messageActions(element, actionScope);
             const semanticTurnId = logicalTurnId(element, role);
             const semanticOrdinal = semanticCounts[role]++;
             semanticMessages.push({
               role,
-              message_id: `DOM:${role}:${semanticTurnId || semanticOrdinal}`,
+              message_id: semanticMessageId(element, role) || `DOM:${role}:${semanticTurnId || semanticOrdinal}`,
               turn_id: semanticTurnId,
               text: body,
-              actions: [...new Set(actions)],
+              actions,
               image_count: [...element.querySelectorAll('img')].filter(visible).length,
             });
           }

@@ -3,7 +3,15 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from playwright_auto.chatgpt import ChatGPTPage, PageBinding, SendReceipt, MessageBaseline, prompt_digest
+from playwright_auto.chatgpt import (
+    ChatGPTPage,
+    MessageBaseline,
+    PageBinding,
+    SendReceipt,
+    inspect_chatgpt_page,
+    inspect_chatgpt_wait_probe,
+    prompt_digest,
+)
 from playwright_auto.role_runtime import Action, Decision, RoleController
 from test_chatgpt_mcp_permission import _with_page
 from test_operational_contract import snapshot
@@ -31,6 +39,95 @@ def environment(client):
     )
     acquired = SimpleNamespace(client=client, page_id="page-1")
     return state, hop, worker, acquired
+
+
+_MODERN_TURN_KEY = "cc4279e0-b3e3-4145-8001-c3ae0449c0d6"
+_MODERN_ASSISTANT_ID = "aa95fd61-2031-4502-86f4-b1c149bb9cd1"
+
+
+def modern_semantic_dom():
+    return f"""
+        <main>
+          <section data-turn-key="{_MODERN_TURN_KEY}">
+            <div data-chatgpt-search-unit-key="fallback-turn-0:0:user"
+                 data-chatgpt-search-message-ids="{_MODERN_TURN_KEY}"></div>
+            <article><h4>You said:</h4><div>original task</div></article>
+            <article data-chatgpt-search-unit-key="fallback-turn-0:2:assistant"
+                     data-chatgpt-search-message-ids="{_MODERN_ASSISTANT_ID} {_MODERN_ASSISTANT_ID}">
+              <h4>ChatGPT said:</h4><div>{{\"route\":\"DONE\",\"handoff\":\"complete\"}}</div>
+            </article>
+            <div class="turn-action-controls">
+              <button aria-label="Copy" style="width:20px;height:20px"></button>
+              <button aria-label="Rate response" style="width:20px;height:20px"></button>
+              <button aria-label="Regenerate response" style="width:20px;height:20px"></button>
+              <button aria-label="Read aloud" style="width:20px;height:20px"></button>
+              <button aria-label="Arbitrary future action" style="width:20px;height:20px"></button>
+            </div>
+          </section>
+          <div contenteditable="true" role="textbox"></div>
+        </main>
+    """
+
+
+def semantic_request():
+    return SendReceipt(
+        prompt="original task",
+        prompt_sha256=prompt_digest("original task"),
+        binding=PageBinding("page-1", "DEV"),
+        baseline=MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+        attempts=1,
+        accepted_via="exact_user_message",
+        session_id_before=None,
+        user_message_id=_MODERN_TURN_KEY,
+        conversation_id="test",
+    )
+
+
+def test_modern_semantic_dom_preserves_exact_identity_completion_actions_and_sparse_probe():
+    async def run(page):
+        current = await inspect_chatgpt_page(page)
+        assert [(item.role, item.message_id, item.turn_id) for item in current.messages] == [
+            ("user", _MODERN_TURN_KEY, f"group:user:{_MODERN_TURN_KEY}"),
+            ("assistant", _MODERN_ASSISTANT_ID, f"group:assistant:{_MODERN_TURN_KEY}"),
+        ]
+        assistant = current.messages[-1]
+        assert set(assistant.actions) == {"copy", "feedback", "regenerate"}
+
+        probe = await inspect_chatgpt_wait_probe(page)
+        assert probe.last_user_message_id == _MODERN_TURN_KEY
+        assert probe.last_user_turn_id == f"group:user:{_MODERN_TURN_KEY}"
+        assert probe.last_assistant_message_id == _MODERN_ASSISTANT_ID
+        assert probe.last_assistant_turn_id == f"group:assistant:{_MODERN_TURN_KEY}"
+
+    asyncio.run(_with_page(modern_semantic_dom(), run))
+
+
+def test_modern_semantic_bound_dom_terminalizes_despite_stale_listen_streaming():
+    async def run(page):
+        current = await inspect_chatgpt_page(page)
+        wait = {}
+        controller = RoleController()
+        first = controller.decide(
+            current,
+            wait,
+            receipt=semantic_request(),
+            network_status="IS_STREAMING",
+            now=datetime(2026, 9, 28, tzinfo=timezone.utc),
+        )
+        assert first.reason == "result_stability"
+        result = controller.decide(
+            current,
+            wait,
+            receipt=semantic_request(),
+            network_status="IS_STREAMING",
+            now=datetime(2026, 9, 28, 0, 0, 5, tzinfo=timezone.utc),
+        )
+        assert result.action is Action.ACCEPT
+        assert result.reason == "valid_bound_result"
+        assert result.response.message_id == _MODERN_ASSISTANT_ID
+        assert result.response.turn_id == f"group:assistant:{_MODERN_TURN_KEY}"
+
+    asyncio.run(_with_page(modern_semantic_dom(), run))
 
 
 def test_listen_telemetry_emits_once_per_semantic_signal(monkeypatch):
