@@ -4420,8 +4420,6 @@ class CDPAWorker:
                 )
                 preboundary_acquisition_recovery = bool(
                     str(state.get("status") or "").upper() == "BLOCKED"
-                    and str(state.get("block_code") or "")
-                    == "preboundary_acquisition_recovery_required"
                     and str(state.get("active_role") or "").upper() == role
                     and isinstance(hop, Mapping)
                     and str(hop.get("target_role") or "").upper() == role
@@ -4436,6 +4434,14 @@ class CDPAWorker:
                     and _recoverable_conversation_identity(role_record.get("page_url"))
                     is not None
                 )
+                if (
+                    isinstance(preboundary_recovery, Mapping)
+                    and preboundary_recovery.get("phase") == "recovery_required"
+                    and not preboundary_acquisition_recovery
+                ):
+                    raise IneffectiveControlError(
+                        "OPEN_ROLE_TAB pre-Send acquisition provenance is not exact; operational block remains"
+                    )
                 receiptless_observed_recovery = False
                 if blocked_role_recovery:
                     if hop is None or str(hop.get("target_role") or "") != role:
@@ -4518,6 +4524,16 @@ class CDPAWorker:
                     binding = receipt.get("binding") if isinstance(receipt.get("binding"), Mapping) else {}
                     expected_binding_page_id = str(binding.get("page_id") or "").strip() or None
                 elif preboundary_acquisition_recovery:
+                    durable_conversation = _recoverable_conversation_identity(role_record.get("page_url"))
+                    command_conversation = (
+                        _recoverable_conversation_identity(command.snapshot.get("conversation_id"))
+                        if command is not None else None
+                    )
+                    if command_conversation is not None and command_conversation != durable_conversation:
+                        raise IneffectiveControlError(
+                            "OPEN_ROLE_TAB command snapshot conflicts with the durable pre-Send conversation identity"
+                        )
+                    expected_conversation = durable_conversation
                     expected_binding_page_id = str(role_record.get("page_id") or "").strip() or None
 
                 async def acquire_open_tab() -> AcquiredRole:
