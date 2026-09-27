@@ -468,6 +468,77 @@ def receipt_user_message_seen(
     return _receipt_user_index(messages, receipt) is not None
 
 
+def bound_assistant_for_receipt(
+    messages: Sequence[MessageSnapshot],
+    receipt: SendReceipt,
+    *,
+    assistant_message_id: str | None = None,
+    assistant_turn_id: str | None = None,
+) -> tuple[MessageSnapshot | None, str | None]:
+    """Resolve exactly one assistant owned by the accepted receipt user.
+
+    The first assistant after the exact user binds the operation. A later user
+    before that bind is explicit foreign interleaving. Once bound, later turns
+    cannot redirect ownership.
+    """
+    user_message_id = str(receipt.user_message_id or "").strip()
+    user_turn_id = str(receipt.user_turn_id or "").strip()
+    if not user_message_id and not user_turn_id:
+        return None, "legacy_receipt_without_exact_user_identity"
+
+    user_matches = [
+        index
+        for index, message in enumerate(messages)
+        if message.role == "user"
+        and (
+            (user_message_id and message.message_id == user_message_id)
+            or (user_turn_id and message.turn_id == user_turn_id)
+        )
+    ]
+    if len(user_matches) > 1:
+        return None, "duplicate_receipt_user_identity"
+    if not user_matches:
+        return None, None
+
+    bound_message_id = str(assistant_message_id or "").strip()
+    bound_turn_id = str(assistant_turn_id or "").strip()
+    tail = messages[user_matches[0] + 1 :]
+    if bound_message_id or bound_turn_id:
+        matches = [
+            message
+            for message in tail
+            if message.role == "assistant"
+            and (not bound_message_id or message.message_id == bound_message_id)
+            and (not bound_turn_id or message.turn_id == bound_turn_id)
+        ]
+        if len(matches) > 1:
+            return None, "duplicate_bound_assistant_identity"
+        if matches:
+            return matches[0], None
+        incompatible = any(
+            message.role == "assistant"
+            and (
+                (bound_message_id and message.message_id == bound_message_id)
+                or (bound_turn_id and message.turn_id == bound_turn_id)
+            )
+            for message in tail
+        )
+        if incompatible:
+            return None, "incompatible_bound_assistant_identity"
+        return None, None
+
+    for message in tail:
+        if message.role == "user":
+            return None, "foreign_user_before_bound_assistant"
+        if message.role != "assistant":
+            continue
+        identity = message.turn_id or message.message_id
+        if identity in receipt.baseline.assistant_turn_ids:
+            continue
+        return message, None
+    return None, None
+
+
 def all_assistant_turns_for_receipt(
     messages: Sequence[MessageSnapshot], receipt: SendReceipt
 ) -> tuple[MessageSnapshot, ...]:

@@ -147,7 +147,7 @@ def test_send_acceptance_ignores_stale_response_activity_without_current_dom_evi
     assert accepted is None
 
 
-def test_send_acceptance_accepts_markerless_current_stop_button_without_listen(monkeypatch):
+def test_send_acceptance_treats_markerless_stop_as_wake_only(monkeypatch):
     import types
     import playwright_auto.role_runtime.signals as signal_module
 
@@ -177,19 +177,17 @@ def test_send_acceptance_accepts_markerless_current_stop_button_without_listen(m
         client._wait_send_acceptance(
             baseline,
             before,
-            timeout_ms=50,
+            timeout_ms=20,
             expected_prompt="prompt",
         )
     )
 
-    assert accepted == ("stop_button", None)
+    assert accepted is None
     acceptance_events = [
         event for event in events
         if event[0:2] == ("SIGNAL", "send_acceptance")
     ]
-    assert len(acceptance_events) == 1
-    assert acceptance_events[0][2]["values"]["accepted_via"] == "stop_button"
-    assert acceptance_events[0][2]["values"]["authority"] == "dom"
+    assert acceptance_events[-1][2]["values"]["outcome"] == "timeout"
 
 
 def test_send_acceptance_timeout_does_not_inherit_client_timeout(monkeypatch):

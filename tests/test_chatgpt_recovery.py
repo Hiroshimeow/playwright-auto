@@ -305,7 +305,8 @@ def test_send_acceptance_rejects_generic_non_response_dom_change(monkeypatch):
     )
 
 
-def test_send_acceptance_observer_wake_reads_owned_snapshot_immediately(monkeypatch):
+
+def test_send_acceptance_observer_wake_does_not_make_assistant_authoritative(monkeypatch):
     from unittest.mock import AsyncMock
 
     page = SequencePage([
@@ -318,17 +319,14 @@ def test_send_acceptance_observer_wake_reads_owned_snapshot_immediately(monkeypa
     client.wait_for_page_observation = AsyncMock(return_value=True)
 
     result = asyncio.run(
-        client._wait_send_acceptance(receipt().baseline, make_snapshot(), timeout_ms=500)
+        client._wait_send_acceptance(receipt().baseline, make_snapshot(), timeout_ms=20)
     )
 
-    assert result is not None
-    assert result[0] == "assistant_message"
-    client.wait_for_page_observation.assert_awaited_once()
-    assert set(client.wait_for_page_observation.await_args.kwargs) == {"timeout_ms"}
-    assert page.inspect_calls == 1
+    assert result is None
+    assert client.wait_for_page_observation.await_count >= 1
 
 
-def test_send_acceptance_observer_timeout_runs_bounded_fallback_probe(monkeypatch):
+def test_send_acceptance_activity_wake_is_not_acceptance_authority(monkeypatch):
     from unittest.mock import AsyncMock
 
     page = SequencePage([make_snapshot(response_activity_structure="streaming")])
@@ -337,32 +335,24 @@ def test_send_acceptance_observer_timeout_runs_bounded_fallback_probe(monkeypatc
     client.wait_for_page_observation = AsyncMock(return_value=False)
 
     result = asyncio.run(
-        client._wait_send_acceptance(receipt().baseline, make_snapshot(), timeout_ms=500)
+        client._wait_send_acceptance(receipt().baseline, make_snapshot(), timeout_ms=20)
     )
 
-    assert result is not None
-    assert result[0] == "assistant_activity"
-    client.wait_for_page_observation.assert_awaited_once()
-    assert 0 < client.wait_for_page_observation.await_args.kwargs["timeout_ms"] <= 250
-    assert page.inspect_calls == 1
+    assert result is None
+    assert client.wait_for_page_observation.await_count >= 1
 
 
-def test_send_acceptance_accepts_visible_stop_control(monkeypatch):
+def test_send_acceptance_rejects_visible_stop_without_exact_user(monkeypatch):
     baseline = receipt().baseline
     pre_send = make_snapshot()
     page = SequencePage([make_snapshot(stop_visible=True)])
     install_sequence(monkeypatch, page)
 
     result = asyncio.run(
-        bind(page)._wait_send_acceptance(
-            baseline,
-            pre_send,
-            timeout_ms=20,
-        )
+        bind(page)._wait_send_acceptance(baseline, pre_send, timeout_ms=20)
     )
 
-    assert result[0] == "stop_button"
-
+    assert result is None
 
 def test_send_acceptance_rejects_preexisting_stop_control(monkeypatch):
     baseline = receipt().baseline
@@ -381,12 +371,12 @@ def test_send_acceptance_rejects_preexisting_stop_control(monkeypatch):
     assert result is None
 
 
-def test_send_acceptance_accepts_new_response_activity_turn_without_stop(monkeypatch):
+
+def test_send_acceptance_rejects_new_response_activity_without_exact_user(monkeypatch):
     baseline = receipt().baseline
     pre_send = make_snapshot(response_activity_turn_id="old-turn")
     page = SequencePage([
         make_snapshot(
-            stop_visible=False,
             response_activity_turn_id="new-turn",
             response_activity_text="working",
             response_activity_length=7,
@@ -398,18 +388,14 @@ def test_send_acceptance_accepts_new_response_activity_turn_without_stop(monkeyp
         bind(page)._wait_send_acceptance(baseline, pre_send, timeout_ms=20)
     )
 
-    assert result[0] == "response_activity_turn"
+    assert result is None
 
 
-def test_send_acceptance_accepts_new_activity_identity_without_stop(monkeypatch):
+def test_send_acceptance_rejects_new_activity_text_without_exact_user(monkeypatch):
     baseline = receipt().baseline
     pre_send = make_snapshot(response_activity_text="old", response_activity_length=3)
     page = SequencePage([
-        make_snapshot(
-            stop_visible=False,
-            response_activity_text="new output",
-            response_activity_length=10,
-        )
+        make_snapshot(response_activity_text="new output", response_activity_length=10)
     ])
     install_sequence(monkeypatch, page)
 
@@ -417,8 +403,7 @@ def test_send_acceptance_accepts_new_activity_identity_without_stop(monkeypatch)
         bind(page)._wait_send_acceptance(baseline, pre_send, timeout_ms=20)
     )
 
-    assert result[0] == "assistant_activity"
-
+    assert result is None
 
 def test_send_acceptance_rejects_disappearing_stale_activity(monkeypatch):
     baseline = receipt().baseline
@@ -433,19 +418,17 @@ def test_send_acceptance_rejects_disappearing_stale_activity(monkeypatch):
     assert result is None
 
 
-def test_send_acceptance_accepts_streaming_node_state_without_text_or_stop(monkeypatch):
+
+def test_send_acceptance_rejects_streaming_structure_without_exact_user(monkeypatch):
     baseline = receipt().baseline
-    pre_send = make_snapshot()
     page = SequencePage([make_snapshot(response_activity_structure="streaming")])
     install_sequence(monkeypatch, page)
 
     result = asyncio.run(
-        bind(page)._wait_send_acceptance(baseline, pre_send, timeout_ms=20)
+        bind(page)._wait_send_acceptance(baseline, make_snapshot(), timeout_ms=20)
     )
 
-    assert result is not None
-    assert result[0] == "assistant_activity"
-
+    assert result is None
 
 def test_send_acceptance_rejects_listen_streaming_without_dom_pair(monkeypatch):
     baseline = receipt().baseline
@@ -462,34 +445,51 @@ def test_send_acceptance_rejects_listen_streaming_without_dom_pair(monkeypatch):
     assert result is None
 
 
-def test_send_acceptance_accepts_response_dom_without_user_match_or_stop(monkeypatch):
+
+def test_send_acceptance_rejects_response_dom_without_exact_user_match(monkeypatch):
     baseline = receipt().baseline
-    pre_send = make_snapshot()
     page = SequencePage([
-        make_snapshot(
-            stop_visible=False,
-            messages=(
-                MessageSnapshot("user", "u-new", "t-user", "rendered differently", ()),
-                MessageSnapshot("assistant", "DOM:assistant:0", None, "done", ()),
-            ),
-        )
+        make_snapshot(messages=(
+            MessageSnapshot("user", "u-new", "t-user", "rendered differently", ()),
+            MessageSnapshot("assistant", "DOM:assistant:0", None, "done", ()),
+        ))
     ])
     install_sequence(monkeypatch, page)
 
     result = asyncio.run(
         bind(page)._wait_send_acceptance(
             baseline,
-            pre_send,
+            make_snapshot(),
             timeout_ms=20,
             expected_prompt="expected prompt",
         )
     )
 
-    assert result is not None
-    accepted_via, accepted_user = result
-    assert accepted_via == "assistant_activity"
-    assert accepted_user is None
+    assert result is None
 
+
+def test_send_acceptance_accepts_exact_frontend_user_identity(monkeypatch):
+    page = SequencePage([make_snapshot()])
+    install_sequence(monkeypatch, page)
+    client = bind(page)
+
+    async def exercise():
+        future = asyncio.get_running_loop().create_future()
+        future.set_result({
+            "observed_user_message_id": "network-user",
+            "conversation_id": "conversation-id",
+        })
+        client._frontend_identity_task = future
+        return await client._wait_send_acceptance(
+            receipt().baseline,
+            make_snapshot(),
+            timeout_ms=20,
+            expected_prompt="expected prompt",
+        )
+
+    accepted_via, accepted_user = asyncio.run(exercise())
+    assert accepted_via == "user_message_identity"
+    assert accepted_user.message_id == "network-user"
 
 def test_page_health_distinguishes_auth_and_empty_snapshot(monkeypatch):
     auth_page = SequencePage([make_snapshot(requires_login=True)])

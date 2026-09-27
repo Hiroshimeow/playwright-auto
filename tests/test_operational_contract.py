@@ -64,8 +64,11 @@ def test_retry_is_recoverable_not_a_fatal_page_state():
     assert state is not ChatGPTState.ERROR
 
 
-def test_current_operator_continuation_does_not_require_original_user_id():
-    response = MessageSnapshot("assistant", "current-answer", "new-turn", "Current result", ())
+def test_wait_for_response_does_not_admit_operator_continuation_without_receipt_user():
+    response = MessageSnapshot(
+        "assistant", "current-answer", "new-turn", "Current result",
+        ("copy-turn-action-button",),
+    )
     current = snapshot(messages=(
         MessageSnapshot("user", "operator-injection", "operator-turn", "continue", ()),
         response,
@@ -77,10 +80,10 @@ def test_current_operator_continuation_does_not_require_original_user_id():
         return current
 
     client.wait_snapshot = read
-    result = asyncio.run(client.wait_for_response(
-        receipt(), timeout_ms=80, stable_ms=0, poll_ms=1, minimum_samples=1,
-    ))
-    assert result == response
+    with pytest.raises(TimeoutError):
+        asyncio.run(client.wait_for_response(
+            receipt(), timeout_ms=20, stable_ms=0, poll_ms=1, minimum_samples=1,
+        ))
 
 
 def test_retry_snapshot_allows_continuation_but_auth_does_not():

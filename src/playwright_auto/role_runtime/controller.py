@@ -61,8 +61,27 @@ class RoleController:
         listen_pending = False
         dom_pending = False
         if phase == "waiting":
-            # Priority #1: terminal LISTEN response.
-            if network_response is not None:
+            # Exact rendered U->A binding owns the operation. LISTEN is
+            # supplemental and may only update the already-bound assistant.
+            response.observe(ctx, receipt, validate)
+            binding_error = str(wait.get("response_binding_error") or "")
+            if binding_error:
+                return self._remember(ctx, Decision(Action.BLOCK, binding_error))
+            dom_decision = response.handle(ctx)
+            if dom_decision is not None:
+                return self._remember(ctx, dom_decision)
+            dom_pending = bool(
+                ctx.candidate is not None
+                and ctx.validation_error is None
+                and not ctx.candidate_stable
+            )
+
+            bound_message_id = str(wait.get("bound_assistant_message_id") or "").strip()
+            bound_turn_id = str(wait.get("bound_assistant_turn_id") or "").strip()
+            if network_response is not None and (
+                (bound_message_id and getattr(network_response, "message_id", None) == bound_message_id)
+                or (bound_turn_id and getattr(network_response, "turn_id", None) == bound_turn_id)
+            ):
                 response.observe_candidate(ctx, network_response, validate, source="listen")
                 listen_decision = response.handle(ctx)
                 if listen_decision is not None:
@@ -72,17 +91,6 @@ class RoleController:
                     and ctx.validation_error is None
                     and not ctx.candidate_stable
                 )
-
-            # Priority #2: rendered DOM response.
-            response.observe(ctx, getattr(receipt, "baseline", None), validate)
-            dom_decision = response.handle(ctx)
-            if dom_decision is not None:
-                return self._remember(ctx, dom_decision)
-            dom_pending = bool(
-                ctx.candidate is not None
-                and ctx.validation_error is None
-                and not ctx.candidate_stable
-            )
 
             # A complete-looking candidate must remain unchanged for five seconds.
             if listen_pending or dom_pending:

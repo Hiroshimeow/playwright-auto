@@ -433,7 +433,13 @@ def record_cycle(
         _emit_signal(identity, "LISTEN", "network_signal", values=listen_values)
         transcript = signals.listen_transcript()
         if transcript is not None:
-            record_transcript(identity, transcript)
+            bound_message_id = str(wait.get("bound_assistant_message_id") or "").strip()
+            bound_turn_id = str(wait.get("bound_assistant_turn_id") or "").strip()
+            if (
+                (bound_message_id and transcript.get("message_id") == bound_message_id)
+                or (bound_turn_id and transcript.get("turn_id") == bound_turn_id)
+            ):
+                record_transcript(identity, transcript)
 
     current_decision = (
         str(
@@ -446,6 +452,21 @@ def record_cycle(
         ),
         str(getattr(decision, "reason", "") or ""),
     )
+    bound_progress = wait.get("bound_assistant_progress")
+    if isinstance(bound_progress, Mapping):
+        bound_text = str(bound_progress.get("text") or "")
+        record_transcript(
+            identity,
+            {
+                "author": "assistant",
+                "message_id": bound_progress.get("message_id"),
+                "turn_id": bound_progress.get("turn_id"),
+                "text": bound_text,
+                "text_length": len(bound_text),
+                "complete": current_decision[0] == "accept",
+            },
+        )
+
     if previous_decision != current_decision:
         values = signals.debug_values()
         values.update(

@@ -84,8 +84,11 @@ def test_malformed_result_queues_exact_parser_error_with_original_receipt_intact
     state, hop, worker, acquired = environment(Client())
     worker._validate_response_candidate = lambda *_: (_ for _ in ()).throw(ValueError("invalid route: missing handoff"))
     current = snapshot(messages=(
-        MessageSnapshot("user", "operator", "turn-operator", "continue", ()),
-        MessageSnapshot("assistant", "bad", "turn-bad", "not JSON", ()),
+        MessageSnapshot("user", "user-original", "turn-original", "original task", ()),
+        MessageSnapshot(
+            "assistant", "bad", "turn-bad", "not JSON",
+            ("copy-turn-action-button",),
+        ),
     ))
     controller = RoleController()
     asyncio.run(controller.run(worker, state, hop, acquired, None, snapshot=current, wait_ms=0))

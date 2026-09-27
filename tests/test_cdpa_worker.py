@@ -3122,7 +3122,7 @@ def test_normal_wait_routes_valid_local_file_response_without_repair(tmp_path: P
         "a-normal-path-only",
         "ta-normal-path-only",
         json.dumps({"route": "TEST", "handoff": handoff}),
-        (),
+        ("copy-turn-action-button",),
     )
     snapshot = send_snapshot(
         messages=(MessageSnapshot("user", "u1", "t1", receipt.prompt, ()), response),
@@ -3187,7 +3187,7 @@ def test_waiting_requires_valid_route_report_and_two_samples_before_hop_response
         "a-valid",
         "ta-valid",
         '{"route":"TEST","handoff":".plan/alpha/alpha-plan_turn1_task-valid-gate.md"}',
-        (),
+        ("copy-turn-action-button",),
     )
     snapshot = send_snapshot(
         messages=(MessageSnapshot("user", "u1", "t1", receipt.prompt, ()), response),
@@ -3224,7 +3224,7 @@ def test_waiting_requires_valid_route_report_and_two_samples_before_hop_response
     asyncio.run(worker._waiting(state, hop, Actions(), path))
 
     assert hop["wait"]["result_samples"] == 2
-    assert hop["wait"]["controller_reason"] == "valid_current_result"
+    assert hop["wait"]["controller_reason"] == "valid_bound_result"
     assert hop["state"] == "routed"
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).status is RequestStatus.COMPLETED
     assert _active_hop(state)["target_role"] == "TEST"

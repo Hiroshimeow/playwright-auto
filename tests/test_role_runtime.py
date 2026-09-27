@@ -18,8 +18,10 @@ def step(current, wait, seconds=0, **kwargs):
 
 def current_result(text="result", **kwargs):
     return snapshot(messages=(
-        MessageSnapshot("user", "operator-user", "operator-turn", "continue", ()),
-        MessageSnapshot("assistant", "answer", "answer-turn", text, ()),
+        MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
+        MessageSnapshot(
+            "assistant", "answer", "answer-turn", text, ("copy-turn-action-button",)
+        ),
     ), **kwargs)
 
 
@@ -52,7 +54,7 @@ def test_valid_result_wins_over_permission_evidence_after_five_second_stability(
     assert step(current, wait).action is Action.WAIT
     result = step(current, wait, 5)
     assert result.action is Action.ACCEPT
-    assert result.reason == "valid_current_result"
+    assert result.reason == "valid_bound_result"
     assert result.response.text == "result"
 
 
@@ -147,13 +149,18 @@ def test_failed_allow_with_real_dom_permission_waits_until_normal_timeout():
     assert decision.action is Action.REFRESH
 
 
-def test_operator_continuation_accepts_current_result_without_original_user():
-    current = current_result()
+def test_operator_continuation_without_receipt_user_cannot_steal_result():
+    current = snapshot(messages=(
+        MessageSnapshot("user", "operator-user", "operator-turn", "continue", ()),
+        MessageSnapshot(
+            "assistant", "operator-answer", "operator-answer-turn", "result",
+            ("copy-turn-action-button",),
+        ),
+    ))
     wait = {}
     assert step(current, wait).action is Action.WAIT
-    result = step(current, wait, 5)
-    assert result.action is Action.ACCEPT
-    assert result.response.text == "result"
+    assert step(current, wait, 5).action is Action.WAIT
+    assert "bound_assistant_message_id" not in wait
 
 
 def test_valid_result_can_finish_despite_stuck_stop():
@@ -326,12 +333,85 @@ def test_timeout_after_refresh_keeps_waiting_and_rearms_when_stop_and_listener_a
     assert "timeout_status" not in wait
 
 
-def test_latest_injected_user_invalidates_old_candidate_without_identity_error():
+def test_later_human_turns_cannot_redirect_already_bound_assistant():
     current = current_result()
     wait = {}
-    step(current, wait)
-    current = snapshot(messages=(*current.messages, MessageSnapshot("user", "another", "another", "change", ())))
+    assert step(current, wait).action is Action.WAIT
+    assert wait["bound_assistant_message_id"] == "answer"
+    interleaved = snapshot(messages=(
+        *current.messages,
+        MessageSnapshot("user", "another", "another", "change", ()),
+        MessageSnapshot(
+            "assistant", "human-answer", "human-answer-turn", "other result",
+            ("copy-turn-action-button",),
+        ),
+    ))
+    result = step(interleaved, wait, 5)
+    assert result.action is Action.ACCEPT
+    assert result.response.message_id == "answer"
+
+
+def test_foreign_user_before_bound_assistant_blocks_explicitly():
+    current = snapshot(messages=(
+        MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
+        MessageSnapshot("user", "manual-user", "manual-turn", "manual", ()),
+        MessageSnapshot(
+            "assistant", "manual-answer", "manual-answer-turn", "later",
+            ("copy-turn-action-button",),
+        ),
+    ))
+    result = step(current, {})
+    assert result.action is Action.BLOCK
+    assert result.reason == "foreign_user_before_bound_assistant"
+
+
+def test_bound_assistant_remount_same_identity_keeps_binding():
+    wait = {}
+    first = snapshot(messages=(
+        MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
+        MessageSnapshot("assistant", "answer", "answer-turn", "part", ()),
+    ))
+    assert step(first, wait).action is Action.WAIT
+    assert wait["bound_assistant_message_id"] == "answer"
+    remounted = snapshot(messages=(
+        MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
+        MessageSnapshot(
+            "assistant", "answer", "answer-turn", "done",
+            ("copy-turn-action-button",),
+        ),
+    ))
+    assert step(remounted, wait, 1).action is Action.WAIT
+    result = step(remounted, wait, 6)
+    assert result.action is Action.ACCEPT
+    assert result.response.message_id == "answer"
+
+
+def test_duplicate_receipt_user_identity_blocks():
+    current = snapshot(messages=(
+        MessageSnapshot("user", "original-user", "one", "original task", ()),
+        MessageSnapshot("user", "original-user", "two", "original task", ()),
+    ))
+    result = step(current, {})
+    assert result.action is Action.BLOCK
+    assert result.reason == "duplicate_receipt_user_identity"
+
+
+def test_completed_action_is_required_for_bound_terminal_result():
+    wait = {}
+    current = snapshot(messages=(
+        MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
+        MessageSnapshot("assistant", "answer", "answer-turn", "done", ()),
+    ))
+    assert step(current, wait).action is Action.WAIT
     assert step(current, wait, 5).action is Action.WAIT
+    completed = snapshot(messages=(
+        MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
+        MessageSnapshot(
+            "assistant", "answer", "answer-turn", "done",
+            ("copy-turn-action-button",),
+        ),
+    ))
+    assert step(completed, wait, 5).action is Action.ACCEPT
 
 
 def test_history_after_allow_never_refreshes_old_conversation():
@@ -382,8 +462,11 @@ def test_reload_settle_window_is_twenty_seconds():
 
 def test_empty_assistant_placeholder_does_not_hide_completed_result():
     current = snapshot(messages=(
-        MessageSnapshot("user", "operator-user", "operator-turn", "continue", ()),
-        MessageSnapshot("assistant", "answer", "answer-turn", '{"route":"REVIEW"}', ()),
+        MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
+        MessageSnapshot(
+            "assistant", "answer", "answer-turn", '{"route":"REVIEW"}',
+            ("copy-turn-action-button",),
+        ),
         MessageSnapshot("assistant", "placeholder", "answer-turn", "", ()),
     ))
     wait = {}
@@ -393,16 +476,22 @@ def test_empty_assistant_placeholder_does_not_hide_completed_result():
     assert result.response.message_id == "answer"
 
 
-def test_terminal_listen_result_waits_five_seconds_before_accept():
-    current = snapshot()
-    listen = MessageSnapshot("assistant", "answer", "answer-turn", '{"route":"REVIEW"}', ())
+def test_correlated_listen_result_waits_five_seconds_before_accept():
+    current = snapshot(messages=(
+        MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
+        MessageSnapshot("assistant", "answer", "answer-turn", "partial", ()),
+    ))
+    listen = MessageSnapshot(
+        "assistant", "answer", "answer-turn", '{"route":"REVIEW"}',
+        ("copy-turn-action-button",),
+    )
     wait = {}
     first = step(current, wait, network_response=listen)
     assert first.action is Action.WAIT
     assert wait["listen_result_samples"] == 1
     result = step(current, wait, 5, network_response=listen)
     assert result.action is Action.ACCEPT
-    assert result.reason == "valid_current_result"
+    assert result.reason == "valid_bound_result"
 
 
 def test_choice_prompt_waits_instead_of_blocking_task():
@@ -411,17 +500,24 @@ def test_choice_prompt_waits_instead_of_blocking_task():
     assert result.reason == "choice_prompt_wait"
 
 
-def test_terminal_listen_result_wins_before_dialog_and_choice_wait_gates():
+def test_correlated_listen_result_wins_before_dialog_and_choice_wait_gates():
     current = snapshot(
+        messages=(
+            MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
+            MessageSnapshot("assistant", "answer", "answer-turn", "partial", ()),
+        ),
         blocking_dialogs=("Unexpected dialog",),
         choice_prompt_labels=("Continue",),
     )
-    listen = MessageSnapshot("assistant", "answer", "answer-turn", '{"route":"REVIEW"}', ())
+    listen = MessageSnapshot(
+        "assistant", "answer", "answer-turn", '{"route":"REVIEW"}',
+        ("copy-turn-action-button",),
+    )
     wait = {}
     assert step(current, wait, network_response=listen).action is Action.WAIT
     result = step(current, wait, 5, network_response=listen)
     assert result.action is Action.ACCEPT
-    assert result.reason == "valid_current_result"
+    assert result.reason == "valid_bound_result"
 
 
 def test_stale_network_streaming_does_not_block_pre_send():
@@ -437,17 +533,20 @@ def test_stale_network_streaming_does_not_block_pre_send():
     assert result.reason == "ready"
 
 
-def test_listen_response_has_priority_over_dom_response():
+def test_uncorrelated_listen_response_cannot_replace_bound_dom_response():
     dom = current_result('{"route":"DEV"}')
-    listen = MessageSnapshot("assistant", "listen-answer", "listen-turn", '{"route":"REVIEW"}', ())
+    listen = MessageSnapshot(
+        "assistant", "listen-answer", "listen-turn", '{"route":"REVIEW"}',
+        ("copy-turn-action-button",),
+    )
     wait = {}
     assert step(dom, wait, network_response=listen).reason == "result_stability"
     result = step(dom, wait, 5, network_response=listen)
     assert result.action is Action.ACCEPT
-    assert result.response.message_id == "listen-answer"
+    assert result.response.message_id == "answer"
 
 
-def test_dom_response_is_priority_two_when_listen_has_no_response():
+def test_bound_dom_response_finishes_without_listen_response():
     dom = current_result('{"route":"DEV"}')
     wait = {}
     assert step(dom, wait).reason == "result_stability"

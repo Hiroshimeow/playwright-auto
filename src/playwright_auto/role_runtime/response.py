@@ -1,10 +1,11 @@
-"""Current result selection. LISTEN is priority #1; rendered DOM is priority #2."""
+"""Exact accepted-user to assistant binding for current response selection."""
 from __future__ import annotations
 
 import hashlib
 from typing import Any, Callable, Sequence
 
 from ..cdpa_response import parse_time
+from ..chatgpt_models import bound_assistant_for_receipt
 from .model import Action, Context, Decision
 
 
@@ -76,13 +77,21 @@ def observe_candidate(
 
     if ctx.wait.get(key_name) != key:
         if getattr(ctx, "phase", "wait") != "pre_send":
-            ctx.wait["last_assistant_progress"] = {
+            progress = {
                 "source": source,
                 "text": str(candidate.text or "")[:8000],
                 "message_id": getattr(candidate, "message_id", None),
                 "turn_id": getattr(candidate, "turn_id", None),
                 "observed_at": ctx.now.isoformat(),
             }
+            ctx.wait["last_assistant_progress"] = progress
+            if source == "dom" and (
+                (ctx.wait.get("bound_assistant_message_id")
+                 and progress["message_id"] == ctx.wait.get("bound_assistant_message_id"))
+                or (ctx.wait.get("bound_assistant_turn_id")
+                    and progress["turn_id"] == ctx.wait.get("bound_assistant_turn_id"))
+            ):
+                ctx.wait["bound_assistant_progress"] = progress
         ctx.wait[key_name] = key
         ctx.wait[at_name] = ctx.now.isoformat()
         ctx.wait[samples_name] = 1
@@ -100,20 +109,63 @@ def observe_candidate(
     ctx.candidate_stable = stable_for >= ctx.policy.response_stable_seconds
 
 
+def _bound_assistant(ctx: Context, receipt: Any) -> Any | None:
+    messages = tuple(getattr(ctx.snapshot, "messages", ()) or ())
+    if receipt is None:
+        return current_assistant(messages)
+    if not getattr(receipt, "user_message_id", None) and not getattr(receipt, "user_turn_id", None):
+        return current_assistant(messages, getattr(receipt, "baseline", None))
+
+    candidate, error = bound_assistant_for_receipt(
+        messages,
+        receipt,
+        assistant_message_id=ctx.wait.get("bound_assistant_message_id"),
+        assistant_turn_id=ctx.wait.get("bound_assistant_turn_id"),
+    )
+    if error is not None:
+        ctx.wait["response_binding_error"] = error
+        return None
+    ctx.wait.pop("response_binding_error", None)
+    if candidate is None:
+        return None
+    if not ctx.wait.get("bound_assistant_message_id") and not ctx.wait.get("bound_assistant_turn_id"):
+        ctx.wait["bound_assistant_message_id"] = getattr(candidate, "message_id", None)
+        ctx.wait["bound_assistant_turn_id"] = getattr(candidate, "turn_id", None)
+    return candidate
+
+
 def observe(
     ctx: Context,
-    baseline: Any,
+    receipt: Any,
     validate: Callable[[Any], None] | None,
 ) -> None:
     observe_candidate(
         ctx,
-        current_assistant(tuple(getattr(ctx.snapshot, "messages", ())), baseline),
+        _bound_assistant(ctx, receipt),
         validate,
         source="dom",
     )
 
 
 def handle(ctx: Context) -> Decision | None:
-    if ctx.candidate is not None and ctx.candidate_stable and ctx.validation_error is None:
-        return Decision(Action.ACCEPT, "valid_current_result", ctx.candidate)
-    return None
+    candidate = ctx.candidate
+    if candidate is None or not ctx.candidate_stable or ctx.validation_error is not None:
+        return None
+    if not str(getattr(candidate, "text", "") or "").strip() and not getattr(candidate, "image_count", 0):
+        return None
+
+    actions = tuple(getattr(candidate, "actions", ()) or ())
+    completed_action = any(
+        "copy" in str(action).lower()
+        or "feedback" in str(action).lower()
+        or "regenerate" in str(action).lower()
+        for action in actions
+    )
+    bound_turn_id = str(ctx.wait.get("bound_assistant_turn_id") or "").strip()
+    activity_turn_id = str(getattr(ctx.snapshot, "response_activity_turn_id", "") or "").strip()
+    bound_generation_active = bool(
+        bound_turn_id and activity_turn_id and bound_turn_id == activity_turn_id
+    )
+    if bound_generation_active or not completed_action:
+        return None
+    return Decision(Action.ACCEPT, "valid_bound_result", candidate)

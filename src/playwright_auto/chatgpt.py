@@ -64,6 +64,7 @@ from .chatgpt_models import (
     WaitProbe,
     all_assistant_turns_for_receipt,
     assistant_turns_for_receipt,
+    bound_assistant_for_receipt,
     capture_message_baseline,
     capture_response_recovery_baseline,
     classify_chatgpt_state,
@@ -1990,10 +1991,18 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             .slice(0, 12);
 
           const chatRoot = document.querySelector('main') || document.body;
+          const logicalTurnId = (element) => {
+            const owner = element?.closest('[data-turn-id],[data-turn-key],[data-turn-id-container]');
+            if (!owner) return null;
+            return owner.getAttribute('data-turn-id')
+              || owner.getAttribute('data-turn-key')
+              || owner.getAttribute('data-turn-id-container')
+              || null;
+          };
           const legacyMessages = [...chatRoot.querySelectorAll('[data-message-author-role][data-message-id]')]
             .filter(visible)
             .map((element) => {
-              const turn = element.closest('[data-turn-id]');
+              const turnId = logicalTurnId(element);
               const actions = [...element.querySelectorAll('button[data-testid]')]
                 .filter(visible)
                 .map((button) => button.dataset.testid)
@@ -2002,7 +2011,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
               return {
                 role: element.getAttribute('data-message-author-role') || '',
                 message_id: element.getAttribute('data-message-id') || '',
-                turn_id: turn?.getAttribute('data-turn-id') || null,
+                turn_id: turnId,
                 text: text(element),
                 actions: [...new Set(actions)],
                 image_count: imageCount,
@@ -2021,10 +2030,12 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
               .filter(visible)
               .map((button) => button.dataset.testid)
               .filter(Boolean);
+            const semanticTurnId = logicalTurnId(element);
+            const semanticOrdinal = semanticCounts[role]++;
             semanticMessages.push({
               role,
-              message_id: `DOM:${role}:${semanticCounts[role]++}`,
-              turn_id: null,
+              message_id: `DOM:${role}:${semanticTurnId || semanticOrdinal}`,
+              turn_id: semanticTurnId,
               text: body,
               actions: [...new Set(actions)],
               image_count: [...element.querySelectorAll('img')].filter(visible).length,
@@ -2044,9 +2055,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
                 .filter(Boolean)
                 .join('|')
             : (semanticAssistant ? 'semantic-assistant' : '');
-          const responseActivityTurnId = activeResponse
-            ?.closest('[data-turn-id]')
-            ?.getAttribute('data-turn-id') || null;
+          const responseActivityTurnId = logicalTurnId(activeResponse);
 
           const requiresLogin = location.hostname === 'auth.openai.com' || Boolean(login);
           const authCallbackError = location.hostname === 'chatgpt.com' && location.pathname === '/auth/error';
@@ -3873,10 +3882,6 @@ class ChatGPTPage:
         deadline = time.monotonic() + timeout_ms / 1000
         accepted_user: MessageSnapshot | None = None
         last_snapshot = pre_send
-        baseline_activity, _ = response_activity_signature(pre_send, baseline)
-        baseline_activity_turn_id = str(pre_send.response_activity_turn_id or "")
-        baseline_activity_structure = str(pre_send.response_activity_structure or "")
-        baseline_stop_visible = bool(pre_send.stop_visible)
         fallback_probe_ms = 250
 
         def accepted(
@@ -3911,28 +3916,27 @@ class ChatGPTPage:
                 if expected_prompt is None or rendered_user_text_matches(candidate.text, expected_prompt):
                     accepted_user = candidate
                     return accepted("exact_user_message", accepted_user)
-            assistants = new_assistant_turns(snapshot.messages, baseline)
-            if any(
-                message.message_id
-                and not message.message_id.startswith("DOM:")
-                and message.message_id not in baseline.message_ids
-                for message in assistants
-            ):
-                return accepted("assistant_message", accepted_user)
-            activity_turn_id = str(snapshot.response_activity_turn_id or "")
-            if activity_turn_id and activity_turn_id != baseline_activity_turn_id:
-                return accepted("response_activity_turn", accepted_user)
-            activity, activity_length = response_activity_signature(snapshot, baseline)
-            activity_structure = str(snapshot.response_activity_structure or "")
-            if (
-                activity_length > 0 and activity != baseline_activity
-            ) or (
-                activity_structure
-                and activity_structure != baseline_activity_structure
-            ):
-                return accepted("assistant_activity", accepted_user)
-            if snapshot.stop_visible and not baseline_stop_visible:
-                return accepted("stop_button", accepted_user)
+            identity_task = self._frontend_identity_task
+            if identity_task is not None and identity_task.done():
+                try:
+                    identity = identity_task.result()
+                except Exception:
+                    identity = None
+                if isinstance(identity, Mapping):
+                    observed_user_message_id = _safe_identity_string(
+                        identity.get("observed_user_message_id")
+                    )
+                    if observed_user_message_id is not None:
+                        accepted_user = MessageSnapshot(
+                            role="user",
+                            message_id=observed_user_message_id,
+                            turn_id=None,
+                            text=expected_prompt or "",
+                            actions=(),
+                        )
+                        return accepted("user_message_identity", accepted_user)
+            # Assistant/activity/Stop are wake signals only. They do not prove
+            # which user turn this Send created on a long-lived conversation.
 
     async def _prepare_prompt_locked(
         self,
@@ -4472,6 +4476,8 @@ class ChatGPTPage:
         last_snapshot: ChatGPTSnapshot | None = None
         last_error: BaseException | None = None
         unchanged_ticks = 0
+        bound_assistant_turn_id = str(expected_assistant_turn_id or "").strip()
+        bound_assistant_message_id = str(expected_assistant_message_id or "").strip()
 
         while time.monotonic() < deadline:
             try:
@@ -4518,33 +4524,45 @@ class ChatGPTPage:
                 await asyncio.sleep(self._adaptive_wait_seconds(poll_ms, unchanged_ticks))
                 continue
 
-            # A later user turn or an unsent draft does not invalidate the current
-            # conversation result. Original-user identity protects Send receipts only.
-            from .role_runtime.response import current_assistant
-            current = current_assistant(snapshot.messages, receipt.baseline)
-            assistants = (current,) if current is not None else ()
-            expected_turn = str(expected_assistant_turn_id or "").strip()
-            expected_message = str(expected_assistant_message_id or "").strip()
-            if expected_turn or expected_message:
-                exact_assistants = all_assistant_turns_for_receipt(
-                    snapshot.messages, receipt
+            if receipt.user_message_id or receipt.user_turn_id:
+                candidate, binding_error = bound_assistant_for_receipt(
+                    snapshot.messages,
+                    receipt,
+                    assistant_message_id=bound_assistant_message_id or None,
+                    assistant_turn_id=bound_assistant_turn_id or None,
                 )
+                if binding_error is not None:
+                    raise SendRecoveryError(
+                        f"exact response binding failed: {binding_error}"
+                    )
+                if (
+                    candidate is not None
+                    and not bound_assistant_turn_id
+                    and not bound_assistant_message_id
+                ):
+                    bound_assistant_turn_id = str(candidate.turn_id or "")
+                    bound_assistant_message_id = str(candidate.message_id or "")
             else:
-                exact_assistants = assistants
-            if expected_turn:
-                candidate = next(
-                    (item for item in exact_assistants if item.turn_id == expected_turn),
-                    None,
-                )
-            elif expected_message:
-                candidate = next(
-                    (item for item in exact_assistants if item.message_id == expected_message),
-                    None,
-                )
-            else:
-                candidate = assistants[-1] if assistants else None
+                # Legacy receipts predate exact user identity; preserve their old
+                # read path without using it for new accepted operations.
+                from .role_runtime.response import current_assistant
+                candidate = current_assistant(snapshot.messages, receipt.baseline)
+
             current_fingerprint = message_fingerprint(candidate)
-            transport_ui_active = response_transport_ui_active(snapshot)
+            bound_activity = bool(
+                candidate is not None
+                and candidate.turn_id
+                and snapshot.response_activity_turn_id
+                and candidate.turn_id == snapshot.response_activity_turn_id
+            )
+            transport_ui_active = bool(
+                bound_activity
+                or (
+                    candidate is not None
+                    and response_transport_ui_active(snapshot)
+                    and not candidate.actions
+                )
+            )
 
             candidate_present = candidate is not None
             if candidate_present and response_is_stale(candidate, recovery_baseline):
@@ -4597,10 +4615,18 @@ class ChatGPTPage:
                 else:
                     confirmed = candidate_samples >= required_samples
 
+                completed_action = any(
+                    "copy" in str(action).lower()
+                    or "feedback" in str(action).lower()
+                    or "regenerate" in str(action).lower()
+                    for action in candidate.actions
+                )
+                exact_receipt = bool(receipt.user_message_id or receipt.user_turn_id)
                 if (
                     not incomplete
                     and validation_error is None
                     and not transport_ui_active
+                    and (completed_action or not exact_receipt)
                     and time_stable
                     and confirmed
                 ):
