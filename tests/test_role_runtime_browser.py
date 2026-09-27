@@ -67,6 +67,58 @@ def test_listen_telemetry_emits_once_per_semantic_signal(monkeypatch):
     assert listen[-1][2]["values"]["status"] == "COMPLETE"
 
 
+def test_malformed_result_queues_exact_parser_error_with_original_receipt_intact():
+    from playwright_auto.chatgpt import MessageSnapshot
+
+    class Client:
+        async def install_page_observer(self):
+            return None
+
+        def page_observation(self):
+            return {}
+
+    state, hop, worker, acquired = environment(Client())
+    worker._validate_response_candidate = lambda *_: (_ for _ in ()).throw(ValueError("invalid route: missing handoff"))
+    current = snapshot(messages=(
+        MessageSnapshot("user", "operator", "turn-operator", "continue", ()),
+        MessageSnapshot("assistant", "bad", "turn-bad", "not JSON", ()),
+    ))
+    controller = RoleController()
+    asyncio.run(controller.run(worker, state, hop, acquired, None, snapshot=current, wait_ms=0))
+    hop["wait"]["result_seen_at"] = (datetime.now(timezone.utc) - timedelta(seconds=6)).isoformat()
+    result = asyncio.run(controller.run(worker, state, hop, acquired, None, snapshot=current, wait_ms=0))
+    assert result.action is Action.REPAIR
+    assert state["repair"] == "invalid route: missing handoff"
+    assert hop["receipt"] == request().to_dict()
+
+
+def test_no_terminal_result_timeout_does_not_queue_format_route_repair():
+    class Client:
+        async def install_page_observer(self):
+            return None
+
+        def page_observation(self):
+            return {}
+
+    state, hop, worker, acquired = environment(Client())
+    queued = []
+    worker._queue_format_repair = lambda *_: queued.append(True)
+    worker._block = lambda _state, reason, **kwargs: _state.update(block_reason=reason, block_code=kwargs.get("code"))
+    hop["wait"].update(
+        controller_progress_at=(datetime.now(timezone.utc) - timedelta(seconds=601)).isoformat(),
+        timeout_refreshed=True,
+        timeout_status_checked=True,
+        timeout_status="COMPLETE",
+    )
+    result = asyncio.run(RoleController().run(
+        worker, state, hop, acquired, None, snapshot=snapshot(error_texts=("provider failed",)), wait_ms=0,
+    ))
+    assert result.reason == "state_repair"
+    assert queued == []
+    assert state["block_code"] == "response_without_terminal_result"
+    assert hop["receipt"] == request().to_dict()
+
+
 def test_hidden_allow_real_dom_snapshot_reaches_dispatch_after_five_seconds():
     async def run(page):
         client = ChatGPTPage(page, timeout_ms=5_000)
@@ -93,7 +145,7 @@ def test_hidden_allow_real_dom_snapshot_reaches_dispatch_after_five_seconds():
     """, run))
 
 
-def test_retry_repair_goes_through_binding_and_real_send_without_retry_click(monkeypatch):
+def test_no_result_timeout_blocks_without_retry_click_or_new_send(monkeypatch):
     import playwright_auto.chatgpt as module
     async def no_delay(*args, **kwargs):
         return 0
@@ -109,20 +161,16 @@ def test_retry_repair_goes_through_binding_and_real_send_without_retry_click(mon
             timeout_status_checked=True,
             timeout_status="COMPLETE",
         )
+        worker._block = lambda target, reason, **kwargs: target.update(
+            block_reason=reason, block_code=kwargs.get("code")
+        )
         result = await controller.run(worker, state, hop, acquired, None, wait_ms=0)
         assert result.action is Action.REPAIR
-        assert "state_repair" in state["repair"]
-        # Exercise exactly the pre-send binding path that blocked the production repair.
-        await client.prepare_task("task-1")
-        await client.bind_task_identity("task-1", "team-1")
-        result = await controller.run(worker, state, hop, acquired, None, phase="pre_send", wait_ms=0)
-        assert result.reason == "ready"
-        guide = "Continue from this state. Do not repeat prior actions. Return the required route JSON."
-        receipt = await client.send(guide, wait_for_stop=False, max_attempts=1, recovery_reload=False,
-                                    expected_task_id="task-1", expected_team="team-1")
-        assert receipt.user_message_id == "repair-user"
+        assert state["block_code"] == "response_without_terminal_result"
+        assert "repair" not in state
+        assert hop["receipt"] == request().to_dict()
         assert await page.evaluate("window.retryClicks || 0") == 0
-        assert await page.evaluate("window.sentPrompts") == [guide]
+        assert await page.evaluate("window.sentPrompts || []") == []
     asyncio.run(_with_page("""
         <main>
         <div data-message-author-role="user" data-message-id="user-original">original task</div>

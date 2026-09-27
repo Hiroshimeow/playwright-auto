@@ -1860,7 +1860,7 @@ def recent_assistant_turns(
 
 async def clear_composer(page: Any, timeout_ms: int = 5_000) -> None:
     """Clear the ProseMirror composer using the interaction verified on ChatGPT."""
-    composer = page.locator(SELECTORS["composer"]).first
+    composer = page.locator(SELECTORS["composer"] + ":visible").first
     await composer.wait_for(state="visible", timeout=timeout_ms)
     if not (await composer.inner_text()).strip():
         return
@@ -1868,7 +1868,7 @@ async def clear_composer(page: Any, timeout_ms: int = 5_000) -> None:
     await composer.press("Backspace")
     await page.wait_for_function(
         """selector => {
-          const element = document.querySelector(selector);
+          const element = [...document.querySelectorAll(selector)].find(node => node.getClientRects().length);
           return Boolean(element) && !(element.innerText || '').trim();
         }""",
         arg=SELECTORS["composer"],
@@ -1883,13 +1883,13 @@ async def set_composer_text(page: Any, text: str, timeout_ms: int = 5_000) -> No
         action_delay_multiplier("composer_fill"),
     )
     await record_page_action(page, "composer_fill", "start", detail=f"{len(text)} chars")
-    composer = page.locator(SELECTORS["composer"]).first
+    composer = page.locator(SELECTORS["composer"] + ":visible").first
     await composer.wait_for(state="visible", timeout=timeout_ms)
     if text:
         await composer.fill(text)
         await page.wait_for_function(
             """([selector, expected]) => {
-              const element = document.querySelector(selector);
+              const element = [...document.querySelectorAll(selector)].find(node => node.getClientRects().length);
               const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
               return Boolean(element) && normalize(element.innerText) === expected;
             }""",

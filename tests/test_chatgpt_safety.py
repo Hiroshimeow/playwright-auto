@@ -250,6 +250,28 @@ def test_manual_composer_is_not_overwritten(monkeypatch):
         asyncio.run(client.set_text("workflow prompt"))
 
 
+def test_set_composer_text_targets_actionable_composer_not_hidden_duplicate(monkeypatch):
+    from test_chatgpt_mcp_permission import _with_page
+
+    async def no_delay(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(chatgpt, "action_delay", no_delay)
+    monkeypatch.setattr(chatgpt, "record_page_action", no_delay)
+
+    async def run(page):
+        await chatgpt.set_composer_text(page, "new prompt", timeout_ms=300)
+        assert await page.locator("#live-composer").inner_text() == "new prompt"
+        assert await page.locator("#hidden-composer").inner_text() == "hidden draft"
+
+    asyncio.run(_with_page("""
+        <main>
+          <div id="hidden-composer" contenteditable="true" role="textbox" style="display:none">hidden draft</div>
+          <div id="live-composer" contenteditable="true" role="textbox"></div>
+        </main>
+    """, run))
+
+
 def test_prepare_prompt_refills_empty_before_send(monkeypatch):
     page = DummyPage(snapshot())
     client = ChatGPTPage(page)
