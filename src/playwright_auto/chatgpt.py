@@ -45,6 +45,15 @@ SELECTORS = {
     "error_retry": '[data-testid="regenerate-thread-error-button"]',
 }
 
+_COMPOSER_OWNER_SELECTOR = (
+    ':is(div#prompt-textarea[contenteditable="true"][role="textbox"], '
+    '[data-testid="composer"] [contenteditable="true"][role="textbox"])'
+)
+_COMPOSER_FORM_SELECTOR = (
+    ':is(form:has(button[data-testid="send-button"], button[aria-label="Send prompt"]) '
+    '[contenteditable="true"][role="textbox"])'
+)
+
 SHORTCUTS = {
     "send_or_stop": "Enter",
     "toggle_dictation": "Control+Shift+D",
@@ -1858,22 +1867,48 @@ def recent_assistant_turns(
     return tuple(selected)
 
 
-async def clear_composer(page: Any, timeout_ms: int = 5_000) -> None:
-    """Clear the ProseMirror composer using the interaction verified on ChatGPT."""
-    composer = page.locator(SELECTORS["composer"] + ":visible").first
-    await composer.wait_for(state="visible", timeout=timeout_ms)
+async def _owned_composer_locator(page: Any, timeout_ms: int) -> Any:
+    generic = page.locator(SELECTORS["composer"] + ":visible")
+    generic_first = generic.first
+    await generic_first.wait_for(state="visible", timeout=timeout_ms)
+    owned = page.locator(_COMPOSER_OWNER_SELECTOR + ":visible")
+    count = getattr(owned, "count", None)
+    if not callable(count):
+        return generic_first
+    owned_count = await count()
+    if owned_count > 1:
+        raise ComposerConflictError("multiple eligible live composer owners")
+    if owned_count == 1:
+        return owned.first
+    form_owned = page.locator(_COMPOSER_FORM_SELECTOR + ":visible")
+    form_owned_count = await form_owned.count()
+    if form_owned_count > 1:
+        raise ComposerConflictError("multiple eligible live composer owners")
+    if form_owned_count == 1:
+        return form_owned.first
+    generic_count = await generic.count()
+    if generic_count != 1:
+        raise ComposerConflictError("composer ownership is ambiguous")
+    return generic_first
+
+
+async def _assert_composer_text(composer: Any, expected: str) -> None:
+    if not visible_text_matches(await composer.inner_text(), expected):
+        raise RuntimeError("composer text did not match expected value")
+
+
+async def _clear_composer_locator(composer: Any) -> None:
     if not (await composer.inner_text()).strip():
         return
     await composer.press("Control+A")
     await composer.press("Backspace")
-    await page.wait_for_function(
-        """selector => {
-          const element = [...document.querySelectorAll(selector)].find(node => node.getClientRects().length);
-          return Boolean(element) && !(element.innerText || '').trim();
-        }""",
-        arg=SELECTORS["composer"],
-        timeout=timeout_ms,
-    )
+    await _assert_composer_text(composer, "")
+
+
+async def clear_composer(page: Any, timeout_ms: int = 5_000) -> None:
+    """Clear the uniquely owned ProseMirror composer."""
+    composer = await _owned_composer_locator(page, timeout_ms)
+    await _clear_composer_locator(composer)
 
 
 async def set_composer_text(page: Any, text: str, timeout_ms: int = 5_000) -> None:
@@ -1883,31 +1918,39 @@ async def set_composer_text(page: Any, text: str, timeout_ms: int = 5_000) -> No
         action_delay_multiplier("composer_fill"),
     )
     await record_page_action(page, "composer_fill", "start", detail=f"{len(text)} chars")
-    composer = page.locator(SELECTORS["composer"] + ":visible").first
-    await composer.wait_for(state="visible", timeout=timeout_ms)
+    composer = await _owned_composer_locator(page, timeout_ms)
     if text:
         expected = normalize_visible_text(text)
-        async with asyncio.timeout(timeout_ms / 1000):
-            for attempt in range(2):
-                await clear_composer(page, timeout_ms=timeout_ms)
-                await composer.click()
-                await page.keyboard.insert_text(text)
-                try:
-                    await page.wait_for_function(
-                        """([selector, expected]) => {
-                          const element = [...document.querySelectorAll(selector)].find(node => node.getClientRects().length);
-                          const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
-                          return Boolean(element) && normalize(element.innerText) === expected;
-                        }""",
-                        arg=[SELECTORS["composer"], expected],
-                        timeout=min(timeout_ms, 2_000),
-                    )
-                except Exception:
-                    if attempt == 0 and not visible_text_matches(await composer.inner_text(), text):
-                        continue
-                    raise
-                await record_page_action(page, "composer_fill", "complete", detail=f"{len(text)} chars")
-                return
+        substep = "composer_clear"
+        try:
+            async with asyncio.timeout(timeout_ms / 1000):
+                for attempt in range(2):
+                    substep = "composer_clear"
+                    await _clear_composer_locator(composer)
+                    substep = "composer_click"
+                    await composer.click()
+                    evaluate = getattr(composer, "evaluate", None)
+                    if callable(evaluate):
+                        focused = await evaluate(
+                            "element => document.activeElement === element || element.contains(document.activeElement)"
+                        )
+                        if not focused:
+                            if attempt == 0:
+                                continue
+                            raise ComposerConflictError("composer focus was stolen before input")
+                    substep = "composer_insert"
+                    await page.keyboard.insert_text(text)
+                    substep = "composer_readback"
+                    try:
+                        await _assert_composer_text(composer, expected)
+                    except Exception:
+                        if attempt == 0 and not visible_text_matches(await composer.inner_text(), text):
+                            continue
+                        raise
+                    await record_page_action(page, "composer_fill", "complete", detail=f"{len(text)} chars")
+                    return
+        except TimeoutError as exc:
+            raise TimeoutError(f"composer fill timed out at {substep}") from exc
     await clear_composer(page, timeout_ms=timeout_ms)
     await record_page_action(page, "composer_fill", "complete", detail="cleared")
 
@@ -2117,9 +2160,27 @@ async def click_send_button(
           const initialPageStateConflict = validatePageState();
           if (initialPageStateConflict) return initialPageStateConflict;
 
-          const composerSelector = 'div#prompt-textarea, [data-testid="composer"] [contenteditable="true"], form [contenteditable="true"], [contenteditable="true"][role="textbox"]';
-          const findComposer = () => [...document.querySelectorAll(composerSelector)]
-            .find((element) => visible(element) && enabled(element) && editable(element)) || null;
+          const eligibleComposer = (element) =>
+            visible(element) && enabled(element) && editable(element);
+          const findComposer = () => {
+            const owned = [...document.querySelectorAll(
+              'div#prompt-textarea[contenteditable="true"][role="textbox"], [data-testid="composer"] [contenteditable="true"][role="textbox"]'
+            )].filter(eligibleComposer);
+            if (owned.length !== 0) return owned.length === 1 ? owned[0] : null;
+            const formOwned = [...document.querySelectorAll(
+              'form [contenteditable="true"][role="textbox"]'
+            )].filter(eligibleComposer).filter((element) => {
+              const form = element.closest('form');
+              return Boolean(form?.querySelector(
+                'button[data-testid="send-button"], button[aria-label="Send prompt"]'
+              ));
+            });
+            if (formOwned.length !== 0) return formOwned.length === 1 ? formOwned[0] : null;
+            const generic = [...document.querySelectorAll(
+              '[contenteditable="true"][role="textbox"]'
+            )].filter(eligibleComposer);
+            return generic.length === 1 ? generic[0] : null;
+          };
           const composer = findComposer();
           if (!composer || (expectedPrompt !== null && text(composer) !== expectedPrompt)) {
             return {
@@ -2297,10 +2358,9 @@ async def click_send_button(
               actual: attachmentMarkers,
             };
           }
-          const findSendTarget = (scopeRoot) => [...new Set([
-            ...scopeRoot.querySelectorAll('button,[role="button"]'),
-            ...document.querySelectorAll('button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"]')
-          ])].map((button) => {
+          const findSendTarget = (scopeRoot) => [
+            ...scopeRoot.querySelectorAll('button,[role="button"]')
+          ].map((button) => {
             const label = [
               button.innerText || button.textContent || '',
               button.getAttribute('aria-label') || '',
@@ -3165,12 +3225,34 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
           const text = (element) => (element?.innerText || "").replace(/\s+/g, " ").trim();
           const firstVisible = (selector) => [...document.querySelectorAll(selector)].find(visible) || null;
 
-          const composer = firstVisible('[contenteditable="true"][role="textbox"]');
+          const eligibleComposer = (element) => Boolean(
+            visible(element) && element.isContentEditable &&
+            element.getAttribute('aria-disabled') !== 'true'
+          );
+          const resolveComposer = () => {
+            const owned = [...document.querySelectorAll(
+              'div#prompt-textarea[contenteditable="true"][role="textbox"], [data-testid="composer"] [contenteditable="true"][role="textbox"]'
+            )].filter(eligibleComposer);
+            if (owned.length !== 0) return owned.length === 1 ? owned[0] : null;
+            const formOwned = [...document.querySelectorAll(
+              'form [contenteditable="true"][role="textbox"]'
+            )].filter(eligibleComposer).filter((element) => {
+              const form = element.closest('form');
+              return Boolean(form?.querySelector(
+                'button[data-testid="send-button"], button[aria-label="Send prompt"]'
+              ));
+            });
+            if (formOwned.length !== 0) return formOwned.length === 1 ? formOwned[0] : null;
+            const generic = [...document.querySelectorAll(
+              '[contenteditable="true"][role="textbox"]'
+            )].filter(eligibleComposer);
+            return generic.length === 1 ? generic[0] : null;
+          };
+          const composer = resolveComposer();
           const composerRoot = composer?.closest('form') || composer?.closest('[data-testid="composer"]') || document;
-          const sendCandidates = [...new Set([
-            ...composerRoot.querySelectorAll('button,[role="button"]'),
-            ...document.querySelectorAll('button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"]')
-          ])].map((button) => {
+          const sendCandidates = [
+            ...composerRoot.querySelectorAll('button,[role="button"]')
+          ].map((button) => {
             const label = [
               text(button),
               button.getAttribute('aria-label') || '',

@@ -20,6 +20,7 @@ from playwright_auto.cdpa_worker import CDPAWorker
 from playwright_auto.dashboard_api import DashboardAPI
 
 from test_cdpa_core import write_config
+from test_cdpa_worker import FakeActions
 
 
 def make_store(tmp_path: Path) -> tuple[object, TaskStore]:
@@ -291,6 +292,102 @@ def test_solo_invalid_role_route_repairs_same_role(tmp_path: Path):
     assert repair["target_role"] == "AUDIT"
     assert len(state["roles"]) == 1
     assert "PLAN" not in state["roles"]
+
+
+def test_solo_route_repair_prompt_carries_exact_error_and_candidate_without_goal(tmp_path: Path):
+    config, store = make_store(tmp_path)
+    state = store.create_task(
+        "Solo repair proof",
+        task_id="solo-repair-proof",
+        workflow_mode="solo",
+        roles=("DEV",),
+        goal="DO_NOT_REPEAT_SUBSTANTIVE_GOAL",
+        browser_endpoint_id="9222",
+    )
+    worker = CDPAWorker(config, store=store)
+    original = active_hop(state)
+    asyncio.run(worker._pre_send(state, original, FakeActions()))
+    malformed = '{"route":"PAUSE","handoff":"Provider said "unavailable""}'
+    original["state"] = "responded"
+    original["response"] = malformed
+
+    worker._responded(state, original)
+    repair = active_hop(state)
+    assert repair["kind"] == "route_repair"
+    assert repair["target_role"] == "DEV"
+
+    asyncio.run(worker._pre_send(state, repair, FakeActions()))
+
+    assert repair["validation_error"] in repair["prompt"]
+    assert json.dumps(malformed) in repair["prompt"]
+    assert "DO_NOT_REPEAT_SUBSTANTIVE_GOAL" not in repair["prompt"]
+    assert repair["expected_report_path"] is None
+    assert "correct only" in repair["prompt"].lower()
+    assert '"route":"DONE"' in repair["prompt"]
+    assert '"route":"PAUSE"' in repair["prompt"]
+
+
+def test_solo_route_repair_actual_send_persists_exact_repair_prompt_once(tmp_path: Path):
+    config, store = make_store(tmp_path)
+    state = store.create_task(
+        "Solo repair send",
+        requested_team="solo-repair-send",
+        task_id="solo-repair-send",
+        workflow_mode="solo",
+        roles=("PLAN",),
+        goal="DO_NOT_REPEAT_SUBSTANTIVE_GOAL",
+        browser_endpoint_id="9222",
+    )
+    worker = CDPAWorker(config, store=store)
+    original = active_hop(state)
+    asyncio.run(worker._pre_send(state, original, FakeActions()))
+    malformed = '{"route":"PAUSE","handoff":"Provider said "unavailable""}'
+    original["state"] = "responded"
+    original["response"] = malformed
+    worker._responded(state, original)
+    repair = active_hop(state)
+    asyncio.run(worker._pre_send(state, repair, FakeActions()))
+
+    from test_cdpa_worker import RecordingCDPASendActions, RecordingCDPASendClient
+    from playwright_auto.durable import RequestLedger, RequestStatus
+
+    client = RecordingCDPASendClient(task_id=state["task_id"], team=state["team"])
+    actions = RecordingCDPASendActions(client)
+    asyncio.run(worker._sending(state, repair, actions))
+
+    record = RequestLedger(repair["ledger_path"]).get(repair["request_id"])
+    assert client.send_calls == [repair["prompt"]]
+    assert record is not None
+    assert record.status is RequestStatus.SENT
+    assert record.attempts == 1
+    assert record.rendered_prompt == repair["prompt"]
+    assert "DO_NOT_REPEAT_SUBSTANTIVE_GOAL" not in record.rendered_prompt
+
+
+def test_solo_repeated_invalid_repairs_are_bounded(tmp_path: Path):
+    config, store = make_store(tmp_path)
+    state = store.create_task(
+        "Solo bounded repair",
+        task_id="solo-bounded-repair",
+        workflow_mode="solo",
+        roles=("DEV",),
+        browser_endpoint_id="9222",
+    )
+    worker = CDPAWorker(config, store=store)
+
+    for _ in range(config.route_repair_attempts + 1):
+        hop = active_hop(state)
+        hop["state"] = "responded"
+        hop["response"] = "not json"
+        worker._responded(state, hop)
+        if state["status"] == "BLOCKED":
+            break
+
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "route_validation_exhausted"
+    assert state["block_retryable"] is True
+    assert len(state["hops"]) == config.route_repair_attempts + 1
+    assert active_hop(state)["repair_attempt"] == config.route_repair_attempts
 
 
 def test_dashboard_api_normalizes_solo_to_existing_role_and_hard_endpoint(

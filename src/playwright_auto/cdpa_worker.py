@@ -5978,12 +5978,32 @@ class CDPAWorker:
                 str(hop.get("kind") or "") != "task"
                 or bool(str(hop.get("conversation_url") or "").strip())
             )
+            repair_error = None
+            repair_candidate = None
+            if str(hop.get("kind") or "") == "route_repair":
+                repair_error = str(hop.get("validation_error") or "").strip() or None
+                parent_hop_id = hop.get("parent_hop_id")
+                parent_hop = next(
+                    (
+                        item
+                        for item in state.get("hops") or ()
+                        if isinstance(item, Mapping)
+                        and item.get("hop_id") == parent_hop_id
+                    ),
+                    None,
+                )
+                if isinstance(parent_hop, Mapping):
+                    repair_candidate = sanitize_text(
+                        parent_hop.get("response") or "", max_chars=4000
+                    )
             built = self.prompts.build_solo(
                 task_name=str(state.get("task_title") or state["task_text"]).splitlines()[0],
                 logical_role=role,
                 goal=task_goal_for_hop(state, int(hop["hop_id"])),
                 workspace=str(state["repository"]),
                 continuation=continuation,
+                repair_error=repair_error,
+                repair_candidate=repair_candidate,
             )
             prompt = built.text
             hop["prompt"] = prompt

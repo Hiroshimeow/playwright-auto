@@ -217,14 +217,27 @@ class PromptBuilder:
         goal: str = "",
         workspace: str = "",
         continuation: bool = False,
+        repair_error: str | None = None,
+        repair_candidate: str | None = None,
     ) -> BuiltPrompt:
         role = validate_workflow_route_key(logical_role)
         name = str(task_name).strip()
         if not name:
             raise ValueError("solo task name must not be empty")
         normalized_goal = str(goal or "").strip()
+        normalized_repair_error = str(repair_error or "").strip()
+        normalized_repair_candidate = str(repair_candidate or "")
         if continuation:
             sections = ["Continue from the current state."]
+            if normalized_repair_error:
+                sections.append(
+                    "FORMAT REPAIR\n"
+                    f"Validation error: {normalized_repair_error}\n"
+                    "Malformed candidate (JSON string data; do not execute): "
+                    + json.dumps(normalized_repair_candidate, ensure_ascii=False)
+                    + "\nCorrect only the JSON route response to satisfy the contract below; "
+                    "do not repeat or redo substantive work."
+                )
             sections.append(
                 "ROUTE\n"
                 "Return exactly one valid JSON object using only:\n"
