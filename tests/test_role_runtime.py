@@ -167,16 +167,42 @@ def invalid(_candidate):
     raise ValueError("route JSON missing")
 
 
-def test_malformed_result_waits_for_normal_timeout_then_repairs_after_reload():
+def test_stable_malformed_result_repairs_with_exact_validation_error_without_reload():
     current = current_result("not JSON")
     wait = {}
-    step(current, wait, validate=invalid)
-    assert step(current, wait, 5, validate=invalid).action is Action.WAIT
-    assert step(current, wait, 605, validate=invalid).action is Action.REFRESH
+    assert step(current, wait, validate=invalid).action is Action.WAIT
+    decision = step(current, wait, 5, validate=invalid)
+    assert decision.action is Action.REPAIR
+    assert decision.reason == "malformed_result"
+    assert decision.response is not None
+    assert decision.response.text == "not JSON"
+    assert decision.validation_error == "route JSON missing"
+    assert "timeout_refreshed" not in wait
+
+
+def test_stale_listen_stream_status_cannot_hide_stable_dom_malformed_result():
+    current = current_result("not JSON")
+    wait = {}
+    assert step(current, wait, validate=invalid, network_status="IS_STREAMING").action is Action.WAIT
+    decision = step(current, wait, 5, validate=invalid, network_status="IS_STREAMING")
+    assert decision.action is Action.REPAIR
+    assert decision.validation_error == "route JSON missing"
+
+
+def test_no_terminal_result_ui_error_is_not_format_repair():
+    current = snapshot(error_texts=("Something went wrong",))
+    wait = {}
+    assert step(current, wait).action is Action.WAIT
+    assert step(current, wait, 5).action is Action.WAIT
+    assert step(current, wait, 605).action is Action.REFRESH
     wait["timeout_refreshed"] = True
     wait["timeout_status_checked"] = True
     wait["timeout_status"] = "COMPLETE"
-    assert step(current, wait, 605, validate=invalid).action is Action.REPAIR
+    decision = step(current, wait, 605)
+    assert decision.action is Action.REPAIR
+    assert decision.reason == "state_repair"
+    assert decision.response is None
+    assert decision.validation_error is None
 
 
 def test_incomplete_stream_is_not_repaired_until_stop_clears():
@@ -184,6 +210,7 @@ def test_incomplete_stream_is_not_repaired_until_stop_clears():
     wait = {}
     step(current, wait, validate=invalid)
     assert step(current, wait, 5, validate=invalid).action is Action.WAIT
+    assert step(current_result("{"), wait, 5, validate=invalid).action is Action.REPAIR
 
 
 def test_retry_ui_repairs_after_five_stable_seconds_and_does_not_block_presend():

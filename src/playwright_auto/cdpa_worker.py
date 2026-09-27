@@ -5557,7 +5557,8 @@ class CDPAWorker:
         owned = await actions.locate_owned(state, role)
         if owned is not None:
             await self._dismiss_known_rate_limit_on_existing(owned)
-            role_record["context_source"] = "fresh"
+            if not is_independent_task(state):
+                role_record["context_source"] = "fresh"
             role_record.pop("bootstrap_source_donor", None)
             role_record.pop("bootstrap_context_recovery", None)
             return owned
@@ -5571,7 +5572,8 @@ class CDPAWorker:
             url="https://chatgpt.com/",
             clean_for_send=True,
         )
-        role_record["context_source"] = "fresh"
+        if not is_independent_task(state):
+            role_record["context_source"] = "fresh"
         role_record.pop("bootstrap_source_donor", None)
         role_record.pop("bootstrap_context_recovery", None)
         return acquired

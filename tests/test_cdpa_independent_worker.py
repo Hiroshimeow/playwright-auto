@@ -79,6 +79,18 @@ def setup_agent(tmp_path: Path):
     return config, store, blocked, claimed, CDPAWorker(config, store=store)
 
 
+def test_persistent_independent_fresh_chat_keeps_validator_context_source_unset(tmp_path: Path):
+    _config, store, _blocked, state, worker = setup_agent(tmp_path)
+    hop = _active_hop(state)
+    assert state.get("context_policy") != "fresh"
+
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+
+    assert hop["state"] == "sending"
+    assert state["roles"]["AGENT"].get("context_source") is None
+    assert store._manifest_value_error(state["manifest_path"], state) is None
+
+
 def test_temporary_independent_pre_send_opens_exact_fresh_url_and_ignores_saved_chat(tmp_path: Path):
     _config, _store, _blocked, state, worker = setup_agent(tmp_path)
     state["independent"]["temporary_chat"] = True

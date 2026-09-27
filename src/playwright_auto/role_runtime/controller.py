@@ -101,11 +101,20 @@ class RoleController:
             else:
                 wait.pop("retry_seen_at", None)
 
-        if (
-            ctx.candidate is not None
-            and ctx.validation_error is None
-            and not ctx.candidate_stable
-        ):
+        if ctx.candidate is not None and ctx.validation_error is not None:
+            # A cached LISTEN stream status can outlive the rendered response.
+            # Only current-page activity prevents repairing a stable DOM candidate.
+            page_state = getattr(snapshot, "state", None)
+            if (
+                bool(getattr(snapshot, "stop_visible", False))
+                or str(getattr(page_state, "value", page_state) or "").lower() == "responding"
+                or not ctx.candidate_stable
+            ):
+                return self._remember(ctx, Decision(Action.WAIT, "malformed_result_stability"))
+            return self._remember(ctx, Decision(
+                Action.REPAIR, "malformed_result", ctx.candidate, ctx.validation_error,
+            ))
+        if ctx.candidate is not None and not ctx.candidate_stable:
             return self._remember(ctx, Decision(Action.WAIT, "result_stability"))
 
         permission_decision = allow.handle(ctx)
@@ -303,8 +312,19 @@ class RoleController:
             wait["timeout_status_checked"] = True
             wait["timeout_status"] = await worker._one_shot_stream_status(actions, receipt) if receipt else None
             return decision
+        if decision.action is Action.REPAIR and decision.reason != "malformed_result":
+            worker._block(
+                state,
+                "Accepted execution has no terminal result; exact response recovery is required before format repair.",
+                code="response_without_terminal_result",
+                retryable=False,
+            )
+            return decision
         if decision.action is Action.REPAIR:
-            worker._queue_format_repair(state, hop, decision.response, RouteContractError(decision.reason))
+            worker._queue_format_repair(
+                state, hop, decision.response,
+                RouteContractError(decision.validation_error or decision.reason),
+            )
             return decision
         if decision.action is Action.ACCEPT:
             if receipt is not None:

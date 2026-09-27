@@ -23,6 +23,7 @@ class Decision:
     action: Action
     reason: str
     response: Any = None
+    validation_error: str | None = None
 
 
 @dataclass(frozen=True)
