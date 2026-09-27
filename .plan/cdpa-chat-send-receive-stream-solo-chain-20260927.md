@@ -1,4 +1,4 @@
-﻿# CDPA Feature Plan â€” Exact Send / Bound Response / Scoped Stream
+# CDPA Feature Plan — Exact Send / Bound Response / Scoped Stream
 
 Date: 2026-09-27
 Repository: `E:\git-project\playwright-auto-multicdp`
@@ -10,7 +10,7 @@ This is a new feature slice. The plan/review checkpoint must be committed before
 
 ## Mandatory Solo-chain contract
 
-Báº®T BUá»˜C má»i Solo agent trong chuá»—i nÃ y pháº£i tá»± spawn Solo task role tiáº¿p theo trÆ°á»›c khi káº¿t thÃºc, vÃ  tiáº¿p tá»¥c chuá»—i Solo REVIEW/DEV/TEST cho Ä‘áº¿n khi cÃ´ng viá»‡c thá»±c sá»± hoÃ n thÃ nh vÃ  cÃ³ báº±ng chá»©ng Ä‘á»™c láº­p. KhÃ´ng dÃ¹ng Team Task vÃ  khÃ´ng dá»±a vÃ o route worker Ä‘á»ƒ chuyá»ƒn role.
+BẮT BUỘC mọi Solo agent trong chuỗi này phải tự spawn Solo task role tiếp theo trước khi kết thúc, và tiếp tục chuỗi Solo REVIEW/DEV/TEST cho đến khi công việc thực sự hoàn thành và có bằng chứng độc lập. Không dùng Team Task và không dựa vào route worker để chuyển role.
 
 The chain is sequential. Each agent spawns exactly one next Solo role unless it is the final independent closure REVIEW and all acceptance evidence is complete.
 
@@ -41,7 +41,7 @@ Therefore:
 
 1. `ChatGPTPage._wait_send_acceptance()` currently accepts `assistant_message`, `response_activity_turn`, `assistant_activity`, and Stop transition without exact automation-user identity. Those are progress signals, not exact Send identity.
 2. `wait_for_response()` defaults to `role_runtime.response.current_assistant()`, which deliberately selects the newest assistant after the newest rendered user. That contradicts this feature's long-lived/manual-interleaving requirement.
-3. `all_assistant_turns_for_receipt()` includes assistants after later user turns; it is not an exact Uâ†’A binding primitive.
+3. `all_assistant_turns_for_receipt()` includes assistants after later user turns; it is not an exact U→A binding primitive.
 4. Live transcript projection in `role_runtime.signals` is based on latest probe/LISTEN state and is not tied to one receipt-bound assistant.
 5. The existing frontend observer already extracts the exact user message ID from `POST /backend-api/f/conversation`. Reuse that owner; do not add another request-identity subsystem.
 6. Existing durable Send handling already fails closed after a possibly-dispatched click. A new `NOT_DISPATCHED/DISPATCHED/ACCEPTED` durable state machine would duplicate the ledger and is rejected.
@@ -51,7 +51,7 @@ Therefore:
 
 From `docs/architecture.md`, `src/chatgpt-session.ts`, and `browser-worker.ts`:
 - baseline logical turn identity rather than display index;
-- include persistent turn containers/group keys so virtualization/remount does not create false â€œnewâ€ turns;
+- include persistent turn containers/group keys so virtualization/remount does not create false “new” turns;
 - exact assistant-turn binding followed by scoped observation of that bound turn;
 - fail explicitly on duplicate/missing logical identities or foreign user-turn interference;
 - terminal evidence from the bound response DOM: response exists, generation no longer running, usable content exists, completed-turn action exists, then content remains stable for the existing settle interval;
@@ -60,14 +60,14 @@ From `docs/architecture.md`, `src/chatgpt-session.ts`, and `browser-worker.ts`:
 ### Reference assumptions that do NOT fit CDPA
 
 Do not copy:
-- â€œone new turn since baseline is oursâ€ as a sufficient rule; the human can race a manual Send on the same long-lived role URL;
+- “one new turn since baseline is ours” as a sufficient rule; the human can race a manual Send on the same long-lived role URL;
 - retained WebContentsView/launcher lease assumptions that exclude unrelated manual conversation activity;
 - MCP tool-batch fences, external-progress completion fencing, Codex-specific trace/Markdown serializers, or the large completion/DOM-health class stack;
 - a separate response reader or a second orchestration state machine.
 
 ## Smallest safe implementation
 
-### 1. Exact Send confirmation â€” reuse existing ledger and frontend identity
+### 1. Exact Send confirmation — reuse existing ledger and frontend identity
 
 Do not add durable Send states.
 
@@ -116,7 +116,7 @@ Extend the existing sparse/full wait observation only as much as needed to:
 - expose one completed-turn action boolean if the current `MessageSnapshot.actions` cannot already prove it;
 - detect duplicate/missing exact turn structure.
 
-MutationObserver remains the wake source. Existing bounded fallback observation remains the resilience path. No new 200â€“300 ms semantic poll loop.
+MutationObserver remains the wake source. Existing bounded fallback observation remains the resilience path. No new 200–300 ms semantic poll loop.
 
 ### 4. Streaming and terminal authority use the same bound turn
 
@@ -142,7 +142,7 @@ Do not introduce a new completion class unless the existing wait-state fields ca
 On reload/remount:
 - reconcile by exact persisted user/assistant logical identity;
 - persistent container/group identity may remount without changing ownership;
-- missing identity is â€œnot currently renderedâ€ until bounded reconciliation proves absence;
+- missing identity is “not currently rendered” until bounded reconciliation proves absence;
 - duplicate exact identities, incompatible replacement, or foreign user interleaving before bind fail explicitly;
 - no drift path authorizes Send replay.
 
@@ -153,7 +153,7 @@ Keep the regression set compact but cover every invariant:
 1. old conversation + manual history before Send does not affect new Send identity;
 2. exact outgoing user ID is accepted; broad assistant/activity/Stop alone is insufficient;
 3. click/acceptance ambiguity never causes a second click;
-4. exact Uâ†’A normal binding;
+4. exact U→A normal binding;
 5. human U appears before automation A: explicit interruption, no later-assistant theft;
 6. human U/A after A is already bound: bound A remains owned;
 7. bound assistant remounts with same logical identity: tracking continues;

@@ -1,4 +1,4 @@
-﻿# REVIEW report â€” CDPA Send / Receive / Stream feature plan
+# REVIEW report — CDPA Send / Receive / Stream feature plan
 
 Task: `cdpa-idem-bbb63a71b92e95ad0b221bc4`
 Team: `cdpa-chat-sendrecv-stream-plan-review-20260927`
@@ -33,7 +33,7 @@ Reference repo:
 2. Current `_wait_send_acceptance()` emits broad acceptance from assistant/activity/Stop signals. These signals prove progress but not the exact automation user turn.
 3. CDPA already observes the exact outgoing `user_message_id` from `POST /backend-api/f/conversation`. The feature should promote/reuse that existing identity path rather than invent another tracker.
 4. Current `wait_for_response()` defaults to `current_assistant()`, which selects the assistant after the newest rendered user. That is incompatible with long-lived role URLs when a human chats manually after or during automation.
-5. `all_assistant_turns_for_receipt()` can cross later user turns and therefore is not a strict Uâ†’A binding primitive.
+5. `all_assistant_turns_for_receipt()` can cross later user turns and therefore is not a strict U→A binding primitive.
 6. Live transcript and LISTEN acceptance are currently latest/global oriented rather than receipt-bound.
 7. Reference repo mechanisms worth adopting: logical turn identities, persistent turn containers/group keys across virtualization, bind-once assistant ownership, bound-turn scoped DOM reads, explicit DOM-drift failure, completion action + no generation + stable content.
 8. Reference assumptions that do not fit: one-new-turn-since-baseline alone, retained isolated WebContents assumptions, Codex MCP tool-batch fences, trace/Markdown serialization stack, and its larger completion-health class hierarchy.
@@ -68,8 +68,18 @@ Revised plan:
 
 ## Solo-chain requirement
 
-Báº®T BUá»˜C má»i Solo agent trong chuá»—i nÃ y pháº£i tá»± spawn Solo task role tiáº¿p theo trÆ°á»›c khi káº¿t thÃºc, vÃ  tiáº¿p tá»¥c chuá»—i Solo REVIEW/DEV/TEST cho Ä‘áº¿n khi cÃ´ng viá»‡c thá»±c sá»± hoÃ n thÃ nh vÃ  cÃ³ báº±ng chá»©ng Ä‘á»™c láº­p. KhÃ´ng dÃ¹ng Team Task vÃ  khÃ´ng dá»±a vÃ o route worker Ä‘á»ƒ chuyá»ƒn role.
+BẮT BUỘC mọi Solo agent trong chuỗi này phải tự spawn Solo task role tiếp theo trước khi kết thúc, và tiếp tục chuỗi Solo REVIEW/DEV/TEST cho đến khi công việc thực sự hoàn thành và có bằng chứng độc lập. Không dùng Team Task và không dựa vào route worker để chuyển role.
 
 ## Child DEV
 
-Pending creation after this report and revised plan are checkpoint-committed. The child must be Solo DEV on endpoint 9202, implement the smallest complete safe slice, verify and commit task-owned changes, then spawn exactly one Solo REVIEW before it exits.
+Created and confirmed by the local API:
+- task_id: `cdpa-idem-5eacc0a62cb909cae874f34d`
+- team: `cdpa-chat-sendrecv-stream-dev-20260927`
+- role: `DEV`
+- workflow: Solo
+- endpoint: 9202 / `56b44af5-6790-430f-afe3-4f78766d58be`
+- plan/review checkpoint: `715d96955b0fd227298435dcfc290fe24d9c8023`
+
+Creation command reached API state `applied`, and the task projection showed RUNNING on the requested endpoint.
+
+Recovery note: an idempotency-confirmation mistake caused hop 1 to receive the placeholder goal `test`. Because that Send was already accepted, it was not replayed or overwritten. The same task now has a durable goal revision applying from hop 2 with the full implementation goal, including the plan/report/checkpoint, g6/9202/no-push/no-g8 constraints, preservation of unrelated dirty work, required implementation/verification/commit work, and the mandatory self-propagating Solo-chain sentence. A Resume/reconcile control was queued/applied for the accepted hop rather than creating a second DEV task. Exactly one child Solo DEV was created.
