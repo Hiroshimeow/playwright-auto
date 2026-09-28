@@ -4647,16 +4647,23 @@ class ChatGPTPage:
                     receipt,
                     assistant_message_id=bound_assistant_message_id or None,
                     assistant_turn_id=bound_assistant_turn_id or None,
+                    allow_user_steering=True,
                 )
                 if binding_error is not None:
                     raise SendRecoveryError(
                         f"exact response binding failed: {binding_error}"
                     )
-                if (
-                    candidate is not None
-                    and not bound_assistant_turn_id
-                    and not bound_assistant_message_id
-                ):
+                if candidate is not None:
+                    old_bound_identity = bound_assistant_turn_id or bound_assistant_message_id
+                    new_bound_identity = str(candidate.turn_id or candidate.message_id or "")
+                    if (
+                        old_bound_identity
+                        and new_bound_identity
+                        and old_bound_identity != new_bound_identity
+                    ):
+                        candidate_fingerprint = ""
+                        candidate_since = None
+                        candidate_samples = 0
                     bound_assistant_turn_id = str(candidate.turn_id or "")
                     bound_assistant_message_id = str(candidate.message_id or "")
             else:

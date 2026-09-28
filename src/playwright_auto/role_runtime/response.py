@@ -121,6 +121,7 @@ def _bound_assistant(ctx: Context, receipt: Any) -> Any | None:
         receipt,
         assistant_message_id=ctx.wait.get("bound_assistant_message_id"),
         assistant_turn_id=ctx.wait.get("bound_assistant_turn_id"),
+        allow_user_steering=True,
     )
     if error is not None:
         ctx.wait["response_binding_error"] = error
@@ -128,9 +129,31 @@ def _bound_assistant(ctx: Context, receipt: Any) -> Any | None:
     ctx.wait.pop("response_binding_error", None)
     if candidate is None:
         return None
-    if not ctx.wait.get("bound_assistant_message_id") and not ctx.wait.get("bound_assistant_turn_id"):
-        ctx.wait["bound_assistant_message_id"] = getattr(candidate, "message_id", None)
-        ctx.wait["bound_assistant_turn_id"] = getattr(candidate, "turn_id", None)
+    old_identity = str(
+        ctx.wait.get("bound_assistant_turn_id")
+        or ctx.wait.get("bound_assistant_message_id")
+        or ""
+    ).strip()
+    new_identity = str(
+        getattr(candidate, "turn_id", None)
+        or getattr(candidate, "message_id", None)
+        or ""
+    ).strip()
+    if old_identity and new_identity and old_identity != new_identity:
+        # A user injected a continuation into the running conversation. Reset
+        # only response-observation stability; the original Send receipt and
+        # RequestLedger remain unchanged and must never be replayed.
+        for key in (
+            "result_seen_key", "result_seen_at", "result_samples",
+            "listen_result_seen_key", "listen_result_seen_at", "listen_result_samples",
+            "bound_assistant_progress",
+        ):
+            ctx.wait.pop(key, None)
+        ctx.wait["user_steering_rebind_count"] = int(
+            ctx.wait.get("user_steering_rebind_count") or 0
+        ) + 1
+    ctx.wait["bound_assistant_message_id"] = getattr(candidate, "message_id", None)
+    ctx.wait["bound_assistant_turn_id"] = getattr(candidate, "turn_id", None)
     return candidate
 
 

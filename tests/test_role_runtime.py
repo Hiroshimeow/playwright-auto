@@ -149,7 +149,7 @@ def test_failed_allow_with_real_dom_permission_waits_until_normal_timeout():
     assert decision.action is Action.REFRESH
 
 
-def test_operator_continuation_without_receipt_user_cannot_steal_result():
+def test_operator_continuation_without_rendered_receipt_user_is_valid_steering():
     current = snapshot(messages=(
         MessageSnapshot("user", "operator-user", "operator-turn", "continue", ()),
         MessageSnapshot(
@@ -159,8 +159,10 @@ def test_operator_continuation_without_receipt_user_cannot_steal_result():
     ))
     wait = {}
     assert step(current, wait).action is Action.WAIT
-    assert step(current, wait, 5).action is Action.WAIT
-    assert "bound_assistant_message_id" not in wait
+    assert wait["bound_assistant_message_id"] == "operator-answer"
+    result = step(current, wait, 5)
+    assert result.action is Action.ACCEPT
+    assert result.response.message_id == "operator-answer"
 
 
 def test_valid_result_can_finish_despite_stuck_stop():
@@ -333,7 +335,7 @@ def test_timeout_after_refresh_keeps_waiting_and_rearms_when_stop_and_listener_a
     assert "timeout_status" not in wait
 
 
-def test_later_human_turns_cannot_redirect_already_bound_assistant():
+def test_later_human_turn_reanchors_already_bound_assistant():
     current = current_result()
     wait = {}
     assert step(current, wait).action is Action.WAIT
@@ -346,12 +348,17 @@ def test_later_human_turns_cannot_redirect_already_bound_assistant():
             ("copy-turn-action-button",),
         ),
     ))
-    result = step(interleaved, wait, 5)
+    first = step(interleaved, wait, 5)
+    assert first.action is Action.WAIT
+    assert wait["bound_assistant_message_id"] == "human-answer"
+    assert wait["bound_assistant_turn_id"] == "human-answer-turn"
+    assert wait["user_steering_rebind_count"] == 1
+    result = step(interleaved, wait, 10)
     assert result.action is Action.ACCEPT
-    assert result.response.message_id == "answer"
+    assert result.response.message_id == "human-answer"
 
 
-def test_foreign_user_before_bound_assistant_blocks_explicitly():
+def test_user_injection_before_bound_assistant_is_valid_steering():
     current = snapshot(messages=(
         MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
         MessageSnapshot("user", "manual-user", "manual-turn", "manual", ()),
@@ -360,9 +367,31 @@ def test_foreign_user_before_bound_assistant_blocks_explicitly():
             ("copy-turn-action-button",),
         ),
     ))
-    result = step(current, {})
-    assert result.action is Action.BLOCK
-    assert result.reason == "foreign_user_before_bound_assistant"
+    wait = {}
+    first = step(current, wait)
+    assert first.action is Action.WAIT
+    assert "response_binding_error" not in wait
+    assert wait["bound_assistant_message_id"] == "manual-answer"
+    result = step(current, wait, 5)
+    assert result.action is Action.ACCEPT
+    assert result.response.message_id == "manual-answer"
+
+
+def test_multiple_user_injections_follow_latest_user_without_blocking():
+    current = snapshot(messages=(
+        MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
+        MessageSnapshot("user", "manual-user-1", "manual-turn-1", "first steer", ()),
+        MessageSnapshot("user", "manual-user-2", "manual-turn-2", "second steer", ()),
+        MessageSnapshot(
+            "assistant", "manual-answer", "manual-answer-turn", "final after steering",
+            ("copy-turn-action-button",),
+        ),
+    ))
+    wait = {}
+    assert step(current, wait).action is Action.WAIT
+    assert "response_binding_error" not in wait
+    assert wait["bound_assistant_message_id"] == "manual-answer"
+    assert step(current, wait, 5).action is Action.ACCEPT
 
 
 def test_bound_assistant_remount_same_identity_keeps_binding():

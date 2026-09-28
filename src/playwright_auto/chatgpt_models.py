@@ -510,6 +510,7 @@ def bound_assistant_for_receipt(
     *,
     assistant_message_id: str | None = None,
     assistant_turn_id: str | None = None,
+    allow_user_steering: bool = False,
 ) -> tuple[MessageSnapshot | None, str | None]:
     """Resolve the one logical assistant response owned by the accepted user."""
     user_message_id = str(receipt.user_message_id or "").strip()
@@ -519,6 +520,67 @@ def bound_assistant_for_receipt(
 
     bound_message_id = str(assistant_message_id or "").strip()
     bound_turn_id = str(assistant_turn_id or "").strip()
+
+    if allow_user_steering:
+        exact_receipt_users = [
+            index
+            for index, message in enumerate(messages)
+            if message.role == "user"
+            and (
+                (user_message_id and message.message_id == user_message_id)
+                or (user_turn_id and message.turn_id == user_turn_id)
+            )
+        ]
+        if len(exact_receipt_users) > 1:
+            return None, "duplicate_receipt_user_identity"
+        anchor_index = _receipt_user_index(messages, receipt)
+        if anchor_index is None:
+            # The accepted user can be virtualized out after a rerender. A user
+            # that is not part of the pre-Send baseline is then an operator
+            # continuation and becomes the new response anchor.
+            post_baseline_users = [
+                index
+                for index, message in enumerate(messages)
+                if message.role == "user"
+                and message.message_id not in receipt.baseline.user_message_ids
+                and message.message_id not in receipt.baseline.message_ids
+                and (
+                    not message.turn_id
+                    or message.turn_id not in receipt.baseline.logical_turn_ids
+                )
+            ]
+            if post_baseline_users:
+                anchor_index = post_baseline_users[-1]
+        if anchor_index is not None:
+            first_identity = ""
+            candidates: list[MessageSnapshot] = []
+            for message in messages[anchor_index + 1 :]:
+                if message.role == "user":
+                    # User input inside an active task is valid steering. Follow
+                    # the latest human turn instead of treating it as ownership
+                    # loss, while keeping the original Send receipt immutable.
+                    first_identity = ""
+                    candidates = []
+                    continue
+                if message.role != "assistant":
+                    continue
+                identity = message.turn_id or message.message_id
+                if (
+                    identity in receipt.baseline.assistant_turn_ids
+                    or identity in receipt.baseline.logical_turn_ids
+                ):
+                    continue
+                if not first_identity:
+                    first_identity = identity
+                elif identity != first_identity:
+                    return None, "conflicting_unbound_assistant_identity"
+                candidates.append(message)
+            if not candidates:
+                return None, None
+            return next(
+                (message for message in reversed(candidates) if message.text.strip()),
+                candidates[-1],
+            ), None
 
     # After the first exact U->A bind, persisted assistant identity is the
     # operation authority. The receipt user may be virtualized out, and a
