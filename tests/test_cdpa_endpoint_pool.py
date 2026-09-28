@@ -285,3 +285,72 @@ def test_auth_probe_uses_existing_chatgpt_page_without_creating_one(monkeypatch)
     context = type("Context", (), {"pages": [type("Page", (), {"url": "https://chatgpt.com/"})()]})()
     result = asyncio.run(module.probe_chatgpt_auth(context))
     assert result == {"auth_state": "authenticated", "chatgpt_ready": True}
+
+
+def test_same_address_physical_identity_change_reattaches_only_changed_endpoint(tmp_path):
+    async def run():
+        pool, _registry, first, second, connections, now = make_pool(tmp_path)
+        await pool.refresh(wait=True)
+        first_context = pool.contexts[first["endpoint_id"]]
+        peer_context = pool.contexts[second["endpoint_id"]]
+        first_playwright = next(
+            playwright for playwright, browser in connections
+            if browser.contexts[0].address == first["cdp_url"]
+        )
+
+        async def changed_version(address):
+            identity = "changed-browser" if address == first["cdp_url"] else address.rsplit(":", 1)[-1]
+            return {"webSocketDebuggerUrl": f"ws://localhost/devtools/browser/{identity}"}
+
+        pool.version_probe = changed_version
+        now[0] += 20
+        await pool.refresh()
+
+        assert pool.contexts[first["endpoint_id"]] is not first_context
+        assert pool.contexts[second["endpoint_id"]] is peer_context
+        assert first_playwright.stops == 1
+        await pool.close()
+
+    asyncio.run(run())
+
+
+def test_periodic_identity_probe_same_identity_does_not_reconnect(tmp_path):
+    async def run():
+        pool, _registry, first, second, connections, now = make_pool(tmp_path)
+        await pool.refresh(wait=True)
+        first_context = pool.contexts[first["endpoint_id"]]
+        peer_context = pool.contexts[second["endpoint_id"]]
+        count = len(connections)
+
+        now[0] += 20
+        await pool.refresh()
+
+        assert len(connections) == count
+        assert pool.contexts[first["endpoint_id"]] is first_context
+        assert pool.contexts[second["endpoint_id"]] is peer_context
+        await pool.close()
+
+    asyncio.run(run())
+
+
+def test_identity_change_collision_fails_closed_without_touching_peer(tmp_path):
+    async def run():
+        pool, _registry, first, second, _connections, now = make_pool(tmp_path)
+        await pool.refresh(wait=True)
+        peer_context = pool.contexts[second["endpoint_id"]]
+
+        async def colliding_version(address):
+            identity = second["cdp_url"].rsplit(":", 1)[-1] if address == first["cdp_url"] else address.rsplit(":", 1)[-1]
+            return {"webSocketDebuggerUrl": f"ws://localhost/devtools/browser/{identity}"}
+
+        pool.version_probe = colliding_version
+        now[0] += 20
+        snapshot = await pool.refresh()
+        states = {item["endpoint_id"]: item for item in snapshot["endpoints"]}
+
+        assert first["endpoint_id"] not in pool.contexts
+        assert states[first["endpoint_id"]]["health"] == "conflict"
+        assert pool.contexts[second["endpoint_id"]] is peer_context
+        await pool.close()
+
+    asyncio.run(run())

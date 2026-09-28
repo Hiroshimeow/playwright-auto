@@ -250,8 +250,35 @@ class EndpointPool:
                 self._runtimes[endpoint_id] = runtime
             if runtime.context is not None:
                 if wait or now >= runtime.auth_probe_after:
-                    await self._refresh_auth(runtime)
-                continue
+                    try:
+                        version = await self.version_probe(runtime.address)
+                        physical_id = self._physical_identity(version, runtime.address)
+                    except Exception as exc:
+                        await self._stop_attachment(runtime)
+                        runtime.health = "offline"
+                        runtime.auth_state = "unknown"
+                        runtime.chatgpt_ready = False
+                        runtime.error = f"CDP identity probe failed: {exc}"
+                        runtime.retry_after = now + self.retry_delay
+                        continue
+                    if runtime.physical_id and physical_id != runtime.physical_id:
+                        claimed.discard(runtime.physical_id)
+                        await self._stop_attachment(runtime)
+                        runtime.health = "offline"
+                        runtime.auth_state = "unknown"
+                        runtime.chatgpt_ready = False
+                        runtime.error = "physical browser identity changed"
+                        runtime.retry_after = 0.0
+                        if physical_id in claimed:
+                            runtime.health = "conflict"
+                            runtime.error = "physical browser is already owned by another endpoint"
+                            runtime.retry_after = now + self.retry_delay
+                            continue
+                    else:
+                        await self._refresh_auth(runtime)
+                        continue
+                if runtime.context is not None:
+                    continue
             if not wait and now < runtime.retry_after:
                 continue
             await self._connect(record, runtime, claimed)
