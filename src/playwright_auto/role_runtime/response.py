@@ -166,6 +166,16 @@ def handle(ctx: Context) -> Decision | None:
     bound_generation_active = bool(
         bound_turn_id and activity_turn_id and bound_turn_id == activity_turn_id
     )
-    if bound_generation_active or not completed_action:
+    resume_terminal = bool(ctx.wait.get("resume_allow_missing_completion_action"))
+    if bound_generation_active:
+        return None
+    if not completed_action and not resume_terminal:
+        return None
+    if resume_terminal and (
+        bool(getattr(ctx.snapshot, "response_projection_active", False))
+        or bool(getattr(ctx.snapshot, "retry_visible", False))
+        or bool(getattr(ctx.snapshot, "blocking_dialogs", ()))
+        or bool(getattr(ctx.snapshot, "error_texts", ()))
+    ):
         return None
     return Decision(Action.ACCEPT, "valid_bound_result", candidate)

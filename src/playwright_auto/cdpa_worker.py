@@ -8049,7 +8049,11 @@ class CDPAWorker:
                 postcondition="tab_reopened",
             )
             return
-        decision = await self.role_controller.run(self, state, hop, acquired, actions, wait_ms=0)
+        wait["resume_allow_missing_completion_action"] = True
+        try:
+            decision = await self.role_controller.run(self, state, hop, acquired, actions, wait_ms=0)
+        finally:
+            wait.pop("resume_allow_missing_completion_action", None)
         if state.get("status") == "BLOCKED":
             self._require_resume_recovery(
                 state, control, action="observe_saved_tab",
