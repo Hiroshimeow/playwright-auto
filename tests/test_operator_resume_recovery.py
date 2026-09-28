@@ -513,7 +513,8 @@ def test_resume_different_accepted_binding_fails_before_backend_or_rebind(
     assert record.attempts == 1
 
 
-def test_resume_routes_valid_local_report_response_without_replay(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("resume_code", ["response_timeout", "response_without_terminal_result"])
+def test_resume_routes_valid_local_report_response_without_replay(tmp_path: Path, monkeypatch, resume_code):
     store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-resume-path-only"
     )
@@ -581,7 +582,7 @@ def test_resume_routes_valid_local_report_response_without_replay(tmp_path: Path
         async def locate_owned(self, _state, _role):
             return acquired
 
-    _queue_blocked_resume(store, state)
+    _queue_blocked_resume(store, state, code=resume_code)
     monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
 
     recovered = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))

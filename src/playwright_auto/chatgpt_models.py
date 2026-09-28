@@ -278,6 +278,8 @@ class ChatGPTSnapshot:
             "response_activity_turn_id": self.response_activity_turn_id,
             "response_activity_length": self.response_activity_length,
             "logical_turn_ids": list(self.logical_turn_ids),
+            "response_segments": [segment.to_dict() for segment in self.response_segments],
+            "response_projection_active": self.response_projection_active,
             "state": self.state.value,
             "requires_login": self.requires_login,
             "composer_present": self.composer_present,

@@ -283,7 +283,8 @@ def transcript_messages(probe: Any) -> tuple[dict[str, Any], ...]:
     activity_text = str(getattr(probe, "response_activity_text", "") or "")
     assistant_text = str(getattr(probe, "assistant_text", "") or "")
     activity_is_newer = bool(
-        activity_turn_id
+        not projected
+        and activity_turn_id
         and activity_turn_id != assistant_turn_id
         and activity_text
     )
@@ -314,7 +315,7 @@ def transcript_messages(probe: Any) -> tuple[dict[str, Any], ...]:
             ),
             "complete": not active,
         })
-    elif activity_turn_id and activity_text:
+    elif not projected and activity_turn_id and activity_text:
         messages.append({
             "author": "assistant",
             "message_id": None,

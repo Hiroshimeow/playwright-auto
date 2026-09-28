@@ -8,6 +8,7 @@ from playwright_auto.role_runtime.signals import (
     SignalIdentity,
     record_cycle,
     record_signal_error,
+    transcript_messages,
 )
 
 
@@ -204,6 +205,33 @@ def test_bound_dom_stream_keeps_one_logical_key_across_message_node_remount(monk
         (None, "turn-stable", False),
         (None, "turn-stable", True),
     ]
+
+
+def test_projected_response_segments_emit_distinct_transcript_rows_without_aggregate_duplicate():
+    probe = SimpleNamespace(
+        last_user_message_id="user-1",
+        last_user_turn_id="turn-1",
+        last_user_text="task",
+        response_activity_turn_id="turn-1",
+        response_activity_text="Thinking answer",
+        response_activity_length=15,
+        response_segments=(
+            SimpleNamespace(key="projection:turn-1:status:0", kind="status", text="Thinking"),
+            SimpleNamespace(key="projection:turn-1:answer:0", kind="answer", text="answer"),
+        ),
+        last_assistant_turn_id=None,
+        last_assistant_message_id=None,
+        assistant_text="",
+    )
+
+    rows = transcript_messages(probe)
+
+    assistant = [row for row in rows if row["author"] == "assistant"]
+    assert [(row["message_id"], row["phase"], row["text"]) for row in assistant] == [
+        ("projection:turn-1:status:0", "status", "Thinking"),
+        ("projection:turn-1:answer:0", "answer", "answer"),
+    ]
+    assert all(row["complete"] is False for row in assistant)
 
 
 def test_signal_identity_prefers_snapshot_ownership():
