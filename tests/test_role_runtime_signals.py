@@ -234,6 +234,36 @@ def test_projected_response_segments_emit_distinct_transcript_rows_without_aggre
     assert all(row["complete"] is False for row in assistant)
 
 
+def test_projected_answer_deduplicates_real_assistant_aggregate_with_message_id():
+    probe = SimpleNamespace(
+        last_user_message_id="user-1",
+        last_user_turn_id="turn-1",
+        last_user_text="task",
+        response_activity_turn_id="turn-1",
+        response_activity_text="Thinking answer",
+        response_activity_length=15,
+        response_segments=(
+            SimpleNamespace(key="projection:turn-1:status:0", kind="status", text="Thinking"),
+            SimpleNamespace(key="projection:turn-1:answer:0", kind="answer", text="answer"),
+        ),
+        last_assistant_turn_id="turn-1",
+        last_assistant_message_id="assistant-1",
+        assistant_text="answer",
+        assistant_text_length=6,
+        stop_visible=False,
+        transport_active=False,
+    )
+
+    rows = transcript_messages(probe)
+
+    assistant = [row for row in rows if row["author"] == "assistant"]
+    assert [(row["message_id"], row["text"]) for row in assistant] == [
+        ("projection:turn-1:status:0", "Thinking"),
+        ("projection:turn-1:answer:0", "answer"),
+    ]
+    assert sum(row["text"] == "answer" for row in assistant) == 1
+
+
 def test_signal_identity_prefers_snapshot_ownership():
     identity = SignalIdentity.from_snapshot(
         _snapshot(),

@@ -478,6 +478,60 @@ def test_current_response_projection_preserves_order_and_stable_segment_keys():
     """, run))
 
 
+def test_completed_projection_activity_does_not_veto_but_unresolved_activity_does():
+    async def run(page):
+        completed = await inspect_chatgpt_wait_probe(page)
+        assert [(item.kind, item.active) for item in completed.response_segments] == [
+            ("status", False),
+            ("tool", False),
+            ("answer", False),
+        ]
+        assert completed.response_projection_active is False
+
+        await page.evaluate("""() => {
+            document.querySelector('[data-turn-id="turn-current"]').insertAdjacentHTML(
+                'beforeend',
+                '<div data-testid="tool-calling" data-state="open">Calling tool</div>'
+            );
+        }""")
+        unresolved = await inspect_chatgpt_wait_probe(page, previous_probe=completed)
+        assert unresolved.response_projection_active is True
+        assert unresolved.response_segments[-1].kind == "tool"
+        assert unresolved.response_segments[-1].active is True
+
+    asyncio.run(_with_page("""
+        <main>
+          <section data-turn-id="turn-current">
+            <div data-message-author-role="user" data-message-id="user-original">original task</div>
+            <div data-testid="status-running" data-streaming-response-status="complete">Finished</div>
+            <div data-testid="tool-calling" data-state="closed">Tool result</div>
+            <div class="markdown">answer</div>
+          </section>
+          <div contenteditable="true" role="textbox"></div>
+        </main>
+    """, run))
+
+
+def test_text_only_retry_ignores_historical_response_before_latest_user():
+    async def run(page):
+        probe = await inspect_chatgpt_wait_probe(page)
+        assert probe.retry_visible is False
+
+    asyncio.run(_with_page("""
+        <main>
+          <section data-turn-id="turn-old">
+            <div data-message-author-role="user" data-message-id="user-old">old task</div>
+            <div data-message-author-role="assistant" data-message-id="assistant-old">failed</div>
+            <button>Retry</button>
+          </section>
+          <section data-turn-id="turn-current">
+            <div data-message-author-role="user" data-message-id="user-original">current task</div>
+          </section>
+          <div contenteditable="true" role="textbox"></div>
+        </main>
+    """, run))
+
+
 def test_text_only_retry_is_scoped_to_current_response():
     async def run(page):
         scoped = await inspect_chatgpt_wait_probe(page)

@@ -282,6 +282,16 @@ def transcript_messages(probe: Any) -> tuple[dict[str, Any], ...]:
     assistant_turn_id = getattr(probe, "last_assistant_turn_id", None)
     activity_text = str(getattr(probe, "response_activity_text", "") or "")
     assistant_text = str(getattr(probe, "assistant_text", "") or "")
+    projected_has_assistant_aggregate = bool(
+        projected
+        and assistant_text
+        and (not activity_turn_id or not assistant_turn_id or activity_turn_id == assistant_turn_id)
+        and any(
+            str(getattr(segment, "kind", "") or "") == "answer"
+            and str(getattr(segment, "text", "") or "") == assistant_text
+            for segment in projected
+        )
+    )
     activity_is_newer = bool(
         not projected
         and activity_turn_id
@@ -299,7 +309,11 @@ def transcript_messages(probe: Any) -> tuple[dict[str, Any], ...]:
             ),
             "complete": False,
         })
-    elif getattr(probe, "last_assistant_message_id", None) and assistant_text:
+    elif (
+        getattr(probe, "last_assistant_message_id", None)
+        and assistant_text
+        and not projected_has_assistant_aggregate
+    ):
         logical_turn_id = assistant_turn_id or activity_turn_id
         active = bool(
             getattr(probe, "stop_visible", False)

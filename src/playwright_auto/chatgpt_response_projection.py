@@ -59,10 +59,17 @@ RESPONSE_PROJECTION_JS = r"""
     seen.add(key);
     const text = value.slice(0, Math.max(0, 24000 - total));
     total += text.length;
-    const active = kind !== 'answer' && (
-      element.matches('[data-streaming-response-status]') ||
-      element.getAttribute('aria-busy') === 'true' ||
-      element.getAttribute('data-state') === 'open' ||
+    const streamState = normalize(element.getAttribute('data-streaming-response-status')).toLowerCase();
+    const state = normalize(element.getAttribute('data-state')).toLowerCase();
+    const ariaBusy = normalize(element.getAttribute('aria-busy')).toLowerCase();
+    const completed = /^(complete|completed|done|finished|closed|idle)$/.test(streamState) ||
+      /^(complete|completed|done|finished|closed)$/.test(state) ||
+      ariaBusy === 'false';
+    const active = kind !== 'answer' && !completed && (
+      (element.matches('[data-streaming-response-status]') && !streamState) ||
+      /^(streaming|running|working|thinking|searching|calling|loading|open|pending|active)$/.test(streamState) ||
+      ariaBusy === 'true' ||
+      state === 'open' ||
       /running|working|thinking|searching|calling|loading/i.test(testid)
     );
     segments.push({key, kind, text, active});
@@ -84,15 +91,20 @@ RETRY_RESOLVER_JS = r"""
   const exact = [...document.querySelectorAll('[data-testid="regenerate-thread-error-button"]')]
     .find((element) => visible(element) && !element.disabled && element.getAttribute('aria-disabled') !== 'true');
   if (exact) return exact;
-  const responseRoots = [...document.querySelectorAll('[data-turn-id],[data-turn-key],[data-turn-id-container]')]
-    .filter(visible)
-    .filter((root) => root.querySelector('[data-message-author-role="assistant"],[data-chatgpt-search-unit-key$=":assistant"],[data-streaming-response-status]'));
-  const root = responseRoots.at(-1) || null;
-  if (!root) return null;
-  const matches = [...root.querySelectorAll('button,[role="button"]')].filter((element) =>
-    visible(element) && !element.disabled && element.getAttribute('aria-disabled') !== 'true' &&
-    String(element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim() === 'Retry'
-  );
+  const latestUser = [...document.querySelectorAll(
+    '[data-message-author-role="user"], [data-chatgpt-search-unit-key$=":user"]'
+  )].filter(visible).at(-1) || null;
+  const userTurn = latestUser?.closest('[data-turn-id],[data-turn-key],[data-turn-id-container]') || latestUser;
+  const matches = [...document.querySelectorAll('button,[role="button"]')].filter((element) => {
+    if (!visible(element) || element.disabled || element.getAttribute('aria-disabled') === 'true') return false;
+    if (String(element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim() !== 'Retry') return false;
+    const root = element.closest('[data-turn-id],[data-turn-key],[data-turn-id-container]');
+    if (!root || !root.querySelector(
+      '[data-message-author-role="assistant"],[data-chatgpt-search-unit-key$=":assistant"],[data-streaming-response-status]'
+    )) return false;
+    return !userTurn || root === userTurn ||
+      Boolean(userTurn.compareDocumentPosition(root) & Node.DOCUMENT_POSITION_FOLLOWING);
+  });
   return matches.length === 1 ? matches[0] : null;
 })()
 """
