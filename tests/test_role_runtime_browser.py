@@ -440,3 +440,62 @@ def test_page_observer_replaces_legacy_dom_observer_on_live_page():
         assert await page.evaluate("Boolean(window.__CDPA_ROLE_DOM_V2__)") is True
 
     asyncio.run(_with_page("<main></main>", run))
+
+
+def test_current_response_projection_preserves_order_and_stable_segment_keys():
+    async def run(page):
+        first = await inspect_chatgpt_wait_probe(page)
+        assert [(item.kind, item.text) for item in first.response_segments] == [
+            ("status", "Thinking"),
+            ("answer", "answer one"),
+            ("status", "Searching"),
+            ("answer", "answer two"),
+        ]
+        assert first.response_projection_active is True
+        assert first.last_assistant_message_id is None
+        keys = [item.key for item in first.response_segments]
+
+        await page.evaluate("""() => {
+            const firstAnswer = document.querySelector('.markdown');
+            firstAnswer.className = 'markdown prose churned';
+            firstAnswer.textContent = 'answer one updated';
+        }""")
+        second = await inspect_chatgpt_wait_probe(page, previous_probe=first)
+        assert [item.key for item in second.response_segments] == keys
+        assert second.response_segments[1].text == "answer one updated"
+
+    asyncio.run(_with_page("""
+        <main>
+          <section data-turn-id="turn-current">
+            <div data-message-author-role="user" data-message-id="user-original">original task</div>
+            <div data-testid="status-running">Thinking</div>
+            <div class="markdown">answer one</div>
+            <div data-testid="status-searching">Searching</div>
+            <div class="markdown">answer two</div>
+          </section>
+          <div contenteditable="true" role="textbox"></div>
+        </main>
+    """, run))
+
+
+def test_text_only_retry_is_scoped_to_current_response():
+    async def run(page):
+        scoped = await inspect_chatgpt_wait_probe(page)
+        assert scoped.retry_visible is True
+        await page.evaluate("""() => {
+            const button = document.querySelector('[data-turn-id] button');
+            document.querySelector('main').appendChild(button);
+        }""")
+        unrelated = await inspect_chatgpt_wait_probe(page, previous_probe=scoped)
+        assert unrelated.retry_visible is False
+
+    asyncio.run(_with_page("""
+        <main>
+          <section data-turn-id="turn-current">
+            <div data-message-author-role="user" data-message-id="user-original">original task</div>
+            <div data-message-author-role="assistant" data-message-id="assistant-current">failed</div>
+            <button>Retry</button>
+          </section>
+          <div contenteditable="true" role="textbox"></div>
+        </main>
+    """, run))

@@ -264,6 +264,21 @@ def transcript_messages(probe: Any) -> tuple[dict[str, Any], ...]:
         })
 
     activity_turn_id = getattr(probe, "response_activity_turn_id", None)
+    projected = tuple(getattr(probe, "response_segments", ()) or ())
+    for segment in projected:
+        segment_text = str(getattr(segment, "text", "") or "")
+        segment_key = str(getattr(segment, "key", "") or "")
+        if not segment_text or not segment_key:
+            continue
+        messages.append({
+            "author": "assistant",
+            "message_id": segment_key,
+            "turn_id": activity_turn_id,
+            "text": segment_text,
+            "text_length": len(segment_text),
+            "complete": False,
+            "phase": str(getattr(segment, "kind", "status") or "status"),
+        })
     assistant_turn_id = getattr(probe, "last_assistant_turn_id", None)
     activity_text = str(getattr(probe, "response_activity_text", "") or "")
     assistant_text = str(getattr(probe, "assistant_text", "") or "")

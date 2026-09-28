@@ -53,6 +53,7 @@ from .chatgpt_graph import (
     rendered_user_text_matches,
     visible_text_matches,
 )
+from .chatgpt_response_projection import RESPONSE_PROJECTION_JS, RETRY_RESOLVER_JS
 from .chatgpt_models import (
     ChatGPTSnapshot,
     ChatGPTState,
@@ -60,6 +61,7 @@ from .chatgpt_models import (
     MessageSnapshot,
     PageBinding,
     PageHealth,
+    ResponseSegment,
     SendReceipt,
     WaitProbe,
     all_assistant_turns_for_receipt,
@@ -1622,8 +1624,9 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
           const composer = composerOwner.element;
           const composerRoot = composer?.closest('form') || composer?.closest('[data-testid="composer"]') || null;
           const stop = firstVisible('button[data-testid="stop-button"], button[aria-label*="Stop"]');
-          const retry = firstVisible('[data-testid="regenerate-thread-error-button"]');
+          const retry = (__CDPA_RETRY_RESOLVER__);
           const activeResponse = latest('[data-streaming-response-status]');
+          const projection = (__CDPA_RESPONSE_PROJECTION__);
           const semantic = semanticTurns();
           const semanticUser = semantic.filter((turn) => turn.role === 'user').at(-1) || null;
           const semanticAssistant = semantic.filter((turn) => turn.role === 'assistant').at(-1) || null;
@@ -1641,7 +1644,8 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             turnId: semanticAssistant?.turnId || null,
           };
           const assistantText = lastAssistant ? boundedText(lastAssistant, 24000) : (semanticAssistant?.text || '');
-          const activityText = activeResponse ? boundedText(activeResponse, 24000) : (semanticAssistant?.text || '');
+          const projectedActivityText = projection.segments.map((segment) => segment.text).join(' ').slice(0, 24000);
+          const activityText = projectedActivityText || (activeResponse ? boundedText(activeResponse, 24000) : (semanticAssistant?.text || ''));
           const assistantShape = {
             length: assistantText.length,
             tail: assistantText.slice(-160),
@@ -1762,14 +1766,18 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             assistant_text_tail: assistantShape.tail,
             response_activity_length: activityShape.length,
             response_activity_tail: activityShape.tail,
-            response_activity_turn_id: logicalTurnId(activeResponse, 'assistant'),
+            response_activity_turn_id: projection.active ? projection.turn_id : logicalTurnId(activeResponse, 'assistant'),
+            response_segments: projection.segments,
+            response_projection_active: Boolean(projection.active),
             last_user_text: lastUser ? boundedText(lastUser, 12000) : (semanticUser?.text || ''),
             assistant_text: assistantText,
             response_activity_text: activityText,
           };
           };
           return true;
-        }""".replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS)
+        }""".replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS).replace(
+            '__CDPA_RESPONSE_PROJECTION__', RESPONSE_PROJECTION_JS
+        ).replace('__CDPA_RETRY_RESOLVER__', RETRY_RESOLVER_JS)
 
 
 async def inspect_chatgpt_wait_probe(
@@ -1855,6 +1863,17 @@ async def inspect_chatgpt_wait_probe(
         last_user_text=str(raw.get("last_user_text") or ""),
         assistant_text=str(raw.get("assistant_text") or ""),
         response_activity_text=str(raw.get("response_activity_text") or ""),
+        response_segments=tuple(
+            ResponseSegment(
+                key=str(segment.get("key") or ""),
+                kind=str(segment.get("kind") or "status"),
+                text=str(segment.get("text") or ""),
+                active=bool(segment.get("active")),
+            )
+            for segment in raw.get("response_segments") or ()
+            if segment.get("key") and segment.get("text")
+        ),
+        response_projection_active=bool(raw.get("response_projection_active")),
     )
 
 
@@ -1894,7 +1913,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
           const send = sendCandidates[0]?.button || null;
           const stop = firstVisible('button[data-testid="stop-button"], button[aria-label*="Stop"]');
           const login = firstVisible('[data-testid="login-button"]');
-          const retry = firstVisible('[data-testid="regenerate-thread-error-button"]');
+          const retry = (__CDPA_RETRY_RESOLVER__);
           const errorTexts = [...document.querySelectorAll('[role="alert"]')]
             .filter(visible)
             .map(text)
@@ -2117,8 +2136,10 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
           const activeResponse = [...chatRoot.querySelectorAll('[data-streaming-response-status]')]
             .filter(visible)
             .at(-1) || null;
+          const projection = (__CDPA_RESPONSE_PROJECTION__);
           const semanticAssistant = semanticMessages.filter((message) => message.role === 'assistant').at(-1) || null;
-          const responseActivityText = activeResponse ? text(activeResponse) : (semanticAssistant?.text || '');
+          const projectedActivityText = projection.segments.map((segment) => segment.text).join(' ').slice(0, 24000);
+          const responseActivityText = projectedActivityText || (activeResponse ? text(activeResponse) : (semanticAssistant?.text || ''));
           const responseActivityStructure = activeResponse
             ? [...activeResponse.querySelectorAll('[data-testid]')]
                 .filter(visible)
@@ -2126,7 +2147,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
                 .filter(Boolean)
                 .join('|')
             : (semanticAssistant ? 'semantic-assistant' : '');
-          const responseActivityTurnId = logicalTurnId(activeResponse, 'assistant');
+          const responseActivityTurnId = projection.active ? projection.turn_id : logicalTurnId(activeResponse, 'assistant');
 
           const requiresLogin = location.hostname === 'auth.openai.com' || Boolean(login);
           const authCallbackError = location.hostname === 'chatgpt.com' && location.pathname === '/auth/error';
@@ -2192,11 +2213,15 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             response_activity_text: responseActivityText,
             response_activity_structure: responseActivityStructure,
             response_activity_turn_id: responseActivityTurnId,
+            response_segments: projection.segments,
+            response_projection_active: Boolean(projection.active),
             logical_turn_ids: [...logicalTurnIds],
             messages,
           };
         }
-        """.replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS),
+        """.replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS)
+          .replace('__CDPA_RESPONSE_PROJECTION__', RESPONSE_PROJECTION_JS)
+          .replace('__CDPA_RETRY_RESOLVER__', RETRY_RESOLVER_JS),
         [
             ROLE_STORAGE_KEY,
             PAGE_ID_STORAGE_KEY,
@@ -2238,6 +2263,17 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
         logical_turn_ids=tuple(
             str(value) for value in raw.get("logical_turn_ids") or [] if value
         ),
+        response_segments=tuple(
+            ResponseSegment(
+                key=str(segment.get("key") or ""),
+                kind=str(segment.get("kind") or "status"),
+                text=str(segment.get("text") or ""),
+                active=bool(segment.get("active")),
+            )
+            for segment in raw.get("response_segments") or ()
+            if segment.get("key") and segment.get("text")
+        ),
+        response_projection_active=bool(raw.get("response_projection_active")),
         state=classify_chatgpt_state(raw_for_state),
         requires_login=bool(raw.get("requires_login")),
         composer_present=bool(raw.get("composer_present")),

@@ -196,6 +196,17 @@ class SendReceipt:
 
 
 @dataclass(frozen=True)
+class ResponseSegment:
+    key: str
+    kind: str
+    text: str
+    active: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"key": self.key, "kind": self.kind, "text": self.text, "active": self.active}
+
+
+@dataclass(frozen=True)
 class ChatGPTSnapshot:
     url: str
     session_id: str | None
@@ -226,6 +237,8 @@ class ChatGPTSnapshot:
     composer_ambiguous: bool = False
     composer_owner_source: str = ""
     logical_turn_ids: tuple[str, ...] = ()
+    response_segments: tuple[ResponseSegment, ...] = ()
+    response_projection_active: bool = False
 
     @property
     def conversation_url(self) -> str | None:
@@ -324,6 +337,8 @@ class WaitProbe:
     response_activity_text: str = ""
     composer_ambiguous: bool = False
     composer_owner_source: str = ""
+    response_segments: tuple[ResponseSegment, ...] = ()
+    response_projection_active: bool = False
 
     @property
     def composer_empty(self) -> bool:
