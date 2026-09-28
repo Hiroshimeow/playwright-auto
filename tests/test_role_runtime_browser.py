@@ -532,6 +532,36 @@ def test_text_only_retry_ignores_historical_response_before_latest_user():
     """, run))
 
 
+def test_exact_testid_retry_is_scoped_to_current_response():
+    async def run(page):
+        historical = await inspect_chatgpt_wait_probe(page)
+        assert historical.retry_visible is False
+
+        await page.evaluate("""() => {
+            document.querySelector('[data-turn-id="turn-current"]').insertAdjacentHTML(
+                'beforeend',
+                '<div data-message-author-role="assistant" data-message-id="assistant-current">failed</div>' +
+                '<button data-testid="regenerate-thread-error-button">Retry</button>'
+            );
+        }""")
+        current = await inspect_chatgpt_wait_probe(page, previous_probe=historical)
+        assert current.retry_visible is True
+
+    asyncio.run(_with_page("""
+        <main>
+          <section data-turn-id="turn-old">
+            <div data-message-author-role="user" data-message-id="user-old">old task</div>
+            <div data-message-author-role="assistant" data-message-id="assistant-old">failed</div>
+            <button data-testid="regenerate-thread-error-button">Retry</button>
+          </section>
+          <section data-turn-id="turn-current">
+            <div data-message-author-role="user" data-message-id="user-original">current task</div>
+          </section>
+          <div contenteditable="true" role="textbox"></div>
+        </main>
+    """, run))
+
+
 def test_text_only_retry_is_scoped_to_current_response():
     async def run(page):
         scoped = await inspect_chatgpt_wait_probe(page)

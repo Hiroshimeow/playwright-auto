@@ -88,13 +88,21 @@ RETRY_RESOLVER_JS = r"""
     element && window.getComputedStyle(element).visibility !== 'hidden' &&
     (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
   );
-  const exact = [...document.querySelectorAll('[data-testid="regenerate-thread-error-button"]')]
-    .find((element) => visible(element) && !element.disabled && element.getAttribute('aria-disabled') !== 'true');
-  if (exact) return exact;
   const latestUser = [...document.querySelectorAll(
     '[data-message-author-role="user"], [data-chatgpt-search-unit-key$=":user"]'
   )].filter(visible).at(-1) || null;
   const userTurn = latestUser?.closest('[data-turn-id],[data-turn-key],[data-turn-id-container]') || latestUser;
+  const exact = [...document.querySelectorAll('[data-testid="regenerate-thread-error-button"]')]
+    .find((element) => {
+      if (!visible(element) || element.disabled || element.getAttribute('aria-disabled') === 'true') return false;
+      const root = element.closest('[data-turn-id],[data-turn-key],[data-turn-id-container]');
+      if (!root || !root.querySelector(
+        '[data-message-author-role="assistant"],[data-chatgpt-search-unit-key$=":assistant"],[data-streaming-response-status]'
+      )) return false;
+      return !userTurn || root === userTurn ||
+        Boolean(userTurn.compareDocumentPosition(root) & Node.DOCUMENT_POSITION_FOLLOWING);
+    });
+  if (exact) return exact;
   const matches = [...document.querySelectorAll('button,[role="button"]')].filter((element) => {
     if (!visible(element) || element.disabled || element.getAttribute('aria-disabled') === 'true') return false;
     if (String(element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim() !== 'Retry') return false;
