@@ -1,290 +1,297 @@
-# PLAN report — CDPA live stream / BLOCKED recovery repair
+# PLAN report — CDPA live stream / BLOCKED recovery repair (current-truth refresh)
 
 Task: `cdpa-idem-785d75d981319be4b33834f9`  
 Team: `cdpa-live-stream-block-repair-team-20260928`  
 Workspace: `E:\git-project\playwright-auto-multicdp`  
-Execution constraint: g6 only via @md; this workflow is pinned to endpoint `9202` (registry endpoint `56b44af5-6790-430f-afe3-4f78766d58be` -> `http://127.0.0.1:9202`). Do not use 9212/9222. No push.
+Execution constraint: g6 only via @md; endpoint 9202 only; no push.
 
-## Repository truth and protected baseline
+## Decision
 
-- PLAN started from HEAD `2e17db3ba29b17322b75dd40167a3a30513be7d7` on `feat/cdpa-multi-cdp-temporary-recovery`.
-- Relevant recent commits inspected: `2e17db3`, `ab03276`, `1c86a3d`, `a96e070`, `61a4753`, `d088084`, `940eb6b`, `a2c06a3`, `0b5fcd7`, `5168cd8`.
-- Read current `AGENTS.md`, `LEARNING.md`, `PROBLEM.md`, repo HCU rules/profile and relevant source/tests. The HCU fingerprint differs because the worktree already contains unrelated dirty documentation; no rule change relevant to this task was inferred from that mismatch.
-- Pre-existing dirty/untracked state is protected and must remain uncommitted by this task:
-  - modified: `.agents/agents/code-reviewer.md`, `.gitignore`, `AGENTS.md`, `PROBLEM.md`, `README.md`, `prompts/cdpa/BASE_CONTEXT.md`, `prompts/cdpa/RESPONSE_GUIDE.md`, `src/playwright_auto/cdpa_defaults/prompts/cdpa/BASE_CONTEXT.md`
-  - untracked: `.github/`, `.skills/solo-role/`, `.skills/using-codex/`, `.skills/using-pi-coding/`, `NUL`, `state_api_dump.json`, `task_api_dump.json`
-- No files were staged at PLAN intake. Never reset/stash/clean/switch branch. Use selective staging and inspect `git diff --cached --name-status` before every commit.
+**Route REVIEW, not DEV.**
 
-## Current upstream research
+The repository advanced materially after PLAN intake. Current HEAD is now:
+`a058d29d964e3040838461fb48db564ed0626456` (`fix: scope exact Retry to current response`).
 
-Verified current upstream `https://github.com/miuuyy/codex-chatgpt-web` main/HEAD on 2026-09-28:
-- commit: `2d73f626290a5062825bb595dabb89aaf88d16c5`
-- license: MIT, Copyright (c) 2026 codex-chatgpt-web contributors.
-- sources inspected at that exact commit:
-  - `docs/architecture.md`
-  - `docs/security-model.md`
-  - `src/adapters/chatgpt-web/index.ts`
-  - issue `#221` (closed)
-  - PR `#222` (closed, not merged; do not treat it as authoritative implementation).
+The originally planned implementation has largely already landed through the Solo chain. Current evidence says A/B/C/F are implemented and focused tests are green. D/E were already implemented before that chain and remain green. G/H remain preserve-only.
 
-Useful current upstream concepts, to borrow rather than port:
-1. Browser submission/response binding is based on logical `data-turn-id` / persistent turn containers rather than display indexes.
-2. Visible ChatGPT status rows project to reasoning summaries; stable prose between status rows projects to commentary; final answer remains a distinct phase.
-3. Current adapter emits reasoning as `thinking_delta`, commentary as `text_delta phase=commentary`, and final answer as `text_delta phase=final_answer`.
-4. Current security model explicitly records an answer projection before a tool batch, blocks completion while the tool is unresolved, then requires a new stable final-answer projection after that causal boundary; a two-phase completion fence re-reads DOM and commits only if activity revision is unchanged and no invocation is active.
-5. The regression pattern documented around #221 includes answer content between multiple status/tool containers. Therefore CDPA must preserve DOM order such as `status -> answer part 1 -> status -> answer part 2`; a later status row must not cause preceding answer text to be discarded or reclassified.
-6. During active CoT/tool phases there may be visible status text without a final markdown answer. That is liveness/activity evidence, not completion evidence.
+The remaining gap is **independent review of the latest committed state**, because:
+- the first independent REVIEW found 3 real defects;
+- those were fixed in `721db28`;
+- a later exact-Retry scoping fix landed in `a058d29`;
+- the intended REVIEW r2 never inspected those fixes because it blocked before Send on `preboundary_acquisition_recovery_required`;
+- live ChatGPT runtime proof for incremental middle-response projection on endpoint 9202 is still not independently established.
 
-These patterns align with CDPA's existing exact-send/no-resend contract and do not justify copying upstream's broker/orchestration architecture.
+Therefore another implementation pass would be wasteful unless REVIEW reproduces a concrete defect.
 
-## Current CDPA ownership and root causes
+## Repository truth
 
-### Response extraction / live transcript
+PLAN initially inspected HEAD `2e17db3ba29b17322b75dd40167a3a30513be7d7`. Re-check on 2026-09-29 found:
 
-Current owners:
+- `a3e87d6` — PLAN checkpoint.
+- `fceb5a8` — bounded current-response timeline/projector + TRANSCRIPT wiring + initial scoped Retry.
+- `f731f8d` — Resume-only exact terminal response consumption without normal completion controls.
+- `01830e2` — EndpointPool physical browser identity revalidation / reattach.
+- `b1acecf` — projection/recovery contract tightening.
+- `332804c` — DEV evidence report.
+- `e8a8e76` — separate user-steering behavior change; current HEAD includes it but it is not part of this repair's original owned scope.
+- `721db28` — fixes REVIEW findings: projected/real transcript dedup, latest-turn Retry scope, completed activity veto.
+- `a058d29` — further scopes even exact testid Retry to the current response.
+
+Current worktree still contains pre-existing dirty/untracked material that must not be reset/stashed/cleaned or accidentally committed:
+- modified: `.agents/agents/code-reviewer.md`, `.gitignore`, `AGENTS.md`, `PROBLEM.md`, `README.md`, `prompts/cdpa/BASE_CONTEXT.md`, `prompts/cdpa/RESPONSE_GUIDE.md`, `src/playwright_auto/cdpa_defaults/prompts/cdpa/BASE_CONTEXT.md`
+- untracked: `.github/`, `.skills/solo-role/`, `.skills/using-codex/`, `.skills/using-pi-coding/`, `NUL`, `state_api_dump.json`, `task_api_dump.json`.
+
+Do not attribute or stage those files/hunks to this task.
+
+## Upstream research retained from PLAN
+
+Current upstream `miuuyy/codex-chatgpt-web` was verified at commit:
+`2d73f626290a5062825bb595dabb89aaf88d16c5`, MIT license.
+
+Relevant current concepts:
+- logical turn identity is more reliable than display order;
+- visible status rows / reasoning / commentary are projected separately from final answer;
+- answer chunks can legitimately occur between multiple tool/status containers;
+- unresolved tool activity must veto completion;
+- completion requires a fresh stable final-answer projection after tool boundaries;
+- progress/status proves liveness only, never completion.
+
+CDPA should continue borrowing these narrow lifecycle concepts only; no broker/orchestration port is justified.
+
+## Current implementation assessment
+
+### A. Incremental current-response projection — COMPLETE pending independent review/live proof
+
+Current owner:
+- `src/playwright_auto/chatgpt_response_projection.py`
 - `src/playwright_auto/chatgpt.py`
-  - `_WAIT_PROBE_INSTALL_SCRIPT`
-  - `inspect_chatgpt_wait_probe`
-  - `inspect_chatgpt_page`
-- `src/playwright_auto/chatgpt_models.py`: `WaitProbe`, `ChatGPTSnapshot`
-- `src/playwright_auto/role_runtime/page_observer.py`: MutationObserver wake source
-- `src/playwright_auto/role_runtime/signals.py`: `transcript_messages`, `record_probe`, `record_full_snapshot`, `record_cycle`
-- `src/playwright_auto/live_stream.py` and `dashboard_assets/live_stream.js`: existing TRANSCRIPT upsert path/reducer.
+- `src/playwright_auto/chatgpt_models.py`
+- `src/playwright_auto/role_runtime/signals.py`.
 
-Verified current gap: both sparse wait probe and full snapshot still derive most assistant content from:
-- `[data-message-author-role][data-message-id]`,
-- exact semantic `main h4` labels (`You said:` / `ChatGPT said:`),
-- `[data-streaming-response-status]`.
-Current Retry detection is only `[data-testid="regenerate-thread-error-button"]`.
+Current projector:
+- bounds output to 24 segments / 24k text;
+- scopes to the logical response turn after the latest user;
+- preserves DOM order;
+- emits answer/tool/reasoning/status segments;
+- uses stable synthetic keys based on turn + kind + ordinal;
+- keeps projected activity outside terminal `ChatGPTSnapshot.messages`;
+- exposes `response_projection_active` only from unresolved non-answer activity.
 
-The MutationObserver is already the correct wake mechanism. It must stay wake-only; do not add a second observer/response engine.
+`721db28` additionally fixed the first REVIEW's finding that completed retained tool/status rows could keep activity permanently active and fixed projected/real answer duplication.
 
-Live durable evidence from `.runtime/live-events.jsonl` for clone-repackage task `cdpa-idem-896a33fc42e7f712be4ca99e` reproduces defect A:
-- user TRANSCRIPT at `2026-09-28T01:24:45.110315Z`;
-- DOM at `01:24:45.109315Z`: `assistant_text_length=0`, `response_activity_length=0`, no assistant message/turn, `stop_visible=true`;
-- no assistant TRANSCRIPT during the long visible middle work;
-- final assistant first appears around `01:43:09.854254Z`, with lengths jumping to 935.
-This is a current runtime reproduction, not a hypothetical fixture.
+Focused/browser/runtime projection tests are currently green.
 
-### Resume / terminal result
+Still not independently proven on real ChatGPT 9202 after the final fixes: visible middle reasoning/tool/status must generate assistant TRANSCRIPT before final answer in an actual current UI response.
+
+### B. Text-only / exact Retry scoping — COMPLETE pending independent review
+
+Current resolver is `RETRY_RESOLVER_JS` in `chatgpt_response_projection.py`.
+
+Current behavior:
+- exact `data-testid=regenerate-thread-error-button` is no longer globally accepted;
+- exact and text-only Retry must be visible/enabled, structurally inside a response root, and at/after the latest user turn;
+- text-only fallback requires exactly one matching `Retry`;
+- historical Retry before latest user is ignored;
+- no automatic Retry/Regenerate caller was added.
+
+`a058d29` specifically added coverage for historical exact-testid Retry vs current response.
+
+### C. Resume valid terminal response consumption — COMPLETE pending independent review
 
 Current owners:
-- `src/playwright_auto/role_runtime/response.py::observe/handle`
-- `src/playwright_auto/role_runtime/controller.py::RoleController.decide/run`
-- `src/playwright_auto/cdpa_worker.py::_recover_resume_waiting`, `_record_response`, `_responded`, `_complete_request_response`.
+- `role_runtime/response.py`
+- `cdpa_worker.py::_recover_resume_waiting`.
 
-Focused current-source reproduction:
-`tests/test_operator_resume_recovery.py::test_resume_routes_valid_local_report_response_without_replay`
-is RED on HEAD:
-- expected `postcondition=response_consumed`
-- actual `observation_rearmed`.
-The same focused run produced `1 failed, 26 passed`.
+`f731f8d` adds a transient Resume-only relaxation for exact-bound, parser-valid, stable terminal response when completion action controls are absent.
 
-Root cause: `response.handle` requires a completion UI action (copy/feedback/regenerate) in addition to stable valid content. The Resume fixture has an exact accepted bound assistant response and valid expected report, but no action controls, so it is not consumed. Also, `_recover_resume_waiting` currently queues the `response_without_terminal_result` repair before giving a newly rendered exact terminal response a narrow chance to be consumed.
+Safety guards remain:
+- no unresolved response projection activity;
+- no Retry;
+- no blocking dialog/error;
+- exact accepted binding/receipt preserved;
+- normal live waiting still requires normal completion evidence.
 
-The fix must be Resume-specific or equivalently narrow. Do not globally remove completion-action guards from normal live waiting.
+Focused regression now passes for both `response_timeout` and `response_without_terminal_result` recovery, with zero Send/Retry/Regenerate replay and ledger attempts remaining exactly 1.
 
-### P-043 / P-044
+### D. P-043 malformed_result — COMPLETE / PRESERVE
 
-Current source is ahead of `PROBLEM.md`:
-- P-043 behavior exists in `role_runtime/controller.py`: stable invalid candidate becomes `Action.REPAIR / malformed_result` after normal stability once current-page activity no longer indicates generation.
-- P-044 behavior exists in `cdpa_prompts.py::PromptBuilder.build_solo` plus `cdpa_worker.py::_pre_send`: Solo route repair carries the exact validation error and malformed candidate, excludes the substantive goal, asks for JSON-only correction, and uses bounded repair attempts.
+Current controller already surfaces a stable invalid candidate as `malformed_result` after normal stability once current-page generation activity clears.
 
-Focused tests passed:
-- `test_stable_malformed_result_repairs_with_exact_validation_error_without_reload`
-- `test_stale_listen_stream_status_cannot_hide_stable_dom_malformed_result`
-- `test_solo_route_repair_prompt_carries_exact_error_and_candidate_without_goal`
-- `test_solo_route_repair_actual_send_persists_exact_repair_prompt_once`
-- `test_solo_repeated_invalid_repairs_are_bounded`.
+Current focused tests pass:
+- stable malformed result -> repair with exact validation error;
+- stale LISTEN `IS_STREAMING` cannot hide stable malformed DOM result.
 
-Therefore do not re-implement P-043/P-044 unless another phase regresses them. `PROBLEM.md` is also pre-existing dirty; update/mark resolved only after final evidence and only with selective staging of task-owned hunks.
+Do not reimplement unless REVIEW reproduces a current regression.
 
-### EndpointPool physical restart
+### E. P-044 Solo route repair exact parser error — COMPLETE / PRESERVE
 
-Current owner: `src/playwright_auto/cdpa_endpoint_pool.py::EndpointPool.refresh/_connect/_stop_attachment`.
+Current Solo format repair:
+- includes exact validation/parser error;
+- includes malformed candidate as inert JSON-string data;
+- excludes substantive goal;
+- asks only for corrected route JSON;
+- keeps bounded repair retries.
 
-Current `refresh` invalidates an attachment only when endpoint address changes or Playwright `browser.is_connected()` becomes false. `/json/version` physical identity is checked only on `_connect`, so an online runtime can retain a stale BrowserContext if Chromium is physically restarted behind the same 9202 address while the old Browser proxy still reports connected.
+Current focused tests pass.
 
-PLAN reproduced this deterministically with current test fakes:
-- initial physical ID `devtools:11111111-1111-1111-1111-111111111111`;
-- same endpoint later reports `devtools:22222222-2222-2222-2222-222222222222`;
-- after `EndpointPool.refresh`: version probe count for that endpoint remained 1, context was reused, runtime physical ID remained the old ID, health remained `online`.
-So F is a current-source FIX, not speculative.
+### F. EndpointPool stale BrowserContext after physical restart — COMPLETE pending independent review
 
-Worker-level `TargetClosedError` handling already calls `mark_unavailable`; preserve it. The missing piece is periodic physical-identity validation before a stale context has to throw.
+`01830e2` changed `EndpointPool.refresh` to revalidate physical browser identity on the existing readiness/auth cadence.
 
-## Requirement classification
+Current behavior:
+- same-address changed `/json/version` browser identity invalidates only the stale Playwright attachment;
+- reconnect uses the existing path;
+- healthy peers remain untouched;
+- duplicate physical-browser ownership remains fail-closed.
 
-| Item | Decision | Evidence / boundary |
-|---|---|---|
-| A current-response timeline | **FIX** | live reproduction + brittle current extractor |
-| B text-only scoped Retry | **FIX** | current selector only recognizes regenerate-thread-error-button |
-| C Resume terminal consumption | **FIX** | focused regression currently RED |
-| D P-043 malformed_result | **COMPLETE/PRESERVE** | current branch + focused tests green |
-| E P-044 Solo format repair | **COMPLETE/PRESERVE** | current branch + focused tests green |
-| F stale BrowserContext after physical restart | **FIX** | deterministic current-source reproduction |
-| G preboundary acquisition | **PRESERVE / NO CHANGE** | `tests/test_cdpa_presend_cleanready_rootfix.py` green in focused run; no current gap reproduced |
-| H ownership safety blocks | **PRESERVE / NO CHANGE** | no current false positive reproduced; exact identity is authoritative |
+Current endpoint/pool tests are green.
 
-## Implementation contract for DEV
+### G. preboundary acquisition — PRESERVE / NO PRODUCTION CHANGE
 
-### Phase 2 — one small response projector, RED -> GREEN
+Current clean-ready/preboundary focused tests are green.
 
-Create one cohesive primitive/module rather than growing another large branch in `chatgpt.py`, recommended path:
-`src/playwright_auto/chatgpt_response_projection.py`.
+Important: Solo REVIEW r2 itself blocked with `preboundary_acquisition_recovery_required` before reviewing the latest fixes. That task-state incident is **not proof of a current production regression** in this scope. Do not weaken acquisition ownership merely to clear that old blocked task.
 
-It should own the bounded current-turn projection/extractor shared by sparse wait probe and full snapshot. Add only the minimal model surface required in `chatgpt_models.py` (for example `ResponseSegment` plus `response_segments` / explicit active flag on `WaitProbe` and `ChatGPTSnapshot`).
+### H. ownership guardrails — PRESERVE
 
-Mandatory invariants:
-1. Scope extraction to the current logical response turn using existing `data-turn-id`, `data-turn-key`, `data-turn-id-container`, exact latest user identity and assistant/search-unit evidence.
-2. Preserve DOM order across reasoning/commentary/status/tool/answer segments.
-3. Do not put synthetic thinking/tool/status segments into `ChatGPTSnapshot.messages`; terminal response binding must continue to operate only on real assistant response candidates. The timeline is observability/liveness data, not route authority.
-4. Stable synthetic segment identity must not use changing text hashes. Prefer exact user/generation identity + small semantic phase/kind + stable structural ordinal. Native message IDs remain authoritative when available.
-5. Bound work: inspect only the current response/turn subtree; cap segment count and total text (recommended <=24 segments and <=24k combined chars). Never serialize `document.body` or generic mutation noise.
-6. Historical completed tool/status rows do not veto forever. Only current unresolved/streaming activity is active.
-7. Progress/tool/reasoning alone can never produce `Action.ACCEPT`.
-8. If a final-looking answer exists while a current unresolved tool/status phase remains active, that activity vetoes terminal completion.
-9. Preserve `status -> answer1 -> status -> answer2`; classify commentary by local/ordered structural position, not “any later status exists”.
+No current false positive was reproduced for:
+- `foreign_user_before_bound_assistant`
+- `conversation_owned_by_other_task`.
 
-Focused browser fixture tests belong in `tests/test_role_runtime_browser.py` (or one narrowly named new projector test file if that keeps fixtures cohesive):
-- visible status/reasoning/tool content before final assistant message produces non-empty response segments/activity even with no `data-message-author-role`, semantic h4, or streaming-status marker;
-- mixed ordered segments preserve both answer chunks and order;
-- rerender/class churn preserves synthetic logical keys and does not create duplicate logical transcript rows;
-- progress-only projection remains outside terminal `messages` and never accepts;
-- unresolved tool/status activity vetoes a final-looking candidate.
+Do not weaken them.
 
-Checkpoint only the projector/model/tests.
+## Independent-review history
 
-### Phase 3 — TRANSCRIPT wiring + safe Retry fallback
+### DEV implementation report
 
-Modify `role_runtime/signals.py` to emit projected segments through the existing `TRANSCRIPT message` contract. Reuse `live_stream.py` and the dashboard reducer. The dashboard already preserves multiple distinct real message IDs in one turn and performs upsert/authoritative LISTEN precedence; do not redesign it unless a focused failing test proves one extra `phase`/`kind` field is needed.
+`.plan/cdpa-live-stream-block-repair-team-20260928/cdpa-live-stream-block-repair-solo-dev-turn1.md`
 
-Rules:
-- synthetic segment rows get stable `message_id` keys so multiple segments within one turn do not collapse to `assistant:<turn>`;
-- active reasoning/tool/status/partial rows are `complete=false`;
-- only existing validated terminal authority may produce `complete=true`;
-- LISTEN terminal response remains authoritative over DOM partials.
+DEV reported checkpoints through `b1acecf`, with:
+- 124 passed role-runtime/browser/signals/live-stream/dashboard;
+- 68 passed + 4 skipped endpoint/pool/solo/presend/exact-send group;
+- 7 focused Resume ownership/no-replay passes.
 
-Add one shared response-scoped Retry resolver used by wait/full read paths:
-1. first prefer exact `data-testid=regenerate-thread-error-button`;
-2. fallback only to exactly one visible, enabled `button,[role=button]` whose normalized visible text is exactly `Retry` and which is structurally inside the current response/assistant turn;
-3. ambiguous or out-of-response Retry text is ignored/fail-closed;
-4. do not globally search/click arbitrary “Retry” text;
-5. do not introduce automatic Retry/Regenerate. Current controller behavior is detection -> 5s stable -> bounded `retry_visible_stable` repair/block.
+### REVIEW r1
 
-Also update narrow read-only page-state checks in `chatgpt.py` to use the same resolver where they currently only recognize the testid, if a stale error surface could otherwise be misclassified as send-ready. Do not change explicit `retry_generation` into an automatic path; production currently has no caller.
+Task `cdpa-idem-438bf9cf2536dc82261141cf` completed and found 3 concrete defects:
+1. duplicate projected + real assistant transcript rows;
+2. text-only Retry could bind historical response instead of latest logical turn;
+3. retained completed status/tool rows could keep `response_projection_active=true` indefinitely.
 
-Tests:
-- response-scoped text-only Retry is detected without testid/aria-label;
-- unrelated composer/dialog/page Retry text is not detected;
-- stable scoped Retry reaches `retry_visible_stable` bounded recovery;
-- no Send, Retry or Regenerate click occurs in this recovery path;
-- live-stream/dashboard existing reducer tests stay green.
+It spawned DEV r3.
 
-Checkpoint projector-to-TRANSCRIPT + Retry only.
+### DEV r3
 
-### Phase 4 — consume already-rendered valid response on Resume
+Task `cdpa-idem-b2f83c9f92b5955919cbba80` completed:
+- fixed all 3 REVIEW r1 defects in `721db28`;
+- reported focused + role/signals/live-stream + browser/dashboard + Resume/no-replay tests green;
+- spawned REVIEW r2.
 
-Repair `CDPAWorker._recover_resume_waiting` with the smallest narrow path:
-1. after reacquiring and verifying the exact saved page/binding/conversation, first allow the existing exact accepted bound assistant response to be observed/validated;
-2. if it is exact-bound, parser-valid, references the expected report handoff, the expected report evidence exists, is stable, and there is no current unresolved projected activity / Retry / blocking error, consume it via the existing `_record_response -> _responded -> _complete_request_response` flow;
-3. this Resume-only “already-rendered terminal evidence” path may tolerate missing completion action controls; normal live waiting must retain its stronger completion-action guard;
-4. only if a `response_without_terminal_result` Resume still has no valid exact terminal result should the existing route-only repair be queued;
-5. never call Send, Retry, Regenerate, or create another original request. RequestLedger attempts must remain exactly 1 and immutable receipt/page/user identities must remain unchanged.
+### REVIEW r2
 
-Mandatory tests:
-- make `test_resume_routes_valid_local_report_response_without_replay` green with `response_consumed`;
-- keep `test_resume_missing_terminal_result_block_queues_route_repair_without_timeout_extension` green;
-- preserve exact binding divergence/manual-composer/streaming Resume tests;
-- assert Send/Retry/Regenerate counts remain zero and ledger attempts remain one.
+Task `cdpa-idem-b12b44bc67025b078e7d2a84` did **not** perform the review. It blocked in `pre_send` with:
+`preboundary_acquisition_recovery_required`.
 
-Checkpoint Resume fix only.
+Therefore there is no valid independent clean review after `721db28`, and certainly none after later `a058d29`.
 
-### Phase 5 — preserve P-043/P-044, no duplicate implementation
+## Fresh PLAN verification on current HEAD a058d29
 
-Re-run the existing focused P-043/P-044 tests after the projector/Resume changes. Add a regression fixture only if the new DOM projection exposes a new malformed-path bug. Otherwise make no production change.
+Used the existing venv directly because `uv run` previously conflicted with the running worker binary.
 
-Do not edit `PROBLEM.md` yet merely because unit tests pass. At final integration, mark P-043/P-044 resolved only if required test + runtime/live evidence is sufficient. Because `PROBLEM.md` was dirty before this task, selective-stage only task-owned lines if it is changed.
+### Core response projection/live stream/dashboard
 
-### Phase 6 — EndpointPool physical identity reattach
+`.\.venv\Scripts\python.exe -m pytest -q tests\test_role_runtime.py tests\test_role_runtime_browser.py tests\test_role_runtime_signals.py tests\test_live_stream.py tests\test_dashboard.py`
 
-Modify only `EndpointPool.refresh` / a tiny helper:
-- on the same periodic cadence already used for online auth/readiness refresh (not every tight scheduler iteration), probe `/json/version` for each reused online runtime;
-- compute current `_physical_identity`;
-- if it differs from `runtime.physical_id`, stop only the Playwright attachment via `_stop_attachment`, mark runtime unavailable/unknown with immediate reconnect eligibility, then reuse the existing `_connect` path in the same/next normal refresh;
-- never close the user's Chromium process;
-- rebuild/maintain the `claimed` set so the existing duplicate-physical-browser conflict guard remains authoritative; never steal another endpoint's browser;
-- preserve existing worker `TargetClosedError -> mark_unavailable` handling.
+Result: **129 passed in 22.60s**.
 
-Tests in `tests/test_cdpa_endpoint_pool.py`:
-- same-address physical identity change replaces only that endpoint's stale attachment and obtains the new context;
-- healthy peer context is untouched;
-- same physical identity does not reconnect unnecessarily;
-- new identity colliding with another registered runtime remains conflict/fail-closed.
+This covers current response projection, ordered segments, dedup/reducer behavior, Retry scoping fixtures, activity veto, and dashboard/live-stream contracts.
 
-Checkpoint endpoint reattach only.
+### Focused Resume + P-043/P-044
 
-### Phase 7 — integration evidence and cleanup
+Focused command covering:
+- valid accepted response consumed without replay;
+- missing-terminal-result repair preservation;
+- exact Solo repair prompt/error/candidate;
+- bounded Solo repair;
+- malformed_result and stale-LISTEN malformed handling.
 
-Run focused + regression suites with the existing environment interpreter. `uv run pytest` is currently unusable because the running worker holds `.venv\Scripts\cdpa-worker.exe` and uv fails with Access Denied before test execution. This is an environment conflict, not a test failure. Use:
-`.\.venv\Scripts\python.exe -m pytest ...`
-unless DEV intentionally stops/restarts the worker under an authorized phase.
+Result: **8 passed in 1.57s**.
 
-Minimum regression groups:
-- `tests/test_role_runtime.py`
-- `tests/test_role_runtime_browser.py`
-- `tests/test_live_stream.py`
-- relevant live-stream reducer cases in `tests/test_dashboard.py`
-- `tests/test_operator_resume_recovery.py`
-- `tests/test_cdpa_solo_task.py`
-- `tests/test_cdpa_endpoint_pool.py`
-- `tests/test_cdpa_pool_audit.py`
-- `tests/test_cdpa_presend_cleanready_rootfix.py`
-- exact-send/binding/no-resend tests touched by the changed boundaries.
+### Endpoint / preboundary / exact-send safety
 
-Then obtain appropriate live/runtime evidence on endpoint **9202 only**:
-- a response with visible middle reasoning/progress/tool activity yields incremental assistant TRANSCRIPT before final;
-- text-only scoped Retry transitions to bounded recovery if safely reproducible without destructive mutation;
-- final route still waits for all active tool/progress evidence to clear;
-- no replay / ledger attempts remain one.
+`.\.venv\Scripts\python.exe -m pytest -q tests\test_cdpa_endpoint_pool.py tests\test_cdpa_pool_audit.py tests\test_cdpa_presend_cleanready_rootfix.py tests\test_cdpa_late_send_identity.py tests\test_cdpa_send_recovery_audit.py`
 
-Inspect `git status --short`, `git diff`, every phase commit, and `git diff <baseline>..HEAD --name-status`. Verify no protected pre-existing dirty/untracked file/hunk entered a task commit. No push.
+Result: **34 passed, 4 skipped in 2.63s**.
 
-Final independent routing expectation: DEV -> REVIEW. REVIEW inspects actual commits/diff and over-engineering boundary. If implementation is clean but live/runtime evidence remains incomplete, REVIEW routes TEST; otherwise REVIEW routes PLAN for closure. Only PLAN may DONE.
+### Full operator Resume file
 
-## Focused evidence already collected by PLAN
+`tests/test_operator_resume_recovery.py --maxfail=1`
 
-Command (existing venv):
-`.\.venv\Scripts\python.exe -m pytest -q tests/test_operator_resume_recovery.py::test_resume_routes_valid_local_report_response_without_replay tests/test_role_runtime.py::test_stable_malformed_result_repairs_with_exact_validation_error_without_reload tests/test_role_runtime.py::test_stale_listen_stream_status_cannot_hide_stable_dom_malformed_result tests/test_cdpa_solo_task.py::test_solo_route_repair_prompt_carries_exact_error_and_candidate_without_goal tests/test_cdpa_solo_task.py::test_solo_route_repair_actual_send_persists_exact_repair_prompt_once tests/test_cdpa_solo_task.py::test_solo_repeated_invalid_repairs_are_bounded tests/test_cdpa_endpoint_pool.py tests/test_cdpa_presend_cleanready_rootfix.py`
+Result before stop: **30 passed, 1 failed**.
 
-Result: **1 failed, 26 passed in 2.41s**. Only failure is the required C regression: `response_consumed` expected, `observation_rearmed` actual. P-043/P-044, current EndpointPool unit suite, and preboundary clean-ready tests were green; the additional physical-identity-change probe independently reproduced F because the existing suite does not cover that case.
+Failure:
+`test_reacquired_pristine_request_crosses_send_boundary_exactly_once`
 
-## Non-goals / invariants
+Cause is the already-known test-fixture debt: its local `SimpleNamespace` lacks `logical_turn_ids`, while unchanged durable send code calls:
+`capture_message_baseline(before_send.messages, before_send.logical_turn_ids)`.
+This is outside the live-stream/Resume terminal fix range and was already documented by DEV. Treat it as an independent repo test debt, not a PASS. REVIEW should confirm whether it needs a separate task; do not silently fix it as scope creep.
 
-- No new orchestration framework, generalized state machine, selector-registry platform, or second response engine.
-- MutationObserver remains a wake source, not semantic authority.
-- Exact accepted Send ownership, request ledger, no-resend, task/team/page binding, conversation ownership and fail-closed safety remain authoritative.
-- Never weaken `foreign_user_before_bound_assistant` or `conversation_owned_by_other_task` without a new current-source false-positive reproduction and a safer exact-identity fix.
-- Do not touch preboundary acquisition solely to clear old manifests.
-- Progress/tool/reasoning evidence may prove liveness but never completion.
-- Existing final route/report parser and report evidence gates remain authoritative.
-- Keep text/DOM work bounded.
+### Diff hygiene
 
-## Commit contract
+Task-relevant current range from PLAN checkpoint to HEAD:
+- 11 relevant files;
+- 630 insertions / 25 deletions across projector/model/wiring/Resume/EndpointPool/tests;
+- `git diff --check` on that relevant range is clean.
 
-Required small checkpoints:
-1. PLAN/research report (this file).
-2. Response projector + RED->GREEN fixture tests.
-3. TRANSCRIPT wiring + scoped Retry detection/recovery.
-4. Resume response-consumption fix.
-5. P-043/P-044 only if a real regression requires code; otherwise no commit.
-6. Endpoint physical-identity reattach.
-7. Final integration/evidence/report cleanup.
+This size is larger than the original minimal first patch because it includes later review fixes and the separate current-head user-steering changes in shared files. REVIEW must distinguish task-owned commits from unrelated `e8a8e76` rather than judging the aggregate as one authored patch.
 
-Record every DEV/REVIEW/TEST checkpoint SHA in subsequent reports. A Git commit cannot embed its own final SHA in the file it hashes without changing that SHA; therefore this PLAN report identifies its checkpoint by path and consumers should resolve it with `git log -1 -- <this report path>`, then record that SHA in the next handoff.
+## REVIEW execution contract
 
-## Acceptance gate for later PLAN closure
+Review current HEAD `a058d29d964e3040838461fb48db564ed0626456`; do not review only `b1acecf`.
 
-DONE is forbidden until all user acceptance bullets are verified, including ordered mixed segments, rerender dedupe, scoped text-only Retry, activity completion veto, Resume response consumption with zero replay, P-043/P-044 preservation, endpoint reattach if reproduced (it was), exact-send/no-resend/ownership/preboundary regressions, and independent REVIEW/TEST evidence as needed.
+Inspect these task-owned checkpoints:
+- `fceb5a8`
+- `f731f8d`
+- `01830e2`
+- `b1acecf`
+- `721db28`
+- `a058d29`
 
-Route now: **DEV**.
+Treat `e8a8e76` as concurrent/shared-file context, not automatically as task-owned scope.
+
+REVIEW must independently verify:
+1. projector chooses the actual current response turn, not historical roots;
+2. mixed status/answer/status/answer preserves all answer/activity order;
+3. synthetic keys remain stable under rerender/class churn;
+4. projected + real answer events do not duplicate;
+5. completed historical tool/status rows do not keep active forever;
+6. unresolved current tool/status still vetoes terminal completion;
+7. both text-only and exact-testid Retry are scoped to the current response and ambiguous/global Retry is ignored;
+8. no automatic Retry/Regenerate/Send replay path was introduced;
+9. Resume missing-completion-action relaxation is reachable only during Resume, remains exact-bound/parser-valid/stable, and is vetoed by activity/Retry/error/dialog;
+10. `response_without_terminal_result` consumes an already-rendered valid result before queuing route repair;
+11. EndpointPool reattach cannot steal another endpoint's browser and does not close Chromium;
+12. P-043/P-044 and preboundary/ownership guardrails remain intact;
+13. no pre-existing dirty/untracked content entered the task commits;
+14. no unnecessary second response engine/state-machine/platform was introduced.
+
+If REVIEW finds a concrete code defect, route DEV.
+
+If code review is clean but live current-ChatGPT evidence is still missing, route TEST with endpoint **9202 only**. TEST should obtain runtime evidence that middle reasoning/progress/tool activity yields incremental assistant TRANSCRIPT before final and that terminal completion waits for unresolved activity to clear.
+
+If REVIEW + required live TEST are both clean, route PLAN for closure. Only PLAN may route DONE.
+
+## Non-goals
+
+- No new orchestration framework.
+- No selector registry platform.
+- No second response state machine.
+- No global arbitrary text Retry.
+- No progress/tool signal as completion authority.
+- No ownership/preboundary weakening to clear stale manifests.
+- No unrelated cleanup of the current dirty worktree.
+- No push.
+
+## Route
+
+**REVIEW**.
