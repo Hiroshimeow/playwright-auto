@@ -47,10 +47,6 @@ export function renderWorkflowAgentOptions(root, agents = []) {
     input.checked = selected.size
       ? selected.has(agent.route_key)
       : DEFAULT_WORKFLOW_ROLES.has(agent.route_key);
-    if (agent.route_key === "PLAN") {
-      input.checked = true;
-      input.disabled = true;
-    }
     const copy = document.createElement("span");
     copy.className = "workflow-agent-copy";
     const name = document.createElement("strong");
@@ -76,8 +72,7 @@ export function applyReuseRoleSelection(roleInputs, item = null, {reset = false}
       : new Set([...roleInputs].filter(input => input.checked).map(input => input.value));
   for (const input of roleInputs) {
     if (locked || reset) input.checked = selected.has(input.value);
-    if (input.value === "PLAN") input.checked = true;
-    input.disabled = locked || input.value === "PLAN";
+    input.disabled = locked;
   }
 }
 

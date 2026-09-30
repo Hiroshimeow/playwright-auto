@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
-from .cdpa_workflow_agents import validate_workflow_route_key
+from .cdpa_workflow_agents import validate_workflow_route_key, workflow_closing_role
 from .file_lock import exclusive_file_lock, fsync_parent_directory
 
 ROUTES = frozenset({"PLAN", "DEV", "REVIEW", "TEST", "AUDIT", "PAUSE", "DONE"})
@@ -126,12 +126,13 @@ def parse_route_response(
         raise RouteContractError(f"unsupported route {route!r}")
     if not handoff:
         raise RouteContractError("handoff must not be empty")
+    closing_role = workflow_closing_role(allowed) or "PLAN"
     if (
         route == "DONE"
         and not allow_non_plan_done
-        and str(source_role or "").strip().upper() != "PLAN"
+        and str(source_role or "").strip().upper() != closing_role
     ):
-        raise RouteContractError("only PLAN may route DONE")
+        raise RouteContractError(f"only {closing_role} may route DONE")
     return RouteDecision(route, handoff)
 
 

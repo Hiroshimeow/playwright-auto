@@ -7,7 +7,7 @@ import re
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from .cdpa_config import CDPAConfig
 from .cdpa_independent import normalize_system_prompt
@@ -23,6 +23,17 @@ SYSTEM_WORKFLOW_ROUTE_ORDER = ("PLAN", "DEV", "TEST", "REVIEW", "AUDIT")
 def ordered_system_routes(config: CDPAConfig) -> tuple[str, ...]:
     configured = set(config.roles)
     return tuple(route for route in SYSTEM_WORKFLOW_ROUTE_ORDER if route in configured)
+
+
+def workflow_closing_role(route_keys: Iterable[Any]) -> str | None:
+    """Return the only team role allowed to route DONE: PLAN, else REVIEW."""
+    selected = {str(item).strip().upper() for item in route_keys}
+    return next((role for role in ("PLAN", "REVIEW") if role in selected), None)
+
+
+def require_team_closing_role(route_keys: Iterable[Any]) -> None:
+    if workflow_closing_role(route_keys) is None:
+        raise ValueError("team workflow roles must include PLAN or REVIEW to close the task")
 
 
 def validate_workflow_route_key(value: Any) -> str:
@@ -91,8 +102,7 @@ def workflow_snapshot(
         if route_key in result:
             raise ValueError("workflow agent snapshot contains duplicate route keys")
         result[route_key] = definition
-    if "PLAN" not in result:
-        raise ValueError("workflow agent snapshot must include PLAN")
+    require_team_closing_role(result)
     return result
 
 
@@ -138,8 +148,8 @@ def task_workflow_definitions(
     workflow_mode = str(state.get("workflow_mode") or "team").strip().lower()
     if workflow_mode not in {"team", "solo"}:
         raise ValueError("workflow_mode must be team or solo")
-    if workflow_mode == "team" and "PLAN" not in result:
-        raise ValueError("workflow task must include PLAN")
+    if workflow_mode == "team":
+        require_team_closing_role(result)
     if workflow_mode == "solo" and len(result) != 1:
         raise ValueError("solo workflow task must include exactly one role")
     return result
@@ -297,17 +307,10 @@ class WorkflowAgentCatalog:
                 self._load_unlocked(), route_key, include_deleted=include_deleted
             )
 
-    def resolve(
-        self,
-        route_keys: Sequence[str],
-        *,
-        require_plan: bool = True,
-    ) -> dict[str, dict[str, Any]]:
+    def resolve(self, route_keys: Sequence[str]) -> dict[str, dict[str, Any]]:
         requested = [validate_workflow_route_key(item) for item in route_keys]
         if len(set(requested)) != len(requested):
             raise ValueError("workflow roles must not contain duplicates")
-        if require_plan and "PLAN" not in requested:
-            raise ValueError("roles must include PLAN")
         with exclusive_file_lock(self.lock_path):
             value = self._load_unlocked()
             result: dict[str, dict[str, Any]] = {}

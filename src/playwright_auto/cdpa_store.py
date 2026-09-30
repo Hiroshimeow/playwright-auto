@@ -61,6 +61,7 @@ from .cdpa_workflow_agents import (
     WorkflowAgentCatalog,
     normalize_workflow_display_name,
     ordered_system_routes,
+    require_team_closing_role,
     task_workflow_definitions,
     validate_workflow_route_key,
 )
@@ -109,8 +110,6 @@ def report_mode_from_options(options: Mapping[str, Any]) -> str:
 def normalize_workflow_roles(
     value: Any,
     configured_roles: Sequence[str],
-    *,
-    require_plan: bool = True,
 ) -> tuple[str, ...]:
     available = tuple(str(role).strip().upper() for role in configured_roles)
     if value is None:
@@ -129,8 +128,6 @@ def normalize_workflow_roles(
     unknown = set(requested) - set(available)
     if unknown:
         raise ValueError(f"unknown workflow roles: {sorted(unknown)!r}")
-    if require_plan and "PLAN" not in requested:
-        raise ValueError("roles must include PLAN")
     selected = set(requested)
     return tuple(role for role in available if role in selected)
 
@@ -2656,6 +2653,7 @@ class TaskStore(IndependentAgentStoreMixin):
         workflow_mode: str = "team",
         goal: str = "",
         conversation_url: str | None = None,
+        initial_role: str | None = None,
     ) -> dict[str, Any]:
         endpoint = self.endpoints.resolve(browser_endpoint_id)
         required_endpoint = (
@@ -2674,7 +2672,7 @@ class TaskStore(IndependentAgentStoreMixin):
             raise ValueError("bootstrap context policy requires a bootstrap snapshot")
         if mode == "temporary" and normalized_bootstrap is not None:
             raise ValueError("temporary workflows do not support bootstrap context")
-        initial_role = workflow_roles[0] if workflow_mode == "solo" else "PLAN"
+        initial_role = initial_role or workflow_roles[0]
         roles = {}
         for logical in workflow_roles:
             roles[logical] = {
@@ -3004,6 +3002,7 @@ class TaskStore(IndependentAgentStoreMixin):
         workflow_mode: str = "team",
         goal: str | None = None,
         conversation_url: str | None = None,
+        start_role: str | None = None,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
         if type(temporary) is not bool:
@@ -3037,14 +3036,12 @@ class TaskStore(IndependentAgentStoreMixin):
         ):
             raise ValueError("solo workflow task requires exactly one selected role")
         requested_roles = (
-            normalize_workflow_roles(
-                roles,
-                catalog_routes,
-                require_plan=normalized_workflow_mode != "solo",
-            )
+            normalize_workflow_roles(roles, catalog_routes)
             if roles is not None
             else None
         )
+        if normalized_workflow_mode == "team" and requested_roles is not None:
+            require_team_closing_role(requested_roles)
         if normalized_workflow_mode == "solo":
             if requested_roles is None or len(requested_roles) != 1:
                 raise ValueError("solo workflow task requires exactly one selected role")
@@ -3286,11 +3283,13 @@ class TaskStore(IndependentAgentStoreMixin):
                 )
             if set(normalized_new) - set(workflow_roles):
                 raise ValueError("new_roles must be selected workflow roles")
-            selected_mode = conversation_mode or ("temporary" if temporary or endpoint["temporary_default"] else "persistent")
-            workflow_agent_snapshot = self.workflow_agents.resolve(
-                workflow_roles,
-                require_plan=normalized_workflow_mode != "solo",
+            initial_role = (
+                str(start_role).strip().upper() if start_role is not None else workflow_roles[0]
             )
+            if initial_role not in workflow_roles:
+                raise ValueError("start_role must be one of the selected workflow roles")
+            selected_mode = conversation_mode or ("temporary" if temporary or endpoint["temporary_default"] else "persistent")
+            workflow_agent_snapshot = self.workflow_agents.resolve(workflow_roles)
             title_slug = slugify(text)
             target = (self.root / team / task_id / f"{title_slug}.json").resolve()
             if target.exists():
@@ -3308,6 +3307,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 target=target,
                 normalized_new=normalized_new,
                 workflow_roles=workflow_roles,
+                initial_role=initial_role,
                 new_all=new_all,
                 normalized_report_mode=normalized_report_mode,
                 normalized_dependencies=normalized_dependencies,

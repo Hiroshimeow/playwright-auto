@@ -538,6 +538,31 @@ def test_taskless_resume_rejects_temp_and_browser(tmp_path: Path, monkeypatch, c
         )
 
 
+def test_task_cli_roles_submit_team_subset_and_are_invalid_for_resume(tmp_path: Path, monkeypatch, capsys):
+    payloads = []
+    config = SimpleNamespace(
+        repository_root=tmp_path.resolve(),
+        dashboard_api_host="127.0.0.1",
+        dashboard_api_port=9225,
+        dashboard_url="http://127.0.0.1:9224",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cdpa_cli_module, "load_cdpa_config", lambda _path, *, repository_root: config)
+    monkeypatch.setattr(
+        cdpa_cli_module,
+        "_post",
+        lambda _config, path, payload, **_kwargs: payloads.append((path, payload)) or {"status": "queued"},
+    )
+
+    assert cdpa_main(["duo task", "--roles", "dev, review"]) == 0
+    assert payloads[0][0] == "/api/tasks"
+    assert payloads[0][1]["roles"] == ["DEV", "REVIEW"]
+    assert "workflow_mode" not in payloads[0][1]
+
+    assert cdpa_main(["--team", "existing", "--roles", "DEV,REVIEW"]) == 2
+    assert "--roles" in capsys.readouterr().err
+    assert len(payloads) == 1
+
 def test_windows_worker_pm2_restart_reaps_old_lease_owner(tmp_path: Path, monkeypatch):
     calls: list[list[str]] = []
 

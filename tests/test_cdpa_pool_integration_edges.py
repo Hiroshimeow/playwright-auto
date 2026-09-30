@@ -87,7 +87,7 @@ def test_accepted_provisional_url_canonicalizes_only_on_same_owned_page(tmp_path
     actions.reopen.assert_not_awaited()
 
 
-def test_accepted_provisional_url_same_page_without_canonical_url_stays_blocked(tmp_path):
+def test_accepted_provisional_url_same_page_before_save_keeps_observing_without_reopen(tmp_path):
     _store, state, worker, _path, hop, receipt, _sent = _prepare_sent_waiting_task(
         tmp_path, task_id="provisional-still-local"
     )
@@ -97,6 +97,28 @@ def test_accepted_provisional_url_same_page_without_canonical_url_stays_blocked(
     user = MessageSnapshot(role="user", message_id="u1", turn_id="t1", text=receipt.prompt, actions=())
     snapshot = SimpleNamespace(page_id=receipt.binding.page_id, session_id="local-chatgpt%3Atemporary",
                                url=provisional, messages=(user,))
+    acquired = AcquiredRole(client=SimpleNamespace(assert_ownership=AsyncMock(return_value=snapshot)),
+                            page_id=receipt.binding.page_id, url=provisional, created=False, new_chat=False)
+    actions = SimpleNamespace(locate_owned=AsyncMock(return_value=acquired), reopen=AsyncMock())
+
+    assert asyncio.run(worker._owned_or_block(state, "PLAN", actions)) is acquired
+    assert state["status"] != "BLOCKED"
+    assert state.get("block_code") is None
+    assert hop["conversation_url"] == provisional
+    durable = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
+    assert durable.receipt["conversation_id"] is None
+    assert durable.attempts == 1
+    actions.reopen.assert_not_awaited()
+
+
+def test_accepted_provisional_url_same_page_without_user_turn_blocks(tmp_path):
+    _store, state, worker, _path, hop, receipt, _sent = _prepare_sent_waiting_task(
+        tmp_path, task_id="provisional-user-turn-lost"
+    )
+    provisional = "https://chatgpt.com/c/local-chatgpt%3Atemporary"
+    hop["conversation_url"] = provisional
+    state["roles"]["PLAN"]["page_url"] = provisional
+    snapshot = SimpleNamespace(page_id=receipt.binding.page_id, session_id=None, url=provisional, messages=())
     acquired = AcquiredRole(client=SimpleNamespace(assert_ownership=AsyncMock(return_value=snapshot)),
                             page_id=receipt.binding.page_id, url=provisional, created=False, new_chat=False)
     actions = SimpleNamespace(locate_owned=AsyncMock(return_value=acquired), reopen=AsyncMock())
@@ -142,6 +164,20 @@ def test_accepted_provisional_url_lost_page_blocks_without_reopen_or_rebind(tmp_
     assert hop["receipt"] == receipt.to_dict()
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
     actions.reopen.assert_not_awaited()
+
+
+def test_unresolved_accepted_send_recovers_by_reconciliation_not_resend(tmp_path):
+    from playwright_auto.cdpa_commands import workflow_control_eligibility
+
+    _store, state, _worker, _path, _hop, _receipt, _sent = _prepare_sent_waiting_task(
+        tmp_path, task_id="provisional-controls"
+    )
+    state.update(status="BLOCKED", block_code="accepted_conversation_identity_unresolved", block_retryable=False)
+
+    assert workflow_control_eligibility(state, "restart_role", role="PLAN")["eligible"] is False
+    assert workflow_control_eligibility(state, "new_chat", role="PLAN")["eligible"] is False
+    assert workflow_control_eligibility(state, "retry")["eligible"] is False
+    assert workflow_control_eligibility(state, "route_plan")["eligible"] is True
 
 
 def test_temporary_receipt_identity_is_provenance_not_a_saved_reopen_url(tmp_path):

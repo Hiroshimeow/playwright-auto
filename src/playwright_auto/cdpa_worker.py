@@ -108,7 +108,7 @@ from .cdpa_store import (
 from .cdpa_team import cleanup_eligible, has_other_nonterminal_team_work
 from .role_indicator import WINDOW_NAME_PREFIX
 from .observability import append_live_event, configure_live_event_log
-from .cdpa_workflow_agents import task_workflow_definitions
+from .cdpa_workflow_agents import task_workflow_definitions, workflow_closing_role
 from .chatgpt import (
     ChatGPTAutomationError,
     ChatGPTPage,
@@ -379,6 +379,10 @@ def _provisional_conversation_url(value: Any) -> bool:
         parsed.path.startswith("/c/")
         and unquote(parsed.path.rsplit("/", 1)[-1]).lower().startswith("local-chatgpt:")
     )
+
+
+class AcceptedConversationIdentityPending(GraphIdentityError):
+    """The exact owned page shows the accepted user turn, but ChatGPT has not saved the chat yet."""
 
 
 def _role_ownership_block_code(error: BaseException) -> str | None:
@@ -2570,13 +2574,20 @@ class CDPAWorker:
             if accepted_provisional:
                 # The local-chatgpt URL is a live-page hint, not a durable reopen address.
                 # Enrichment checks the exact receipt, page binding and accepted user turn.
+                identity_pending = False
                 if acquired is not None:
                     try:
                         receipt = SendReceipt.from_dict(receipt_payload)
                         await self._discover_accepted_conversation_identity(state, hop, actions, receipt)
+                    except AcceptedConversationIdentityPending:
+                        identity_pending = True
                     except GraphIdentityError:
                         pass
-                if _provisional_conversation_url(hop.get("conversation_url")):
+                if identity_pending:
+                    # ChatGPT saves a new chat shortly after Send; keep observing the exact
+                    # page (never reopen it) and retry canonicalization on the next tick.
+                    expected_conversation = None
+                elif _provisional_conversation_url(hop.get("conversation_url")):
                     self._block(
                         state,
                         "Accepted Send has only a provisional local-chatgpt URL; canonical conversation identity "
@@ -2585,7 +2596,8 @@ class CDPAWorker:
                         code="accepted_conversation_identity_unresolved", retryable=False,
                     )
                     return None
-                expected_conversation = _recoverable_conversation_identity(hop.get("conversation_url"))
+                else:
+                    expected_conversation = _recoverable_conversation_identity(hop.get("conversation_url"))
             if temporary:
                 token = state["roles"][role].get("temporary_document_id")
                 lost_document = bool(
@@ -6956,7 +6968,7 @@ class CDPAWorker:
             )
         conversation_id = str(snapshot.session_id or "").strip()
         if not conversation_id or _provisional_conversation_url(snapshot.url):
-            raise GraphIdentityError(
+            raise AcceptedConversationIdentityPending(
                 "accepted conversation identity is unknown because the owned page is not a saved conversation"
             )
         try:
@@ -7274,6 +7286,9 @@ class CDPAWorker:
         )
         old_hop_id = int(hop["hop_id"])
         source_role = str(hop.get("target_role") or state.get("active_role") or "PLAN").upper()
+        closing_role = workflow_closing_role(state.get("roles") or ())
+        if closing_role is None:
+            raise RuntimeError("accepted-send reconciliation requires a PLAN or REVIEW role")
         hop["state"] = "abandoned"
         hop["abandon_reason"] = reason
         hop["accepted_send_reconciliation"] = {
@@ -7287,7 +7302,7 @@ class CDPAWorker:
         child = self._append_hop(
             state,
             source_role=source_role,
-            target_role="PLAN",
+            target_role=closing_role,
             handoff=reconciliation_handoff,
             kind="accepted_send_reconciliation",
         )
@@ -7296,7 +7311,7 @@ class CDPAWorker:
                 "at": utc_now(),
                 "hop_id": old_hop_id,
                 "source_role": source_role,
-                "route": "PLAN",
+                "route": closing_role,
                 "kind": "accepted_send_reconciliation",
                 "new_hop_id": child["hop_id"],
                 "reason": reason,
@@ -7314,6 +7329,8 @@ class CDPAWorker:
     ) -> dict[str, int]:
         if str(state.get("workflow_mode") or "team").strip().lower() == "solo":
             raise RuntimeError("Route PLAN is unavailable for Solo Task")
+        if "PLAN" not in (state.get("roles") or {}):
+            raise RuntimeError("Route PLAN is unavailable for a team without PLAN")
         if state.get("status") in TERMINAL:
             raise RuntimeError("cannot route a terminal task to PLAN")
         if str(hop.get("state") or "") in IN_FLIGHT:
@@ -11769,6 +11786,7 @@ class CDPAWorker:
                         workflow_mode=str(payload.get("workflow_mode") or "team"),
                         goal=payload.get("goal"),
                         conversation_url=payload.get("conversation_url") or None,
+                        start_role=payload.get("start_role") or None,
                         external_command_id=command_id,
                     )
                 self._publish_command_state(state)

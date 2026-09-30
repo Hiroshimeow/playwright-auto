@@ -12,7 +12,7 @@ from .cdpa_independent import (
     normalize_agent_name,
     normalize_system_prompt,
 )
-from .cdpa_workflow_agents import validate_workflow_route_key
+from .cdpa_workflow_agents import validate_workflow_route_key, workflow_closing_role
 
 
 @dataclass(frozen=True)
@@ -90,6 +90,7 @@ class PromptBuilder:
         *,
         physical_role: str,
         source_physical_role: str | None,
+        closing_role: str | None = "PLAN",
     ) -> str:
         normalized = validate_workflow_route_key(role)
         continuation = ""
@@ -99,7 +100,8 @@ class PromptBuilder:
         if normalized == "PLAN":
             directive += " If acceptance is satisfied after clean REVIEW, route DONE; otherwise route the smallest role with concrete remaining work."
         elif normalized == "REVIEW":
-            directive += " Clean work routes to PLAN; a concrete reproducible defect routes to DEV."
+            clean_route = "to PLAN" if closing_role == "PLAN" else "DONE when acceptance is satisfied"
+            directive += f" Clean work routes {clean_route}; a concrete reproducible defect routes to DEV."
         return directive
 
     @staticmethod
@@ -150,10 +152,11 @@ class PromptBuilder:
         turn_number = int(turn)
         path_type = PureWindowsPath if PureWindowsPath(workspace).drive else PurePosixPath
         report_destination = path_type(str(workspace).strip()) / expected_report_path
+        closing_role = workflow_closing_role(allowed)
         prompt_routes = tuple(
             item
             for item in allowed
-            if item != "PAUSE" and (item != "DONE" or role == "PLAN")
+            if item != "PAUSE" and (item != "DONE" or role == closing_role)
         )
         context = [
             f"Turn: {turn_number}",
@@ -203,6 +206,7 @@ class PromptBuilder:
                 role,
                 physical_role=str(physical_role).strip(),
                 source_physical_role=source_physical_role,
+                closing_role=closing_role,
             )
         )
         return BuiltPrompt(

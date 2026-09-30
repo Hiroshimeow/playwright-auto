@@ -41,6 +41,7 @@ from .live_stream import LiveEnvelope, LiveStreamHub
 from .cdpa_workflow_agents import (
     normalize_workflow_display_name,
     ordered_system_routes,
+    require_team_closing_role,
     validate_workflow_route_key,
 )
 
@@ -277,8 +278,10 @@ class DashboardAPI:
                 "invalid_request",
                 f"unknown workflow roles: {sorted(unknown)!r}",
             )
-        if "PLAN" not in roles:
-            raise APIError(400, "invalid_request", "roles must include PLAN")
+        try:
+            require_team_closing_role(roles)
+        except ValueError as exc:
+            raise APIError(400, "invalid_request", str(exc)) from exc
         selected = set(roles)
         return [role for role in available if role in selected]
 
@@ -346,6 +349,7 @@ class DashboardAPI:
             "role",
             "goal",
             "conversation_url",
+            "start_role",
         }
         unknown = set(raw) - allowed
         if unknown:
@@ -410,6 +414,7 @@ class DashboardAPI:
                 "bootstrap_definition",
                 "temporary",
                 "required_browser_endpoint_id",
+                "start_role",
             } & set(raw)
             if conflicting:
                 raise APIError(
@@ -433,6 +438,15 @@ class DashboardAPI:
             )
         elif "roles" in raw:
             normalized["roles"] = self._workflow_roles(raw.get("roles"))
+        if workflow_mode == "team" and "start_role" in raw:
+            start_role = raw.get("start_role")
+            if not isinstance(start_role, str) or not start_role.strip():
+                raise APIError(400, "invalid_request", "start_role must be a non-empty string")
+            normalized["start_role"] = start_role.strip().upper()
+            if "roles" in normalized and normalized["start_role"] not in normalized["roles"]:
+                raise APIError(
+                    400, "invalid_request", "start_role must be one of the selected workflow roles"
+                )
         if "temporary" in raw:
             if type(raw.get("temporary")) is not bool:
                 raise APIError(400, "invalid_request", "temporary must be a boolean")

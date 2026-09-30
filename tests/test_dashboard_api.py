@@ -1042,6 +1042,23 @@ def test_create_keeps_soft_browser_endpoint_task_neutral_without_bootstrap_infer
     assert payload["context_policy"] == "fresh"
 
 
+def test_create_team_roles_may_omit_plan_and_select_start_role(tmp_path: Path):
+    api = DashboardAPI(load_cdpa_config(None, repository_root=tmp_path))
+
+    payload = api.normalize_create({"task": "duo", "roles": ["REVIEW", "DEV"], "start_role": "review"})
+    assert payload["roles"] == ["DEV", "REVIEW"]
+    assert payload["start_role"] == "REVIEW"
+
+    with pytest.raises(APIError, match="PLAN or REVIEW"):
+        api.normalize_create({"task": "no closer", "roles": ["DEV", "TEST"]})
+    with pytest.raises(APIError, match="start_role must be one of the selected"):
+        api.normalize_create({"task": "bad start", "roles": ["DEV", "REVIEW"], "start_role": "PLAN"})
+    with pytest.raises(APIError, match="Team Task fields"):
+        api.normalize_create(
+            {"task": "solo", "workflow_mode": "solo", "role": "DEV", "start_role": "DEV", "browser_endpoint_id": "9202"}
+        )
+
+
 def test_system_status_uses_cross_platform_disk_usage(tmp_path, monkeypatch):
     import playwright_auto.dashboard_api as dashboard_module
     config = load_cdpa_config(None, repository_root=tmp_path)

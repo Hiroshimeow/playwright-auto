@@ -959,13 +959,13 @@ def test_create_task_role_selection_defaults_and_reuse_lock_are_explicit():
     assert "renderWorkflowAgentOptions" in actions
     assert 'input.name = "roles"' in actions
     assert 'input.value = agent.route_key' in actions
-    assert 'if (agent.route_key === "PLAN")' in actions
+    assert 'if (agent.route_key === "PLAN")' not in actions
     assert 'DEFAULT_WORKFLOW_ROLES.has(agent.route_key)' in actions
     assert "selectedWorkflowRoles" in app
     assert "body.roles = selectedWorkflowRoles" in app
     assert "applyReuseRoleSelection" in actions
     assert "item.roles" in actions
-    assert 'input.disabled = locked || input.value === "PLAN"' in actions
+    assert "input.disabled = locked;" in actions
 
 
 def test_parent_dependencies_render_team_names_and_exact_remove_actions():

@@ -14,7 +14,7 @@ from .cdpa_routes import RouteContractError, validate_file_report
 from .durable import DurableRequestError, RequestLedger
 from .cdpa_store_common import TERMINAL, slugify
 from .cdpa_team import physical_role
-from .cdpa_workflow_agents import normalize_workflow_definition
+from .cdpa_workflow_agents import normalize_workflow_definition, workflow_closing_role
 
 _SCHEMA_VERSION = 1
 _SPLITS = {"train", "heldout", "unassigned"}
@@ -92,7 +92,7 @@ def _valid_role_hop_identity(path: Path, state: Mapping[str, Any], mode: str) ->
         workflow_mode = str(state.get("workflow_mode") or "team").strip().lower()
         if workflow_mode not in {"team", "solo"}:
             return False
-        if workflow_mode == "team" and "PLAN" not in roles:
+        if workflow_mode == "team" and workflow_closing_role(roles) is None:
             return False
         if workflow_mode == "solo" and len(roles) != 1:
             return False

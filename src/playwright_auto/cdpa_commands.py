@@ -718,6 +718,8 @@ def workflow_control_eligibility(
         )
         if unresolved_accepted:
             return yes()
+        if "PLAN" not in roles:
+            return no("Route PLAN is unavailable for a team without PLAN.")
         if active_role == "PLAN":
             return no("PLAN is already the active role.")
         if renewal_blocked:

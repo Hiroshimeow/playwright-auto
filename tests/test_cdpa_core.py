@@ -289,6 +289,83 @@ def test_workflow_role_subset_is_canonical_and_exact_team_reuse_inherits(tmp_pat
     assert set(store.load(legacy["manifest_path"])["roles"]) == set(config.roles)
 
 
+def test_dev_review_team_starts_with_dev_and_review_closes(tmp_path: Path):
+    from playwright_auto.cdpa_commands import workflow_control_eligibility
+    from playwright_auto.cdpa_prompts import PromptBuilder
+    from playwright_auto.cdpa_routes import RouteContractError, parse_route_response
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_task(
+        "dev review only",
+        requested_team="duo",
+        task_id="task-dev-review",
+        roles=("REVIEW", "DEV"),
+    )
+    assert list(state["roles"]) == ["DEV", "REVIEW"]
+    assert state["active_role"] == "DEV"
+    assert state["hops"][0]["target_role"] == "DEV"
+    assert state["roles"]["DEV"]["status"] == "pending"
+    assert workflow_control_eligibility(state, "route_plan")["eligible"] is False
+
+    review_first = store.create_task(
+        "dev review starting at review",
+        requested_team="duo-review",
+        task_id="task-dev-review-start",
+        roles=("DEV", "REVIEW"),
+        start_role="review",
+    )
+    assert list(review_first["roles"]) == ["DEV", "REVIEW"]
+    assert review_first["active_role"] == "REVIEW"
+    assert review_first["hops"][0]["target_role"] == "REVIEW"
+    assert review_first["roles"]["REVIEW"]["status"] == "pending"
+    assert review_first["roles"]["DEV"]["status"] == "unallocated"
+    with pytest.raises(ValueError, match="start_role must be one of the selected"):
+        store.create_task(
+            "unselected start",
+            requested_team="duo-bad-start",
+            task_id="task-dev-review-bad-start",
+            roles=("DEV", "REVIEW"),
+            start_role="PLAN",
+        )
+
+    with pytest.raises(ValueError, match="must include PLAN or REVIEW"):
+        store.create_task(
+            "no closer",
+            requested_team="no-closer",
+            task_id="task-no-closer",
+            roles=("DEV", "TEST"),
+        )
+
+    allowed = ("DEV", "REVIEW", "PAUSE", "DONE")
+    done = '{"route":"DONE","handoff":"r.md"}'
+    assert parse_route_response(done, source_role="REVIEW", allowed_routes=allowed).route == "DONE"
+    with pytest.raises(RouteContractError, match="only REVIEW may route DONE"):
+        parse_route_response(done, source_role="DEV", allowed_routes=allowed)
+    with pytest.raises(RouteContractError, match="only PLAN may route DONE"):
+        parse_route_response(
+            done, source_role="REVIEW", allowed_routes=("PLAN", "DEV", "REVIEW", "PAUSE", "DONE")
+        )
+
+    common = dict(
+        task_title="dev review only",
+        task_id="task-dev-review",
+        team="duo",
+        turn=1,
+        allowed_routes=allowed,
+        workspace=str(tmp_path),
+        source_physical_role=None,
+        handoff="handoff",
+        goal="goal",
+        expected_report_path=".plan/duo/r.md",
+    )
+    review = PromptBuilder(config).build(logical_role="REVIEW", physical_role="duo-review", **common)
+    dev = PromptBuilder(config).build(logical_role="DEV", physical_role="duo-dev", **common)
+    assert '"route":"DEV|REVIEW|DONE"' in review.text
+    assert "Clean work routes DONE when acceptance is satisfied" in review.text
+    assert '"route":"DEV|REVIEW"' in dev.text
+
+
 def test_task_bootstrap_snapshot_is_optional_immutable_and_validated(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)

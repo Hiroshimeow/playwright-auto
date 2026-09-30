@@ -122,6 +122,7 @@ def submit_task(
     solo_role: str | None = None,
     goal: str | None = None,
     conversation_url: str | None = None,
+    roles: Sequence[str] = (),
 ) -> Mapping[str, Any]:
     mode = str(workflow_mode or "team").strip().lower()
     if mode == "solo":
@@ -160,6 +161,8 @@ def submit_task(
         "depends_on_task_ids": list(depends_on_task_ids),
         "upload_paths": [str(Path(path).expanduser().resolve()) for path in upload_paths],
     }
+    if roles:
+        payload["roles"] = list(roles)
     if repository is not None:
         payload["repository"] = str(repository.expanduser().resolve())
     if temporary:
@@ -722,6 +725,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--new-all", action="store_true", help="reset every selected role lazily once")
     parser.add_argument("--team", default=None, help="new-task team base or exact team to resume")
     parser.add_argument(
+        "--roles",
+        default=None,
+        help="comma-separated Team Task roles, e.g. DEV,REVIEW; must include PLAN or REVIEW",
+    )
+    parser.add_argument(
         "--solo",
         metavar="ROLE",
         default=None,
@@ -818,11 +826,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("provide task text either positionally or with --task, not both")
         task = str(args.task_option or args.task or "").strip()
         new_roles = parse_new_roles(args.new_roles)
+        team_roles = parse_new_roles(args.roles)
         dependencies = parse_dependency_ids(args.depends_on)
         existing_solo = bool(args.solo and args.conversation_url)
         if task or existing_solo:
             if args.solo and (
                 new_roles
+                or team_roles
                 or args.new_all
                 or args.temp
                 or dependencies
@@ -854,6 +864,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 solo_role=args.solo,
                 goal=args.goal,
                 conversation_url=args.conversation_url,
+                roles=team_roles,
             )
             mode = "created"
         else:
@@ -870,9 +881,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "--temp and --browser are invalid in taskless resume mode; "
                     "--solo, --goal, and --conversation-url are also invalid"
                 )
-            if new_roles or args.new_all or dependencies or args.upload:
+            if new_roles or team_roles or args.new_all or dependencies or args.upload:
                 raise ValueError(
-                    "--new, --new-all, --depends-on, and --upload are invalid in taskless resume mode"
+                    "--new, --roles, --new-all, --depends-on, and --upload are invalid in taskless resume mode"
                 )
             state = resume_task(
                 config,
