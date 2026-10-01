@@ -91,6 +91,7 @@ def parse_route_response(
     *,
     source_role: str | None = None,
     allowed_routes: Sequence[str] | None = None,
+    closing_role: str | None = None,
     allow_non_plan_done: bool = False,
 ) -> RouteDecision:
     source = str(text).strip()
@@ -126,13 +127,17 @@ def parse_route_response(
         raise RouteContractError(f"unsupported route {route!r}")
     if not handoff:
         raise RouteContractError("handoff must not be empty")
-    closing_role = workflow_closing_role(allowed) or "PLAN"
+    effective_closing_role = (
+        validate_workflow_route_key(closing_role)
+        if closing_role is not None
+        else (workflow_closing_role(allowed) or "PLAN")
+    )
     if (
         route == "DONE"
         and not allow_non_plan_done
-        and str(source_role or "").strip().upper() != closing_role
+        and str(source_role or "").strip().upper() != effective_closing_role
     ):
-        raise RouteContractError(f"only {closing_role} may route DONE")
+        raise RouteContractError(f"only {effective_closing_role} may route DONE")
     return RouteDecision(route, handoff)
 
 
@@ -198,6 +203,7 @@ def parse_role_response(
     source_role: str,
     report_mode: str = "file",
     allowed_routes: Sequence[str] | None = None,
+    closing_role: str | None = None,
     allow_non_plan_done: bool = False,
 ) -> ParsedRoleResponse:
     mode = str(report_mode).strip().lower()
@@ -213,6 +219,7 @@ def parse_role_response(
                 text,
                 source_role=source_role,
                 allowed_routes=allowed_routes,
+                closing_role=closing_role,
                 allow_non_plan_done=allow_non_plan_done,
             ),
             None,
@@ -222,6 +229,7 @@ def parse_role_response(
         route_source,
         source_role=source_role,
         allowed_routes=allowed_routes,
+        closing_role=closing_role,
         allow_non_plan_done=allow_non_plan_done,
     )
     if decision.handoff != "INLINE":

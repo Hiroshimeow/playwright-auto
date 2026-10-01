@@ -49,7 +49,7 @@ def test_alternating_routes_do_not_trigger_context_rotation(tmp_path):
     )
 
 
-def test_route_churn_is_bounded_only_by_durable_execution_budget(tmp_path):
+def test_route_churn_is_bounded_by_gate_a_route_budget_before_execution_budget(tmp_path):
     _, _, state, worker = setup_task(
         tmp_path,
         task_id="task-route-churn-budget",
@@ -63,17 +63,17 @@ def test_route_churn_is_bounded_only_by_durable_execution_budget(tmp_path):
             break
 
     assert state["status"] == "BLOCKED"
-    assert state["block_code"] == "autonomous_execution_budget_exhausted"
+    assert state["block_code"] == "ROUTE_BUDGET_EXHAUSTED"
     assert state["block_retryable"] is False
-    assert source["state"] == "routed"
-    assert source["route"] == routes[-1]
-    assert state["active_hop_id"] == 12
-    assert state["execution_budget"]["charged_hop_ids"] == list(range(1, 13))
-    assert len(state["hops"]) == 12
-    assert RequestLedger(source["ledger_path"]).peek(f"{state['task_id']}-hop13") is None
+    assert state["route_seq"] == state["max_routes"] == 8
+    assert source["state"] == "responded"
+    assert state["active_hop_id"] == 9
+    assert len(state["hops"]) == 9
+    assert len(state["execution_budget"]["charged_hop_ids"]) < 12
+    assert RequestLedger(source["ledger_path"]).peek(f"{state['task_id']}-hop10") is None
 
 
-def test_execution_budget_survives_manifest_reload_without_double_charge(tmp_path):
+def test_route_budget_survives_manifest_reload_without_double_charge(tmp_path):
     config, store, state, worker = setup_task(
         tmp_path,
         task_id="task-budget-restart-stable",
@@ -83,21 +83,22 @@ def test_execution_budget_survives_manifest_reload_without_double_charge(tmp_pat
 
     for route in ("DEV", "REVIEW", "DEV", "REVIEW", "DEV"):
         _accept_route(worker, state, route)
+    assert state["route_seq"] == 5
     store.save(path, state)
     reloaded = store.load(path)
     restarted = CDPAWorker(config, store=store)
 
+    assert reloaded["route_seq"] == 5
     assert reloaded["execution_budget"]["charged_hop_ids"] == list(range(1, 7))
-    for route in ("REVIEW", "DEV", "REVIEW", "DEV", "REVIEW", "DEV"):
-        _accept_route(restarted, reloaded, route)
+    for route in ("REVIEW", "DEV", "REVIEW", "DEV"):
+        final = _accept_route(restarted, reloaded, route)
+        if reloaded["status"] == "BLOCKED":
+            break
 
-    assert reloaded["status"] == "RUNNING"
-    assert reloaded["active_hop_id"] == 12
-    assert reloaded["execution_budget"]["charged_hop_ids"] == list(range(1, 13))
-
-    final = _accept_route(restarted, reloaded, "REVIEW")
     assert reloaded["status"] == "BLOCKED"
-    assert reloaded["active_hop_id"] == 12
-    assert final["state"] == "routed"
-    assert len(reloaded["execution_budget"]["charged_hop_ids"]) == 12
-    assert RequestLedger(final["ledger_path"]).peek(f"{reloaded['task_id']}-hop13") is None
+    assert reloaded["block_code"] == "ROUTE_BUDGET_EXHAUSTED"
+    assert reloaded["route_seq"] == reloaded["max_routes"] == 8
+    assert reloaded["active_hop_id"] == 9
+    assert final["state"] == "responded"
+    assert len(reloaded["execution_budget"]["charged_hop_ids"]) == 9
+    assert RequestLedger(final["ledger_path"]).peek(f"{reloaded['task_id']}-hop10") is None

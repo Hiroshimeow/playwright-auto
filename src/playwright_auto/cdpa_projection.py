@@ -273,6 +273,8 @@ def _roles(
                 "browser_endpoint_id": role_endpoint,
                 "last_endpoint_id": str(value.get("last_endpoint_id") or "").strip() or None,
                 "status": str(value.get("status") or "unknown"),
+                "slot_state": str(value.get("slot_state") or "materialized"),
+                "materialized_at": value.get("materialized_at"),
                 "turn": int(value.get("turn") or 0),
                 "online": online,
                 "chat_url": _public_chat_url(
@@ -534,6 +536,8 @@ def _report_rows(
         encoded = str(content).encode("utf-8") if content is not None else None
         public_row = {
             "report_id": report_id,
+            "material_id": report_id,
+            "material_url": f"/api/report/{task_id}/{report_id}",
             "physical_role": str(report.get("physical_role") or "") or None,
             "role": str(report.get("role") or "") or None,
             "turn": report.get("turn"),
@@ -1059,6 +1063,63 @@ def build_task_projection(
             recover_routed_hops=True,
         )
     maintenance_reports, maintenance_private = _maintenance_reports(raw)
+    raw_materials = raw.get("materials") if isinstance(raw.get("materials"), Mapping) else {}
+    materials_private = {
+        str(material_id): dict(locator)
+        for material_id, locator in raw_materials.items()
+        if isinstance(locator, Mapping)
+    }
+    materials_public = [
+        {
+            "material_id": material_id,
+            "source_kind": locator.get("source_kind"),
+            "material_type": locator.get("material_type"),
+            "version": locator.get("version"),
+            "content_length": locator.get("content_length"),
+            "url": f"/api/report/{task_id}/{material_id}",
+        }
+        for material_id, locator in materials_private.items()
+    ]
+    existing_material_ids = {
+        str(item.get("material_id") or item.get("report_id") or "")
+        for item in reports
+        if isinstance(item, Mapping)
+    }
+    role_records = raw.get("roles") if isinstance(raw.get("roles"), Mapping) else {}
+    for material_id, locator in materials_private.items():
+        if material_id in existing_material_ids:
+            continue
+        material_type = str(locator.get("material_type") or "").strip().lower()
+        if material_type not in {"report", "handoff"}:
+            continue
+        role_key = str(locator.get("role_key") or raw.get("active_role") or "").strip().upper() or None
+        role_record = role_records.get(role_key) if role_key else None
+        reports.append(
+            {
+                "report_id": material_id,
+                "material_id": material_id,
+                "material_url": f"/api/report/{task_id}/{material_id}",
+                "physical_role": (
+                    str(role_record.get("physical_role") or "") or None
+                    if isinstance(role_record, Mapping)
+                    else None
+                ),
+                "role": role_key,
+                "turn": locator.get("turn") or (
+                    role_record.get("turn") if isinstance(role_record, Mapping) else None
+                ),
+                "created_at": locator.get("created_at") or raw.get("updated_at"),
+                "summary": f"{material_type} · {str(locator.get('source_kind') or 'inline')}",
+                "outcome": None,
+                "source_task_id": task_id,
+                "generation": None,
+                "availability": "available",
+                "source_kind": locator.get("source_kind"),
+                "material_type": material_type,
+                "version": locator.get("version"),
+                "content_length": locator.get("content_length"),
+            }
+        )
     timeline = _timeline(raw)
     public_waiting_reason = _public_text(raw.get("waiting_reason"), max_chars=500) or None
     if public_waiting_reason:
@@ -1197,7 +1258,25 @@ def build_task_projection(
         "queue_position": queue.get("position"),
         "queue_length": queue.get("length"),
         "roles": compact_roles,
-        "has_reports": bool(reports or maintenance_reports),
+        "submitted_roles": [str(item) for item in raw.get("submitted_roles") or []],
+        "initial_roles": [
+            str(item)
+            for item in (
+                raw.get("initial_roles")
+                or (list((raw.get("roles") or {}).keys()) if isinstance(raw.get("roles"), Mapping) else [])
+            )
+        ],
+        "reachable_roles": [str(item) for item in raw.get("reachable_roles") or []],
+        "start_role": str(raw.get("start_role") or "") or None,
+        "closing_role": str(raw.get("closing_role") or "") or None,
+        "route_seq": int(raw.get("route_seq") or 0),
+        "max_routes": int(raw.get("max_routes") or 0) if "max_routes" in raw else None,
+        "max_route_repairs": (
+            int(raw.get("max_route_repairs") or 0)
+            if "max_route_repairs" in raw
+            else None
+        ),
+        "has_reports": bool(reports or maintenance_reports or materials_public),
         "task_title": title,
         "version": 0,
     }
@@ -1382,6 +1461,12 @@ def build_task_projection(
         "timeline": timeline[:50],
         "timeline_total": len(timeline),
         "reports": reports,
+        "materials": materials_public,
+        "role_slots": _public_value(dict(raw.get("role_slots") or {})),
+        "route_contract_id": str(raw.get("route_contract_id") or "") or None,
+        "self_route_policy": _public_value(raw.get("self_route_policy") or {}),
+        "self_route_counts": _public_value(raw.get("self_route_counts") or {}),
+        "route_repair_count": int(raw.get("route_repair_count") or 0),
         "independent_history": independent_history,
         "maintenance_reports": maintenance_reports,
         "depends_on_task_ids": [str(item) for item in raw.get("depends_on_task_ids") or []],
@@ -1436,6 +1521,7 @@ def build_task_projection(
         "manifest_path": str(raw.get("manifest_path") or ""),
         "repository": str(raw.get("repository") or ""),
         "reports": report_private,
+        "materials": materials_private,
         "maintenance_reports": maintenance_private,
         "timeline": timeline,
     }

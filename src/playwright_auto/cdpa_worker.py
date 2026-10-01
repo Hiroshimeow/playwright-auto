@@ -52,6 +52,7 @@ from .cdpa_browser_projection import build_browser_projection
 from .cdpa_endpoint_pool import EndpointPool
 from .cdpa_endpoints import normalize_endpoint_record
 from .cdpa_managed_browser import ManagedBrowserLifecycle
+from .cdpa_materials import register_material
 from .cdpa_independent import (
     BUILTIN_MAINTAINERS_PROMPT,
     BUILTIN_MONITOR_PROMPT,
@@ -88,6 +89,12 @@ from .cdpa_response import (
     start_wait_budget,
 )
 from .cdpa_safety import sanitize_exception, sanitize_text, sanitize_value
+from .cdpa_route_contract import (
+    RoutePolicyError,
+    apply_valid_route_transition,
+    build_route_contract,
+    route_repair_budget_exhausted,
+)
 from .cdpa_routes import (
     InlineReportMaterializationError,
     RouteContractError,
@@ -108,7 +115,11 @@ from .cdpa_store import (
 from .cdpa_team import cleanup_eligible, has_other_nonterminal_team_work
 from .role_indicator import WINDOW_NAME_PREFIX
 from .observability import append_live_event, configure_live_event_log
-from .cdpa_workflow_agents import task_workflow_definitions, workflow_closing_role
+from .cdpa_workflow_agents import (
+    semantic_routes_from_workflow_definitions,
+    task_workflow_definitions,
+    workflow_closing_role,
+)
 from .chatgpt import (
     ChatGPTAutomationError,
     ChatGPTPage,
@@ -545,6 +556,67 @@ class CDPAWorker:
         self._manifest_cache: dict[
             Path, tuple[tuple[int, int, int, int], dict[str, Any]]
         ] = {}
+
+    def _frozen_route_contract(
+        self, state: Mapping[str, Any], role: str
+    ) -> Any | None:
+        if not str(state.get("route_contract_id") or "").strip():
+            return None
+        return build_route_contract(
+            current_role=role,
+            reachable_roles=tuple(state.get("reachable_roles") or ()),
+            closing_role=state.get("closing_role"),
+            semantic_routes=state.get("semantic_routes") or {},
+            route_contract_id=state.get("route_contract_id"),
+            max_routes=state.get("max_routes"),
+            route_seq=state.get("route_seq", 0),
+            max_route_repairs=state.get("max_route_repairs", self.config.route_repair_attempts),
+            repair_count=state.get("route_repair_count", 0),
+            self_route_policy=state.get("self_route_policy", "forbidden"),
+            self_route_counts=state.get("self_route_counts") or {},
+        )
+
+    def _gate_a_route_contract(
+        self, state: Mapping[str, Any], role: str
+    ) -> Any | None:
+        """Build the frozen Gate-A route contract for a new TeamTask.
+
+        Legacy manifests without a route_contract_id keep their existing route path.
+        New manifests compare the frozen semantic snapshot with the current prompt
+        configuration before any Send can be prepared.
+        """
+        if not str(state.get("route_contract_id") or "").strip():
+            return None
+        reachable = tuple(state.get("reachable_roles") or ())
+        if not reachable:
+            raise RoutePolicyError(
+                "ROUTE_CONTRACT_INVALID", "Gate-A task is missing reachable_roles"
+            )
+        try:
+            current_definitions = self.store.workflow_agents.resolve_for_task(reachable)
+        except ValueError as exc:
+            raise RoutePolicyError(
+                "ROUTE_CONTRACT_DRIFT",
+                "reachable role prompt/template definition changed after task creation",
+            ) from exc
+        current_semantic_all = semantic_routes_from_workflow_definitions(current_definitions)
+        current_semantic = {
+            role_key: dict(current_semantic_all.get(role_key, {}))
+            for role_key in reachable
+        }
+        return build_route_contract(
+            current_role=role,
+            reachable_roles=reachable,
+            closing_role=state.get("closing_role"),
+            semantic_routes=current_semantic,
+            route_contract_id=state.get("route_contract_id"),
+            max_routes=state.get("max_routes"),
+            route_seq=state.get("route_seq", 0),
+            max_route_repairs=state.get("max_route_repairs", self.config.route_repair_attempts),
+            repair_count=state.get("route_repair_count", 0),
+            self_route_policy=state.get("self_route_policy", "forbidden"),
+            self_route_counts=state.get("self_route_counts") or {},
+        )
 
     @staticmethod
     def _manifest_identity(path: Path) -> tuple[int, int, int, int]:
@@ -5711,6 +5783,18 @@ class CDPAWorker:
         await self._admission_preflight(state, actions)
         self._normalize_legacy_pre_send_report_mode(state, hop)
         role = str(hop["target_role"])
+        route_contract = None
+        if str(state.get("workflow_mode") or "team").strip().lower() == "team":
+            try:
+                route_contract = self._gate_a_route_contract(state, role)
+            except RoutePolicyError as exc:
+                self._block(
+                    state,
+                    exc.message,
+                    code=exc.code,
+                    retryable=False,
+                )
+                return
         if self._attachment_files_for_generation(state, role) is None:
             return
         route_repair_owned = None
@@ -6144,7 +6228,11 @@ class CDPAWorker:
             in {"bootstrap_donor", "bootstrap_native", "bootstrap_ui"}
             and generation == 1
         )
-        allowed_routes = tuple(workflow_definitions) + ("PAUSE", "DONE")
+        allowed_routes = (
+            route_contract.allowed_routes
+            if route_contract is not None
+            else tuple(workflow_definitions) + ("PAUSE", "DONE")
+        )
         if hop.get("kind") in {"route_repair", "report_repair"} and (
             acquired.new_chat or (acquired.created and role_record.get("last_endpoint_id"))
         ):
@@ -6167,6 +6255,15 @@ class CDPAWorker:
                 # Legacy persisted fresh fallbacks may still contain executable context.
                 # Keep donor/endpoint audit evidence, never re-inject abandoned instructions.
                 recovery_metadata.pop("prewarm_context", None)
+        if route_contract is not None:
+            contract_context = "ROUTE_CONTRACT\n" + "\n".join(
+                route_contract.prompt_route_lines()
+            )
+            bounded_context = (
+                bounded_context + "\n\n" + contract_context
+                if bounded_context
+                else contract_context
+            )
         if hop.get("kind") == "route_repair":
             bounded_context = ""  # Format repair never reintroduces the original goal or handoff.
             repair_prompt = self.prompts.repair(
@@ -6216,6 +6313,9 @@ class CDPAWorker:
                 physical_role=str(hop["physical_role"]),
                 turn=int(hop["turn"]),
                 allowed_routes=allowed_routes,
+                closing_role=(
+                    str(state.get("closing_role") or "") or None
+                ),
                 workspace=str(state["repository"]),
                 source_physical_role=source_physical,
                 handoff=str(hop["handoff"]),
@@ -6760,12 +6860,17 @@ class CDPAWorker:
         remote_repository = remote_repository_from_task(task_text)
         if remote_repository is None or _report_mode(state) == "inline":
             return
+        route_contract = self._frozen_route_contract(state, str(hop["target_role"]))
         parsed = parse_role_response(
             response_text,
             source_role=str(hop["target_role"]),
             report_mode=_report_mode(state),
-            allowed_routes=tuple(task_workflow_definitions(state, self.config))
-            + ("PAUSE", "DONE"),
+            allowed_routes=(
+                route_contract.allowed_routes
+                if route_contract is not None
+                else tuple(task_workflow_definitions(state, self.config)) + ("PAUSE", "DONE")
+            ),
+            closing_role=(str(state.get("closing_role") or "") or None),
         )
         if parsed.inline_report is not None:
             return
@@ -6855,12 +6960,17 @@ class CDPAWorker:
                 allow_non_plan_done=True,
             )
             return
+        route_contract = self._frozen_route_contract(state, role)
         parse_role_response(
             response.text,
             source_role=role,
             report_mode=_report_mode(state),
-            allowed_routes=tuple(task_workflow_definitions(state, self.config))
-            + ("PAUSE", "DONE"),
+            allowed_routes=(
+                route_contract.allowed_routes
+                if route_contract is not None
+                else tuple(task_workflow_definitions(state, self.config)) + ("PAUSE", "DONE")
+            ),
+            closing_role=(str(state.get("closing_role") or "") or None),
         )
 
     @staticmethod
@@ -7516,15 +7626,29 @@ class CDPAWorker:
         if decision is not None:
             hop["validation_route"] = decision.route
             hop["validation_handoff"] = decision.handoff
-        attempt = int(hop.get("repair_attempt") or 0) + 1
-        if attempt > self.config.route_repair_attempts:
-            self._block(
-                state,
-                f"route repair exhausted: {error}",
-                code="route_validation_exhausted",
-                retryable=True,
-            )
-            return
+        gate_a = bool(str(state.get("route_contract_id") or "").strip())
+        if gate_a:
+            consumed = int(state.get("route_repair_count") or 0)
+            if route_repair_budget_exhausted(state):
+                self._block(
+                    state,
+                    f"route repair exhausted: {error}",
+                    code="ROUTE_VALIDATION_EXHAUSTED",
+                    retryable=False,
+                )
+                return
+            attempt = consumed + 1
+            state["route_repair_count"] = attempt
+        else:
+            attempt = int(hop.get("repair_attempt") or 0) + 1
+            if attempt > self.config.route_repair_attempts:
+                self._block(
+                    state,
+                    f"route repair exhausted: {error}",
+                    code="route_validation_exhausted",
+                    retryable=True,
+                )
+                return
         role = str(hop["target_role"])
         hop["state"] = "routed"
         hop["route"] = role
@@ -7641,13 +7765,20 @@ class CDPAWorker:
         legacy_inline = response_mode == "inline"
         decision = None
         inline_report = None
+        route_contract = None
         try:
+            route_contract = self._frozen_route_contract(state, role)
+            response_allowed_routes = (
+                route_contract.allowed_routes
+                if route_contract is not None
+                else tuple(task_workflow_definitions(state, self.config)) + ("PAUSE", "DONE")
+            )
             parsed = parse_role_response(
                 str(hop.get("response") or ""),
                 source_role=role,
                 report_mode=response_mode,
-                allowed_routes=tuple(task_workflow_definitions(state, self.config))
-                + ("PAUSE", "DONE"),
+                allowed_routes=response_allowed_routes,
+                closing_role=(str(state.get("closing_role") or "") or None),
             )
             decision = parsed.decision
             inline_report = parsed.inline_report
@@ -7722,6 +7853,14 @@ class CDPAWorker:
                 report_path = evidence.path
                 report_sha256 = evidence.sha256
                 report_size = evidence.size
+        except RoutePolicyError as exc:
+            self._block(
+                state,
+                exc.message,
+                code=exc.code,
+                retryable=False,
+            )
+            return
         except InlineReportMaterializationError:
             self._block(
                 state,
@@ -7731,6 +7870,18 @@ class CDPAWorker:
             )
             return
         except (RouteContractError, ValueError, OSError) as exc:
+            if (
+                decision is None
+                and route_contract is not None
+                and route_contract.budget_exhausted
+            ):
+                self._block(
+                    state,
+                    "route budget is exhausted; closing role may emit DONE only",
+                    code="ROUTE_BUDGET_EXHAUSTED",
+                    retryable=False,
+                )
+                return
             if legacy_inline:
                 options = state.get("options")
                 if isinstance(options, dict):
@@ -7754,6 +7905,20 @@ class CDPAWorker:
             }
         )
         hop["timestamps"]["routed_at"] = utc_now()
+        register_material(
+            state,
+            source_kind="route_json",
+            material_type="handoff",
+            version=str(state.get("route_contract_id") or f"hop-{hop['hop_id']}"),
+            content=json.dumps(
+                {"route": decision.route, "handoff": routed_handoff},
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            mime_type="application/json",
+            role_key=role,
+            material_id=f"handoff-hop-{hop['hop_id']}",
+        )
         if not any(
             item.get("path") == report_path
             and item.get("role") == role
@@ -7789,6 +7954,8 @@ class CDPAWorker:
         state["block_reason"] = None
         state["pause_reason"] = None
         if decision.route == "DONE":
+            if route_contract is not None:
+                state["route_repair_count"] = 0
             state["status"] = "DONE"
             state["terminal_state"] = "DONE"
             state["kanban_column"] = "DONE_STOPPED"
@@ -7805,6 +7972,22 @@ class CDPAWorker:
             state["active_hop_id"] = hop["hop_id"]
             state["active_action"] = "paused"
             return
+        if route_contract is not None:
+            try:
+                apply_valid_route_transition(
+                    state,
+                    source_role=role,
+                    target_role=decision.route,
+                    materialized_at=utc_now(),
+                )
+            except RoutePolicyError as exc:
+                self._block(
+                    state,
+                    exc.message,
+                    code=exc.code,
+                    retryable=False,
+                )
+                return
         if self._execution_budget_exhausted(state):
             self._block(
                 state,
@@ -11769,6 +11952,16 @@ class CDPAWorker:
                             if "roles" in payload
                             else None
                         ),
+                        route_targets=tuple(payload.get("route_targets") or ()),
+                        closing_role=payload.get("closing_role") or None,
+                        provider_id=str(payload.get("provider_id") or "chatgpt_web"),
+                        max_routes=int(payload.get("max_routes", 8)),
+                        max_route_repairs=(
+                            int(payload["max_route_repairs"])
+                            if "max_route_repairs" in payload
+                            else None
+                        ),
+                        self_route_policy=payload.get("self_route_policy", "forbidden"),
                         new_roles=tuple(payload.get("new_roles") or ()),
                         new_all=bool(payload.get("new_all")),
                         repository=self._repository_allowed(payload.get("repository")),
@@ -12132,6 +12325,8 @@ class CDPAWorker:
                     role=payload.get("role"),
                     reason=payload.get("reason"),
                     confirmed=bool(payload.get("confirmed")),
+                    max_routes=payload.get("max_routes"),
+                    max_route_repairs=payload.get("max_route_repairs"),
                     external_command_id=command_id,
                 )
                 if self.runtime_degraded:

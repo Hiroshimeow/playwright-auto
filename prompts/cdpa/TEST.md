@@ -8,4 +8,4 @@ Distinguish `PASS`, `FAIL`, `INCOMPLETE`, and `NOT_MEASURED`. Unavailable, unsaf
 
 If repository truth or the PLAN contract makes the expected result materially ambiguous, report the conflict rather than inventing an oracle.
 
-Route reproducible implementation failures to DEV. Route verified acceptance evidence, contract/evidence ambiguity, or non-implementation gaps to PLAN. Use PAUSE only when a genuine unresolved external/manual prerequisite prevents the required observation and no legal in-task verification remains. `DONE` remains PLAN-only.
+Route reproducible implementation failures to DEV. Route verified acceptance evidence, contract/evidence ambiguity, or non-implementation gaps to PLAN. Use PAUSE only when a genuine unresolved external/manual prerequisite prevents the required observation and no legal in-task verification remains. Use `DONE` only when the per-turn RouteContract declares this role as `closing_role`.

@@ -4,4 +4,4 @@ Research and verify repository truth before deciding scope. Do not implement. Lo
 
 Turn the Goal into a concrete DEV contract: identify the existing owner and current behavior; classify each requirement as PRESERVE, COMPLETE, or FIX; name exact files or boundaries, required invariants, acceptance evidence, non-goals, dependencies, and any safe fallback. Resolve material uncertainty instead of planning from assumption.
 
-Assess reports and evidence truthfully. Missing or unavailable proof is `INCOMPLETE` or `NOT_MEASURED`, never PASS. Route actionable implementation to DEV, independent runtime verification to TEST, and unresolved external prerequisites to PAUSE. Only PLAN may route `DONE`, and only when acceptance is proven and required artifacts are complete.
+Assess reports and evidence truthfully. Missing or unavailable proof is `INCOMPLETE` or `NOT_MEASURED`, never PASS. Route actionable implementation to DEV, independent runtime verification to TEST, and unresolved external prerequisites to PAUSE. Use `DONE` only when the per-turn RouteContract declares this role as `closing_role`, and only when acceptance is proven and required artifacts are complete.

@@ -1,7 +1,7 @@
-# Quickstart: HCUW Runtime V2 Skeleton
+﻿# Quickstart: HCUW Runtime V2 Skeleton
 
 **Feature**: HCUW Runtime V2 Skeleton
-**Status**: Draft - review before implementation
+**Status**: Implemented skeleton validation
 
 This guide defines how the minimal web/API skeleton should be validated after implementation. It is intentionally written before implementation so the operator can review the target behavior.
 
@@ -30,7 +30,7 @@ After approval and implementation, start API server:
 
 ```powershell
 cd C:\Users\DuongNH66\Desktop\git\cdpa
-uv run python -m playwright_auto.hcuw_runtime.cli start-api --host 127.0.0.1 --port 9227
+uv run python -m playwright_auto.hcuw_runtime.cli start-api
 ```
 
 In another shell:
@@ -40,6 +40,8 @@ Invoke-RestMethod http://127.0.0.1:9227/api/health
 Invoke-RestMethod http://127.0.0.1:9227/api/config
 Invoke-RestMethod http://127.0.0.1:9227/api/runs
 Invoke-RestMethod http://127.0.0.1:9227/api/endpoints
+Invoke-RestMethod http://127.0.0.1:9227/api/audit/snapshot
+Invoke-RestMethod http://127.0.0.1:9227/api/audit/events?since=0
 ```
 
 Expected:
@@ -58,7 +60,7 @@ Start dashboard server:
 
 ```powershell
 cd C:\Users\DuongNH66\Desktop\git\cdpa
-uv run python -m playwright_auto.hcuw_runtime.cli start-dashboard --host 127.0.0.1 --port 9226 --api http://127.0.0.1:9227
+uv run python -m playwright_auto.hcuw_runtime.cli start-dashboard
 ```
 
 Open:
@@ -75,6 +77,7 @@ Expected visible UI:
 - Endpoints table.
 - Diagnostics panel.
 - Manual refresh button.
+- Realtime Observation Audit panels for DOM, Mutation, LISTEN, and Actions.
 - Last refresh timestamp.
 
 Expected network behavior:
@@ -119,6 +122,8 @@ With existing CDP endpoints configured, call:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:9227/api/endpoints
+Invoke-RestMethod http://127.0.0.1:9227/api/audit/snapshot
+Invoke-RestMethod http://127.0.0.1:9227/api/audit/events?since=0
 ```
 
 Expected:
@@ -164,4 +169,4 @@ git diff --check
 
 ## Stop Rule
 
-This quickstart does not authorize implementation. It defines future validation once the operator approves the plan.
+This quickstart validates the implemented runtime-v2 skeleton. Later send/bind/route work still requires a separate approved feature.

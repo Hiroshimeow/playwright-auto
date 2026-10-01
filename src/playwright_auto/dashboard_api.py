@@ -26,6 +26,11 @@ from .cdpa_commands import RepairRequest
 from .cdpa_config import CDPAConfig, declared_repository_from_task, load_cdpa_config
 from .cdpa_endpoints import BrowserEndpointRegistry
 from .cdpa_identity import generate_idempotent_task_id, validate_task_id
+from .cdpa_materials import (
+    MaterialRefError,
+    bounded_material_payload,
+    missing_material_payload,
+)
 from .cdpa_independent import (
     normalize_agent_name,
     normalize_completion_request,
@@ -34,6 +39,7 @@ from .cdpa_independent import (
     normalize_system_prompt,
     validate_trigger_settings,
 )
+from .cdpa_role_policy import RolePolicyError, normalize_role_list
 from .cdpa_routes import effective_report_mode
 from .cdpa_runtime_db import IdempotencyConflict, RuntimeDB, RuntimeDBError
 from .observability import mcp_allow_click_summary, read_recent_live_events
@@ -41,7 +47,6 @@ from .live_stream import LiveEnvelope, LiveStreamHub
 from .cdpa_workflow_agents import (
     normalize_workflow_display_name,
     ordered_system_routes,
-    require_team_closing_role,
     validate_workflow_route_key,
 )
 
@@ -252,38 +257,10 @@ class DashboardAPI:
         return tuple(routes) or ordered_system_routes(self.config)
 
     def _workflow_roles(self, value: object) -> list[str]:
-        raw_roles = self._list(value, "roles")
-        roles: list[str] = []
-        for item in raw_roles:
-            if not isinstance(item, str) or not item.strip():
-                raise APIError(
-                    400,
-                    "invalid_request",
-                    "roles must contain non-empty strings",
-                )
-            roles.append(item.strip().upper())
-        if not roles:
-            raise APIError(400, "invalid_request", "roles must not be empty")
-        if len(set(roles)) != len(roles):
-            raise APIError(
-                400,
-                "invalid_request",
-                "roles must not contain duplicates",
-            )
-        available = self._active_workflow_routes()
-        unknown = set(roles) - set(available)
-        if unknown:
-            raise APIError(
-                400,
-                "invalid_request",
-                f"unknown workflow roles: {sorted(unknown)!r}",
-            )
         try:
-            require_team_closing_role(roles)
-        except ValueError as exc:
-            raise APIError(400, "invalid_request", str(exc)) from exc
-        selected = set(roles)
-        return [role for role in available if role in selected]
+            return list(normalize_role_list(self._list(value, "roles"), field="roles"))
+        except RolePolicyError as exc:
+            raise APIError(400, "invalid_request", exc.message) from exc
 
     def _bootstrap_definition(self, value: Any) -> dict[str, Any]:
         if not isinstance(value, Mapping):
@@ -334,6 +311,12 @@ class DashboardAPI:
             "requested_team",
             "reuse_team",
             "roles",
+            "route_targets",
+            "closing_role",
+            "provider_id",
+            "max_routes",
+            "max_route_repairs",
+            "self_route_policy",
             "new_roles",
             "new_all",
             "repository",
@@ -404,9 +387,48 @@ class DashboardAPI:
             ),
             "upload_paths": self._list(raw.get("upload_paths"), "upload_paths"),
         }
+        if "route_targets" in raw:
+            try:
+                route_targets = list(
+                    normalize_role_list(
+                        self._list(raw.get("route_targets"), "route_targets"),
+                        field="route_targets",
+                        allow_empty=True,
+                    )
+                )
+            except RolePolicyError as exc:
+                raise APIError(400, "invalid_request", exc.message) from exc
+            normalized["route_targets"] = route_targets
+        if "closing_role" in raw:
+            try:
+                normalized["closing_role"] = normalize_role_list(
+                    [raw.get("closing_role")], field="closing_role"
+                )[0]
+            except RolePolicyError as exc:
+                raise APIError(400, "invalid_request", exc.message) from exc
+        if "provider_id" in raw:
+            provider_id = raw.get("provider_id")
+            if not isinstance(provider_id, str) or not provider_id.strip():
+                raise APIError(400, "invalid_request", "provider_id must be a non-empty string")
+            normalized["provider_id"] = provider_id.strip()
+        for field, minimum in (("max_routes", 1), ("max_route_repairs", 0)):
+            if field not in raw:
+                continue
+            value = raw.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise APIError(400, "invalid_request", f"{field} must be an integer >= {minimum}")
+            normalized[field] = value
+        if "self_route_policy" in raw:
+            normalized["self_route_policy"] = raw.get("self_route_policy")
         if workflow_mode == "solo":
             conflicting = {
                 "roles",
+                "route_targets",
+                "closing_role",
+                "provider_id",
+                "max_routes",
+                "max_route_repairs",
+                "self_route_policy",
                 "reuse_team",
                 "new_roles",
                 "new_all",
@@ -1006,6 +1028,75 @@ class DashboardAPI:
         except IdempotencyConflict as exc:
             raise APIError(409, "idempotency_conflict", str(exc)) from exc
 
+    def report_material(self, task_id: str, material_id: str) -> dict[str, Any]:
+        validated_task_id = validate_task_id(task_id)
+        private = self.db.get_task_private(validated_task_id)
+        if private is None:
+            raise APIError(404, "task_not_found", "task does not exist")
+        materials = private.get("materials")
+        locator = materials.get(material_id) if isinstance(materials, Mapping) else None
+        if isinstance(locator, Mapping):
+            try:
+                return bounded_material_payload(
+                    task_id=validated_task_id,
+                    material_id=material_id,
+                    locator=locator,
+                    content=locator.get("content") if "content" in locator else None,
+                )
+            except MaterialRefError as exc:
+                payload = missing_material_payload(
+                    task_id=validated_task_id, material_id=material_id
+                )
+                payload["error"] = {"code": exc.code, "message": exc.message}
+                return payload
+
+        reports = private.get("reports")
+        report_locator = reports.get(material_id) if isinstance(reports, Mapping) else None
+        if not isinstance(report_locator, Mapping):
+            return missing_material_payload(
+                task_id=validated_task_id, material_id=material_id
+            )
+        source_kind = "inline" if "content" in report_locator else "file"
+        material_locator = {
+            **dict(report_locator),
+            "source_kind": source_kind,
+            "material_type": "report",
+            "version": "v1",
+            "mime_type": "text/markdown",
+            "content_ref": (
+                str(report_locator.get("path") or "") or None
+                if source_kind == "file"
+                else None
+            ),
+        }
+        try:
+            content = (
+                str(report_locator.get("content") or "")
+                if source_kind == "inline"
+                else self.report_bytes(validated_task_id, material_id, maintenance=False)
+            )
+            return bounded_material_payload(
+                task_id=validated_task_id,
+                material_id=material_id,
+                locator=material_locator,
+                content=content,
+            )
+        except APIError as exc:
+            payload = bounded_material_payload(
+                task_id=validated_task_id,
+                material_id=material_id,
+                locator=material_locator,
+                content=None,
+            )
+            payload["error"] = {"code": exc.code, "message": exc.message}
+            return payload
+        except MaterialRefError as exc:
+            payload = missing_material_payload(
+                task_id=validated_task_id, material_id=material_id
+            )
+            payload["error"] = {"code": exc.code, "message": exc.message}
+            return payload
+
     def report_bytes(self, task_id: str, report_id: str, *, maintenance: bool) -> bytes:
         private = self.db.get_task_private(validate_task_id(task_id))
         if private is None:
@@ -1420,6 +1511,9 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                 headers={"Cache-Control": "no-store"},
             )
             return
+        if len(parts) == 4 and parts[:2] == ["api", "report"]:
+            self._json(200, app.report_material(parts[2], parts[3]))
+            return
         if len(parts) == 4 and parts[:2] == ["api", "reports"]:
             body = app.report_bytes(parts[2], parts[3], maintenance=False)
             self._send(200, body, content_type="text/markdown; charset=utf-8")
@@ -1626,17 +1720,45 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                             expected = int(expected)
                         except (TypeError, ValueError) as exc:
                             raise APIError(400, "invalid_request", "expected_task_version must be an integer") from exc
+                    control_payload = {
+                        "action": action,
+                        "role": raw.get("role"),
+                        "reason": raw.get("reason"),
+                        "confirmed": bool(raw.get("confirmed")),
+                    }
+                    if action == "increase_route_limits":
+                        allowed_fields = {
+                            "action",
+                            "expected_task_version",
+                            "max_routes",
+                            "max_route_repairs",
+                        }
+                        unknown_fields = set(raw) - allowed_fields
+                        if unknown_fields:
+                            raise APIError(
+                                400,
+                                "invalid_request",
+                                f"increase_route_limits has unsupported fields: {sorted(unknown_fields)!r}",
+                            )
+                        if "max_routes" not in raw and "max_route_repairs" not in raw:
+                            raise APIError(
+                                400,
+                                "invalid_request",
+                                "increase_route_limits requires max_routes and/or max_route_repairs",
+                            )
+                        for field in ("max_routes", "max_route_repairs"):
+                            if field not in raw:
+                                continue
+                            value = raw.get(field)
+                            if isinstance(value, bool) or not isinstance(value, int):
+                                raise APIError(400, "invalid_request", f"{field} must be an integer")
+                            control_payload[field] = value
                     command = app.enqueue(
                         idempotency_key=key,
                         kind="task_control",
                         task_id=task_id,
                         expected_task_version=expected,
-                        payload={
-                            "action": action,
-                            "role": raw.get("role"),
-                            "reason": raw.get("reason"),
-                            "confirmed": bool(raw.get("confirmed")),
-                        },
+                        payload=control_payload,
                     )
         self._json(
             202,

@@ -205,6 +205,8 @@ PLAN -> DEV -> REVIEW -> PLAN -> DONE
 
 TEST or AUDIT are opt-in when a runtime, restart, browser, destructive, environment-specific, cross-cutting, or otherwise unproven boundary needs independent evidence. PLAN alone may route `DONE`.
 
+A Team Task may select a role subset with `--roles` (for example `--roles DEV,REVIEW`). The first selected role in canonical order (`PLAN, DEV, TEST, REVIEW, AUDIT`) starts; a team without PLAN runs `DEV -> REVIEW -> DONE`, and REVIEW is then the only role that may route `DONE`. A team must include PLAN or REVIEW.
+
 Repository work uses HCUW as the durable engineering frame:
 
 1. Load `AGENTS.md`, `.agents/README.md`, and `.agents/rules/project.md` once; use `.hcu/profile.md` only when HCUW compatibility metadata is needed.

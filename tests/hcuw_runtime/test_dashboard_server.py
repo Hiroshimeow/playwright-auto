@@ -89,10 +89,14 @@ def test_dashboard_unknown_route_is_404(tmp_path: Path) -> None:
 def test_dashboard_team_task_form_and_task_table_show_roles_and_block_state(tmp_path: Path) -> None:
     text = response_text(DashboardServer(load_runtime_config(repository_root=tmp_path)).handle_get_path("/"))
 
-    assert 'name="team-role" value="DEV" checked' in text
-    assert 'name="team-role" value="REVIEW" checked' in text
-    assert 'name="team-role" value="PLAN">' in text
+    assert 'id="team-roles" value="DEV,REVIEW"' in text
+    assert 'id="route-targets"' in text
+    assert 'id="start-role"' in text
+    assert 'id="closing-role"' in text
+    assert "must include PLAN or REVIEW" not in text
     assert "payload.start_role = startRole" in text
+    assert "payload.closing_role = closingRole" in text
+    assert "payload.route_targets = routeTargets" in text
     for header in ("Roles", "Start role", "Status", "Block code", "Updated"):
         assert f"<th>{header}</th>" in text
     assert "item.latest ? 'current' : 'older'" in text

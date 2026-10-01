@@ -38,7 +38,7 @@ Normal Send, Resume, Wait, and Route are exact-execution-identity operations. Th
 
 Exactly-once Send is non-negotiable: persist request identity before the irreversible boundary, persist accepted provenance after it, and never resolve an accepted or ambiguous Send by blindly sending again. Manual drafts and attachments are operator-owned evidence.
 
-Role reports are file-backed under `.plan/<team>/...`; the worker owns durable task state. PLAN alone may close the workflow with `DONE`.
+Role reports are file-backed under `.plan/<team>/...`; the worker owns durable task state. PLAN alone may close the workflow with `DONE` (REVIEW closes a team selected without PLAN).
 
 ## Change discipline
 

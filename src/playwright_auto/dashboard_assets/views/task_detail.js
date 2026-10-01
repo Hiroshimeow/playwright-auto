@@ -89,6 +89,10 @@ function reportForInput(reports, input) {
   return reports.find(report => Number(report.turn) === turn) || null;
 }
 
+function reportSelectionKey(report) {
+  return report?.url || report?.material_url || null;
+}
+
 export function workflowReportModel(detail = {}, selectedRole = null, selectedReportUrl = null) {
   const roles = detail.roles || [];
   const physicalRoles = new Map(roles.map(role => [role.physical_role, role.logical_role]));
@@ -119,7 +123,9 @@ export function workflowReportModel(detail = {}, selectedRole = null, selectedRe
   const currentOrders = new Set(roleModels.filter(item => item.current).map(item => item.current._order));
   const olderReports = reports.filter(report => !currentOrders.has(report._order)).sort(reportSort);
   const newest = [...reports].sort(reportSort)[0] || null;
-  const explicit = selectedReportUrl ? reports.find(report => report.url === selectedReportUrl) : null;
+  const explicit = selectedReportUrl
+    ? reports.find(report => reportSelectionKey(report) === selectedReportUrl)
+    : null;
   const selectedRoleModel = roleModels.find(item => item.role === selectedRole)
     || roleModels.find(item => item.role === detail.active_role)
     || null;
@@ -481,7 +487,8 @@ export function reportBody(report, reportBodies) {
   if (report?.availability === "unavailable") {
     return "Report is unavailable on this dashboard host.";
   }
-  const loaded = report?.url ? reportBodies.get(report.url) : null;
+  const key = reportSelectionKey(report);
+  const loaded = key ? reportBodies.get(key) : null;
   if (loaded?.status === "ready") return loaded.body;
   if (loaded?.status === "error") return `Report load failed: ${loaded.error}`;
   if (report?.content || report?.message) return report.content || report.message;
@@ -570,8 +577,9 @@ function workflowReports(detail, selectedRole, selectedReportUrl, reportBodies) 
     role.dataset.taskId = detail.task_id;
     role.append(el("strong", item.role));
     role.append(el("span", item.current ? `Turn ${item.current.turn ?? "—"}` : item.missingReason));
-    if (item.current?.url) {
-      role.dataset.reportSelect = item.current.url;
+    const currentReportKey = reportSelectionKey(item.current);
+    if (currentReportKey) {
+      role.dataset.reportSelect = currentReportKey;
       role.dataset.reportRole = item.role;
     }
     navigator.append(role);
@@ -600,7 +608,7 @@ function workflowReports(detail, selectedRole, selectedReportUrl, reportBodies) 
       const select = el("button", null, "older-report");
       select.type = "button";
       select.dataset.taskId = detail.task_id;
-      select.dataset.reportSelect = item.url || "";
+      select.dataset.reportSelect = reportSelectionKey(item) || "";
       select.dataset.reportRole = item._logicalRole || "";
       select.append(el("strong", `${item._logicalRole} · Turn ${item.turn ?? "—"}`));
       if (item.created_at) select.append(el("span", item.created_at));

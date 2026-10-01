@@ -51,7 +51,7 @@ def test_task_runner_accepts_explicit_roles_and_start_role(tmp_path: Path) -> No
 
     assert request.team == "hcuw-v2-test"
     assert request.browser == "9222"
-    assert request.roles == ("DEV", "REVIEW")
+    assert request.roles == ("REVIEW", "DEV")
     assert request.start_role == "REVIEW"
     assert request.task == "review repo"
 
@@ -59,18 +59,30 @@ def test_task_runner_accepts_explicit_roles_and_start_role(tmp_path: Path) -> No
 def test_task_runner_defaults_start_role_to_first_canonical_role(tmp_path: Path) -> None:
     request = make_runner(tmp_path)._validate_payload({"task": "x", "roles": ["REVIEW", "DEV"]})
 
-    assert request.start_role == "DEV"
+    assert request.start_role == "REVIEW"
+
+
+def test_t009_task_runner_accepts_unregistered_valid_custom_role(tmp_path: Path) -> None:
+    request = make_runner(tmp_path)._validate_payload(
+        {
+            "task": "custom role",
+            "roles": ["custom-review"],
+            "route_targets": ["custom-dev"],
+        }
+    )
+
+    assert request.roles == ("CUSTOM_REVIEW",)
+    assert request.start_role == "CUSTOM_REVIEW"
+    assert request.closing_role == "CUSTOM_REVIEW"
+    assert request.policy.reachable_roles == ("CUSTOM_REVIEW", "CUSTOM_DEV")
 
 
 @pytest.mark.parametrize(
     ("payload", "message"),
     [
         ({"task": "x"}, "roles must be a non-empty array"),
-        ({"task": "x", "roles": "DEV,REVIEW"}, "roles must be a non-empty array"),
-        ({"task": "x", "roles": ["DEV", "DEV", "REVIEW"]}, "duplicates"),
-        ({"task": "x", "roles": ["DEV", "WF_X"]}, "unknown roles"),
-        ({"task": "x", "roles": ["DEV", "TEST"]}, "PLAN or REVIEW"),
-        ({"task": "x", "roles": ["DEV", "REVIEW"], "start_role": "PLAN"}, "start_role must be included"),
+        ({"task": "x", "roles": "DEV,REVIEW"}, "roles must be an array"),
+        ({"task": "x", "roles": ["DEV", "REVIEW"], "start_role": "PLAN"}, "start_role must belong"),
         ({"task": "x", "roles": ["REVIEW"], "workflow_mode": "solo"}, "Team Task only"),
         ({"task": "x", "roles": ["REVIEW"], "role": "REVIEW"}, "Team Task only"),
         ({"task": "x", "roles": ["REVIEW"], "conversation_url": "https://chatgpt.com/c/1"}, "Team Task only"),
@@ -92,6 +104,42 @@ def test_task_runner_rejects_invalid_requests_before_legacy_enqueue(
 
     assert error.value.reason == "invalid_task_request"
     assert message in error.value.message
+
+
+@pytest.mark.parametrize(
+    "derived_field",
+    [
+        "task_id",
+        "submitted_roles",
+        "reachable_roles",
+        "route_contract_id",
+        "self_route_counts",
+        "route_seq",
+        "active_role",
+        "status",
+        "created_at",
+        "updated_at",
+        "role_slots",
+    ],
+)
+def test_t015_task_runner_rejects_runtime_derived_fields_before_legacy_enqueue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, derived_field: str
+) -> None:
+    runner = make_runner(tmp_path)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("derived fields must not reach legacy CDPA")
+
+    monkeypatch.setattr(RuntimeTaskRunner, "ensure_legacy_runtime", forbidden)
+    monkeypatch.setattr(RuntimeTaskRunner, "_post_legacy_api", forbidden)
+    payload = {"task": "x", "roles": ["DEV"]}
+    payload[derived_field] = {} if derived_field in {"self_route_counts", "role_slots"} else "client-owned"
+    with pytest.raises(RuntimeTaskRunnerError) as error:
+        runner.submit_task(payload)
+
+    assert error.value.reason == "invalid_task_request"
+    assert "runtime-derived TeamTask fields are not client-writable" in error.value.message
+    assert derived_field in error.value.message
 
 
 def test_task_runner_submits_roles_and_start_role_to_legacy_team_api(

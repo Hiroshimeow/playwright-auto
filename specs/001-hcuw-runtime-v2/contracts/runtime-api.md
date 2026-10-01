@@ -1,4 +1,4 @@
-# Runtime V2 API Contract
+﻿# Runtime V2 API Contract
 
 **Feature**: HCUW Runtime V2 Skeleton
 **Status**: Draft - review before implementation
@@ -190,6 +190,61 @@ Failure behavior:
 - Malformed config returns `ok=false` with `endpoint_config_invalid`.
 - One offline endpoint does not fail the entire response.
 
+
+## GET /api/audit/snapshot
+
+Purpose: expose dashboard-safe, read-only audit state for the 9226 audit view.
+
+Response data:
+
+```json
+{
+  "sources": [
+    {
+      "source": "dom|mutation|listen|actions",
+      "status": "active|inactive|error",
+      "message": "what this source can currently show",
+      "updated_at": "2026-09-30T00:00:00+00:00",
+      "last_event_id": 1,
+      "payload": {}
+    }
+  ],
+  "events": [
+    {
+      "event_id": 1,
+      "source": "actions",
+      "kind": "api_request",
+      "message": "GET /api/health",
+      "created_at": "2026-09-30T00:00:00+00:00",
+      "payload": {}
+    }
+  ],
+  "max_events": 300
+}
+```
+
+Skeleton behavior:
+
+- `actions` is active and records runtime-v2 API/action events.
+- `dom`, `mutation`, and `listen` are visible as explicit inactive sources until later source owners attach.
+- Inactive sources must not be hidden or faked.
+- Audit routes must not send prompts, adopt tabs, inject MutationObserver, parse LISTEN frames, or mutate legacy state in this skeleton.
+
+## GET /api/audit/events
+
+Purpose: expose incremental audit events for realtime dashboard polling.
+
+Query:
+
+- `since=<event_id>`: returns only events with a greater `event_id`.
+
+Response data:
+
+```json
+{
+  "items": []
+}
+```
 ## Dashboard 9226 Contract
 
 Dashboard server responsibilities:
@@ -236,3 +291,28 @@ Feature owner mapping follows canonical `HCU-ARCH-002` in `.agents/rules/project
 
 - endpoint reachability is assigned to `EndpointInventory`; dashboard only displays the result;
 - state file validity is assigned to `RuntimeStateStore`; API only formats the error.
+
+## POST /api/tasks
+
+Purpose: submit a real CDPA task through runtime-v2 API 9227 while keeping ownership explicit.
+
+Request JSON:
+
+```json
+{
+  "task": "review this repo without modifying files",
+  "team": "hcuw-v2-smoke-review",
+  "browser": "9222",
+  "solo_role": "PLAN",
+  "goal": "Smoke review through runtime-v2 API 9227"
+}
+```
+
+Owner boundaries:
+
+- `RuntimeApiServer` owns JSON parsing and response envelope only.
+- `RuntimeTaskRunner` owns real task submission orchestration.
+- `RuntimeStateStore` owns `.runtime-v2/tasks/*.json` persistence.
+- Legacy CDPA remains owner of current Send/bind/route/browser behavior until a later runtime-v2 source owner replaces it.
+
+This endpoint may start the legacy CDPA runtime if `127.0.0.1:9225` is unavailable. It must not directly implement DOM, MutationObserver, LISTEN, Send, bind, route, or route repair.

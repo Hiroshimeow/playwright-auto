@@ -93,8 +93,8 @@ def test_task_snapshots_custom_agent_and_exact_team_reuse_fails_after_delete(tmp
         task_id="task-catalog-one",
         roles=("PLAN", "DEV", route_key, "REVIEW"),
     )
-    assert list(first["roles"]) == ["PLAN", "DEV", "REVIEW", route_key]
-    assert list(first["workflow_agents"]) == ["PLAN", "DEV", "REVIEW", route_key]
+    assert list(first["roles"]) == ["PLAN", "DEV", route_key, "REVIEW"]
+    assert list(first["workflow_agents"]) == ["PLAN", "DEV", route_key, "REVIEW"]
     assert first["workflow_agents"][route_key]["system_prompt"] == "TASK_SNAPSHOT_PROMPT"
 
     store.update_workflow_agent(
@@ -153,7 +153,7 @@ def test_worker_custom_hop_uses_snapshotted_prompt_and_dynamic_routes(tmp_path: 
 
     assert "CUSTOM_WORKER_PROMPT_MARKER" in hop["prompt"]
     assert "TURN_CONTEXT" not in hop["prompt"]
-    assert f'"route":"PLAN|REVIEW|{route_key}"' in hop["prompt"]
+    assert '"route":"PLAN|REVIEW|PAUSE"' in hop["prompt"]
     assert "PAUSE" not in state["roles"]
 
     decision = parse_route_response(
@@ -277,7 +277,7 @@ def test_custom_role_controls_and_replacement_keep_snapshot(tmp_path: Path):
         incident_id="incident-custom-replacement",
     )
     replacement = result["replacement"]
-    assert list(replacement["roles"]) == ["PLAN", "REVIEW", route_key]
+    assert list(replacement["roles"]) == ["PLAN", route_key, "REVIEW"]
     assert replacement["workflow_agents"][route_key]["system_prompt"] == (
         "REPLACEMENT_SNAPSHOT_PROMPT"
     )

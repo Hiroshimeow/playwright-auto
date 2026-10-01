@@ -598,14 +598,38 @@ async function loadReports(detail) {
     ...(detail?.task_mode === "independent" ? (detail?.maintenance_reports || []) : []),
   ];
   await Promise.all(reports.map(async report => {
-    if (!report.url || reportBodies.has(report.url)) return;
-    reportBodies.set(report.url, {status: "loading"});
+    const cacheKey = report.url || report.material_url;
+    const endpoint = report.material_url || report.url;
+    if (!endpoint || !cacheKey || reportBodies.has(cacheKey)) return;
+    reportBodies.set(cacheKey, {status: "loading"});
     try {
-      const response = await fetch(report.url, {headers: {Accept: "text/markdown"}});
+      const materialBacked = Boolean(report.material_url);
+      const response = await fetch(endpoint, {
+        headers: {Accept: materialBacked ? "application/json" : "text/markdown"},
+      });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      reportBodies.set(report.url, {status: "ready", body: await response.text()});
+      if (materialBacked) {
+        const payload = await response.json();
+        const metadata = [
+          payload.source_kind,
+          payload.material_type,
+          payload.version,
+          Number.isFinite(Number(payload.content_length)) ? `${Number(payload.content_length).toLocaleString()} bytes` : null,
+          payload.truncated ? "truncated" : null,
+        ].filter(Boolean).join(" · ");
+        const errorText = payload.error
+          ? `${payload.error.code || "MATERIAL_ERROR"}: ${payload.error.message || "Material content is unavailable."}`
+          : null;
+        const body = payload.content || errorText || "Material content is unavailable for bounded inline display.";
+        reportBodies.set(cacheKey, {
+          status: "ready",
+          body: metadata ? `${metadata}\n\n${body}` : body,
+        });
+      } else {
+        reportBodies.set(cacheKey, {status: "ready", body: await response.text()});
+      }
     } catch (error) {
-      reportBodies.set(report.url, {status: "error", error: error.message});
+      reportBodies.set(cacheKey, {status: "error", error: error.message});
     }
     if (state.selectedDetail?.task_id === detail?.task_id) {
       commit(current => { current.agentReportsRevision += 1; });
