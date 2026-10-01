@@ -20,18 +20,18 @@ At the start of an agent session:
 1. Read the repository root `AGENTS.md`.
 2. Read `.hcu/profile.md`.
 3. Run `hcuw fingerprint .`.
-4. If `.hcu/rules.md` exists, read it once and compare its `hcu_baseline` and `evidence_fingerprint`.
+4. If `.agents/rules/project.md` exists, read it once and compare its `hcu_baseline` and `evidence_fingerprint`.
 5. If both match, use the loaded policy for the rest of the session unless the files change.
 6. If either differs, use `hcu-rules` for narrow reconciliation; do not regenerate the whole rulebook.
-7. If `.hcu/rules.md` does not exist, initialize it once using the bootstrap protocol below before substantive implementation.
+7. If `.agents/rules/project.md` does not exist, initialize it once using the bootstrap protocol below before substantive implementation.
 
 After rules are loaded, do not reload this skill or regenerate the rules on every turn.
 
-Explicit user instructions and more specific repository instructions override HCUW rules for the current task.
+Explicit current user/task instructions outrank repository policy. More-specific repository instructions and active feature specs may strengthen or specialize behavior within their scope, but they must not silently override `.agents/rules/project.md`; surface a material conflict instead.
 
 ## First-load rule bootstrap
 
-When `.hcu/rules.md` is missing, create it before substantive implementation.
+When `.agents/rules/project.md` is missing, create it before substantive implementation.
 
 Do not ask the user to author the initial rules. Derive them from:
 
@@ -44,11 +44,11 @@ Do not ask the user to author the initial rules. Derive them from:
 
 Keep discovery bounded. Do not crawl old history, every document, or unrelated source merely to make the rule file look comprehensive.
 
-The managed baseline below remains authoritative in this skill. Do not copy generic baseline rules into `.hcu/rules.md`. The project rulebook contains only repository-specific policy supported by explicit user intent or evidence.
+The managed baseline below remains authoritative in this skill. Do not copy generic baseline rules into `.agents/rules/project.md`. The project rulebook contains only repository-specific policy supported by explicit user intent or evidence.
 
 Create a candidate with front matter containing `hcu_baseline: "0.5"`, `derived_at`, and the current `evidence_fingerprint` from `hcuw fingerprint .`. Mark each project-specific rule as `[user]`, `[evidence: path]`, or `[inferred]`. Use `[inferred]` sparingly.
 
-Write the candidate to a unique temporary file under `.hcu/`, then run `hcuw claim-rules . <candidate-path>`. If another agent already created the rulebook, discard the candidate and load the existing file; never merge two first-load rulebooks automatically.
+Write the candidate to a unique temporary file under `.agents/rules/`, then atomically install it only if `.agents/rules/project.md` is still absent. If another agent already created the rulebook, discard the candidate and load the existing file; never merge two first-load rulebooks automatically. Keep `.hcu/rules.md` as a compatibility pointer only.
 
 If bounded evidence is insufficient for a project-specific rule, omit it rather than inventing one.
 
@@ -68,7 +68,7 @@ If bounded evidence is insufficient for a project-specific rule, omit it rather 
 - Prefer simple, direct control flow over framework-style indirection.
 - Keep modules, classes, and functions cohesive; split by responsibility only when there is a real boundary.
 - Use clear domain names and explicit types/data shapes where they reduce ambiguity.
-- Let repository formatters, linters, type checkers, compilers, and nearby code own mechanically checkable conventions; do not duplicate those rules in `.hcu/rules.md`.
+- Let repository formatters, linters, type checkers, compilers, and nearby code own mechanically checkable conventions; do not duplicate those rules in `.agents/rules/project.md`.
 - Prefer deletion or local repair over adding another layer around broken ownership.
 - Comments explain non-obvious intent or invariants, not what obvious code already says.
 - Handle errors at the smallest layer that can make the correct decision; do not duplicate the same guard across many layers.
@@ -85,7 +85,7 @@ Use the lowest sufficient scope:
 
 Inside BOUNDED or SPEC, if a named uncertainty can materially change correctness, safety, or architecture, resolve that uncertainty before proceeding. Do not create a separate workflow mode just to label uncertainty.
 
-For SPEC work, create only what is useful under `.hcu/specs/<change>/`:
+For SPEC work, create only what is useful under `specs/<change>/`:
 - `spec.md`: behavior, acceptance criteria, non-goals;
 - `plan.md`: smallest viable design when design decisions are non-trivial;
 - `tasks.md`: only when dependency ordering or multi-session recovery actually benefits from it.
@@ -133,7 +133,7 @@ Historical incidents do not automatically become global domain states.
 #### Documentation and durable learning
 - Update current-state documentation only after behavior is verified.
 - Durable architecture decisions belong in the repository's architecture/ADR mechanism if it has one.
-- Stable engineering policy belongs in `.hcu/rules.md`.
+- Stable engineering policy belongs in `.agents/rules/project.md`.
 - Task-only facts stay with the task/spec, not in global rules.
 - A recurring procedure may become a skill only when it is reusable and non-obvious.
 
@@ -149,7 +149,7 @@ Add only repository-specific rules supported by evidence, such as:
 
 Do not invent architecture or conventions merely to fill sections.
 
-Once created, `.hcu/rules.md` is repository-owned and persistent. Future HCUW updates must not overwrite it.
+Once created, `.agents/rules/project.md` is repository-owned and persistent. Future HCUW updates must not overwrite it.
 
 ## Work execution
 

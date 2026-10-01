@@ -12,7 +12,7 @@ For non-trivial repository work:
 4. Read `LEARNING.md` when present, then inspect only task-relevant source, tests, diff, handoff, and evidence.
 5. Load the smallest matching repository-local skill before substantive work.
 
-Do not repeatedly reload HCUW policy during the same session unless its files change. Explicit task constraints, repository-specific instructions, accepted specs, tests, and current implementation truth remain authoritative.
+Do not repeatedly reload HCUW policy during the same session unless its files change. .specify/ keeps the standard Spec Kit workflow/tooling layout; active feature artifacts live under specs/. Explicit task constraints, repository-specific instructions, accepted specs, tests, and current implementation truth remain authoritative.
 
 ## Normal CDPA task intake
 

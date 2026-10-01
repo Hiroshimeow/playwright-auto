@@ -15,11 +15,11 @@ Apply review criteria in this order:
 
 1. The caller's explicit scope and requirements.
 2. Repository instructions such as `AGENTS.md` or `CLAUDE.md`.
-3. `.hcu/rules.md` when present.
+3. `.agents/rules/project.md` when present.
 4. Accepted specs, plans, tests, and public contracts relevant to the change.
 5. The fallback rules below.
 
-Do not invent missing requirements. Report ambiguity when it materially prevents a verdict. Never create or modify `.hcu/rules.md` during review.
+Do not invent missing requirements. Report ambiguity when it materially prevents a verdict. Never create or modify `.agents/rules/project.md` during review.
 
 ## Review Procedure
 
