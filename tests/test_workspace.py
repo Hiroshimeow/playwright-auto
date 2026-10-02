@@ -310,3 +310,28 @@ def test_open_role_classifies_cloudflare_challenge_as_retryable_rate_limit():
         asyncio.run(ChatGPTWorkspace().open_role(context, "PLAN"))
 
     assert context.page.closed is True
+
+
+class CanonicalChallengePage(ChallengePage):
+    async def goto(self, _url, **_options):
+        self.url = "https://chatgpt.com/c/conversation-1"
+
+    async def evaluate(self, _script):
+        return True
+
+
+class CanonicalChallengeContext:
+    def __init__(self):
+        self.page = CanonicalChallengePage()
+
+    async def new_page(self):
+        return self.page
+
+
+def test_open_role_classifies_canonical_url_cloudflare_challenge():
+    context = CanonicalChallengeContext()
+
+    with pytest.raises(RateLimitBlockedError, match="Cloudflare challenge"):
+        asyncio.run(ChatGPTWorkspace().open_role(context, "PLAN"))
+
+    assert context.page.closed is True

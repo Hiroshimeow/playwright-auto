@@ -17,6 +17,7 @@ from playwright_auto.chatgpt import (
     MessageSnapshot,
     PageBinding,
     PageOwnershipError,
+    RateLimitBlockedError,
 )
 
 
@@ -102,6 +103,22 @@ def test_clean_ready_never_wraps_semantic_errors_as_transient(semantic_error):
         asyncio.run(client.wait_until_clean_ready(timeout_ms=5, poll_ms=1))
 
     assert caught.value is semantic_error
+
+
+def test_clean_ready_classifies_canonical_cloudflare_challenge(monkeypatch):
+    page = SimpleNamespace(url="https://chatgpt.com/c/conversation-1")
+    client = client_with_page(page)
+    client.assert_ownership = AsyncMock(side_effect=AssertionError("must not probe ownership"))
+
+    monkeypatch.setattr(
+        "playwright_auto.chatgpt.cloudflare_challenge_visible",
+        AsyncMock(return_value=True),
+    )
+
+    with pytest.raises(RateLimitBlockedError, match="Cloudflare challenge"):
+        asyncio.run(client.wait_until_clean_ready(timeout_ms=5, poll_ms=1))
+
+    client.assert_ownership.assert_not_awaited()
 
 
 def test_refresh_baseline_document_probe_is_bounded_and_never_reloads_on_timeout():

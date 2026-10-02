@@ -110,6 +110,27 @@ def conversation_identity(value: Any) -> str | None:
     return f"/c/{match.group(1)}" if match else None
 
 
+def normalize_chatgpt_conversation_url(value: Any) -> str | None:
+    """Validate a user-supplied ChatGPT conversation URL without rewriting it."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    exact = value.strip()
+    try:
+        parsed = urlparse(exact)
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").lower() not in {"chatgpt.com", "www.chatgpt.com"}
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or conversation_identity(exact) is None
+    ):
+        return None
+    return exact
+
+
 def _active_hop(state: Mapping[str, Any]) -> Mapping[str, Any] | None:
     active_hop_id = state.get("active_hop_id")
     for hop in state.get("hops") or ():

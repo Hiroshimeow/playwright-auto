@@ -290,6 +290,32 @@ def rate_limit_dialogs(snapshot: "ChatGPTSnapshot") -> tuple[str, ...]:
     )
 
 
+_CLOUDFLARE_CHALLENGE_JS = r"""
+() => {
+  const title = (document.title || '').trim().toLowerCase();
+  const strongMarker = Boolean(document.querySelector(
+    'script[src*="/cdn-cgi/challenge-platform/"], ' +
+    'script[src*="challenges.cloudflare.com/turnstile"], ' +
+    '[name="cf-turnstile-response"]'
+  ));
+  return strongMarker && title === 'just a moment...';
+}
+"""
+
+
+async def cloudflare_challenge_visible(page: Any) -> bool:
+    """Return true for the provider challenge page without mutating it."""
+    url = str(getattr(page, "url", "") or "")
+    if "__cf_chl_rt_tk=" in url:
+        return True
+    try:
+        return await page.evaluate(_CLOUDFLARE_CHALLENGE_JS) is True
+    except Exception:
+        # Navigation can replace the execution context while the challenge is
+        # settling. The next readiness probe will retry against the new one.
+        return False
+
+
 _PAGE_WORKFLOW_LOCKS: weakref.WeakKeyDictionary[Any, asyncio.Lock] = weakref.WeakKeyDictionary()
 _PAGE_MUTATION_LOCKS: weakref.WeakKeyDictionary[Any, asyncio.Lock] = weakref.WeakKeyDictionary()
 _PAGE_WAIT_STATES: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
@@ -3099,6 +3125,10 @@ class ChatGPTPage:
         choice_pending = False
 
         while time.monotonic() < deadline:
+            if await cloudflare_challenge_visible(self.page):
+                raise RateLimitBlockedError(
+                    "Cloudflare challenge blocked ChatGPT page readiness"
+                )
             try:
                 last_snapshot = await self.assert_ownership()
             except (

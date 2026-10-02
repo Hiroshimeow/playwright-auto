@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 from uuid import UUID
 
 from .cdpa_browser_projection import inspect_page_metadata
+from .cdpa_commands import conversation_identity
 from .cdpa_config import CDPAConfig
 from .cdpa_independent import is_independent_task
 from .chatgpt import (
@@ -24,6 +25,7 @@ from .chatgpt import (
     backend_stream_status as read_backend_stream_status,
     release_backend_stream_status as release_read_backend_stream_status,
     clear_composer,
+    cloudflare_challenge_visible,
     random_delay,
     rate_limit_dialogs,
     refresh_page,
@@ -56,16 +58,12 @@ def _reopenable_conversation_identity(value: Any) -> str | None:
         parsed = urlparse(str(value or ""))
     except ValueError:
         return None
-    path = parsed.path.rstrip("/")
-    conversation_id = path.rsplit("/", 1)[-1]
-    if (
-        (parsed.hostname or "").lower() not in _CHATGPT_HOSTS
-        or not path.startswith("/c/")
-        or len(path) <= 3
-        or conversation_id.startswith("WEB:")
-    ):
+    if (parsed.hostname or "").lower() not in _CHATGPT_HOSTS:
         return None
-    return path
+    identity = conversation_identity(value)
+    if identity is None or identity.rsplit("/", 1)[-1].startswith("WEB:"):
+        return None
+    return identity
 
 
 class BranchBootstrapError(RuntimeError):
@@ -771,20 +769,12 @@ class CDPATabActions:
         )
         if not page_id or not page_url:
             raise RoleOwnershipError("role has no recorded page identity to reopen")
-        parsed_url = urlparse(page_url)
-        if (parsed_url.hostname or "").lower() not in _CHATGPT_HOSTS:
+        expected_conversation = _reopenable_conversation_identity(page_url)
+        if expected_conversation is None:
             raise RoleOwnershipError(
-                f"recorded role URL is not a ChatGPT conversation: {page_url!r}"
+                f"recorded role URL is not an exact ChatGPT conversation: {page_url!r}"
             )
-        conversation_id = parsed_url.path.rstrip("/").rsplit("/", 1)[-1]
-        if conversation_id.startswith("WEB:"):
-            raise RoleOwnershipError(
-                "temporary WEB conversation cannot be reopened exactly; use Restart role or Stop"
-            )
-        if not parsed_url.path.startswith("/c/"):
-            raise RoleOwnershipError(
-                f"recorded role URL is not an exact conversation URL: {page_url!r}"
-            )
+        conversation_id = expected_conversation.rsplit("/", 1)[-1]
 
         existing = await self.locate_owned(manifest, logical_role)
         created = existing is None
@@ -800,11 +790,8 @@ class CDPATabActions:
             page = client.page
         timeout = round(self.config.workspace_timeout_seconds * 1000)
         try:
-            actual_url = urlparse(str(page.url))
             exact_url = (
-                actual_url.scheme == parsed_url.scheme
-                and actual_url.netloc == parsed_url.netloc
-                and actual_url.path.rstrip("/") == parsed_url.path.rstrip("/")
+                _reopenable_conversation_identity(page.url) == expected_conversation
             )
             if not exact_url:
                 await page.goto(
@@ -813,14 +800,13 @@ class CDPATabActions:
                 await page.locator("body").wait_for(
                     state="visible", timeout=timeout
                 )
-                actual_url = urlparse(str(page.url))
-                if (
-                    actual_url.scheme != parsed_url.scheme
-                    or actual_url.netloc != parsed_url.netloc
-                    or actual_url.path.rstrip("/") != parsed_url.path.rstrip("/")
-                ):
+                if await cloudflare_challenge_visible(page):
+                    raise RateLimitBlockedError(
+                        "Cloudflare challenge blocked recorded ChatGPT conversation reopen"
+                    )
+                if _reopenable_conversation_identity(page.url) != expected_conversation:
                     raise RoleOwnershipError(
-                        "conversation reopen redirected away from the recorded URL: "
+                        "conversation reopen redirected away from the recorded conversation: "
                         f"{page.url!r}"
                     )
                 await client.restore_identity(
@@ -831,6 +817,10 @@ class CDPATabActions:
                     binding_id=str(role_record.get("binding_id") or "") or None,
                 )
             else:
+                if await cloudflare_challenge_visible(page):
+                    raise RateLimitBlockedError(
+                        "Cloudflare challenge blocked recorded ChatGPT conversation reopen"
+                    )
                 snapshot = await client.assert_ownership()
                 if (
                     str(snapshot.page_id or "") != page_id

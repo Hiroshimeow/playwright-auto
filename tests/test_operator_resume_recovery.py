@@ -1789,6 +1789,7 @@ def test_reacquired_pristine_request_crosses_send_boundary_exactly_once(tmp_path
                 retry_visible=False,
                 blocking_dialogs=(),
                 messages=(),
+                logical_turn_ids=(),
                 session_id="presend-session",
                 conversation_url="https://chatgpt.com/c/WEB:presend-replacement",
                 url="https://chatgpt.com/c/WEB:presend-replacement",
@@ -3035,6 +3036,7 @@ def test_lost_sending_atomic_nonacceptance_rebinds_same_request_and_sends_once(
         attachment_markers=(),
         blocking_dialogs=(),
         messages=(),
+        logical_turn_ids=(),
         session_id="55555555-5555-4555-8555-555555555555",
         url="https://chatgpt.com/c/55555555-5555-4555-8555-555555555555",
         conversation_url="https://chatgpt.com/c/55555555-5555-4555-8555-555555555555",
@@ -3142,6 +3144,7 @@ def test_lost_sending_replacement_persists_admission_and_releases_gate_before_se
         attachment_markers=(),
         blocking_dialogs=(),
         messages=(),
+        logical_turn_ids=(),
         session_id="77777777-7777-4777-8777-777777777777",
         url=replacement_url,
         conversation_url=replacement_url,
@@ -3240,6 +3243,7 @@ def test_lost_sending_bounded_continuation_failure_is_not_replayed(
         attachment_markers=(),
         blocking_dialogs=(),
         messages=(),
+        logical_turn_ids=(),
         session_id="99999999-9999-4999-8999-999999999999",
         url="https://chatgpt.com/c/99999999-9999-4999-8999-999999999999",
         conversation_url="https://chatgpt.com/c/99999999-9999-4999-8999-999999999999",
@@ -3951,14 +3955,17 @@ def test_resume_accepted_root_canonicalizes_from_exact_owned_local_page_without_
     hop["conversation_url"] = "https://chatgpt.com/"
     state["roles"]["PLAN"]["page_url"] = "https://chatgpt.com/"
     snapshot = _accepted_snapshot(receipt)
-    snapshot.session_id = "local-canonical"
+    snapshot.session_id = "11111111-1111-4111-8111-111111111111"
+    snapshot.url = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111"
+    snapshot.conversation_url = snapshot.url
 
     class Client:
         async def assert_ownership(self):
             return snapshot
 
     acquired = AcquiredRole(
-        Client(), receipt.binding.page_id, "https://chatgpt.com/c/local-canonical", False, False
+        Client(), receipt.binding.page_id,
+        "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111", False, False
     )
     calls = {"search": 0, "graph": 0}
 
@@ -3977,10 +3984,10 @@ def test_resume_accepted_root_canonicalizes_from_exact_owned_local_page_without_
     )
 
     assert calls == {"search": 0, "graph": 0}
-    assert enriched.conversation_id == "local-canonical"
+    assert enriched.conversation_id == "11111111-1111-4111-8111-111111111111"
     durable = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
     assert durable is not None
-    assert durable.receipt["conversation_id"] == "local-canonical"
+    assert durable.receipt["conversation_id"] == "11111111-1111-4111-8111-111111111111"
     assert durable.attempts == 1
 
 
@@ -3992,14 +3999,16 @@ def test_resume_accepted_root_message_id_only_uses_same_local_identity_proof(tmp
     RequestLedger(hop["ledger_path"]).update(hop["request_id"], receipt=message_only.to_dict())
     hop["receipt"] = message_only.to_dict()
     snapshot = _accepted_snapshot(message_only)
-    snapshot.session_id = "message-only-canonical"
+    snapshot.session_id = "22222222-2222-4222-8222-222222222222"
+    snapshot.url = "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222"
+    snapshot.conversation_url = snapshot.url
 
     class Client:
         async def assert_ownership(self):
             return snapshot
 
     acquired = AcquiredRole(
-        Client(), message_only.binding.page_id, "https://chatgpt.com/c/message-only-canonical", False, False
+        Client(), message_only.binding.page_id, "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222", False, False
     )
 
     class Actions:
@@ -4013,7 +4022,7 @@ def test_resume_accepted_root_message_id_only_uses_same_local_identity_proof(tmp
     enriched = asyncio.run(
         worker._discover_accepted_conversation_identity(state, hop, Actions(), message_only)
     )
-    assert enriched.conversation_id == "message-only-canonical"
+    assert enriched.conversation_id == "22222222-2222-4222-8222-222222222222"
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
 
 

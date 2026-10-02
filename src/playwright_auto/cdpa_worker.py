@@ -4623,7 +4623,13 @@ class CDPAWorker:
                     result = {"deferred": True, "reason": "rate_limit_cooldown"}
                     acquired = None
                 else:
-                    acquired = await acquire_open_tab()
+                    try:
+                        acquired = await acquire_open_tab()
+                    except RateLimitBlockedError as exc:
+                        await self._enter_rate_limit_cooldown(state, actions, exc)
+                        state["active_action"] = "rate_limit_cooldown"
+                        result = {"deferred": True, "reason": "rate_limit_cooldown"}
+                        acquired = None
                 if acquired is None:
                     recovered = False
                 else:
@@ -5539,6 +5545,8 @@ class CDPAWorker:
         target_team = str(state.get("team") or "")
         target_physical = str(state["roles"][role].get("physical_role") or "")
         for task in self.store.discover():
+            if str(task.get("status") or "").upper() in {"DONE", "STOPPED"}:
+                continue
             owner_task = str(task.get("task_id") or "")
             owner_team = str(task.get("team") or "")
             roles = task.get("roles")
@@ -5952,7 +5960,7 @@ class CDPAWorker:
             )
             hop["state"] = "waiting"
             hop["timestamps"]["waiting_at"] = now.isoformat()
-            hop["adopted_existing_response"] = True
+            hop["observed_existing_response"] = True
             state["started_at"] = state.get("started_at") or now.isoformat()
             state["status"] = "RUNNING"
             state["kanban_column"] = _column_for(role)
@@ -6008,10 +6016,9 @@ class CDPAWorker:
             state["active_action"] = "send"
             return
         if str(state.get("workflow_mode") or "team").strip().lower() == "solo":
-            continuation = (
-                str(hop.get("kind") or "") != "task"
-                or bool(str(hop.get("conversation_url") or "").strip())
-            )
+            # Reusing a conversation is not itself a continuation: the first
+            # task hop still owns and must deliver the current Solo Goal.
+            continuation = str(hop.get("kind") or "") != "task"
             repair_error = None
             repair_candidate = None
             if str(hop.get("kind") or "") == "route_repair":
@@ -7200,6 +7207,19 @@ class CDPAWorker:
         )
         if acquired is None or admitted:
             # A reopened page is persisted before ordinary response observation resumes.
+            return
+        if hop.get("observed_existing_response") is True and not hop.get("receipt"):
+            # This activity predates the current request. Observe only whether it
+            # is still active; never bind, validate, repair, or route its output.
+            decision = await self.role_controller.run(
+                self, state, hop, acquired, actions, phase="pre_send", wait_ms=0,
+            )
+            if decision.reason == "ready":
+                hop["state"] = "pre_send"
+                hop.pop("observed_existing_response", None)
+                hop["wait"] = {}
+                hop.get("timestamps", {}).pop("waiting_at", None)
+                state["active_action"] = "queued"
             return
         await self.role_controller.run(self, state, hop, acquired, actions)
         if hop.get("state") == "responded" and not is_independent_task(state):

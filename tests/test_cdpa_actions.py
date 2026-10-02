@@ -1686,6 +1686,30 @@ def test_recorded_offline_role_requires_controlled_reopen(tmp_path, monkeypatch)
     assert actions.browser_context.detached_sessions == 1
 
 
+def test_recorded_offline_project_conversation_reopens_by_canonical_identity(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    monkeypatch.setattr(actions_module, "random_delay", lambda *_args, **_kwargs: asyncio.sleep(0))
+    actions = CDPATabActions(FakeContext(), config)
+    project_url = (
+        "https://chatgpt.com/g/g-p-project-private-vault/c/exact-conversation"
+    )
+    state = manifest(
+        page_id="closed-page",
+        page_url=project_url,
+        conversation_url=project_url,
+    )
+
+    reopened = asyncio.run(
+        actions.reopen(state, "PLAN", require_clean_ready=False)
+    )
+
+    assert reopened.page_id == "closed-page"
+    assert reopened.url == project_url
+    assert reopened.client.page.goto_calls == [project_url]
+    assert reopened.client.clean_ready_calls == []
+
+
 def test_explicit_restart_discards_only_exact_known_automated_draft(tmp_path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)

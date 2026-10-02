@@ -12,7 +12,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any, Callable, Iterator, Mapping, Sequence
-from urllib.parse import urlparse
 
 from .cdpa_bootstraps import (
     is_legacy_bootstrap_record,
@@ -24,6 +23,7 @@ from .cdpa_commands import (
     WorkerCommand,
     command_snapshot,
     workflow_control_eligibility,
+    normalize_chatgpt_conversation_url,
 )
 from .cdpa_config import CDPAConfig
 from .cdpa_endpoints import BrowserEndpointRegistry
@@ -164,22 +164,11 @@ def _optional_nonempty_string(value: Any, field: str) -> str | None:
 def _optional_solo_conversation_url(value: Any) -> str | None:
     if value is None:
         return None
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("conversation URL must be null or an exact ChatGPT conversation URL")
-    normalized = value.strip()
-    parsed = urlparse(normalized)
-    parts = [part for part in parsed.path.split("/") if part]
-    if (
-        parsed.scheme != "https"
-        or (parsed.hostname or "").lower() not in {"chatgpt.com", "www.chatgpt.com"}
-        or len(parts) != 2
-        or parts[0] != "c"
-        or not parts[1]
-        or parsed.params
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError("conversation URL must be an exact ChatGPT /c/... conversation URL")
+    normalized = normalize_chatgpt_conversation_url(value)
+    if normalized is None:
+        raise ValueError(
+            "conversation URL must be null or an exact ChatGPT conversation URL ending in /c/<conversation-id>"
+        )
     return normalized
 
 

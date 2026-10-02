@@ -6,7 +6,6 @@ color: purple
 tools: read, grep, find, bash
 skills: reviewing-code
 thinking: high
-max_turns: 40
 persist_session: false
 output_transcript: true
 isolation: off

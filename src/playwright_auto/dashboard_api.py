@@ -22,7 +22,7 @@ from .cdpa_bootstraps import (
     normalize_bootstrap_record,
     resolve_default_bootstrap_id,
 )
-from .cdpa_commands import RepairRequest
+from .cdpa_commands import RepairRequest, normalize_chatgpt_conversation_url
 from .cdpa_config import CDPAConfig, declared_repository_from_task, load_cdpa_config
 from .cdpa_endpoints import BrowserEndpointRegistry
 from .cdpa_identity import generate_idempotent_task_id, validate_task_id
@@ -457,30 +457,14 @@ class DashboardAPI:
             normalized["required_browser_endpoint_id"] = endpoint_id
             conversation_url = raw.get("conversation_url")
             if conversation_url is not None:
-                if not isinstance(conversation_url, str) or not conversation_url.strip():
+                normalized_url = normalize_chatgpt_conversation_url(conversation_url)
+                if normalized_url is None:
                     raise APIError(
                         400,
                         "invalid_request",
-                        "conversation_url must be an exact ChatGPT /c/... URL",
+                        "conversation_url must be an exact ChatGPT conversation URL ending in /c/<id>",
                     )
-                parsed = urlsplit(conversation_url.strip())
-                parts = [part for part in parsed.path.split("/") if part]
-                if (
-                    parsed.scheme != "https"
-                    or (parsed.hostname or "").lower()
-                    not in {"chatgpt.com", "www.chatgpt.com"}
-                    or len(parts) != 2
-                    or parts[0] != "c"
-                    or not parts[1]
-                    or parsed.query
-                    or parsed.fragment
-                ):
-                    raise APIError(
-                        400,
-                        "invalid_request",
-                        "conversation_url must be an exact ChatGPT /c/... URL",
-                    )
-                normalized["conversation_url"] = conversation_url.strip()
+                normalized["conversation_url"] = normalized_url
             normalized["bootstrap_id"] = None
             normalized["context_policy"] = "fresh"
             return normalized

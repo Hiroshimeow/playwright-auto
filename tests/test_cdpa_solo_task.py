@@ -708,11 +708,12 @@ def test_solo_existing_responding_url_enters_wait_without_send(tmp_path: Path, m
     assert hop["state"] == "waiting"
     assert hop["receipt"] is None
     assert hop["prompt"] is None
-    assert hop["adopted_existing_response"] is True
+    assert hop["observed_existing_response"] is True
+    assert "adopted_existing_response" not in hop
     assert state["active_action"] == "wait_response"
 
 
-def test_solo_existing_idle_url_sends_only_continuation_prompt(tmp_path: Path, monkeypatch):
+def test_solo_existing_idle_url_sends_full_first_goal_prompt(tmp_path: Path, monkeypatch):
     config, store = make_store(tmp_path)
     url = "https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
     state = store.create_task(
@@ -759,9 +760,9 @@ def test_solo_existing_idle_url_sends_only_continuation_prompt(tmp_path: Path, m
     assert hop["state"] == "sending"
     assert hop["receipt"] is None
     assert clean_calls == [True]
-    assert hop["prompt"].startswith("Continue from the current state.")
-    assert "Review only the current state" not in hop["prompt"]
-    assert "You are REVIEW for the solo task" not in hop["prompt"]
+    assert "Review only the current state" in hop["prompt"]
+    assert "You are REVIEW for the solo task" in hop["prompt"]
+    assert not hop["prompt"].startswith("Continue from the current state.")
 
 
 def test_solo_foreign_conversation_owner_blocks_before_adoption(tmp_path: Path):
@@ -795,6 +796,43 @@ def test_solo_foreign_conversation_owner_blocks_before_adoption(tmp_path: Path):
     assert state["status"] == "BLOCKED"
     assert state["block_code"] == "conversation_owned_by_other_task"
     assert "solo-owner" in state["block_reason"]
+
+
+
+
+def test_solo_terminal_historical_conversation_owner_does_not_block_reuse(tmp_path: Path, monkeypatch):
+    config, store = make_store(tmp_path)
+    url = "https://chatgpt.com/c/terminal-history-reuse"
+    owner = store.create_task("Historical owner", requested_team="owner", task_id="solo-terminal-owner")
+    owner["roles"]["PLAN"]["page_id"] = "owner-page"
+    owner["roles"]["PLAN"]["page_url"] = url
+    owner["status"] = "DONE"
+    owner["terminal_state"] = "DONE"
+    owner["active_role"] = None
+    owner["active_hop_id"] = None
+    store.save(owner["manifest_path"], owner)
+    state = store.create_task(
+        "Solo reuse historical", task_id="solo-reuse-terminal", workflow_mode="solo",
+        roles=("DEV",), browser_endpoint_id="9222", conversation_url=url,
+        goal="Reuse the historical conversation",
+    )
+    worker = CDPAWorker(config, store=store)
+    hop = active_hop(state)
+    acquired = AcquiredRole(client=SimpleNamespace(), page_id="new-page", url=url, created=True, new_chat=False)
+
+    class Actions:
+        async def adopt_conversation(self, *_args, **_kwargs): return acquired
+        async def acquire(self, *_args, **_kwargs): return acquired
+
+    async def no_rate_limit(_acquired): return None
+    async def ready(*_args, **_kwargs): return SimpleNamespace(reason="ready")
+    monkeypatch.setattr(worker, "_dismiss_known_rate_limit_on_existing", no_rate_limit)
+    monkeypatch.setattr(worker.role_controller, "run", ready)
+
+    asyncio.run(worker._pre_send(state, hop, Actions()))
+    assert state["status"] == "RUNNING"
+    assert hop["state"] == "sending"
+    assert "Reuse the historical conversation" in hop["prompt"]
 
 
 def test_solo_never_exposes_route_plan_control(tmp_path: Path):
@@ -874,6 +912,40 @@ def test_solo_adopted_waiting_reuses_existing_wait_budget_without_sent_receipt(
     assert hop["state"] == "waiting"
     assert hop["wait"]["deadline_at"] == original_deadline
 
+
+
+def test_solo_preexisting_response_completion_is_not_consumed_and_goal_resumes(tmp_path: Path, monkeypatch):
+    config, store = make_store(tmp_path)
+    url = "https://chatgpt.com/c/old-response-isolation"
+    state = store.create_task(
+        "Solo old response", task_id="solo-old-response", workflow_mode="solo",
+        roles=("DEV",), goal="CURRENT GOAL MUST SEND", browser_endpoint_id="9222",
+        conversation_url=url,
+    )
+    worker = CDPAWorker(config, store=store)
+    hop = active_hop(state)
+    acquired = AcquiredRole(client=SimpleNamespace(), page_id="page-old", url=url, created=False, new_chat=False)
+
+    class Actions:
+        async def adopt_conversation(self, *_args, **_kwargs): return acquired
+        async def acquire(self, *_args, **_kwargs): return acquired
+        async def locate_owned(self, *_args, **_kwargs): return acquired
+    async def no_rate_limit(_acquired): return None
+    reasons = iter(("response_in_progress", "ready", "ready"))
+    async def controller(*_args, **_kwargs):
+        return SimpleNamespace(reason=next(reasons))
+    monkeypatch.setattr(worker, "_dismiss_known_rate_limit_on_existing", no_rate_limit)
+    monkeypatch.setattr(worker.role_controller, "run", controller)
+
+    asyncio.run(worker._pre_send(state, hop, Actions()))
+    assert hop["state"] == "waiting" and hop["observed_existing_response"] is True
+    asyncio.run(worker._waiting(state, hop, Actions(), Path(state["manifest_path"])))
+    assert hop["state"] == "pre_send"
+    assert hop.get("response") is None
+    assert not state.get("route_timeline")
+    asyncio.run(worker._pre_send(state, hop, Actions()))
+    assert hop["state"] == "sending"
+    assert "CURRENT GOAL MUST SEND" in hop["prompt"]
 
 def test_solo_route_plan_control_path_is_explicitly_unavailable(tmp_path: Path):
     config, store = make_store(tmp_path)

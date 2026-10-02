@@ -30,6 +30,20 @@ cdpa --team <exact-existing-team>
 
 New workflow tasks start Fresh. Bootstrap branching is temporarily disabled.
 
+## Solo tasks and chained Solo roles
+
+If the user asks for a Solo Task, Solo role, or chained/self-spawning Solo tasks, load `.skills/solo-role/SKILL.md` before creating any task. Do not improvise the Solo API or reuse Team Task routing fields.
+
+Canonical single-task form:
+
+```powershell
+cdpa "<task>" --solo REVIEW --goal "<one-role goal>" --browser <9212-or-9222> --team <unique-team> --repository "<target-repository>"
+```
+
+For new Solo work, consider both endpoint 9212 and endpoint 9222 and choose the one with available tab capacity at spawn time; do not blindly default to 9202. A Solo request still carries exactly one concrete `--browser` endpoint. If the operator explicitly pins an endpoint, honor that pin.
+
+For chained Solo work, use `.skills/solo-role/scripts/spawn_solo_task.py`. If the current Solo task is not independently complete, it MUST NOT stop: it creates exactly one next Solo task itself before finishing; the route worker is not the chain mechanism. After POST accepts that child, wait until the child task is actually materialized and visible on the dashboard/task API before the parent may finish. A queued/accepted POST prevents duplicate creation, but it is not permission for the parent to stop while the child is still absent from the dashboard. Reuse an existing ChatGPT conversation with an exact HTTPS ChatGPT URL ending in `/c/<id>` (including project-scoped URLs); the supplied URL is preserved for navigation.
+
 ## Execution model
 
 One workflow team owns one browser endpoint/account for its lifetime. Roles do not independently migrate endpoints. Persistent roles may continue only their own durable conversation; Temporary workflows use Fresh context and never auto-reload because reload can destroy temporary document identity.
@@ -38,7 +52,7 @@ Normal Send, Resume, Wait, and Route are exact-execution-identity operations. Th
 
 Exactly-once Send is non-negotiable: persist request identity before the irreversible boundary, persist accepted provenance after it, and never resolve an accepted or ambiguous Send by blindly sending again. Manual drafts and attachments are operator-owned evidence.
 
-Role reports are file-backed under `.plan/<team>/...`; the worker owns durable task state. PLAN alone may close the workflow with `DONE`.
+Role reports are file-backed under `.plan/<team>/...`; the worker owns durable task state. For Team Tasks, PLAN alone may close the workflow with `DONE`. A Solo task follows its own `DONE`/`PAUSE` contract; chained Solo work must create the next Solo task explicitly as described above.
 
 ## Change discipline
 

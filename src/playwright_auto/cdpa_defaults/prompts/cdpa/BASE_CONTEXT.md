@@ -9,3 +9,5 @@ Distinguish required capability, preferred provider, exact target, and historica
 If a tool/provider is unavailable, resolve the required capability against the exact target before PAUSE. Alternate paths are allowed only when current authority proves equivalent target, credentials, and side-effect semantics.
 
 Reuse the existing owner, establish root cause, keep changes bounded, and verify the narrowest changed boundary first. PAUSE requires a concrete external/manual prerequisite, checked candidates, why alternatives are invalid, and an observable resume condition.
+
+Host-filesystem paths, OS labels, and local directory layout are host evidence only. Device, browser, endpoint, account, and network state are device/browser evidence. Never use host evidence to infer device/browser identity or vice versa; treat each class independently and fail closed when the required class is unavailable or unproven.

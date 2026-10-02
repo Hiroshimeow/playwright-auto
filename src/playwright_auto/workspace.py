@@ -6,7 +6,13 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from .chatgpt import ChatGPTPage, PageBinding, RateLimitBlockedError, validate_page_role
+from .chatgpt import (
+    ChatGPTPage,
+    PageBinding,
+    RateLimitBlockedError,
+    cloudflare_challenge_visible,
+    validate_page_role,
+)
 
 
 class WorkspaceBindingError(RuntimeError):
@@ -127,7 +133,7 @@ class ChatGPTWorkspace:
                 force_new_page_id=force_new_page_id,
             )
         except Exception as exc:
-            cloudflare_challenge = "__cf_chl_rt_tk=" in str(getattr(page, "url", ""))
+            cloudflare_challenge = await cloudflare_challenge_visible(page)
             await page.close()
             if cloudflare_challenge:
                 raise RateLimitBlockedError(

@@ -56,6 +56,37 @@ cdpa "<task>" --temp
 
 Bootstrap selection is temporarily disabled. New workflow tasks always use Fresh context.
 
+### Solo Tasks
+
+Solo Tasks run exactly one workflow role and require an explicit browser endpoint:
+
+```powershell
+cdpa "Review the plan and create the next implementation task." `
+  --solo REVIEW `
+  --goal "Review the current plan against repository truth, then finish only after creating the next Solo DEV task." `
+  --browser 9202 `
+  --team my-change-plan-review `
+  --repository "E:\git-project\my-project"
+```
+
+To adopt an existing persistent ChatGPT conversation, add an exact URL:
+
+```powershell
+--conversation-url "https://chatgpt.com/c/<conversation-id>"
+```
+
+Solo Task creation is intentionally different from Team Task creation. Do not add Team-only fields/flags such as `--new`, `--new-all`, `--temp`, `--depends-on`, uploads, bootstrap fields, or `required_browser_endpoint_id`. The Solo API derives the required endpoint from `--browser`.
+
+For a linked Solo REVIEW/DEV/TEST chain, load `.skills/solo-role/SKILL.md` and use `.skills/solo-role/scripts/spawn_solo_task.py`. A non-final Solo agent creates exactly one next Solo task before returning DONE; do not use the Team route worker as the chaining mechanism. The helper uses deterministic idempotency so retrying the same child create does not duplicate work.
+
+Typical chain after a plan already exists:
+
+```text
+REVIEW(plan) -> DEV -> REVIEW(code) -> [DEV -> REVIEW as needed] -> TEST if runtime proof is needed -> REVIEW(closure)
+```
+
+Only the final closure REVIEW stops the chain after independent acceptance evidence is complete. A genuine external/manual prerequisite with no legal in-task action may PAUSE instead of creating a useless child loop.
+
 ### Dependencies
 
 ```powershell
@@ -197,13 +228,15 @@ Controls are processed by the durable worker state machine.
 
 ## Workflow and HCUW
 
-The default localized workflow is:
+The default localized **Team Task** workflow is:
 
 ```text
 PLAN -> DEV -> REVIEW -> PLAN -> DONE
 ```
 
-TEST or AUDIT are opt-in when a runtime, restart, browser, destructive, environment-specific, cross-cutting, or otherwise unproven boundary needs independent evidence. PLAN alone may route `DONE`.
+TEST or AUDIT are opt-in when a runtime, restart, browser, destructive, environment-specific, cross-cutting, or otherwise unproven boundary needs independent evidence. PLAN alone may route `DONE` for Team Tasks.
+
+Solo Tasks do not use this route chain. They have one role per task; linked Solo work creates the next Solo task explicitly as described in `.skills/solo-role/SKILL.md`.
 
 Repository work uses HCUW as the durable engineering frame:
 
