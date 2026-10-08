@@ -26,6 +26,7 @@ from playwright_auto.durable import (
     classify_recovery_state,
 )
 from playwright_auto.durable_blocks import DurableSendBlock
+from playwright_auto.chatgpt_errors import UnsafePageStateError
 from playwright_auto.file_lock import open_shared_read
 from playwright_auto.upload import UploadReceipt, collect_file_identities
 from playwright_auto.workflow import Workflow, WorkflowExecutionError
@@ -37,6 +38,7 @@ def snapshot(
     attachments=(),
     messages=(),
     state=ChatGPTState.NEW_CHAT,
+    stop=False,
 ):
     return ChatGPTSnapshot(
         url="https://chatgpt.com/c/session-1",
@@ -50,7 +52,7 @@ def snapshot(
         composer_text=text,
         send_visible=bool(text),
         send_enabled=bool(text),
-        stop_visible=False,
+        stop_visible=stop,
         blocking_dialogs=(),
         attachment_markers=tuple(attachments),
         error_texts=(),
@@ -570,6 +572,45 @@ def test_crash_resume_with_transcript_marker_waits_without_resend(tmp_path):
     assert RequestLedger(ledger_path).get(record.request_id).status is (
         RequestStatus.COMPLETED
     )
+
+
+def test_active_response_before_click_does_not_cross_durable_send_boundary(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+
+    class ActiveBeforeClickClient(FakeDurableClient):
+        async def set_text(self, text):
+            await super().set_text(text)
+            self.current = snapshot(
+                text=text,
+                messages=self.current.messages,
+                state=ChatGPTState.DRAFT,
+                stop=True,
+            )
+
+        async def send(self, *_args, **_kwargs):
+            raise AssertionError("Send must not be called while an existing response is active")
+
+    client = ActiveBeforeClickClient()
+
+    with pytest.raises(Exception) as captured:
+        run_block(
+            DurableSendBlock(
+                "current task",
+                ledger_path=ledger_path,
+                request_id="request-active-before-click",
+                wait_for_response=False,
+            ),
+            client,
+        )
+
+    record = RequestLedger(ledger_path).get("request-active-before-click")
+    assert isinstance(captured.value.cause, UnsafePageStateError)
+    assert record is not None
+    assert record.status is RequestStatus.PROMPT_SET
+    assert record.attempts == 0
+    assert record.binding is None
+    assert record.accepted_at is None
+    assert client.send_calls == []
 
 
 def test_pristine_new_dirty_composer_clears_once_then_sends_exactly_once(tmp_path):

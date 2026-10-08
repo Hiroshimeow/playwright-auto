@@ -16,6 +16,7 @@ from .chatgpt import (
     visible_text_matches,
     wait_for_existing_conversation_messages,
 )
+from .chatgpt_errors import UnsafePageStateError
 from .durable import (
     DurableRecoveryState,
     DurableRequestError,
@@ -595,6 +596,13 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
             )
 
         before_send = await context.client.assert_ownership()
+        if bool(getattr(before_send, "stop_visible", False)) or bool(
+            getattr(before_send, "response_projection_active", False)
+        ):
+            # This request has not crossed the click boundary yet. Preserve the
+            # pristine durable record so higher-level orchestration can wait for
+            # the pre-existing response instead of manufacturing an ambiguous Send.
+            raise UnsafePageStateError("page is already responding")
         if self.require_existing_conversation_baseline:
             before_send = await wait_for_existing_conversation_messages(
                 before_send,

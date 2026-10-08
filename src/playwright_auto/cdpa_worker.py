@@ -6832,6 +6832,23 @@ class CDPAWorker:
                 return await block.run(WorkflowContext(acquired.client))
 
             output = await self._run_automated_send(perform_send)
+        except UnsafePageStateError as exc:
+            current_record = ledger.peek(str(hop["request_id"]))
+            solo_existing_url = (
+                str(state.get("workflow_mode") or "team").strip().lower() == "solo"
+                and str(hop.get("kind") or "") == "task"
+                and bool(str(hop.get("conversation_url") or "").strip())
+            )
+            if (
+                solo_existing_url
+                and self._should_observe_existing_response(exc)
+                and self._is_pristine_preboundary_sending_record(
+                    state, hop, current_record
+                )
+            ):
+                self._observe_existing_response(state, hop)
+                return
+            raise
         except ConversationTranscriptNotReadyError as exc:
             current_record = ledger.get(str(hop["request_id"]))
             if (

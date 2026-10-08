@@ -17,6 +17,8 @@ from playwright_auto.chatgpt import MessageBaseline, MessageSnapshot, PageBindin
 from playwright_auto.cdpa_prompts import PromptBuilder
 from playwright_auto.cdpa_store import TaskStore, task_goal_for_hop
 from playwright_auto.cdpa_worker import CDPAWorker
+from playwright_auto.durable import RequestLedger, RequestStatus
+from playwright_auto.chatgpt_errors import UnsafePageStateError
 from playwright_auto.dashboard_api import DashboardAPI
 
 from test_cdpa_core import write_config
@@ -715,6 +717,102 @@ def test_solo_existing_responding_url_enters_wait_without_send(tmp_path: Path, m
     assert hop["observed_existing_response"] is True
     assert "adopted_existing_response" not in hop
     assert state["active_action"] == "wait_response"
+
+
+def test_solo_existing_url_send_race_observes_active_response_then_retries_goal(
+    tmp_path: Path, monkeypatch
+):
+    config, store = make_store(tmp_path)
+    url = "https://chatgpt.com/c/solo-send-race"
+    state = store.create_task(
+        "Solo send race",
+        task_id="solo-send-race",
+        workflow_mode="solo",
+        roles=("DEV",),
+        goal="CURRENT GOAL MUST SEND AFTER OLD RESPONSE",
+        browser_endpoint_id="9222",
+        conversation_url=url,
+    )
+    worker = CDPAWorker(config, store=store)
+    hop = active_hop(state)
+    acquired = AcquiredRole(
+        client=SimpleNamespace(),
+        page_id="page-send-race",
+        url=url,
+        created=False,
+        new_chat=False,
+        conversation_id=url.rsplit("/", 1)[-1],
+    )
+
+    class Actions:
+        async def adopt_conversation(self, *_args, **_kwargs):
+            return acquired
+
+        async def acquire(self, *_args, **_kwargs):
+            return acquired
+
+    async def no_rate_limit(_acquired):
+        return None
+
+    async def ready(*_args, **_kwargs):
+        return SimpleNamespace(reason="ready")
+
+    monkeypatch.setattr(worker, "_dismiss_known_rate_limit_on_existing", no_rate_limit)
+    monkeypatch.setattr(worker.role_controller, "run", ready)
+
+    asyncio.run(worker._pre_send(state, hop, Actions()))
+    assert hop["state"] == "sending"
+
+    constructor = worker_module.task_workflow_definitions(state, config)["DEV"]["system_prompt"]
+    ledger = RequestLedger(hop["ledger_path"])
+    record = ledger.begin(
+        role=hop["physical_role"],
+        prompt=hop["prompt"],
+        source_context={
+            "task_id": state["task_id"],
+            "team": state["team"],
+            "hop_id": hop["hop_id"],
+            "manifest": state["manifest_path"],
+        },
+        role_prompt_hash=worker_module._sha(constructor),
+        request_id=hop["request_id"],
+        render_request_marker=False,
+    )
+    assert record.status is RequestStatus.NEW
+    assert record.attempts == 0
+
+    async def owned(*_args, **_kwargs):
+        return acquired
+
+    async def active_before_click(_block, _context):
+        raise UnsafePageStateError("page is already responding")
+
+    monkeypatch.setattr(worker, "_owned_or_block", owned)
+    monkeypatch.setattr(worker_module.DurableSendBlock, "run", active_before_click)
+
+    asyncio.run(worker._sending(state, hop, Actions()))
+
+    durable = ledger.get(hop["request_id"])
+    assert durable is not None
+    assert durable.status is RequestStatus.NEW
+    assert durable.attempts == 0
+    assert state["status"] == "RUNNING"
+    assert state["active_action"] == "wait_response"
+    assert hop["state"] == "waiting"
+    assert hop["observed_existing_response"] is True
+    assert hop.get("receipt") is None
+
+    asyncio.run(
+        worker._waiting(
+            state,
+            hop,
+            Actions(),
+            Path(state["manifest_path"]),
+        )
+    )
+    assert hop["state"] == "pre_send"
+    assert "observed_existing_response" not in hop
+    assert state["active_action"] == "queued"
 
 
 def test_solo_existing_idle_url_sends_full_first_goal_prompt(tmp_path: Path, monkeypatch):
