@@ -69,6 +69,7 @@ class RoleController:
                 return self._remember(ctx, Decision(Action.BLOCK, binding_error))
             dom_decision = response.handle(ctx)
             if dom_decision is not None:
+                wait["terminal_response_source"] = "dom"
                 return self._remember(ctx, dom_decision)
             dom_pending = bool(
                 ctx.candidate is not None
@@ -85,6 +86,7 @@ class RoleController:
                 response.observe_candidate(ctx, network_response, validate, source="listen")
                 listen_decision = response.handle(ctx)
                 if listen_decision is not None:
+                    wait["terminal_response_source"] = "listen"
                     return self._remember(ctx, listen_decision)
                 listen_pending = bool(
                     ctx.candidate is not None
@@ -245,9 +247,92 @@ class RoleController:
                 snapshot = await client.assert_ownership()
         read = getattr(client, "page_observation", None)
         evidence = read() if callable(read) else {}
-        signals = RoleSignals.from_sources(
-            snapshot, evidence if isinstance(evidence, Mapping) else {}
+        raw_evidence = dict(evidence) if isinstance(evidence, Mapping) else {}
+        observed_at = parse_time(raw_evidence.get("observed_at"))
+        instance_id = str(raw_evidence.get("observer_instance_id") or "")
+        epoch = raw_evidence.get("observer_epoch")
+        signal_seq = raw_evidence.get("signal_seq")
+        current_conversation = str(raw_evidence.get("conversation_id") or "")
+        snapshot_path = urlsplit(str(getattr(snapshot, "url", "") or "")).path
+        snapshot_conversation = (
+            snapshot_path.rsplit("/", 1)[-1]
+            if snapshot_path.startswith("/c/")
+            else ""
         )
+        listen_current = bool(
+            observed_at is not None
+            and (datetime.now(timezone.utc) - observed_at).total_seconds() <= 5.0
+            and instance_id
+            and isinstance(epoch, int)
+            and not isinstance(epoch, bool)
+            and isinstance(signal_seq, int)
+            and not isinstance(signal_seq, bool)
+            and (
+                not current_conversation
+                or current_conversation.startswith("WEB:")
+                or not snapshot_conversation
+                or current_conversation == snapshot_conversation
+            )
+        )
+        if not listen_current:
+            for key in ("permission_action", "response", "status"):
+                raw_evidence.pop(key, None)
+        else:
+            watermark = wait.get("listen_watermark")
+            newer = not isinstance(watermark, Mapping)
+            if isinstance(watermark, Mapping):
+                watermark_instance = str(
+                    watermark.get("observer_instance_id") or ""
+                )
+                watermark_epoch = watermark.get("observer_epoch")
+                watermark_seq = watermark.get("signal_seq")
+                if watermark_instance == instance_id:
+                    newer = bool(
+                        isinstance(watermark_epoch, int)
+                        and not isinstance(watermark_epoch, bool)
+                        and isinstance(watermark_seq, int)
+                        and not isinstance(watermark_seq, bool)
+                        and (
+                            epoch > watermark_epoch
+                            or (
+                                epoch == watermark_epoch
+                                and signal_seq > watermark_seq
+                            )
+                        )
+                    )
+                else:
+                    retired_instances = {
+                        str(value)
+                        for value in wait.get("listen_retired_instances") or []
+                        if str(value)
+                    }
+                    watermark_observed_at = parse_time(
+                        watermark.get("observed_at")
+                    )
+                    newer = bool(
+                        instance_id not in retired_instances
+                        and (
+                            watermark_observed_at is None
+                            or (
+                                observed_at is not None
+                                and observed_at > watermark_observed_at
+                            )
+                        )
+                    )
+                    if newer and watermark_instance:
+                        retired_instances.add(watermark_instance)
+                        wait["listen_retired_instances"] = sorted(retired_instances)
+            if newer:
+                wait["listen_watermark"] = {
+                    "observer_instance_id": instance_id,
+                    "observer_epoch": epoch,
+                    "signal_seq": signal_seq,
+                    "observed_at": raw_evidence.get("observed_at"),
+                }
+            else:
+                for key in ("permission_action", "response", "status"):
+                    raw_evidence.pop(key, None)
+        signals = RoleSignals.from_sources(snapshot, raw_evidence)
         permission = signals.permission
         # LISTEN response and rendered DOM remain independent response sources.
         # Policy consumes one normalized signal frame; raw network chunks never leak in.
@@ -449,7 +534,7 @@ class RoleController:
                 wait["timeout_refreshed"] = True
             begin_refresh(wait)
             try:
-                await client.refresh()
+                await client.refresh(reason=decision.reason)
             except Exception as exc:
                 finish_refresh(wait, error=type(exc).__name__)
                 raise

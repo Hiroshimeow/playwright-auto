@@ -171,6 +171,91 @@ def _public_handoff(value: object) -> str | None:
     return Path(text.replace("\\", "/")).name or None
 
 
+def _operational_projection(raw: Mapping[str, Any]) -> dict[str, Any]:
+    hops = [item for item in raw.get("hops") or [] if isinstance(item, Mapping)]
+    active_hop_id = raw.get("active_hop_id")
+    hop = next(
+        (item for item in hops if item.get("hop_id") == active_hop_id),
+        hops[-1] if hops else {},
+    )
+    wait = hop.get("wait") if isinstance(hop.get("wait"), Mapping) else {}
+    hop_state = str(hop.get("state") or "").strip().lower()
+    if hop_state in {"new", "prepared", "pre_send"}:
+        boundary = "pre_send"
+    elif hop_state in {"sending", "sent", "waiting", "responded"} or hop.get("receipt"):
+        boundary = "crossed"
+    else:
+        boundary = "unknown"
+
+    governing = (
+        hop.get("governing_contract_ref")
+        if isinstance(hop.get("governing_contract_ref"), Mapping)
+        else {}
+    )
+    watermark = (
+        wait.get("listen_watermark")
+        if isinstance(wait.get("listen_watermark"), Mapping)
+        else {}
+    )
+    route_control = next(
+        (
+            item
+            for item in reversed(raw.get("controls") or [])
+            if isinstance(item, Mapping)
+            and str(item.get("action") or "") == "route_plan"
+            and str(item.get("status") or "") == "applied"
+        ),
+        None,
+    )
+    reconciliation = str(hop.get("kind") or "") == "accepted_send_reconciliation"
+    return {
+        "endpoint": {
+            "home_endpoint": str(raw.get("browser_endpoint_id") or "") or None,
+            "endpoint_pinned": raw.get("endpoint_pinned") is not False,
+            "required_endpoint": str(raw.get("required_browser_endpoint_id") or "") or None,
+        },
+        "request_boundary": boundary,
+        "accepted_identity": {
+            "started_at": wait.get("accepted_identity_started_at"),
+            "deadline_at": wait.get("accepted_identity_deadline_at"),
+            "finished_at": wait.get("accepted_identity_finished_at"),
+            "outcome": wait.get("accepted_identity_outcome"),
+        },
+        "governing_contract": {
+            "resolved": bool(governing.get("resolved")),
+            "goal_revision": governing.get("goal_revision"),
+            "semantic_sha256": governing.get("semantic_sha256"),
+            "continuation_sha256": governing.get("continuation_sha256"),
+        },
+        "listen": {
+            "observer_instance_id": watermark.get("observer_instance_id"),
+            "observer_epoch": watermark.get("observer_epoch"),
+            "signal_seq": watermark.get("signal_seq"),
+            "observed_at": watermark.get("observed_at"),
+            "retired_instance_count": len(wait.get("listen_retired_instances") or []),
+        },
+        "terminal": {
+            "decision": wait.get("controller_decision"),
+            "reason": wait.get("controller_reason"),
+            "source": wait.get("terminal_response_source"),
+        },
+        "reconciliation": {
+            "active_or_latest": reconciliation,
+            "no_replay": bool(hop.get("reconciliation_no_replay")) if reconciliation else False,
+            "control_origin": (
+                str(route_control.get("origin") or "operator")
+                if reconciliation and isinstance(route_control, Mapping)
+                else None
+            ),
+            "route_plan_control_id": (
+                route_control.get("control_id")
+                if reconciliation and isinstance(route_control, Mapping)
+                else None
+            ),
+        },
+    }
+
+
 def _public_hop(hop: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "hop_id": hop.get("hop_id"),
@@ -1385,10 +1470,13 @@ def build_task_projection(
         "independent_history": independent_history,
         "maintenance_reports": maintenance_reports,
         "depends_on_task_ids": [str(item) for item in raw.get("depends_on_task_ids") or []],
+        "operational": _operational_projection(raw),
         "dependencies": [
             {
                 "task_id": dependency_id,
                 "team": str(dependency.get("team") or "") or dependency_id,
+                "status": str(dependency.get("status") or "").upper() or None,
+                "block_code": str(dependency.get("block_code") or "") or None,
             }
             for dependency_id in [str(item) for item in raw.get("depends_on_task_ids") or []]
             for dependency in [

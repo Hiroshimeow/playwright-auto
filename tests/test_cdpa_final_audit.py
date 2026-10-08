@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -137,3 +141,132 @@ def test_malformed_pid_receipt_never_reaches_native_process_lookup(tmp_path, pid
     assert state["managed_running"] is None
     assert state["process_ownership"] == "unverified"
     assert not calls
+
+def test_provider_challenge_remains_evidence_only_outside_blocker_recovery_state():
+    root = Path(__file__).resolve().parents[1]
+    evidence_source = (root / "src" / "playwright_auto" / "chatgpt.py").read_text(encoding="utf-8").lower()
+    assert "cloudflare_challenge_visible" in evidence_source
+    assert "cf-turnstile" in evidence_source
+
+    for relative in (
+        "src/playwright_auto/cdpa_worker.py",
+        "src/playwright_auto/cdpa_store.py",
+        "src/playwright_auto/cdpa_commands.py",
+        "src/playwright_auto/cdpa_projection.py",
+    ):
+        text = (root / relative).read_text(encoding="utf-8").lower()
+        assert "cloudflare" not in text
+        assert "turnstile" not in text
+        assert "challenge_bypass" not in text
+        assert "clear_browser_cache" not in text
+        assert "clear_browser_caches" not in text
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows cmd.exe acceptance")
+def test_windows_cmd_structured_admission_file_preserves_multiline_semantics(tmp_path):
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_store import normalize_governing_contract
+    from playwright_auto.dashboard_api import DashboardAPI
+    from test_cdpa_core import write_config
+
+    repository_root = Path(__file__).resolve().parents[1]
+    python_exe = repository_root / ".venv" / "Scripts" / "python.exe"
+    config_path = write_config(tmp_path)
+    captured = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            captured.update(json.loads(self.rfile.read(length).decode("utf-8")))
+            body = json.dumps({"task_id": "windows-shell", "status": "INBOX"}).encode("utf-8")
+            self.send_response(202)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            return None
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    port = int(server.server_address[1])
+    config_data = json.loads(config_path.read_text(encoding="utf-8"))
+    config_data["dashboard"]["api_port"] = port
+    config_path.write_text(json.dumps(config_data, indent=2), encoding="utf-8")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    task = '  line one\r\n--config must-stay-data\rheader: value\nquote "x" \\ path\nUnicode \u3053\u3093\u306b\u3061\u306f  '
+    objective = '  objective\r\nsecond\rthird --config data  '
+    directives = [
+        'first\r\nline',
+        ' second "quoted" \\ value ',
+        '--config still data',
+    ]
+    envelope = tmp_path / "admission.json"
+    envelope.write_text(
+        json.dumps(
+            {
+                "task": task,
+                "governing_objective": objective,
+                "governing_directives": directives,
+                "requested_team": "windows-admission",
+                "repository": str(tmp_path),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    command = subprocess.list2cmdline(
+        [
+            str(python_exe),
+            "-m",
+            "playwright_auto.cdpa_cli",
+            "--admission-file",
+            str(envelope),
+            "--config",
+            str(config_path),
+        ]
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(repository_root / "src")
+    try:
+        completed = subprocess.run(
+            ["cmd.exe", "/d", "/s", "/c", command],
+            cwd=tmp_path,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    normalized = DashboardAPI(
+        load_cdpa_config(config_path, repository_root=tmp_path)
+    ).normalize_create(captured)
+    expected_task = task.replace("\r\n", "\n").replace("\r", "\n")
+    expected_payload, expected_digest = normalize_governing_contract(
+        objective, directives
+    )
+    assert normalized["task"] == expected_task
+    payload, digest = normalize_governing_contract(
+        normalized["governing_objective"],
+        normalized["governing_directives"],
+    )
+    assert payload == expected_payload
+    assert digest == expected_digest
+    semantic = json.loads(payload)
+    assert semantic["objective"] == objective.replace("\r\n", "\n").replace("\r", "\n")
+    assert semantic["directives"] == [
+        value.replace("\r\n", "\n").replace("\r", "\n")
+        for value in directives
+    ]
+    assert "--config must-stay-data" in normalized["task"]
+    assert "--config still data" in semantic["directives"]

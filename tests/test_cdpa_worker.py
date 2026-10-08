@@ -279,6 +279,8 @@ def setup_task(
         roles=roles,
         repository=repository,
         bootstrap=bootstrap,
+        governing_objective="Implement exact production behavior",
+        governing_directives=[],
     )
     return config, store, state, CDPAWorker(config, store=store)
 
@@ -352,6 +354,8 @@ def test_presend_block_closes_team_tabs_and_preserves_block_truth(tmp_path: Path
         requested_team="blocked-release",
         task_id="task-presend-block-release",
         upload_paths=[attachment],
+        governing_objective="Requires attachment",
+        governing_directives=(),
     )
     path = Path(state["manifest_path"])
     attachment.unlink()
@@ -515,6 +519,8 @@ def test_archive_worktree_control_rejects_repository_with_nonterminal_owner(tmp_
         requested_team="active-owner",
         task_id="task-worktree-owner",
         repository=str(target),
+        governing_objective="Still owns this repository",
+        governing_directives=(),
     )
     assert owner["status"] not in {"DONE", "STOPPED"}
     state = store.request_control(path, "archive_worktree", confirmed=True)
@@ -558,6 +564,8 @@ def test_archive_worktree_control_serializes_final_owner_proof_and_removal_with_
                 requested_team="concurrent-owner",
                 task_id="task-worktree-concurrent-owner",
                 repository=str(target),
+                governing_objective="Concurrent owner",
+                governing_directives=(),
             )
             ordering.append("owner-created")
         except BaseException as exc:  # pragma: no cover - asserted below
@@ -1221,12 +1229,16 @@ def test_waiting_stop_control_applies_before_waiting_short_circuit(
         "dependency",
         requested_team="dependency",
         task_id="task-waiting-stop-dependency",
+        governing_objective="dependency",
+        governing_directives=(),
     )
     state = store.create_task(
         "waiting child",
         requested_team="waiting-stop",
         task_id="task-waiting-stop",
         depends_on_task_ids=(dependency["task_id"],),
+        governing_objective="waiting child",
+        governing_directives=(),
     )
     path = Path(state["manifest_path"])
     assert state["status"] == "WAITING"
@@ -1279,6 +1291,8 @@ def test_pause_requested_during_role_acquisition_survives_and_applies_before_sen
         "owner",
         requested_team="alpha",
         task_id="task-presend-control-race",
+        governing_objective="owner",
+        governing_directives=(),
     )
     path = Path(state["manifest_path"])
     worker = CDPAWorker(config, store=store)
@@ -1323,6 +1337,8 @@ def test_pause_requested_after_accepted_send_survives_without_duplicate_send(
         "owner",
         requested_team="alpha",
         task_id="task-send-control-race",
+        governing_objective="owner",
+        governing_directives=(),
     )
     path = Path(state["manifest_path"])
     worker = CDPAWorker(config, store=store)
@@ -1403,6 +1419,8 @@ def test_pre_send_first_role_uses_bootstrap_once_and_keeps_full_prompt(tmp_path:
         task_id="task-bootstrap-runtime",
         roles=("PLAN", "DEV", "REVIEW"),
         bootstrap=anchor,
+        governing_objective="Implement exact production behavior",
+        governing_directives=(),
     )
     worker = CDPAWorker(config, store=store)
 
@@ -1473,11 +1491,15 @@ def test_bootstrap_branch_rejects_foreign_durable_writable_conversation(tmp_path
         requested_team="owner-collision",
         task_id="task-owner-collision",
         bootstrap=anchor,
+        governing_objective="owner collision",
+        governing_directives=(),
     )
     foreign = store.create_task(
         "foreign owner",
         requested_team="foreign-owner",
         task_id="task-foreign-owner",
+        governing_objective="foreign owner",
+        governing_directives=(),
     )
     candidate_id = "88888888-8888-4888-8888-888888888888"
     foreign_role = foreign["roles"]["PLAN"]
@@ -1533,6 +1555,8 @@ def test_pre_send_unresolved_native_branch_blocks_without_ui_fallback(tmp_path: 
         requested_team="unresolved-branch",
         task_id="task-unresolved-branch",
         bootstrap=anchor,
+        governing_objective="unresolved provisional branch",
+        governing_directives=(),
     )
     worker = CDPAWorker(config, store=store)
     unresolved_type = getattr(
@@ -1570,6 +1594,8 @@ def test_bootstrap_alias_rejection_keeps_durable_attempts_at_zero(tmp_path: Path
         requested_team="alias-zero-send",
         task_id="task-alias-zero-send",
         bootstrap=anchor,
+        governing_objective="alias stays pre-send",
+        governing_directives=(),
     )
     worker = CDPAWorker(config, store=store)
 
@@ -1602,6 +1628,8 @@ def test_pre_send_bootstrap_transient_failure_stays_pre_send_without_fresh_fallb
         requested_team="fallback",
         task_id="task-bootstrap-fallback",
         bootstrap=selected,
+        governing_objective="fallback",
+        governing_directives=(),
     )
     worker = CDPAWorker(config, store=store)
 
@@ -1641,6 +1669,8 @@ def test_pre_send_bootstrap_transient_failure_stays_pre_send_without_fresh_fallb
         requested_team="protected-send",
         task_id="task-bootstrap-protected-send",
         bootstrap=selected,
+        governing_objective="protected send",
+        governing_directives=(),
     )
     protected_hop = _active_hop(protected)
     protected_hop["receipt"] = {"accepted": True}
@@ -3882,12 +3912,14 @@ class ExplodingBrowserContext:
 def test_dependency_waiting_does_not_construct_browser_actions_or_rewrite(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
-    store.create_task("Parent", requested_team="parent", task_id="task-parent")
+    store.create_task("Parent", requested_team="parent", task_id="task-parent", governing_objective="Parent", governing_directives=())
     child = store.create_task(
         "Child",
         requested_team="child",
         task_id="task-child",
         depends_on_task_ids=("task-parent",),
+        governing_objective="Child",
+        governing_directives=(),
     )
     path = Path(child["manifest_path"])
     before = path.read_bytes()
@@ -3905,12 +3937,14 @@ def test_dependency_waiting_does_not_construct_browser_actions_or_rewrite(tmp_pa
 def test_dependency_release_is_one_durable_transition_without_browser_action(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
-    parent = store.create_task("Parent", requested_team="parent", task_id="task-parent")
+    parent = store.create_task("Parent", requested_team="parent", task_id="task-parent", governing_objective="Parent", governing_directives=())
     child = store.create_task(
         "Child",
         requested_team="child",
         task_id="task-child",
         depends_on_task_ids=("task-parent",),
+        governing_objective="Child",
+        governing_directives=(),
     )
     store.update(
         parent["manifest_path"],
@@ -3955,9 +3989,9 @@ def test_dependency_release_is_one_durable_transition_without_browser_action(tmp
 def test_same_team_queue_releases_oldest_ready_task_before_browser_access(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
-    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner")
-    queued_b = store.create_task("queued b", reuse_team="alpha", task_id="task-b")
-    queued_a = store.create_task("queued a", reuse_team="alpha", task_id="task-a")
+    owner = store.create_task("owner", requested_team="alpha", task_id="task-owner", governing_objective="owner", governing_directives=())
+    queued_b = store.create_task("queued b", reuse_team="alpha", task_id="task-b", governing_objective="queued b", governing_directives=())
+    queued_a = store.create_task("queued a", reuse_team="alpha", task_id="task-a", governing_objective="queued a", governing_directives=())
     same_time = "2026-07-23T00:00:00+00:00"
     for queued in (queued_a, queued_b):
         store.update(
@@ -4075,6 +4109,8 @@ def test_cdpa_uploads_once_per_role_conversation_generation(tmp_path: Path, monk
         requested_team="alpha",
         task_id="task-upload-generation",
         upload_paths=[attachment],
+        governing_objective="Analyze context",
+        governing_directives=(),
     )
     worker = CDPAWorker(config, store=store)
     captured_files: list[tuple[str, ...]] = []
@@ -4289,6 +4325,8 @@ def test_runtime_worker_hung_dom_probe_revisits_expired_second_task_past_bound(
         "second task",
         requested_team="beta",
         task_id="task-runtime-hung-dom-b",
+        governing_objective="second task",
+        governing_directives=(),
     )
     worker.hydrate_runtime()
     assert worker.registry is not None
@@ -4438,6 +4476,8 @@ def test_runtime_worker_consumes_new_requested_control_during_unrelated_slow_cyc
         "blocked target",
         requested_team="target-team",
         task_id="task-runtime-live-control",
+        governing_objective="blocked target",
+        governing_directives=(),
     )
     target_path = Path(target["manifest_path"])
     target["status"] = "BLOCKED"
@@ -5021,6 +5061,8 @@ def test_dashboard_actions_snapshot_tracks_browser_and_command_changes(tmp_path:
             "repository": str(tmp_path),
             "report_mode": "file",
             "roles": ["PLAN", "REVIEW"],
+            "governing_objective": "Created dashboard action dependency",
+            "governing_directives": [],
         },
     )
     assert worker._apply_next_command()["status"] == "applied"
@@ -5248,6 +5290,8 @@ def test_runtime_create_command_applies_once_and_publishes_projection(tmp_path: 
             "repository": str(tmp_path),
             "report_mode": "file",
             "roles": ["REVIEW", "PLAN"],
+            "governing_objective": "Created through mailbox",
+            "governing_directives": [],
         },
     )
 
@@ -5424,6 +5468,8 @@ def test_bootstrap_projection_is_sanitized_and_distinguishes_fallbacks(tmp_path:
         task_id="task-bootstrap-projection",
         roles=("PLAN", "DEV", "REVIEW"),
         bootstrap=bootstrap_record(),
+        governing_objective="projection bootstrap",
+        governing_directives=(),
     )
     state["roles"]["PLAN"]["context_source"] = "bootstrap_donor"
     state["roles"]["DEV"]["context_source"] = "bootstrap_native"
@@ -5442,7 +5488,9 @@ def test_bootstrap_projection_is_sanitized_and_distinguishes_fallbacks(tmp_path:
     assert bootstrap_record()["terminal_assistant_message_id"] not in serialized
 
     fresh = store.create_task(
-        "projection fresh", requested_team="projection-fresh", task_id="task-fresh-projection"
+        "projection fresh", requested_team="projection-fresh", task_id="task-fresh-projection",
+        governing_objective="projection fresh",
+        governing_directives=(),
     )
     fresh_detail = build_task_projection(fresh, tasks=[fresh]).detail
     assert "bootstrap_context" not in fresh_detail
@@ -5583,7 +5631,13 @@ def test_change_goal_command_applies_once_and_reconciles_without_browser(tmp_pat
     worker.hydrate_runtime()
     worker.runtime_db.enqueue_command(
         command_id="cmd-change-goal", idempotency_key="change-goal", kind="change_goal",
-        task_id=state["task_id"], expected_task_version=None, payload={"goal": "Replacement from command"},
+        task_id=state["task_id"],
+        expected_task_version=None,
+        payload={
+            "goal": "Replacement from command",
+            "governing_objective": "Replacement from command",
+            "governing_directives": [],
+        },
     )
     applied = worker.dispatch_command_once()
     assert applied["status"] == "applied"
@@ -5606,7 +5660,10 @@ def test_change_goal_keeps_current_prompt_and_updates_first_later_hop(tmp_path: 
     _config, store, state, worker = setup_task(tmp_path, task_id="task-goal-prompt")
     state = store.update(state["manifest_path"], lambda current: {**current, "status": "RUNNING"})
     state = store.change_goal(
-        state["manifest_path"], "Replacement for later roles",
+        state["manifest_path"],
+        "Replacement for later roles",
+        governing_objective="Replacement for later roles",
+        governing_directives=(),
         external_command_id="cmd-goal-prompt",
     )
     current = _active_hop(state)
@@ -5859,6 +5916,8 @@ def test_first_allocation_keeps_catalog_primary_before_task_backup(tmp_path: Pat
         requested_team="donor-preference",
         task_id="task-donor-preference",
         bootstrap=record,
+        governing_objective="prefer stable primary donor",
+        governing_directives=(),
     )
     child_donor = {
         "conversation_id": "33333333-3333-4333-8333-333333333333",
@@ -5912,6 +5971,8 @@ def test_transient_donor_backend_failure_retries_without_removing_or_blocking(tm
         requested_team="donor-transient",
         task_id="task-donor-transient",
         bootstrap=record,
+        governing_objective="transient donor read",
+        governing_directives=(),
     )
     worker = CDPAWorker(config, store=store)
 
@@ -5941,6 +6002,8 @@ def test_source_only_bootstrap_requires_local_materialization_without_graph_fetc
         requested_team="donor-source",
         task_id="task-donor-source",
         bootstrap=record,
+        governing_objective="materialize source donor",
+        governing_directives=(),
     )
     worker = CDPAWorker(config, store=store)
     assistant_id = "22222222-2222-4222-8222-222222222222"
@@ -5991,6 +6054,8 @@ def test_active_rate_limit_gate_blocks_prewarm_before_global_role_acquisition(tm
         requested_team="donor-prewarm-gated",
         task_id="task-donor-prewarm-gated",
         bootstrap=record,
+        governing_objective="do not prewarm during cooldown",
+        governing_directives=(),
     )
     state["bootstrap_source_exhausted"] = True
     worker = CDPAWorker(config, store=store)
@@ -6024,6 +6089,8 @@ def test_prewarm_regenerates_donor_through_shared_send_gate(tmp_path: Path, monk
         requested_team="donor-prewarm",
         task_id="task-donor-prewarm",
         bootstrap=record,
+        governing_objective="regenerate donor",
+        governing_directives=(),
     )
     state["bootstrap_source_exhausted"] = True
     worker = CDPAWorker(config, store=store)
@@ -6118,6 +6185,8 @@ def test_exhausted_source_without_prewarm_blocks_without_fresh_fallback(tmp_path
         requested_team="donor-lost",
         task_id="task-donor-lost",
         bootstrap=record,
+        governing_objective="lost donors",
+        governing_directives=(),
     )
     worker = CDPAWorker(config, store=store)
 
@@ -6147,6 +6216,8 @@ def test_accepted_first_role_self_clones_child_local_bootstrap_donor(tmp_path: P
         requested_team="donor-capture",
         task_id="task-donor-capture",
         bootstrap=record,
+        governing_objective="capture descendant donor",
+        governing_directives=(),
     )
     role = state["roles"]["PLAN"]
     role["context_source"] = "bootstrap_donor"
@@ -6210,6 +6281,8 @@ def test_aliased_role_conversation_is_not_persisted_as_descendant_bootstrap_dono
         requested_team="donor-alias",
         task_id="task-donor-alias",
         bootstrap=record,
+        governing_objective="reject aliased descendant donor",
+        governing_directives=(),
     )
     role = state["roles"]["PLAN"]
     role["context_source"] = "bootstrap_donor"
@@ -6286,6 +6359,7 @@ def test_custom_workflow_roles_share_the_same_execution_budget(tmp_path: Path):
     custom = store.create_workflow_agent(
         display_name="Custom loop role",
         system_prompt="Perform the assigned custom workflow role.",
+        continuation_contract="Continue the assigned custom workflow role on later turns.",
         external_command_id="create-custom-loop-role",
     )["route_key"]
     state = store.create_task(
@@ -6293,6 +6367,8 @@ def test_custom_workflow_roles_share_the_same_execution_budget(tmp_path: Path):
         requested_team="custom-loop",
         task_id="task-custom-budget",
         roles=("PLAN", custom),
+        governing_objective="Exercise custom workflow budget",
+        governing_directives=(),
     )
     worker = CDPAWorker(config, store=store)
 

@@ -1746,3 +1746,15 @@ def test_live_stream_controller_buffers_bootstrap_keeps_one_source_and_ignores_s
         "auditIds": ["event-1"],
         "currentScope": "task:REVIEW",
     }
+
+
+def test_dashboard_team_create_and_goal_change_send_governing_contract_fields():
+    html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+    app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
+
+    assert 'name="governing_objective"' in html
+    assert 'name="governing_directives"' in html
+    assert html.count('name="governing_objective"') >= 2
+    assert html.count('name="governing_directives"') >= 2
+    assert "governing_objective:" in app
+    assert "governing_directives:" in app

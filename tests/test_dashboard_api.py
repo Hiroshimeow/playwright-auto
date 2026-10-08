@@ -149,7 +149,12 @@ def test_bootstrap_catalog_is_read_only_for_new_tasks(tmp_path: Path):
         assert json.loads(body)["items"][0]["bootstrap_id"] == "general-team-bootstrap"
         assert base["conversation_id"] not in body.decode()
 
-        common = {"task": "fresh task", "repository": str(tmp_path)}
+        common = {
+            "task": "fresh task",
+            "repository": str(tmp_path),
+            "governing_objective": "fresh task",
+            "governing_directives": [],
+        }
         status, _headers, data = request(
             server, "POST", "/api/tasks", body=common,
             headers={"Idempotency-Key": "fresh-default"},
@@ -223,7 +228,11 @@ def test_agents_api_etag_and_workflow_catalog_commands(tmp_path: Path):
             server,
             "POST",
             "/api/workflow-agents",
-            body={"name": "Writer", "system_prompt": "WRITER_PROMPT"},
+            body={
+                "name": "Writer",
+                "system_prompt": "WRITER_PROMPT",
+                "continuation_contract": "Continue Writer work.",
+            },
             headers={"Idempotency-Key": "create-writer"},
         )
         assert status == 202
@@ -232,13 +241,18 @@ def test_agents_api_etag_and_workflow_catalog_commands(tmp_path: Path):
         assert command["payload"] == {
             "name": "Writer",
             "system_prompt": "WRITER_PROMPT",
+            "continuation_contract": "Continue Writer work.",
         }
 
         status, _headers, body = request(
             server,
             "POST",
             "/api/workflow-agents/WF_123456789ABC/settings",
-            body={"name": "Researcher v2", "system_prompt": "CUSTOM_PROMPT_V2"},
+            body={
+                "name": "Researcher v2",
+                "system_prompt": "CUSTOM_PROMPT_V2",
+                "continuation_contract": "Continue Researcher work.",
+            },
             headers={"Idempotency-Key": "update-researcher"},
         )
         assert status == 202
@@ -571,27 +585,29 @@ def test_create_repository_inference_is_header_bounded_and_strict(tmp_path: Path
         {
             "task": "Title\nRepository relative/path",
             "repository": str(repo_a),
+            "governing_objective": "Title\nRepository relative/path",
+            "governing_directives": [],
         }
     )
     assert explicit["repository"] == str(repo_a.resolve())
 
     one_line = api.normalize_create(
-        {"task": f"Title\nRepository {repo_a}", "repository": None}
+        {"task": f"Title\nRepository {repo_a}", "repository": None, "governing_objective": f"Title\nRepository {repo_a}", "governing_directives": []}
     )
     assert one_line["repository"] == str(repo_a.resolve())
 
     embedded = api.normalize_create(
-        {"task": f"QMH task. Repository {repo_a}, use @mcp-g8 only."}
+        {"task": f"QMH task. Repository {repo_a}, use @mcp-g8 only.", "governing_objective": f"QMH task. Repository {repo_a}, use @mcp-g8 only.", "governing_directives": []}
     )
     assert embedded["repository"] == str(repo_a.resolve())
 
     embedded_target = api.normalize_create(
-        {"task": f"QMH task. Target repository {repo_b} use @mcp-g8 only."}
+        {"task": f"QMH task. Target repository {repo_b} use @mcp-g8 only.", "governing_objective": f"QMH task. Target repository {repo_b} use @mcp-g8 only.", "governing_directives": []}
     )
     assert embedded_target["repository"] == str(repo_b.resolve())
 
     remote = api.normalize_create(
-        {"task": r"Screens task. Target repository E:\python_project\Screens-Trans-Chatbot, use @mcp-thinkbook only."}
+        {"task": r"Screens task. Target repository E:\python_project\Screens-Trans-Chatbot, use @mcp-thinkbook only.", "governing_objective": r"Screens task. Target repository E:\python_project\Screens-Trans-Chatbot, use @mcp-thinkbook only.", "governing_directives": []}
     )
     assert remote["repository"] == str(tmp_path.resolve())
 
@@ -599,17 +615,19 @@ def test_create_repository_inference_is_header_bounded_and_strict(tmp_path: Path
         {
             "task": f"Title\nRepository/worktree:\n\n{repo_b}\n\nPURPOSE\nDo work",
             "repository": "   ",
+            "governing_objective": f"Title\nRepository/worktree:\n\n{repo_b}\n\nPURPOSE\nDo work",
+            "governing_directives": [],
         }
     )
     assert two_line["repository"] == str(repo_b.resolve())
 
     fallback = api.normalize_create(
-        {"task": f"Title\nPURPOSE\nRepository {repo_a}\nThis is later prose"}
+        {"task": f"Title\nPURPOSE\nRepository {repo_a}\nThis is later prose", "governing_objective": f"Title\nPURPOSE\nRepository {repo_a}\nThis is later prose", "governing_directives": []}
     )
     assert fallback["repository"] == str(tmp_path.resolve())
 
     arbitrary = api.normalize_create(
-        {"task": f"Title\nNotes\nExample: Repository {repo_b}"}
+        {"task": f"Title\nNotes\nExample: Repository {repo_b}", "governing_objective": f"Title\nNotes\nExample: Repository {repo_b}", "governing_directives": []}
     )
     assert arbitrary["repository"] == str(tmp_path.resolve())
 
@@ -623,13 +641,13 @@ def test_create_repository_inference_is_header_bounded_and_strict(tmp_path: Path
     )
     for task in invalid:
         with pytest.raises(APIError) as exc_info:
-            api.normalize_create({"task": task})
+            api.normalize_create({"task": task, "governing_objective": task, "governing_directives": []})
         assert exc_info.value.status == 400
         assert exc_info.value.code == "invalid_request"
 
     outside = tmp_path.parent.parent / "outside-allowed-root"
     with pytest.raises(APIError) as exc_info:
-        api.normalize_create({"task": f"Title\nRepository {outside}"})
+        api.normalize_create({"task": f"Title\nRepository {outside}", "governing_objective": f"Title\nRepository {outside}", "governing_directives": []})
     assert exc_info.value.status == 400
     assert exc_info.value.code == "repository_not_allowed"
 
@@ -646,6 +664,8 @@ def test_inferred_repository_persists_through_runtime_create_command(tmp_path: P
             body={
                 "task": f"Cross repo task\nRepository {execution_repository}",
                 "requested_team": "inferred-repo",
+                "governing_objective": "Cross repo task",
+                "governing_directives": [],
             },
             headers={"Idempotency-Key": "inferred-repository"},
         )
@@ -685,7 +705,13 @@ def test_invalid_repository_header_does_not_enqueue_command(tmp_path: Path):
 
 def test_mutations_require_idempotency_and_reuse_identical_command(tmp_path: Path):
     _config, db, server, thread = start_api(tmp_path)
-    body = {"task": "new task", "requested_team": "new", "repository": str(tmp_path)}
+    body = {
+        "task": "new task",
+        "requested_team": "new",
+        "repository": str(tmp_path),
+        "governing_objective": "new task",
+        "governing_directives": [],
+    }
     try:
         status, _headers, _data = request(server, "POST", "/api/tasks", body=body)
         assert status == 400
@@ -757,7 +783,12 @@ def test_tasks_api_is_file_only_for_same_and_cross_workspace(tmp_path: Path):
             ("cross-root-file", execution_repository, "file"),
         )
         for key, repository, requested_mode in cases:
-            body = {"task": key, "repository": str(repository)}
+            body = {
+                "task": key,
+                "repository": str(repository),
+                "governing_objective": key,
+                "governing_directives": [],
+            }
             if requested_mode is not None:
                 body["report_mode"] = requested_mode
             status, _headers, data = request(
@@ -780,6 +811,8 @@ def test_tasks_api_is_file_only_for_same_and_cross_workspace(tmp_path: Path):
                     "task": f"invalid-report-mode-{mode}",
                     "repository": str(execution_repository),
                     "report_mode": mode,
+                    "governing_objective": f"invalid-report-mode-{mode}",
+                    "governing_directives": [],
                 },
                 headers={"Idempotency-Key": f"invalid-report-mode-{mode}"},
             )
@@ -993,15 +1026,29 @@ def test_change_goal_endpoint_enqueues_strict_idempotent_command(tmp_path: Path)
     _config, db, server, thread = start_api(tmp_path)
     headers = {"Idempotency-Key": "goal-key"}
     try:
-        status, _headers, data = request(server, "POST", "/api/tasks/task-a/goal", body={"goal": "Full replacement", "expected_task_version": 4}, headers=headers)
+        goal_body = {
+            "goal": "Full replacement",
+            "governing_objective": "Full replacement",
+            "governing_directives": [],
+            "expected_task_version": 4,
+        }
+        status, _headers, data = request(
+            server, "POST", "/api/tasks/task-a/goal", body=goal_body, headers=headers
+        )
         assert status == 202
         queued = json.loads(data)
         command = db.get_command(queued["command_id"])
         assert command["kind"] == "change_goal"
         assert command["task_id"] == "task-a"
-        assert command["payload"] == {"goal": "Full replacement"}
+        assert command["payload"] == {
+            "goal": "Full replacement",
+            "governing_objective": "Full replacement",
+            "governing_directives": [],
+        }
         assert command["expected_task_version"] == 4
-        status, _headers, repeated = request(server, "POST", "/api/tasks/task-a/goal", body={"goal": "Full replacement", "expected_task_version": 4}, headers=headers)
+        status, _headers, repeated = request(
+            server, "POST", "/api/tasks/task-a/goal", body=goal_body, headers=headers
+        )
         assert status == 202
         assert json.loads(repeated) == queued
         bad_bodies = ({"goal": "   "}, {"goal": "x", "extra": True}, {"goal": "x", "expected_task_version": "bad"})
@@ -1018,24 +1065,24 @@ def test_create_normalizes_explicit_temp_and_browser_overrides(tmp_path: Path):
     api = DashboardAPI(config)
 
     payload = api.normalize_create(
-        {"task": "placed task", "temporary": True, "browser_endpoint_id": "9202"}
+        {"task": "placed task", "temporary": True, "browser_endpoint_id": "9202", "governing_objective": "placed task", "governing_directives": []}
     )
     assert payload["conversation_mode"] == "temporary"
     assert payload["browser_endpoint_id"] == "9202"
 
-    inherited = api.normalize_create({"task": "inherit browser defaults"})
+    inherited = api.normalize_create({"task": "inherit browser defaults", "governing_objective": "inherit browser defaults", "governing_directives": []})
     assert "conversation_mode" not in inherited
     assert "browser_endpoint_id" not in inherited
 
     with pytest.raises(APIError, match="temporary"):
-        api.normalize_create({"task": "bad temp", "temporary": "true"})
+        api.normalize_create({"task": "bad temp", "temporary": "true", "governing_objective": "bad temp", "governing_directives": []})
 
 
 def test_create_keeps_soft_browser_endpoint_task_neutral_without_bootstrap_inference(tmp_path: Path):
     config = load_cdpa_config(None, repository_root=tmp_path)
     api = DashboardAPI(config)
 
-    payload = api.normalize_create({"task": "placed task", "browser_endpoint_id": "9202"})
+    payload = api.normalize_create({"task": "placed task", "browser_endpoint_id": "9202", "governing_objective": "placed task", "governing_directives": []})
 
     assert payload["browser_endpoint_id"] == "9202"
     assert payload["bootstrap_id"] is None

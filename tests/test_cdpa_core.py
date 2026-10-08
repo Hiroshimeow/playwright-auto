@@ -74,28 +74,45 @@ def write_config(root: Path) -> Path:
         "Only PLAN may use `DONE`.\n",
         encoding="utf-8",
     )
+    (root / "prompts" / "cdpa" / "CONTINUATION.json").write_text(
+        json.dumps(
+            {
+                role: f"{role} continuation contract."
+                for role in ("PLAN", "DEV", "REVIEW", "TEST", "AUDIT")
+            }
+        ),
+        encoding="utf-8",
+    )
     return path
 
 
 def install_cycle_isolation_graph(store: TaskStore) -> dict[str, dict[str, object]]:
     missing_parent = store.create_task(
-        "Missing parent", requested_team="missing-parent", task_id="missing-parent"
+        "Missing parent", requested_team="missing-parent", task_id="missing-parent",
+        governing_objective="Missing parent",
+        governing_directives=(),
     )
     missing_only = store.create_task(
         "Missing only",
         requested_team="missing-only",
         task_id="missing-only",
         depends_on_task_ids=("missing-parent",),
+        governing_objective="Missing only",
+        governing_directives=(),
     )
-    a = store.create_task("A", requested_team="a", task_id="task-a")
+    a = store.create_task("A", requested_team="a", task_id="task-a", governing_objective="A", governing_directives=())
     b = store.create_task(
         "B",
         requested_team="b",
         task_id="task-b",
         depends_on_task_ids=("task-a",),
+        governing_objective="B",
+        governing_directives=(),
     )
     unrelated = store.create_task(
-        "Unrelated", requested_team="unrelated", task_id="unrelated-task"
+        "Unrelated", requested_team="unrelated", task_id="unrelated-task",
+        governing_objective="Unrelated",
+        governing_directives=(),
     )
     Path(missing_parent["manifest_path"]).unlink()
     a_path = Path(a["manifest_path"])
@@ -131,7 +148,7 @@ def poison_catalog_identity_entry(
 
 
 def install_duplicate_task_graph(store: TaskStore) -> dict[str, dict[str, object]]:
-    alpha = store.create_task("Alpha", requested_team="alpha", task_id="dup-task")
+    alpha = store.create_task("Alpha", requested_team="alpha", task_id="dup-task", governing_objective="Alpha", governing_directives=())
     alpha_path = Path(alpha["manifest_path"])
     alpha_bytes = alpha_path.read_bytes()
     catalog = json.loads(store.catalog_path.read_text(encoding="utf-8"))
@@ -140,13 +157,15 @@ def install_duplicate_task_graph(store: TaskStore) -> dict[str, dict[str, object
     del catalog["entries"][alpha_key]
     store.catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
 
-    beta = store.create_task("Beta", requested_team="beta", task_id="dup-task")
-    unique = store.create_task("Unique", requested_team="unique", task_id="unique-task")
+    beta = store.create_task("Beta", requested_team="beta", task_id="dup-task", governing_objective="Beta", governing_directives=())
+    unique = store.create_task("Unique", requested_team="unique", task_id="unique-task", governing_objective="Unique", governing_directives=())
     child = store.create_task(
         "Child",
         requested_team="child",
         task_id="child-task",
         depends_on_task_ids=("dup-task",),
+        governing_objective="Child",
+        governing_directives=(),
     )
 
     alpha_path.write_bytes(alpha_bytes)
@@ -189,15 +208,15 @@ def test_config_rate_limit_quiet_period_is_overridable(tmp_path: Path):
 def test_task_creation_allocates_same_base_concurrently_and_reuses_terminal(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
-    first = store.create_task("first task", requested_team="alpha", task_id="task-a")
-    second = store.create_task("second task", requested_team="alpha", task_id="task-b")
-    third = store.create_task("third task", requested_team="alpha", task_id="task-c")
+    first = store.create_task("first task", requested_team="alpha", task_id="task-a", governing_objective="first task", governing_directives=())
+    second = store.create_task("second task", requested_team="alpha", task_id="task-b", governing_objective="second task", governing_directives=())
+    third = store.create_task("third task", requested_team="alpha", task_id="task-c", governing_objective="third task", governing_directives=())
     assert [first["team"], second["team"], third["team"]] == ["alpha", "alpha2", "alpha3"]
     assert physical_role("DEV", "alpha", second["team_suffix"]) == "alpha-dev2"
     assert first["roles"]["PLAN"]["physical_role"] == "alpha-plan"
     assert second["roles"]["DEV"]["physical_role"] == "alpha-dev2"
 
-    different_base = store.create_task("different base", requested_team="beta", task_id="task-beta")
+    different_base = store.create_task("different base", requested_team="beta", task_id="task-beta", governing_objective="different base", governing_directives=())
     assert different_base["team"] == "beta"
     assert different_base["roles"]["PLAN"]["physical_role"] == "beta-plan"
 
@@ -211,7 +230,7 @@ def test_task_creation_allocates_same_base_concurrently_and_reuses_terminal(tmp_
             "active_hop_id": None,
         },
     )
-    reused = store.create_task("fourth task", requested_team="alpha", task_id="task-d")
+    reused = store.create_task("fourth task", requested_team="alpha", task_id="task-d", governing_objective="fourth task", governing_directives=())
     assert reused["team"] == "alpha"
     assert reused["roles"]["PLAN"]["physical_role"] == "alpha-plan"
     assert reused["reusable_teams"] == ["alpha"]
@@ -220,7 +239,13 @@ def test_task_creation_allocates_same_base_concurrently_and_reuses_terminal(tmp_
 def test_manifest_path_and_initial_plan_are_lazy(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     state = TaskStore(config).create_task(
-        "Build production CDPA", requested_team="prod", task_id="task-prod", new_roles=("DEV",), new_all=False
+        "Build production CDPA",
+        requested_team="prod",
+        task_id="task-prod",
+        new_roles=("DEV",),
+        new_all=False,
+        governing_objective="Build production CDPA",
+        governing_directives=(),
     )
     expected = tmp_path / ".plan" / "prod" / "task-prod" / "build-production-cdpa.json"
     assert Path(state["manifest_path"]) == expected.resolve()
@@ -240,6 +265,8 @@ def test_workflow_role_subset_is_canonical_and_exact_team_reuse_inherits(tmp_pat
         requested_team="alpha",
         task_id="task-subset",
         roles=("REVIEW", "PLAN"),
+        governing_objective="small workflow",
+        governing_directives=(),
     )
     assert list(first["roles"]) == ["PLAN", "REVIEW"]
     assert list(store.load(first["manifest_path"])["roles"]) == ["PLAN", "REVIEW"]
@@ -248,6 +275,8 @@ def test_workflow_role_subset_is_canonical_and_exact_team_reuse_inherits(tmp_pat
         "reuse subset",
         reuse_team="alpha",
         task_id="task-subset-reuse",
+        governing_objective="reuse subset",
+        governing_directives=(),
     )
     assert list(inherited["roles"]) == ["PLAN", "REVIEW"]
 
@@ -256,6 +285,8 @@ def test_workflow_role_subset_is_canonical_and_exact_team_reuse_inherits(tmp_pat
         reuse_team="alpha",
         task_id="task-subset-match",
         roles=("PLAN", "REVIEW"),
+        governing_objective="reuse matching subset",
+        governing_directives=(),
     )
     assert list(matched["roles"]) == ["PLAN", "REVIEW"]
 
@@ -265,6 +296,8 @@ def test_workflow_role_subset_is_canonical_and_exact_team_reuse_inherits(tmp_pat
             reuse_team="alpha",
             task_id="task-subset-mismatch",
             roles=("PLAN", "DEV"),
+            governing_objective="reuse mismatched subset",
+            governing_directives=(),
         )
     with pytest.raises(ValueError, match="must include PLAN"):
         store.create_task(
@@ -272,6 +305,8 @@ def test_workflow_role_subset_is_canonical_and_exact_team_reuse_inherits(tmp_pat
             requested_team="missing-plan",
             task_id="task-missing-plan",
             roles=("DEV",),
+            governing_objective="missing plan",
+            governing_directives=(),
         )
     with pytest.raises(ValueError, match="must not contain duplicates"):
         store.create_task(
@@ -279,12 +314,16 @@ def test_workflow_role_subset_is_canonical_and_exact_team_reuse_inherits(tmp_pat
             requested_team="duplicate-plan",
             task_id="task-duplicate-plan",
             roles=("PLAN", "PLAN"),
+            governing_objective="duplicate plan",
+            governing_directives=(),
         )
 
     legacy = store.create_task(
         "legacy full workflow",
         requested_team="legacy",
         task_id="task-legacy-full",
+        governing_objective="legacy full workflow",
+        governing_directives=(),
     )
     assert set(store.load(legacy["manifest_path"])["roles"]) == set(config.roles)
 
@@ -308,7 +347,9 @@ def test_task_bootstrap_snapshot_is_optional_immutable_and_validated(tmp_path: P
     }
 
     fresh = store.create_task(
-        "fresh task", requested_team="fresh", task_id="task-bootstrap-fresh"
+        "fresh task", requested_team="fresh", task_id="task-bootstrap-fresh",
+        governing_objective="fresh task",
+        governing_directives=(),
     )
     assert "bootstrap" not in fresh
     assert all("context_source" not in role for role in fresh["roles"].values())
@@ -318,6 +359,8 @@ def test_task_bootstrap_snapshot_is_optional_immutable_and_validated(tmp_path: P
         requested_team="bootstrapped",
         task_id="task-bootstrap-selected",
         bootstrap=bootstrap,
+        governing_objective="bootstrapped task",
+        governing_directives=(),
     )
     assert selected["bootstrap"] == normalize_bootstrap_record(bootstrap)
     bootstrap["name"] = "Mutated caller value"
@@ -349,7 +392,7 @@ def test_initial_plan_handoff_does_not_duplicate_authoritative_goal(tmp_path: Pa
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
     goal = "Implement the requested behavior with focused tests."
-    state = store.create_task(goal, task_id="task-prompt-dedup")
+    state = store.create_task(goal, task_id="task-prompt-dedup", governing_objective=goal, governing_directives=())
     hop = state["hops"][0]
     assert state["task_text"] == goal
     assert hop["handoff"] == "Initial task intake; no prior role handoff."
@@ -476,7 +519,7 @@ def test_same_role_continuation_prompt_rejects_report_only_turn(tmp_path: Path):
 def test_exact_team_resume_preserves_identity_and_creation_still_allocates(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
-    created = store.create_task("first task", requested_team="alpha", task_id="task-a")
+    created = store.create_task("first task", requested_team="alpha", task_id="task-a", governing_objective="first task", governing_directives=())
     manifest = Path(created["manifest_path"])
     manifest_count = len(store.discover_paths())
     catalog_count = len(json.loads(store.catalog_path.read_text(encoding="utf-8"))["entries"])
@@ -538,7 +581,7 @@ def test_exact_team_resume_preserves_identity_and_creation_still_allocates(tmp_p
     assert pending[0]["role"] == "PLAN"
     assert manifest.exists()
 
-    second = store.create_task("second task", requested_team="alpha", task_id="task-b")
+    second = store.create_task("second task", requested_team="alpha", task_id="task-b", governing_objective="second task", governing_directives=())
     assert second["team"] == "alpha2"
     assert second["task_id"] == "task-b"
 
@@ -554,6 +597,8 @@ def test_manifest_replace_succeeds_while_replacement_safe_reader_is_open(tmp_pat
         "resume with replacement-safe reader",
         requested_team="alpha",
         task_id="task-shared-reader",
+        governing_objective="resume with replacement-safe reader",
+        governing_directives=(),
     )
     manifest = Path(created["manifest_path"])
 
@@ -576,6 +621,8 @@ def test_task_discovery_reads_manifest_with_replacement_safe_reader(tmp_path: Pa
         "replacement-safe discovery",
         requested_team="alpha",
         task_id="task-shared-discovery",
+        governing_objective="replacement-safe discovery",
+        governing_directives=(),
     )
     manifest = Path(created["manifest_path"]).resolve()
     reader = getattr(store_module, "read_shared_text", None)
@@ -595,7 +642,7 @@ def test_task_discovery_reads_manifest_with_replacement_safe_reader(tmp_path: Pa
 def test_resume_manifest_replace_retries_transient_windows_permission_error(tmp_path: Path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
-    created = store.create_task("resume replace contention", requested_team="alpha", task_id="task-replace")
+    created = store.create_task("resume replace contention", requested_team="alpha", task_id="task-replace", governing_objective="resume replace contention", governing_directives=())
     manifest = Path(created["manifest_path"])
     temporary = manifest.with_suffix(manifest.suffix + ".tmp")
     real_replace = store_module.atomic_replace
@@ -629,7 +676,7 @@ def test_resume_manifest_replace_retries_transient_windows_permission_error(tmp_
 def test_manifest_replace_contention_exhaustion_preserves_old_target_and_tmp(tmp_path: Path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
-    created = store.create_task("resume replace exhaustion", requested_team="alpha", task_id="task-replace-exhaust")
+    created = store.create_task("resume replace exhaustion", requested_team="alpha", task_id="task-replace-exhaust", governing_objective="resume replace exhaustion", governing_directives=())
     manifest = Path(created["manifest_path"])
     temporary = manifest.with_suffix(manifest.suffix + ".tmp")
     original = manifest.read_text(encoding="utf-8")
@@ -663,7 +710,7 @@ def test_manifest_replace_contention_exhaustion_preserves_old_target_and_tmp(tmp
 def test_manifest_replace_does_not_retry_non_permission_error(tmp_path: Path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
-    created = store.create_task("resume replace invalid", requested_team="alpha", task_id="task-replace-invalid")
+    created = store.create_task("resume replace invalid", requested_team="alpha", task_id="task-replace-invalid", governing_objective="resume replace invalid", governing_directives=())
     manifest = Path(created["manifest_path"])
     real_replace = store_module.atomic_replace
     attempts = 0
@@ -776,7 +823,7 @@ def test_cleanup_only_terminal_and_idle():
 def test_reuse_team_creates_waiting_task_without_allocating_suffix(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
-    first = store.create_task("one", requested_team="alpha", task_id="task-one")
+    first = store.create_task("one", requested_team="alpha", task_id="task-one", governing_objective="one", governing_directives=())
 
     assert build_dashboard_actions([first])["reuse_teams"] == [
         {
@@ -786,7 +833,7 @@ def test_reuse_team_creates_waiting_task_without_allocating_suffix(tmp_path: Pat
         }
     ]
 
-    second = store.create_task("two", reuse_team="alpha", task_id="task-two")
+    second = store.create_task("two", reuse_team="alpha", task_id="task-two", governing_objective="two", governing_directives=())
 
     assert second["team"] == "alpha"
     assert second["reusable_teams"] == ["alpha"]
@@ -869,19 +916,25 @@ def test_new_workflow_tasks_are_file_report_only_across_repositories(tmp_path: P
     execution_repository.mkdir()
 
     same_root_default = store.create_task(
-        "File report", requested_team="alpha", task_id="task-file"
+        "File report", requested_team="alpha", task_id="task-file",
+        governing_objective="File report",
+        governing_directives=(),
     )
     same_root_explicit = store.create_task(
         "Explicit file report",
         requested_team="beta",
         task_id="task-explicit-file",
         report_mode="file",
+        governing_objective="Explicit file report",
+        governing_directives=(),
     )
     cross_root_default = store.create_task(
         "Cross-root default report",
         requested_team="delta",
         task_id="task-cross-default",
         repository=execution_repository,
+        governing_objective="Cross-root default report",
+        governing_directives=(),
     )
     cross_root_explicit = store.create_task(
         "Cross-root explicit file report",
@@ -889,6 +942,8 @@ def test_new_workflow_tasks_are_file_report_only_across_repositories(tmp_path: P
         task_id="task-cross-explicit",
         repository=execution_repository,
         report_mode="file",
+        governing_objective="Cross-root explicit file report",
+        governing_directives=(),
     )
 
     assert same_root_default["options"]["report_mode"] == "file"
@@ -903,6 +958,8 @@ def test_new_workflow_tasks_are_file_report_only_across_repositories(tmp_path: P
                 requested_team=f"bad-{mode}",
                 task_id=f"task-bad-report-mode-{mode}",
                 report_mode=mode,
+                governing_objective=f"Bad report mode {mode}",
+                governing_directives=(),
             )
 
 
@@ -950,12 +1007,14 @@ def test_workflow_prompt_builder_rejects_inline_report_mode():
 def test_dependency_creation_waits_and_legacy_manifests_remain_compatible(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
-    parent = store.create_task("Parent", requested_team="parent", task_id="task-parent")
+    parent = store.create_task("Parent", requested_team="parent", task_id="task-parent", governing_objective="Parent", governing_directives=())
     child = store.create_task(
         "Child",
         requested_team="child",
         task_id="task-child",
         depends_on_task_ids=("task-parent",),
+        governing_objective="Child",
+        governing_directives=(),
     )
 
     assert child["depends_on_task_ids"] == ["task-parent"]
@@ -982,7 +1041,7 @@ def test_dependency_creation_waits_and_legacy_manifests_remain_compatible(tmp_pa
 def test_dependency_creation_ready_when_all_parents_done(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
-    parent = store.create_task("Parent", requested_team="parent", task_id="task-parent")
+    parent = store.create_task("Parent", requested_team="parent", task_id="task-parent", governing_objective="Parent", governing_directives=())
     store.update(
         parent["manifest_path"],
         lambda state: {
@@ -1000,6 +1059,8 @@ def test_dependency_creation_ready_when_all_parents_done(tmp_path: Path):
         requested_team="child",
         task_id="task-child",
         depends_on_task_ids=("task-parent",),
+        governing_objective="Child",
+        governing_directives=(),
     )
     assert child["status"] == "INBOX"
     assert child["waiting"]["reason"] is None
@@ -1009,9 +1070,11 @@ def test_dependency_creation_ready_when_all_parents_done(tmp_path: Path):
 def test_dependency_creation_rejects_missing_self_duplicate_and_cycle_before_write(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
-    a = store.create_task("A", requested_team="a", task_id="task-a")
+    a = store.create_task("A", requested_team="a", task_id="task-a", governing_objective="A", governing_directives=())
     b = store.create_task(
-        "B", requested_team="b", task_id="task-b", depends_on_task_ids=("task-a",)
+        "B", requested_team="b", task_id="task-b", depends_on_task_ids=("task-a",),
+        governing_objective="B",
+        governing_directives=(),
     )
     before = sorted(str(path) for path in store.discover_paths())
 
@@ -1026,6 +1089,8 @@ def test_dependency_creation_rejects_missing_self_duplicate_and_cycle_before_wri
                 requested_team=task_id,
                 task_id=task_id,
                 depends_on_task_ids=parents,
+                governing_objective=task_id,
+                governing_directives=(),
             )
     assert sorted(str(path) for path in store.discover_paths()) == before
 
@@ -1080,7 +1145,13 @@ def _stop_task(store: TaskStore, state: dict, reason="stopped parent") -> dict:
 def test_replace_task_and_rewire_preserves_old_parent_and_child_order(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
-    grandparent = store.create_task("Grandparent", requested_team="gp", task_id="task-gp")
+    grandparent = store.create_task(
+        "Grandparent",
+        requested_team="gp",
+        task_id="task-gp",
+        governing_objective="Preserve replacement graph order.",
+        governing_directives=[],
+    )
     store.update(
         grandparent["manifest_path"],
         lambda state: {
@@ -1093,12 +1164,20 @@ def test_replace_task_and_rewire_preserves_old_parent_and_child_order(tmp_path: 
         },
     )
     parent = store.create_task(
-        "Parent", requested_team="parent", task_id="task-parent",
+        "Parent",
+        requested_team="parent",
+        task_id="task-parent",
         depends_on_task_ids=("task-gp",),
+        governing_objective="Preserve replacement graph order.",
+        governing_directives=[],
     )
     child = store.create_task(
-        "Child", requested_team="child", task_id="task-child",
+        "Child",
+        requested_team="child",
+        task_id="task-child",
         depends_on_task_ids=("task-gp", "task-parent"),
+        governing_objective="Preserve replacement graph order.",
+        governing_directives=[],
     )
     parent = _stop_task(store, parent)
     old_bytes = Path(parent["manifest_path"]).read_bytes()
@@ -1169,6 +1248,8 @@ def test_historical_terminal_inline_manifest_remains_readable_without_rewrite(
         "Historical inline task",
         requested_team="history-inline",
         task_id="task-history-inline",
+        governing_objective="Historical inline task",
+        governing_directives=(),
     )
     state = store.update(
         state["manifest_path"],
@@ -1198,6 +1279,8 @@ def test_replacement_of_legacy_inline_task_is_file_mode(tmp_path: Path):
         requested_team="legacy-cross",
         task_id="task-legacy-cross",
         repository=execution_repository,
+        governing_objective="Preserve replacement report-mode compatibility.",
+        governing_directives=[],
     )
     original = store.update(
         original["manifest_path"],
@@ -1251,6 +1334,8 @@ def test_upload_paths_are_hashed_when_task_is_created(tmp_path: Path):
         requested_team="alpha",
         task_id="task-upload-create",
         upload_paths=[context],
+        governing_objective="Analyze uploaded context",
+        governing_directives=(),
     )
 
     assert state["attachments"] == [
@@ -1302,7 +1387,7 @@ def test_runtime_config_defaults_to_loopback_three_process_layout(tmp_path: Path
 def test_noop_manifest_update_performs_no_replace_or_timestamp_write(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
-    state = store.create_task("noop", requested_team="noop", task_id="task-noop")
+    state = store.create_task("noop", requested_team="noop", task_id="task-noop", governing_objective="noop", governing_directives=())
     manifest = Path(state["manifest_path"])
     before_stat = manifest.stat()
     before = store.load(manifest)
@@ -1318,7 +1403,7 @@ def test_noop_manifest_update_performs_no_replace_or_timestamp_write(tmp_path: P
 def test_manifest_replace_retries_windows_access_denied(tmp_path: Path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
-    state = store.create_task("replace retry", requested_team="replace-retry", task_id="task-replace-retry")
+    state = store.create_task("replace retry", requested_team="replace-retry", task_id="task-replace-retry", governing_objective="replace retry", governing_directives=())
     target = Path(state["manifest_path"]).resolve()
     original_replace = store_module.os.replace
     calls = []
@@ -1344,10 +1429,16 @@ def test_manifest_replace_retries_windows_access_denied(tmp_path: Path, monkeypa
 def test_change_goal_is_durable_next_hop_only_and_rejects_invalid_tasks(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
-    state = store.create_task("Original goal", requested_team="goal", task_id="task-goal")
+    state = store.create_task("Original goal", requested_team="goal", task_id="task-goal", governing_objective="Original goal", governing_directives=())
     state = store.update(state["manifest_path"], lambda current: {**current, "status": "RUNNING"})
     original_hop = json.loads(json.dumps(state["hops"][0]))
-    changed = store.change_goal(state["manifest_path"], "Replacement goal\nwith full text", external_command_id="cmd-goal-1")
+    changed = store.change_goal(
+        state["manifest_path"],
+        "Replacement goal\nwith full text",
+        governing_objective="Replacement goal\nwith full text",
+        governing_directives=(),
+        external_command_id="cmd-goal-1",
+    )
     assert changed["task_text"] == "Original goal"
     assert changed["effective_goal"] == "Replacement goal\nwith full text"
     assert changed["hops"][0] == original_hop
@@ -1356,28 +1447,71 @@ def test_change_goal_is_durable_next_hop_only_and_rejects_invalid_tasks(tmp_path
     assert effective_task_goal(changed) == "Replacement goal\nwith full text"
     assert task_goal_for_hop(changed, 1) == "Original goal"
     assert task_goal_for_hop(changed, 2) == "Replacement goal\nwith full text"
-    latest = store.change_goal(changed["manifest_path"], "Latest replacement", external_command_id="cmd-goal-2")
+    latest = store.change_goal(
+        changed["manifest_path"],
+        "Latest replacement",
+        governing_objective="Latest replacement",
+        governing_directives=(),
+        external_command_id="cmd-goal-2",
+    )
     assert task_goal_for_hop(latest, 2) == "Latest replacement"
-    replay = store.change_goal(latest["manifest_path"], "Latest replacement", external_command_id="cmd-goal-2")
+    replay = store.change_goal(
+        latest["manifest_path"],
+        "Latest replacement",
+        governing_objective="Latest replacement",
+        governing_directives=(),
+        external_command_id="cmd-goal-2",
+    )
     assert replay["goal_revisions"] == latest["goal_revisions"]
     with pytest.raises(ValueError, match="provenance"):
-        store.change_goal(latest["manifest_path"], "Different payload", external_command_id="cmd-goal-2")
-    with pytest.raises(ValueError, match="must not be blank"):
-        store.change_goal(latest["manifest_path"], "   ")
+        store.change_goal(
+            latest["manifest_path"],
+            "Different payload",
+            governing_objective="Different payload",
+            governing_directives=(),
+            external_command_id="cmd-goal-2",
+        )
+    with pytest.raises(ValueError, match="task must not be empty"):
+        store.change_goal(
+            latest["manifest_path"],
+            "   ",
+            governing_objective="valid governing objective",
+            governing_directives=(),
+        )
     with pytest.raises(ValueError, match="unchanged"):
-        store.change_goal(latest["manifest_path"], "Latest replacement")
+        store.change_goal(
+            latest["manifest_path"],
+            "Latest replacement",
+            governing_objective="Latest replacement",
+            governing_directives=(),
+        )
     paused = store.update(latest["manifest_path"], lambda current: {**current, "status": "PAUSED"})
     before = Path(paused["manifest_path"]).read_bytes()
     with pytest.raises(ValueError, match="RUNNING"):
-        store.change_goal(paused["manifest_path"], "Rejected")
+        store.change_goal(
+            paused["manifest_path"],
+            "Rejected",
+            governing_objective="Rejected",
+            governing_directives=(),
+        )
     assert Path(paused["manifest_path"]).read_bytes() == before
     done = store.update(paused["manifest_path"], lambda current: {
         **current, "status": "DONE", "terminal_state": "DONE",
         "active_role": None, "active_hop_id": None,
     })
     with pytest.raises(ValueError, match="RUNNING"):
-        store.change_goal(done["manifest_path"], "Rejected terminal")
+        store.change_goal(
+            done["manifest_path"],
+            "Rejected terminal",
+            governing_objective="Rejected terminal",
+            governing_directives=(),
+        )
     agent = store.create_independent_agent("Goal agent", system_prompt="Inspect", task_id="agent-goal-g1", enabled=True)
     agent = store.update(agent["manifest_path"], lambda current: {**current, "status": "RUNNING"})
     with pytest.raises(ValueError, match="workflow"):
-        store.change_goal(agent["manifest_path"], "Rejected")
+        store.change_goal(
+            agent["manifest_path"],
+            "Rejected",
+            governing_objective="Rejected",
+            governing_directives=(),
+        )

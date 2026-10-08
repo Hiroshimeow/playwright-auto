@@ -161,6 +161,32 @@ def test_accept_boundary_clears_stale_response_status_and_old_epoch():
     assert observer.observation()["status"] is None
 
 
+def test_observer_emits_instance_epoch_monotonic_signal_sequence_and_time():
+    page = Page()
+    observer = observer_for(page)
+    first = observer.observation()
+    assert first["observer_instance_id"]
+    assert first["observer_epoch"] == 0
+    assert first["signal_seq"] == 0
+    assert first["observed_at"] is None
+
+    observer.publish({"status": "IS_STREAMING"}, epoch=0, source="test")
+    second = observer.observation()
+    assert second["observer_instance_id"] == first["observer_instance_id"]
+    assert second["observer_epoch"] == 0
+    assert second["signal_seq"] == 1
+    assert second["observed_at"]
+
+    observer.publish({"status": "COMPLETE"}, epoch=0, source="test")
+    third = observer.observation()
+    assert third["signal_seq"] == 2
+
+    observer.clear_response_state()
+    fourth = observer.observation()
+    assert fourth["observer_epoch"] == 1
+    assert fourth["signal_seq"] == 2
+
+
 def test_explicit_failure_is_not_overwritten_by_terminal_response():
     page = Page()
     observer = observer_for(page)

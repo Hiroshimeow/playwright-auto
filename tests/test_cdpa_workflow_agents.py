@@ -25,6 +25,46 @@ def setup(tmp_path: Path):
     return config, store
 
 
+def test_custom_workflow_agent_requires_bounded_continuation_contract(tmp_path: Path):
+    config, _store = setup(tmp_path)
+    catalog = WorkflowAgentCatalog(config)
+
+    with pytest.raises(ValueError, match="continuation_contract"):
+        catalog.create(
+            display_name="Researcher",
+            system_prompt="FIRST TURN ONLY",
+            external_command_id="missing-continuation",
+        )
+
+    created = catalog.create(
+        display_name="Researcher",
+        system_prompt="FIRST TURN ONLY",
+        continuation_contract="Always preserve REQUIRED_CUSTOM_DIRECTIVE across later hops.",
+        external_command_id="with-continuation",
+    )
+    assert created["continuation_contract"] == (
+        "Always preserve REQUIRED_CUSTOM_DIRECTIVE across later hops."
+    )
+    with pytest.raises(ValueError, match="2048"):
+        catalog.update(
+            created["route_key"],
+            display_name="Researcher",
+            system_prompt="FIRST TURN ONLY",
+            continuation_contract="x" * 2049,
+            external_command_id="oversize-continuation",
+        )
+
+
+def test_system_workflow_agents_have_repository_continuation_contracts(tmp_path: Path):
+    config, _store = setup(tmp_path)
+    agents = {item["route_key"]: item for item in WorkflowAgentCatalog(config).list_agents()}
+    assert set(agents) >= {"PLAN", "DEV", "TEST", "REVIEW", "AUDIT"}
+    for role in ("PLAN", "DEV", "TEST", "REVIEW", "AUDIT"):
+        value = agents[role]["continuation_contract"]
+        assert value.strip()
+        assert len(value) <= 2048
+
+
 def test_catalog_system_overrides_custom_identity_and_tombstone(tmp_path: Path):
     config, _store = setup(tmp_path)
     catalog = WorkflowAgentCatalog(config)
@@ -35,6 +75,7 @@ def test_catalog_system_overrides_custom_identity_and_tombstone(tmp_path: Path):
         "route_key": "PLAN",
         "display_name": "PLAN",
         "system_prompt": "# PLAN\nConstructor for PLAN.",
+        "continuation_contract": "PLAN continuation contract.",
         "is_system": True,
         "deleted_at": None,
     }
@@ -54,6 +95,7 @@ def test_catalog_system_overrides_custom_identity_and_tombstone(tmp_path: Path):
     created = catalog.create(
         display_name="Researcher",
         system_prompt="CUSTOM_WORKFLOW_MARKER",
+        continuation_contract="Preserve the custom workflow contract.",
         external_command_id="cmd-custom-create",
     )
     assert created["route_key"].startswith("WF_")
@@ -64,6 +106,7 @@ def test_catalog_system_overrides_custom_identity_and_tombstone(tmp_path: Path):
         route_key,
         display_name="Renamed researcher",
         system_prompt="CUSTOM_WORKFLOW_MARKER_V2",
+        continuation_contract="Preserve the updated custom workflow contract.",
         external_command_id="cmd-custom-update",
     )
     assert renamed["route_key"] == route_key
@@ -83,6 +126,7 @@ def test_task_snapshots_custom_agent_and_exact_team_reuse_fails_after_delete(tmp
     custom = store.create_workflow_agent(
         display_name="Researcher",
         system_prompt="TASK_SNAPSHOT_PROMPT",
+        continuation_contract="Preserve TASK_SNAPSHOT_REQUIRED_DIRECTIVE.",
         external_command_id="cmd-create-researcher",
     )
     route_key = custom["route_key"]
@@ -92,6 +136,8 @@ def test_task_snapshots_custom_agent_and_exact_team_reuse_fails_after_delete(tmp
         requested_team="catalog-team",
         task_id="task-catalog-one",
         roles=("PLAN", "DEV", route_key, "REVIEW"),
+        governing_objective="Use the custom workflow safely.",
+        governing_directives=[],
     )
     assert list(first["roles"]) == ["PLAN", "DEV", "REVIEW", route_key]
     assert list(first["workflow_agents"]) == ["PLAN", "DEV", "REVIEW", route_key]
@@ -101,6 +147,7 @@ def test_task_snapshots_custom_agent_and_exact_team_reuse_fails_after_delete(tmp
         route_key,
         display_name="Researcher edited",
         system_prompt="CATALOG_CHANGED_PROMPT",
+        continuation_contract="Preserve CATALOG_CHANGED_REQUIRED_DIRECTIVE.",
         external_command_id="cmd-edit-researcher",
     )
     persisted = store.load(first["manifest_path"])
@@ -126,6 +173,8 @@ def test_task_snapshots_custom_agent_and_exact_team_reuse_fails_after_delete(tmp
             "Reuse deleted composition",
             reuse_team="catalog-team",
             task_id="task-catalog-two",
+            governing_objective="Reuse the catalog team.",
+            governing_directives=[],
         )
 
 
@@ -134,6 +183,7 @@ def test_worker_custom_hop_uses_snapshotted_prompt_and_dynamic_routes(tmp_path: 
     custom = store.create_workflow_agent(
         display_name="Researcher",
         system_prompt="CUSTOM_WORKER_PROMPT_MARKER",
+        continuation_contract="Preserve CUSTOM_WORKER_REQUIRED_DIRECTIVE.",
         external_command_id="cmd-create-worker-custom",
     )
     route_key = custom["route_key"]
@@ -142,6 +192,8 @@ def test_worker_custom_hop_uses_snapshotted_prompt_and_dynamic_routes(tmp_path: 
         requested_team="alpha",
         task_id="task-custom-worker",
         roles=("PLAN", route_key, "REVIEW"),
+        governing_objective="Exercise the custom workflow hop.",
+        governing_directives=[],
     )
     hop = _active_hop(state)
     hop["target_role"] = route_key
@@ -175,6 +227,7 @@ def test_custom_agent_receives_real_hop_and_routes_onward(tmp_path: Path):
     custom = store.create_workflow_agent(
         display_name="Researcher",
         system_prompt="REAL_CUSTOM_HOP_PROMPT",
+        continuation_contract="Preserve REAL_CUSTOM_REQUIRED_DIRECTIVE.",
         external_command_id="cmd-real-custom-hop",
     )
     route_key = custom["route_key"]
@@ -183,6 +236,8 @@ def test_custom_agent_receives_real_hop_and_routes_onward(tmp_path: Path):
         requested_team="custom-route",
         task_id="task-custom-route",
         roles=("PLAN", route_key, "REVIEW"),
+        governing_objective="Route through the custom agent.",
+        governing_directives=[],
     )
     worker = CDPAWorker(store.config, store=store)
     actions = FakeActions()
@@ -231,6 +286,7 @@ def test_custom_role_controls_and_replacement_keep_snapshot(tmp_path: Path):
     custom = store.create_workflow_agent(
         display_name="Researcher",
         system_prompt="REPLACEMENT_SNAPSHOT_PROMPT",
+        continuation_contract="Preserve REPLACEMENT_REQUIRED_DIRECTIVE.",
         external_command_id="cmd-replacement-custom",
     )
     route_key = custom["route_key"]
@@ -239,6 +295,8 @@ def test_custom_role_controls_and_replacement_keep_snapshot(tmp_path: Path):
         requested_team="replace-custom",
         task_id="task-replace-custom",
         roles=("PLAN", route_key, "REVIEW"),
+        governing_objective="Replace the custom workflow safely.",
+        governing_directives=[],
     )
 
     controlled = store.request_control(
@@ -345,7 +403,11 @@ def test_agents_snapshot_api_and_workflow_command_dispatch(tmp_path: Path):
     ]
 
     payload = api.normalize_workflow_agent_create(
-        {"name": "Researcher", "system_prompt": "API_CUSTOM_PROMPT"}
+        {
+            "name": "Researcher",
+            "system_prompt": "API_CUSTOM_PROMPT",
+            "continuation_contract": "Preserve API_CUSTOM_REQUIRED_DIRECTIVE.",
+        }
     )
     command = api.enqueue(
         idempotency_key="api-create-workflow-agent",

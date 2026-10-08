@@ -19,7 +19,13 @@ from test_operator_resume_recovery import _prepare_pristine_new_sending_record
 
 def test_explicit_fresh_context_survives_manifest_round_trip(tmp_path):
     worker, store, _, _, _ = _setup(tmp_path)
-    task = store.create_task("fresh roundtrip", task_id="fresh-roundtrip", context_policy="fresh")
+    task = store.create_task(
+        "fresh roundtrip",
+        task_id="fresh-roundtrip",
+        context_policy="fresh",
+        governing_objective="fresh roundtrip",
+        governing_directives=[],
+    )
     task["roles"]["PLAN"]["context_source"] = "fresh"
     saved = store.save(task["manifest_path"], task)
     assert store.load(saved["manifest_path"])["context_policy"] == "fresh"
@@ -60,12 +66,16 @@ def test_legacy_accepted_execution_cannot_be_misclassified_as_unassigned(tmp_pat
     assert _active_hop(state)["request_id"] != hop["request_id"]
 
 
-def test_pristine_new_ledger_request_can_relocate_without_changing_request(tmp_path):
-    store, state, worker, _, hop, ledger, _ = _prepare_pristine_new_sending_record(tmp_path, task_id="pristine-relocation")
-    state["roles"]["PLAN"]["browser_endpoint_id"] = store.endpoints.resolve()["endpoint_id"]
+def test_pristine_new_pinned_request_cannot_relocate_or_change_request(tmp_path):
+    store, state, worker, _, hop, ledger, _ = _prepare_pristine_new_sending_record(
+        tmp_path, task_id="pristine-relocation"
+    )
+    original_endpoint = store.endpoints.resolve()["endpoint_id"]
+    state["roles"]["PLAN"]["browser_endpoint_id"] = original_endpoint
     endpoint = store.endpoints.add("9202")["endpoint_id"]
     request = hop["request_id"]
-    assert worker._prepare_execution_endpoint(state, endpoint)
+    assert worker._prepare_execution_endpoint(state, endpoint) is False
+    assert state["browser_endpoint_id"] == original_endpoint
     assert hop["request_id"] == request
     assert ledger.get(request).attempts == 0
     assert ledger.get(request).receipt is None
@@ -139,7 +149,7 @@ def test_ambient_disconnect_does_not_prevent_peer_work(tmp_path, monkeypatch):
     assert seen == [second["endpoint_id"]]
 
 
-def test_pristine_prompt_set_ledger_request_can_relocate_without_replay(tmp_path):
+def test_pristine_prompt_set_pinned_request_cannot_relocate_or_replay(tmp_path):
     from playwright_auto.durable import RequestStatus
     store, state, worker, _, hop, ledger, _ = _prepare_pristine_new_sending_record(
         tmp_path, task_id="pristine-prompt-set-relocation"
@@ -149,8 +159,9 @@ def test_pristine_prompt_set_ledger_request_can_relocate_without_replay(tmp_path
     endpoint = store.endpoints.add("9202")["endpoint_id"]
     request = hop["request_id"]
     ledger.update(request, status=RequestStatus.PROMPT_SET)
-    assert worker._prepare_execution_endpoint(state, endpoint)
+    assert worker._prepare_execution_endpoint(state, endpoint) is False
     current = ledger.get(request)
+    assert state["browser_endpoint_id"] == original_endpoint
     assert hop["request_id"] == request
     assert current.status is RequestStatus.PROMPT_SET
     assert current.attempts == 0

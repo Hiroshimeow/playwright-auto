@@ -10,7 +10,13 @@ import pytest
 import playwright_auto.cdpa_worker as worker_module
 from playwright_auto.cdpa_worker import _active_hop
 import playwright_auto.chatgpt as chatgpt_module
-from playwright_auto.chatgpt import MessageSnapshot
+from playwright_auto.chatgpt import (
+    MessageBaseline,
+    MessageSnapshot,
+    PageBinding,
+    SendReceipt,
+    prompt_digest,
+)
 from playwright_auto.durable import DurableRequestError, RequestLedger, RequestStatus
 from test_cdpa_worker import (
     FakeActions,
@@ -48,6 +54,248 @@ def test_recovery_snapshot_uses_durable_workspace_and_send_evidence(tmp_path: Pa
     assert "notes.txt" in snapshot["workspace"]["git_status"]
     assert snapshot["reports"][-1]["path"] == ".plan/alpha/plan.md"
     assert snapshot["reason"] == "endpoint unavailable"
+
+
+@pytest.mark.parametrize(
+    ("parent_kind", "fields"),
+    (
+        (
+            "route_repair",
+            {
+                "validation_error": "route JSON invalid",
+                "expected_report_path": ".plan/alpha/alpha-plan_turn1_route.md",
+            },
+        ),
+        (
+            "report_repair",
+            {
+                "validation_error": "report missing",
+                "locked_route": "REVIEW",
+                "locked_handoff": ".plan/alpha/alpha-plan_turn1_report.md",
+                "expected_report_path": ".plan/alpha/alpha-plan_turn1_report.md",
+            },
+        ),
+    ),
+)
+def test_execution_recovery_preserves_parent_prompt_authority_class(
+    tmp_path: Path,
+    parent_kind: str,
+    fields: dict[str, str],
+):
+    store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id=f"task-{parent_kind}-generation-loss"
+    )
+    state["conversation_mode"] = "temporary"
+    state["context_policy"] = "fresh"
+    hop["kind"] = parent_kind
+    hop.update(fields)
+    home = str(state["browser_endpoint_id"])
+    role = state["roles"]["PLAN"]
+    role.update(
+        browser_endpoint_id=home,
+        page_id=receipt.binding.page_id,
+        page_url="https://chatgpt.com/?temporary-chat=true",
+        online=False,
+    )
+
+    assert worker._prepare_cross_endpoint_recovery(
+        state,
+        home,
+        reason="temporary document lost",
+        force_new_generation=True,
+    ) is True
+
+    recovery = _active_hop(state)
+    assert recovery["kind"] == "execution_recovery"
+    assert recovery["recovered_parent_kind"] == parent_kind
+    for key, value in fields.items():
+        assert recovery[key] == value
+
+    # A repair recovery must not need substantive governing semantics.
+    state.pop("governing_semantic_payload", None)
+    state.pop("governing_semantic_sha256", None)
+    actions = FakeActions()
+    asyncio.run(worker._pre_send(state, recovery, actions))
+    assert state.get("block_code") != "governing_contract_unavailable"
+    assert "GOVERNING_SEMANTIC_SOURCE" not in str(recovery.get("prompt") or "")
+    if parent_kind == "route_repair":
+        assert "repairing the route response" in str(recovery.get("prompt") or "")
+    else:
+        assert "CDPA_REPORT_REPAIR" in str(recovery.get("prompt") or "")
+
+
+def test_temporary_substantive_execution_recovery_inherits_governing_authority_without_goal_replay(
+    tmp_path: Path,
+):
+    store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-temporary-substantive-recovery"
+    )
+    state["conversation_mode"] = "temporary"
+    state["context_policy"] = "fresh"
+    home = str(state["browser_endpoint_id"])
+    role = state["roles"]["PLAN"]
+    role.update(
+        browser_endpoint_id=home,
+        page_id="lost-temporary-page",
+        page_url="https://chatgpt.com/?temporary-chat=true",
+        online=False,
+    )
+    original_request_id = hop["request_id"]
+    original_record = RequestLedger(hop["ledger_path"]).get(original_request_id)
+    assert original_record is not None
+    original_attempts = original_record.attempts
+    original_task = state["task_text"]
+    state["task_text"] = original_task + "\nFULL_ORIGINAL_GOAL_DETAIL_MUST_NOT_REPLAY"
+
+    assert worker._prepare_cross_endpoint_recovery(
+        state,
+        home,
+        reason="temporary generation document lost",
+        force_new_generation=True,
+    ) is True
+
+    recovery = _active_hop(state)
+    assert recovery["kind"] == "execution_recovery"
+    assert recovery["recovered_parent_kind"] == "task"
+    assert recovery["recovery_of_request_id"] == original_request_id
+    assert recovery["request_id"] != original_request_id
+    assert role["browser_endpoint_id"] == home
+    assert recovery.get("browser_endpoint_id") in (None, home)
+    child_record = RequestLedger(recovery["ledger_path"]).peek(recovery["request_id"])
+    assert child_record is None or child_record.attempts == 0
+    assert RequestLedger(hop["ledger_path"]).get(original_request_id).attempts == original_attempts == 1
+
+    actions = FakeActions()
+    asyncio.run(worker._pre_send(state, recovery, actions))
+    prompt = str(recovery.get("prompt") or "")
+    assert "GOVERNING_SEMANTIC_SOURCE" in prompt
+    assert "ROLE_CONTINUATION_CONTRACT" in prompt
+    assert "GOVERNING_EXECUTION_FACTS_REF" in prompt
+    assert "FULL_ORIGINAL_GOAL_DETAIL_MUST_NOT_REPLAY" not in prompt
+    assert recovery["state"] == "sending"
+    assert role["browser_endpoint_id"] == home
+    assert RequestLedger(hop["ledger_path"]).get(original_request_id).attempts == original_attempts
+    assert not hasattr(actions, "reopen")
+
+
+def test_accepted_send_reconciliation_generation_loss_preserves_no_replay_lineage(
+    tmp_path: Path,
+):
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-reconciliation-generation-loss"
+    )
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["conversation_mode"] = "temporary"
+    raw["context_policy"] = "fresh"
+    path.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    state = store.load(path)
+    hop = _active_hop(state)
+    home = str(state["browser_endpoint_id"])
+    original_request_id = hop["request_id"]
+    original_prompt = receipt.prompt
+    original_record = RequestLedger(hop["ledger_path"]).get(original_request_id)
+    assert original_record is not None and original_record.attempts == 1
+
+    state.update(
+        status="BLOCKED",
+        kanban_column="BLOCKED",
+        block_code="accepted_conversation_identity_unresolved",
+        block_retryable=False,
+        block_reason="accepted conversation identity could not be verified",
+        active_action="blocked",
+    )
+    state = store.save(path, state)
+    queued = store.request_control(
+        path,
+        "route_plan",
+        role="PLAN",
+        reason="reconcile accepted orphan without replay",
+        external_command_id="reconciliation-generation-loss",
+    )
+    assert asyncio.run(worker._apply_control(queued, FakeActions(), path)) is True
+
+    reconciliation = _active_hop(queued)
+    assert reconciliation["kind"] == "accepted_send_reconciliation"
+    assert reconciliation["request_id"] != original_request_id
+    assert "must not be replayed" in reconciliation["handoff"]
+    assert "must not be repeated" in reconciliation["handoff"]
+    assert reconciliation["reconciliation_original_request_id"] == original_request_id
+    assert reconciliation["reconciliation_no_replay"] is True
+
+    asyncio.run(worker._pre_send(queued, reconciliation, FakeActions()))
+    assert "GOVERNING_SEMANTIC_SOURCE" in str(reconciliation.get("prompt") or "")
+
+    baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
+    recon_receipt = SendReceipt(
+        prompt=str(reconciliation["prompt"]),
+        prompt_sha256=prompt_digest(str(reconciliation["prompt"])),
+        binding=PageBinding("page-alpha-plan", "alpha-plan"),
+        baseline=baseline,
+        attempts=1,
+        accepted_via="user_message_identity",
+        session_id_before=None,
+        user_message_id="u-reconciliation",
+        user_turn_id="t-reconciliation",
+    )
+    recon_ledger = RequestLedger(reconciliation["ledger_path"])
+    recon_record = recon_ledger.begin(
+        role=str(reconciliation["physical_role"]),
+        prompt=str(reconciliation["prompt"]),
+        request_id=str(reconciliation["request_id"]),
+        render_request_marker=False,
+    )
+    recon_ledger.update(
+        recon_record.request_id,
+        status=RequestStatus.SENDING,
+        attempts=1,
+        binding=recon_receipt.binding,
+        baseline=baseline,
+    )
+    recon_ledger.update(
+        recon_record.request_id,
+        status=RequestStatus.SENT,
+        accepted_at=2.0,
+        receipt=recon_receipt.to_dict(),
+    )
+    reconciliation["receipt"] = recon_receipt.to_dict()
+    reconciliation["state"] = "waiting"
+    reconciliation.setdefault("timestamps", {})["sent_at"] = "2026-10-05T00:00:00+00:00"
+    worker._start_wait_budget_from_sent(reconciliation)
+    queued["roles"]["PLAN"].update(
+        browser_endpoint_id=home,
+        page_id="lost-reconciliation-page",
+        page_url="https://chatgpt.com/?temporary-chat=true",
+        online=False,
+    )
+
+    reconciliation_request_id = reconciliation["request_id"]
+    assert worker._prepare_cross_endpoint_recovery(
+        queued,
+        home,
+        reason="temporary reconciliation generation lost",
+        force_new_generation=True,
+    ) is True
+
+    recovery = _active_hop(queued)
+    assert recovery["kind"] == "execution_recovery"
+    assert recovery["recovered_parent_kind"] == "accepted_send_reconciliation"
+    assert recovery["recovery_of_request_id"] == reconciliation_request_id
+    assert recovery["request_id"] not in {original_request_id, reconciliation_request_id}
+    assert recovery["reconciliation_original_request_id"] == original_request_id
+    assert recovery["reconciliation_no_replay"] is True
+    assert queued["roles"]["PLAN"]["browser_endpoint_id"] == home
+    assert RequestLedger(hop["ledger_path"]).get(original_request_id).attempts == 1
+    assert RequestLedger(reconciliation["ledger_path"]).get(reconciliation_request_id).attempts == 1
+
+    asyncio.run(worker._pre_send(queued, recovery, FakeActions()))
+    recovery_prompt = str(recovery.get("prompt") or "")
+    assert "GOVERNING_SEMANTIC_SOURCE" in recovery_prompt
+    assert "ROLE_CONTINUATION_CONTRACT" in recovery_prompt
+    assert "GOVERNING_EXECUTION_FACTS_REF" in recovery_prompt
+    assert "do not replay the prior accepted request" in str(recovery.get("handoff") or "").lower()
+    assert original_prompt not in recovery_prompt
+    assert queued["roles"]["PLAN"]["browser_endpoint_id"] == home
+    assert RequestLedger(hop["ledger_path"]).get(original_request_id).attempts == 1
 
 
 def test_completed_durable_response_is_consumed_before_cross_endpoint_recovery(tmp_path: Path):

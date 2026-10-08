@@ -30,6 +30,8 @@ def test_direct_create_without_independent_agents_claims_idle_pool_capacity(tmp_
         expected_task_version=None,
         payload={
             "task": "Normal task created directly from clarified chat intake",
+            "governing_objective": "Normal task created directly from clarified chat intake",
+            "governing_directives": [],
             "requested_team": "direct-intake",
             "repository": str(tmp_path),
             "report_mode": "file",
@@ -136,7 +138,7 @@ def test_waiting_for_pool_does_not_release_exact_team_queue_ownership(tmp_path, 
             await worker.run_once_pool(pool)
             owner = store.load(tasks[0]["manifest_path"])
             assert owner["status"] == "WAITING"
-            queued = store.create_task("next job", reuse_team=owner["team"], task_id="same-team-next")
+            queued = store.create_task("next job", reuse_team=owner["team"], task_id="same-team-next", governing_objective="next job", governing_directives=[])
             current, _ = store.refresh_scheduling(queued["manifest_path"], tasks=[owner, queued])
             assert current["status"] == "WAITING"
             assert current["queue"]["blocked_by_task_id"] == owner["task_id"]
@@ -200,7 +202,7 @@ def test_capacity_enforced_during_concurrent_page_allocation(tmp_path, monkeypat
 
 def test_initial_browser_is_preference_not_team_invariant(tmp_path, monkeypatch):
     worker, store, first, second, _ = _setup(tmp_path, task_count=0)
-    task = store.create_task("preferred second", task_id="second-browser", browser_endpoint_id=second["endpoint_id"])
+    task = store.create_task("preferred second", task_id="second-browser", browser_endpoint_id=second["endpoint_id"], governing_objective="preferred second", governing_directives=[])
     worker.registry.update_task(task, now=0)
     quiet(worker, monkeypatch)
     observed = []

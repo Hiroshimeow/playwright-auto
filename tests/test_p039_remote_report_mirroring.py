@@ -102,6 +102,8 @@ def setup_remote_task(tmp_path: Path):
         report_mode="file",
         roles=("PLAN", "DEV", "REVIEW"),
         repository=tmp_path,
+        governing_objective=REMOTE_TASK,
+        governing_directives=[],
     )
     hop = _active_hop(state)
     hop["expected_report_path"] = expected_report_relative(

@@ -16,7 +16,7 @@ from test_cdpa_worker import FakeActions, bootstrap_record, ready_client
 def test_canonical_branch_identity_survives_store_with_provisional_visible_url(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
-    state = store.create_task("canonical branch", task_id="canonical-branch", bootstrap=bootstrap_record())
+    state = store.create_task("canonical branch", task_id="canonical-branch", bootstrap=bootstrap_record(), governing_objective="canonical branch", governing_directives=[])
     worker = CDPAWorker(config, store=store)
     canonical = "77777777-7777-4777-8777-777777777777"
     visible = "https://chatgpt.com/c/WEB:88888888-8888-4888-8888-888888888888"
@@ -39,6 +39,8 @@ def test_bootstrap_donor_rotation_uses_direct_branch_route_only(tmp_path: Path, 
         requested_team="direct-bootstrap",
         task_id="task-direct-bootstrap",
         bootstrap=selected,
+        governing_objective="direct bootstrap rotation",
+        governing_directives=[],
     )
     second = {
         "conversation_id": "33333333-3333-4333-8333-333333333333",

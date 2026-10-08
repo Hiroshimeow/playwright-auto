@@ -453,7 +453,7 @@ def test_repair_release_rearms_stale_terminal_wait_and_consumes_materialized_bac
     assert state["status"] == "RUNNING"
     assert routed["state"] == "routed"
     assert routed["response"] == response_text
-    assert routed["wait"]["controller_reason"] == "valid_current_result"
+    assert routed["wait"]["controller_reason"] == "valid_bound_result"
     assert hop["state"] == "pre_send"
     assert hop["target_role"] == "REVIEW"
     assert calls == {"status": 0, "graph": 0, "locate": 1, "send": 0, "retry": 0, "restart": 0, "new_chat": 0}
@@ -479,7 +479,8 @@ def test_repair_release_rearms_once_when_terminal_continuation_is_still_missing(
         async def wait_snapshot(self, _receipt, **_kwargs):
             return snapshot
 
-        async def refresh(self):
+        async def refresh(self, *, reason=None):
+            assert reason == "response_timeout_recheck"
             calls["refresh"] += 1
 
     acquired = AcquiredRole(
@@ -556,6 +557,8 @@ def test_shared_root_cause_reuses_one_repair_and_gates_each_affected_task(tmp_pa
         "Second affected task",
         requested_team="beta",
         task_id="task-shared-b",
+        governing_objective="Second affected task",
+        governing_directives=[],
     )
     task_b = block_task(store, task_b, hop_state="waiting")
 
@@ -610,6 +613,8 @@ def test_done_repair_prevents_new_call_for_same_known_root_cause(tmp_path: Path)
         "Recurring known root",
         requested_team="beta",
         task_id="task-known-root-b",
+        governing_objective="Recurring known root",
+        governing_directives=[],
     )
     task_b = block_task(store, task_b, hop_state="waiting")
 

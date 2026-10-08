@@ -195,9 +195,10 @@ def test_fresh_chat_preflight_is_exact_role_scoped(monkeypatch):
     async def strict_team(*_args, **_kwargs):
         raise AssertionError("fresh_chat must not use strict team-wide preflight")
 
-    async def close_team(scope, *, preflighted_pages=None):
+    async def close_team(scope, *, preflighted_pages=None, reason="owned_team_cleanup"):
         assert preflighted_pages == [owned]
         assert set(scope["roles"]) == {"PLAN"}
+        assert reason == "fresh_role_replacement"
         return 1
 
     monkeypatch.setattr(actions, "preflight_role", role_preflight)

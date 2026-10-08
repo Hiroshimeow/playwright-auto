@@ -76,6 +76,8 @@ def _setup(tmp_path: Path, *, bootstrap=None, roles=None):
         task_id="task-prompt-compression",
         roles=roles,
         bootstrap=bootstrap,
+        governing_objective="Prompt compression task",
+        governing_directives=[],
     )
     return store, state, CDPAWorker(config, store=store)
 
@@ -197,6 +199,8 @@ def test_custom_workflow_prompt_is_preserved_even_when_bootstrap_inherited(tmp_p
         task_id="task-custom-bootstrap-prompt",
         roles=("PLAN", route, "REVIEW"),
         bootstrap=bootstrap_record(),
+        governing_objective="Custom bootstrap prompt",
+        governing_directives=[],
     )
     hop = _active_hop(state)
     hop["target_role"] = route

@@ -136,7 +136,13 @@ def test_send_waits_three_units_before_click(monkeypatch):
 
 
 def test_new_chat_waits_three_units_before_navigation(monkeypatch):
+    from types import SimpleNamespace
     page = FakePage(evaluate_result=False)
+
+    async def clean_probe(*args, **kwargs):
+        return SimpleNamespace(composer_text="", attachment_count=0, composer_ambiguous=False)
+
+    monkeypatch.setattr(chatgpt, "inspect_chatgpt_wait_probe", clean_probe)
 
     async def fake_delay(_page, action, multiplier):
         page.events.append(f"delay:{action}:{multiplier}")

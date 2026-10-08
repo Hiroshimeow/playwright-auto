@@ -13,6 +13,7 @@ from .chatgpt import (
     cloudflare_challenge_visible,
     validate_page_role,
 )
+from .observability import record_page_action
 
 
 class WorkspaceBindingError(RuntimeError):
@@ -120,9 +121,36 @@ class ChatGPTWorkspace:
     ) -> ChatGPTPage:
         if role in self._clients:
             raise WorkspaceBindingError(f"role {role!r} is already open")
-        page = await browser_context.new_page()
+        opening = await record_page_action(
+            None, "open_tab", "start", reason="workspace_open_role", identity={},
+            detail=f"requested_role={role}",
+        )
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page = await browser_context.new_page()
+        except Exception as exc:
+            await record_page_action(
+                None, "open_tab", "error", reason="workspace_open_role",
+                identity=opening, detail=type(exc).__name__,
+            )
+            raise
+        await record_page_action(
+            page, "open_tab", "complete", reason="workspace_open_role", identity=opening
+        )
+        navigation = await record_page_action(
+            page, "goto", "start", reason="workspace_open_role", identity={}
+        )
+        try:
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            except Exception as exc:
+                await record_page_action(
+                    page, "goto", "error", reason="workspace_open_role",
+                    identity=navigation, detail=type(exc).__name__,
+                )
+                raise
+            await record_page_action(
+                page, "goto", "complete", reason="workspace_open_role", identity=navigation
+            )
             await page.locator(
                 '[contenteditable="true"][role="textbox"]'
             ).first.wait_for(state="visible", timeout=timeout_ms)
@@ -134,7 +162,20 @@ class ChatGPTWorkspace:
             )
         except Exception as exc:
             cloudflare_challenge = await cloudflare_challenge_visible(page)
-            await page.close()
+            closing = await record_page_action(
+                page, "close_tab", "start", reason="failed_role_acquisition", identity={}
+            )
+            try:
+                await page.close()
+            except Exception as close_error:
+                await record_page_action(
+                    page, "close_tab", "error", reason="failed_role_acquisition",
+                    identity=closing, detail=type(close_error).__name__,
+                )
+                raise
+            await record_page_action(
+                page, "close_tab", "complete", reason="failed_role_acquisition", identity=closing
+            )
             if cloudflare_challenge:
                 raise RateLimitBlockedError(
                     "Cloudflare challenge blocked fresh ChatGPT page readiness"

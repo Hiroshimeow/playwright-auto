@@ -144,7 +144,7 @@ def test_clear_repository_projects_removes_account_scoped_mappings_only(tmp_path
 
 def test_repository_project_catalog_round_trip_preserves_unrelated_keys(tmp_path: Path):
     store, _worker = make_worker(tmp_path)
-    state = store.create_task("x", requested_team="alpha", task_id="task-a")
+    state = store.create_task("x", requested_team="alpha", task_id="task-a", governing_objective="x", governing_directives=[])
     catalog = json.loads(store.catalog_path.read_text())
     catalog["operator_key"] = {"keep": True}
     store.catalog_path.write_text(json.dumps(catalog))
@@ -159,7 +159,7 @@ def test_repository_project_catalog_round_trip_preserves_unrelated_keys(tmp_path
 
 def test_malformed_repository_project_catalog_fails_only_accessor(tmp_path: Path):
     store, _worker = make_worker(tmp_path)
-    store.create_task("x", requested_team="alpha", task_id="task-a")
+    store.create_task("x", requested_team="alpha", task_id="task-a", governing_objective="x", governing_directives=[])
     catalog = json.loads(store.catalog_path.read_text())
     catalog["repository_projects"] = []
     store.catalog_path.write_text(json.dumps(catalog))
@@ -170,7 +170,7 @@ def test_malformed_repository_project_catalog_fails_only_accessor(tmp_path: Path
 
 def test_repository_project_catalog_rejects_shared_project_id(tmp_path: Path):
     store, _worker = make_worker(tmp_path)
-    store.create_task("x", requested_team="alpha", task_id="task-a")
+    store.create_task("x", requested_team="alpha", task_id="task-a", governing_objective="x", governing_directives=[])
     repo_a = str((tmp_path / "a" / "repo").resolve())
     repo_b = str((tmp_path / "b" / "repo").resolve())
     store.set_repository_project(repo_a, "g-p-shared")
@@ -223,7 +223,7 @@ def test_grouping_patch_failure_is_fail_soft_and_repeat_is_tolerated(tmp_path: P
     store, worker = make_worker(tmp_path)
     repository = str((tmp_path / "repo").resolve())
     store.set_repository_project(repository, "g-p-existing")
-    task = store.create_task("x", requested_team="alpha", task_id="task-a", repository=repository)
+    task = store.create_task("x", requested_team="alpha", task_id="task-a", repository=repository, governing_objective="x", governing_directives=[])
     before = store.load(task["manifest_path"])
     calls = []
 

@@ -65,7 +65,7 @@ def test_new_triggered_agent_ignores_history_and_opens_only_for_a_new_event(
 ):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
-    old = store.create_task("Old done", requested_team="old", task_id="old-done")
+    old = store.create_task("Old done", requested_team="old", task_id="old-done", governing_objective="Old done", governing_directives=[])
     old = store.update(
         old["manifest_path"],
         lambda current: {
@@ -97,7 +97,7 @@ def test_new_triggered_agent_ignores_history_and_opens_only_for_a_new_event(
     assert persisted["status"] == "WAITING"
     assert persisted["independent"]["active_event"] is None
 
-    new = store.create_task("New done", requested_team="new", task_id="new-done")
+    new = store.create_task("New done", requested_team="new", task_id="new-done", governing_objective="New done", governing_directives=[])
     store.update(
         new["manifest_path"],
         lambda current: {
@@ -126,13 +126,15 @@ def test_workflow_create_api_canonicalizes_required_browser_endpoint(tmp_path: P
         {
             "task": "Gmail child workflow",
             "required_browser_endpoint_id": "localhost:9202",
+            "governing_objective": "Gmail child workflow",
+            "governing_directives": [],
         }
     )
 
     assert payload["required_browser_endpoint_id"] == gmail["endpoint_id"]
     with pytest.raises(Exception, match="not registered"):
         api.normalize_create(
-            {"task": "Bad Gmail child", "required_browser_endpoint_id": "9302"}
+            {"task": "Bad Gmail child", "required_browser_endpoint_id": "9302", "governing_objective": "Bad Gmail child", "governing_directives": []}
         )
 
 

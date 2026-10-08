@@ -143,6 +143,10 @@ function syncCreateMode() {
   roots.requestedTeamField.hidden = existingSolo;
   roots.taskInput.required = !existingSolo;
   roots.taskInput.disabled = existingSolo;
+  for (const input of roots.form.querySelectorAll('[name="governing_objective"], [name="governing_directives"]')) {
+    input.required = !solo;
+    input.disabled = solo;
+  }
   roots.soloRole.required = solo;
   roots.browserEndpointSelect.required = solo;
   if (solo) roots.reuseTeam.value = "";
@@ -1796,6 +1800,12 @@ roots.browserManager.addEventListener("submit", async event => {
   });
 });
 
+function parseGoverningDirectives(value) {
+  const parsed = JSON.parse(String(value ?? ""));
+  if (!Array.isArray(parsed)) throw new Error("Governing directives must be a JSON array.");
+  return parsed;
+}
+
 roots.form.addEventListener("submit", event => {
   event.preventDefault();
   syncCreateMode();
@@ -1808,8 +1818,8 @@ roots.form.addEventListener("submit", event => {
   const mode = createWorkflowMode();
   const conversationUrl = String(values.get("conversation_url") || "").trim();
   const existingSolo = mode === "solo" && Boolean(conversationUrl);
-  const task = String(values.get("task") || "").trim();
-  if (!task && !existingSolo) {
+  const task = String(values.get("task") || "");
+  if (!task.trim() && !existingSolo) {
     showCreateValidation("Task details are required.");
     return;
   }
@@ -1825,7 +1835,7 @@ roots.form.addEventListener("submit", event => {
     body = {
       workflow_mode: "solo",
       role,
-      goal: String(values.get("goal") || "").trim(),
+      goal: String(values.get("goal") || ""),
       browser_endpoint_id: browserEndpointId,
     };
     if (existingSolo) body.conversation_url = conversationUrl;
@@ -1841,8 +1851,17 @@ roots.form.addEventListener("submit", event => {
       ...manualDependencies,
     ])];
     const reuseTeam = String(values.get("reuse_team") || "").trim();
+    let governingDirectives;
+    try {
+      governingDirectives = parseGoverningDirectives(values.get("governing_directives"));
+    } catch (error) {
+      showCreateValidation(error.message);
+      return;
+    }
     body = {
       task,
+      governing_objective: String(values.get("governing_objective") || ""),
+      governing_directives: governingDirectives,
       repository: String(values.get("repository") || "").trim() || null,
       depends_on_task_ids: dependencies,
     };
@@ -2048,13 +2067,28 @@ roots.changeGoalForm.addEventListener("submit", event => {
   event.preventDefault();
   const taskId = roots.changeGoalForm.elements.task_id.value;
   const goal = roots.changeGoalForm.elements.goal.value;
+  const governingObjective = roots.changeGoalForm.elements.governing_objective.value;
   const expected = Number(roots.changeGoalForm.elements.expected_task_version.value);
   if (!goal.trim()) { toast("Goal must not be blank."); return; }
+  let governingDirectives;
+  try {
+    governingDirectives = parseGoverningDirectives(
+      roots.changeGoalForm.elements.governing_directives.value,
+    );
+  } catch (error) {
+    toast(error.message);
+    return;
+  }
   queueCommand({
     kind: "change_goal",
     taskId,
     endpoint: `/api/tasks/${encodeURIComponent(taskId)}/goal`,
-    body: {goal, expected_task_version: expected},
+    body: {
+      goal,
+      governing_objective: governingObjective,
+      governing_directives: governingDirectives,
+      expected_task_version: expected,
+    },
     label: `Change goal · ${state.selectedDetail?.team || taskId}`,
   });
   closeChangeGoal();

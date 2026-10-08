@@ -20,6 +20,8 @@ def test_store_persists_explicit_fresh_context_policy_independently_of_bootstrap
         requested_team="fresh-policy",
         task_id="task-explicit-fresh",
         context_policy="fresh",
+        governing_objective="explicit fresh task",
+        governing_directives=[],
     )
 
     assert fresh["context_policy"] == "fresh"
@@ -55,6 +57,8 @@ def test_store_rejects_fresh_policy_with_bootstrap_snapshot(tmp_path: Path):
             task_id="task-invalid-context",
             bootstrap=bootstrap,
             context_policy="fresh",
+            governing_objective="invalid mixed context",
+            governing_directives=[],
         )
 
 
@@ -62,7 +66,12 @@ def test_dashboard_explicit_null_bootstrap_materializes_fresh_policy(tmp_path: P
     config = load_cdpa_config(None, repository_root=tmp_path)
     api = DashboardAPI(config)
 
-    payload = api.normalize_create({"task": "fresh API task", "bootstrap_id": None})
+    payload = api.normalize_create({
+        "task": "fresh API task",
+        "bootstrap_id": None,
+        "governing_objective": "fresh API task",
+        "governing_directives": [],
+    })
 
     assert payload["bootstrap_id"] is None
     assert payload["context_policy"] == "fresh"
@@ -95,6 +104,8 @@ def test_store_rejects_temporary_with_bootstrap_snapshot(tmp_path: Path):
             temporary=True,
             bootstrap=_bootstrap_record(),
             context_policy="bootstrap",
+            governing_objective="temporary bootstrap conflict",
+            governing_directives=[],
         )
 
 
@@ -106,7 +117,11 @@ def test_dashboard_temporary_defaults_to_fresh_and_rejects_explicit_bootstrap(tm
     endpoints.update(endpoint["endpoint_id"], temporary_default=True)
     api = DashboardAPI(config)
 
-    inherited = api.normalize_create({"task": "temporary endpoint default"})
+    inherited = api.normalize_create({
+        "task": "temporary endpoint default",
+        "governing_objective": "temporary endpoint default",
+        "governing_directives": [],
+    })
     assert inherited["bootstrap_id"] is None
     assert inherited["context_policy"] == "fresh"
 
@@ -115,4 +130,6 @@ def test_dashboard_temporary_defaults_to_fresh_and_rejects_explicit_bootstrap(tm
             "task": "invalid temporary bootstrap",
             "temporary": True,
             "bootstrap_id": "general-team-bootstrap",
+            "governing_objective": "invalid temporary bootstrap",
+            "governing_directives": [],
         })

@@ -120,6 +120,8 @@
             <div><p class="eyebrow">Task details</p><h3 id="create-task-details-title">What should the team deliver?</h3></div>
           </div>
           <label>Task<textarea name="task" rows="7" required placeholder="Describe the required result, constraints, and acceptance evidence."></textarea></label>
+          <label data-team-only>Governing objective<textarea name="governing_objective" rows="3" required placeholder="Compact objective that must survive later substantive hops."></textarea></label>
+          <label data-team-only>Governing directives (JSON array)<textarea name="governing_directives" rows="3" required>[]</textarea></label>
           <label data-team-only hidden>Context<select name="bootstrap_id"><option value="">Fresh context</option></select></label>
           <div data-bootstrap-inline data-team-only hidden></div>
           <p class="form-help" data-team-only>Workflow roles start with Fresh context. Bootstrap branching is temporarily disabled.</p>
@@ -183,7 +185,7 @@
 
       <footer class="dialog-actions create-dialog-footer">
         <div class="create-footer-copy">
-          <p id="create-selection-summary" class="create-selection-summary" aria-live="polite">PLAN · DEV · REVIEW</p>
+          <p id="create-selection-summary" class="create-selection-summary" aria-live="polite">PLAN Ã‚Â· DEV Ã‚Â· REVIEW</p>
           <p id="create-validation" class="create-validation" aria-live="assertive" hidden></p>
         </div>
         <div class="create-footer-actions">
@@ -203,6 +205,8 @@
       <input type="hidden" name="task_id">
       <input type="hidden" name="expected_task_version">
       <label>Full replacement goal<textarea name="goal" rows="12" required></textarea></label>
+      <label>Governing objective<textarea name="governing_objective" rows="3" required></textarea></label>
+      <label>Governing directives (JSON array)<textarea name="governing_directives" rows="3" required>[]</textarea></label>
       <p class="form-help">Applies from the next route/hop. The current hop is not changed or resent.</p>
       <footer class="dialog-actions">
         <button type="button" class="button" data-close-change-goal>Cancel</button>
@@ -295,7 +299,7 @@
             <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
             <span class="switch-label">Enabled</span>
           </label>
-          <button type="button" class="button icon-button agent-settings-close" data-close-agent-settings aria-label="Close agent settings">×</button>
+          <button type="button" class="button icon-button agent-settings-close" data-close-agent-settings aria-label="Close agent settings">Ãƒâ€”</button>
         </div>
       </header>
 

@@ -302,6 +302,120 @@ def test_projection_hydrates_missing_file_report_evidence_inside_task_team_root(
     }
 
 
+def test_projection_exposes_bounded_operational_evidence_without_sensitive_payloads(tmp_path: Path):
+    raw = raw_task(tmp_path)
+    raw.update(
+        browser_endpoint_id="9212",
+        endpoint_pinned=True,
+        required_browser_endpoint_id="9212",
+    )
+    hop = raw["hops"][-1]
+    hop.update(
+        state="waiting",
+        kind="accepted_send_reconciliation",
+        receipt={
+            "user_message_id": "private-user-message-12345678",
+            "conversation_id": "private-conversation-12345678",
+            "prompt": "private accepted prompt body",
+        },
+        governing_contract_ref={
+            "resolved": True,
+            "goal_revision": 3,
+            "semantic_sha256": "a" * 64,
+            "continuation_sha256": "b" * 64,
+            "manifest_path": str(tmp_path / ".plan" / "alpha" / "task-a.json"),
+        },
+        reconciliation_original_request_id="private-request-12345678",
+        reconciliation_user_message_id="private-user-message-12345678",
+        reconciliation_no_replay=True,
+        wait={
+            "accepted_identity_started_at": "2026-10-05T00:00:00+00:00",
+            "accepted_identity_deadline_at": "2026-10-05T00:00:45+00:00",
+            "accepted_identity_finished_at": "2026-10-05T00:00:03+00:00",
+            "accepted_identity_outcome": "resolved",
+            "listen_watermark": {
+                "observer_instance_id": "observer-2",
+                "observer_epoch": 4,
+                "signal_seq": 18,
+                "observed_at": "2026-10-05T00:00:02+00:00",
+                "response": "must not leak",
+            },
+            "listen_retired_instances": ["observer-1"],
+            "controller_decision": "accept",
+            "controller_reason": "valid_bound_result",
+            "terminal_response_source": "listen",
+            "response": "private response body",
+        },
+    )
+    raw["controls"] = [
+        {
+            "control_id": 9,
+            "action": "route_plan",
+            "status": "applied",
+            "origin": "operator",
+            "reason": "operator reconciliation",
+            "command": {"repository": str(tmp_path)},
+        }
+    ]
+
+    projection = build_task_projection(raw, tasks=[raw])
+    operational = projection.detail["operational"]
+
+    assert operational == {
+        "endpoint": {
+            "home_endpoint": "9212",
+            "endpoint_pinned": True,
+            "required_endpoint": "9212",
+        },
+        "request_boundary": "crossed",
+        "accepted_identity": {
+            "started_at": "2026-10-05T00:00:00+00:00",
+            "deadline_at": "2026-10-05T00:00:45+00:00",
+            "finished_at": "2026-10-05T00:00:03+00:00",
+            "outcome": "resolved",
+        },
+        "governing_contract": {
+            "resolved": True,
+            "goal_revision": 3,
+            "semantic_sha256": "a" * 64,
+            "continuation_sha256": "b" * 64,
+        },
+        "listen": {
+            "observer_instance_id": "observer-2",
+            "observer_epoch": 4,
+            "signal_seq": 18,
+            "observed_at": "2026-10-05T00:00:02+00:00",
+            "retired_instance_count": 1,
+        },
+        "terminal": {
+            "decision": "accept",
+            "reason": "valid_bound_result",
+            "source": "listen",
+        },
+        "reconciliation": {
+            "active_or_latest": True,
+            "no_replay": True,
+            "control_origin": "operator",
+            "route_plan_control_id": 9,
+        },
+    }
+    public = json.dumps(operational, sort_keys=True)
+    for secret in (
+        "private-user-message-12345678",
+        "private-conversation-12345678",
+        "private-request-12345678",
+        "private accepted prompt body",
+        "private response body",
+        str(tmp_path),
+    ):
+        assert secret not in public
+
+    legacy = raw_task(tmp_path)
+    legacy.pop("endpoint_pinned", None)
+    legacy_projection = build_task_projection(legacy, tasks=[legacy])
+    assert legacy_projection.detail["operational"]["endpoint"]["endpoint_pinned"] is True
+
+
 def test_projection_hydrates_missing_file_report_evidence_from_cross_workspace_repository(tmp_path: Path):
     control = tmp_path / "control"
     execution = tmp_path / "execution"
@@ -767,7 +881,12 @@ def test_projection_resolves_parent_dependency_team_names(tmp_path: Path):
     projection = build_task_projection(raw, tasks=[raw, parent])
 
     assert projection.detail["dependencies"] == [
-        {"task_id": "parent-task-id", "team": "human-readable-parent-team"}
+        {
+            "task_id": "parent-task-id",
+            "team": "human-readable-parent-team",
+            "status": "RUNNING",
+            "block_code": None,
+        }
     ]
 
 

@@ -42,6 +42,8 @@ def test_team_task_bootstrap_remains_plan_first(tmp_path: Path):
         "Team behavior stays unchanged",
         requested_team="team-mode",
         task_id="team-mode",
+        governing_objective="Team behavior stays unchanged",
+        governing_directives=[],
     )
 
     assert state["workflow_mode"] == "team"
@@ -493,6 +495,8 @@ def test_cli_submit_task_adds_solo_fields_without_changing_team_payload(
         team="team",
         new_roles=(),
         new_all=False,
+        governing_objective="Team",
+        governing_directives=[],
     )
     cli_module.submit_task(
         config,
@@ -772,6 +776,8 @@ def test_solo_foreign_conversation_owner_blocks_before_adoption(tmp_path: Path):
         "Owner",
         requested_team="owner",
         task_id="solo-owner",
+        governing_objective="Owner",
+        governing_directives=[],
     )
     owner["roles"]["PLAN"]["page_id"] = "owner-page"
     owner["roles"]["PLAN"]["page_url"] = url
@@ -803,7 +809,7 @@ def test_solo_foreign_conversation_owner_blocks_before_adoption(tmp_path: Path):
 def test_solo_terminal_historical_conversation_owner_does_not_block_reuse(tmp_path: Path, monkeypatch):
     config, store = make_store(tmp_path)
     url = "https://chatgpt.com/c/terminal-history-reuse"
-    owner = store.create_task("Historical owner", requested_team="owner", task_id="solo-terminal-owner")
+    owner = store.create_task("Historical owner", requested_team="owner", task_id="solo-terminal-owner", governing_objective="Historical owner", governing_directives=[])
     owner["roles"]["PLAN"]["page_id"] = "owner-page"
     owner["roles"]["PLAN"]["page_url"] = url
     owner["status"] = "DONE"

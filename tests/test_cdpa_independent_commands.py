@@ -98,6 +98,8 @@ def _create_blocked_target(
         "Blocked periodic target",
         requested_team=team,
         task_id=task_id,
+        governing_objective="Blocked periodic target",
+        governing_directives=[],
     )
 
     def block(current: dict) -> dict:
@@ -559,11 +561,15 @@ def test_periodic_bind_rejects_stale_rebind_and_ineligible_targets(tmp_path: Pat
         "Not blocked",
         requested_team="periodic-ineligible",
         task_id="periodic-ineligible-task",
+        governing_objective="Not blocked",
+        governing_directives=[],
     )
     terminal = store.create_task(
         "Already done",
         requested_team="periodic-terminal",
         task_id="periodic-terminal-task",
+        governing_objective="Already done",
+        governing_directives=[],
     )
     terminal = store.update(
         terminal["manifest_path"],
@@ -947,6 +953,8 @@ def test_independent_target_control_is_bound_to_active_event(tmp_path: Path):
         "Completed repair",
         requested_team="control-repair",
         task_id="control-repair-task",
+        governing_objective="Completed repair",
+        governing_directives=[],
     )
     repair = store.update(
         repair["manifest_path"],
@@ -964,6 +972,8 @@ def test_independent_target_control_is_bound_to_active_event(tmp_path: Path):
         requested_team="control-target",
         task_id="control-target-task",
         depends_on_task_ids=(repair["task_id"],),
+        governing_objective="Blocked target",
+        governing_directives=[],
     )
 
     def block(current: dict) -> dict:
@@ -1069,7 +1079,9 @@ def test_independent_target_control_is_bound_to_active_event(tmp_path: Path):
     )
 
     other = store.create_task(
-        "Other target", requested_team="other-target", task_id="other-target-task"
+        "Other target", requested_team="other-target", task_id="other-target-task",
+        governing_objective="Other target",
+        governing_directives=[],
     )
     enqueue(
         worker.runtime_db,
@@ -1104,6 +1116,8 @@ def test_safe_restore_replaces_stopped_target_with_preserved_lineage(tmp_path: P
         "Stopped logical goal",
         requested_team="safe-restore-stopped",
         task_id="safe-restore-stopped-task",
+        governing_objective="Stopped logical goal",
+        governing_directives=[],
     )
     parent = store.update(
         parent["manifest_path"],
@@ -1117,6 +1131,8 @@ def test_safe_restore_replaces_stopped_target_with_preserved_lineage(tmp_path: P
     parent = store.change_goal(
         parent["manifest_path"],
         "Revised stopped logical goal",
+        governing_objective="Revised stopped logical goal",
+        governing_directives=[],
         external_command_id="revise-before-safe-restore",
     )
     child = store.create_task(
@@ -1124,6 +1140,8 @@ def test_safe_restore_replaces_stopped_target_with_preserved_lineage(tmp_path: P
         requested_team="safe-restore-child",
         task_id="safe-restore-child-task",
         depends_on_task_ids=(parent["task_id"],),
+        governing_objective="Dependent child",
+        governing_directives=[],
     )
 
     def stop(current: dict) -> dict:
@@ -1215,6 +1233,8 @@ def test_safe_restore_replacement_denies_unresolved_send_boundaries(
         f"Stopped boundary target {boundary}",
         requested_team=team,
         task_id=f"safe-restore-stopped-{boundary}-task",
+        governing_objective=f"Stopped boundary target {boundary}",
+        governing_directives=[],
     )
 
     def stop_with_boundary(current: dict) -> dict:
@@ -1293,6 +1313,8 @@ def test_safe_restore_does_not_override_explicit_operator_stop(tmp_path: Path):
         "Operator stopped target",
         requested_team="safe-restore-operator-stop",
         task_id="safe-restore-operator-stop-task",
+        governing_objective="Operator stopped target",
+        governing_directives=[],
     )
     queued = store.request_control(
         target["manifest_path"],
@@ -1353,6 +1375,8 @@ def test_safe_restore_denies_non_pristine_send_boundaries(tmp_path: Path, bounda
         f"Boundary target {boundary}",
         requested_team=f"safe-restore-{boundary}",
         task_id=f"safe-restore-{boundary}-task",
+        governing_objective=f"Boundary target {boundary}",
+        governing_directives=[],
     )
 
     def prepare(current: dict) -> dict:
@@ -1442,6 +1466,8 @@ def test_safe_restore_rejects_send_boundary_race_at_persistence(
         "Race target",
         requested_team="safe-restore-race",
         task_id="safe-restore-race-task",
+        governing_objective="Race target",
+        governing_directives=[],
     )
 
     def block(current: dict) -> dict:

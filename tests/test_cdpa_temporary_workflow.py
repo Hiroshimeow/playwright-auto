@@ -22,6 +22,8 @@ def _temporary_task(tmp_path: Path, *, task_id: str):
         requested_team="alpha",
         task_id=task_id,
         temporary=True,
+        governing_objective="Continue workflow in temporary chat",
+        governing_directives=[],
     )
     return store, state, CDPAWorker(config, store=store)
 

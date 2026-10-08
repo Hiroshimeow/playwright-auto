@@ -9,6 +9,15 @@ import playwright_auto.cdpa_cli as cdpa_cli_module
 from playwright_auto.cdpa_cli import main as cdpa_main
 
 
+def submit_team_task(config, **kwargs):
+    return cdpa_cli_module.submit_task(
+        config,
+        governing_objective="CLI runtime test objective.",
+        governing_directives=[],
+        **kwargs,
+    )
+
+
 def test_submit_task_keeps_file_mode_across_workspaces(tmp_path: Path, monkeypatch):
     control_repository = tmp_path / "control"
     execution_repository = tmp_path / "execution"
@@ -23,7 +32,7 @@ def test_submit_task_keeps_file_mode_across_workspaces(tmp_path: Path, monkeypat
     monkeypatch.setattr(cdpa_cli_module, "_post", fake_post)
     config = SimpleNamespace(repository_root=control_repository.resolve())
 
-    cdpa_cli_module.submit_task(
+    submit_team_task(
         config,
         task="cross workspace",
         repository=execution_repository,
@@ -31,7 +40,7 @@ def test_submit_task_keeps_file_mode_across_workspaces(tmp_path: Path, monkeypat
         new_roles=(),
         new_all=False,
     )
-    cdpa_cli_module.submit_task(
+    submit_team_task(
         config,
         task="same workspace",
         repository=control_repository,
@@ -39,7 +48,7 @@ def test_submit_task_keeps_file_mode_across_workspaces(tmp_path: Path, monkeypat
         new_roles=(),
         new_all=False,
     )
-    cdpa_cli_module.submit_task(
+    submit_team_task(
         config,
         task="infer repository",
         repository=None,
@@ -65,7 +74,7 @@ def test_direct_intake_submits_one_normal_unpinned_workflow(tmp_path: Path, monk
     monkeypatch.setattr(cdpa_cli_module, "_post", fake_post)
     config = SimpleNamespace(repository_root=tmp_path.resolve())
 
-    cdpa_cli_module.submit_task(
+    submit_team_task(
         config,
         task="Implement clarified request with focused acceptance evidence",
         repository=tmp_path,
@@ -149,7 +158,7 @@ def test_submit_task_omits_bootstrap_for_default_fresh_context(tmp_path: Path, m
         or {"status": "queued"},
     )
 
-    cdpa_cli_module.submit_task(
+    submit_team_task(
         config,
         task="fresh default",
         repository=None,
@@ -469,7 +478,7 @@ def test_task_cli_temp_and_browser_forward_creation_policy(tmp_path: Path, monke
     ]) == 0
     assert captured[0]["temporary"] is True
     assert captured[0]["browser_endpoint_id"] == "9202"
-    assert "required_browser_endpoint_id" not in captured[0]
+    assert captured[0]["required_browser_endpoint_id"] is None
 
 
 def test_submit_task_emits_only_explicit_temp_and_browser_overrides(tmp_path: Path, monkeypatch):
@@ -481,7 +490,7 @@ def test_submit_task_emits_only_explicit_temp_and_browser_overrides(tmp_path: Pa
         lambda _config, path, payload, **_kwargs: payloads.append(payload)
         or {"status": "queued"},
     )
-    cdpa_cli_module.submit_task(
+    submit_team_task(
         config,
         task="placement override",
         repository=None,
@@ -497,7 +506,7 @@ def test_submit_task_emits_only_explicit_temp_and_browser_overrides(tmp_path: Pa
     assert payloads[0]["required_browser_endpoint_id"] == "9202"
 
     payloads.clear()
-    cdpa_cli_module.submit_task(
+    submit_team_task(
         config,
         task="inherit defaults",
         repository=None,

@@ -44,20 +44,18 @@ def test_recovery_send_does_not_require_old_account_conversation_baseline(tmp_pa
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
 
 
-def test_fresh_pristine_relocation_reacquires_surface_with_same_request(tmp_path):
-    store, state, worker, _, hop, ledger, _ = _prepare_pristine_new_sending_record(tmp_path, task_id="pristine-surface")
-    state["bootstrap"] = None
-    state["context_policy"] = "fresh"
-    state["roles"]["PLAN"].update(context_source="fresh", bootstrap_source_donor=None,
-                                      browser_endpoint_id=store.endpoints.resolve()["endpoint_id"])
+def test_prepared_sending_record_cannot_be_relocated_as_fake_fresh_placement(tmp_path):
+    store, state, worker, _, hop, ledger, _ = _prepare_pristine_new_sending_record(
+        tmp_path, task_id="pristine-surface"
+    )
     endpoint = store.endpoints.add("9202")["endpoint_id"]
     request = hop["request_id"]
     prompt = hop["prompt"]
-    assert worker._prepare_execution_endpoint(state, endpoint)
-    actions = TemporaryWorkflowActions()
-    acquired = asyncio.run(worker._owned_or_block(state, "PLAN", actions))
-    assert acquired is not None
-    assert actions.fresh_urls == ["https://chatgpt.com/"]
+
+    assert state["admission"]["bootstrap_present"] is True
+    assert hop["state"] == "sending"
+    assert worker._prepare_execution_endpoint(state, endpoint) is False
+    assert state["browser_endpoint_id"] != endpoint
     assert hop["request_id"] == request and hop["prompt"] == prompt
     assert ledger.get(request).attempts == 0
 

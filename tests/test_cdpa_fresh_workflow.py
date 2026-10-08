@@ -69,6 +69,8 @@ def _fresh_task(tmp_path: Path):
         requested_team="fresh-workflow",
         task_id="task-fresh-workflow",
         context_policy="fresh",
+        governing_objective="explicit fresh workflow",
+        governing_directives=[],
     )
     return state, CDPAWorker(config, store=store)
 

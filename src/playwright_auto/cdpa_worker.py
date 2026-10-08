@@ -50,6 +50,7 @@ from .cdpa_commands import (
 from .cdpa_config import CDPAConfig, load_cdpa_config, remote_repository_from_task
 from .cdpa_browser_projection import build_browser_projection
 from .cdpa_endpoint_pool import EndpointPool
+from .cdpa_dependencies import dependency_readiness
 from .cdpa_endpoints import normalize_endpoint_record
 from .cdpa_managed_browser import ManagedBrowserLifecycle
 from .cdpa_independent import (
@@ -100,6 +101,8 @@ from .cdpa_routes import (
 )
 from .cdpa_store import (
     TaskStore,
+    governing_semantic_for_hop,
+    normalize_governing_contract,
     is_replaced_immutable_history,
     task_goal_for_hop,
     report_mode_from_options,
@@ -186,6 +189,12 @@ _STATUS_RECOVERY_GRAPH_SECONDS = 300.0
 _TERMINAL_GRAPH_RETRY_SECONDS = 120.0
 _TERMINAL_GRAPH_MAX_ATTEMPTS = 3
 CLEANUP_IDENTICAL_FAILURE_LIMIT = 3
+
+
+class _AcceptedConversationIdentityConflict(GraphIdentityError):
+    """Exact accepted page/user now proves a conflicting canonical identity."""
+
+
 _CLEANUP_RETRY_DELAYS_SECONDS = (30.0, 120.0)
 _DOM_FALLBACK_SETTLE_SECONDS = 30.0
 _POST_REFRESH_RESPONSE_PROBE_SECONDS = 60.0
@@ -912,14 +921,50 @@ class CDPAWorker:
                 if endpoint_id != home:
                     return False
             else:
+                admission = (
+                    state.get("admission")
+                    if isinstance(state.get("admission"), Mapping)
+                    else {}
+                )
+                if bool(admission.get("browser_endpoint_explicit", False)):
+                    return False
+                if bool(admission.get("required_endpoint_explicit", False)):
+                    return False
+                if not self._execution_is_pristine_pre_send(state):
+                    return False
+                role = str(state.get("active_role") or "").upper()
+                role_record = (state.get("roles") or {}).get(role)
+                if (
+                    not isinstance(role_record, Mapping)
+                    or role_record.get("page_id")
+                    or role_record.get("page_url")
+                ):
+                    return False
+                endpoint = self.store.endpoints.get(endpoint_id)
+                mode_explicit = bool(
+                    admission.get(
+                        "conversation_mode_explicit",
+                        state.get("conversation_mode_explicit", False),
+                    )
+                )
+                context_explicit = bool(admission.get("context_policy_explicit", False))
+                selected_mode = str(state.get("conversation_mode") or "")
+                if not mode_explicit:
+                    selected_mode = (
+                        "temporary"
+                        if endpoint.get("temporary_default")
+                        else "persistent"
+                    )
+                if state.get("bootstrap") is not None and selected_mode == "temporary":
+                    return False
+                selected_context = state.get("context_policy")
+                if not context_explicit and state.get("bootstrap") is None:
+                    selected_context = "fresh"
                 state["browser_endpoint_id"] = endpoint_id
                 state["endpoint_pinned"] = True
-                if not state.get("conversation_mode_explicit", False):
-                    endpoint = self.store.endpoints.get(endpoint_id)
-                    state["conversation_mode"] = (
-                        "temporary" if endpoint.get("temporary_default") else "persistent"
-                    )
-                state["context_policy"] = "fresh"
+                state["conversation_mode"] = selected_mode
+                if selected_context is not None:
+                    state["context_policy"] = selected_context
         role = str(state.get("active_role") or "").upper()
         record = state.get("roles", {}).get(role) if role else None
         if not isinstance(record, dict):
@@ -1868,6 +1913,22 @@ class CDPAWorker:
             kind="independent_job" if is_independent_task(state) else "execution_recovery",
         )
         child["recovery_of_request_id"] = original_request_id
+        parent_kind = str(hop.get("kind") or "task")
+        child["recovered_parent_kind"] = parent_kind
+        if parent_kind in {"route_repair", "report_repair"}:
+            for key in (
+                "validation_error",
+                "locked_route",
+                "locked_handoff",
+                "expected_report_path",
+                "repair_attempt",
+            ):
+                if key in hop:
+                    child[key] = copy.deepcopy(hop[key])
+        if parent_kind == "accepted_send_reconciliation":
+            for key, value in hop.items():
+                if str(key).startswith("reconciliation_"):
+                    child[key] = copy.deepcopy(value)
         role_record.pop("branch_conversation_id", None)
         role_record.update(
             last_endpoint_id=self._execution_endpoint_id(state, role),
@@ -2558,6 +2619,17 @@ class CDPAWorker:
                 return None
             if ownership_retry_at is not None:
                 hop.setdefault("wait", {}).pop("ownership_retry_at", None)
+            if isinstance(hop.get("receipt"), Mapping):
+                try:
+                    self._reconcile_hop_conversation_identity(state, hop)
+                except RuntimeError as exc:
+                    self._block(
+                        state,
+                        exc,
+                        code="accepted_receipt_provenance_divergence",
+                        retryable=False,
+                    )
+                    return None
             acquired = await actions.locate_owned(state, role)
             temporary = state.get("conversation_mode") == "temporary"
             receipt_payload = hop.get("receipt")
@@ -2568,24 +2640,87 @@ class CDPAWorker:
                 and not receipt_payload.get("conversation_id")
             )
             if accepted_provisional:
-                # The local-chatgpt URL is a live-page hint, not a durable reopen address.
-                # Enrichment checks the exact receipt, page binding and accepted user turn.
-                if acquired is not None:
-                    try:
-                        receipt = SendReceipt.from_dict(receipt_payload)
-                        await self._discover_accepted_conversation_identity(state, hop, actions, receipt)
-                    except GraphIdentityError:
-                        pass
-                if _provisional_conversation_url(hop.get("conversation_url")):
+                receipt = SendReceipt.from_dict(receipt_payload)
+                if acquired is None or str(acquired.page_id) != str(receipt.binding.page_id):
                     self._block(
                         state,
-                        "Accepted Send has only a provisional local-chatgpt URL; canonical conversation identity "
-                        "was not proven on the exact owned page. Reopen is unsafe; preserve the accepted "
-                        "request and resolve identity from exact-page evidence or operator review.",
-                        code="accepted_conversation_identity_unresolved", retryable=False,
+                        "Accepted Send lost the exact owned page while canonical conversation identity was unresolved.",
+                        code="accepted_conversation_identity_unresolved",
+                        retryable=False,
                     )
                     return None
-                expected_conversation = _recoverable_conversation_identity(hop.get("conversation_url"))
+                ownership = await acquired.client.assert_ownership()
+                if (
+                    str(ownership.page_id) != str(receipt.binding.page_id)
+                    or not receipt_user_message_seen(ownership.messages, receipt)
+                ):
+                    self._block(
+                        state,
+                        "Accepted Send lost exact accepted-user provenance while canonical conversation identity was unresolved.",
+                        code="accepted_conversation_identity_unresolved",
+                        retryable=False,
+                    )
+                    return None
+                try:
+                    await self._discover_accepted_conversation_identity(
+                        state, hop, actions, receipt
+                    )
+                except _AcceptedConversationIdentityConflict as exc:
+                    wait = hop.setdefault("wait", {})
+                    wait["accepted_identity_finished_at"] = datetime.now(timezone.utc).isoformat()
+                    wait["accepted_identity_outcome"] = "blocked_unresolved"
+                    self._block(
+                        state,
+                        exc,
+                        code="accepted_conversation_identity_unresolved",
+                        retryable=False,
+                    )
+                    return None
+                except GraphIdentityError:
+                    wait = hop.setdefault("wait", {})
+                    now = datetime.now(timezone.utc)
+                    response_deadline = parse_time(wait.get("deadline_at"))
+                    started_at = parse_time(wait.get("accepted_identity_started_at"))
+                    settle_deadline = parse_time(wait.get("accepted_identity_deadline_at"))
+                    if started_at is None:
+                        if response_deadline is None or now >= response_deadline:
+                            wait["accepted_identity_finished_at"] = now.isoformat()
+                            wait["accepted_identity_outcome"] = "blocked_unresolved"
+                            self._block(
+                                state,
+                                "Accepted conversation identity remained provisional at the response deadline.",
+                                code="accepted_conversation_identity_unresolved",
+                                retryable=False,
+                            )
+                            return None
+                        started_at = now
+                        settle_deadline = min(
+                            now + timedelta(seconds=5),
+                            response_deadline,
+                        )
+                        wait["accepted_identity_started_at"] = started_at.isoformat()
+                        wait["accepted_identity_deadline_at"] = settle_deadline.isoformat()
+                        wait["accepted_identity_page_id"] = str(receipt.binding.page_id)
+                    if settle_deadline is None or now >= settle_deadline:
+                        wait["accepted_identity_finished_at"] = now.isoformat()
+                        wait["accepted_identity_outcome"] = "blocked_unresolved"
+                        self._block(
+                            state,
+                            "Accepted conversation identity did not settle on the exact owned page before its persisted deadline.",
+                            code="accepted_conversation_identity_unresolved",
+                            retryable=False,
+                        )
+                        return None
+                    state["status"] = "RUNNING"
+                    state["active_action"] = "wait_accepted_conversation_identity"
+                    return None
+                wait = hop.setdefault("wait", {})
+                if wait.get("accepted_identity_started_at") is not None:
+                    wait["accepted_identity_finished_at"] = datetime.now(timezone.utc).isoformat()
+                    wait["accepted_identity_outcome"] = "canonicalized"
+                expected_conversation = _recoverable_conversation_identity(
+                    hop.get("conversation_url")
+                )
             if temporary:
                 token = state["roles"][role].get("temporary_document_id")
                 lost_document = bool(
@@ -3535,7 +3670,15 @@ class CDPAWorker:
                     )
             return current
 
-        saved = self.store.update(manifest_path, merge)
+        initial_placement = (
+            before.get("endpoint_pinned", True) is False
+            and after.get("endpoint_pinned") is True
+        )
+        saved = (
+            self.store.update_initial_placement(manifest_path, merge)
+            if initial_placement
+            else self.store.update(manifest_path, merge)
+        )
         self._record_controller_live_transition(before, saved)
         self._remember_manifest(manifest_path, saved)
         return saved
@@ -3782,6 +3925,21 @@ class CDPAWorker:
             # BLOCKED truth is already durable. Browser-resource release is best-effort
             # and must never replace the original diagnosis.
             return
+
+    def _accepted_admission_integrity_error(
+        self,
+        state: Mapping[str, Any],
+        hop: Mapping[str, Any],
+    ) -> str | None:
+        if self._sending_hop_durable_boundary_state(hop) == "preboundary":
+            return None
+        task_text = state.get("task_text")
+        expected = state.get("task_text_sha256")
+        if isinstance(task_text, str) and isinstance(expected, str):
+            actual = hashlib.sha256(task_text.encode("utf-8")).hexdigest()
+            if actual != expected:
+                return "accepted admission integrity corruption: task_text hash mismatch"
+        return None
 
     def _sending_hop_durable_boundary_state(self, hop: Mapping[str, Any]) -> str:
         receipt = hop.get("receipt")
@@ -5641,6 +5799,100 @@ class CDPAWorker:
         role_record.pop("bootstrap_context_recovery", None)
         return acquired
 
+    def _governing_contract_for_hop(
+        self,
+        state: Mapping[str, Any],
+        hop: Mapping[str, Any],
+        workflow_definition: Mapping[str, Any],
+    ) -> str:
+        try:
+            semantic_payload, semantic_sha256, revision, goal_sha256 = (
+                governing_semantic_for_hop(state, int(hop["hop_id"]))
+            )
+            continuation = workflow_definition.get("continuation_contract")
+            if not isinstance(continuation, str) or not continuation.strip():
+                raise ValueError(
+                    "governing_contract_unavailable: role continuation contract is missing"
+                )
+            if len(continuation) > 2048:
+                raise ValueError(
+                    "governing_contract_unavailable: role continuation contract exceeds 2048 code points"
+                )
+            manifest_raw = str(state.get("manifest_path") or "")
+            manifest = Path(manifest_raw).expanduser().resolve()
+            plans_root = self.config.plans_root.expanduser().resolve()
+            if str(manifest) != manifest_raw:
+                raise ValueError(
+                    "governing_contract_unavailable: manifest_path is not canonical"
+                )
+            try:
+                manifest.relative_to(plans_root)
+            except ValueError as exc:
+                raise ValueError(
+                    "governing_contract_unavailable: manifest_path is outside plans root"
+                ) from exc
+            if not manifest.is_file():
+                raise ValueError(
+                    "governing_contract_unavailable: task manifest is unavailable"
+                )
+            persisted_manifest = self.store.load(manifest)
+            if (
+                str(persisted_manifest.get("task_id") or "")
+                != str(state.get("task_id") or "")
+                or str(persisted_manifest.get("manifest_path") or "")
+                != manifest_raw
+            ):
+                raise ValueError(
+                    "governing_contract_unavailable: manifest identity does not match the executing task"
+                )
+            continuation_sha256 = hashlib.sha256(
+                continuation.encode("utf-8")
+            ).hexdigest()
+            facts = json.dumps(
+                {
+                    "task_id": str(state["task_id"]),
+                    "hop_id": int(hop["hop_id"]),
+                    "manifest_path": manifest_raw,
+                    "repository": str(state["repository"]),
+                    "workflow_mode": str(state.get("workflow_mode") or "team"),
+                    "home_endpoint": str(state.get("browser_endpoint_id") or ""),
+                    "required_endpoint": (
+                        str(state.get("required_browser_endpoint_id"))
+                        if state.get("required_browser_endpoint_id") is not None
+                        else None
+                    ),
+                    "conversation_mode": str(
+                        state.get("conversation_mode") or "persistent"
+                    ),
+                    "context_policy": str(state.get("context_policy") or "fresh"),
+                    "goal_revision": revision,
+                    "effective_goal_sha256": goal_sha256,
+                    "semantic_sha256": semantic_sha256,
+                    "target_role": str(hop["target_role"]),
+                    "continuation_sha256": continuation_sha256,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            block = self.prompts.governing_block(
+                semantic_payload, continuation, facts
+            )
+        except (KeyError, TypeError, ValueError, OSError) as exc:
+            if "governing_contract_unavailable" in str(exc):
+                raise
+            raise ValueError(
+                f"governing_contract_unavailable: {exc}"
+            ) from exc
+        if isinstance(hop, dict):
+            hop["governing_contract_ref"] = {
+                "semantic_sha256": semantic_sha256,
+                "continuation_sha256": continuation_sha256,
+                "manifest_path": manifest_raw,
+                "goal_revision": revision,
+                "resolved": True,
+            }
+        return block
+
     @staticmethod
     def _route_repair_stale_error_send_ready(snapshot: Any) -> bool:
         """Allow a route-only repair after a failed generation when the composer is clean."""
@@ -5704,9 +5956,46 @@ class CDPAWorker:
         if (hop.get("preboundary_recovery") or {}).get("phase") == "recovery_required":
             # Acquisition did not return a binding; never implicitly allocate again.
             return
+        role = str(hop["target_role"])
+        hop_kind = str(hop.get("kind") or "")
+        prompt_kind = (
+            str(hop.get("recovered_parent_kind") or "")
+            if hop_kind == "execution_recovery"
+            and str(hop.get("recovered_parent_kind") or "") in {"route_repair", "report_repair"}
+            else hop_kind
+        )
+        governing_contract = None
+        governing_workflow_definitions = None
+        substantive_team_hop = (
+            not is_independent_task(state)
+            and str(state.get("workflow_mode") or "team").strip().lower() == "team"
+            and prompt_kind not in {"route_repair", "report_repair"}
+            and (
+                int(hop.get("turn") or 0) > 1
+                or str(hop.get("kind") or "")
+                in {"execution_recovery", "accepted_send_reconciliation"}
+            )
+        )
+        if substantive_team_hop:
+            try:
+                governing_workflow_definitions = task_workflow_definitions(
+                    state, self.config
+                )
+                governing_contract = self._governing_contract_for_hop(
+                    state,
+                    hop,
+                    governing_workflow_definitions[role],
+                )
+            except (KeyError, TypeError, ValueError, OSError) as exc:
+                self._block(
+                    state,
+                    str(exc),
+                    code="governing_contract_unavailable",
+                    retryable=False,
+                )
+                return
         await self._admission_preflight(state, actions)
         self._normalize_legacy_pre_send_report_mode(state, hop)
-        role = str(hop["target_role"])
         if self._attachment_files_for_generation(state, role) is None:
             return
         route_repair_owned = None
@@ -6061,7 +6350,11 @@ class CDPAWorker:
             state["active_action"] = "send"
             return
         report_repository, report_plans_root = _workflow_report_roots(self.config, state)
-        expected = expected_report_relative(
+        expected = (
+            str(hop.get("expected_report_path") or "").strip()
+            if prompt_kind in {"route_repair", "report_repair"}
+            else ""
+        ) or expected_report_relative(
             plans_root=report_plans_root,
             repository_root=report_repository,
             team=str(state["team"]),
@@ -6075,7 +6368,11 @@ class CDPAWorker:
             if source_logical in state["roles"]
             else None
         )
-        workflow_definitions = task_workflow_definitions(state, self.config)
+        workflow_definitions = (
+            governing_workflow_definitions
+            if governing_workflow_definitions is not None
+            else task_workflow_definitions(state, self.config)
+        )
         workflow_definition = workflow_definitions[role]
         stale_recovery_rebind = (
             hop.get("kind") == "execution_recovery"
@@ -6140,10 +6437,10 @@ class CDPAWorker:
             and generation == 1
         )
         allowed_routes = tuple(workflow_definitions) + ("PAUSE", "DONE")
-        if hop.get("kind") in {"route_repair", "report_repair"} and (
+        if prompt_kind in {"route_repair", "report_repair"} and (
             acquired.new_chat or (acquired.created and role_record.get("last_endpoint_id"))
         ):
-            if hop.get("kind") == "route_repair":
+            if prompt_kind == "route_repair":
                 hop.pop("context_recovery_snapshot", None)
             else:
                 hop["context_recovery_snapshot"] = self._build_execution_recovery_snapshot(
@@ -6162,7 +6459,7 @@ class CDPAWorker:
                 # Legacy persisted fresh fallbacks may still contain executable context.
                 # Keep donor/endpoint audit evidence, never re-inject abandoned instructions.
                 recovery_metadata.pop("prewarm_context", None)
-        if hop.get("kind") == "route_repair":
+        if prompt_kind == "route_repair":
             bounded_context = ""  # Format repair never reintroduces the original goal or handoff.
             repair_prompt = self.prompts.repair(
                 task_id=str(state["task_id"]),
@@ -6176,7 +6473,7 @@ class CDPAWorker:
             )
             prompt = (bounded_context + "\n\n" if bounded_context else "") + repair_prompt
             included = False
-        elif hop.get("kind") == "report_repair":
+        elif prompt_kind == "report_repair":
             locked_route = str(hop.get("locked_route") or "").strip().upper()
             locked_handoff = str(hop.get("locked_handoff") or "").strip()
             if locked_handoff != expected:
@@ -6225,6 +6522,7 @@ class CDPAWorker:
                 is_system_role=bool(workflow_definition["is_system"]),
                 bootstrap_inherited=bootstrap_inherited,
                 bounded_context=bounded_context or None,
+                governing_contract=governing_contract,
             )
             prompt = built.text
             included = built.constructor_included
@@ -6969,9 +7267,16 @@ class CDPAWorker:
         try:
             canonical_id = str(UUID(conversation_id))
         except ValueError as exc:
-            raise GraphIdentityError("accepted conversation has no canonical UUID") from exc
-        if canonical_id != conversation_id or _recoverable_conversation_identity(snapshot.url) != f"/c/{conversation_id}":
-            raise GraphIdentityError("accepted conversation URL does not prove its canonical identity")
+            raise _AcceptedConversationIdentityConflict(
+                "accepted conversation identity conflicts with canonical page evidence"
+            ) from exc
+        if (
+            canonical_id != conversation_id
+            or _recoverable_conversation_identity(snapshot.url) != f"/c/{conversation_id}"
+        ):
+            raise _AcceptedConversationIdentityConflict(
+                "accepted conversation identity conflicts with canonical page evidence"
+            )
         ledger.enrich_receipt_conversation_id(
             request_id,
             accepted_receipt=receipt,
@@ -7311,6 +7616,9 @@ class CDPAWorker:
             handoff=reconciliation_handoff,
             kind="accepted_send_reconciliation",
         )
+        child["reconciliation_original_request_id"] = request_id
+        child["reconciliation_user_message_id"] = receipt.user_message_id
+        child["reconciliation_no_replay"] = True
         state.setdefault("route_timeline", []).append(
             {
                 "at": utc_now(),
@@ -8010,9 +8318,27 @@ class CDPAWorker:
         )
         if not missing_terminal_result_recovery:
             self._start_wait_budget_from_sent(hop)
-        self._reconcile_hop_conversation_identity(state, hop)
+        try:
+            self._reconcile_hop_conversation_identity(state, hop)
+        except RuntimeError as exc:
+            self._require_resume_recovery(
+                state,
+                control,
+                action="none",
+                reason_code="accepted_receipt_provenance_divergence",
+                reason=sanitize_exception(exc),
+                next_safe_action=(
+                    "Explicit Stop is the only legal in-task exit; preserve both "
+                    "divergent accepted receipt records for forensic review."
+                ),
+            )
+            return
         wait = hop["wait"]
-        if remaining_timeout_ms(wait) <= 0 and not missing_terminal_result_recovery:
+        if (
+            remaining_timeout_ms(wait) <= 0
+            and not missing_terminal_result_recovery
+            and wait.get("accepted_identity_started_at") is None
+        ):
             wait["deadline_at"] = (datetime.now(timezone.utc) + timedelta(
                 seconds=self.config.response_timeout_seconds)).isoformat()
             for key in ("timeout_refreshed", "timeout_status_checked", "timeout_status"):
@@ -8028,6 +8354,23 @@ class CDPAWorker:
             )
             return
         if acquired is None:
+            if (
+                str(state.get("status") or "").upper() == "RUNNING"
+                and state.get("active_action") == "wait_accepted_conversation_identity"
+            ):
+                self._finish_resume_control(
+                    state,
+                    control,
+                    outcome="continued",
+                    action="observe_accepted_identity_settle",
+                    reason_code=None,
+                    reason=(
+                        "The exact accepted page and user remain proven while canonical "
+                        "conversation identity settles within the persisted deadline."
+                    ),
+                    postcondition="accepted_identity_settle_preserved",
+                )
+                return
             self._require_resume_recovery(
                 state, control, action="reopen_saved_tab",
                 reason_code=str(state.get("block_code") or "role_offline"),
@@ -10062,6 +10405,34 @@ class CDPAWorker:
                     state = json.loads(
                         json.dumps(state, ensure_ascii=False, default=str)
                     )
+                current_hop = _active_hop(state) if state.get("active_hop_id") is not None else None
+                pending_forensic_control = _next_requested_control(state)
+                stop_forensic_control = (
+                    str(state.get("status") or "").upper() == "BLOCKED"
+                    and str(state.get("block_code") or "")
+                    == "accepted_admission_integrity_corruption"
+                    and isinstance(pending_forensic_control, Mapping)
+                    and str(pending_forensic_control.get("action") or "") == "stop"
+                )
+                if isinstance(current_hop, Mapping) and not stop_forensic_control:
+                    integrity_error = self._accepted_admission_integrity_error(
+                        state, current_hop
+                    )
+                    if integrity_error is not None:
+                        self._block(
+                            state,
+                            integrity_error,
+                            code="accepted_admission_integrity_corruption",
+                            retryable=False,
+                        )
+                        saved = self._persist_transport_result(
+                            path,
+                            transport_baseline,
+                            state,
+                        )
+                        state.clear()
+                        state.update(saved)
+                        return saved
                 if endpoint_id is not None and not self._prepare_execution_endpoint(state, endpoint_id):
                     if not self._prepare_cross_endpoint_recovery(
                         state,
@@ -11409,7 +11780,24 @@ class CDPAWorker:
                 if isinstance(item, Mapping)
                 and item.get("external_command_id") == command_id
             ]
-            if len(revisions) != 1 or revisions[0].get("goal") != payload.get("goal"):
+            try:
+                expected_semantic, expected_semantic_sha256 = normalize_governing_contract(
+                    payload.get("governing_objective"),
+                    payload.get("governing_directives")
+                    if "governing_directives" in payload
+                    else None,
+                )
+            except ValueError as exc:
+                raise RuntimeError(
+                    "change-goal command provenance does not match its payload"
+                ) from exc
+            if (
+                len(revisions) != 1
+                or revisions[0].get("goal") != payload.get("goal")
+                or revisions[0].get("governing_semantic_payload") != expected_semantic
+                or revisions[0].get("governing_semantic_sha256")
+                != expected_semantic_sha256
+            ):
                 raise RuntimeError("change-goal command provenance does not match its payload")
             return state
         if kind == "remove_parent_dependency":
@@ -11438,6 +11826,26 @@ class CDPAWorker:
                 != str(self._repository_allowed(payload.get("repository")))
             ):
                 raise RuntimeError("create command provenance does not match its payload")
+            if "governing_objective" in payload or "governing_directives" in payload:
+                try:
+                    expected_semantic, expected_semantic_sha256 = normalize_governing_contract(
+                        payload.get("governing_objective"),
+                        payload.get("governing_directives")
+                        if "governing_directives" in payload
+                        else None,
+                    )
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "create command governing provenance is invalid"
+                    ) from exc
+                if (
+                    state.get("governing_semantic_payload") != expected_semantic
+                    or state.get("governing_semantic_sha256")
+                    != expected_semantic_sha256
+                ):
+                    raise RuntimeError(
+                        "create command governing provenance does not match its payload"
+                    )
             if "roles" in payload:
                 expected_roles = {
                     str(role).strip().upper() for role in payload["roles"]
@@ -11789,6 +12197,9 @@ class CDPAWorker:
                         workflow_mode=str(payload.get("workflow_mode") or "team"),
                         goal=payload.get("goal"),
                         conversation_url=payload.get("conversation_url") or None,
+                        governing_objective=payload.get("governing_objective"),
+                        governing_directives=payload.get("governing_directives"),
+                        admission_provenance=payload.get("admission_provenance"),
                         external_command_id=command_id,
                     )
                 self._publish_command_state(state)
@@ -11797,6 +12208,7 @@ class CDPAWorker:
                 definition = self.store.create_workflow_agent(
                     display_name=payload.get("name"),
                     system_prompt=payload.get("system_prompt"),
+                    continuation_contract=payload.get("continuation_contract"),
                     external_command_id=command_id,
                 )
                 self._publish_agents()
@@ -11809,6 +12221,7 @@ class CDPAWorker:
                     str(payload.get("route_key") or ""),
                     display_name=payload.get("name"),
                     system_prompt=payload.get("system_prompt"),
+                    continuation_contract=payload.get("continuation_contract"),
                     external_command_id=command_id,
                 )
                 self._publish_agents()
@@ -12080,6 +12493,8 @@ class CDPAWorker:
                 state = self.store.change_goal(
                     current["manifest_path"],
                     str(payload.get("goal") or ""),
+                    governing_objective=payload.get("governing_objective"),
+                    governing_directives=payload.get("governing_directives"),
                     external_command_id=command_id,
                 )
                 self._publish_command_state(state)
@@ -12695,6 +13110,14 @@ class CDPAWorker:
                         continue
                     selected_endpoint = endpoint_id
                     selected_context = browser_context
+                    dependency_release_only = (
+                        endpoint_pool is not None
+                        and str(state.get("status") or "").upper() == "WAITING"
+                        and str((state.get("waiting") or {}).get("reason") or "")
+                        == "dependency"
+                        and bool(state.get("depends_on_task_ids"))
+                        and dependency_readiness(state, scheduling_tasks).ready
+                    )
                     if endpoint_pool is not None:
                         independent = state.get("independent") if isinstance(state.get("independent"), Mapping) else None
                         active_event = (
@@ -12809,7 +13232,13 @@ class CDPAWorker:
                             ):
                                 endpointless_control = (pending_control_id, pending_action)
                                 selected_endpoint = None
-                        if selected_endpoint is None and endpointless_control is None:
+                        if dependency_release_only:
+                            selected_endpoint = None
+                        if (
+                            selected_endpoint is None
+                            and endpointless_control is None
+                            and not dependency_release_only
+                        ):
                             if state.get("status") in {"INBOX", "RUNNING"}:
                                 state = self._set_pool_wait(state, waiting=True)
                                 affected.add(task_id)

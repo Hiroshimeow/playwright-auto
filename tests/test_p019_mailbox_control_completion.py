@@ -39,12 +39,16 @@ def _waiting_task(tmp_path: Path, *, task_id: str):
         "unfinished parent",
         requested_team=f"{task_id}-parent",
         task_id=f"{task_id}-parent",
+        governing_objective="unfinished parent",
+        governing_directives=[],
     )
     child = store.create_task(
         "dependency-held child",
         requested_team=f"{task_id}-child",
         task_id=task_id,
         depends_on_task_ids=(parent["task_id"],),
+        governing_objective="dependency-held child",
+        governing_directives=[],
     )
     worker = CDPAWorker(config, store=store)
     worker.hydrate_runtime()
@@ -58,6 +62,8 @@ def _standalone_task(tmp_path: Path, *, task_id: str):
         "standalone mailbox control fixture",
         requested_team=f"{task_id}-team",
         task_id=task_id,
+        governing_objective="standalone mailbox control fixture",
+        governing_directives=[],
     )
     worker = CDPAWorker(config, store=store)
     worker.hydrate_runtime()

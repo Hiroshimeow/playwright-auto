@@ -17,6 +17,7 @@ from urllib.request import Request, urlopen
 
 from .cdpa_config import CDPAConfig, load_cdpa_config
 from .cdpa_runtime_db import RuntimeDB
+from .cdpa_store import canonicalize_task_text, normalize_governing_contract
 
 
 _BOOTSTRAP_UNSET = object()
@@ -122,6 +123,10 @@ def submit_task(
     solo_role: str | None = None,
     goal: str | None = None,
     conversation_url: str | None = None,
+    conversation_mode: str | None = None,
+    context_policy: str | None = None,
+    governing_objective: str | None = None,
+    governing_directives: Sequence[str] | None = None,
 ) -> Mapping[str, Any]:
     mode = str(workflow_mode or "team").strip().lower()
     if mode == "solo":
@@ -129,14 +134,15 @@ def submit_task(
             raise ValueError("Solo Task requires --solo ROLE")
         if not browser_endpoint_id:
             raise ValueError("Solo Task requires --browser ENDPOINT")
+        goal_text = str(goal or "")
         payload = {
             "workflow_mode": "solo",
             "role": str(solo_role).strip().upper(),
-            "goal": str(goal or "").strip(),
+            "goal": canonicalize_task_text(goal_text) if goal_text else "",
             "browser_endpoint_id": browser_endpoint_id,
         }
         if str(task).strip():
-            payload["task"] = str(task).strip()
+            payload["task"] = canonicalize_task_text(task)
         if team:
             payload["requested_team"] = team
         if conversation_url:
@@ -151,9 +157,16 @@ def submit_task(
         )
     if mode != "team":
         raise ValueError("workflow_mode must be team or solo")
+    semantic_payload, _semantic_sha256 = normalize_governing_contract(
+        governing_objective,
+        governing_directives,
+    )
+    semantic = json.loads(semantic_payload)
     payload = {
-        "task": task,
+        "task": canonicalize_task_text(task),
         "requested_team": team,
+        "governing_objective": semantic["objective"],
+        "governing_directives": semantic["directives"],
         "new_roles": list(new_roles),
         "new_all": bool(new_all),
         "report_mode": "file",
@@ -162,8 +175,16 @@ def submit_task(
     }
     if repository is not None:
         payload["repository"] = str(repository.expanduser().resolve())
+    if temporary and conversation_mode is not None:
+        raise ValueError("temporary and conversation_mode are mutually exclusive")
     if temporary:
         payload["temporary"] = True
+    elif conversation_mode is not None:
+        if conversation_mode not in {"temporary", "persistent"}:
+            raise ValueError("conversation_mode must be temporary or persistent")
+        payload["conversation_mode"] = conversation_mode
+    if context_policy is not None:
+        payload["context_policy"] = context_policy
     if browser_endpoint_id is not None:
         payload["browser_endpoint_id"] = browser_endpoint_id
     if required_browser_endpoint_id is not None:
@@ -704,6 +725,47 @@ def supervisor_main(argv: Sequence[str] | None = None) -> int:
         time.sleep(max(1.0, min(config.heartbeat_seconds, 5.0)))
 
 
+def _read_admission_file(path: str | Path) -> dict[str, Any]:
+    try:
+        value = json.loads(Path(path).expanduser().read_bytes().decode("utf-8", errors="strict"))
+    except UnicodeDecodeError as exc:
+        raise ValueError("admission file must be strict UTF-8") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError("admission file must contain one JSON object") from exc
+    if not isinstance(value, Mapping):
+        raise ValueError("admission file must contain one JSON object")
+    allowed = {
+        "task",
+        "requested_team",
+        "new_roles",
+        "new_all",
+        "repository",
+        "depends_on_task_ids",
+        "upload_paths",
+        "temporary",
+        "browser_endpoint_id",
+        "required_browser_endpoint_id",
+        "conversation_mode",
+        "context_policy",
+        "governing_objective",
+        "governing_directives",
+    }
+    unknown = set(value) - allowed
+    if unknown:
+        raise ValueError(f"admission file contains unsupported fields: {sorted(unknown)!r}")
+    task = canonicalize_task_text(value.get("task"))
+    payload, _digest = normalize_governing_contract(
+        value.get("governing_objective"),
+        value.get("governing_directives") if "governing_directives" in value else None,
+    )
+    semantic = json.loads(payload)
+    result = dict(value)
+    result["task"] = task
+    result["governing_objective"] = semantic["objective"]
+    result["governing_directives"] = semantic["directives"]
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Create or resume a durable CDPA task on a shared browser endpoint pool",
@@ -718,6 +780,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("task", nargs="?", help="complete task text; omit to resume --team")
     parser.add_argument("--task", dest="task_option", help="complete task text (explicit form)")
+    parser.add_argument(
+        "--admission-file",
+        default=None,
+        help="strict UTF-8 JSON Team admission envelope for lossless multiline task/governing fields",
+    )
+    parser.add_argument(
+        "--governing-objective",
+        default=None,
+        help="authoritative cross-hop Team objective; use --admission-file for multiline values",
+    )
+    parser.add_argument(
+        "--governing-directive",
+        action="append",
+        default=None,
+        help="ordered authoritative cross-hop Team directive; repeat as needed",
+    )
     parser.add_argument("--new", dest="new_roles", help="comma-separated roles reset lazily once")
     parser.add_argument("--new-all", action="store_true", help="reset every selected role lazily once")
     parser.add_argument("--team", default=None, help="new-task team base or exact team to resume")
@@ -816,10 +894,47 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = load_cdpa_config(args.config, repository_root=control_repository)
         if args.task and args.task_option:
             raise ValueError("provide task text either positionally or with --task, not both")
-        task = str(args.task_option or args.task or "").strip()
-        new_roles = parse_new_roles(args.new_roles)
-        dependencies = parse_dependency_ids(args.depends_on)
-        existing_solo = bool(args.solo and args.conversation_url)
+        admission = _read_admission_file(args.admission_file) if args.admission_file else None
+        if admission is not None:
+            conflicting = (
+                args.task,
+                args.task_option,
+                args.new_roles,
+                args.new_all,
+                args.team,
+                args.solo,
+                args.goal,
+                args.conversation_url,
+                args.temp,
+                args.browser,
+                args.depends_on,
+                args.upload,
+                args.repository,
+                args.governing_objective,
+                args.governing_directive,
+            )
+            if any(conflicting):
+                raise ValueError(
+                    "--admission-file carries Team task/control fields and cannot be mixed with task creation arguments"
+                )
+            task = admission["task"]
+            new_roles = tuple(
+                str(item).strip().upper()
+                for item in admission.get("new_roles") or ()
+                if str(item).strip()
+            )
+            dependencies = tuple(str(item) for item in admission.get("depends_on_task_ids") or ())
+            repository = (
+                Path(admission["repository"]).expanduser().resolve()
+                if admission.get("repository") is not None
+                else None
+            )
+            existing_solo = False
+        else:
+            task = str(args.task_option or args.task or "")
+            new_roles = parse_new_roles(args.new_roles)
+            dependencies = parse_dependency_ids(args.depends_on)
+            existing_solo = bool(args.solo and args.conversation_url)
         if task or existing_solo:
             if args.solo and (
                 new_roles
@@ -841,19 +956,37 @@ def main(argv: Sequence[str] | None = None) -> int:
                 config,
                 task=task,
                 repository=repository,
-                team=args.team,
+                team=(admission.get("requested_team") if admission is not None else args.team),
                 new_roles=new_roles,
-                new_all=bool(args.new_all),
-                temporary=bool(args.temp),
-                browser_endpoint_id=args.browser,
+                new_all=bool(admission.get("new_all")) if admission is not None else bool(args.new_all),
+                temporary=bool(admission.get("temporary")) if admission is not None else bool(args.temp),
+                browser_endpoint_id=(admission.get("browser_endpoint_id") if admission is not None else args.browser),
+                required_browser_endpoint_id=(admission.get("required_browser_endpoint_id") if admission is not None else None),
                 depends_on_task_ids=dependencies,
                 upload_paths=tuple(
-                    str(Path(path).expanduser().resolve()) for path in args.upload
+                    str(Path(path).expanduser().resolve())
+                    for path in (
+                        admission.get("upload_paths") or ()
+                        if admission is not None
+                        else args.upload
+                    )
                 ),
                 workflow_mode="solo" if args.solo else "team",
                 solo_role=args.solo,
                 goal=args.goal,
                 conversation_url=args.conversation_url,
+                conversation_mode=(admission.get("conversation_mode") if admission is not None else None),
+                context_policy=(admission.get("context_policy") if admission is not None else None),
+                governing_objective=(
+                    admission.get("governing_objective")
+                    if admission is not None
+                    else args.governing_objective
+                ),
+                governing_directives=(
+                    admission.get("governing_directives")
+                    if admission is not None
+                    else args.governing_directive
+                ),
             )
             mode = "created"
         else:

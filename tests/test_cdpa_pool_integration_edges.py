@@ -87,7 +87,7 @@ def test_accepted_provisional_url_canonicalizes_only_on_same_owned_page(tmp_path
     actions.reopen.assert_not_awaited()
 
 
-def test_accepted_provisional_url_same_page_without_canonical_url_stays_blocked(tmp_path):
+def test_accepted_provisional_url_same_page_without_canonical_url_enters_read_only_settle(tmp_path):
     _store, state, worker, _path, hop, receipt, _sent = _prepare_sent_waiting_task(
         tmp_path, task_id="provisional-still-local"
     )
@@ -99,12 +99,32 @@ def test_accepted_provisional_url_same_page_without_canonical_url_stays_blocked(
                                url=provisional, messages=(user,))
     acquired = AcquiredRole(client=SimpleNamespace(assert_ownership=AsyncMock(return_value=snapshot)),
                             page_id=receipt.binding.page_id, url=provisional, created=False, new_chat=False)
-    actions = SimpleNamespace(locate_owned=AsyncMock(return_value=acquired), reopen=AsyncMock())
+    actions = SimpleNamespace(
+        locate_owned=AsyncMock(return_value=acquired),
+        reopen=AsyncMock(),
+        fresh_chat=AsyncMock(),
+    )
+    original_attempts = RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts
+    original_request_id = hop["request_id"]
+    original_deadline = hop["wait"]["deadline_at"]
+    original_hop_count = len(state["hops"])
 
     assert asyncio.run(worker._owned_or_block(state, "PLAN", actions)) is None
-    assert state["block_code"] == "accepted_conversation_identity_unresolved"
-    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).receipt["conversation_id"] is None
+
+    assert state["status"] == "RUNNING"
+    assert state["block_code"] is None
+    assert state["active_action"] == "wait_accepted_conversation_identity"
+    assert hop["request_id"] == original_request_id
+    assert hop["wait"]["deadline_at"] == original_deadline
+    assert hop["wait"]["accepted_identity_page_id"] == receipt.binding.page_id
+    assert "accepted_identity_started_at" in hop["wait"]
+    assert "accepted_identity_deadline_at" in hop["wait"]
+    assert len(state["hops"]) == original_hop_count
+    durable = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
+    assert durable.receipt["conversation_id"] is None
+    assert durable.attempts == original_attempts
     actions.reopen.assert_not_awaited()
+    actions.fresh_chat.assert_not_awaited()
 
 
 def test_accepted_provisional_url_other_page_cannot_enrich_or_rebind(tmp_path):
@@ -133,15 +153,64 @@ def test_accepted_provisional_url_lost_page_blocks_without_reopen_or_rebind(tmp_
     provisional = "https://chatgpt.com/c/local-chatgpt%3Atemporary"
     hop["conversation_url"] = provisional
     state["roles"]["PLAN"]["page_url"] = provisional
-    actions = SimpleNamespace(locate_owned=AsyncMock(return_value=None), reopen=AsyncMock())
+    actions = SimpleNamespace(
+        locate_owned=AsyncMock(return_value=None),
+        reopen=AsyncMock(),
+        fresh_chat=AsyncMock(),
+    )
+    original_hop_count = len(state["hops"])
+    original_attempts = RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts
 
     assert asyncio.run(worker._owned_or_block(state, "PLAN", actions)) is None
+
     assert state["status"] == "BLOCKED"
     assert state["block_code"] == "accepted_conversation_identity_unresolved"
-    assert "provisional" in state["block_reason"].lower()
+    assert state["block_retryable"] is False
     assert hop["receipt"] == receipt.to_dict()
-    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
+    assert len(state["hops"]) == original_hop_count
+    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == original_attempts
     actions.reopen.assert_not_awaited()
+    actions.fresh_chat.assert_not_awaited()
+
+
+def test_accepted_provisional_url_lost_user_provenance_blocks_without_replay(tmp_path):
+    _store, state, worker, _path, hop, receipt, _sent = _prepare_sent_waiting_task(
+        tmp_path, task_id="provisional-lost-user"
+    )
+    provisional = "https://chatgpt.com/c/local-chatgpt%3Atemporary"
+    hop["conversation_url"] = provisional
+    state["roles"]["PLAN"]["page_url"] = provisional
+    snapshot = SimpleNamespace(
+        page_id=receipt.binding.page_id,
+        session_id="local-chatgpt%3Atemporary",
+        url=provisional,
+        messages=(),
+    )
+    acquired = AcquiredRole(
+        client=SimpleNamespace(assert_ownership=AsyncMock(return_value=snapshot)),
+        page_id=receipt.binding.page_id,
+        url=provisional,
+        created=False,
+        new_chat=False,
+    )
+    actions = SimpleNamespace(
+        locate_owned=AsyncMock(return_value=acquired),
+        reopen=AsyncMock(),
+        fresh_chat=AsyncMock(),
+    )
+    original_hop_count = len(state["hops"])
+    original_attempts = RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts
+
+    assert asyncio.run(worker._owned_or_block(state, "PLAN", actions)) is None
+
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "accepted_conversation_identity_unresolved"
+    assert state["block_retryable"] is False
+    assert hop["receipt"] == receipt.to_dict()
+    assert len(state["hops"]) == original_hop_count
+    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == original_attempts
+    actions.reopen.assert_not_awaited()
+    actions.fresh_chat.assert_not_awaited()
 
 
 def test_temporary_receipt_identity_is_provenance_not_a_saved_reopen_url(tmp_path):

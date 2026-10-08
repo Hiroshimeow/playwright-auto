@@ -35,6 +35,32 @@ class PromptBuilder:
         except ValueError:
             return str(self.config.plans_root)
 
+    @staticmethod
+    def governing_block(
+        semantic_payload: str,
+        continuation_contract: str,
+        facts_payload: str,
+    ) -> str:
+        payloads = (
+            ("GOVERNING_SEMANTIC_SOURCE", str(semantic_payload), 4096),
+            ("ROLE_CONTINUATION_CONTRACT", str(continuation_contract), 2048),
+            ("GOVERNING_EXECUTION_FACTS_REF", str(facts_payload), 4096),
+        )
+        for _header, payload, limit in payloads:
+            if not payload.strip() or len(payload) > limit:
+                raise ValueError(
+                    "governing_contract_unavailable: governing payload is missing or exceeds its bound"
+                )
+        block = "\n".join(
+            f"{header} {len(payload):05d}\n{payload}"
+            for header, payload, _limit in payloads
+        )
+        if len(block) > 10343:
+            raise ValueError(
+                "governing_contract_unavailable: serialized governing block exceeds 10343 code points"
+            )
+        return block
+
     def naming_rule(self) -> str:
         return f"{self._plans_prefix()}/<team>/<physical-role>_turn<N>_<task-id>.md"
 
@@ -132,6 +158,7 @@ class PromptBuilder:
         is_system_role: bool = True,
         bootstrap_inherited: bool = False,
         bounded_context: str | None = None,
+        governing_contract: str | None = None,
     ) -> BuiltPrompt:
         role = validate_workflow_route_key(logical_role)
         allowed = tuple(str(item).strip().upper() for item in allowed_routes)
@@ -178,6 +205,8 @@ class PromptBuilder:
                 custom_constructor_included = True
             if normalized_constructor is None or skill_guidance not in normalized_constructor:
                 sections.append(skill_guidance)
+        if turn_number > 1 and governing_contract:
+            sections.append(str(governing_contract))
         if bounded_context:
             sections.append("RECOVERY_CONTEXT\n" + str(bounded_context).strip())
         sections.append(

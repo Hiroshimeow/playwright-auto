@@ -219,6 +219,8 @@ def test_projection_uses_requested_endpoint_until_role_is_actually_placed(tmp_pa
         requested_team="queued-alpha",
         task_id="task-queued-placement",
         browser_endpoint_id=requested["endpoint_id"],
+        governing_objective="queued placement",
+        governing_directives=[],
     )
 
     queued = build_task_projection(
@@ -244,7 +246,7 @@ def test_projection_uses_requested_endpoint_until_role_is_actually_placed(tmp_pa
 def test_projection_exposes_role_execution_endpoint_placement(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
-    state = store.create_task("placement", requested_team="alpha", task_id="task-placement")
+    state = store.create_task("placement", requested_team="alpha", task_id="task-placement", governing_objective="placement", governing_directives=[])
     state["roles"]["PLAN"]["browser_endpoint_id"] = "endpoint-a"
     state["roles"]["DEV"]["browser_endpoint_id"] = "endpoint-b"
     projection = build_task_projection(

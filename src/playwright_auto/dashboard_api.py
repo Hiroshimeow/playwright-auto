@@ -36,9 +36,11 @@ from .cdpa_independent import (
 )
 from .cdpa_routes import effective_report_mode
 from .cdpa_runtime_db import IdempotencyConflict, RuntimeDB, RuntimeDBError
+from .cdpa_store import canonicalize_task_text, normalize_governing_contract
 from .observability import mcp_allow_click_summary, read_recent_live_events
 from .live_stream import LiveEnvelope, LiveStreamHub
 from .cdpa_workflow_agents import (
+    normalize_continuation_contract,
     normalize_workflow_display_name,
     ordered_system_routes,
     validate_workflow_route_key,
@@ -346,6 +348,10 @@ class DashboardAPI:
             "role",
             "goal",
             "conversation_url",
+            "conversation_mode",
+            "context_policy",
+            "governing_objective",
+            "governing_directives",
         }
         unknown = set(raw) - allowed
         if unknown:
@@ -353,7 +359,13 @@ class DashboardAPI:
         workflow_mode = str(raw.get("workflow_mode") or "team").strip().lower()
         if workflow_mode not in {"team", "solo"}:
             raise APIError(400, "invalid_request", "workflow_mode must be team or solo")
-        task = str(raw.get("task") or "").strip()
+        raw_task = raw.get("task")
+        task = ""
+        if isinstance(raw_task, str) and raw_task.strip():
+            try:
+                task = canonicalize_task_text(raw_task)
+            except ValueError as exc:
+                raise APIError(400, "invalid_request", str(exc)) from exc
         if not task and workflow_mode == "solo":
             existing_url = str(raw.get("conversation_url") or "").strip()
             if existing_url:
@@ -399,7 +411,36 @@ class DashboardAPI:
                 raw.get("depends_on_task_ids"), "depends_on_task_ids"
             ),
             "upload_paths": self._list(raw.get("upload_paths"), "upload_paths"),
+            "admission_provenance": {
+                "requested_team_explicit": "requested_team" in raw,
+                "repository_explicit": "repository" in raw,
+                "browser_endpoint_explicit": "browser_endpoint_id" in raw,
+                "required_endpoint_explicit": "required_browser_endpoint_id" in raw,
+                "conversation_mode_explicit": (
+                    "temporary" in raw or "conversation_mode" in raw
+                ),
+                "context_policy_explicit": "context_policy" in raw,
+            },
         }
+        if workflow_mode == "team":
+            try:
+                semantic_payload, _semantic_sha256 = normalize_governing_contract(
+                    raw.get("governing_objective"),
+                    raw.get("governing_directives")
+                    if "governing_directives" in raw
+                    else None,
+                )
+            except ValueError as exc:
+                raise APIError(400, "governing_contract_required", str(exc)) from exc
+            semantic = json.loads(semantic_payload)
+            normalized["governing_objective"] = semantic["objective"]
+            normalized["governing_directives"] = semantic["directives"]
+        elif "governing_objective" in raw or "governing_directives" in raw:
+            raise APIError(
+                400,
+                "invalid_request",
+                "governing fields are valid only for Team Task",
+            )
         if workflow_mode == "solo":
             conflicting = {
                 "roles",
@@ -424,7 +465,11 @@ class DashboardAPI:
                 raise APIError(400, "invalid_request", f"unknown workflow role: {role!r}")
             normalized["workflow_mode"] = "solo"
             normalized["roles"] = [role]
-            normalized["goal"] = str(raw.get("goal") or "").strip()
+            goal_text = str(raw.get("goal") or "")
+            try:
+                normalized["goal"] = canonicalize_task_text(goal_text) if goal_text else ""
+            except ValueError as exc:
+                raise APIError(400, "invalid_request", str(exc)) from exc
         elif "role" in raw or "goal" in raw or "conversation_url" in raw:
             raise APIError(
                 400,
@@ -436,8 +481,24 @@ class DashboardAPI:
         if "temporary" in raw:
             if type(raw.get("temporary")) is not bool:
                 raise APIError(400, "invalid_request", "temporary must be a boolean")
-            if raw.get("temporary") is True:
-                normalized["conversation_mode"] = "temporary"
+            if "conversation_mode" in raw:
+                raise APIError(
+                    400,
+                    "invalid_request",
+                    "temporary and conversation_mode are mutually exclusive",
+                )
+            normalized["conversation_mode"] = (
+                "temporary" if raw["temporary"] else "persistent"
+            )
+        elif "conversation_mode" in raw:
+            mode = raw.get("conversation_mode")
+            if mode not in {"temporary", "persistent"}:
+                raise APIError(
+                    400,
+                    "invalid_request",
+                    "conversation_mode must be temporary or persistent",
+                )
+            normalized["conversation_mode"] = mode
         if "browser_endpoint_id" in raw:
             endpoint = raw.get("browser_endpoint_id")
             if not isinstance(endpoint, str) or not endpoint.strip():
@@ -498,6 +559,13 @@ class DashboardAPI:
                 "invalid_request",
                 "bootstrap context is temporarily disabled; new workflow tasks always use Fresh context",
             )
+        context_policy = raw.get("context_policy", "fresh")
+        if context_policy != "fresh":
+            raise APIError(
+                400,
+                "invalid_request",
+                "context_policy must be fresh while bootstrap context is disabled",
+            )
         normalized["bootstrap_id"] = None
         normalized["context_policy"] = "fresh"
         return normalized
@@ -505,18 +573,25 @@ class DashboardAPI:
     def normalize_workflow_agent_create(
         self, raw: Mapping[str, Any]
     ) -> dict[str, Any]:
-        if set(raw) - {"name", "system_prompt"}:
+        if set(raw) - {"name", "system_prompt", "continuation_contract"}:
             raise APIError(
                 400,
                 "invalid_request",
-                "workflow agent accepts only name and system_prompt",
+                "workflow agent accepts only name, system_prompt, and continuation_contract",
             )
         try:
             name = normalize_workflow_display_name(raw.get("name"))
             prompt = normalize_system_prompt(raw.get("system_prompt"))
+            continuation = normalize_continuation_contract(
+                raw.get("continuation_contract")
+            )
         except ValueError as exc:
             raise APIError(400, "invalid_request", str(exc)) from exc
-        return {"name": name, "system_prompt": prompt}
+        return {
+            "name": name,
+            "system_prompt": prompt,
+            "continuation_contract": continuation,
+        }
 
     def normalize_workflow_agent_update(
         self, route_key: str, raw: Mapping[str, Any]
@@ -891,11 +966,29 @@ class DashboardAPI:
 
     @staticmethod
     def normalize_goal_change(raw: Mapping[str, Any]) -> tuple[dict[str, Any], int | None]:
-        if set(raw) - {"goal", "expected_task_version"}:
-            raise APIError(400, "invalid_request", "goal change accepts only goal and expected_task_version")
-        goal = raw.get("goal")
-        if not isinstance(goal, str) or not goal.strip():
-            raise APIError(400, "invalid_request", "goal must not be blank")
+        allowed = {
+            "goal",
+            "governing_objective",
+            "governing_directives",
+            "expected_task_version",
+        }
+        if set(raw) - allowed:
+            raise APIError(
+                400,
+                "invalid_request",
+                "goal change accepts only goal, governing fields, and expected_task_version",
+            )
+        try:
+            goal = canonicalize_task_text(raw.get("goal"))
+            semantic_payload, _semantic_sha256 = normalize_governing_contract(
+                raw.get("governing_objective"),
+                raw.get("governing_directives")
+                if "governing_directives" in raw
+                else None,
+            )
+        except ValueError as exc:
+            raise APIError(400, "governing_contract_required", str(exc)) from exc
+        semantic = json.loads(semantic_payload)
         expected = raw.get("expected_task_version")
         if expected is not None:
             if isinstance(expected, bool):
@@ -906,7 +999,11 @@ class DashboardAPI:
                 raise APIError(400, "invalid_request", "expected_task_version must be an integer") from exc
             if expected < 0:
                 raise APIError(400, "invalid_request", "expected_task_version must be non-negative")
-        return {"goal": goal}, expected
+        return {
+            "goal": goal,
+            "governing_objective": semantic["objective"],
+            "governing_directives": semantic["directives"],
+        }, expected
 
     @staticmethod
     def normalize_parent_removal(raw: Mapping[str, Any]) -> int:

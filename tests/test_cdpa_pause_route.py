@@ -214,16 +214,17 @@ def test_operator_resume_from_role_pause_appends_one_fresh_same_role_hop(tmp_pat
     source_hop_id = source["hop_id"]
     source_request_id = source["request_id"]
     source_handoff = source["report_path"]
-    state["effective_goal"] = "Revised goal after external prerequisite"
-    state["goal_revisions"] = [
-        {
-            "revision": 1,
-            "changed_at": state["updated_at"],
-            "applies_from_hop_id": source_hop_id + 1,
-            "goal": state["effective_goal"],
-            "external_command_id": "pause-goal-revision",
-        }
-    ]
+    state["status"] = "RUNNING"
+    state["kanban_column"] = "PLAN"
+    store.save(path, state)
+    state = store.change_goal(
+        path,
+        "Revised goal after external prerequisite",
+        governing_objective="Revised goal after external prerequisite",
+        governing_directives=[],
+        external_command_id="pause-goal-revision",
+    )
+    state.update(status="PAUSED", kanban_column="PAUSED", active_action="paused")
     store.save(path, state)
     queued = store.request_resume(
         path,

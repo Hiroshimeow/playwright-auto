@@ -25,6 +25,8 @@ def _setup(tmp_path: Path):
     task = store.create_task(
         "release endpoint pin",
         requested_team="release-pin",
+        governing_objective="Release endpoint test objective.",
+        governing_directives=[],
         browser_endpoint_id=preferred["endpoint_id"],
         required_browser_endpoint_id=preferred["endpoint_id"],
     )

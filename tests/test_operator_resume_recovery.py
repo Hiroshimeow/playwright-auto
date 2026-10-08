@@ -118,7 +118,13 @@ def test_resume_pending_mcp_permission_hands_back_to_shared_controller(tmp_path:
             return snapshot
 
         def page_observation(self):
-            return {"permission_action": permission}
+            return {
+                "permission_action": permission,
+                "observer_instance_id": "resume-mcp-observer",
+                "observer_epoch": 1,
+                "signal_seq": 1,
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+            }
 
         async def auto_allow_mcp_permission(self, *, passive_action=None):
             calls.append(("allow", passive_action["target_message_id"]))
@@ -438,31 +444,54 @@ def test_resume_immutable_receipt_divergence_fails_before_backend_or_dom(
     state = store.save(path, state)
     hop = _active_hop(state)
 
+    calls = {"status": 0, "graph": 0, "dom": 0, "reopen": 0, "send": 0}
+
     class Actions:
         async def backend_stream_status(self, *_args, **_kwargs):
+            calls["status"] += 1
             raise AssertionError("receipt divergence must fail before backend reads")
 
         async def backend_conversation(self, *_args, **_kwargs):
+            calls["graph"] += 1
             raise AssertionError("receipt divergence must fail before backend reads")
 
         async def locate_owned(self, *_args, **_kwargs):
+            calls["dom"] += 1
             raise AssertionError("receipt divergence must fail before DOM")
 
         async def reopen(self, *_args, **_kwargs):
+            calls["reopen"] += 1
             raise AssertionError("receipt divergence must fail before reopen")
 
+    def forbidden_resume_send(*_args, **_kwargs):
+        calls["send"] += 1
+        raise AssertionError("receipt divergence must not enter a Send recovery path")
+
+    monkeypatch.setattr(worker, "_record_resume_send_acceptance", forbidden_resume_send)
+
+    original_request_id = hop["request_id"]
+    original_hop_receipt = json.loads(json.dumps(hop_receipt.to_dict()))
+    original_ledger_receipt = json.loads(json.dumps(ledger_receipt.to_dict()))
     _queue_blocked_resume(store, state)
     monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
 
     recovered = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
 
     control = recovered["controls"][-1]
+    recovered_hop = next(
+        item for item in recovered["hops"] if item["request_id"] == original_request_id
+    )
     record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
-    assert control["status"] == "failed"
-    assert control["result"]["reason_code"] == "resume_recovery_failed"
-    assert "conversation identity" in control["result"]["reason"]
+    assert calls == {"status": 0, "graph": 0, "dom": 0, "reopen": 0, "send": 0}
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "accepted_receipt_provenance_divergence"
     assert recovered["status"] == "BLOCKED"
+    assert recovered["block_code"] == "accepted_receipt_provenance_divergence"
+    assert recovered["block_retryable"] is False
+    assert recovered_hop["request_id"] == original_request_id
+    assert recovered_hop["receipt"] == original_hop_receipt
     assert record is not None
+    assert record.receipt == original_ledger_receipt
     assert record.attempts == 1
 
 
@@ -505,10 +534,12 @@ def test_resume_different_accepted_binding_fails_before_backend_or_rebind(
 
     control = recovered["controls"][-1]
     record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
-    assert control["status"] == "failed"
-    assert control["result"]["reason_code"] == "resume_recovery_failed"
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "accepted_receipt_provenance_divergence"
     assert "immutable receipt diverged" in control["result"]["reason"]
     assert recovered["status"] == "BLOCKED"
+    assert recovered["block_code"] == "accepted_receipt_provenance_divergence"
+    assert recovered["block_retryable"] is False
     assert record is not None
     assert record.attempts == 1
 
@@ -671,6 +702,8 @@ def test_workflow_create_rejects_split_browser_endpoints(tmp_path: Path):
             temporary=True,
             browser_endpoint_id=source_endpoint,
             required_browser_endpoint_id=target_endpoint,
+            governing_objective="Reject split workflow endpoint",
+            governing_directives=[],
         )
 
 
@@ -3946,6 +3979,171 @@ def _accepted_identity_graph(user_message_id: str, prompt: str):
     }
 
 
+def test_resume_during_accepted_identity_settle_reuses_persisted_deadlines_without_replay(
+    tmp_path: Path,
+):
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-resume-identity-settle"
+    )
+    provisional = "https://chatgpt.com/c/local-chatgpt:resume-identity-settle"
+    hop["conversation_url"] = provisional
+    state["roles"]["PLAN"]["page_url"] = provisional
+    snapshot = _accepted_snapshot(receipt)
+    snapshot.session_id = "local-chatgpt:resume-identity-settle"
+    snapshot.url = provisional
+    snapshot.conversation_url = provisional
+
+    class Client:
+        async def assert_ownership(self):
+            return snapshot
+
+    class Actions:
+        def __init__(self):
+            self.locate_calls = 0
+            self.reopen_calls = 0
+
+        async def locate_owned(self, *_args, **_kwargs):
+            self.locate_calls += 1
+            return AcquiredRole(
+                Client(),
+                receipt.binding.page_id,
+                snapshot.url,
+                False,
+                False,
+            )
+
+        async def reopen(self, *_args, **_kwargs):
+            self.reopen_calls += 1
+            raise AssertionError("Resume during identity settle must not reopen or replay")
+
+    actions = Actions()
+    assert asyncio.run(worker._owned_or_block(state, "PLAN", actions)) is None
+    assert state["status"] == "RUNNING"
+    assert state["active_action"] == "wait_accepted_conversation_identity"
+    started_at = hop["wait"]["accepted_identity_started_at"]
+    settle_deadline = hop["wait"]["accepted_identity_deadline_at"]
+    response_deadline = hop["wait"]["deadline_at"]
+    original_attempts = RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts
+    original_hop_count = len(state["hops"])
+    state = store.save(path, state)
+
+    queued = store.request_resume(
+        path,
+        reason="operator verifies active identity settle",
+        external_command_id="resume-identity-settle",
+    )
+    assert asyncio.run(worker._apply_control(queued, actions, path)) is True
+    control = queued["controls"][-1]
+    assert control["status"] == "recovering"
+
+    asyncio.run(worker._recover_resume_control(queued, control, actions))
+
+    resumed_hop = _active_hop(queued)
+    resumed_wait = resumed_hop["wait"]
+    assert queued["status"] == "RUNNING"
+    assert queued["active_action"] == "wait_accepted_conversation_identity"
+    assert control["status"] == "applied"
+    assert control["result"]["postcondition"] == "accepted_identity_settle_preserved"
+    assert resumed_wait["accepted_identity_started_at"] == started_at
+    assert resumed_wait["accepted_identity_deadline_at"] == settle_deadline
+    assert resumed_wait["deadline_at"] == response_deadline
+    assert len(queued["hops"]) == original_hop_count
+    assert RequestLedger(resumed_hop["ledger_path"]).get(resumed_hop["request_id"]).attempts == original_attempts
+    assert actions.reopen_calls == 0
+
+    canonical_id = "11111111-1111-4111-8111-111111111111"
+    snapshot.session_id = canonical_id
+    snapshot.url = f"https://chatgpt.com/c/{canonical_id}"
+    snapshot.conversation_url = snapshot.url
+
+    assert asyncio.run(worker._owned_or_block(queued, "PLAN", actions)) is not None
+    final_wait = _active_hop(queued)["wait"]
+    assert final_wait["accepted_identity_started_at"] == started_at
+    assert final_wait["accepted_identity_deadline_at"] == settle_deadline
+    assert final_wait["deadline_at"] == response_deadline
+    assert final_wait["accepted_identity_outcome"] == "canonicalized"
+    assert RequestLedger(resumed_hop["ledger_path"]).get(resumed_hop["request_id"]).attempts == original_attempts
+    assert actions.reopen_calls == 0
+
+
+def test_resume_after_accepted_identity_settle_expiry_preserves_all_deadlines_and_blocks(
+    tmp_path: Path,
+    monkeypatch,
+):
+    store, state, worker, path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-resume-identity-settle-expired"
+    )
+    provisional = "https://chatgpt.com/c/local-chatgpt:resume-identity-expired"
+    hop["conversation_url"] = provisional
+    state["roles"]["PLAN"]["page_url"] = provisional
+    snapshot = _accepted_snapshot(receipt)
+    snapshot.session_id = "local-chatgpt:resume-identity-expired"
+    snapshot.url = provisional
+    snapshot.conversation_url = provisional
+
+    class Client:
+        async def assert_ownership(self):
+            return snapshot
+
+    class Actions:
+        def __init__(self):
+            self.reopen_calls = 0
+
+        async def locate_owned(self, *_args, **_kwargs):
+            return AcquiredRole(
+                Client(),
+                receipt.binding.page_id,
+                snapshot.url,
+                False,
+                False,
+            )
+
+        async def reopen(self, *_args, **_kwargs):
+            self.reopen_calls += 1
+            raise AssertionError("expired identity settle Resume must not reopen or replay")
+
+    actions = Actions()
+    assert asyncio.run(worker._owned_or_block(state, "PLAN", actions)) is None
+    started_at = hop["wait"]["accepted_identity_started_at"]
+    original_settle_deadline = hop["wait"]["accepted_identity_deadline_at"]
+    original_response_deadline = hop["wait"]["deadline_at"]
+    original_attempts = RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts
+    original_hop_count = len(state["hops"])
+
+    expired = datetime.now(timezone.utc) - timedelta(seconds=1)
+    hop["wait"]["accepted_identity_deadline_at"] = expired.isoformat()
+    hop["wait"]["deadline_at"] = expired.isoformat()
+    expired_settle_deadline = hop["wait"]["accepted_identity_deadline_at"]
+    expired_response_deadline = hop["wait"]["deadline_at"]
+    store.save(path, state)
+
+    queued = store.request_resume(
+        path,
+        reason="operator verifies expired identity settle",
+        external_command_id="resume-identity-settle-expired",
+    )
+    assert asyncio.run(worker._apply_control(queued, actions, path)) is True
+    control = queued["controls"][-1]
+    assert control["status"] == "recovering"
+
+    asyncio.run(worker._recover_resume_control(queued, control, actions))
+
+    resumed_hop = _active_hop(queued)
+    resumed_wait = resumed_hop["wait"]
+    assert queued["status"] == "BLOCKED"
+    assert queued["block_code"] == "accepted_conversation_identity_unresolved"
+    assert queued["block_retryable"] is False
+    assert resumed_wait["accepted_identity_started_at"] == started_at
+    assert resumed_wait["accepted_identity_deadline_at"] == expired_settle_deadline
+    assert resumed_wait["deadline_at"] == expired_response_deadline
+    assert original_settle_deadline != expired_settle_deadline
+    assert original_response_deadline != expired_response_deadline
+    assert resumed_wait["accepted_identity_outcome"] == "blocked_unresolved"
+    assert len(queued["hops"]) == original_hop_count
+    assert RequestLedger(resumed_hop["ledger_path"]).get(resumed_hop["request_id"]).attempts == original_attempts
+    assert actions.reopen_calls == 0
+
+
 def test_resume_accepted_root_canonicalizes_from_exact_owned_local_page_without_backend_search(
     tmp_path: Path,
 ):
@@ -4223,6 +4421,12 @@ def test_recovering_resume_control_survives_worker_restart_and_observes_active_p
     )
     path = Path(state["manifest_path"])
     endpoint_id = state["browser_endpoint_id"]
+
+    def persist_initial_placement(current):
+        assert worker._prepare_execution_endpoint(current, endpoint_id) is True
+        return current
+
+    state = store.update_initial_placement(path, persist_initial_placement)
     role = state["roles"]["PLAN"]
     role.update(
         browser_endpoint_id=endpoint_id,

@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 
 import pytest
 
@@ -211,6 +212,36 @@ def test_manual_composer_input_never_triggers_recovery_reload(monkeypatch):
     )
     assert result.text == "final response"
     assert page.reload_calls == 0
+
+
+@pytest.mark.parametrize("progressing,expected_reloads", [(True, 0), (False, 1)])
+def test_active_reload_clock_tracks_bound_assistant_progress(monkeypatch, progressing, expected_reloads):
+    clock = [0.0]
+    page = SequencePage([conversation("draft", stop=True)])
+    client = bind(page)
+    texts = iter(["draft", "draft", "draft growing"] if progressing else ["draft"])
+
+    async def read(_receipt, **_kwargs):
+        text = next(texts, "draft growing" if progressing else "draft")
+        return conversation(text, stop=True)
+
+    async def sleep(_seconds):
+        clock[0] += 60
+
+    async def refresh(_page, **_kwargs):
+        page.reload_calls += 1
+
+    client.wait_snapshot = read
+    monkeypatch.setattr(chatgpt.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(chatgpt.asyncio, "sleep", sleep)
+    monkeypatch.setattr(chatgpt, "refresh_page", refresh)
+    with pytest.raises(TimeoutError, match="remained active"):
+        asyncio.run(client.wait_for_response(
+            replace(receipt(), user_message_id="u2", user_turn_id="t2"),
+            timeout_ms=181_000, stable_ms=0, poll_ms=1,
+            active_reload_after_ms=120_000, reload_wait_ms=0,
+        ))
+    assert page.reload_calls == expected_reloads
 
 
 def test_choice_prompt_fails_closed_without_explicit_resolution(monkeypatch):

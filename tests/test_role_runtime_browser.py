@@ -130,6 +130,164 @@ def test_modern_semantic_bound_dom_terminalizes_despite_stale_listen_streaming()
     asyncio.run(_with_page(modern_semantic_dom(), run))
 
 
+def test_listen_freshness_watermark_advances_once_and_stale_age_is_ignored():
+    now = datetime.now(timezone.utc)
+
+    class Client:
+        evidence = {
+            "status": "IS_STREAMING",
+            "conversation_id": "test",
+            "observer_instance_id": "observer-a",
+            "observer_epoch": 2,
+            "signal_seq": 7,
+            "observed_at": now.isoformat(),
+        }
+
+        async def install_page_observer(self):
+            return None
+
+        def page_observation(self):
+            return dict(self.evidence)
+
+    client = Client()
+    state, hop, worker, acquired = environment(client)
+    controller = RoleController()
+    current = snapshot(url="https://chatgpt.com/c/test")
+
+    asyncio.run(controller.run(worker, state, hop, acquired, None, snapshot=current, wait_ms=0))
+    assert hop["wait"]["listen_watermark"]["signal_seq"] == 7
+    first = dict(hop["wait"]["listen_watermark"])
+
+    asyncio.run(controller.run(worker, state, hop, acquired, None, snapshot=current, wait_ms=0))
+    assert hop["wait"]["listen_watermark"] == first
+
+    client.evidence["signal_seq"] = 8
+    client.evidence["observed_at"] = datetime.now(timezone.utc).isoformat()
+    asyncio.run(controller.run(worker, state, hop, acquired, None, snapshot=current, wait_ms=0))
+    assert hop["wait"]["listen_watermark"]["signal_seq"] == 8
+
+    client.evidence.update(
+        signal_seq=9,
+        observed_at=(datetime.now(timezone.utc) - timedelta(seconds=6)).isoformat(),
+    )
+    asyncio.run(controller.run(worker, state, hop, acquired, None, snapshot=current, wait_ms=0))
+    assert hop["wait"]["listen_watermark"]["signal_seq"] == 8
+
+
+def test_listen_watermark_strictly_consumes_sequence_epoch_and_instance():
+    base = datetime.now(timezone.utc)
+
+    class Client:
+        evidence = {
+            "status": "IS_STREAMING",
+            "response": {
+                "role": "assistant",
+                "message_id": "listen-1",
+                "turn_id": "listen-turn-1",
+                "text": "network candidate",
+                "image_count": 0,
+            },
+            "conversation_id": "test",
+            "observer_instance_id": "observer-a",
+            "observer_epoch": 2,
+            "signal_seq": 7,
+            "observed_at": base.isoformat(),
+        }
+
+        async def install_page_observer(self):
+            return None
+
+        def page_observation(self):
+            return dict(self.evidence)
+
+    client = Client()
+    state, hop, worker, acquired = environment(client)
+    controller = RoleController()
+    current = snapshot(url="https://chatgpt.com/c/test")
+    seen = []
+
+    def record_decision(_snapshot, _wait, **kwargs):
+        signals = kwargs["signals"]
+        seen.append(
+            (
+                signals.network_status,
+                signals.network_response,
+                signals.observer_instance_id,
+                signals.observer_epoch,
+                signals.signal_seq,
+            )
+        )
+        return Decision(Action.WAIT, "captured")
+
+    controller.decide = record_decision
+
+    async def consume():
+        return await controller.run(
+            worker, state, hop, acquired, None, snapshot=current, wait_ms=0
+        )
+
+    asyncio.run(consume())
+    assert seen[-1][0] == "IS_STREAMING"
+    assert seen[-1][1]["message_id"] == "listen-1"
+    assert hop["wait"]["listen_watermark"]["observer_instance_id"] == "observer-a"
+    assert hop["wait"]["listen_watermark"]["observer_epoch"] == 2
+    assert hop["wait"]["listen_watermark"]["signal_seq"] == 7
+    first = dict(hop["wait"]["listen_watermark"])
+
+    asyncio.run(consume())
+    assert seen[-1][:2] == (None, None)
+    assert hop["wait"]["listen_watermark"] == first
+
+    client.evidence.update(
+        signal_seq=6,
+        observed_at=(base + timedelta(milliseconds=10)).isoformat(),
+    )
+    asyncio.run(consume())
+    assert seen[-1][:2] == (None, None)
+    assert hop["wait"]["listen_watermark"] == first
+
+    client.evidence.update(
+        observer_epoch=1,
+        signal_seq=99,
+        observed_at=(base + timedelta(milliseconds=20)).isoformat(),
+    )
+    asyncio.run(consume())
+    assert seen[-1][:2] == (None, None)
+    assert hop["wait"]["listen_watermark"] == first
+
+    client.evidence.update(
+        observer_epoch=3,
+        signal_seq=1,
+        observed_at=(base + timedelta(milliseconds=30)).isoformat(),
+    )
+    asyncio.run(consume())
+    assert seen[-1][0] == "IS_STREAMING"
+    assert hop["wait"]["listen_watermark"]["observer_epoch"] == 3
+    assert hop["wait"]["listen_watermark"]["signal_seq"] == 1
+    higher_epoch = dict(hop["wait"]["listen_watermark"])
+
+    client.evidence.update(
+        observer_instance_id="observer-b",
+        observer_epoch=1,
+        signal_seq=1,
+        observed_at=(base + timedelta(milliseconds=40)).isoformat(),
+    )
+    asyncio.run(consume())
+    assert seen[-1][0] == "IS_STREAMING"
+    assert hop["wait"]["listen_watermark"]["observer_instance_id"] == "observer-b"
+    new_instance = dict(hop["wait"]["listen_watermark"])
+
+    client.evidence.update(
+        observer_instance_id="observer-a",
+        observer_epoch=99,
+        signal_seq=999,
+        observed_at=(base + timedelta(milliseconds=50)).isoformat(),
+    )
+    asyncio.run(consume())
+    assert seen[-1][:2] == (None, None)
+    assert hop["wait"]["listen_watermark"] == new_instance
+
+
 def test_listen_telemetry_emits_once_per_semantic_signal(monkeypatch):
     import playwright_auto.role_runtime.signals as signal_module
 
@@ -144,6 +302,10 @@ def test_listen_telemetry_emits_once_per_semantic_signal(monkeypatch):
         evidence = {
             "status": "IS_STREAMING",
             "response": {"role": "assistant", "message_id": "net-1", "turn_id": "turn-1", "text": "working", "image_count": 0},
+            "observer_instance_id": "telemetry-observer",
+            "observer_epoch": 1,
+            "signal_seq": 1,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
         }
 
         async def install_page_observer(self):
@@ -161,7 +323,11 @@ def test_listen_telemetry_emits_once_per_semantic_signal(monkeypatch):
     asyncio.run(controller.run(worker, state, hop, acquired, None, snapshot=current, wait_ms=0))
     assert [event[:2] for event in events].count(("LISTEN", "network_signal")) == 1
 
-    client.evidence["status"] = "COMPLETE"
+    client.evidence.update(
+        status="COMPLETE",
+        signal_seq=2,
+        observed_at=datetime.now(timezone.utc).isoformat(),
+    )
     asyncio.run(controller.run(worker, state, hop, acquired, None, snapshot=current, wait_ms=0))
     listen = [event for event in events if event[:2] == ("LISTEN", "network_signal")]
     assert len(listen) == 2

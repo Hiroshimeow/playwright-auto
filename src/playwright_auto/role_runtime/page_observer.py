@@ -11,7 +11,9 @@ import json
 import time
 import weakref
 from collections import Counter
+from datetime import datetime, timezone
 from typing import Any, Mapping
+from uuid import uuid4
 from urllib.parse import urlparse
 
 from .listen import ConversationDecoder, conversation_id, extract, source_kind
@@ -71,7 +73,10 @@ class PageObserver:
         self.installed = False
         self.attached = False
         self.closed = False
+        self.observer_instance_id = str(uuid4())
         self.epoch = 0
+        self.signal_seq = 0
+        self.observed_at: str | None = None
         self.current_conversation = conversation_id(page.url)
         self.permission: dict[str, Any] | None = None
         self.response: dict[str, Any] | None = None
@@ -207,6 +212,8 @@ class PageObserver:
             # conversation, not a reason to detach or wait for an old user ID.
             self.response = None
             self.status = "IS_STREAMING"
+            self.signal_seq += 1
+            self.observed_at = datetime.now(timezone.utc).isoformat()
             self.network_wake.set()
 
     def _on_finished(self, request) -> None:
@@ -367,6 +374,8 @@ class PageObserver:
                 self.metrics["permissions"] += 1
         self.metrics["observations"] += 1
         self.metrics[source] += 1
+        self.signal_seq += 1
+        self.observed_at = datetime.now(timezone.utc).isoformat()
         self.network_wake.set()
 
     def observation(self) -> dict[str, Any]:
@@ -374,6 +383,10 @@ class PageObserver:
             "permission_action": dict(self.permission) if self.permission else None,
             "response": dict(self.response) if self.response else None,
             "status": self.status, "conversation_id": self.current_conversation,
+            "observer_instance_id": self.observer_instance_id,
+            "observer_epoch": self.epoch,
+            "signal_seq": self.signal_seq,
+            "observed_at": self.observed_at,
             "messages": list(self.messages), "diagnostics": dict(self.metrics),
             "listener_attached": self.attached, "streaming_supported": self.streaming_supported,
         }

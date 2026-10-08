@@ -59,6 +59,11 @@ class RoleSignals:
     network_status: str | None = None
     network_response: Mapping[str, Any] | None = None
     diagnostics: Mapping[str, Any] | None = None
+    conversation_id: str | None = None
+    observer_instance_id: str | None = None
+    observer_epoch: int | None = None
+    signal_seq: int | None = None
+    observed_at: str | None = None
     listener_attached: bool = False
     streaming_supported: bool = False
 
@@ -76,6 +81,27 @@ class RoleSignals:
             network_status=(str(raw.get("status")) if raw.get("status") else None),
             network_response=(dict(response) if isinstance(response, Mapping) else None),
             diagnostics=(dict(diagnostics) if isinstance(diagnostics, Mapping) else {}),
+            conversation_id=(
+                str(raw.get("conversation_id")) if raw.get("conversation_id") else None
+            ),
+            observer_instance_id=(
+                str(raw.get("observer_instance_id"))
+                if raw.get("observer_instance_id")
+                else None
+            ),
+            observer_epoch=(
+                int(raw["observer_epoch"])
+                if isinstance(raw.get("observer_epoch"), int)
+                and not isinstance(raw.get("observer_epoch"), bool)
+                else None
+            ),
+            signal_seq=(
+                int(raw["signal_seq"])
+                if isinstance(raw.get("signal_seq"), int)
+                and not isinstance(raw.get("signal_seq"), bool)
+                else None
+            ),
+            observed_at=(str(raw.get("observed_at")) if raw.get("observed_at") else None),
             listener_attached=bool(raw.get("listener_attached")),
             streaming_supported=bool(raw.get("streaming_supported")),
         )

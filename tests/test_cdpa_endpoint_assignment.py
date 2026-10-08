@@ -16,11 +16,20 @@ def stores(tmp_path):
     return TaskStore(config), BrowserEndpointRegistry(config)
 
 
+def create_team_task(store, task, **kwargs):
+    return store.create_task(
+        task,
+        governing_objective="Endpoint assignment test objective.",
+        governing_directives=[],
+        **kwargs,
+    )
+
+
 def test_task_snapshots_initial_endpoint_affinity_but_role_placement_can_move(tmp_path):
     store, endpoints = stores(tmp_path)
     original = endpoints.resolve()
     second = endpoints.add("9202")
-    task = store.create_task("First task", task_id="first", requested_team="alpha")
+    task = create_team_task(store, "First task", task_id="first", requested_team="alpha")
     endpoints.update(second["endpoint_id"], is_default=True)
 
     assert store.load(task["manifest_path"])["browser_endpoint_id"] == original["endpoint_id"]
@@ -30,31 +39,31 @@ def test_task_snapshots_initial_endpoint_affinity_but_role_placement_can_move(tm
     )
     assert moved["roles"]["PLAN"]["browser_endpoint_id"] == second["endpoint_id"]
     assert moved["browser_endpoint_id"] == original["endpoint_id"]
-    later = store.create_task("Second task", task_id="second")
+    later = create_team_task(store, "Second task", task_id="second")
     assert later["browser_endpoint_id"] == second["endpoint_id"]
 
 
 def test_explicit_browser_selection_accepts_registry_shorthand(tmp_path):
     store, endpoints = stores(tmp_path)
     second = endpoints.add("9202")
-    task = store.create_task("Chosen browser", browser_endpoint_id="localhost:9202")
+    task = create_team_task(store, "Chosen browser", browser_endpoint_id="localhost:9202")
     assert task["browser_endpoint_id"] == second["endpoint_id"]
     with pytest.raises(ValueError, match="not registered"):
-        store.create_task("Unknown browser", browser_endpoint_id="9302")
+        create_team_task(store, "Unknown browser", browser_endpoint_id="9302")
 
 
 def test_workflow_required_browser_is_canonical_hard_affinity_and_immutable(tmp_path):
     store, endpoints = stores(tmp_path)
     required = endpoints.add("9202")
     other = endpoints.add("9212")
-    task = store.create_task(
+    task = create_team_task(store,
         "Gmail child",
         required_browser_endpoint_id="localhost:9202",
     )
 
     assert task["required_browser_endpoint_id"] == required["endpoint_id"]
     with pytest.raises(ValueError, match="not registered"):
-        store.create_task(
+        create_team_task(store,
             "Unknown Gmail browser",
             required_browser_endpoint_id="9302",
         )
@@ -69,9 +78,9 @@ def test_workflow_required_browser_is_canonical_hard_affinity_and_immutable(tmp_
 
 def test_exact_team_new_work_can_choose_a_different_endpoint(tmp_path):
     store, endpoints = stores(tmp_path)
-    first = store.create_task("First task", task_id="first", requested_team="alpha")
+    first = create_team_task(store, "First task", task_id="first", requested_team="alpha")
     second = endpoints.add("9202", is_default=True)
-    queued = store.create_task(
+    queued = create_team_task(store,
         "Next task",
         task_id="next",
         reuse_team=first["team"],
@@ -84,21 +93,21 @@ def test_exact_team_new_work_can_choose_a_different_endpoint(tmp_path):
 def test_temporary_is_creation_snapshot_and_temp_only_forces_true(tmp_path):
     store, endpoints = stores(tmp_path)
     endpoint = endpoints.resolve()
-    regular = store.create_task("Persistent task")
-    forced = store.create_task("Forced temporary", temporary=True)
+    regular = create_team_task(store, "Persistent task")
+    forced = create_team_task(store, "Forced temporary", temporary=True)
     endpoints.update(endpoint["endpoint_id"], temporary_default=True)
-    inherited = store.create_task("Inherited temporary")
+    inherited = create_team_task(store, "Inherited temporary")
     assert regular["conversation_mode"] == "persistent"
     assert forced["conversation_mode"] == inherited["conversation_mode"] == "temporary"
     endpoints.update(endpoint["endpoint_id"], temporary_default=False)
     assert store.load(inherited["manifest_path"])["conversation_mode"] == "temporary"
     with pytest.raises(ValueError, match="boolean"):
-        store.create_task("Invalid temp", temporary="false")
+        create_team_task(store, "Invalid temp", temporary="false")
 
 
 def test_initial_endpoint_and_mode_are_durable_policy_not_role_placement(tmp_path):
     store, endpoints = stores(tmp_path)
-    task = store.create_task("Durable policy")
+    task = create_team_task(store, "Durable policy")
     second = endpoints.add("9202")
     with pytest.raises(ValueError, match="immutable"):
         store.update(
@@ -119,7 +128,7 @@ def test_initial_endpoint_and_mode_are_durable_policy_not_role_placement(tmp_pat
 
 def test_legacy_manifest_stays_on_original_endpoint_without_read_rewrite(tmp_path):
     store, endpoints = stores(tmp_path)
-    task = store.create_task("Legacy task")
+    task = create_team_task(store, "Legacy task")
     task.pop("browser_endpoint_id", None)
     task.pop("conversation_mode", None)
     for role in task["roles"].values():
@@ -136,7 +145,7 @@ def test_legacy_manifest_stays_on_original_endpoint_without_read_rewrite(tmp_pat
 
 def test_role_endpoint_requires_a_durable_identifier_but_not_task_equality(tmp_path):
     store, endpoints = stores(tmp_path)
-    task = store.create_task("Role placement")
+    task = create_team_task(store, "Role placement")
     other = endpoints.add("9202")
     moved = store.update(
         task["manifest_path"],
@@ -152,20 +161,20 @@ def test_role_endpoint_requires_a_durable_identifier_but_not_task_equality(tmp_p
 
 def test_terminal_team_reuse_metadata_is_not_endpoint_scoped(tmp_path):
     store, endpoints = stores(tmp_path)
-    first = store.create_task("First task", requested_team="alpha")
+    first = create_team_task(store, "First task", requested_team="alpha")
     store.update(
         first["manifest_path"],
         lambda state: state.update(status="DONE", active_role=None, active_hop_id=None),
     )
     second = endpoints.add("9202", is_default=True)
-    later = store.create_task("Later task", requested_team="alpha")
+    later = create_team_task(store, "Later task", requested_team="alpha")
     assert later["browser_endpoint_id"] == second["endpoint_id"]
     assert first["team"] in later["reusable_teams"]
 
 
 def test_replacement_keeps_conversation_mode_without_endpoint_ownership_semantics(tmp_path):
     store, endpoints = stores(tmp_path)
-    original = store.create_task("Continue existing workspace", temporary=True, requested_team="alpha")
+    original = create_team_task(store, "Continue existing workspace", temporary=True, requested_team="alpha")
     _stop_task(store, original)
     endpoints.add("9202", is_default=True)
     replacement = store.replace_task_and_rewire(
@@ -345,9 +354,9 @@ def test_independent_generation_uses_current_endpoint_capacity_and_keeps_mode_po
 
 def test_draining_historical_endpoint_does_not_strand_exact_team(tmp_path):
     store, endpoints = stores(tmp_path)
-    task = store.create_task("Draining team", requested_team="alpha")
+    task = create_team_task(store, "Draining team", requested_team="alpha")
     second = endpoints.add("9202", is_default=True)
     endpoints.remove(task["browser_endpoint_id"], has_nonterminal_tasks=True)
-    queued = store.create_task("More work", reuse_team=task["team"])
+    queued = create_team_task(store, "More work", reuse_team=task["team"])
     assert queued["browser_endpoint_id"] == second["endpoint_id"]
     assert queued["status"] == "WAITING"

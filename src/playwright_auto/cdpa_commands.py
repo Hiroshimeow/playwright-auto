@@ -687,6 +687,18 @@ def workflow_control_eligibility(
     def no(reason: str) -> dict[str, Any]:
         return {"eligible": False, "reason": reason, "role": selected_role}
 
+    if (
+        status == "BLOCKED"
+        and block_code in {
+            "accepted_receipt_provenance_divergence",
+            "accepted_admission_integrity_corruption",
+        }
+        and normalized_action != "stop"
+    ):
+        return no(
+            "Accepted forensic provenance is fail-closed; explicit Stop is the only legal control."
+        )
+
     if normalized_action == "pause":
         return yes() if status in {"INBOX", "RUNNING", "BLOCKED"} else no(
             "Pause is available only for INBOX or RUNNING work, or BLOCKED work."
@@ -694,14 +706,26 @@ def workflow_control_eligibility(
     if normalized_action == "resume":
         if status in _WORKFLOW_TERMINAL:
             return no("Terminal work cannot be resumed.")
-        if status == "WAITING" and str(state.get("waiting_code") or "") in {
-            "dependencies",
-            "dependency_waiting",
-        }:
+        if (
+            status == "WAITING"
+            and str(state.get("waiting_code") or "").startswith("dependency")
+        ):
             return no("Resume cannot bypass unfinished dependencies.")
         if hop is None:
             return no("Resume requires an active durable hop.")
         return yes()
+
+    if (
+        status == "WAITING"
+        and str(state.get("waiting_code") or "").startswith("dependency")
+        and normalized_action in {
+            "restart_role",
+            "new_chat",
+            "open_tab",
+            "clear_team",
+        }
+    ):
+        return no("This browser-capacity control cannot bypass unfinished dependencies.")
 
     if normalized_action == "retry":
         if status != "BLOCKED":

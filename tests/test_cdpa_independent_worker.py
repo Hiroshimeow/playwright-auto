@@ -30,6 +30,8 @@ def setup_agent(tmp_path: Path):
         "Blocked target",
         requested_team="alpha",
         task_id="target-a",
+        governing_objective="Blocked target",
+        governing_directives=[],
     )
     blocked = store.update(
         blocked["manifest_path"],
@@ -483,8 +485,8 @@ def test_interval_agent_stays_waiting_until_first_interval_is_due(tmp_path: Path
 def test_worker_activates_oldest_independent_event_and_persists_claim(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
-    older = store.create_task("Older", requested_team="alpha", task_id="older")
-    newer = store.create_task("Newer", requested_team="beta", task_id="newer")
+    older = store.create_task("Older", requested_team="alpha", task_id="older", governing_objective="Older", governing_directives=[])
+    newer = store.create_task("Newer", requested_team="beta", task_id="newer", governing_objective="Newer", governing_directives=[])
     for state, at in (
         (older, "2026-07-26T00:00:00+00:00"),
         (newer, "2026-07-26T00:01:00+00:00"),
@@ -542,6 +544,8 @@ def _blocked_target(store: TaskStore, task_id: str, *, blocked_at: datetime) -> 
         f"Blocked {task_id}",
         requested_team=task_id,
         task_id=task_id,
+        governing_objective=f"Blocked {task_id}",
+        governing_directives=[],
     )
     state = store.update(
         state["manifest_path"],

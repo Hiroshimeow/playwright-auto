@@ -161,6 +161,44 @@ def _optional_nonempty_string(value: Any, field: str) -> str | None:
     return value.strip()
 
 
+def canonicalize_task_text(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("task must be a string")
+    text = value.replace("\r\n", "\n").replace("\r", "\n")
+    if not text.strip():
+        raise ValueError("task must not be empty")
+    return text
+
+
+def normalize_governing_contract(
+    objective: Any,
+    directives: Any,
+) -> tuple[str, str]:
+    if not isinstance(objective, str):
+        raise ValueError("governing_contract_required: governing_objective must be a nonblank string")
+    objective = objective.replace("\r\n", "\n").replace("\r", "\n")
+    if not objective.strip():
+        raise ValueError("governing_contract_required: governing_objective must be a nonblank string")
+    if not isinstance(directives, (list, tuple)):
+        raise ValueError("governing_contract_required: governing_directives must be an explicit list")
+    normalized: list[str] = []
+    for item in directives:
+        if not isinstance(item, str):
+            raise ValueError("governing_contract_required: governing_directives entries must be strings")
+        item = item.replace("\r\n", "\n").replace("\r", "\n")
+        if not item.strip():
+            raise ValueError("governing_contract_required: governing_directives entries must be nonblank")
+        normalized.append(item)
+    payload = json.dumps(
+        {"objective": objective, "directives": normalized},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if len(payload) > 4096:
+        raise ValueError("governing_contract_required: governing semantic payload exceeds 4096 code points")
+    return payload, hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _optional_solo_conversation_url(value: Any) -> str | None:
     if value is None:
         return None
@@ -204,6 +242,55 @@ def task_goal_for_hop(state: Mapping[str, Any], hop_id: int) -> str:
         ):
             selected = goal
     return selected
+
+
+def governing_semantic_for_hop(
+    state: Mapping[str, Any],
+    hop_id: int,
+) -> tuple[str, str, int, str]:
+    payload = state.get("governing_semantic_payload")
+    digest = state.get("governing_semantic_sha256")
+    revision_number = 0
+    revisions = state.get("goal_revisions")
+    if isinstance(revisions, list):
+        for revision in revisions:
+            if not isinstance(revision, Mapping):
+                continue
+            applies_from = revision.get("applies_from_hop_id")
+            if (
+                isinstance(applies_from, int)
+                and not isinstance(applies_from, bool)
+                and applies_from <= int(hop_id)
+            ):
+                payload = revision.get("governing_semantic_payload")
+                digest = revision.get("governing_semantic_sha256")
+                revision_number = int(revision.get("revision") or 0)
+    if not isinstance(payload, str) or not isinstance(digest, str):
+        raise ValueError(
+            "governing_contract_unavailable: authoritative governing semantic payload is missing"
+        )
+    try:
+        semantic = json.loads(payload)
+        if not isinstance(semantic, Mapping) or list(semantic) != [
+            "objective",
+            "directives",
+        ]:
+            raise ValueError
+        canonical_payload, canonical_digest = normalize_governing_contract(
+            semantic.get("objective"),
+            semantic.get("directives"),
+        )
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "governing_contract_unavailable: governing semantic payload is invalid"
+        ) from exc
+    if canonical_payload != payload or canonical_digest != digest:
+        raise ValueError(
+            "governing_contract_unavailable: governing semantic source/hash mismatch"
+        )
+    goal = task_goal_for_hop(state, int(hop_id))
+    goal_sha256 = hashlib.sha256(goal.encode("utf-8")).hexdigest()
+    return payload, digest, revision_number, goal_sha256
 
 
 def retained_report_references(
@@ -747,7 +834,12 @@ class TaskStore(IndependentAgentStoreMixin):
                 if not isinstance(revision, Mapping):
                     return "goal revision must be an object"
                 if set(revision) != {
-                    "revision", "changed_at", "applies_from_hop_id", "goal",
+                    "revision",
+                    "changed_at",
+                    "applies_from_hop_id",
+                    "goal",
+                    "governing_semantic_payload",
+                    "governing_semantic_sha256",
                     "external_command_id",
                 }:
                     return "goal revision keys are invalid"
@@ -767,6 +859,34 @@ class TaskStore(IndependentAgentStoreMixin):
                     return "goal revision applies_from_hop_id must be at least 2"
                 if not isinstance(goal, str) or not goal.strip():
                     return "goal revision goal must be a non-empty string"
+                semantic_payload = revision.get("governing_semantic_payload")
+                semantic_sha256 = revision.get("governing_semantic_sha256")
+                if (
+                    not isinstance(semantic_payload, str)
+                    or len(semantic_payload) > 4096
+                    or not isinstance(semantic_sha256, str)
+                    or hashlib.sha256(semantic_payload.encode("utf-8")).hexdigest()
+                    != semantic_sha256
+                ):
+                    return "goal revision governing contract is invalid"
+                try:
+                    semantic = json.loads(semantic_payload)
+                    if not isinstance(semantic, Mapping) or list(semantic) != [
+                        "objective",
+                        "directives",
+                    ]:
+                        return "goal revision governing contract is invalid"
+                    canonical_payload, canonical_sha256 = normalize_governing_contract(
+                        semantic.get("objective"),
+                        semantic.get("directives"),
+                    )
+                except (ValueError, json.JSONDecodeError):
+                    return "goal revision governing contract is invalid"
+                if (
+                    canonical_payload != semantic_payload
+                    or canonical_sha256 != semantic_sha256
+                ):
+                    return "goal revision governing contract is invalid"
                 if not isinstance(command_id, str) or not command_id.strip():
                     return "goal revision external_command_id must be a non-empty string"
                 latest_goal = goal
@@ -1984,13 +2104,15 @@ class TaskStore(IndependentAgentStoreMixin):
                     "required_browser_endpoint_id",
                     "conversation_mode",
                     "context_policy",
+                    "endpoint_pinned",
                 ):
-                    if (
-                        field in original
-                        and candidate.get(field) != original[field]
-                        and field not in mutable_fields
-                    ):
-                        raise ValueError(f"task {field} is immutable")
+                    if field in mutable_fields:
+                        continue
+                    if field in original:
+                        if field not in candidate or candidate[field] != original[field]:
+                            raise ValueError(f"task {field} is immutable")
+                    elif field == "endpoint_pinned" and field in candidate:
+                        raise ValueError("task endpoint_pinned is immutable")
                 if (
                     "browser_endpoint_id" not in original
                     and "browser_endpoint_id" in candidate
@@ -2050,6 +2172,171 @@ class TaskStore(IndependentAgentStoreMixin):
     ) -> dict[str, Any]:
         target = Path(path).expanduser().resolve()
         return self._mutate_manifest(target, mutator)
+
+    def update_initial_placement(
+        self,
+        path: str | Path,
+        mutator: Callable[[dict[str, Any]], Mapping[str, Any] | None],
+    ) -> dict[str, Any]:
+        """Persist the one-time endpoint choice for an unplaced workflow team."""
+        target = Path(path).expanduser().resolve()
+
+        def place(current: dict[str, Any]) -> Mapping[str, Any] | None:
+            if current.get("endpoint_pinned", True) is not False:
+                raise ValueError("initial endpoint placement requires an unpinned task")
+            before = json.loads(json.dumps(current, ensure_ascii=False))
+            active_hop_id = current.get("active_hop_id")
+            hop = next(
+                (
+                    item
+                    for item in current.get("hops") or ()
+                    if isinstance(item, Mapping) and item.get("hop_id") == active_hop_id
+                ),
+                None,
+            )
+            if (
+                not isinstance(hop, Mapping)
+                or str(hop.get("state") or "") != "pre_send"
+                or hop.get("receipt") is not None
+                or hop.get("message_identity") is not None
+            ):
+                raise ValueError("initial endpoint placement requires pristine pre-Send state")
+            active_role = str(current.get("active_role") or "").upper()
+            role = (current.get("roles") or {}).get(active_role)
+            if not isinstance(role, Mapping) or role.get("page_id") or role.get("page_url"):
+                raise ValueError("initial endpoint placement requires an unbound active role")
+
+            result = mutator(current)
+            candidate = result if result is not None else current
+            if candidate.get("endpoint_pinned") is not True:
+                raise ValueError("initial endpoint placement must pin the selected endpoint")
+
+            allowed_top = {
+                "browser_endpoint_id",
+                "endpoint_pinned",
+                "conversation_mode",
+                "context_policy",
+                "roles",
+                "hops",
+            }
+            for key in before.keys() | candidate.keys():
+                if key not in allowed_top and before.get(key) != candidate.get(key):
+                    raise ValueError(
+                        f"initial endpoint placement cannot mutate {key}"
+                    )
+
+            admission = (
+                before.get("admission")
+                if isinstance(before.get("admission"), Mapping)
+                else {}
+            )
+            if bool(admission.get("browser_endpoint_explicit", False)):
+                raise ValueError(
+                    "initial endpoint placement requires omitted endpoint provenance"
+                )
+            if bool(admission.get("required_endpoint_explicit", False)):
+                raise ValueError(
+                    "initial endpoint placement cannot override a required endpoint"
+                )
+            if (
+                before.get("conversation_mode") != candidate.get("conversation_mode")
+                and bool(
+                    admission.get(
+                        "conversation_mode_explicit",
+                        before.get("conversation_mode_explicit", False),
+                    )
+                )
+            ):
+                raise ValueError(
+                    "initial endpoint placement cannot rewrite explicit conversation mode"
+                )
+            endpoint = self.endpoints.get(str(candidate.get("browser_endpoint_id") or ""))
+            if not bool(
+                admission.get(
+                    "conversation_mode_explicit",
+                    before.get("conversation_mode_explicit", False),
+                )
+            ):
+                expected_mode = (
+                    "temporary"
+                    if endpoint.get("temporary_default")
+                    else "persistent"
+                )
+                if candidate.get("conversation_mode") != expected_mode:
+                    raise ValueError(
+                        "initial endpoint placement must use the selected endpoint default mode"
+                    )
+            if before.get("context_policy") != candidate.get("context_policy"):
+                if bool(admission.get("context_policy_explicit", False)):
+                    raise ValueError(
+                        "initial endpoint placement cannot rewrite explicit context policy"
+                    )
+                if before.get("bootstrap") is not None:
+                    raise ValueError(
+                        "initial endpoint placement cannot rewrite bootstrap context"
+                    )
+                if candidate.get("context_policy") != "fresh":
+                    raise ValueError(
+                        "initial endpoint placement may derive only Fresh context"
+                    )
+            if (
+                before.get("bootstrap") is not None
+                and candidate.get("conversation_mode") == "temporary"
+            ):
+                raise ValueError(
+                    "initial endpoint placement cannot move bootstrap context to Temporary"
+                )
+
+            active_role = str(before.get("active_role") or "").upper()
+            before_roles = before.get("roles") or {}
+            candidate_roles = candidate.get("roles") or {}
+            if set(before_roles) != set(candidate_roles):
+                raise ValueError("initial endpoint placement cannot change workflow roles")
+            for role_key in before_roles:
+                old_role = before_roles[role_key]
+                new_role = candidate_roles[role_key]
+                if role_key != active_role:
+                    if old_role != new_role:
+                        raise ValueError(
+                            "initial endpoint placement cannot mutate inactive roles"
+                        )
+                    continue
+                for key in set(old_role) | set(new_role):
+                    if key != "browser_endpoint_id" and old_role.get(key) != new_role.get(key):
+                        raise ValueError(
+                            f"initial endpoint placement cannot mutate active role {key}"
+                        )
+
+            before_hops = before.get("hops") or []
+            candidate_hops = candidate.get("hops") or []
+            if len(before_hops) != len(candidate_hops):
+                raise ValueError("initial endpoint placement cannot change hop history")
+            for old_hop, new_hop in zip(before_hops, candidate_hops):
+                if old_hop.get("hop_id") != active_hop_id:
+                    if old_hop != new_hop:
+                        raise ValueError(
+                            "initial endpoint placement cannot mutate inactive hops"
+                        )
+                    continue
+                for key in set(old_hop) | set(new_hop):
+                    if key != "browser_endpoint_id" and old_hop.get(key) != new_hop.get(key):
+                        raise ValueError(
+                            f"initial endpoint placement cannot mutate active hop {key}"
+                        )
+            return candidate
+
+        return self._mutate_manifest(
+            target,
+            place,
+            mutable_fields=frozenset(
+                {
+                    "browser_endpoint_id",
+                    "conversation_mode",
+                    "context_policy",
+                    "endpoint_pinned",
+                }
+            ),
+        )
 
     def update_for_control(
         self,
@@ -2908,11 +3195,13 @@ class TaskStore(IndependentAgentStoreMixin):
         *,
         display_name: Any,
         system_prompt: Any,
+        continuation_contract: Any = None,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
         return self.workflow_agents.create(
             display_name=display_name,
             system_prompt=system_prompt,
+            continuation_contract=continuation_contract,
             external_command_id=external_command_id,
         )
 
@@ -2922,12 +3211,14 @@ class TaskStore(IndependentAgentStoreMixin):
         *,
         display_name: Any,
         system_prompt: Any,
+        continuation_contract: Any = None,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
         return self.workflow_agents.update(
             route_key,
             display_name=display_name,
             system_prompt=system_prompt,
+            continuation_contract=continuation_contract,
             external_command_id=external_command_id,
         )
 
@@ -2993,6 +3284,9 @@ class TaskStore(IndependentAgentStoreMixin):
         workflow_mode: str = "team",
         goal: str | None = None,
         conversation_url: str | None = None,
+        governing_objective: str | None = None,
+        governing_directives: Sequence[str] | None = None,
+        admission_provenance: Mapping[str, Any] | None = None,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
         if type(temporary) is not bool:
@@ -3001,19 +3295,26 @@ class TaskStore(IndependentAgentStoreMixin):
             raise ValueError("conversation_mode must be persistent or temporary")
         if context_policy not in {None, "fresh", "bootstrap"}:
             raise ValueError("context_policy must be fresh or bootstrap")
+        context_policy_was_explicit = context_policy is not None
         normalized_workflow_mode = str(workflow_mode or "team").strip().lower()
         if normalized_workflow_mode not in {"team", "solo"}:
             raise ValueError("workflow_mode must be team or solo")
-        normalized_goal = str(goal or "").strip()
+        goal_text = str(goal or "")
+        normalized_goal = canonicalize_task_text(goal_text) if goal_text else ""
         normalized_conversation_url = _optional_solo_conversation_url(conversation_url)
         if normalized_workflow_mode == "team":
             if goal is not None or normalized_conversation_url is not None:
                 raise ValueError("goal and conversation_url are valid only for solo workflow tasks")
         elif browser_endpoint_id is None or not str(browser_endpoint_id).strip():
             raise ValueError("solo workflow task requires an explicit browser endpoint")
-        text = str(task).strip()
-        if not text:
-            raise ValueError("task must not be empty")
+        text = canonicalize_task_text(task)
+        governing_payload: str | None = None
+        governing_sha256: str | None = None
+        if normalized_workflow_mode == "team":
+            governing_payload, governing_sha256 = normalize_governing_contract(
+                governing_objective,
+                governing_directives,
+            )
         task_id = _validate_task_id(task_id or generate_task_id(text))
         catalog_routes = tuple(
             item["route_key"] for item in self.workflow_agents.list_agents()
@@ -3321,12 +3622,40 @@ class TaskStore(IndependentAgentStoreMixin):
                 goal=normalized_goal,
                 conversation_url=normalized_conversation_url,
             )
-            state["endpoint_pinned"] = bool(
+            endpoint_pinned = bool(
                 normalized_workflow_mode == "solo"
                 or exact_reuse_team is not None
                 or browser_endpoint_id is not None
                 or required_endpoint is not None
             )
+            supplied = dict(admission_provenance or {})
+            state["task_text_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if normalized_goal:
+                state["goal_sha256"] = hashlib.sha256(
+                    normalized_goal.encode("utf-8")
+                ).hexdigest()
+            if governing_payload is not None:
+                state["governing_semantic_payload"] = governing_payload
+                state["governing_semantic_sha256"] = governing_sha256
+            state["admission"] = {
+                "requested_team_explicit": bool(supplied.get("requested_team_explicit", requested_team is not None)),
+                "repository_explicit": bool(supplied.get("repository_explicit", repository is not None)),
+                "browser_endpoint_explicit": bool(supplied.get("browser_endpoint_explicit", browser_endpoint_id is not None)),
+                "required_endpoint_explicit": bool(supplied.get("required_endpoint_explicit", required_browser_endpoint_id is not None)),
+                "conversation_mode_explicit": bool(supplied.get("conversation_mode_explicit", temporary or conversation_mode is not None)),
+                "context_policy_explicit": bool(supplied.get("context_policy_explicit", context_policy_was_explicit)),
+                "bootstrap_present": normalized_bootstrap is not None,
+                "endpoint_pin_intent": endpoint_pinned,
+                "normalized_team": team,
+                "normalized_repository": str(repository_path),
+                "normalized_browser_endpoint_id": endpoint["endpoint_id"],
+                "normalized_required_browser_endpoint_id": (
+                    required_endpoint["endpoint_id"] if required_endpoint is not None else None
+                ),
+                "normalized_conversation_mode": selected_mode,
+                "normalized_context_policy": context_policy,
+            }
+            state["endpoint_pinned"] = endpoint_pinned
             state["conversation_mode_explicit"] = bool(
                 temporary or conversation_mode is not None
             )
@@ -4660,6 +4989,10 @@ class TaskStore(IndependentAgentStoreMixin):
         incident_id: str | None = None,
         source_task_id: str | None = None,
         source_event_key: str | None = None,
+        corrected_task_text: str | None = None,
+        corrected_goal: str | None = None,
+        governing_objective: str | None = None,
+        governing_directives: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         target_id = _validate_task_id(target_task_id)
         recovery_instruction = str(replacement_task).strip()
@@ -4802,14 +5135,71 @@ class TaskStore(IndependentAgentStoreMixin):
                     raise ValueError(
                         "replacement target cleanup is already in progress"
                     )
+                durable_admission_integrity_incident = (
+                    str(target_state.get("block_code") or "")
+                    == "accepted_admission_integrity_corruption"
+                    or any(
+                        isinstance(item, Mapping)
+                        and "accepted admission integrity corruption"
+                        in str(item.get("error") or "").lower()
+                        for item in target_state.get("errors") or []
+                    )
+                    or any(
+                        "accepted admission integrity corruption" in str(error).lower()
+                        for hop_record in target_state.get("hops") or []
+                        if isinstance(hop_record, Mapping)
+                        for error in hop_record.get("errors") or []
+                    )
+                )
+                incident_correction = (
+                    durable_admission_integrity_incident
+                    or corrected_task_text is not None
+                    or corrected_goal is not None
+                )
+                if incident_correction and target_status != "STOPPED":
+                    raise ValueError(
+                        "admission-integrity replacement requires a STOPPED target"
+                    )
                 if reuse_team and target_status != "STOPPED":
                     raise ValueError(
                         "reuse_team requires a STOPPED replacement target"
                     )
 
-                task_text = replacement_continuation_text(
-                    target_state, recovery_instruction
-                )
+                workflow_mode = str(
+                    target_state.get("workflow_mode") or "team"
+                ).strip().lower()
+                if incident_correction:
+                    if corrected_task_text is None:
+                        raise ValueError(
+                            "admission-integrity replacement requires corrected_task_text"
+                        )
+                    if workflow_mode == "solo" and corrected_goal is None:
+                        raise ValueError(
+                            "admission-integrity replacement requires corrected_goal for Solo Task"
+                        )
+                    task_text = canonicalize_task_text(corrected_task_text)
+                    if workflow_mode == "team":
+                        semantic_payload, semantic_sha256 = normalize_governing_contract(
+                            governing_objective,
+                            governing_directives,
+                        )
+                    else:
+                        semantic_payload = None
+                        semantic_sha256 = None
+                else:
+                    task_text = replacement_continuation_text(
+                        target_state, recovery_instruction
+                    )
+                    semantic_payload = (
+                        str(target_state.get("governing_semantic_payload"))
+                        if isinstance(target_state.get("governing_semantic_payload"), str)
+                        else None
+                    )
+                    semantic_sha256 = (
+                        str(target_state.get("governing_semantic_sha256"))
+                        if isinstance(target_state.get("governing_semantic_sha256"), str)
+                        else None
+                    )
                 known_ids = {str(item["task_id"]) for item in manifests}
                 replacement_id = generate_task_id(task_text)
                 while replacement_id in known_ids:
@@ -4876,6 +5266,16 @@ class TaskStore(IndependentAgentStoreMixin):
                 now = utc_now()
                 repository_path = Path(target_state["repository"]).expanduser().resolve()
                 report_mode = "file"
+                workflow_agents = task_workflow_definitions(
+                    target_state, self.config
+                )
+                replacement_goal = ""
+                if workflow_mode == "solo":
+                    replacement_goal = (
+                        canonicalize_task_text(corrected_goal)
+                        if corrected_goal is not None
+                        else str(target_state.get("goal") or "")
+                    )
                 replacement_state = self._initial_task_state(
                     text=task_text,
                     requested_team=target_state.get("requested_team"),
@@ -4887,13 +5287,9 @@ class TaskStore(IndependentAgentStoreMixin):
                     reusable_teams=reusable_teams,
                     target=replacement_path,
                     normalized_new=(),
-                    workflow_roles=tuple(
-                        task_workflow_definitions(target_state, self.config)
-                    ),
+                    workflow_roles=tuple(workflow_agents),
                     new_all=False,
-                    workflow_agents=task_workflow_definitions(
-                        target_state, self.config
-                    ),
+                    workflow_agents=workflow_agents,
                     normalized_report_mode=report_mode,
                     normalized_dependencies=dependencies,
                     normalized_replaces=target_id,
@@ -4919,7 +5315,38 @@ class TaskStore(IndependentAgentStoreMixin):
                         if target_state.get("context_policy") in {"fresh", "bootstrap"}
                         else None
                     ),
+                    workflow_mode=workflow_mode,
+                    goal=replacement_goal,
                 )
+                replacement_state["endpoint_pinned"] = True
+                replacement_state["conversation_mode_explicit"] = bool(
+                    target_state.get("conversation_mode_explicit", True)
+                )
+                replacement_state["task_text_sha256"] = hashlib.sha256(
+                    task_text.encode("utf-8")
+                ).hexdigest()
+                if workflow_mode == "solo" and replacement_goal:
+                    replacement_state["goal_sha256"] = hashlib.sha256(
+                        replacement_goal.encode("utf-8")
+                    ).hexdigest()
+                if workflow_mode == "team" and semantic_payload is not None:
+                    replacement_state["governing_semantic_payload"] = semantic_payload
+                    replacement_state["governing_semantic_sha256"] = semantic_sha256
+                if isinstance(target_state.get("admission"), Mapping):
+                    replacement_state["admission"] = json.loads(
+                        json.dumps(target_state["admission"], ensure_ascii=False)
+                    )
+                    replacement_state["admission"]["endpoint_pin_intent"] = True
+                    replacement_state["admission"]["normalized_team"] = team
+                    replacement_state["admission"]["normalized_browser_endpoint_id"] = (
+                        self.endpoint_id_for(target_state)
+                    )
+                    replacement_state["admission"]["normalized_conversation_mode"] = (
+                        replacement_state["conversation_mode"]
+                    )
+                    replacement_state["admission"]["normalized_context_policy"] = (
+                        replacement_state.get("context_policy")
+                    )
                 replacement_state["dependency_events"].append(
                     {
                         "at": now,
@@ -5866,10 +6293,15 @@ class TaskStore(IndependentAgentStoreMixin):
         path: str | Path,
         goal: str,
         *,
+        governing_objective: str | None = None,
+        governing_directives: Sequence[str] | None = None,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
-        if not isinstance(goal, str) or not goal.strip():
-            raise ValueError("goal must not be blank")
+        goal = canonicalize_task_text(goal)
+        semantic_payload, semantic_sha256 = normalize_governing_contract(
+            governing_objective,
+            governing_directives,
+        )
         command_id = str(external_command_id or "").strip()
 
         def mutate(state: dict[str, Any]) -> dict[str, Any]:
@@ -5891,7 +6323,11 @@ class TaskStore(IndependentAgentStoreMixin):
                     if isinstance(item, Mapping)
                     and item.get("external_command_id") == command_id
                 ]
-                if len(matching) != 1 or matching[0].get("goal") != goal:
+                if (
+                    len(matching) != 1
+                    or matching[0].get("goal") != goal
+                    or matching[0].get("governing_semantic_sha256") != semantic_sha256
+                ):
                     raise ValueError("change-goal command provenance does not match its payload")
                 return state
             if effective_task_goal(state) == goal:
@@ -5903,6 +6339,8 @@ class TaskStore(IndependentAgentStoreMixin):
                 "changed_at": utc_now(),
                 "applies_from_hop_id": active_hop_id + 1,
                 "goal": goal,
+                "governing_semantic_payload": semantic_payload,
+                "governing_semantic_sha256": semantic_sha256,
                 "external_command_id": command_id,
             }
             state["effective_goal"] = goal

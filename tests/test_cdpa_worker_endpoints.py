@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 import playwright_auto.cdpa_worker as worker_module
 from playwright_auto.cdpa_actions import AcquiredRole
@@ -19,6 +22,15 @@ async def _noop(*_args, **_kwargs):
     return None
 
 
+def create_team_task(store, task, **kwargs):
+    return store.create_task(
+        task,
+        governing_objective="Endpoint worker test objective.",
+        governing_directives=[],
+        **kwargs,
+    )
+
+
 def _setup(tmp_path: Path, *, task_count: int = 1):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
@@ -27,7 +39,7 @@ def _setup(tmp_path: Path, *, task_count: int = 1):
     tasks = []
     for index in range(task_count):
         tasks.append(
-            store.create_task(
+            create_team_task(store,
                 f"task {index}",
                 task_id=f"task-{index}",
                 requested_team=f"team-{index}",
@@ -217,7 +229,7 @@ def test_required_workflow_endpoint_waits_instead_of_falling_back_to_free_peer(t
     store = TaskStore(config)
     first = store.endpoints.resolve()
     required = store.endpoints.add("9202")
-    task = store.create_task(
+    task = create_team_task(store,
         "Gmail child",
         requested_team="gmail-child",
         required_browser_endpoint_id=required["endpoint_id"],
@@ -265,7 +277,7 @@ def test_release_required_endpoint_control_allows_normal_allocator_peer_fallback
     store = TaskStore(config)
     peer = store.endpoints.resolve()
     preferred = store.endpoints.add("9202")
-    task = store.create_task(
+    task = create_team_task(store,
         "release hard pin",
         requested_team="release-hard-pin",
         browser_endpoint_id=preferred["endpoint_id"],
@@ -316,7 +328,7 @@ def test_pool_cycle_applies_required_endpoint_release_from_browser_pool_wait_wit
     store = TaskStore(config)
     peer = store.endpoints.resolve()
     required = store.endpoints.add("9202")
-    task = store.create_task(
+    task = create_team_task(store,
         "release blocked hard pin",
         requested_team="release-blocked-hard-pin",
         browser_endpoint_id=required["endpoint_id"],
@@ -394,7 +406,7 @@ def test_browser_dependent_control_does_not_bypass_required_endpoint_pool_wait(
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
     required = store.endpoints.add("9202")
-    task = store.create_task(
+    task = create_team_task(store,
         "keep browser control gated",
         requested_team="browser-control-gated",
         required_browser_endpoint_id=required["endpoint_id"],
@@ -454,7 +466,7 @@ def test_later_release_does_not_bypass_earlier_browser_dependent_control(
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
     required = store.endpoints.add("9202")
-    task = store.create_task(
+    task = create_team_task(store,
         "preserve mixed control order",
         requested_team="mixed-control-order",
         required_browser_endpoint_id=required["endpoint_id"],
@@ -531,7 +543,7 @@ def test_stale_endpointless_release_admission_cannot_execute_later_browser_contr
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
     required = store.endpoints.add("9202")
-    task = store.create_task(
+    task = create_team_task(store,
         "bind endpointless admission to release control",
         requested_team="endpointless-control-race",
         required_browser_endpoint_id=required["endpoint_id"],
@@ -629,7 +641,7 @@ def test_required_endpoint_preserves_accepted_send_exact_execution(tmp_path, mon
     store = TaskStore(config)
     first = store.endpoints.resolve()
     required = store.endpoints.add("9202")
-    task = store.create_task(
+    task = create_team_task(store,
         "Gmail child",
         requested_team="gmail-accepted",
         required_browser_endpoint_id=required["endpoint_id"],
@@ -779,7 +791,7 @@ def test_same_endpoint_serializes_admission_and_overflow_auto_wakes(tmp_path, mo
     endpoint = store.endpoints.resolve()
     store.endpoints.update(endpoint["endpoint_id"], max_active_tabs=2)
     tasks = [
-        store.create_task(
+        create_team_task(store,
             f"serialized {index}",
             task_id=f"serialized-{index}",
             requested_team=f"serialized-team-{index}",
@@ -894,7 +906,7 @@ def test_midcycle_rescan_admits_browser_pool_waiter_before_running_set_drains(
     endpoint = store.endpoints.resolve()
     store.endpoints.update(endpoint["endpoint_id"], max_active_tabs=2)
     tasks = [
-        store.create_task(
+        create_team_task(store,
             f"midcycle {index}",
             task_id=f"midcycle-{index}",
             requested_team=f"midcycle-team-{index}",
@@ -989,13 +1001,13 @@ def test_different_endpoints_admit_concurrently(tmp_path, monkeypatch):
     store.endpoints.update(first["endpoint_id"], max_active_tabs=1)
     store.endpoints.update(second["endpoint_id"], max_active_tabs=1)
     tasks = [
-        store.create_task(
+        create_team_task(store,
             "first endpoint",
             task_id="parallel-first",
             requested_team="parallel-first",
             required_browser_endpoint_id=first["endpoint_id"],
         ),
-        store.create_task(
+        create_team_task(store,
             "second endpoint",
             task_id="parallel-second",
             requested_team="parallel-second",
@@ -1109,7 +1121,7 @@ def test_open_tab_controls_share_endpoint_admission_gate(tmp_path, monkeypatch):
     endpoint = store.endpoints.resolve()
     store.endpoints.update(endpoint["endpoint_id"], max_active_tabs=2)
     tasks = [
-        store.create_task(
+        create_team_task(store,
             f"control {index}",
             task_id=f"control-{index}",
             requested_team=f"control-team-{index}",
@@ -1291,7 +1303,7 @@ def test_lost_page_recovery_reopen_shares_endpoint_admission_gate(tmp_path):
     worker = CDPAWorker(config, store=store)
     states = []
     for index in range(2):
-        task = store.create_task(
+        task = create_team_task(store,
             f"recovery {index}",
             task_id=f"recovery-{index}",
             requested_team=f"recovery-team-{index}",
@@ -1386,7 +1398,7 @@ def test_legacy_bootstrap_metadata_is_ignored_for_new_role_allocation(tmp_path):
             "updated_at": "2026-08-06T00:00:00+00:00",
         }
     )
-    state = store.create_task(
+    state = create_team_task(store,
         "legacy bootstrap metadata",
         task_id="legacy-bootstrap-allocation",
         requested_team="legacy-bootstrap-allocation",
@@ -1453,7 +1465,7 @@ def test_pool_exhaustion_waits_without_semantic_block(tmp_path, monkeypatch):
 def test_endpoint_disconnect_does_not_abort_peer_execution(tmp_path, monkeypatch):
     worker, store, _first, _second, _tasks = _setup(tmp_path, task_count=1)
     store.endpoints.update(_first["endpoint_id"], max_active_tabs=1)
-    peer = store.create_task(
+    peer = create_team_task(store,
         "peer task",
         task_id="task-1",
         requested_team="team-1",
@@ -1873,7 +1885,7 @@ def test_unpinned_team_first_placement_pins_endpoint_and_inherits_temporary_defa
     store = TaskStore(config)
     first = store.endpoints.resolve()
     second = store.endpoints.add("9202", temporary_default=True)
-    state = store.create_task(
+    state = create_team_task(store,
         "default placement",
         task_id="default-placement",
         requested_team="default-placement",
@@ -1891,6 +1903,348 @@ def test_unpinned_team_first_placement_pins_endpoint_and_inherits_temporary_defa
     assert state["context_policy"] == "fresh"
 
     assert worker._prepare_execution_endpoint(state, first["endpoint_id"]) is False
+
+
+def test_unpinned_team_first_placement_persists_selected_endpoint(tmp_path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    first = store.endpoints.resolve()
+    second = store.endpoints.add("9202", temporary_default=True)
+    state = create_team_task(store,
+        "persist default placement",
+        task_id="persist-default-placement",
+        requested_team="persist-default-placement",
+    )
+    worker = CDPAWorker(config, store=store)
+    path = Path(state["manifest_path"])
+
+    assert state["browser_endpoint_id"] == first["endpoint_id"]
+    assert state["endpoint_pinned"] is False
+
+    placed = copy.deepcopy(state)
+    assert worker._prepare_execution_endpoint(placed, second["endpoint_id"]) is True
+
+    saved = worker._persist_transport_result(path, state, placed)
+
+    assert saved["endpoint_pinned"] is True
+    assert saved["browser_endpoint_id"] == second["endpoint_id"]
+    assert saved["conversation_mode"] == "temporary"
+    assert saved["context_policy"] == "fresh"
+
+
+def test_unpinned_first_placement_preserves_explicit_mode_and_context(tmp_path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    temporary_endpoint = store.endpoints.add("9202", temporary_default=True)
+    persistent_endpoint = store.endpoints.add("9212", temporary_default=False)
+    worker = CDPAWorker(config, store=store)
+
+    explicit_persistent = create_team_task(
+        store,
+        "explicit persistent",
+        task_id="placement-explicit-persistent",
+        conversation_mode="persistent",
+        context_policy="fresh",
+    )
+    assert explicit_persistent["endpoint_pinned"] is False
+    assert worker._prepare_execution_endpoint(
+        explicit_persistent, temporary_endpoint["endpoint_id"]
+    ) is True
+    assert explicit_persistent["browser_endpoint_id"] == temporary_endpoint["endpoint_id"]
+    assert explicit_persistent["conversation_mode"] == "persistent"
+    assert explicit_persistent["context_policy"] == "fresh"
+
+    explicit_temporary = create_team_task(
+        store,
+        "explicit temporary",
+        task_id="placement-explicit-temporary",
+        conversation_mode="temporary",
+        context_policy="fresh",
+    )
+    assert explicit_temporary["endpoint_pinned"] is False
+    assert worker._prepare_execution_endpoint(
+        explicit_temporary, persistent_endpoint["endpoint_id"]
+    ) is True
+    assert explicit_temporary["conversation_mode"] == "temporary"
+    assert explicit_temporary["context_policy"] == "fresh"
+
+
+def test_unpinned_bootstrap_cannot_place_on_temporary_default_endpoint(tmp_path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    temporary_endpoint = store.endpoints.add("9202", temporary_default=True)
+    bootstrap = BootstrapCatalog(tmp_path).upsert(
+        {
+            "bootstrap_id": "placement-bootstrap",
+            "name": "Placement Bootstrap",
+            "description": "Bootstrap placement contract",
+            "source_conversation_id": "11111111-1111-4111-8111-111111111111",
+            "prewarm_prompt": "Use bootstrap",
+            "max_backups": 1,
+            "donors": [],
+            "enabled": True,
+            "tags": [],
+            "created_at": "2026-08-06T00:00:00+00:00",
+            "updated_at": "2026-08-06T00:00:00+00:00",
+        }
+    )
+    state = create_team_task(
+        store,
+        "bootstrap placement",
+        task_id="placement-bootstrap-task",
+        bootstrap=bootstrap,
+    )
+    worker = CDPAWorker(config, store=store)
+
+    assert state["endpoint_pinned"] is False
+    assert state["context_policy"] == "bootstrap"
+    assert worker._prepare_execution_endpoint(
+        state, temporary_endpoint["endpoint_id"]
+    ) is False
+    assert state["endpoint_pinned"] is False
+    assert state["context_policy"] == "bootstrap"
+
+
+def test_legacy_missing_endpoint_pin_is_treated_as_pinned_without_manifest_migration(tmp_path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    home = store.endpoints.resolve()
+    peer = store.endpoints.add("9202")
+    state = create_team_task(
+        store,
+        "legacy missing pin",
+        task_id="legacy-missing-pin",
+        browser_endpoint_id=home["endpoint_id"],
+    )
+    path = Path(state["manifest_path"])
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.pop("endpoint_pinned", None)
+    data.pop("admission", None)
+    data.pop("conversation_mode_explicit", None)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    before_bytes = path.read_bytes()
+    loaded = store.load(path)
+    worker = CDPAWorker(config, store=store)
+
+    assert "endpoint_pinned" not in loaded
+    assert "admission" not in loaded
+    assert "conversation_mode_explicit" not in loaded
+    assert worker._execution_endpoint_id(loaded) == home["endpoint_id"]
+    assert worker._prepare_execution_endpoint(loaded, peer["endpoint_id"]) is False
+    assert path.read_bytes() == before_bytes
+
+    candidate = copy.deepcopy(loaded)
+    candidate["endpoint_pinned"] = False
+    with pytest.raises(ValueError, match="endpoint_pinned.*immutable"):
+        store.save(path, candidate)
+    assert path.read_bytes() == before_bytes
+
+    with pytest.raises(ValueError, match="endpoint_pinned.*immutable"):
+        store.update(path, lambda current: current.update(endpoint_pinned=False))
+    assert path.read_bytes() == before_bytes
+
+    unchanged = store.load(path)
+    assert "endpoint_pinned" not in unchanged
+    assert unchanged["browser_endpoint_id"] == home["endpoint_id"]
+    assert worker._execution_endpoint_id(unchanged) == home["endpoint_id"]
+    assert worker._prepare_execution_endpoint(unchanged, peer["endpoint_id"]) is False
+    assert unchanged["browser_endpoint_id"] == home["endpoint_id"]
+
+
+def test_pinned_temporary_workflow_never_spills_to_9222_when_home_is_unavailable(
+    tmp_path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    spill = store.endpoints.resolve()
+    home = store.endpoints.add("9202", temporary_default=True)
+    task = create_team_task(
+        store,
+        "temporary pinned no spill",
+        task_id="temporary-pinned-no-spill",
+        browser_endpoint_id=home["endpoint_id"],
+        temporary=True,
+    )
+    worker = CDPAWorker(config, store=store)
+    worker.hydrate_runtime()
+    assert worker.registry is not None
+    worker.registry.update_task(task, now=0.0)
+    seen = []
+
+    async def scenario():
+        pool = await _pool(store)
+        await pool.mark_unavailable(home["endpoint_id"], "synthetic home outage")
+
+        async def advance(path, context, *, scheduling_tasks=None, endpoint_id=None):
+            seen.append((Path(path).name, getattr(context, "name", None), endpoint_id))
+            return store.load(path)
+
+        monkeypatch.setattr(worker, "advance", advance)
+        monkeypatch.setattr(worker, "_maintain_ambient_page_automation", _noop)
+        monkeypatch.setattr(worker, "_refresh_rate_limit_cooldown", _noop)
+        monkeypatch.setattr(worker, "_close_idle_independent_tabs", _noop)
+        await worker.run_once_pool(pool)
+        await pool.close()
+
+    asyncio.run(scenario())
+
+    saved = store.load(task["manifest_path"])
+    assert seen == []
+    assert saved["browser_endpoint_id"] == home["endpoint_id"]
+    assert saved["conversation_mode"] == "temporary"
+    assert saved["status"] == "WAITING"
+    assert saved["waiting"]["reason"] == "browser_pool"
+    assert spill["endpoint_id"] != home["endpoint_id"]
+
+
+def test_dependency_wait_uses_zero_pool_slot_and_no_browser_execution(tmp_path, monkeypatch):
+    worker, store, first, second, _tasks = _setup(tmp_path, task_count=0)
+    store.endpoints.update(first["endpoint_id"], max_active_tabs=1)
+    store.endpoints.remove(second["endpoint_id"], has_nonterminal_tasks=True)
+    parent = create_team_task(
+        store,
+        "unfinished parent",
+        task_id="dependency-zero-slot-parent",
+        browser_endpoint_id=first["endpoint_id"],
+    )
+    child = create_team_task(
+        store,
+        "waiting child",
+        task_id="dependency-zero-slot-child",
+        browser_endpoint_id=first["endpoint_id"],
+        depends_on_task_ids=(parent["task_id"],),
+    )
+    worker.hydrate_runtime()
+    assert worker.registry is not None
+    worker.registry.update_task(parent, now=0.0)
+    worker.registry.update_task(child, now=0.0)
+    with pytest.raises(ValueError, match="Resume cannot bypass unfinished dependencies"):
+        store.request_resume(
+            child["manifest_path"],
+            reason="operator attempt to resume dependency wait",
+            external_command_id="pool-resume-dependency-wait",
+        )
+    with pytest.raises(ValueError, match="cannot bypass unfinished dependencies"):
+        store.request_control(
+            child["manifest_path"],
+            "clear_team",
+            confirmed=False,
+            reason="operator attempt to clear dependency-waiting team",
+            external_command_id="pool-clear-team-dependency-wait",
+        )
+    unchanged_child = store.load(child["manifest_path"])
+    assert unchanged_child.get("controls") in (None, [])
+    worker.registry.update_task(unchanged_child, now=0.0)
+    called = []
+
+    async def advance(path, *_args, **_kwargs):
+        task_id = store.load(path)["task_id"]
+        called.append(task_id)
+        if task_id == child["task_id"]:
+            raise AssertionError("unfinished dependency child must not be scheduled")
+        return store.load(path)
+
+    async def scenario():
+        pool = await _pool(store)
+        monkeypatch.setattr(worker, "advance", advance)
+        monkeypatch.setattr(worker, "_maintain_ambient_page_automation", _noop)
+        monkeypatch.setattr(worker, "_refresh_rate_limit_cooldown", _noop)
+        monkeypatch.setattr(worker, "_close_idle_independent_tabs", _noop)
+        await worker.run_once_pool(pool)
+        await pool.close()
+
+    asyncio.run(scenario())
+
+    saved = store.load(child["manifest_path"])
+    assert saved["status"] == "WAITING"
+    assert saved["waiting_code"] == "dependency"
+    assert child["task_id"] not in called
+    assert child["task_id"] not in worker._execution_leases
+
+
+def test_dependency_done_release_is_endpointless_even_when_home_capacity_is_full(
+    tmp_path, monkeypatch
+):
+    worker, store, first, second, _tasks = _setup(tmp_path, task_count=0)
+    store.endpoints.update(first["endpoint_id"], max_active_tabs=1)
+    store.endpoints.remove(second["endpoint_id"], has_nonterminal_tasks=True)
+    parent = create_team_task(
+        store,
+        "parent",
+        task_id="dependency-release-parent",
+        browser_endpoint_id=first["endpoint_id"],
+    )
+    child = create_team_task(
+        store,
+        "child",
+        task_id="dependency-release-child",
+        browser_endpoint_id=first["endpoint_id"],
+        depends_on_task_ids=(parent["task_id"],),
+    )
+    child_before = store.load(child["manifest_path"])
+    home = child_before["browser_endpoint_id"]
+    role_endpoint = child_before["roles"]["PLAN"].get("browser_endpoint_id")
+    hop_endpoint = _active_hop(child_before).get("browser_endpoint_id")
+    pin = child_before["endpoint_pinned"]
+
+    worker.hydrate_runtime()
+    assert worker.registry is not None
+    done_parent = store.update(
+        parent["manifest_path"],
+        lambda state: {
+            **state,
+            "status": "DONE",
+            "terminal_state": "DONE",
+            "kanban_column": "DONE",
+            "active_role": None,
+            "active_hop_id": None,
+            "completed_at": state["updated_at"],
+        },
+    )
+    worker.registry.update_task(done_parent, now=0.0)
+    worker.registry.update_task(child_before, now=0.0)
+    worker._execution_leases["unrelated-busy-work"] = {
+        "endpoint_id": first["endpoint_id"],
+        "task_id": "unrelated-busy-work",
+        "team": "other",
+        "role": "DEV",
+        "request_id": "busy-request",
+        "page_id": None,
+    }
+    original_advance = worker.advance
+    observations = []
+
+    async def advance(path, context, **kwargs):
+        observations.append(
+            {
+                "endpoint_id": kwargs.get("endpoint_id"),
+                "child_has_lease": child["task_id"] in worker._execution_leases,
+                "pages": list(getattr(context, "pages", [])),
+            }
+        )
+        return await original_advance(path, context, **kwargs)
+
+    async def scenario():
+        pool = await _pool(store)
+        monkeypatch.setattr(worker, "advance", advance)
+        monkeypatch.setattr(worker, "_maintain_ambient_page_automation", _noop)
+        monkeypatch.setattr(worker, "_refresh_rate_limit_cooldown", _noop)
+        monkeypatch.setattr(worker, "_close_idle_independent_tabs", _noop)
+        await worker.run_once_pool(pool)
+        await pool.close()
+
+    asyncio.run(scenario())
+
+    released = store.load(child["manifest_path"])
+    assert observations == [{"endpoint_id": None, "child_has_lease": False, "pages": []}]
+    assert released["status"] == "INBOX"
+    assert released["waiting_code"] is None
+    assert released["browser_endpoint_id"] == home
+    assert released["roles"]["PLAN"].get("browser_endpoint_id") == role_endpoint
+    assert _active_hop(released).get("browser_endpoint_id") == hop_endpoint
+    assert released["endpoint_pinned"] is pin is True
+    assert child["task_id"] not in worker._execution_leases
+    assert "unrelated-busy-work" in worker._execution_leases
 
 
 def test_pool_cycle_stale_registry_terminal_manifest_never_gets_capacity_lease(tmp_path, monkeypatch):

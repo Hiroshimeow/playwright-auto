@@ -45,12 +45,14 @@ def test_unfinished_dependency_reconciles_executable_state_before_transport(
     tmp_path: Path, status: str
 ):
     store, _config = make_store(tmp_path)
-    parent = store.create_task("Parent", requested_team="parent", task_id="parent-task")
+    parent = store.create_task("Parent", requested_team="parent", task_id="parent-task", governing_objective="Parent", governing_directives=[])
     child = store.create_task(
         "Child",
         requested_team="child",
         task_id="child-task",
         depends_on_task_ids=(parent["task_id"],),
+        governing_objective="Child",
+        governing_directives=[],
     )
     forced = force_state(store, child, status)
     preserved_hop = copy.deepcopy(forced["hops"][0])
@@ -79,12 +81,14 @@ def test_worker_advance_converges_invalid_executable_state_before_browser_access
     status: str,
 ):
     store, config = make_store(tmp_path)
-    parent = store.create_task("Parent", requested_team="parent", task_id="parent-task")
+    parent = store.create_task("Parent", requested_team="parent", task_id="parent-task", governing_objective="Parent", governing_directives=[])
     child = store.create_task(
         "Child",
         requested_team="child",
         task_id="child-task",
         depends_on_task_ids=(parent["task_id"],),
+        governing_objective="Child",
+        governing_directives=[],
     )
     forced = force_state(store, child, status)
     preserved_hop = copy.deepcopy(forced["hops"][0])
@@ -103,16 +107,73 @@ def test_worker_advance_converges_invalid_executable_state_before_browser_access
     assert result["hops"][0] == preserved_hop
 
 
-def test_resume_with_unfinished_parent_applies_waiting_postcondition_without_browser_access(
+def test_resume_is_rejected_before_queue_for_canonical_dependency_wait(
     tmp_path: Path,
 ):
-    store, config = make_store(tmp_path)
-    parent = store.create_task("Parent", requested_team="parent", task_id="parent-task")
+    store, _config = make_store(tmp_path)
+    parent = store.create_task(
+        "Parent",
+        requested_team="parent",
+        task_id="parent-task",
+        governing_objective="Parent",
+        governing_directives=[],
+    )
     child = store.create_task(
         "Child",
         requested_team="child",
         task_id="child-task",
         depends_on_task_ids=(parent["task_id"],),
+        governing_objective="Child",
+        governing_directives=[],
+    )
+    before = store.load(child["manifest_path"])
+    assert before["status"] == "WAITING"
+    assert before["waiting_code"] == "dependency"
+    assert before["waiting"]["reason"] == "dependency"
+    assert before.get("controls") in (None, [])
+
+    with pytest.raises(ValueError, match="Resume cannot bypass unfinished dependencies"):
+        store.request_resume(
+            child["manifest_path"],
+            reason="operator attempt to bypass unfinished parent",
+            external_command_id="resume-dependency-wait",
+        )
+    for action in ("restart_role", "new_chat", "open_tab", "clear_team"):
+        with pytest.raises(ValueError, match="cannot bypass unfinished dependencies"):
+            store.request_control(
+                child["manifest_path"],
+                action,
+                role="PLAN" if action != "clear_team" else None,
+                reason=f"operator attempt to {action} during dependency wait",
+                external_command_id=f"{action}-dependency-wait",
+            )
+    with pytest.raises(ValueError, match="PLAN is already the active role"):
+        store.request_control(
+            child["manifest_path"],
+            "route_plan",
+            reason="operator attempt to route during dependency wait",
+            external_command_id="route-plan-dependency-wait",
+        )
+
+    after = store.load(child["manifest_path"])
+    assert after["status"] == "WAITING"
+    assert after["waiting_code"] == "dependency"
+    assert after["waiting"]["waiting_on"] == [parent["task_id"]]
+    assert after.get("controls") in (None, [])
+
+
+def test_resume_with_unfinished_parent_applies_waiting_postcondition_without_browser_access(
+    tmp_path: Path,
+):
+    store, config = make_store(tmp_path)
+    parent = store.create_task("Parent", requested_team="parent", task_id="parent-task", governing_objective="Parent", governing_directives=[])
+    child = store.create_task(
+        "Child",
+        requested_team="child",
+        task_id="child-task",
+        depends_on_task_ids=(parent["task_id"],),
+        governing_objective="Child",
+        governing_directives=[],
     )
     paused = force_state(store, child, "PAUSED")
     preserved_hop = copy.deepcopy(paused["hops"][0])
@@ -144,12 +205,14 @@ def test_dependency_readiness_preserves_explicit_missing_stopped_and_done_states
     tmp_path: Path,
 ):
     store, _config = make_store(tmp_path)
-    parent = store.create_task("Parent", requested_team="parent", task_id="parent-task")
+    parent = store.create_task("Parent", requested_team="parent", task_id="parent-task", governing_objective="Parent", governing_directives=[])
     child = store.create_task(
         "Child",
         requested_team="child",
         task_id="child-task",
         depends_on_task_ids=(parent["task_id"],),
+        governing_objective="Child",
+        governing_directives=[],
     )
 
     missing, changed = store.refresh_scheduling(
@@ -204,12 +267,14 @@ def test_accepted_waiting_hop_survives_dependency_barrier_and_releases_without_r
     tmp_path: Path,
 ):
     store, _config = make_store(tmp_path)
-    parent = store.create_task("Parent", requested_team="parent", task_id="parent-task")
+    parent = store.create_task("Parent", requested_team="parent", task_id="parent-task", governing_objective="Parent", governing_directives=[])
     child = store.create_task(
         "Child",
         requested_team="child",
         task_id="child-task",
         depends_on_task_ids=(parent["task_id"],),
+        governing_objective="Child",
+        governing_directives=[],
     )
 
     def accepted(current: dict) -> dict:
@@ -270,12 +335,14 @@ def test_runtime_hydration_reconciles_running_child_before_projection(
     tmp_path: Path,
 ):
     store, config = make_store(tmp_path)
-    parent = store.create_task("Parent", requested_team="parent", task_id="parent-task")
+    parent = store.create_task("Parent", requested_team="parent", task_id="parent-task", governing_objective="Parent", governing_directives=[])
     child = store.create_task(
         "Child",
         requested_team="child",
         task_id="child-task",
         depends_on_task_ids=(parent["task_id"],),
+        governing_objective="Child",
+        governing_directives=[],
     )
     running = force_state(store, child, "RUNNING")
 
@@ -295,12 +362,14 @@ def test_parent_removal_command_enforces_version_and_updates_projection_immediat
     tmp_path: Path,
 ):
     store, config = make_store(tmp_path)
-    parent = store.create_task("Parent", requested_team="parent", task_id="parent-task")
+    parent = store.create_task("Parent", requested_team="parent", task_id="parent-task", governing_objective="Parent", governing_directives=[])
     child = store.create_task(
         "Child",
         requested_team="child",
         task_id="child-task",
         depends_on_task_ids=(parent["task_id"],),
+        governing_objective="Child",
+        governing_directives=[],
     )
     worker = CDPAWorker(config, store=store)
     worker.hydrate_runtime()
@@ -357,13 +426,15 @@ def test_parent_removal_is_exact_idempotent_and_reconciles_remaining_dependencie
     tmp_path: Path,
 ):
     store, _config = make_store(tmp_path)
-    first = store.create_task("First", requested_team="first", task_id="parent-first")
-    second = store.create_task("Second", requested_team="second", task_id="parent-second")
+    first = store.create_task("First", requested_team="first", task_id="parent-first", governing_objective="First", governing_directives=[])
+    second = store.create_task("Second", requested_team="second", task_id="parent-second", governing_objective="Second", governing_directives=[])
     child = store.create_task(
         "Child",
         requested_team="child",
         task_id="child-task",
         depends_on_task_ids=(first["task_id"], second["task_id"]),
+        governing_objective="Child",
+        governing_directives=[],
     )
     preserved_hop = copy.deepcopy(child["hops"][0])
 
@@ -411,12 +482,14 @@ def test_parent_removal_is_exact_idempotent_and_reconciles_remaining_dependencie
 @pytest.mark.parametrize("parent_task_id", ["not-a-parent", ""])
 def test_parent_removal_rejects_invalid_exact_parent(tmp_path: Path, parent_task_id: str):
     store, _config = make_store(tmp_path)
-    parent = store.create_task("Parent", requested_team="parent", task_id="parent-task")
+    parent = store.create_task("Parent", requested_team="parent", task_id="parent-task", governing_objective="Parent", governing_directives=[])
     child = store.create_task(
         "Child",
         requested_team="child",
         task_id="child-task",
         depends_on_task_ids=(parent["task_id"],),
+        governing_objective="Child",
+        governing_directives=[],
     )
 
     with pytest.raises(ValueError):
@@ -425,12 +498,14 @@ def test_parent_removal_rejects_invalid_exact_parent(tmp_path: Path, parent_task
 
 def test_parent_removal_rejects_terminal_child(tmp_path: Path):
     store, _config = make_store(tmp_path)
-    parent = store.create_task("Parent", requested_team="parent", task_id="parent-task")
+    parent = store.create_task("Parent", requested_team="parent", task_id="parent-task", governing_objective="Parent", governing_directives=[])
     child = store.create_task(
         "Child",
         requested_team="child",
         task_id="child-task",
         depends_on_task_ids=(parent["task_id"],),
+        governing_objective="Child",
+        governing_directives=[],
     )
     terminal = store.update(
         child["manifest_path"],

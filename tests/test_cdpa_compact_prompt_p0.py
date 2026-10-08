@@ -14,6 +14,29 @@ FINAL_DIRECTIVE = "Work first. Write the report, then return exactly one valid r
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_governing_wire_grammar_exact_lengths_bounds_and_no_trailing_newline():
+    semantic = "s" * 4096
+    continuation = "r" * 2048
+    facts = "f" * 4096
+    block = PromptBuilder.governing_block(semantic, continuation, facts)
+
+    assert block.startswith("GOVERNING_SEMANTIC_SOURCE 04096\n")
+    assert "\nROLE_CONTINUATION_CONTRACT 02048\n" in block
+    assert "\nGOVERNING_EXECUTION_FACTS_REF 04096\n" in block
+    assert block.endswith(facts)
+    assert not block.endswith("\n")
+    assert len(block) == 10343
+
+    import pytest
+
+    with pytest.raises(ValueError, match="governing_contract_unavailable"):
+        PromptBuilder.governing_block("s" * 4097, continuation, facts)
+    with pytest.raises(ValueError, match="governing_contract_unavailable"):
+        PromptBuilder.governing_block(semantic, "r" * 2049, facts)
+    with pytest.raises(ValueError, match="governing_contract_unavailable"):
+        PromptBuilder.governing_block(semantic, continuation, "f" * 4097)
+
+
 PLAN_CLOSURE_CUE = (
     "If acceptance is satisfied after clean REVIEW, route DONE; otherwise route the smallest role with concrete remaining work."
 )

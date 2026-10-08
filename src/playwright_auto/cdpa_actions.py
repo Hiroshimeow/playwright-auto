@@ -31,6 +31,7 @@ from .chatgpt import (
     refresh_page,
 )
 from .workspace import ChatGPTWorkspace
+from .observability import record_page_action
 
 _CHATGPT_HOSTS = frozenset({"chatgpt.com", "www.chatgpt.com"})
 _NEW_BRANCH_ENDPOINT = "https://chatgpt.com/backend-api/conversation/new_branch"
@@ -780,7 +781,21 @@ class CDPATabActions:
         created = existing is None
         if created:
             await random_delay(action_delay_multiplier("open_tab"))
-            page = await self.browser_context.new_page()
+            opening = await record_page_action(
+                None, "open_tab", "start", reason="saved_conversation_reopen",
+                identity={}, detail=f"requested_role={physical}",
+            )
+            try:
+                page = await self.browser_context.new_page()
+            except Exception as exc:
+                await record_page_action(
+                    None, "open_tab", "error", reason="saved_conversation_reopen",
+                    identity=opening, detail=type(exc).__name__,
+                )
+                raise
+            await record_page_action(
+                page, "open_tab", "complete", reason="saved_conversation_reopen", identity=opening
+            )
             client = ChatGPTPage(
                 page,
                 timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
@@ -794,8 +809,22 @@ class CDPATabActions:
                 _reopenable_conversation_identity(page.url) == expected_conversation
             )
             if not exact_url:
-                await page.goto(
-                    page_url, wait_until="domcontentloaded", timeout=timeout
+                navigation = await record_page_action(
+                    page, "goto", "start", reason="saved_conversation_reopen",
+                    identity={} if created else None,
+                )
+                try:
+                    await page.goto(
+                        page_url, wait_until="domcontentloaded", timeout=timeout
+                    )
+                except Exception as exc:
+                    await record_page_action(
+                        page, "goto", "error", reason="saved_conversation_reopen",
+                        identity=navigation, detail=type(exc).__name__,
+                    )
+                    raise
+                await record_page_action(
+                    page, "goto", "complete", reason="saved_conversation_reopen", identity=navigation
                 )
                 await page.locator("body").wait_for(
                     state="visible", timeout=timeout
@@ -859,7 +888,20 @@ class CDPATabActions:
             )
         except Exception:
             if created:
-                await page.close()
+                closing = await record_page_action(
+                    page, "close_tab", "start", reason="failed_conversation_reopen", identity={}
+                )
+                try:
+                    await page.close()
+                except Exception as exc:
+                    await record_page_action(
+                        page, "close_tab", "error", reason="failed_conversation_reopen",
+                        identity=closing, detail=type(exc).__name__,
+                    )
+                    raise
+                await record_page_action(
+                    page, "close_tab", "complete", reason="failed_conversation_reopen", identity=closing
+                )
             raise
 
     async def restart(
@@ -1018,7 +1060,9 @@ class CDPATabActions:
         role_scope = {**manifest, "roles": {logical_role: record}}
         selected = await self.preflight_role(role_scope, logical_role)
         if selected:
-            await self.close_team(role_scope, preflighted_pages=selected)
+            await self.close_team(
+                role_scope, preflighted_pages=selected, reason="fresh_role_replacement"
+            )
             if await self.preflight_role(role_scope, logical_role):
                 raise TeamCloseError("fresh chat could not close the previous owned role tab")
         physical = str(record["physical_role"])
@@ -1053,7 +1097,20 @@ class CDPATabActions:
                 new_chat=True,
             )
         except Exception:
-            await client.page.close()
+            closing = await record_page_action(
+                client.page, "close_tab", "start", reason="failed_fresh_role_binding"
+            )
+            try:
+                await client.page.close()
+            except Exception as exc:
+                await record_page_action(
+                    client.page, "close_tab", "error", reason="failed_fresh_role_binding",
+                    identity=closing, detail=type(exc).__name__,
+                )
+                raise
+            await record_page_action(
+                client.page, "close_tab", "complete", reason="failed_fresh_role_binding", identity=closing
+            )
             raise
 
     async def new_chat(
@@ -1359,6 +1416,7 @@ class CDPATabActions:
         manifest: Mapping[str, Any],
         *,
         preflighted_pages: Sequence[Any] | None = None,
+        reason: str = "owned_team_cleanup",
     ) -> int:
         selected = (
             list(preflighted_pages)
@@ -1367,11 +1425,22 @@ class CDPATabActions:
         )
         closed = 0
         for page in selected:
+            await action_delay(page, "close_tab", action_delay_multiplier("close_tab"))
+            closing = await record_page_action(
+                page, "close_tab", "start", reason=reason
+            )
             try:
-                await action_delay(page, "close_tab", action_delay_multiplier("close_tab"))
                 await page.close()
             except Exception as exc:
+                await record_page_action(
+                    page, "close_tab", "error", reason=reason,
+                    identity=closing, detail=type(exc).__name__,
+                )
                 if page.is_closed():
+                    await record_page_action(
+                        page, "close_tab", "complete", reason=reason,
+                        identity=closing, detail="verified_closed_after_error",
+                    )
                     closed += 1
                     continue
                 raise TeamCloseError(
@@ -1379,9 +1448,16 @@ class CDPATabActions:
                     closed_tabs=closed,
                 ) from exc
             if not page.is_closed():
+                await record_page_action(
+                    page, "close_tab", "error", reason=reason,
+                    identity=closing, detail="close_not_verified",
+                )
                 raise TeamCloseError(
                     "assigned team tab did not report closed after page.close()",
                     closed_tabs=closed,
                 )
+            await record_page_action(
+                page, "close_tab", "complete", reason=reason, identity=closing
+            )
             closed += 1
         return closed

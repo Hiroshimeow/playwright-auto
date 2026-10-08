@@ -17,6 +17,7 @@ CATALOG_VERSION = 1
 _ROUTE_KEY = re.compile(r"^[A-Z][A-Z0-9_]{0,31}$")
 _CUSTOM_PREFIX = "WF_"
 _MAX_DISPLAY_NAME = 80
+_MAX_CONTINUATION_CONTRACT = 2048
 SYSTEM_WORKFLOW_ROUTE_ORDER = ("PLAN", "DEV", "TEST", "REVIEW", "AUDIT")
 
 
@@ -33,6 +34,28 @@ def validate_workflow_route_key(value: Any) -> str:
             "uppercase letters, digits, or underscores"
         )
     return route_key
+
+
+def normalize_continuation_contract(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("workflow agent continuation_contract must be a non-empty string")
+    text = value.replace("\r\n", "\n").replace("\r", "\n")
+    if not text.strip():
+        raise ValueError("workflow agent continuation_contract must be a non-empty string")
+    if len(text) > _MAX_CONTINUATION_CONTRACT:
+        raise ValueError(
+            f"workflow agent continuation_contract must be at most {_MAX_CONTINUATION_CONTRACT} characters"
+        )
+    return text
+
+
+def system_continuation_contract(config: CDPAConfig, route_key: str) -> str:
+    key = validate_workflow_route_key(route_key)
+    path = config.response_guide_path.with_name("CONTINUATION.json")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, Mapping) or key not in value:
+        raise ValueError(f"system continuation contract is missing for {key}")
+    return normalize_continuation_contract(value[key])
 
 
 def normalize_workflow_display_name(value: Any) -> str:
@@ -74,6 +97,11 @@ def normalize_workflow_definition(
         "route_key": route_key,
         "display_name": normalize_workflow_display_name(value.get("display_name")),
         "system_prompt": normalize_system_prompt(value.get("system_prompt")),
+        "continuation_contract": (
+            normalize_continuation_contract(value.get("continuation_contract"))
+            if value.get("continuation_contract") is not None
+            else None
+        ),
         "is_system": is_system,
         "deleted_at": deleted_at,
     }
@@ -114,6 +142,7 @@ def task_workflow_definitions(
                 "system_prompt": config.constructor_paths[role]
                 .read_text(encoding="utf-8")
                 .strip(),
+                "continuation_contract": system_continuation_contract(config, role),
                 "is_system": True,
                 "deleted_at": None,
             }
@@ -132,6 +161,10 @@ def task_workflow_definitions(
             raise ValueError("task workflow snapshot must not contain deleted definitions")
         if definition["is_system"] != (route_key in config.roles):
             raise ValueError("task workflow snapshot has inconsistent system identity")
+        if definition["continuation_contract"] is None and definition["is_system"]:
+            definition["continuation_contract"] = system_continuation_contract(
+                config, route_key
+            )
         result[route_key] = definition
     if list(result) != list(roles):
         raise ValueError("workflow_agents keys must exactly match task role order")
@@ -247,6 +280,9 @@ class WorkflowAgentCatalog:
             "system_prompt": self.config.constructor_paths[route_key]
             .read_text(encoding="utf-8")
             .strip(),
+            "continuation_contract": system_continuation_contract(
+                self.config, route_key
+            ),
             "is_system": True,
             "deleted_at": None,
         }
@@ -365,11 +401,17 @@ class WorkflowAgentCatalog:
         *,
         display_name: Any,
         system_prompt: Any,
+        continuation_contract: Any = None,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
         display = normalize_workflow_display_name(display_name)
         prompt = normalize_system_prompt(system_prompt)
-        payload = {"display_name": display, "system_prompt": prompt}
+        continuation = normalize_continuation_contract(continuation_contract)
+        payload = {
+            "display_name": display,
+            "system_prompt": prompt,
+            "continuation_contract": continuation,
+        }
         payload_sha256 = self._payload_hash("create", payload)
         with exclusive_file_lock(self.lock_path):
             value = self._load_unlocked()
@@ -390,6 +432,7 @@ class WorkflowAgentCatalog:
                 "route_key": route_key,
                 "display_name": display,
                 "system_prompt": prompt,
+                "continuation_contract": continuation,
                 "is_system": False,
                 "deleted_at": None,
             }
@@ -410,15 +453,22 @@ class WorkflowAgentCatalog:
         *,
         display_name: Any,
         system_prompt: Any,
+        continuation_contract: Any = None,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
         key = validate_workflow_route_key(route_key)
         display = normalize_workflow_display_name(display_name)
         prompt = normalize_system_prompt(system_prompt)
+        continuation = (
+            system_continuation_contract(self.config, key)
+            if key in self.config.roles and continuation_contract is None
+            else normalize_continuation_contract(continuation_contract)
+        )
         payload = {
             "route_key": key,
             "display_name": display,
             "system_prompt": prompt,
+            "continuation_contract": continuation,
         }
         payload_sha256 = self._payload_hash("update", payload)
         with exclusive_file_lock(self.lock_path):
@@ -440,6 +490,7 @@ class WorkflowAgentCatalog:
                 "route_key": key,
                 "display_name": display,
                 "system_prompt": prompt,
+                "continuation_contract": continuation,
                 "is_system": key in self.config.roles,
                 "deleted_at": None,
             }

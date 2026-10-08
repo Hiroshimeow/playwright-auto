@@ -39,6 +39,8 @@ def _setup(tmp_path: Path, *, task_id: str = "task-a") -> tuple[Any, TaskStore, 
         requested_team="alpha",
         task_id=task_id,
         report_mode="file",
+        governing_objective="Regression anchor task",
+        governing_directives=[],
     )
     return config, store, state, CDPAWorker(config, store=store)
 
@@ -66,6 +68,8 @@ def test_create_command_replay_preflight_waits_under_allocation_lock_contention(
         expected_task_version=None,
         payload={
             "task": "Task created while allocation lock is held",
+            "governing_objective": "Task created while allocation lock is held",
+            "governing_directives": [],
             "requested_team": "contention-team",
             "repository": str(tmp_path),
             "report_mode": "file",
@@ -130,6 +134,8 @@ def test_create_command_replay_idempotency_preserved_under_allocation_lock_conte
         expected_task_version=None,
         payload={
             "task": "Idempotent task creation",
+            "governing_objective": "Idempotent task creation",
+            "governing_directives": [],
             "requested_team": "replay-team",
             "repository": str(tmp_path),
             "report_mode": "file",

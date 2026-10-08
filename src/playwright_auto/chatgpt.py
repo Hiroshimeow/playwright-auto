@@ -737,22 +737,52 @@ async def open_new_chat(page: Any, timeout_ms: int = 8_000) -> str:
         }""",
         SELECTORS["new_chat"],
     )
+    fallback_reason = "new_chat_dom_missing"
     if clicked:
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+        ready = """() => {
+          const composer = (__CDPA_COMPOSER_RESOLVER__)().element;
+          return location.pathname === '/' && Boolean(composer) &&
+            !((composer.innerText || '').trim());
+        }""".replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS)
         try:
-            await page.wait_for_function(
-                """() => {
-                  const composer = (__CDPA_COMPOSER_RESOLVER__)().element;
-                  return location.pathname === '/' && Boolean(composer) &&
-                    !((composer.innerText || '').trim());
-                }""".replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS),
-                timeout=timeout_ms,
-            )
+            await page.wait_for_function(ready, timeout=timeout_ms)
+        except (TimeoutError, PlaywrightTimeoutError):
+            fallback_reason = "new_chat_dom_timeout"
+            # The click may already have committed despite a readiness timeout.
+            # Transport/renderer errors are not authorization to navigate again.
+            if await page.evaluate(ready):
+                await record_page_action(page, "new_chat", "complete", detail="dom")
+                return "dom"
+        else:
             await record_page_action(page, "new_chat", "complete", detail="dom")
             return "dom"
-        except Exception:
-            pass
 
-    await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
+    # Pre-click discard permission does not authorize discarding input that
+    # appeared while the UI transition/readiness observation was pending.
+    probe = await asyncio.wait_for(
+        inspect_chatgpt_wait_probe(page), timeout=max(timeout_ms, 1) / 1000
+    )
+    if probe.composer_ambiguous or probe.composer_text.strip() or probe.attachment_count:
+        raise ComposerConflictError(
+            "New chat fallback would discard current draft or attachments, "
+            "or composer ownership is ambiguous"
+        )
+    navigation = await record_page_action(
+        page, "goto", "start", reason=fallback_reason
+    )
+    try:
+        await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
+    except Exception as exc:
+        await record_page_action(
+            page, "goto", "error", reason=fallback_reason,
+            identity=navigation, detail=type(exc).__name__,
+        )
+        raise
+    await record_page_action(
+        page, "goto", "complete", reason=fallback_reason, identity=navigation
+    )
     await page.wait_for_function(
         """() => Boolean((__CDPA_COMPOSER_RESOLVER__)().element)"""
         .replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS),
@@ -763,8 +793,24 @@ async def open_new_chat(page: Any, timeout_ms: int = 8_000) -> str:
     return "navigate"
 
 
-async def refresh_page(page: Any, timeout_ms: int = 15_000) -> None:
-    await page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
+async def refresh_page(
+    page: Any, timeout_ms: int = 15_000, *, reason: str | None = None,
+    identity: dict[str, Any] | None = None,
+) -> None:
+    reload_event = await record_page_action(
+        page, "reload", "start", reason=reason, identity=identity
+    )
+    try:
+        await page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
+    except Exception as exc:
+        await record_page_action(
+            page, "reload", "error", reason=reason, identity=reload_event,
+            detail=type(exc).__name__,
+        )
+        raise
+    await record_page_action(
+        page, "reload", "complete", reason=reason, identity=reload_event
+    )
 
 
 async def click_send_button(
@@ -3928,6 +3974,7 @@ class ChatGPTPage:
         *,
         allow_responding: bool = True,
         timeout_ms: int | None = None,
+        reason: str | None = None,
     ) -> None:
         from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -3949,8 +3996,17 @@ class ChatGPTPage:
                 ),
                 timeout=observation_timeout,
             )
+            refresh_event = await record_page_action(
+                self.page, "refresh", "start", reason=reason,
+                identity={"page_url": before.url, "page_id": before.page_id,
+                          "role": before.page_role, "task_id": before.page_task_id,
+                          "team": before.page_team},
+            )
+            committed_reload = False
             try:
-                await refresh_page(self.page, timeout_ms=timeout)
+                await refresh_page(
+                    self.page, timeout_ms=timeout, reason=reason, identity=refresh_event,
+                )
             except (TimeoutError, PlaywrightTimeoutError) as reload_error:
                 async def verify_committed_reload() -> bool:
                     after = await self.assert_ownership(
@@ -4011,16 +4067,44 @@ class ChatGPTPage:
                     verified = await asyncio.wait_for(
                         verify_committed_reload(), timeout=observation_timeout
                     )
-                except (TimeoutError, PlaywrightTimeoutError) as post_error:
-                    raise reload_error from post_error
-                except (PageOwnershipError, AuthenticationRequiredError):
+                except (PageOwnershipError, AuthenticationRequiredError) as post_error:
+                    await record_page_action(
+                        self.page, "refresh", "error", reason=reason,
+                        identity=refresh_event, detail=type(post_error).__name__,
+                    )
                     raise reload_error
                 except Exception as post_error:
+                    await record_page_action(
+                        self.page, "refresh", "error", reason=reason,
+                        identity=refresh_event, detail=type(post_error).__name__,
+                    )
                     raise reload_error from post_error
                 if not verified:
+                    await record_page_action(
+                        self.page, "refresh", "error", reason=reason,
+                        identity=refresh_event, detail="reload_commit_not_verified",
+                    )
                     raise reload_error
+                committed_reload = True
+            except Exception as exc:
+                await record_page_action(
+                    self.page, "refresh", "error", reason=reason,
+                    identity=refresh_event, detail=type(exc).__name__,
+                )
+                raise
             else:
-                await self.assert_ownership(require_binding=self.binding is not None)
+                try:
+                    await self.assert_ownership(require_binding=self.binding is not None)
+                except Exception as exc:
+                    await record_page_action(
+                        self.page, "refresh", "error", reason=reason,
+                        identity=refresh_event, detail=type(exc).__name__,
+                    )
+                    raise
+            await record_page_action(
+                self.page, "refresh", "complete", reason=reason, identity=refresh_event,
+                detail="verified_committed_reload" if committed_reload else "verified_ownership",
+            )
             self._owned_composer_text = None
 
     async def _wait_send_acceptance(
@@ -4315,7 +4399,14 @@ class ChatGPTPage:
                         self.page.evaluate(probe), timeout=probe_timeout
                     )
                     try:
-                        await refresh_page(self.page, timeout_ms=timeout)
+                        await refresh_page(
+                            self.page, timeout_ms=timeout, reason="send_recovery",
+                            identity={"page_url": recovery_before.url,
+                                      "page_id": recovery_before.page_id,
+                                      "role": recovery_before.page_role,
+                                      "task_id": recovery_before.page_task_id,
+                                      "team": recovery_before.page_team},
+                        )
                     except (TimeoutError, PlaywrightTimeoutError) as reload_error:
                         async def reconcile_committed_acceptance():
                             recovered = await self.assert_ownership()
@@ -4725,6 +4816,8 @@ class ChatGPTPage:
 
             if candidate_present and candidate is not None:
                 if current_fingerprint != candidate_fingerprint:
+                    if candidate_fingerprint and snapshot.stop_visible:
+                        active_since = now
                     candidate_fingerprint = current_fingerprint
                     candidate_since = now
                     candidate_samples = 1
@@ -4823,7 +4916,12 @@ class ChatGPTPage:
                             receipt.baseline,
                         ),
                     )
-                    await refresh_page(self.page, timeout_ms=timeout)
+                    await refresh_page(
+                        self.page, timeout_ms=timeout, reason="legacy_active_response_stall",
+                        identity={"page_url": snapshot.url, "page_id": snapshot.page_id,
+                                  "role": snapshot.page_role, "task_id": snapshot.page_task_id,
+                                  "team": snapshot.page_team},
+                    )
                     await self.wait_snapshot(receipt, force_full=True)
                     reload_used = True
                     recovery_suspected = skeptical_after_reload

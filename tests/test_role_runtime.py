@@ -165,11 +165,11 @@ def test_operator_continuation_without_rendered_receipt_user_is_valid_steering()
     assert result.response.message_id == "operator-answer"
 
 
-def test_valid_result_can_finish_despite_stuck_stop():
+def test_bound_result_waits_while_current_page_generation_is_active():
     current = current_result(stop_visible=True)
     wait = {}
     step(current, wait)
-    assert step(current, wait, 5).action is Action.ACCEPT
+    assert step(current, wait, 5).action is Action.WAIT
 
 
 def invalid(_candidate):
@@ -275,6 +275,57 @@ def test_timeout_refreshes_at_ten_minutes_regardless_of_stop(stop):
     step(current, wait)
     assert step(current, wait, 599).action is Action.WAIT
     assert step(current, wait, 600).action is Action.REFRESH
+
+
+def test_bound_dom_progress_restarts_stall_clock_but_not_on_first_observation():
+    wait = {"started_at": NOW.isoformat(), "controller_progress_at": NOW.isoformat()}
+    def streaming(text):
+        return snapshot(messages=(
+            MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
+            MessageSnapshot("assistant", "answer", "answer-turn", text, ()),
+        ), stop_visible=True)
+
+    assert step(streaming("draft"), wait).action is Action.WAIT
+    assert wait["controller_progress_at"] == NOW.isoformat()
+    assert step(streaming("draft growing"), wait, 590).action is Action.WAIT
+    assert wait["controller_progress_at"] == (NOW + timedelta(seconds=590)).isoformat()
+    assert step(streaming("draft growing"), wait, 600).action is Action.WAIT
+    assert step(streaming("draft growing"), wait, 1190).action is Action.REFRESH
+
+
+@pytest.mark.parametrize("changed", [True, False])
+def test_bound_dom_virtualization_keeps_progress_history_without_stability(changed):
+    wait = {"started_at": NOW.isoformat(), "controller_progress_at": NOW.isoformat()}
+
+    def streaming(text):
+        return snapshot(messages=(
+            MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
+            MessageSnapshot("assistant", "answer", "answer-turn", text, ()),
+        ), stop_visible=True)
+
+    assert step(streaming("draft"), wait).action is Action.WAIT
+    assert step(snapshot(stop_visible=True), wait, 590).action is Action.WAIT
+    assert "result_seen_at" not in wait
+    assert "result_samples" not in wait
+    assert step(streaming("draft growing" if changed else "draft"), wait, 599).action is Action.WAIT
+    assert wait["result_seen_at"] == (NOW + timedelta(seconds=599)).isoformat()
+    assert wait["result_samples"] == 1
+    assert wait["controller_progress_at"] == (NOW + timedelta(seconds=599 if changed else 0)).isoformat()
+    assert step(streaming("draft growing" if changed else "draft"), wait, 600).action is Action.WAIT
+    assert step(streaming("draft growing" if changed else "draft"), wait, 604).action is (
+        Action.WAIT if changed else Action.REFRESH
+    )
+
+
+def test_unbound_output_cannot_extend_exact_response_stall():
+    wait = {"started_at": NOW.isoformat(), "controller_progress_at": NOW.isoformat()}
+    step(current_result("draft", stop_visible=True), wait)
+    unrelated = snapshot(messages=(
+        MessageSnapshot("user", "unrelated-user", "other-turn", "other", ()),
+        MessageSnapshot("assistant", "other-answer", "other-turn", "unrelated", ()),
+    ), stop_visible=True)
+    assert step(unrelated, wait, 590).action is Action.WAIT
+    assert step(unrelated, wait, 600).action is Action.REFRESH
 
 
 def test_post_send_composer_does_not_block_timeout_recovery():
@@ -510,14 +561,14 @@ def test_duplicate_receipt_user_identity_blocks():
     assert result.reason == "duplicate_receipt_user_identity"
 
 
-def test_completed_action_is_required_for_bound_terminal_result():
+def test_completed_action_is_not_required_for_bound_terminal_result():
     wait = {}
     current = snapshot(messages=(
         MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
         MessageSnapshot("assistant", "answer", "answer-turn", "done", ()),
     ))
     assert step(current, wait).action is Action.WAIT
-    assert step(current, wait, 5).action is Action.WAIT
+    assert step(current, wait, 5).action is Action.ACCEPT
     completed = snapshot(messages=(
         MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
         MessageSnapshot(
@@ -549,7 +600,7 @@ def test_history_after_allow_never_refreshes_old_conversation():
 
 def test_timeout_refresh_preserves_clock_until_post_reload_state_changes():
     class Client:
-        async def refresh(self):
+        async def refresh(self, *, reason=None):
             return None
 
     wait = {"controller_progress_at": NOW.isoformat()}
@@ -593,19 +644,22 @@ def test_empty_assistant_placeholder_does_not_hide_completed_result():
 def test_correlated_listen_result_waits_five_seconds_before_accept():
     current = snapshot(messages=(
         MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
-        MessageSnapshot("assistant", "answer", "answer-turn", "partial", ()),
     ))
     listen = MessageSnapshot(
         "assistant", "answer", "answer-turn", '{"route":"REVIEW"}',
         ("copy-turn-action-button",),
     )
-    wait = {}
+    wait = {
+        "bound_assistant_message_id": "answer",
+        "bound_assistant_turn_id": "answer-turn",
+    }
     first = step(current, wait, network_response=listen)
     assert first.action is Action.WAIT
     assert wait["listen_result_samples"] == 1
     result = step(current, wait, 5, network_response=listen)
     assert result.action is Action.ACCEPT
     assert result.reason == "valid_bound_result"
+    assert wait["terminal_response_source"] == "listen"
 
 
 def test_choice_prompt_waits_instead_of_blocking_task():
@@ -658,6 +712,7 @@ def test_uncorrelated_listen_response_cannot_replace_bound_dom_response():
     result = step(dom, wait, 5, network_response=listen)
     assert result.action is Action.ACCEPT
     assert result.response.message_id == "answer"
+    assert wait["terminal_response_source"] == "dom"
 
 
 def test_bound_dom_response_finishes_without_listen_response():
@@ -667,6 +722,7 @@ def test_bound_dom_response_finishes_without_listen_response():
     result = step(dom, wait, 5)
     assert result.action is Action.ACCEPT
     assert result.response.message_id == "answer"
+    assert wait["terminal_response_source"] == "dom"
 
 
 def test_stale_unrelated_listen_streaming_cannot_block_terminal_bound_dom():
@@ -676,6 +732,50 @@ def test_stale_unrelated_listen_streaming_cannot_block_terminal_bound_dom():
     result = step(dom, wait, 5, network_status="IS_STREAMING")
     assert result.action is Action.ACCEPT
     assert result.response.message_id == "answer"
+    assert wait["terminal_response_source"] == "dom"
+
+
+def test_terminal_bound_dom_does_not_require_completion_action_buttons():
+    dom = snapshot(
+        messages=(
+            MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
+            MessageSnapshot("assistant", "answer", "answer-turn", '{"route":"DEV"}', ()),
+        ),
+        stop_visible=False,
+        response_activity_turn_id=None,
+    )
+    wait = {}
+    assert step(dom, wait, network_status="IS_STREAMING").reason == "result_stability"
+    result = step(dom, wait, 5, network_status="IS_STREAMING")
+    assert result.action is Action.ACCEPT
+    assert result.reason == "valid_bound_result"
+
+
+@pytest.mark.parametrize(
+    "current",
+    (
+        snapshot(
+            messages=(
+                MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
+                MessageSnapshot("assistant", "answer", "answer-turn", '{"route":"DEV"}', ()),
+            ),
+            stop_visible=False,
+            response_activity_turn_id="answer-turn",
+        ),
+        snapshot(
+            messages=(
+                MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
+                MessageSnapshot("assistant", "answer", "answer-turn", '{"route":"DEV"}', ()),
+            ),
+            stop_visible=False,
+            retry_visible=True,
+        ),
+    ),
+)
+def test_terminal_bound_dom_rejects_active_generation_or_retry(current):
+    wait = {}
+    step(current, wait)
+    assert step(current, wait, 5).action is not Action.ACCEPT
 
 
 def test_stale_response_activity_turn_id_is_audit_evidence_not_presend_gate():

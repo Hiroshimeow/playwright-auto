@@ -76,10 +76,26 @@ def observe_candidate(
         return
 
     if ctx.wait.get(key_name) != key:
+        bound_progress = ctx.wait.get("bound_assistant_progress")
+        if source == "dom" and ctx.phase == "waiting" and isinstance(bound_progress, dict):
+            previous_key = bound_progress.get("fingerprint")
+            previous_text = str(bound_progress.get("text") or "")
+            if not previous_key and len(previous_text) < 8000:
+                previous_key = hashlib.sha256(previous_text.encode("utf-8")).hexdigest()
+            if previous_key and previous_key != key and (
+                (ctx.wait.get("bound_assistant_message_id")
+                 and bound_progress.get("message_id") == ctx.wait.get("bound_assistant_message_id")
+                 and getattr(candidate, "message_id", None) == ctx.wait.get("bound_assistant_message_id"))
+                or (ctx.wait.get("bound_assistant_turn_id")
+                    and bound_progress.get("turn_id") == ctx.wait.get("bound_assistant_turn_id")
+                    and getattr(candidate, "turn_id", None) == ctx.wait.get("bound_assistant_turn_id"))
+            ):
+                ctx.wait["controller_progress_at"] = ctx.now.isoformat()
         if getattr(ctx, "phase", "wait") != "pre_send":
             progress = {
                 "source": source,
                 "text": str(candidate.text or "")[:8000],
+                "fingerprint": key,
                 "message_id": getattr(candidate, "message_id", None),
                 "turn_id": getattr(candidate, "turn_id", None),
                 "observed_at": ctx.now.isoformat(),
@@ -177,27 +193,16 @@ def handle(ctx: Context) -> Decision | None:
     if not str(getattr(candidate, "text", "") or "").strip() and not getattr(candidate, "image_count", 0):
         return None
 
-    actions = tuple(getattr(candidate, "actions", ()) or ())
-    completed_action = any(
-        "copy" in str(action).lower()
-        or "feedback" in str(action).lower()
-        or "regenerate" in str(action).lower()
-        for action in actions
-    )
     bound_turn_id = str(ctx.wait.get("bound_assistant_turn_id") or "").strip()
     activity_turn_id = str(getattr(ctx.snapshot, "response_activity_turn_id", "") or "").strip()
     bound_generation_active = bool(
         bound_turn_id and activity_turn_id and bound_turn_id == activity_turn_id
     )
-    resume_terminal = bool(ctx.wait.get("resume_allow_missing_completion_action"))
-    if bound_generation_active:
-        return None
-    if not completed_action and not resume_terminal:
-        return None
-    if resume_terminal and (
-        bool(getattr(ctx.snapshot, "response_projection_active", False))
+    if (
+        bound_generation_active
+        or bool(getattr(ctx.snapshot, "stop_visible", False))
+        or bool(getattr(ctx.snapshot, "response_projection_active", False))
         or bool(getattr(ctx.snapshot, "retry_visible", False))
-        or bool(getattr(ctx.snapshot, "blocking_dialogs", ()))
         or bool(getattr(ctx.snapshot, "error_texts", ()))
     ):
         return None

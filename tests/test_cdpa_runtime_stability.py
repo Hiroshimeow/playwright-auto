@@ -129,6 +129,8 @@ def _setup(tmp_path: Path):
         "Repair shared runtime boundaries",
         requested_team="alpha",
         task_id="task-rate-a",
+        governing_objective="Repair shared runtime boundaries",
+        governing_directives=[],
     )
     worker = CDPAWorker(config, store=store)
     worker.runtime_db.ensure_schema()
@@ -626,7 +628,13 @@ def test_blocked_workflow_pause_resume_restores_exact_block(tmp_path: Path):
 def test_pre_send_page_already_responding_is_observed_not_blocked(tmp_path: Path, monkeypatch):
     _config, store, state, worker = _setup(tmp_path)
     endpoint_id = state["browser_endpoint_id"]
-    state["endpoint_pinned"] = True
+    path = Path(state["manifest_path"])
+
+    def persist_initial_placement(current):
+        assert worker._prepare_execution_endpoint(current, endpoint_id) is True
+        return current
+
+    state = store.update_initial_placement(path, persist_initial_placement)
     role = state["roles"]["PLAN"]
     role.update(
         browser_endpoint_id=endpoint_id,

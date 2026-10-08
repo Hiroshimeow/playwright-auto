@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -376,6 +378,9 @@ def append_action_event(
     page_id: str | None = None,
     role: str | None = None,
     task_id: str | None = None,
+    team: str | None = None,
+    reason: str | None = None,
+    action_id: str | None = None,
     delay_seconds: float | None = None,
     detail: str | None = None,
 ) -> dict[str, Any]:
@@ -391,6 +396,9 @@ def append_action_event(
         "page_id": page_id,
         "role": role,
         "task_id": task_id,
+        "team": team,
+        "reason": reason,
+        "action_id": action_id,
         "delay_seconds": delay_seconds,
         "detail": detail,
     }
@@ -466,45 +474,65 @@ async def record_page_action(
     *,
     delay_seconds: float | None = None,
     detail: str | None = None,
+    reason: str | None = None,
+    action_id: str | None = None,
+    identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # Terminal mutation events reuse the pre-mutation identity: a destroyed
+    # renderer cannot erase attribution or require another page inspection.
     metadata: dict[str, Any] = {}
     try:
-        metadata = await page.evaluate(
+        metadata = identity if identity is not None else await asyncio.wait_for(page.evaluate(
             """() => ({
               page_id: sessionStorage.getItem('playwright-auto:page-id'),
               role: sessionStorage.getItem('playwright-auto:role'),
               task_id: sessionStorage.getItem('playwright-auto:task-id'),
               team: sessionStorage.getItem('playwright-auto:team'),
             })"""
-        )
+        ), timeout=0.25)
     except Exception:
         metadata = {}
     if not isinstance(metadata, dict):
         metadata = {}
-    page_url = str(getattr(page, "url", "") or "")
-    event = append_action_event(
-        action,
-        phase,
-        page_url=page_url,
-        page_id=metadata.get("page_id"),
-        role=metadata.get("role"),
-        task_id=metadata.get("task_id"),
-        delay_seconds=delay_seconds,
-        detail=detail,
+    try:
+        page_url = str(getattr(page, "url", "") or metadata.get("page_url") or "")
+    except Exception:
+        page_url = str(metadata.get("page_url") or "")
+    action_id = action_id or (identity or {}).get("action_id")
+    if phase == "start" and action_id is None:
+        action_id = f"action-{uuid4().hex}"
+    fields = dict(
+        page_url=page_url, page_id=metadata.get("page_id"),
+        role=metadata.get("role"), task_id=metadata.get("task_id"),
+        team=metadata.get("team"), reason=reason, action_id=action_id,
+        delay_seconds=delay_seconds, detail=detail,
     )
-    append_live_event(
-        "ACTION",
-        f"{action}:{phase}",
-        page_url=page_url,
-        page_id=metadata.get("page_id"),
-        role=metadata.get("role"),
-        task_id=metadata.get("task_id"),
-        team=metadata.get("team"),
-        values={
-            "action": str(action),
-            "phase": str(phase),
-            **({"delay_seconds": delay_seconds} if delay_seconds is not None else {}),
-        },
-        detail=detail,
-    )
+    try:
+        event = append_action_event(action, phase, **fields)
+    except OSError:
+        # Observation must not turn an applied mutation into a retry decision.
+        # Return captured identity for correlation, not a fabricated persisted event.
+        logging.getLogger(__name__).warning("Action telemetry unavailable (OSError)")
+        event = {"action": action, "phase": phase, **fields, "logging_error": "OSError"}
+    try:
+        append_live_event(
+            "ACTION",
+            f"{action}:{phase}",
+            page_url=page_url,
+            page_id=metadata.get("page_id"),
+            role=metadata.get("role"),
+            task_id=metadata.get("task_id"),
+            team=metadata.get("team"),
+            values={
+                "action": str(action),
+                "phase": str(phase),
+                "reason": reason,
+                "action_id": action_id,
+                **({"delay_seconds": delay_seconds} if delay_seconds is not None else {}),
+            },
+            detail=detail,
+        )
+    except OSError:
+        logging.getLogger(__name__).warning("Live action telemetry unavailable (OSError)")
+        event["logging_error"] = "OSError"
     return event

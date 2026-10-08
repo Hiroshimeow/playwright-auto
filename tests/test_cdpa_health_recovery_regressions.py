@@ -22,6 +22,8 @@ def test_required_temporary_endpoint_ownership_persists_before_pre_send_and_rest
         requested_team="temporary-required-endpoint",
         required_browser_endpoint_id=required["endpoint_id"],
         temporary=True,
+        governing_objective="Temporary required endpoint",
+        governing_directives=[],
     )
     path = Path(task["manifest_path"])
     worker = CDPAWorker(config, store=store)
