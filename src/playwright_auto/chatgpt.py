@@ -1824,7 +1824,7 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             attachment_count: attachmentCount,
             stop_visible: Boolean(stop),
             retry_visible: Boolean(retry),
-            transport_active: Boolean(activeResponse),
+            transport_active: Boolean(stop) || Boolean(projection.active),
             error_texts: errors,
             blocking_dialogs: dialogs,
             choice_prompt_labels: [...new Set(choices)],
@@ -1838,7 +1838,7 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             assistant_text_tail: assistantShape.tail,
             response_activity_length: activityShape.length,
             response_activity_tail: activityShape.tail,
-            response_activity_turn_id: projection.active ? projection.turn_id : logicalTurnId(activeResponse, 'assistant'),
+            response_activity_turn_id: projection.active ? projection.turn_id : null,
             response_segments: projection.segments,
             response_projection_active: Boolean(projection.active),
             last_user_text: lastUser ? boundedText(lastUser, 12000) : (semanticUser?.text || ''),
@@ -2219,7 +2219,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
                 .filter(Boolean)
                 .join('|')
             : (semanticAssistant ? 'semantic-assistant' : '');
-          const responseActivityTurnId = projection.active ? projection.turn_id : logicalTurnId(activeResponse, 'assistant');
+          const responseActivityTurnId = projection.active ? projection.turn_id : null;
 
           const requiresLogin = location.hostname === 'auth.openai.com' || Boolean(login);
           const authCallbackError = location.hostname === 'chatgpt.com' && location.pathname === '/auth/error';

@@ -102,6 +102,95 @@ def test_modern_semantic_dom_preserves_exact_identity_completion_actions_and_spa
     asyncio.run(_with_page(modern_semantic_dom(), run))
 
 
+def completed_stream_dom():
+    return f"""
+        <main>
+          <section data-turn-key="{_MODERN_TURN_KEY}">
+            <div data-chatgpt-search-unit-key="fallback-turn-0:0:user"
+                 data-chatgpt-search-message-ids="{_MODERN_TURN_KEY}"></div>
+            <article><h4>You said:</h4><div>original task</div></article>
+            <div data-streaming-response-status="complete">done</div>
+            <article data-chatgpt-search-unit-key="fallback-turn-0:2:assistant"
+                     data-chatgpt-search-message-ids="{_MODERN_ASSISTANT_ID}">
+              <h4>ChatGPT said:</h4>
+              <div>{"{"}\"route\":\"DONE\",\"handoff\":\"complete\"{"}"}</div>
+            </article>
+          </section>
+          <div contenteditable="true" role="textbox"></div>
+        </main>
+    """
+
+
+def test_completed_stream_marker_is_quiescent_not_active_generation():
+    async def run(page):
+        probe = await inspect_chatgpt_wait_probe(page)
+        current = await inspect_chatgpt_page(page)
+
+        assert probe.response_projection_active is False
+        assert probe.transport_active is False
+        assert probe.response_activity_turn_id is None
+        assert current.response_projection_active is False
+        assert current.response_activity_turn_id is None
+
+    asyncio.run(_with_page(completed_stream_dom(), run))
+
+
+def test_completion_transition_invalidates_active_wait_cache():
+    async def run(page):
+        active_html = completed_stream_dom().replace(
+            'data-streaming-response-status="complete">done',
+            'data-streaming-response-status="streaming">working',
+        )
+        await page.set_content(active_html)
+        client = ChatGPTPage(page, timeout_ms=5_000)
+        client.binding = PageBinding("page-1", "DEV")
+
+        first = await client.wait_snapshot(semantic_request(), force_full=True)
+        assert first.response_projection_active is True
+        assert first.response_activity_turn_id == f"group:assistant:{_MODERN_TURN_KEY}"
+
+        await page.locator('[data-streaming-response-status]').evaluate(
+            """node => {
+                node.setAttribute('data-streaming-response-status', 'complete');
+                node.textContent = 'done';
+            }"""
+        )
+
+        completed = await client.wait_snapshot(semantic_request())
+        assert completed.response_projection_active is False
+        assert completed.response_activity_turn_id is None
+
+    asyncio.run(_with_page(completed_stream_dom(), run))
+
+
+def test_valid_completed_dom_routes_within_five_seconds_without_completion_actions():
+    async def run(page):
+        current = await inspect_chatgpt_page(page)
+        wait = {}
+        controller = RoleController()
+        t0 = datetime(2026, 10, 8, tzinfo=timezone.utc)
+
+        first = controller.decide(
+            current,
+            wait,
+            receipt=semantic_request(),
+            now=t0,
+        )
+        assert first.reason == "result_stability"
+
+        result = controller.decide(
+            current,
+            wait,
+            receipt=semantic_request(),
+            now=t0 + timedelta(seconds=5),
+        )
+        assert result.action is Action.ACCEPT
+        assert result.reason == "valid_bound_result"
+        assert result.response.message_id == _MODERN_ASSISTANT_ID
+
+    asyncio.run(_with_page(completed_stream_dom(), run))
+
+
 def test_modern_semantic_bound_dom_terminalizes_despite_stale_listen_streaming():
     async def run(page):
         current = await inspect_chatgpt_page(page)
