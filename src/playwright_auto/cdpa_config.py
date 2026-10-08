@@ -321,7 +321,7 @@ def load_cdpa_config(
             minimum=0.0,
             maximum=60.0,
         ),
-        response_stable_ms=int(_positive(response.get("stable_ms", 1000), "response.stable_ms", integer=True)),
+        response_stable_ms=int(_positive(response.get("stable_ms", 5000), "response.stable_ms", integer=True)),
         response_poll_ms=int(_positive(response.get("poll_ms", 5000), "response.poll_ms", integer=True)),
         independent_seed_builtins=bool(
             independent_agents.get("seed_builtins", True)
