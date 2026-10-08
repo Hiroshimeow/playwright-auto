@@ -121,6 +121,19 @@ def completed_stream_dom():
     """
 
 
+def test_full_snapshot_uses_main_that_owns_latest_chat_turn():
+    async def run(page):
+        html = '<main id="decoy"><div>shell</div></main>' + completed_stream_dom()
+        await page.set_content(html)
+        current = await inspect_chatgpt_page(page)
+
+        assert current.messages[-1].message_id == _MODERN_ASSISTANT_ID
+        assert current.messages[-1].turn_id == f"group:assistant:{_MODERN_TURN_KEY}"
+        assert '"route":"DONE"' in current.messages[-1].text
+
+    asyncio.run(_with_page(completed_stream_dom(), run))
+
+
 def test_completed_stream_marker_is_quiescent_not_active_generation():
     async def run(page):
         probe = await inspect_chatgpt_wait_probe(page)

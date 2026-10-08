@@ -2106,7 +2106,9 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             .filter(Boolean)
             .slice(0, 12);
 
-          const chatRoot = document.querySelector('main') || document.body;
+          const latestTurnRoot = [...document.querySelectorAll('[data-turn-key],[data-turn-id],[data-turn-id-container]')]
+            .filter(visible).at(-1) || null;
+          const chatRoot = latestTurnRoot?.closest('main') || composer?.closest('main') || document.body;
           const logicalTurnId = (element, role) => {
             const turnId = element?.closest('[data-turn-id]')?.getAttribute('data-turn-id');
             if (turnId) return turnId;
