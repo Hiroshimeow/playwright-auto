@@ -47,3 +47,7 @@ Thumbs.db
 .env.*
 !.env.example
 evolution_evidence/
+
+# Local CDPA scratch / monitoring artifacts
+.tmp/
+.hcu/cdpa-monitor-ledger.jsonl
