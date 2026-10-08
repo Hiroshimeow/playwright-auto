@@ -205,7 +205,7 @@ class PromptBuilder:
                 custom_constructor_included = True
             if normalized_constructor is None or skill_guidance not in normalized_constructor:
                 sections.append(skill_guidance)
-        if turn_number > 1 and governing_contract:
+        if governing_contract:
             sections.append(str(governing_contract))
         if bounded_context:
             sections.append("RECOVERY_CONTEXT\n" + str(bounded_context).strip())

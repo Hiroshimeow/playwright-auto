@@ -74,6 +74,35 @@ def test_first_turn_normal_prompt_is_goal_route_report_only(tmp_path: Path):
     assert len(prompt) <= 2200
 
 
+def test_first_turn_includes_authoritative_governing_contract_when_available(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    semantic = '{"objective":"authoritative objective","directives":["directive one"]}'
+    block = PromptBuilder.governing_block(semantic, "continue role", "{}")
+    prompt = PromptBuilder(config).build(
+        task_title="First turn authority",
+        task_id="task-first-authority",
+        team="alpha",
+        logical_role="PLAN",
+        physical_role="alpha-plan",
+        turn=1,
+        allowed_routes=("PLAN", "DEV", "REVIEW", "DONE"),
+        workspace=str(ROOT),
+        source_physical_role=None,
+        handoff="Initial task intake; no prior role handoff.",
+        goal="Human-readable task summary.",
+        expected_report_path=".plan/alpha/alpha-plan_turn1_task-first-authority.md",
+        constructor_sent_generation=None,
+        conversation_generation=0,
+        governing_contract=block,
+    ).text
+
+    assert "Goal: Human-readable task summary." in prompt
+    assert "GOVERNING_SEMANTIC_SOURCE" in prompt
+    assert semantic in prompt
+    assert "ROLE_CONTINUATION_CONTRACT" in prompt
+    assert "GOVERNING_EXECUTION_FACTS_REF" in prompt
+
+
 def test_windows_tool_authority_is_session_generic_without_path_guessing(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     prompt = PromptBuilder(config).build(

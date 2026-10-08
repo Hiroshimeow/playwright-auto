@@ -5970,11 +5970,6 @@ class CDPAWorker:
             not is_independent_task(state)
             and str(state.get("workflow_mode") or "team").strip().lower() == "team"
             and prompt_kind not in {"route_repair", "report_repair"}
-            and (
-                int(hop.get("turn") or 0) > 1
-                or str(hop.get("kind") or "")
-                in {"execution_recovery", "accepted_send_reconciliation"}
-            )
         )
         if substantive_team_hop:
             try:
