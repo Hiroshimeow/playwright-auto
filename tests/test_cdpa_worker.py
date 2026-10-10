@@ -2483,8 +2483,9 @@ def test_open_tab_reconciles_preboundary_acquisition_timeout_without_requiring_c
     assert state["roles"]["PLAN"]["page_url"] == conversation_url
 
 
+@pytest.mark.parametrize("via", ["user_message_identity", "stop_button"])
 def test_open_tab_recovers_waiting_accepted_send_on_exact_conversation_without_resend(
-    tmp_path: Path,
+    tmp_path: Path, via: str,
 ):
     _, _, state, worker = setup_task(
         tmp_path, task_id="task-open-tab-waiting-accepted"
@@ -2496,9 +2497,10 @@ def test_open_tab_recovers_waiting_accepted_send_on_exact_conversation_without_r
         "prompt": "accepted prompt",
         "prompt_sha256": "digest",
         "binding": {"page_id": "closed-page", "role": "alpha-plan"},
-        "accepted_via": "user_message_identity",
-        "user_message_id": "accepted-user-message",
-        "user_turn_id": "accepted-user-turn",
+        "accepted_via": via,
+        "user_message_id": "accepted-user-message" if via == "user_message_identity" else None,
+        "user_turn_id": "accepted-user-turn" if via == "user_message_identity" else None,
+        "attempts": 1,
     }
     hop.update(
         state="waiting",
@@ -2599,7 +2601,7 @@ def test_open_tab_reconciles_stale_web_command_snapshot_from_exact_ledger(tmp_pa
         tmp_path, task_id="task-open-tab-stale-web"
     )
     provisional_url = "https://chatgpt.com/c/WEB:stale-open-tab"
-    canonical_id = "canonical-open-tab"
+    canonical_id = "11111111-1111-4111-8111-111111111111"
     canonical_url = f"https://chatgpt.com/c/{canonical_id}"
     hop["conversation_url"] = provisional_url
     state["roles"]["PLAN"].update(page_url=provisional_url, online=False)
@@ -2678,7 +2680,7 @@ def test_open_tab_rejects_conflicting_canonical_snapshot_after_ledger_reconcile(
     )
     command_state = json.loads(json.dumps(state))
     command_hop = _active_hop(command_state)
-    command_hop["conversation_url"] = "https://chatgpt.com/c/conflicting-canonical"
+    command_hop["conversation_url"] = "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222"
     command_state["roles"]["PLAN"]["page_url"] = command_hop["conversation_url"]
     command = WorkerCommand.create(
         origin="operator",
@@ -2689,7 +2691,7 @@ def test_open_tab_rejects_conflicting_canonical_snapshot_after_ledger_reconcile(
     )
     RequestLedger(hop["ledger_path"]).update(
         hop["request_id"],
-        receipt=replace(receipt, conversation_id="durable-canonical").to_dict(),
+        receipt=replace(receipt, conversation_id="11111111-1111-4111-8111-111111111111").to_dict(),
     )
     state["controls"] = [
         {

@@ -228,6 +228,42 @@ def test_response_timeout_is_not_threaded_into_send_acceptance(tmp_path):
     assert client.send_timeout_ms is None
 
 
+def test_stop_button_send_receipt_without_user_id_is_durably_sent_once(tmp_path):
+    from dataclasses import replace
+
+    class StopFirstClient(FakeDurableClient):
+        async def send(self, text, **options):
+            accepted = await super().send(text, **options)
+            return replace(
+                accepted,
+                accepted_via="stop_button",
+                user_message_id=None,
+                user_turn_id=None,
+            )
+
+    ledger_path = tmp_path / "stop-first-ledger.json"
+    client = StopFirstClient()
+    result = run_block(
+        DurableSendBlock(
+            "stop-first prompt",
+            ledger_path=ledger_path,
+            wait_for_response=False,
+            max_attempts=1,
+            recovery_reload=False,
+            render_request_marker=False,
+        ),
+        client,
+    )
+    record = RequestLedger(ledger_path).get(
+        result.context.results["durable_send"]["record"]["request_id"]
+    )
+    assert record.status is RequestStatus.SENT
+    assert record.attempts == 1
+    assert record.receipt["accepted_via"] == "stop_button"
+    assert record.receipt["user_message_id"] is None
+    assert len(client.send_calls) == 1
+
+
 def test_reused_conversation_waits_for_hydrated_baseline_before_sending(tmp_path):
     history = (
         MessageSnapshot("user", "u-old", "t-old", "older prompt", ()),

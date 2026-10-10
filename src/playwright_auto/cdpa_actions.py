@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from uuid import UUID
 
 from .cdpa_browser_projection import inspect_page_metadata
@@ -59,10 +59,14 @@ def _reopenable_conversation_identity(value: Any) -> str | None:
         parsed = urlparse(str(value or ""))
     except ValueError:
         return None
-    if (parsed.hostname or "").lower() not in _CHATGPT_HOSTS:
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").lower() not in _CHATGPT_HOSTS
+        or parsed.query or parsed.fragment
+    ):
         return None
     identity = conversation_identity(value)
-    if identity is None or identity.rsplit("/", 1)[-1].startswith("WEB:"):
+    if identity is None or unquote(identity.rsplit("/", 1)[-1]).lower().startswith(("web:", "local-chatgpt:")):
         return None
     return identity
 

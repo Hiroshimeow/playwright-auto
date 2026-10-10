@@ -147,7 +147,7 @@ def test_send_acceptance_ignores_stale_response_activity_without_current_dom_evi
     assert accepted is None
 
 
-def test_send_acceptance_treats_markerless_stop_as_wake_only(monkeypatch):
+def test_send_acceptance_accepts_new_stop_without_user_message(monkeypatch):
     import types
     import playwright_auto.role_runtime.signals as signal_module
 
@@ -182,12 +182,13 @@ def test_send_acceptance_treats_markerless_stop_as_wake_only(monkeypatch):
         )
     )
 
-    assert accepted is None
+    assert accepted == ("stop_button", None)
     acceptance_events = [
         event for event in events
         if event[0:2] == ("SIGNAL", "send_acceptance")
     ]
-    assert acceptance_events[-1][2]["values"]["outcome"] == "timeout"
+    assert acceptance_events[-1][2]["values"]["outcome"] == "accepted"
+    assert acceptance_events[-1][2]["values"]["accepted_via"] == "stop_button"
 
 
 def test_send_acceptance_timeout_does_not_inherit_client_timeout(monkeypatch):
@@ -1083,7 +1084,7 @@ def test_send_receipt_conversation_id_is_strict_and_allowlisted():
             SendReceipt.from_dict(bad)
 
 
-def test_send_arms_nonblocking_frontend_identity_observer_before_single_click(monkeypatch):
+def test_send_does_not_arm_frontend_http_listener_before_single_click(monkeypatch):
     import types
 
     accepted = MessageSnapshot("user", "u1", "t1", "prompt", ())
@@ -1130,7 +1131,7 @@ def test_send_arms_nonblocking_frontend_identity_observer_before_single_click(mo
 
         async def fake_click(target, **_kwargs):
             target.clicks += 1
-            assert target.listeners.get("response")
+            assert not target.listeners.get("response")
             target.emit("response", Response(gate))
         monkeypatch.setattr(chatgpt, "click_send_button", fake_click)
 
@@ -1139,14 +1140,13 @@ def test_send_arms_nonblocking_frontend_identity_observer_before_single_click(mo
         assert receipt.user_message_id == "u1"
         assert receipt.conversation_id is None
         assert page.clicks == 1
-        assert task is not None and not task.done()
-        gate.set()
-        assert await task == {"observed_user_message_id": "u1", "conversation_id": "c1"}
+        assert task is None
+        assert not page.listeners.get("response")
 
     asyncio.run(run())
 
 
-def test_sequential_send_clears_previous_frontend_identity_task(monkeypatch):
+def test_sequential_send_does_not_inherit_stale_http_identity(monkeypatch):
     import types
 
     before = snapshot(send_visible=True, send_enabled=True)
@@ -1204,22 +1204,22 @@ def test_sequential_send_clears_previous_frontend_identity_task(monkeypatch):
         monkeypatch.setattr(chatgpt, "click_send_button", fake_click)
 
         first = await client.send("first", wait_for_stop=False, max_attempts=1)
-        assert first.conversation_id == "conversation-1"
+        assert first.conversation_id is None
         first_task = client._frontend_identity_task
-        assert first_task is not None and first_task.done()
+        assert first_task is None
 
         second = await client.send("second", wait_for_stop=False, max_attempts=1)
         assert second.user_message_id == "u2"
         assert second.conversation_id is None
         second_task = client.take_frontend_identity_task()
-        assert second_task is not None and not second_task.done()
+        assert second_task is None
         assert page.clicks == 2
-        assert first_task.done()
+        assert not page.listeners.get("response")
 
     asyncio.run(run())
 
 
-def test_post_reload_acceptance_reuses_same_frontend_identity_without_second_click(monkeypatch):
+def test_post_reload_acceptance_never_relies_on_http_identity_or_second_click(monkeypatch):
     import types
 
     before = snapshot(send_visible=True, send_enabled=True)
@@ -1282,7 +1282,7 @@ def test_post_reload_acceptance_reuses_same_frontend_identity_without_second_cli
 
         receipt = await client.send("prompt", wait_for_stop=False, max_attempts=2)
         assert receipt.accepted_via == "post_reload:exact_user_message"
-        assert receipt.conversation_id == "conversation-reload"
+        assert receipt.conversation_id is None
         assert receipt.attempts == 1
         assert page.clicks == 1
         assert acceptance_calls == 1
@@ -1290,7 +1290,7 @@ def test_post_reload_acceptance_reuses_same_frontend_identity_without_second_cli
     asyncio.run(run())
 
 
-def test_frontend_identity_parser_failure_cannot_retry_accepted_dom_send(monkeypatch):
+def test_frontend_response_event_cannot_retry_accepted_dom_send(monkeypatch):
     import types
 
     before = snapshot(send_visible=True, send_enabled=True)
@@ -1345,7 +1345,7 @@ def test_frontend_identity_parser_failure_cannot_retry_accepted_dom_send(monkeyp
         assert receipt.conversation_id is None
         assert receipt.attempts == 1
         assert page.clicks == 1
-        assert task is not None and await task is None
+        assert task is None
 
     asyncio.run(run())
 

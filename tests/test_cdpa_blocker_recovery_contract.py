@@ -287,7 +287,7 @@ def test_accepted_identity_settle_starts_at_first_provisional_decision_and_survi
     assert state["active_action"] == "wait_accepted_conversation_identity"
     assert datetime.fromisoformat(wait["accepted_identity_started_at"]) == first_decision_at
     assert datetime.fromisoformat(wait["accepted_identity_deadline_at"]) == (
-        first_decision_at + timedelta(seconds=5)
+        first_decision_at + timedelta(seconds=10)
     )
     assert wait["accepted_identity_page_id"] == receipt.binding.page_id
     assert wait["deadline_at"] == original_response_deadline
@@ -319,7 +319,7 @@ def test_accepted_identity_settle_starts_at_first_provisional_decision_and_survi
     assert durable.receipt["conversation_id"] == canonical_id
 
 
-def test_accepted_identity_first_provisional_decision_after_response_deadline_blocks_without_settle_budget(
+def test_accepted_identity_url_settle_is_independent_of_response_deadline(
     tmp_path,
     monkeypatch,
 ):
@@ -374,12 +374,10 @@ def test_accepted_identity_first_provisional_decision_after_response_deadline_bl
 
     assert asyncio.run(worker._owned_or_block(state, "PLAN", Actions())) is None
     wait = hop["wait"]
-    assert state["status"] == "BLOCKED"
-    assert state["block_code"] == "accepted_conversation_identity_unresolved"
-    assert state["block_retryable"] is False
-    assert "accepted_identity_started_at" not in wait
-    assert "accepted_identity_deadline_at" not in wait
-    assert wait["accepted_identity_outcome"] == "blocked_unresolved"
+    assert state["status"] == "RUNNING"
+    assert state["active_action"] == "wait_accepted_conversation_identity"
+    assert state["block_code"] is None
+    assert datetime.fromisoformat(wait["accepted_identity_deadline_at"]) == now + timedelta(seconds=10)
     assert len(state["hops"]) == original_hop_count
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == original_attempts
 
@@ -437,7 +435,7 @@ def test_accepted_identity_canonical_conflict_blocks_immediately_without_startin
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == original_attempts
 
 
-def test_accepted_identity_settle_expiry_blocks_without_replay_or_reconciliation(
+def test_accepted_identity_settle_expiry_admits_active_response_without_replay(
     tmp_path,
     monkeypatch,
 ):
@@ -490,13 +488,12 @@ def test_accepted_identity_settle_expiry_blocks_without_replay_or_reconciliation
     deadline = hop["wait"]["accepted_identity_deadline_at"]
     FrozenDateTime.current = datetime.fromisoformat(deadline)
 
-    assert asyncio.run(worker._owned_or_block(state, "PLAN", Actions())) is None
-    assert state["status"] == "BLOCKED"
-    assert state["block_code"] == "accepted_conversation_identity_unresolved"
-    assert state["block_retryable"] is False
+    assert asyncio.run(worker._owned_or_block(state, "PLAN", Actions())) is not None
+    assert state["status"] == "RUNNING"
+    assert state["block_code"] is None
     assert hop["wait"]["accepted_identity_started_at"] == started
     assert hop["wait"]["accepted_identity_deadline_at"] == deadline
-    assert hop["wait"]["accepted_identity_outcome"] == "blocked_unresolved"
+    assert hop["wait"]["accepted_identity_outcome"] == "observe_response_without_url"
     assert len(state["hops"]) == original_hop_count
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == original_attempts
 

@@ -4066,7 +4066,7 @@ def test_resume_during_accepted_identity_settle_reuses_persisted_deadlines_witho
     assert actions.reopen_calls == 0
 
 
-def test_resume_after_accepted_identity_settle_expiry_preserves_all_deadlines_and_blocks(
+def test_resume_after_accepted_identity_settle_expiry_observes_response_without_replay(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -4103,6 +4103,12 @@ def test_resume_after_accepted_identity_settle_expiry_preserves_all_deadlines_an
             raise AssertionError("expired identity settle Resume must not reopen or replay")
 
     actions = Actions()
+    from unittest.mock import AsyncMock
+    from playwright_auto.role_runtime.model import Action, Decision
+    monkeypatch.setattr(
+        worker.role_controller, "run",
+        AsyncMock(return_value=Decision(Action.WAIT, "wait_response")),
+    )
     assert asyncio.run(worker._owned_or_block(state, "PLAN", actions)) is None
     started_at = hop["wait"]["accepted_identity_started_at"]
     original_settle_deadline = hop["wait"]["accepted_identity_deadline_at"]
@@ -4130,15 +4136,16 @@ def test_resume_after_accepted_identity_settle_expiry_preserves_all_deadlines_an
 
     resumed_hop = _active_hop(queued)
     resumed_wait = resumed_hop["wait"]
-    assert queued["status"] == "BLOCKED"
-    assert queued["block_code"] == "accepted_conversation_identity_unresolved"
-    assert queued["block_retryable"] is False
+    assert queued["status"] == "RUNNING"
+    assert queued["block_code"] is None
+    assert control["status"] == "applied"
+    assert control["result"]["postcondition"] == "observation_rearmed"
     assert resumed_wait["accepted_identity_started_at"] == started_at
     assert resumed_wait["accepted_identity_deadline_at"] == expired_settle_deadline
     assert resumed_wait["deadline_at"] == expired_response_deadline
     assert original_settle_deadline != expired_settle_deadline
     assert original_response_deadline != expired_response_deadline
-    assert resumed_wait["accepted_identity_outcome"] == "blocked_unresolved"
+    assert resumed_wait["accepted_identity_outcome"] == "observe_response_without_url"
     assert len(queued["hops"]) == original_hop_count
     assert RequestLedger(resumed_hop["ledger_path"]).get(resumed_hop["request_id"]).attempts == original_attempts
     assert actions.reopen_calls == 0

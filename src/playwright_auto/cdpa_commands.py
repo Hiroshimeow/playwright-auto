@@ -6,7 +6,7 @@ import re
 import unicodedata
 from dataclasses import asdict, dataclass, fields
 from typing import Any, Mapping, Sequence
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 COMMAND_ORIGINS = frozenset({"operator", "independent_agent", "worker", "repair_task"})
 COMMAND_STATES = frozenset(
@@ -119,13 +119,15 @@ def normalize_chatgpt_conversation_url(value: Any) -> str | None:
         parsed = urlparse(exact)
     except ValueError:
         return None
+    identity = conversation_identity(exact)
     if (
         parsed.scheme != "https"
         or (parsed.hostname or "").lower() not in {"chatgpt.com", "www.chatgpt.com"}
-        or parsed.params
-        or parsed.query
-        or parsed.fragment
-        or conversation_identity(exact) is None
+        or parsed.params or parsed.query or parsed.fragment
+        or identity is None
+        or unquote(identity.rsplit("/", 1)[-1]).lower().startswith(
+            ("web:", "local-chatgpt:")
+        )
     ):
         return None
     return exact

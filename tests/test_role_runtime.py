@@ -48,6 +48,23 @@ def test_temporary_save_offer_does_not_block_consuming_completed_response():
     assert step(other, other_wait, 5).action is Action.ACCEPT
 
 
+def test_stop_only_receipt_without_user_id_binds_subsequent_assistant_response():
+    from dataclasses import replace
+
+    stop_receipt = replace(
+        receipt(), accepted_via="stop_button", user_message_id=None, user_turn_id=None
+    )
+    current = current_result()
+    wait = {}
+    controller = RoleController()
+    assert controller.decide(current, wait, receipt=stop_receipt, now=NOW).action is Action.WAIT
+    completed = controller.decide(
+        current, wait, receipt=stop_receipt, now=NOW + timedelta(seconds=5)
+    )
+    assert completed.action is Action.ACCEPT
+    assert completed.response.message_id == "answer"
+
+
 def test_valid_result_wins_over_permission_evidence_after_five_second_stability():
     current = current_result(mcp_permission_node_count=1)
     wait = {}

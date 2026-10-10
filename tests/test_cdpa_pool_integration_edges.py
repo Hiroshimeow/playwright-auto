@@ -173,7 +173,7 @@ def test_accepted_provisional_url_lost_page_blocks_without_reopen_or_rebind(tmp_
     actions.fresh_chat.assert_not_awaited()
 
 
-def test_accepted_provisional_url_lost_user_provenance_blocks_without_replay(tmp_path):
+def test_accepted_provisional_url_missing_rendered_user_waits_without_replay(tmp_path):
     _store, state, worker, _path, hop, receipt, _sent = _prepare_sent_waiting_task(
         tmp_path, task_id="provisional-lost-user"
     )
@@ -203,9 +203,9 @@ def test_accepted_provisional_url_lost_user_provenance_blocks_without_replay(tmp
 
     assert asyncio.run(worker._owned_or_block(state, "PLAN", actions)) is None
 
-    assert state["status"] == "BLOCKED"
-    assert state["block_code"] == "accepted_conversation_identity_unresolved"
-    assert state["block_retryable"] is False
+    assert state["status"] == "RUNNING"
+    assert state["active_action"] == "wait_accepted_conversation_identity"
+    assert state["block_code"] is None
     assert hop["receipt"] == receipt.to_dict()
     assert len(state["hops"]) == original_hop_count
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == original_attempts

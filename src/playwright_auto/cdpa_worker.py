@@ -373,8 +373,65 @@ def _looks_like_recorded_role_offline_error(message: object) -> bool:
 
 
 def _recoverable_conversation_identity(value: Any) -> str | None:
+    try:
+        parsed = urlparse(str(value or ""))
+    except ValueError:
+        return None
     identity = conversation_identity(value)
-    if identity is None or identity.rsplit("/", 1)[-1].startswith("WEB:"):
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").lower() not in {"chatgpt.com", "www.chatgpt.com"}
+        or parsed.query or parsed.fragment
+        or identity is None
+        or unquote(identity.rsplit("/", 1)[-1]).lower().startswith(("web:", "local-chatgpt:"))
+    ):
+        return None
+    return identity
+
+
+def _official_saved_url(value: Any) -> tuple[str, bool] | None:
+    """Canonical persistent ChatGPT conversation URL: (conversation ID, in project)."""
+    try:
+        parsed = urlparse(str(value or ""))
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").lower() not in {"chatgpt.com", "www.chatgpt.com"}
+        or parsed.query or parsed.fragment or parsed.params
+    ):
+        return None
+    path = parsed.path.rstrip("/")
+    match = re.fullmatch(r"/c/([0-9a-fA-F-]{36})", path)
+    project = False
+    if match is None:
+        match = re.fullmatch(r"/g/[^/]+/c/([0-9a-fA-F-]{36})", path)
+        project = True
+    if match is None:
+        return None
+    candidate = match.group(1)
+    try:
+        canonical = str(UUID(candidate))
+    except ValueError:
+        return None
+    return (canonical, project) if candidate.lower() == canonical else None
+
+
+def _preferred_saved_url(*values: Any, conversation_id: str | None = None) -> str | None:
+    choices = []
+    for value in values:
+        parsed = _official_saved_url(value)
+        if parsed is not None and (conversation_id is None or parsed[0] == conversation_id):
+            choices.append((str(value), parsed[1]))
+    return next((value for value, project in choices if project), choices[0][0] if choices else None)
+
+
+def _command_saved_identity(value: Any) -> str | None:
+    """Read a relative /c/id command snapshot, ignoring provisional IDs."""
+    identity = conversation_identity(value)
+    if identity is None or unquote(identity.rsplit("/", 1)[-1]).lower().startswith(
+        ("web:", "local-chatgpt:")
+    ):
         return None
     return identity
 
@@ -2478,12 +2535,22 @@ class CDPAWorker:
         acquired: AcquiredRole,
     ) -> None:
         record = state["roles"][logical_role]
+        saved_page_url = str(acquired.url)
+        if state.get("conversation_mode") != "temporary":
+            existing = None if acquired.new_chat else _official_saved_url(record.get("page_url"))
+            if existing is not None:
+                saved_page_url = (
+                    _preferred_saved_url(acquired.url, record.get("page_url"), conversation_id=existing[0])
+                    or str(record["page_url"])
+                )
+            else:
+                saved_page_url = _preferred_saved_url(acquired.url) or saved_page_url
         changed = (
             acquired.created
             or acquired.new_chat
             or record.get("status") != "active"
             or str(record.get("page_id") or "") != str(acquired.page_id)
-            or str(record.get("page_url") or "") != str(acquired.url)
+            or str(record.get("page_url") or "") != saved_page_url
             or record.get("online") is not True
             or record.get("last_error") is not None
             or bool(record.get("reset_requested"))
@@ -2502,7 +2569,7 @@ class CDPAWorker:
             {
                 "status": "active",
                 "page_id": acquired.page_id,
-                "page_url": acquired.url,
+                "page_url": saved_page_url,
                 "online": True,
                 "last_error": None,
             }
@@ -2633,13 +2700,16 @@ class CDPAWorker:
             acquired = await actions.locate_owned(state, role)
             temporary = state.get("conversation_mode") == "temporary"
             receipt_payload = hop.get("receipt")
-            accepted_provisional = (
+            accepted_identity_pending = (
                 not temporary
                 and isinstance(receipt_payload, Mapping)
-                and _provisional_conversation_url(hop.get("conversation_url"))
                 and not receipt_payload.get("conversation_id")
+                and (
+                    _provisional_conversation_url(hop.get("conversation_url"))
+                    or (acquired is not None and _official_saved_url(acquired.url) is not None)
+                )
             )
-            if accepted_provisional:
+            if accepted_identity_pending:
                 receipt = SendReceipt.from_dict(receipt_payload)
                 if acquired is None or str(acquired.page_id) != str(receipt.binding.page_id):
                     self._block(
@@ -2650,13 +2720,10 @@ class CDPAWorker:
                     )
                     return None
                 ownership = await acquired.client.assert_ownership()
-                if (
-                    str(ownership.page_id) != str(receipt.binding.page_id)
-                    or not receipt_user_message_seen(ownership.messages, receipt)
-                ):
+                if str(ownership.page_id) != str(receipt.binding.page_id):
                     self._block(
                         state,
-                        "Accepted Send lost exact accepted-user provenance while canonical conversation identity was unresolved.",
+                        "Accepted Send is no longer on the owned runtime page.",
                         code="accepted_conversation_identity_unresolved",
                         retryable=False,
                     )
@@ -2679,48 +2746,58 @@ class CDPAWorker:
                 except GraphIdentityError:
                     wait = hop.setdefault("wait", {})
                     now = datetime.now(timezone.utc)
-                    response_deadline = parse_time(wait.get("deadline_at"))
                     started_at = parse_time(wait.get("accepted_identity_started_at"))
-                    settle_deadline = parse_time(wait.get("accepted_identity_deadline_at"))
                     if started_at is None:
-                        if response_deadline is None or now >= response_deadline:
-                            wait["accepted_identity_finished_at"] = now.isoformat()
-                            wait["accepted_identity_outcome"] = "blocked_unresolved"
-                            self._block(
-                                state,
-                                "Accepted conversation identity remained provisional at the response deadline.",
-                                code="accepted_conversation_identity_unresolved",
-                                retryable=False,
-                            )
-                            return None
                         started_at = now
-                        settle_deadline = min(
-                            now + timedelta(seconds=5),
-                            response_deadline,
-                        )
-                        wait["accepted_identity_started_at"] = started_at.isoformat()
-                        wait["accepted_identity_deadline_at"] = settle_deadline.isoformat()
+                        wait["accepted_identity_started_at"] = now.isoformat()
+                        wait["accepted_identity_deadline_at"] = (
+                            now + timedelta(seconds=10)
+                        ).isoformat()
                         wait["accepted_identity_page_id"] = str(receipt.binding.page_id)
-                    if settle_deadline is None or now >= settle_deadline:
-                        wait["accepted_identity_finished_at"] = now.isoformat()
-                        wait["accepted_identity_outcome"] = "blocked_unresolved"
-                        self._block(
-                            state,
-                            "Accepted conversation identity did not settle on the exact owned page before its persisted deadline.",
-                            code="accepted_conversation_identity_unresolved",
-                            retryable=False,
+                    settle_deadline = parse_time(wait.get("accepted_identity_deadline_at"))
+                    if settle_deadline is not None and now < settle_deadline:
+                        state["status"] = "RUNNING"
+                        state["active_action"] = "wait_accepted_conversation_identity"
+                        return None
+                    baseline = receipt.baseline
+                    messages = tuple(getattr(ownership, "messages", ()) or ())
+                    activity = (
+                        bool(getattr(ownership, "stop_visible", False))
+                        or bool(getattr(ownership, "response_projection_active", False))
+                        or bool(getattr(ownership, "response_activity_text", ""))
+                        or bool(getattr(ownership, "response_activity_turn_id", ""))
+                        or receipt_user_message_seen(messages, receipt)
+                        or any(
+                            message.role == "assistant"
+                            and message.message_id
+                            and message.message_id not in baseline.message_ids
+                            for message in messages
+                        )
+                    )
+                    wait["accepted_identity_finished_at"] = now.isoformat()
+                    if activity:
+                        # An accepted Send may complete while its URL remains provisional.
+                        # Let the ordinary response controller decide terminal stability.
+                        wait["accepted_identity_outcome"] = "observe_response_without_url"
+                        expected_conversation = None
+                    else:
+                        wait["accepted_identity_outcome"] = "paused_unresolved"
+                        state["status"] = "PAUSED"
+                        state["kanban_column"] = "PAUSED"
+                        state["active_action"] = "paused"
+                        state["pause_reason"] = (
+                            "Accepted Send has no canonical conversation URL or "
+                            "current response activity; inspect the tab and Resume."
                         )
                         return None
-                    state["status"] = "RUNNING"
-                    state["active_action"] = "wait_accepted_conversation_identity"
-                    return None
-                wait = hop.setdefault("wait", {})
-                if wait.get("accepted_identity_started_at") is not None:
-                    wait["accepted_identity_finished_at"] = datetime.now(timezone.utc).isoformat()
-                    wait["accepted_identity_outcome"] = "canonicalized"
-                expected_conversation = _recoverable_conversation_identity(
-                    hop.get("conversation_url")
-                )
+                else:
+                    wait = hop.setdefault("wait", {})
+                    if wait.get("accepted_identity_started_at") is not None:
+                        wait["accepted_identity_finished_at"] = datetime.now(timezone.utc).isoformat()
+                        wait["accepted_identity_outcome"] = "canonicalized"
+                    expected_conversation = _recoverable_conversation_identity(
+                        hop.get("conversation_url")
+                    )
             if temporary:
                 token = state["roles"][role].get("temporary_document_id")
                 lost_document = bool(
@@ -2759,9 +2836,17 @@ class CDPAWorker:
                 if acquired is not None
                 else None
             )
-            if not temporary and acquired is not None and live_conversation is not None and expected_conversation is None:
-                expected_conversation = live_conversation
-                hop["conversation_url"] = acquired.url
+            if not temporary and acquired is not None and live_conversation is not None:
+                if expected_conversation is None:
+                    expected_conversation = live_conversation
+                if live_conversation == expected_conversation:
+                    hop["conversation_url"] = (
+                        _preferred_saved_url(
+                            acquired.url, hop.get("conversation_url"),
+                            state["roles"][role].get("page_url"),
+                        )
+                        or str(acquired.url)
+                    )
             needs_reopen = (
                 acquired is None
                 or (expected_conversation is not None and live_conversation != expected_conversation)
@@ -4607,6 +4692,17 @@ class CDPAWorker:
                     state["roles"][role]["constructor_sent_generation"] = None
                     result = {"page_id": acquired.page_id, "new_chat": True}
             elif action == "open_tab":
+                if hop is not None and hop_state == "waiting" and isinstance(hop.get("receipt"), Mapping):
+                    self._reconcile_hop_conversation_identity(state, hop)
+                    saved_identity = _recoverable_conversation_identity(hop.get("conversation_url"))
+                    command_identity = (
+                        _command_saved_identity(command.snapshot.get("conversation_id"))
+                        if command is not None else None
+                    )
+                    if saved_identity and command_identity and saved_identity != command_identity:
+                        raise IneffectiveControlError(
+                            "OPEN_ROLE_TAB canonical command snapshot conflicts with the durable accepted conversation identity"
+                        )
                 blocked_role_recovery = _is_verified_role_offline_block(state, role)
                 role_record = state["roles"][role]
                 preboundary_recovery = (
@@ -4660,9 +4756,10 @@ class CDPAWorker:
                     conversation_url = str(hop.get("conversation_url") or "").strip()
                     accepted_waiting_reopen = (
                         hop_state == "waiting"
-                        and bool(
-                            str(receipt.get("user_message_id") or "").strip()
-                            or str(receipt.get("user_turn_id") or "").strip()
+                        and bool(str(receipt.get("accepted_via") or "").strip())
+                        and (
+                            int(receipt.get("attempts") or 0) > 0
+                            or bool(receipt.get("user_message_id") or receipt.get("user_turn_id"))
                         )
                         and conversation_url
                         == str(role_record.get("page_url") or "").strip()
@@ -4694,9 +4791,7 @@ class CDPAWorker:
                         if command is not None
                         else None
                     )
-                    command_canonical = _recoverable_conversation_identity(
-                        command_conversation
-                    )
+                    command_canonical = _command_saved_identity(command_conversation)
                     if (
                         command_canonical is not None
                         and durable_conversation is not None
@@ -4723,7 +4818,7 @@ class CDPAWorker:
                 elif preboundary_acquisition_recovery:
                     durable_conversation = _recoverable_conversation_identity(role_record.get("page_url"))
                     command_conversation = (
-                        _recoverable_conversation_identity(command.snapshot.get("conversation_id"))
+                        _command_saved_identity(command.snapshot.get("conversation_id"))
                         if command is not None else None
                     )
                     if command_conversation is not None and command_conversation != durable_conversation:
@@ -6832,6 +6927,22 @@ class CDPAWorker:
                 return await block.run(WorkflowContext(acquired.client))
 
             output = await self._run_automated_send(perform_send)
+        except ConversationTranscriptNotReadyError as exc:
+            current_record = ledger.get(str(hop["request_id"]))
+            if (
+                current_record is None
+                or current_record.status
+                in {RequestStatus.SENDING, RequestStatus.SENT, RequestStatus.COMPLETED}
+                or int(current_record.attempts or 0) != 0
+            ):
+                raise
+            self._block(
+                state,
+                str(exc),
+                code="conversation_transcript_not_ready",
+                retryable=True,
+            )
+            return
         except UnsafePageStateError as exc:
             current_record = ledger.peek(str(hop["request_id"]))
             solo_existing_url = (
@@ -6849,22 +6960,6 @@ class CDPAWorker:
                 self._observe_existing_response(state, hop)
                 return
             raise
-        except ConversationTranscriptNotReadyError as exc:
-            current_record = ledger.get(str(hop["request_id"]))
-            if (
-                current_record is None
-                or current_record.status
-                in {RequestStatus.SENDING, RequestStatus.SENT, RequestStatus.COMPLETED}
-                or int(current_record.attempts or 0) != 0
-            ):
-                raise
-            self._block(
-                state,
-                str(exc),
-                code="conversation_transcript_not_ready",
-                retryable=True,
-            )
-            return
         except ComposerConflictError as exc:
             self._block(
                 state,
@@ -6938,7 +7033,11 @@ class CDPAWorker:
                 new_chat=False,
             ),
         )
-        hop["conversation_url"] = post_send.conversation_url or str(post_send.url)
+        hop["conversation_url"] = (
+            str(state["roles"][role]["page_url"])
+            if state.get("conversation_mode") != "temporary"
+            else post_send.conversation_url or str(post_send.url)
+        )
         hop["receipt"] = output["receipt"]
         if isinstance(hop.get("preboundary_recovery"), dict):
             hop["preboundary_recovery"]["phase"] = "complete"
@@ -7178,12 +7277,17 @@ class CDPAWorker:
         if not isinstance(payload, Mapping):
             return
         conversation_id = str(payload.get("conversation_id") or "").strip()
-        if not conversation_id:
+        fallback = f"https://chatgpt.com/c/{conversation_id}"
+        if _official_saved_url(fallback) is None:
             return
-        exact_url = f"https://chatgpt.com/c/{conversation_id}"
-        hop["conversation_url"] = exact_url
         role = str(hop.get("target_role") or "").upper()
         role_record = state.get("roles", {}).get(role)
+        exact_url = _preferred_saved_url(
+            hop.get("conversation_url"),
+            role_record.get("page_url") if isinstance(role_record, Mapping) else None,
+            conversation_id=conversation_id,
+        ) or fallback
+        hop["conversation_url"] = exact_url
         if isinstance(role_record, dict):
             role_record["page_url"] = exact_url
 
@@ -7226,9 +7330,9 @@ class CDPAWorker:
         """Canonicalize an accepted conversation only from exact owned local state."""
         if receipt.conversation_id:
             return receipt
-        if receipt.attempts < 1 or not receipt.user_message_id:
+        if receipt.attempts < 1 or not receipt.accepted_via:
             raise DurableRequestError(
-                "accepted conversation discovery requires exact accepted user identity"
+                "accepted conversation discovery requires a durable accepted Send"
             )
         ledger_path = str(hop.get("ledger_path") or "").strip()
         request_id = str(hop.get("request_id") or "").strip()
@@ -7265,29 +7369,43 @@ class CDPAWorker:
                 "accepted conversation identity is unknown because the exact owned page is unavailable"
             )
         snapshot = await acquired.client.assert_ownership()
-        if snapshot.page_id != receipt.binding.page_id or not receipt_user_message_seen(
-            snapshot.messages, receipt
-        ):
-            raise GraphIdentityError(
-                "accepted conversation identity is unknown because exact local user provenance is absent"
-            )
-        conversation_id = str(snapshot.session_id or "").strip()
-        if not conversation_id or _provisional_conversation_url(snapshot.url):
-            raise GraphIdentityError(
-                "accepted conversation identity is unknown because the owned page is not a saved conversation"
-            )
-        try:
-            canonical_id = str(UUID(conversation_id))
-        except ValueError as exc:
+        if snapshot.page_id != receipt.binding.page_id:
+            raise GraphIdentityError("accepted conversation page binding is no longer owned")
+        saved = _official_saved_url(snapshot.url)
+        if saved is None:
+            try:
+                host = (urlparse(str(snapshot.url or "")).hostname or "").lower()
+            except ValueError:
+                host = ""
+            if host in {"chatgpt.com", "www.chatgpt.com"}:
+                raise GraphIdentityError("accepted conversation URL is not canonical yet")
             raise _AcceptedConversationIdentityConflict(
-                "accepted conversation identity conflicts with canonical page evidence"
-            ) from exc
-        if (
-            canonical_id != conversation_id
-            or _recoverable_conversation_identity(snapshot.url) != f"/c/{conversation_id}"
-        ):
+                "accepted conversation navigation left the ChatGPT origin"
+            )
+        conversation_id = saved[0]
+        role_record = state.get("roles", {}).get(role)
+        prior_ids = {
+            parsed[0]
+            for value in (
+                hop.get("conversation_url"),
+                role_record.get("page_url") if isinstance(role_record, Mapping) else None,
+            )
+            if (parsed := _official_saved_url(value)) is not None
+        }
+        if prior_ids and prior_ids != {conversation_id}:
             raise _AcceptedConversationIdentityConflict(
-                "accepted conversation identity conflicts with canonical page evidence"
+                "live conversation UUID conflicts with the saved durable conversation"
+            )
+        if snapshot.session_id and str(snapshot.session_id) != conversation_id:
+            raise _AcceptedConversationIdentityConflict(
+                "canonical ChatGPT URL and page snapshot disagree"
+            )
+        if isinstance(role_record, dict):
+            role_record["page_url"] = (
+                _preferred_saved_url(
+                    snapshot.url, role_record.get("page_url"),
+                    conversation_id=conversation_id,
+                ) or str(snapshot.url)
             )
         ledger.enrich_receipt_conversation_id(
             request_id,

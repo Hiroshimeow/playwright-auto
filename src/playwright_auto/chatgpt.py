@@ -883,10 +883,19 @@ async def click_send_button(
           const editable = (element) => Boolean(element && element.isContentEditable);
           const text = (element) => (element?.innerText || '').replace(/\s+/g, ' ').trim();
 
+          const conversationId = (path) => {
+            const match = String(path || '').match(
+              /^\/c\/([0-9a-fA-F-]{36})\/?$|^\/g\/[^/]+\/c\/([0-9a-fA-F-]{36})\/?$/
+            );
+            return match ? (match[1] || match[2]).toLowerCase() : null;
+          };
           const validateOwnership = () => {
+            const expectedId = conversationId(expectedPath);
+            const currentId = conversationId(location.pathname);
+            const sameConversation = Boolean(expectedId && expectedId === currentId);
             if (expectedHostname !== null && (
                 location.hostname.toLowerCase() !== expectedHostname ||
-                location.pathname !== expectedPath
+                (location.pathname !== expectedPath && !sameConversation)
             )) {
               return {ok: false, method: 'ownership_conflict', reason: 'conversation_changed'};
             }
@@ -4154,20 +4163,35 @@ class ChatGPTPage:
                 if expected_prompt is None or rendered_user_text_matches(candidate.text, expected_prompt):
                     accepted_user = candidate
                     return accepted("exact_user_message", accepted_user)
-            observed_request_user = self._frontend_request_user_message_id
-            if observed_request_user is not None:
-                accepted_user = MessageSnapshot(
-                    role="user",
-                    message_id=observed_request_user,
-                    turn_id=None,
-                    text=expected_prompt or "",
-                    actions=(),
-                )
-                return accepted("user_message_identity", accepted_user)
-            # The body-reading future is enrichment only. It can finish after
-            # the stream and is never acceptance authority.
-            # Assistant/activity/Stop are wake signals only. They do not prove
-            # which user turn this Send created on a long-lived conversation.
+            # A fresh post-click DOM signal confirms dispatch. Never reuse a
+            # Stop control or assistant turn that existed before this click.
+            if snapshot.stop_visible and not pre_send.stop_visible:
+                return accepted("stop_button", None)
+            previous_assistants = {
+                message.message_id for message in pre_send.messages
+                if message.role == "assistant"
+            }
+            if any(
+                message.role == "assistant"
+                and message.message_id
+                and message.message_id not in previous_assistants
+                for message in snapshot.messages
+            ):
+                return accepted("assistant_message", None)
+            if (
+                snapshot.response_activity_turn_id
+                and snapshot.response_activity_turn_id != pre_send.response_activity_turn_id
+            ):
+                return accepted("response_activity_turn", None)
+            if (
+                snapshot.response_activity_text
+                and snapshot.response_activity_text != pre_send.response_activity_text
+            ) or (
+                snapshot.response_activity_structure
+                and snapshot.response_activity_structure != pre_send.response_activity_structure
+            ):
+                return accepted("assistant_activity", None)
+            # A generic observer wake or a stale LISTEN stream is not evidence.
 
     async def _prepare_prompt_locked(
         self,
@@ -4318,8 +4342,7 @@ class ChatGPTPage:
                         self.clear_page_response_state()
                     except Exception:
                         pass
-                    # Passive network identity observation is armed around this same click.
-                    self._arm_frontend_identity_observer()
+                    # Send acceptance is based on fresh DOM evidence only.
                     # Ownership, safe page state, prompt, attachments, and click share one callback.
                     try:
                         await click_send_button(
