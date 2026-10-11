@@ -92,15 +92,31 @@ def test_stop_after_allow_does_not_trigger_early_refresh():
     assert result.reason == "wait_response"
 
 
-def test_stuck_allow_cannot_hide_timeout_timer():
+def test_stale_clicked_allow_marker_retries_when_permission_is_still_visible():
     current = snapshot(mcp_permission_node_count=1)
     wait = {
         "controller_state": "ALLOW",
         "controller_progress_at": NOW.isoformat(),
         "mcp_allow_clicked_target": "__dom__",
     }
-    assert step(current, wait, 599).action is Action.WAIT
-    assert step(current, wait, 600).action is Action.REFRESH
+    decision = step(current, wait)
+    assert decision.action is Action.ALLOW
+    assert decision.reason == "mcp_allow_ready"
+    assert "mcp_allow_clicked_target" not in wait
+
+
+def test_successful_allow_gets_short_post_click_window_then_retries_if_still_visible():
+    current = snapshot(mcp_permission_node_count=1)
+    wait = {
+        "mcp_allow_clicked_at": NOW.isoformat(),
+        "mcp_allow_clicked_target": "__dom__",
+    }
+    before = step(current, wait, 4)
+    assert before.action is Action.WAIT
+    assert before.reason == "mcp_allow_post_click"
+    retry = step(current, wait, 5)
+    assert retry.action is Action.ALLOW
+    assert retry.reason == "mcp_allow_ready"
 
 
 def test_failed_allow_with_no_dom_permission_clears_stale_network_evidence():
@@ -131,7 +147,7 @@ def test_failed_allow_with_no_dom_permission_clears_stale_network_evidence():
     assert "mcp_allow_retry_at" not in wait
 
 
-def test_failed_allow_with_real_dom_permission_waits_until_normal_timeout():
+def test_failed_allow_with_real_dom_permission_remains_retryable():
     current = snapshot(mcp_permission_node_count=1)
     wait = {}
     permission = {"type": "allow", "target_message_id": "target", "remember_answer": True}
@@ -140,35 +156,61 @@ def test_failed_allow_with_real_dom_permission_waits_until_normal_timeout():
         async def auto_allow_mcp_permission(self, *, passive_action=None):
             return None
 
-    result = asyncio.run(RoleController().browser_action(
+    controller = RoleController()
+    result = asyncio.run(controller.browser_action(
         Client(), current, wait, permission, Decision(Action.ALLOW, "mcp_allow_ready")
     ))
     assert result.action is Action.WAIT
-    assert result.reason == "mcp_allow_handler_pending"
-    clicked = datetime.fromisoformat(wait["mcp_allow_clicked_at"])
-    wait["controller_progress_at"] = clicked.isoformat()
+    assert result.reason == "mcp_allow_retry_pending"
+    assert "mcp_allow_clicked_at" not in wait
+    assert "mcp_allow_clicked_target" not in wait
 
-    decision = RoleController().decide(
+    retry_at = datetime.fromisoformat(wait["mcp_allow_retry_at"])
+    before = controller.decide(
         current,
         wait,
         receipt=receipt(),
         permission=permission,
-        now=clicked + timedelta(seconds=599),
+        now=retry_at - timedelta(milliseconds=1),
+        phase="pre_send",
     )
-    assert decision.action is Action.WAIT
-    decision = RoleController().decide(
+    assert before.action is Action.WAIT
+    assert before.reason == "mcp_allow_retry_backoff"
+
+    retry = controller.decide(
         current,
         wait,
         receipt=receipt(),
         permission=permission,
-        now=clicked + timedelta(seconds=600),
+        now=retry_at,
+        phase="pre_send",
     )
-    assert decision.action is Action.REFRESH
+    assert retry.action is Action.ALLOW
+    assert retry.reason == "mcp_allow_ready"
 
 
 def test_operator_continuation_without_rendered_receipt_user_is_valid_steering():
     current = snapshot(messages=(
         MessageSnapshot("user", "operator-user", "operator-turn", "continue", ()),
+        MessageSnapshot(
+            "assistant", "operator-answer", "operator-answer-turn", "result",
+            ("copy-turn-action-button",),
+        ),
+    ))
+    wait = {}
+    assert step(current, wait).action is Action.WAIT
+    assert wait["bound_assistant_message_id"] == "operator-answer"
+    result = step(current, wait, 5)
+    assert result.action is Action.ACCEPT
+    assert result.response.message_id == "operator-answer"
+
+
+def test_duplicate_receipt_dom_nodes_do_not_block_manual_user_steering():
+    current = snapshot(messages=(
+        MessageSnapshot("user", "original-user", "receipt-a", "original task", ()),
+        MessageSnapshot("user", "original-user", "receipt-b", "original task", ()),
+        MessageSnapshot("assistant", "pre-steer", "pre-steer-turn", "old result", ()),
+        MessageSnapshot("user", "operator-user", "operator-turn", "continue current dev work", ()),
         MessageSnapshot(
             "assistant", "operator-answer", "operator-answer-turn", "result",
             ("copy-turn-action-button",),
@@ -568,14 +610,22 @@ def test_duplicate_bound_logical_turn_blocks_even_with_distinct_message_nodes():
     assert result.reason == "duplicate_bound_assistant_identity"
 
 
-def test_duplicate_receipt_user_identity_blocks():
+def test_duplicate_receipt_dom_nodes_collapse_to_latest_logical_anchor():
     current = snapshot(messages=(
         MessageSnapshot("user", "original-user", "one", "original task", ()),
         MessageSnapshot("user", "original-user", "two", "original task", ()),
+        MessageSnapshot(
+            "assistant", "answer", "answer-turn", "done",
+            ("copy-turn-action-button",),
+        ),
     ))
-    result = step(current, {})
-    assert result.action is Action.BLOCK
-    assert result.reason == "duplicate_receipt_user_identity"
+    wait = {}
+    first = step(current, wait)
+    assert first.action is Action.WAIT
+    assert wait["bound_assistant_message_id"] == "answer"
+    result = step(current, wait, 5)
+    assert result.action is Action.ACCEPT
+    assert result.response.message_id == "answer"
 
 
 def test_completed_action_is_not_required_for_bound_terminal_result():

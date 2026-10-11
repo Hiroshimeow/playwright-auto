@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime
 from typing import Any
 
 from .model import Action, Context, Decision
@@ -25,9 +26,32 @@ def handle(ctx: Context) -> Decision | None:
         return None
 
     target = str((ctx.permission or {}).get("target_message_id") or "__dom__")
+    retry_at_raw = str(wait.get("mcp_allow_retry_at") or "").strip()
+    if retry_at_raw:
+        try:
+            retry_at = datetime.fromisoformat(retry_at_raw)
+        except ValueError:
+            retry_at = None
+        if retry_at is not None and ctx.now < retry_at:
+            return Decision(Action.WAIT, "mcp_allow_retry_backoff")
+        wait.pop("mcp_allow_retry_at", None)
+
     clicked_target = str(wait.get("mcp_allow_clicked_target") or "")
     if clicked_target == target:
-        # Same permission was already dispatched. Do not click-loop; ordinary
-        # response timeout/recovery continues to run.
-        return None
+        clicked_at_raw = str(wait.get("mcp_allow_clicked_at") or "").strip()
+        try:
+            clicked_at = datetime.fromisoformat(clicked_at_raw) if clicked_at_raw else None
+        except ValueError:
+            clicked_at = None
+        if (
+            clicked_at is not None
+            and (ctx.now - clicked_at).total_seconds() < ctx.policy.post_allow_seconds
+        ):
+            return Decision(Action.WAIT, "mcp_allow_post_click")
+        # Permission is still visibly present after the post-click window. A
+        # successful click should have removed it, so retry instead of waiting
+        # until the generic timeout. This also recovers durable wait state
+        # written by the pre-hotfix false "clicked" path.
+        wait.pop("mcp_allow_clicked_at", None)
+        wait.pop("mcp_allow_clicked_target", None)
     return Decision(Action.ALLOW, "mcp_allow_ready")

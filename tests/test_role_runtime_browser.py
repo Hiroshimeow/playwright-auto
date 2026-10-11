@@ -528,6 +528,29 @@ def test_genuine_retry_and_stream_failure_remain_retryable_without_format_repair
         assert hop["receipt"] == request().to_dict()
 
 
+def test_codex_allow_once_without_options_dispatches_directly():
+    async def run(page):
+        client = ChatGPTPage(page, timeout_ms=5_000)
+        client.binding = PageBinding("page-1", "DEV")
+        await page.evaluate("""() => {
+            window.approved = false;
+            document.querySelector('[data-codex-approval-surface="true"] button')
+              .addEventListener('click', () => { window.approved = true; });
+        }""")
+        result = await client.auto_allow_mcp_permission()
+        assert result is not None
+        assert result["method"] == "dom_click_once_direct"
+        assert result["remember_answer"] == "false"
+        assert await page.evaluate("window.approved") is True
+
+    asyncio.run(_with_page("""
+        <main>
+          <div data-codex-approval-surface="true"><button>Allow once</button></div>
+          <div contenteditable="true" role="textbox"></div>
+        </main>
+    """, run))
+
+
 def test_hidden_allow_real_dom_snapshot_reaches_dispatch_after_five_seconds():
     async def run(page):
         client = ChatGPTPage(page, timeout_ms=5_000)

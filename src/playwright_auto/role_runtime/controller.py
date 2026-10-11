@@ -496,20 +496,22 @@ class RoleController:
                     for key in ("mcp_allow_seen_at", "mcp_allow_seen_target", "mcp_allow_retry_at", "mcp_allow_dispatch_error"):
                         wait.pop(key, None)
                     return Decision(Action.WAIT, "mcp_allow_stale_cleared")
-                # A real permission node with no dispatchable handler gets one
-                # bounded attempt. Reuse the normal post-Allow window so that
-                # no UI progress becomes F5 after five seconds instead of an
-                # unbounded five-second redispatch loop.
-                for key in ("mcp_allow_seen_at", "mcp_allow_seen_target", "mcp_allow_retry_at"):
+                # A real permission node whose click handler is not dispatchable
+                # must remain eligible for retry. Marking it as "clicked" here
+                # suppresses all future attempts even though no click occurred.
+                for key in ("mcp_allow_seen_at", "mcp_allow_seen_target"):
                     wait.pop(key, None)
+                wait.pop("mcp_allow_clicked_at", None)
+                wait.pop("mcp_allow_clicked_target", None)
                 signature, length = allow.activity(snapshot)
                 wait.update(
-                    mcp_allow_clicked_at=now.isoformat(),
-                    mcp_allow_clicked_target=str((permission or {}).get("target_message_id") or "__dom__"),
+                    mcp_allow_retry_at=(
+                        now + timedelta(seconds=self.policy.post_allow_seconds)
+                    ).isoformat(),
                     mcp_allow_activity_signature=signature,
                     mcp_allow_activity_length=length,
                 )
-                return Decision(Action.WAIT, "mcp_allow_handler_pending")
+                return Decision(Action.WAIT, "mcp_allow_retry_pending")
             for key in ("mcp_allow_seen_at", "mcp_allow_seen_target", "mcp_allow_retry_at", "mcp_allow_dispatch_error"):
                 wait.pop(key, None)
             signature, length = allow.activity(snapshot)

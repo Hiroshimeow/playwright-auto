@@ -483,7 +483,10 @@ def _receipt_user_index(
             matched = visible == expected or bool(marker and marker in message.text)
         if matched:
             matches.append(index)
-    return matches[0] if len(matches) == 1 else None
+    # React may temporarily render the same accepted logical user turn more than
+    # once during steering/rerender. Treat duplicate DOM representations as one
+    # receipt anchor and prefer the latest mounted occurrence.
+    return matches[-1] if matches else None
 
 
 def receipt_user_message_seen(
@@ -510,17 +513,6 @@ def bound_assistant_for_receipt(
     bound_turn_id = str(assistant_turn_id or "").strip()
 
     if allow_user_steering:
-        exact_receipt_users = [
-            index
-            for index, message in enumerate(messages)
-            if message.role == "user"
-            and (
-                (user_message_id and message.message_id == user_message_id)
-                or (user_turn_id and message.turn_id == user_turn_id)
-            )
-        ]
-        if len(exact_receipt_users) > 1:
-            return None, "duplicate_receipt_user_identity"
         anchor_index = _receipt_user_index(messages, receipt)
         if anchor_index is None:
             # The accepted user can be virtualized out after a rerender. A user
@@ -625,14 +617,16 @@ def bound_assistant_for_receipt(
             or (user_turn_id and message.turn_id == user_turn_id)
         )
     ]
-    if len(user_matches) > 1:
-        return None, "duplicate_receipt_user_identity"
     if not user_matches:
         return None, None
 
+    # Multiple DOM nodes can represent the same accepted user identity during a
+    # React remount. They are not multiple accepted Sends. Bind from the latest
+    # rendered receipt anchor so a duplicate node cannot manufacture a foreign
+    # user boundary.
     first_identity = ""
     candidates: list[MessageSnapshot] = []
-    for message in messages[user_matches[0] + 1 :]:
+    for message in messages[user_matches[-1] + 1 :]:
         if message.role == "user":
             if not first_identity:
                 return None, "foreign_user_before_bound_assistant"

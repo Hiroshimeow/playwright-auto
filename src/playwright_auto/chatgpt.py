@@ -1362,6 +1362,10 @@ async def click_preferred_mcp_allow(
               e.getAttribute('aria-disabled') !== 'true' && norm(e.getAttribute('aria-label')) === 'Approval options');
             const once = [...surface.querySelectorAll('button')].find(e => visible(e) && !e.disabled &&
               e.getAttribute('aria-disabled') !== 'true' && /^Allow once\b/i.test(norm(e.innerText || e.textContent)));
+            if (once && !options) {
+              once.click();
+              return {method:'dom_click_once_direct', target_message_id:'', remember_answer:'false'};
+            }
             if (options && once) {
               options.click();
               for (let i = 0; i < 20; i += 1) {
