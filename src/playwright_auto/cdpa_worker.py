@@ -2403,6 +2403,97 @@ class CDPAWorker:
                 pass
         return state
 
+    def _approve_challenge_recovery(
+        self, state: dict[str, Any], control: Mapping[str, Any]
+    ) -> bool:
+        """Use the existing durable hop/ledger for the sole operator-approved exception."""
+        if (
+            state.get("status") != "PAUSED"
+            or state.get("block_code") != "BROWSER_CHALLENGE"
+            or control.get("confirmed") is not True
+            or control.get("origin") != "operator"
+        ):
+            return False
+        hop = _active_hop(state)
+        role = str(hop.get("target_role") or "").upper()
+        owner = (state.get("roles") or {}).get(role)
+        if not isinstance(owner, dict) or role != state.get("active_role"):
+            return False
+        if hop.get("state") not in {"sent", "waiting"} or not isinstance(hop.get("receipt"), Mapping):
+            return False
+        if owner.get("attachments_uploaded_generation") is not None or state.get("attachments"):
+            return False
+        wait = hop.get("wait") or {}
+        if any(wait.get(key) for key in (
+            "transport_ui_active", "last_stop_visible", "response_activity_text",
+        )) or hop.get("response") or hop.get("message_identity"):
+            return False
+        if any(isinstance(item, Mapping) and item.get("challenge_recovery") for item in state.get("hops") or ()):
+            return False
+        for record in (state.get("roles") or {}).values():
+            if isinstance(record, Mapping) and _official_saved_url(record.get("page_url")):
+                return False
+        for item in state.get("hops") or ():
+            if not isinstance(item, Mapping):
+                return False
+            receipt = item.get("receipt") or {}
+            if (
+                _official_saved_url(item.get("conversation_url"))
+                or (isinstance(receipt, Mapping) and _official_saved_url(
+                    f"https://chatgpt.com/c/{receipt.get('conversation_id')}"
+                ))
+            ):
+                return False
+        if any(_official_saved_url(item.get("url")) for item in state.get("role_url_revisions") or () if isinstance(item, Mapping)):
+            return False
+        ledger = RequestLedger(str(hop.get("ledger_path") or ""))
+        try:
+            # Inspect all records, not only the active request. Incomplete/missing
+            # history is not positive proof that no canonical ID was ever saved.
+            raw = json.loads(ledger.path.read_text(encoding="utf-8"))
+            records = raw.get("records")
+            if raw.get("version") != RequestLedger.VERSION or not isinstance(records, dict):
+                return False
+            active = records.get(str(hop.get("request_id") or ""))
+            if not isinstance(active, dict):
+                return False
+            receipt = hop["receipt"]
+            if (
+                active.get("receipt") != receipt
+                or active.get("attempts") != 1
+                or active.get("status") != "sent"
+            ):
+                return False
+            for entry in records.values():
+                if not isinstance(entry, dict):
+                    return False
+                accepted = entry.get("receipt") or {}
+                if (
+                    _official_saved_url(f"https://chatgpt.com/c/{accepted.get('conversation_id')}")
+                    or _official_saved_url(f"https://chatgpt.com/c/{entry.get('session_id_before')}")
+                ):
+                    return False
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
+        # This mutates only the in-memory state that _apply_control saves atomically.
+        # _append_hop creates a new request ID. No Send occurs in this tick.
+        home = self._execution_endpoint_id(state, role) or self.store.endpoint_id_for(state)
+        if not self._prepare_cross_endpoint_recovery(
+            state, home, reason="Operator-approved Cloudflare continuation: original Send may have succeeded",
+            force_new_generation=True,
+        ):
+            return False
+        hop["challenge_recovery"] = {
+            "retry_count": 1,
+            "original_request_id": hop["request_id"],
+            "approved_control_id": control.get("control_id"),
+            "consumed_at": utc_now(),
+        }
+        _active_hop(state)["duplicate_risk_warning"] = (
+            "Original Send may have succeeded. This one approved continuation carries duplicate-send risk."
+        )
+        return True
+
     def _pause_recovery(self, state: dict[str, Any], *, code: str, reason: str) -> None:
         state['status'] = 'PAUSED'
         state['kanban_column'] = 'PAUSED'
@@ -4180,7 +4271,20 @@ class CDPAWorker:
                     status == "PAUSED"
                     and str(state.get("resume_status") or "").upper() == "BLOCKED"
                 )
-                if paused_blocked:
+                if (status == "PAUSED" and state.get("block_code") == "BROWSER_CHALLENGE"
+                        and bool(control.get("confirmed"))):
+                    current = await actions.locate_owned(state, role)
+                    if current is not None:
+                        raise RuntimeError("Original role document is still live; inspect its draft/response before any recovery")
+                    if not self._approve_challenge_recovery(state, control):
+                        raise RuntimeError("Cloudflare once-only recovery prerequisites cannot be proven; preserving original Send")
+                    result = {
+                        "outcome": "continued", "action": "approve_challenge_recovery",
+                        "reason_code": None, "reason": "One fresh continuation authorized; original Send may have succeeded.",
+                        "postcondition": "child_hop_appended", "retry_count": 1,
+                    }
+                    resume_completed = True
+                elif paused_blocked:
                     state["status"] = "BLOCKED"
                     state["kanban_column"] = state.pop("resume_column", "BLOCKED")
                     state["active_action"] = state.pop("resume_action", "blocked") or "blocked"

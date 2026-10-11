@@ -5633,6 +5633,7 @@ class TaskStore(IndependentAgentStoreMixin):
         self,
         state: dict[str, Any],
         *,
+        confirmed: bool = False,
         reason: str | None = None,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
@@ -5687,6 +5688,8 @@ class TaskStore(IndependentAgentStoreMixin):
             {
                 "control_id": sequence,
                 "action": "resume",
+                "confirmed": bool(confirmed),
+                "origin": "operator",
                 "role": str(state.get("active_role") or "PLAN").upper(),
                 "reason": normalized_reason,
                 "status": "requested",
@@ -5952,6 +5955,7 @@ class TaskStore(IndependentAgentStoreMixin):
         self,
         path: str | Path,
         *,
+        confirmed: bool = False,
         reason: str | None = None,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
@@ -5959,7 +5963,7 @@ class TaskStore(IndependentAgentStoreMixin):
             if external_command_id in state.get("applied_command_ids", []):
                 return state
             self._queue_resume(
-                state, reason=reason, external_command_id=external_command_id
+                state, reason=reason, confirmed=confirmed, external_command_id=external_command_id
             )
             self._record_external_command(state, external_command_id)
             return state
@@ -6595,6 +6599,7 @@ class TaskStore(IndependentAgentStoreMixin):
         if action == "resume":
             return self.request_resume(
                 path,
+                confirmed=confirmed,
                 reason=reason or "resume requested",
                 external_command_id=external_command_id,
             )
