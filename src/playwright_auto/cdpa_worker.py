@@ -11963,6 +11963,20 @@ class CDPAWorker:
             if not is_independent_task(state):
                 raise RuntimeError("independent command provenance belongs to a workflow task")
             return state
+        if kind == "change_role_url":
+            revisions = [
+                item for item in state.get("role_url_revisions") or []
+                if isinstance(item, Mapping)
+                and item.get("external_command_id") == command_id
+            ]
+            if (
+                len(revisions) != 1
+                or revisions[0].get("role") != payload.get("role")
+                or revisions[0].get("url") != payload.get("url")
+                or revisions[0].get("browser_endpoint_id") != payload.get("expected_browser_endpoint_id")
+            ):
+                raise RuntimeError("Change URL command replay provenance does not match its payload")
+            return state
         if kind == "change_goal":
             revisions = [
                 item for item in state.get("goal_revisions") or []
@@ -12675,6 +12689,29 @@ class CDPAWorker:
                 )
                 self._publish_command_state(state)
                 result = {"task_id": state["task_id"], "status": state["status"]}
+            elif kind == "change_role_url":
+                if task_id is None:
+                    raise ValueError("change_role_url requires task_id")
+                if self.runtime_degraded:
+                    raise RuntimeError("worker catalog is degraded; refusing role URL ownership changes")
+                current = self._command_task_state(task_id)
+                if current is None:
+                    raise ValueError(f"task does not exist: {task_id}")
+                state = self.store.change_role_url(
+                    current["manifest_path"],
+                    role=str(payload.get("role") or ""),
+                    url=str(payload.get("url") or ""),
+                    expected_browser_endpoint_id=str(payload.get("expected_browser_endpoint_id") or ""),
+                    external_command_id=command_id,
+                )
+                self._publish_command_state(state)
+                result = {
+                    "task_id": task_id,
+                    "role": payload.get("role"),
+                    "url": payload.get("url"),
+                    "browser_endpoint_id": payload.get("expected_browser_endpoint_id"),
+                    "status": state.get("status"),
+                }
             elif kind == "change_goal":
                 if task_id is None:
                     raise ValueError("change_goal requires task_id")
@@ -12778,6 +12815,7 @@ class CDPAWorker:
                 kinds=(
                     "create_task",
                     "change_goal",
+                    "change_role_url",
                     "remove_parent_dependency",
                     "create_workflow_agent",
                     "update_workflow_agent",
@@ -12810,6 +12848,7 @@ class CDPAWorker:
             return self._apply_next_command(
                 allowed_kinds=(
                     "change_goal",
+                    "change_role_url",
                     "remove_parent_dependency",
                     "resume_team",
                     "task_control",
@@ -12820,6 +12859,7 @@ class CDPAWorker:
             "reload_catalog",
             "create_task",
             "change_goal",
+            "change_role_url",
             "remove_parent_dependency",
             "create_workflow_agent",
             "update_workflow_agent",

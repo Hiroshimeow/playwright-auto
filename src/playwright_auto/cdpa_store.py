@@ -6413,6 +6413,167 @@ class TaskStore(IndependentAgentStoreMixin):
 
         return self.update(path, mutate)
 
+    def change_role_url(
+        self,
+        path: str | Path,
+        *,
+        role: str,
+        url: str,
+        expected_browser_endpoint_id: str,
+        external_command_id: str,
+    ) -> dict[str, Any]:
+        """Change one persistent role URL without moving its endpoint or replaying a Send.
+
+        A role that owns an existing page can only change the URL spelling for
+        the same conversation. Moving that role to a different conversation
+        requires its old binding to be safely released first.
+        """
+        role = validate_workflow_route_key(str(role or "").strip().upper())
+        normalized = normalize_saved_chatgpt_conversation_url(url)
+        if normalized is None:
+            raise ValueError("Change URL requires an exact ChatGPT /c/<UUID> HTTPS URL")
+        target_id = conversation_identity(normalized)
+        endpoint_id = str(expected_browser_endpoint_id or "").strip()
+        command_id = str(external_command_id or "").strip()
+        if not endpoint_id or not command_id:
+            raise ValueError("Change URL requires expected_browser_endpoint_id and external_command_id")
+        target = Path(path).expanduser().resolve()
+
+        # Same-worker task creation and command dispatch share this canonical
+        # store; check other live reservations before the per-task atomic update.
+        for other in self.discover():
+            if str(other.get("status") or "").upper() in TERMINAL:
+                continue
+            for other_role, record in (other.get("roles") or {}).items():
+                if (
+                    str(other.get("manifest_path") or "") == str(target)
+                    and str(other_role).upper() == role
+                ):
+                    continue
+                if not isinstance(record, Mapping):
+                    continue
+                other_id = conversation_identity(record.get("page_url"))
+                if other_id is None:
+                    active = next(
+                        (
+                            hop for hop in other.get("hops") or ()
+                            if isinstance(hop, Mapping)
+                            and hop.get("hop_id") == other.get("active_hop_id")
+                            and str(hop.get("target_role") or "").upper() == str(other_role).upper()
+                        ),
+                        None,
+                    )
+                    if active is not None and str(active.get("state") or "") in {
+                        "sending", "sent", "waiting", "responded",
+                    }:
+                        other_id = conversation_identity(active.get("conversation_url"))
+                        receipt = active.get("receipt") if isinstance(active.get("receipt"), Mapping) else {}
+                        if other_id is None and receipt.get("conversation_id"):
+                            other_id = conversation_identity(
+                                f"https://chatgpt.com/c/{receipt['conversation_id']}"
+                            )
+                if other_id == target_id:
+                    raise ValueError(
+                        f"conversation already reserved by {other.get('task_id')}/{other_role}"
+                    )
+
+        def mutate(state: dict[str, Any]) -> dict[str, Any]:
+            revisions = state.get("role_url_revisions") or []
+            if command_id in state.get("applied_command_ids", []):
+                records = [
+                    item for item in revisions
+                    if isinstance(item, Mapping)
+                    and item.get("external_command_id") == command_id
+                ]
+                if (
+                    len(records) != 1
+                    or records[0].get("role") != role
+                    or records[0].get("url") != normalized
+                    or records[0].get("browser_endpoint_id") != endpoint_id
+                ):
+                    raise ValueError("Change URL replay provenance does not match its payload")
+                return state
+            if is_independent_task(state) or str(state.get("status") or "").upper() in TERMINAL:
+                raise ValueError("Change URL requires a nonterminal Solo/Team task")
+            if state.get("conversation_mode") == "temporary":
+                raise ValueError("Change URL is unavailable for Temporary chats")
+            record = (state.get("roles") or {}).get(role)
+            if not isinstance(record, dict):
+                raise ValueError(f"role {role!r} does not belong to this task")
+            pinned = str(record.get("browser_endpoint_id") or state.get("browser_endpoint_id") or "").strip()
+            if pinned != endpoint_id:
+                raise ValueError(f"role endpoint mismatch: expected {pinned}, got {endpoint_id}")
+            if state.get("endpoint_pinned") is False:
+                raise ValueError("role endpoint must be pinned before Change URL")
+            current_url = str(record.get("page_url") or "").strip()
+            if current_url == normalized:
+                raise ValueError("role already has this URL")
+            current_id = conversation_identity(current_url)
+            history_ids: set[str] = set()
+            for hop in state.get("hops") or ():
+                if not isinstance(hop, Mapping) or str(hop.get("target_role") or "").upper() != role:
+                    continue
+                receipt = hop.get("receipt") if isinstance(hop.get("receipt"), Mapping) else {}
+                receipt_id = str(receipt.get("conversation_id") or "").strip()
+                identity = conversation_identity(hop.get("conversation_url"))
+                if identity is None and receipt_id:
+                    identity = conversation_identity(f"https://chatgpt.com/c/{receipt_id}")
+                if identity is not None:
+                    history_ids.add(identity)
+            known_id = current_id or (next(iter(history_ids)) if len(history_ids) == 1 else None)
+            active_hop = next(
+                (
+                    hop for hop in state.get("hops") or ()
+                    if isinstance(hop, dict)
+                    and hop.get("hop_id") == state.get("active_hop_id")
+                    and str(hop.get("target_role") or "").upper() == role
+                ),
+                None,
+            )
+            active_state = str((active_hop or {}).get("state") or "")
+            # A durable Send boundary is never transferable to a different chat.
+            active_receipt = (
+                active_hop.get("receipt")
+                if isinstance((active_hop or {}).get("receipt"), Mapping)
+                else {}
+            )
+            active_id = conversation_identity((active_hop or {}).get("conversation_url"))
+            if active_receipt.get("conversation_id"):
+                active_id = conversation_identity(
+                    f"https://chatgpt.com/c/{active_receipt['conversation_id']}"
+                )
+            if (
+                active_state in {"sending", "sent", "waiting", "responded"}
+                and (active_id or known_id) != target_id
+            ):
+                raise ValueError("active request is in flight; cannot change its conversation identity")
+            if record.get("page_id") and known_id != target_id:
+                raise ValueError(
+                    "role still has a recorded page binding; cannot replace it with a different conversation"
+                )
+            for other_role, other in state["roles"].items():
+                if other_role != role and conversation_identity(other.get("page_url")) == target_id:
+                    raise ValueError(f"conversation is already assigned to role {other_role}")
+            record["page_url"] = normalized
+            if (
+                active_hop is not None and active_state == "pre_send"
+                and active_hop.get("receipt") is None
+                and active_hop.get("message_identity") is None
+            ):
+                active_hop["conversation_url"] = normalized
+            state.setdefault("role_url_revisions", []).append({
+                "role": role,
+                "url": normalized,
+                "previous_url": current_url or None,
+                "browser_endpoint_id": pinned,
+                "changed_at": utc_now(),
+                "external_command_id": command_id,
+            })
+            self._record_external_command(state, command_id)
+            return state
+
+        return self.update(target, mutate)
+
     def request_control(
         self,
         path: str | Path,

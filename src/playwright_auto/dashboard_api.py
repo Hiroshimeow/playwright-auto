@@ -1002,6 +1002,33 @@ class DashboardAPI:
         return payload
 
     @staticmethod
+    def normalize_role_url_change(raw: Mapping[str, Any]) -> tuple[dict[str, Any], int | None]:
+        allowed = {"role", "url", "expected_browser_endpoint_id", "expected_task_version"}
+        if set(raw) - allowed:
+            raise APIError(400, "invalid_request", "Change URL accepts only role, url, endpoint ID and task version")
+        try:
+            role = validate_workflow_route_key(str(raw.get("role") or "").strip().upper())
+        except ValueError as exc:
+            raise APIError(400, "invalid_request", str(exc)) from exc
+        url = normalize_saved_chatgpt_conversation_url(raw.get("url"))
+        if url is None:
+            raise APIError(400, "invalid_request", "URL must be an exact ChatGPT /c/<UUID> HTTPS URL")
+        endpoint_id = str(raw.get("expected_browser_endpoint_id") or "").strip()
+        if not endpoint_id:
+            raise APIError(400, "invalid_request", "expected_browser_endpoint_id is required")
+        expected = raw.get("expected_task_version")
+        if expected is not None:
+            if isinstance(expected, bool):
+                raise APIError(400, "invalid_request", "expected_task_version must be an integer")
+            try:
+                expected = int(expected)
+            except (ValueError, TypeError) as exc:
+                raise APIError(400, "invalid_request", "expected_task_version must be an integer") from exc
+            if expected < 0:
+                raise APIError(400, "invalid_request", "expected_task_version must be non-negative")
+        return {"role": role, "url": url, "expected_browser_endpoint_id": endpoint_id}, expected
+
+    @staticmethod
     def normalize_goal_change(raw: Mapping[str, Any]) -> tuple[dict[str, Any], int | None]:
         allowed = {
             "goal",
@@ -1706,6 +1733,16 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                         task_id=task_id,
                         expected_task_version=expected,
                         payload={"parent_task_id": parent_task_id},
+                    )
+                elif len(parts) == 4 and parts[:2] == ["api", "tasks"] and parts[3] == "role-url":
+                    task_id = validate_task_id(parts[2])
+                    payload, expected = app.normalize_role_url_change(raw)
+                    command = app.enqueue(
+                        idempotency_key=key,
+                        kind="change_role_url",
+                        task_id=task_id,
+                        expected_task_version=expected,
+                        payload=payload,
                     )
                 elif len(parts) == 4 and parts[:2] == ["api", "tasks"] and parts[3] == "goal":
                     task_id = validate_task_id(parts[2])
