@@ -155,3 +155,46 @@ def test_manual_assets_or_active_response_never_approves_replay(tmp_path, safety
     assert len(changed["hops"]) == 1
     assert not changed["hops"][0].get("challenge_recovery")
     actions.fresh_chat.assert_not_awaited()
+
+
+@pytest.mark.parametrize("evidence", [
+    "bound_assistant_message_id", "bound_assistant_turn_id",
+    "bound_assistant_progress", "last_assistant_progress",
+    "activity_signature", "activity_length", "result_seen_key",
+    "response_record", "ledger_response",
+])
+def test_confirmed_recovery_rejects_persisted_original_response_evidence(tmp_path, evidence):
+    store, worker, path, request_id, original = challenge_case(tmp_path)
+    state = store.load(path)
+    hop = state["hops"][0]
+    progress = {
+        "source": "dom", "text": "Existing assistant output",
+        "fingerprint": "existing-response", "message_id": "assistant-1",
+        "turn_id": "assistant-turn-1", "observed_at": "2026-10-11T00:00:00Z",
+    }
+    if evidence in {"bound_assistant_progress", "last_assistant_progress"}:
+        hop["wait"][evidence] = progress
+    elif evidence == "bound_assistant_message_id":
+        hop["wait"][evidence] = "assistant-1"
+    elif evidence == "bound_assistant_turn_id":
+        hop["wait"][evidence] = "assistant-turn-1"
+    elif evidence == "activity_signature":
+        hop["wait"][evidence] = "activity-fingerprint"
+    elif evidence == "activity_length":
+        hop["wait"][evidence] = 22
+    elif evidence == "result_seen_key":
+        hop["wait"][evidence] = "candidate-fingerprint"
+    elif evidence == "response_record":
+        hop[evidence] = {"role": "assistant", "text": "Already observed"}
+    else:
+        RequestLedger(hop["ledger_path"]).update(
+            request_id, response={"role": "assistant", "text": "Already observed"},
+        )
+    store.save(path, state)
+
+    changed, actions = apply_resume(store, worker, path, confirmed=True)
+    assert len(changed["hops"]) == 1
+    assert changed["hops"][0]["state"] != "abandoned"
+    assert not changed["hops"][0].get("challenge_recovery")
+    assert RequestLedger(hop["ledger_path"]).peek(request_id).attempts == 1
+    actions.fresh_chat.assert_not_awaited()

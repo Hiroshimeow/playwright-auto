@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import playwright_auto.cdpa_actions as actions_module
-from playwright_auto.cdpa_actions import AcquiredRole, CDPATabActions, RoleOwnershipError
+from playwright_auto.cdpa_actions import AcquiredRole, BrowserChallengeError, CDPATabActions, RoleOwnershipError
 from playwright_auto.cdpa_worker import _active_hop
 from test_cdpa_worker import setup_task
 
@@ -371,3 +371,22 @@ def test_team_create_ui_exposes_initial_role_and_exact_role_url_fields():
     assert 'name="role_url_lines"' in html
     assert "body.role_conversation_urls = roleUrls" in app
     assert "body.initial_role = startRole" in app
+
+@pytest.mark.parametrize('fault,expected', [
+    (BrowserChallengeError('confirmed Cloudflare'), 'BROWSER_CHALLENGE'),
+    (TimeoutError('saved canonical unavailable'), 'SESSION_UNAVAILABLE'),
+])
+def test_team_preassigned_url_recovery_typed_pause(tmp_path, fault, expected):
+    _config, _store, state, worker = _task(tmp_path)
+    hop = _active_hop(state)
+    actions = SimpleNamespace(
+        preflight_role=AsyncMock(return_value=[]),
+        adopt_conversation=AsyncMock(side_effect=fault),
+        reopen=AsyncMock(), fresh_chat=AsyncMock(), acquire=AsyncMock(),
+    )
+    asyncio.run(worker._pre_send(state, hop, actions))
+    assert state['status'] == 'PAUSED'
+    assert state['block_code'] == expected
+    assert hop['conversation_url'] == URL1
+    assert state['roles']['REVIEW']['page_url'] == URL1
+    actions.fresh_chat.assert_not_awaited()

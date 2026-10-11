@@ -2426,7 +2426,15 @@ class CDPAWorker:
         wait = hop.get("wait") or {}
         if any(wait.get(key) for key in (
             "transport_ui_active", "last_stop_visible", "response_activity_text",
-        )) or hop.get("response") or hop.get("message_identity"):
+            "response_activity_turn_id", "bound_assistant_message_id",
+            "bound_assistant_turn_id", "bound_assistant_progress",
+            "last_assistant_progress", "activity_signature", "activity_length",
+            "activity_changed_at", "activity_observed_at", "result_seen_key",
+            "listen_result_seen_key", "response_binding_error",
+            "user_steering_rebind_count",
+        )) or any(hop.get(key) for key in (
+            "response", "response_record", "response_sha256", "message_identity",
+        )):
             return False
         if any(isinstance(item, Mapping) and item.get("challenge_recovery") for item in state.get("hops") or ()):
             return False
@@ -2462,6 +2470,7 @@ class CDPAWorker:
                 active.get("receipt") != receipt
                 or active.get("attempts") != 1
                 or active.get("status") != "sent"
+                or active.get("response")
             ):
                 return False
             for entry in records.values():
@@ -2785,6 +2794,11 @@ class CDPAWorker:
             if isinstance(hop.get("receipt"), Mapping):
                 try:
                     self._reconcile_hop_conversation_identity(state, hop)
+                    # The accepted ledger may be the only remaining source of the
+                    # canonical UUID; derive ownership after reconciliation.
+                    _, expected_conversation, expected_page_id, _ = (
+                        self._active_recovery_context(state, role)
+                    )
                 except RuntimeError as exc:
                     self._block(
                         state,
@@ -6265,7 +6279,16 @@ class CDPAWorker:
         elif (state.get('conversation_mode') != 'temporary'
               and state['roles'][role].get('page_id')
               and _preferred_saved_url(hop.get('conversation_url'), state['roles'][role].get('page_url'))):
-            acquired = await actions.reopen(state, role, require_clean_ready=False)
+            try:
+                acquired = await actions.reopen(state, role, require_clean_ready=False)
+            except (BrowserChallengeError, TimeoutError, PlaywrightTimeoutError) as exc:
+                if is_cdp_disconnect(exc):
+                    raise
+                self._pause_recovery(state, code=(
+                    'BROWSER_CHALLENGE' if isinstance(exc, BrowserChallengeError)
+                    else 'SESSION_UNAVAILABLE'
+                ), reason=sanitize_exception(exc))
+                return
             await self._dismiss_known_rate_limit_on_existing(acquired)
         elif solo_existing_url or team_existing_url:
             candidate_url = (
@@ -6287,11 +6310,20 @@ class CDPAWorker:
                     retryable=False,
                 )
                 return
-            acquired = await actions.adopt_conversation(
-                state,
-                role,
-                url=candidate_url,
-            )
+            try:
+                acquired = await actions.adopt_conversation(
+                    state,
+                    role,
+                    url=candidate_url,
+                )
+            except (BrowserChallengeError, TimeoutError, PlaywrightTimeoutError) as exc:
+                if is_cdp_disconnect(exc):
+                    raise
+                self._pause_recovery(state, code=(
+                    'BROWSER_CHALLENGE' if isinstance(exc, BrowserChallengeError)
+                    else 'SESSION_UNAVAILABLE'
+                ), reason=sanitize_exception(exc))
+                return
             hop["conversation_url"] = acquired.url
             await self._dismiss_known_rate_limit_on_existing(acquired)
         elif isinstance(independent, dict) and independent.get("temporary_chat") is True:
@@ -6367,10 +6399,19 @@ class CDPAWorker:
                 )
                 return
             hop["conversation_url"] = saved_url
-            if state["roles"][role].get("page_id"):
-                acquired = await actions.reopen(state, role, require_clean_ready=False)
-            else:
-                acquired = await actions.adopt_conversation(state, role, url=saved_url)
+            try:
+                if state["roles"][role].get("page_id"):
+                    acquired = await actions.reopen(state, role, require_clean_ready=False)
+                else:
+                    acquired = await actions.adopt_conversation(state, role, url=saved_url)
+            except (BrowserChallengeError, TimeoutError, PlaywrightTimeoutError) as exc:
+                if is_cdp_disconnect(exc):
+                    raise
+                self._pause_recovery(state, code=(
+                    'BROWSER_CHALLENGE' if isinstance(exc, BrowserChallengeError)
+                    else 'SESSION_UNAVAILABLE'
+                ), reason=sanitize_exception(exc))
+                return
             await self._dismiss_known_rate_limit_on_existing(acquired)
         elif not isinstance(independent, Mapping) and (state.get("context_policy") == "fresh" or hop.get("kind") == "execution_recovery"):
             acquired = await actions.locate_owned(state, role)

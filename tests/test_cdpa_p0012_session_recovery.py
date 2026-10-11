@@ -201,3 +201,31 @@ def test_lost_temporary_document_preserves_accepted_receipt_and_pauses(tmp_path)
     assert RequestLedger(hop['ledger_path']).get(hop['request_id']).attempts == 1
     actions.reopen.assert_not_awaited()
     actions.fresh_chat.assert_not_awaited()
+
+
+def test_ledger_only_accepted_canonical_id_is_reconciled_before_reopen(tmp_path):
+    state, worker, hop, receipt = _sent(tmp_path)
+    hop["conversation_url"] = None
+    state["roles"]["PLAN"]["page_url"] = None
+    ledger = RequestLedger(hop["ledger_path"])
+    canonical = replace(receipt, conversation_id=UUID).to_dict()
+    ledger.update(hop["request_id"], receipt=canonical)
+    original_ledger = ledger.peek(hop["request_id"]).to_dict()
+    acquired = AcquiredRole(
+        client=SimpleNamespace(wait_until_clean_ready=AsyncMock()),
+        page_id="new-runtime-page", url=REGULAR,
+        created=True, new_chat=False,
+    )
+    actions = SimpleNamespace(
+        locate_owned=AsyncMock(return_value=None),
+        reopen=AsyncMock(return_value=acquired),
+        wake=AsyncMock(), fresh_chat=AsyncMock(),
+    )
+    result = asyncio.run(worker._owned_or_block(state, "PLAN", actions))
+    assert result is acquired
+    assert actions.reopen.await_count == 1
+    assert hop["conversation_url"] == REGULAR
+    assert hop["receipt"] == canonical
+    assert hop["receipt"]["binding"] == receipt.to_dict()["binding"]
+    assert ledger.peek(hop["request_id"]).to_dict() == original_ledger
+    actions.fresh_chat.assert_not_awaited()
