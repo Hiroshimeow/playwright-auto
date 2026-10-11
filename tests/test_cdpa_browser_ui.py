@@ -41,7 +41,7 @@ def test_changed_browser_module_graph_uses_fresh_cache_identity_for_changed_modu
     topology_key = "?v=20260914-goal2-ops-v1"
     board_key = "?v=20260915-operator-ux-v1"
     browsers_key = "?v=20260915-endpoint-all-v1"
-    live_key = "?v=20260925-live-sse-v1"
+    challenge_key = "?v=20261011-p0012-challenge-confirm-v1"
     role_url_key = "?v=20261011-change-role-url-v1"
     app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
     html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
@@ -52,10 +52,10 @@ def test_changed_browser_module_graph_uses_fresh_cache_identity_for_changed_modu
 
     assert f'"./views/board.js{board_key}"' in app
     assert f'"./views/browsers.js{browsers_key}"' in app
-    assert f'"./views/task_detail.js{role_url_key}"' in app
-    assert f'"./views/notify.js{live_key}"' in app
-    assert f'"./task_detail.js{live_key}"' in notify
+    assert f'"./views/task_detail.js{challenge_key}"' in app
+    assert f'"./views/notify.js{challenge_key}"' in app
+    assert f'"./task_detail.js{challenge_key}"' in notify
     for source in (board, browsers, detail):
         assert f'"./topology.js{topology_key}"' in source
-    assert f'/assets/app.js{role_url_key}' in html
+    assert f'/assets/app.js{challenge_key}' in html
     assert f'/assets/dashboard.css{role_url_key}' in html
