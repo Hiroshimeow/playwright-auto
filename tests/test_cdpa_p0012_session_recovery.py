@@ -229,3 +229,38 @@ def test_ledger_only_accepted_canonical_id_is_reconciled_before_reopen(tmp_path)
     assert hop["receipt"]["binding"] == receipt.to_dict()["binding"]
     assert ledger.peek(hop["request_id"]).to_dict() == original_ledger
     actions.fresh_chat.assert_not_awaited()
+
+
+def test_confirmed_cloudflare_on_owned_accepted_temporary_page_pauses_without_replay(tmp_path, monkeypatch):
+    state, worker, hop, receipt = _sent(tmp_path)
+    state['conversation_mode'] = 'temporary'
+    state['roles']['PLAN']['temporary_document_id'] = 'original-document'
+    page = SimpleNamespace()
+    acquired = AcquiredRole(client=SimpleNamespace(page=page), page_id='page-alpha-plan', url='https://chatgpt.com/?temporary-chat=true', created=False, new_chat=False)
+    actions = SimpleNamespace(locate_owned=AsyncMock(return_value=acquired), reopen=AsyncMock(), fresh_chat=AsyncMock())
+    monkeypatch.setattr('playwright_auto.cdpa_worker.cloudflare_challenge_visible', AsyncMock(return_value=True), raising=False)
+    assert asyncio.run(worker._owned_or_block(state, 'PLAN', actions)) is None
+    assert state['status'] == 'PAUSED'
+    assert state['block_code'] == 'BROWSER_CHALLENGE'
+    assert hop['receipt'] == receipt.to_dict()
+    actions.fresh_chat.assert_not_awaited()
+
+
+def test_recover_active_role_has_one_total_reopen_and_readiness_deadline(tmp_path, monkeypatch):
+    import playwright_auto.cdpa_worker as worker_module
+    state, worker, hop, _ = _sent(tmp_path)
+    async def delayed_ready(**_kwargs):
+        await asyncio.sleep(0.07)
+    client = SimpleNamespace(wait_until_clean_ready=AsyncMock(side_effect=delayed_ready))
+    acquired = AcquiredRole(client=client, page_id='new-runtime', url=REGULAR, created=True, new_chat=False)
+    async def delayed_reopen(*_args, **_kwargs):
+        await asyncio.sleep(0.07)
+        return acquired
+    actions = SimpleNamespace(reopen=AsyncMock(side_effect=delayed_reopen), wake=AsyncMock())
+    hop['state'] = 'pre_send'
+    original_timeout = asyncio.timeout
+    monkeypatch.setattr(worker_module.asyncio, 'timeout', lambda _seconds: original_timeout(0.10))
+    with pytest.raises(TimeoutError):
+        asyncio.run(worker._recover_active_role(state, 'PLAN', actions))
+    assert client.wait_until_clean_ready.await_count == 1
+    assert state['roles']['PLAN']['page_id'] == 'page-alpha-plan'

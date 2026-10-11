@@ -7,7 +7,7 @@ import {
 } from "./store.js?v=20260914-goal2-ops-v1";
 import {renderBoard, refreshElapsed} from "./views/board.js?v=20260915-operator-ux-v1";
 import {renderBrowserManager, renderBrowserScope, syncCreateBrowserOptions, creationUsesTemporary} from "./views/browsers.js?v=20260915-endpoint-all-v1";
-import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20261011-change-role-url-v1";
+import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20261011-p0012-challenge-confirm-v1";
 import {renderHistory} from "./views/history.js";
 import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20260925-live-sse-v1";
 import {renderRuntime} from "./views/runtime.js?v=20260906-listen-controls-v1";
@@ -1624,6 +1624,9 @@ roots.detail.addEventListener("click", async event => {
     const taskId = control.dataset.taskId;
     const detail = state.selectedDetail;
     const isReset = control.dataset.control === "reset";
+    const challengeApproval = control.dataset.challengeApproval === "true";
+    const duplicateWarning = "The original Send may already have succeeded. Approving creates one new generation and risks duplicate output. Continue?";
+    if (challengeApproval && !window.confirm(duplicateWarning)) return;
     queueCommand({
       kind: control.dataset.control,
       taskId,
@@ -1634,7 +1637,8 @@ roots.detail.addEventListener("click", async event => {
         action: control.dataset.control,
         role: selectedRole(state),
         expected_task_version: Number(control.dataset.version),
-        confirmed: ["stop", "clear_team", "archive_worktree"].includes(control.dataset.control),
+        confirmed: challengeApproval || ["stop", "clear_team", "archive_worktree"].includes(control.dataset.control),
+        ...(challengeApproval ? {reason: "Operator acknowledged duplicate Send risk: original Send may have succeeded"} : {}),
       },
       label: `${control.textContent} · ${detail?.team || taskId}`,
     });

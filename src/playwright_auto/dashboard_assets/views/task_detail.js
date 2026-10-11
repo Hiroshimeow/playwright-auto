@@ -262,7 +262,7 @@ function operationalStateSection(detail, endpoints = []) {
   grid.append(operationalField("Evidence", reportCount + " reports · " + eventCount + " events"));
   section.append(grid);
 
-  const reason = detail.waiting_reason || detail.primary_problem?.message || null;
+  const reason = detail.waiting_reason || detail.primary_problem?.message || detail.pause_reason || detail.block_reason || null;
   if (reason) {
     const explanation = el("p", reason, "operational-state-reason");
     if (detail.primary_problem?.code || detail.block_code) {
@@ -1052,6 +1052,17 @@ function workflowOverview(detail, timeline, selectedRole, endpoints) {
       disabled: eligibility.eligible !== true,
       reason: eligibility.reason || null,
     }));
+    if (action === "resume" && detail.status === "PAUSED" && detail.block_code === "BROWSER_CHALLENGE") {
+      const approve = button("resume", "Approve one challenge recovery", detail, {
+        disabled: eligibility.eligible !== true,
+        reason: eligibility.reason || null,
+      });
+      approve.dataset.challengeApproval = "true";
+      controls.append(approve);
+      operations.append(el("p",
+        "Duplicate Send risk: the original Send may already have succeeded. Only explicitly approve one new generation after checking the original response.",
+        "operational-state-reason"));
+    }
     if (action === "open_tab") controls.append(changeUrlButton(detail));
   }
   operations.append(controls);

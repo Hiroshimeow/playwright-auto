@@ -126,6 +126,7 @@ from .chatgpt import (
     backend_set_conversation_project,
     capture_message_baseline,
     capture_response_recovery_baseline,
+    cloudflare_challenge_visible,
     configure_action_delays,
     ConversationTranscriptNotReadyError,
     IncompleteResponseTimeoutError,
@@ -2738,26 +2739,34 @@ class CDPAWorker:
                 "active role has no exact saved ChatGPT conversation URL",
                 code="role_offline",
             )
-        acquired = await actions.reopen(
-            state,
-            role,
-            require_clean_ready=require_clean_ready and foreground,
-            foreground=foreground,
-        )
-        if _recoverable_conversation_identity(acquired.url) != expected_conversation:
-            raise RoleOwnershipError(
-                "automatic role recovery reopened a different conversation"
+        # Cover the complete worker reopen, wake and readiness path; the
+        # action-level 30s timeout alone does not bound the subsequent wait.
+        async with asyncio.timeout(30):
+            acquired = await actions.reopen(
+                state, role,
+                require_clean_ready=require_clean_ready and foreground,
+                foreground=foreground,
             )
-        # The original receipt remains immutable; a newly restored runtime page
-        # may have a distinct ID once the canonical conversation is verified.
-        if not foreground:
-            await actions.wake(acquired)
-            if require_clean_ready:
-                await acquired.client.wait_until_clean_ready(
-                    timeout_ms=round(self.config.workspace_timeout_seconds * 1000)
+            if _recoverable_conversation_identity(acquired.url) != expected_conversation:
+                raise RoleOwnershipError(
+                    "automatic role recovery reopened a different conversation"
                 )
-        self._record_acquired(state, role, acquired)
-        return acquired
+            if not foreground:
+                await actions.wake(acquired)
+                if require_clean_ready:
+                    try:
+                        await acquired.client.wait_until_clean_ready(
+                            timeout_ms=30000
+                        )
+                    except RateLimitBlockedError as exc:
+                        page = getattr(acquired.client, "page", None)
+                        if page is not None and await cloudflare_challenge_visible(page):
+                            raise BrowserChallengeError(
+                                "Cloudflare challenge blocked recovered role readiness"
+                            ) from exc
+                        raise
+            self._record_acquired(state, role, acquired)
+            return acquired
 
     @staticmethod
     async def _temporary_document_token(client: Any, *, create: bool = False) -> str | None:
@@ -2908,6 +2917,13 @@ class CDPAWorker:
                     expected_conversation = _recoverable_conversation_identity(
                         hop.get("conversation_url")
                     )
+            # Only a positively observed provider challenge on the exact owned
+            # document is evidence; a missing Temporary tab is not proof.
+            if (acquired is not None and isinstance(hop.get("receipt"), Mapping)
+                    and getattr(acquired.client, "page", None) is not None
+                    and await cloudflare_challenge_visible(acquired.client.page)):
+                self._pause_recovery(state, code='BROWSER_CHALLENGE', reason='Cloudflare challenge confirmed on the owned accepted role document.')
+                return None
             if temporary:
                 token = state["roles"][role].get("temporary_document_id")
                 lost_document = bool(
