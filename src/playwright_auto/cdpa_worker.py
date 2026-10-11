@@ -4203,12 +4203,33 @@ class CDPAWorker:
                             "role-initiated pause lost its persisted route handoff"
                         )
                     before = command_snapshot(baseline, role=source_role)
+                    solo_resume = str(state.get("workflow_mode") or "team").lower() == "solo"
+                    saved_url = None
+                    if solo_resume and state.get("conversation_mode") != "temporary":
+                        receipt = hop.get("receipt") if isinstance(hop.get("receipt"), Mapping) else {}
+                        conversation_id = str(receipt.get("conversation_id") or "").strip()
+                        saved_url = _preferred_saved_url(
+                            hop.get("conversation_url"),
+                            state["roles"][source_role].get("page_url"),
+                            conversation_id=conversation_id or None,
+                        )
+                        if not saved_url and conversation_id:
+                            fallback = f"https://chatgpt.com/c/{conversation_id}"
+                            saved_url = fallback if _official_saved_url(fallback) else None
+                        if not saved_url:
+                            raise RuntimeError(
+                                "Solo Resume requires its saved conversation URL; refusing Fresh Chat"
+                            )
                     child = self._append_hop(
                         state,
                         source_role=source_role,
                         target_role=source_role,
                         handoff=handoff,
+                        kind="solo_resume" if solo_resume else "handoff",
                     )
+                    if saved_url:
+                        child["conversation_url"] = saved_url
+                        state["roles"][source_role]["page_url"] = saved_url
                     state.pop("resume_column", None)
                     state["pause_reason"] = None
                     state["block_code"] = None
@@ -6184,6 +6205,28 @@ class CDPAWorker:
                     return
             else:
                 acquired = await actions.acquire(state, role, clean_for_send=True)
+            await self._dismiss_known_rate_limit_on_existing(acquired)
+        elif (
+            not isinstance(independent, Mapping)
+            and str(state.get("workflow_mode") or "team").lower() == "solo"
+            and hop.get("kind") == "solo_resume"
+        ):
+            saved_url = _preferred_saved_url(
+                hop.get("conversation_url"), state["roles"][role].get("page_url")
+            )
+            if not saved_url:
+                self._block(
+                    state,
+                    "Solo continuation has no saved conversation URL; refusing Fresh Chat",
+                    code="conversation_identity_unavailable",
+                    retryable=False,
+                )
+                return
+            hop["conversation_url"] = saved_url
+            if state["roles"][role].get("page_id"):
+                acquired = await actions.reopen(state, role, require_clean_ready=False)
+            else:
+                acquired = await actions.adopt_conversation(state, role, url=saved_url)
             await self._dismiss_known_rate_limit_on_existing(acquired)
         elif not isinstance(independent, Mapping) and (state.get("context_policy") == "fresh" or hop.get("kind") == "execution_recovery"):
             acquired = await actions.locate_owned(state, role)
