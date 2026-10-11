@@ -514,10 +514,9 @@ def test_notify_frontend_contract_reuses_secondary_report_path_and_preserves_his
     assert 'if (current.drawer === "history") renderHistory(roots.secondaryContent, current);' in app
     assert 'if (current.drawer === "notify") renderNotify(roots.secondaryContent, current);' in app
     assert 'if (view === "notify") delete roots.secondaryContent.dataset.secondaryView;' in app
-    cache_key = "20260925-live-sse-v1"
-    role_url_key = "20261011-change-role-url-v1"
-    assert f'/assets/app.js?v={role_url_key}' in html
-    assert f'./views/task_detail.js?v={role_url_key}' in app
+    cache_key = "20261011-p0012-challenge-confirm-v1"
+    assert f'/assets/app.js?v={cache_key}' in html
+    assert f'./views/task_detail.js?v={cache_key}' in app
     assert f'./views/notify.js?v={cache_key}' in app
     assert f'./task_detail.js?v={cache_key}' in notify
     assert 'data-notify-task-id' in notify
@@ -1092,7 +1091,7 @@ def test_board_lane_materialization_keeps_commands_after_operational_lanes():
 
     # board.js and its importing entrypoint both get fresh cache identities.
     assert './views/board.js?v=20260915-operator-ux-v1' in app
-    assert '/assets/app.js?v=20261011-change-role-url-v1' in html
+    assert '/assets/app.js?v=20261011-p0012-challenge-confirm-v1' in html
 
 
 def test_dashboard_compact_layout_contract_keeps_operational_content_visible():
@@ -1128,7 +1127,7 @@ def test_dashboard_dense_operator_layout_contract():
 
     # Published frontend bytes use a fresh cache identity through the changed import graph.
     assert '/assets/dashboard.css?v=20261011-change-role-url-v1' in html
-    assert '/assets/app.js?v=20261011-change-role-url-v1' in html
+    assert '/assets/app.js?v=20261011-p0012-challenge-confirm-v1' in html
     assert './views/board.js?v=20260915-operator-ux-v1' in app
     assert './views/browsers.js?v=20260915-endpoint-all-v1' in app
 

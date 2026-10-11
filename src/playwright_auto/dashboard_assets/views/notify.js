@@ -1,4 +1,4 @@
-import {reportBody, workflowReportModel} from "./task_detail.js?v=20260925-live-sse-v1";
+import {reportBody, workflowReportModel} from "./task_detail.js?v=20261011-p0012-challenge-confirm-v1";
 
 const NOTIFY_STATUSES = new Set(["DONE", "BLOCKED", "PAUSED", "STOPPED"]);
 

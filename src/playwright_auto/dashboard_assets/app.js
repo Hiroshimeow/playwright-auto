@@ -9,7 +9,7 @@ import {renderBoard, refreshElapsed} from "./views/board.js?v=20260915-operator-
 import {renderBrowserManager, renderBrowserScope, syncCreateBrowserOptions, creationUsesTemporary} from "./views/browsers.js?v=20260915-endpoint-all-v1";
 import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20261011-p0012-challenge-confirm-v1";
 import {renderHistory} from "./views/history.js";
-import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20260925-live-sse-v1";
+import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20261011-p0012-challenge-confirm-v1";
 import {renderRuntime} from "./views/runtime.js?v=20260906-listen-controls-v1";
 import {
   applyReuseRoleSelection, renderCreateActions, renderResume, renderWorkflowAgentOptions,
