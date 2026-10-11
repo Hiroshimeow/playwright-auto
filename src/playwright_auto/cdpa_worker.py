@@ -4216,10 +4216,6 @@ class CDPAWorker:
                         if not saved_url and conversation_id:
                             fallback = f"https://chatgpt.com/c/{conversation_id}"
                             saved_url = fallback if _official_saved_url(fallback) else None
-                        if not saved_url:
-                            raise RuntimeError(
-                                "Solo Resume requires its saved conversation URL; refusing Fresh Chat"
-                            )
                     child = self._append_hop(
                         state,
                         source_role=source_role,
@@ -6127,10 +6123,22 @@ class CDPAWorker:
             and bool(str(hop.get("conversation_url") or "").strip())
             and not bool(state["roles"][role].get("page_id"))
         )
+        team_existing_url = (
+            not isinstance(independent, Mapping)
+            and str(state.get("workflow_mode") or "team").strip().lower() == "team"
+            and state.get("conversation_mode") != "temporary"
+            and not state["roles"][role].get("page_id")
+            and bool(_preferred_saved_url(
+                hop.get("conversation_url"), state["roles"][role].get("page_url"),
+            ))
+        )
         if route_repair_stale_error_ready:
             acquired = route_repair_owned
-        elif solo_existing_url:
-            candidate_url = str(hop["conversation_url"])
+        elif solo_existing_url or team_existing_url:
+            candidate_url = (
+                _preferred_saved_url(hop.get("conversation_url"), state["roles"][role].get("page_url"))
+                or str(hop["conversation_url"])
+            )
             owner = self._foreign_durable_conversation_owner(
                 state,
                 role,
@@ -6140,7 +6148,7 @@ class CDPAWorker:
                 owner_task, owner_physical, owner_team = owner
                 self._block(
                     state,
-                    "Solo conversation is already owned by "
+                    "Conversation is already owned by "
                     f"{owner_task}/{owner_physical}/{owner_team}",
                     code="conversation_owned_by_other_task",
                     retryable=False,
@@ -6373,7 +6381,7 @@ class CDPAWorker:
                 self, state, hop, acquired, actions, phase="pre_send", wait_ms=0,
             )
             preparation_reason = preparation.reason
-        if solo_existing_url and preparation_reason == "response_in_progress":
+        if (solo_existing_url or team_existing_url) and preparation_reason == "response_in_progress":
             now = datetime.now(timezone.utc)
             start_wait_budget(
                 hop["wait"],
@@ -6988,13 +6996,21 @@ class CDPAWorker:
             return
         except UnsafePageStateError as exc:
             current_record = ledger.peek(str(hop["request_id"]))
-            solo_existing_url = (
-                str(state.get("workflow_mode") or "team").strip().lower() == "solo"
-                and str(hop.get("kind") or "") == "task"
-                and bool(str(hop.get("conversation_url") or "").strip())
+            adopted_existing_url = (
+                str(hop.get("kind") or "") == "task"
+                and (
+                    (
+                        str(state.get("workflow_mode") or "team").lower() == "solo"
+                        and bool(hop.get("conversation_url"))
+                    )
+                    or bool(_preferred_saved_url(
+                        hop.get("conversation_url"),
+                        state["roles"][role].get("page_url"),
+                    ))
+                )
             )
             if (
-                solo_existing_url
+                adopted_existing_url
                 and self._should_observe_existing_response(exc)
                 and self._is_pristine_preboundary_sending_record(
                     state, hop, current_record
@@ -12370,6 +12386,8 @@ class CDPAWorker:
                         workflow_mode=str(payload.get("workflow_mode") or "team"),
                         goal=payload.get("goal"),
                         conversation_url=payload.get("conversation_url") or None,
+                        initial_role=payload.get("initial_role") or None,
+                        role_conversation_urls=payload.get("role_conversation_urls") or None,
                         governing_objective=payload.get("governing_objective"),
                         governing_directives=payload.get("governing_directives"),
                         admission_provenance=payload.get("admission_provenance"),

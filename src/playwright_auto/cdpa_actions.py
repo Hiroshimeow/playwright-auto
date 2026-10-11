@@ -1008,31 +1008,65 @@ class CDPATabActions:
                 code="conversation_identity_unavailable",
             )
         physical = str(record["physical_role"])
-        await random_delay(action_delay_multiplier("open_tab"))
+        # Explicit URL adoption is the only path allowed to claim an unowned user tab.
+        # Match the exact conversation, not a global role or an arbitrary ChatGPT tab.
+        matching_pages = [
+            page for page in self.browser_context.pages
+            if not page.is_closed()
+            and _reopenable_conversation_identity(page.url) == expected
+        ]
+        if len(matching_pages) > 1:
+            raise RoleOwnershipError(
+                "multiple tabs show the requested conversation; select one unambiguous tab",
+                code="conversation_identity_unavailable",
+            )
         workspace = ChatGPTWorkspace()
-        client = await workspace.open_role(
-            self.browser_context,
-            physical,
-            url=url,
-            timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
-            force_new_page_id=True,
-        )
+        created = not matching_pages
+        if matching_pages:
+            page = matching_pages[0]
+            metadata = await inspect_page_metadata(page)
+            task_owner = str(metadata.get("task_id") or "").strip()
+            team_owner = str(metadata.get("team") or "").strip()
+            if task_owner or team_owner:
+                raise RoleOwnershipError(
+                    "requested conversation tab is already task-owned",
+                    code="conversation_owned_by_other_task",
+                )
+            preflight = await ChatGPTPage(page).snapshot()
+            if preflight.manual_input_pending or str(preflight.composer_text or "").strip():
+                raise ComposerConflictError(
+                    "conversation has a manual draft or attachment; adoption requires a clean composer"
+                )
+            if preflight.stop_visible:
+                raise UnsafePageStateError("page is already responding")
+            client = await workspace.bind(
+                physical, page,
+                timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
+                allow_rebind=True,
+            )
+        else:
+            await random_delay(action_delay_multiplier("open_tab"))
+            client = await workspace.open_role(
+                self.browser_context,
+                physical, url=url,
+                timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
+                force_new_page_id=True,
+            )
         try:
             snapshot = await client.assert_ownership()
             if _reopenable_conversation_identity(snapshot.url) != expected:
                 raise RoleOwnershipError(
-                    "Solo conversation URL redirected away from the requested conversation",
+                    "conversation URL redirected away from the requested conversation",
                     code="conversation_identity_unavailable",
                 )
             await client.bind_task_identity(
-                str(manifest["task_id"]),
-                str(manifest["team"]),
+                str(manifest["task_id"]), str(manifest["team"]),
                 binding_id=str(record.get("binding_id") or "") or None,
             )
             snapshot = await client.assert_ownership()
             if _reopenable_conversation_identity(snapshot.url) != expected:
                 raise RoleOwnershipError(
-                    "Solo conversation identity changed while binding task ownership",
+                    "conversation identity changed while binding task ownership",
                     code="conversation_identity_unavailable",
                 )
             assert client.binding is not None
@@ -1041,12 +1075,13 @@ class CDPATabActions:
                 client=client,
                 page_id=client.binding.page_id,
                 url=str(snapshot.url),
-                created=True,
+                created=created,
                 new_chat=False,
                 conversation_id=expected.rsplit("/", 1)[-1],
             )
         except Exception:
-            await client.page.close()
+            if created:
+                await client.page.close()
             raise
 
     async def fresh_chat(

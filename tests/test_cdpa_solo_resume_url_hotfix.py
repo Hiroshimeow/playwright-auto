@@ -103,9 +103,17 @@ def test_operator_resume_never_allocates_a_new_chat_without_saved_id(tmp_path):
         tmp_path, parent_url=None, role_url="https://chatgpt.com/", receipt_id=None,
     )
     assert asyncio.run(worker._apply_control(state, SimpleNamespace())) is True
-    assert len(state["hops"]) == 1
-    assert state["status"] == "PAUSED"
-    assert state["controls"][0]["status"] in {"rejected", "ineffective"}
+    child = _active_hop(state)
+    assert child["kind"] == "solo_resume"
+    assert not child.get("conversation_url")
+    actions = SimpleNamespace(
+        preflight_role=AsyncMock(return_value=[]),
+        fresh_chat=AsyncMock(),
+    )
+    asyncio.run(worker._pre_send(state, child, actions))
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "conversation_identity_unavailable"
+    actions.fresh_chat.assert_not_awaited()
 
 
 def test_real_solo_resume_keeps_url_through_manifest_reload(tmp_path):

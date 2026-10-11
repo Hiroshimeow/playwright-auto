@@ -2932,6 +2932,8 @@ class TaskStore(IndependentAgentStoreMixin):
         workflow_mode: str = "team",
         goal: str = "",
         conversation_url: str | None = None,
+        initial_role: str | None = None,
+        role_conversation_urls: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         endpoint = self.endpoints.resolve(browser_endpoint_id)
         required_endpoint = (
@@ -2950,7 +2952,7 @@ class TaskStore(IndependentAgentStoreMixin):
             raise ValueError("bootstrap context policy requires a bootstrap snapshot")
         if mode == "temporary" and normalized_bootstrap is not None:
             raise ValueError("temporary workflows do not support bootstrap context")
-        initial_role = workflow_roles[0] if workflow_mode == "solo" else "PLAN"
+        initial_role = initial_role or (workflow_roles[0] if workflow_mode == "solo" else "PLAN")
         roles = {}
         for logical in workflow_roles:
             roles[logical] = {
@@ -2960,7 +2962,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 "status": "pending" if logical == initial_role else "unallocated",
                 "turn": 0,
                 "page_id": None,
-                "page_url": None,
+                "page_url": (role_conversation_urls or {}).get(logical),
                 "online": False,
                 "conversation_generation": 0,
                 "constructor_sent_generation": None,
@@ -2987,7 +2989,11 @@ class TaskStore(IndependentAgentStoreMixin):
             "ledger_path": str((target.parent / "requests.json").resolve()),
             "receipt": None,
             "message_identity": None,
-            **({"conversation_url": conversation_url} if conversation_url is not None else {}),
+            **(
+                {"conversation_url": (role_conversation_urls or {}).get(initial_role) or conversation_url}
+                if (role_conversation_urls or {}).get(initial_role) or conversation_url
+                else {}
+            ),
             "response": None,
             "response_sha256": None,
             "report_path": None,
@@ -3284,6 +3290,8 @@ class TaskStore(IndependentAgentStoreMixin):
         workflow_mode: str = "team",
         goal: str | None = None,
         conversation_url: str | None = None,
+        initial_role: str | None = None,
+        role_conversation_urls: Mapping[str, str] | None = None,
         governing_objective: str | None = None,
         governing_directives: Sequence[str] | None = None,
         admission_provenance: Mapping[str, Any] | None = None,
@@ -3307,6 +3315,21 @@ class TaskStore(IndependentAgentStoreMixin):
                 raise ValueError("goal and conversation_url are valid only for solo workflow tasks")
         elif browser_endpoint_id is None or not str(browser_endpoint_id).strip():
             raise ValueError("solo workflow task requires an explicit browser endpoint")
+        if role_conversation_urls is not None and not isinstance(role_conversation_urls, Mapping):
+            raise ValueError("role_conversation_urls must be a role-to-URL object")
+        if normalized_workflow_mode == "solo" and (initial_role is not None or role_conversation_urls):
+            raise ValueError("initial_role and role_conversation_urls belong to Team Tasks")
+        normalized_urls: dict[str, str] = {}
+        for key, value in (role_conversation_urls or {}).items():
+            role = str(key).strip().upper()
+            if not role or role in normalized_urls:
+                raise ValueError("role_conversation_urls contains an invalid or duplicate role")
+            normalized_urls[role] = _optional_solo_conversation_url(value) or ""
+        if normalized_urls and not browser_endpoint_id:
+            raise ValueError("adopting Team role URLs requires an explicitly selected browser endpoint")
+        if len({url.rsplit("/", 1)[-1].lower() for url in normalized_urls.values()}) != len(normalized_urls):
+            raise ValueError("one ChatGPT conversation cannot belong to multiple Team roles")
+        requested_initial_role = str(initial_role or "").strip().upper() or None
         text = canonicalize_task_text(task)
         governing_payload: str | None = None
         governing_sha256: str | None = None
@@ -3576,7 +3599,37 @@ class TaskStore(IndependentAgentStoreMixin):
                 )
             if set(normalized_new) - set(workflow_roles):
                 raise ValueError("new_roles must be selected workflow roles")
+            if normalized_urls:
+                requested_ids = {url.rsplit("/", 1)[-1].lower() for url in normalized_urls.values()}
+                for existing_task in manifests:
+                    if str(existing_task.get("status") or "").upper() in TERMINAL:
+                        continue
+                    occupied = [
+                        str(item.get("page_url") or "")
+                        for item in (existing_task.get("roles") or {}).values()
+                        if isinstance(item, Mapping)
+                    ] + [
+                        str(item.get("conversation_url") or "")
+                        for item in existing_task.get("hops") or ()
+                        if isinstance(item, Mapping)
+                    ]
+                    if any(
+                        candidate and candidate.rsplit("/", 1)[-1].lower() in requested_ids
+                        and normalize_chatgpt_conversation_url(candidate) is not None
+                        for candidate in occupied
+                    ):
+                        raise ValueError(
+                            f"conversation URL already reserved by task {existing_task.get('task_id')}"
+                        )
+            if requested_initial_role and requested_initial_role not in workflow_roles:
+                raise ValueError("initial_role must be a selected Team workflow role")
+            if set(normalized_urls) - set(workflow_roles):
+                raise ValueError("role_conversation_urls must reference selected Team workflow roles")
+            if set(normalized_urls) & (set(normalized_new) | (set(workflow_roles) if new_all else set())):
+                raise ValueError("an adopted role URL cannot also request a Fresh role reset")
             selected_mode = conversation_mode or ("temporary" if temporary or endpoint["temporary_default"] else "persistent")
+            if normalized_urls and selected_mode != "persistent":
+                raise ValueError("adopting an existing conversation requires persistent ChatGPT mode")
             workflow_agent_snapshot = self.workflow_agents.resolve(
                 workflow_roles,
                 require_plan=normalized_workflow_mode != "solo",
@@ -3621,6 +3674,8 @@ class TaskStore(IndependentAgentStoreMixin):
                 workflow_mode=normalized_workflow_mode,
                 goal=normalized_goal,
                 conversation_url=normalized_conversation_url,
+                initial_role=requested_initial_role,
+                role_conversation_urls=normalized_urls,
             )
             endpoint_pinned = bool(
                 normalized_workflow_mode == "solo"
