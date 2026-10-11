@@ -30,7 +30,7 @@ def probe(**changes):
         page_role="team-dev", page_task_id="task", page_team="team",
         requires_login=False, composer_present=True, composer_text="", attachment_count=0,
         stop_visible=False, transport_active=False, error_texts=(), blocking_dialogs=(),
-        choice_prompt_labels=(), mcp_permission_allow_count=0, mcp_permission_node_count=0,
+        mcp_permission_allow_count=0, mcp_permission_node_count=0,
         last_user_message_id=None, last_user_turn_id=None, last_assistant_message_id=None,
         last_assistant_turn_id=None, assistant_text_length=0, assistant_text_tail="",
         response_activity_length=0, response_activity_tail="", response_activity_turn_id=None,

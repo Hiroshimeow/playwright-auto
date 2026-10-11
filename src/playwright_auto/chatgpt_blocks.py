@@ -203,7 +203,6 @@ class WaitResponseBlock(ChatGPTBlock):
         active_reload_after_ms: int | None = None,
         reload_wait_ms: int = 750,
         skeptical_after_reload: bool = True,
-        resolve_choice_prompt: bool = False,
         block_id: str = "wait_response",
     ) -> None:
         super().__init__(block_id)
@@ -215,7 +214,6 @@ class WaitResponseBlock(ChatGPTBlock):
         self.active_reload_after_ms = active_reload_after_ms
         self.reload_wait_ms = reload_wait_ms
         self.skeptical_after_reload = skeptical_after_reload
-        self.resolve_choice_prompt = resolve_choice_prompt
 
     async def run(self, context: WorkflowContext[ChatGPTPage]) -> dict[str, Any]:
         receipt = context.require(self.receipt_key)
@@ -234,7 +232,6 @@ class WaitResponseBlock(ChatGPTBlock):
             active_reload_after_ms=self.active_reload_after_ms,
             reload_wait_ms=self.reload_wait_ms,
             skeptical_after_reload=self.skeptical_after_reload,
-            resolve_choice_prompt=self.resolve_choice_prompt,
         )
         context.variables[self.response_key] = response
         return response.to_dict()
@@ -246,37 +243,18 @@ class WaitCleanReadyBlock(ChatGPTBlock):
         *,
         timeout_ms: int | None = None,
         poll_ms: int = 100,
-        resolve_choice_prompt: bool = False,
         block_id: str = "wait_clean_ready",
     ) -> None:
         super().__init__(block_id)
         self.timeout_ms = timeout_ms
         self.poll_ms = poll_ms
-        self.resolve_choice_prompt = resolve_choice_prompt
 
     async def run(self, context: WorkflowContext[ChatGPTPage]) -> dict[str, Any]:
         snapshot = await context.client.wait_until_clean_ready(
             timeout_ms=self.timeout_ms,
             poll_ms=self.poll_ms,
-            resolve_choice_prompt=self.resolve_choice_prompt,
         )
         return snapshot.to_dict()
-
-
-class ResolveChoicePromptBlock(ChatGPTBlock):
-    retry_safe = False
-
-    def __init__(
-        self,
-        *,
-        timeout_ms: int | None = None,
-        block_id: str = "resolve_choice_prompt",
-    ) -> None:
-        super().__init__(block_id)
-        self.timeout_ms = timeout_ms
-
-    async def run(self, context: WorkflowContext[ChatGPTPage]) -> str:
-        return await context.client.resolve_choice_prompt(timeout_ms=self.timeout_ms)
 
 
 class RecoverPageBlock(ChatGPTBlock):
@@ -286,21 +264,18 @@ class RecoverPageBlock(ChatGPTBlock):
         self,
         *,
         allow_new_chat: bool = False,
-        resolve_choice_prompt: bool = True,
         timeout_ms: int | None = None,
         require_healthy: bool = True,
         block_id: str = "recover_page",
     ) -> None:
         super().__init__(block_id)
         self.allow_new_chat = allow_new_chat
-        self.resolve_choice_prompt = resolve_choice_prompt
         self.timeout_ms = timeout_ms
         self.require_healthy = require_healthy
 
     async def run(self, context: WorkflowContext[ChatGPTPage]) -> dict[str, Any]:
         health = await context.client.recover_page(
             allow_new_chat=self.allow_new_chat,
-            resolve_choice_prompt=self.resolve_choice_prompt,
             timeout_ms=self.timeout_ms,
         )
         if self.require_healthy and not health.healthy:

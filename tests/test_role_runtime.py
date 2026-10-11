@@ -679,20 +679,14 @@ def test_correlated_listen_result_waits_five_seconds_before_accept():
     assert wait["terminal_response_source"] == "listen"
 
 
-def test_choice_prompt_waits_instead_of_blocking_task():
-    result = step(snapshot(choice_prompt_labels=("Continue",)), {})
-    assert result.action is Action.WAIT
-    assert result.reason == "choice_prompt_wait"
 
-
-def test_correlated_listen_result_wins_before_dialog_and_choice_wait_gates():
+def test_correlated_listen_result_wins_before_dialog_wait_gate():
     current = snapshot(
         messages=(
             MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
             MessageSnapshot("assistant", "answer", "answer-turn", "partial", ()),
         ),
         blocking_dialogs=("Unexpected dialog",),
-        choice_prompt_labels=("Continue",),
     )
     listen = MessageSnapshot(
         "assistant", "answer", "answer-turn", '{"route":"REVIEW"}',

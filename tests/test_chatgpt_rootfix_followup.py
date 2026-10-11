@@ -11,7 +11,6 @@ from playwright_auto.chatgpt import (
     ChatGPTPage,
     ChatGPTSnapshot,
     ChatGPTState,
-    ChoicePromptBlockedError,
     ComposerConflictError,
     ManualInputPendingError,
     MessageSnapshot,
@@ -91,7 +90,6 @@ def test_clean_ready_preserves_timeout_type_and_chains_original_error(timeout_ty
         PageOwnershipError("wrong owner"),
         AuthenticationRequiredError("login required"),
         ManualInputPendingError("manual input"),
-        ChoicePromptBlockedError("choice blocked"),
     ],
 )
 def test_clean_ready_never_wraps_semantic_errors_as_transient(semantic_error):

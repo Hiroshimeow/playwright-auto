@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 from .chatgpt import (
     ATTACHMENT_OWNERSHIP_WINDOW_KEY,
-    ChoicePromptBlockedError,
     ComposerConflictError,
     PageOwnershipError,
     SELECTORS,
@@ -733,10 +732,6 @@ async def wait_upload_ready(
             await asyncio.sleep(poll_ms / 1000)
             continue
         last_snapshot = snapshot
-        if snapshot.choice_prompt_pending:
-            raise ChoicePromptBlockedError(
-                f"upload is blocked by choice prompt: {list(snapshot.choice_prompt_labels)!r}"
-            )
         text = snapshot.composer_text.strip()
         if text and not _request_anchor_matches(
             text,
@@ -821,10 +816,6 @@ async def upload_files(
         snapshot = await client.assert_ownership()
         if snapshot.stop_visible:
             raise UnsafePageStateError("cannot upload while a response is active")
-        if snapshot.choice_prompt_pending:
-            raise ChoicePromptBlockedError(
-                f"upload is blocked by choice prompt: {list(snapshot.choice_prompt_labels)!r}"
-            )
         if snapshot.blocking_dialogs:
             await dismiss_stale_upload_overlay(client.page)
             snapshot = await client.assert_ownership()

@@ -29,7 +29,6 @@ def _snapshot(**overrides):
         "retry_visible": False,
         "blocking_dialogs": (),
         "error_texts": (),
-        "choice_prompt_labels": (),
         "mcp_permission_node_count": 0,
         "mcp_permission_allow_count": 0,
     }

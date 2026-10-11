@@ -8,7 +8,6 @@ from playwright_auto.chatgpt import (
     ChatGPTPage,
     ChatGPTSnapshot,
     ChatGPTState,
-    ChoicePromptBlockedError,
     ManualInputPendingError,
     MessageBaseline,
     MessageSnapshot,
@@ -28,7 +27,6 @@ def make_snapshot(
     composer_present=True,
     composer_editable=True,
     stop_visible=False,
-    choice_labels=(),
     attachments=(),
     requires_login=False,
     state=ChatGPTState.WAITING_PROMPT,
@@ -54,7 +52,6 @@ def make_snapshot(
         attachment_markers=tuple(attachments),
         error_texts=(),
         messages=tuple(messages),
-        choice_prompt_labels=tuple(choice_labels),
         response_activity_turn_id=response_activity_turn_id,
         response_activity_text=response_activity_text,
         response_activity_structure=response_activity_structure,
@@ -244,26 +241,6 @@ def test_active_reload_clock_tracks_bound_assistant_progress(monkeypatch, progre
     assert page.reload_calls == expected_reloads
 
 
-def test_choice_prompt_fails_closed_without_explicit_resolution(monkeypatch):
-    page = SequencePage(
-        [
-            make_snapshot(
-                composer_present=False,
-                composer_editable=False,
-                choice_labels=("Continue",),
-                state=ChatGPTState.UNKNOWN,
-            )
-        ]
-    )
-    install_sequence(monkeypatch, page)
-
-    with pytest.raises(ChoicePromptBlockedError, match="Continue"):
-        asyncio.run(
-            bind(page).wait_for_response(
-                receipt(), timeout_ms=8, stable_ms=0, poll_ms=1
-            )
-        )
-
 
 def test_image_only_assistant_response_is_valid(monkeypatch):
     page = SequencePage([conversation("", image_count=1)])
@@ -277,6 +254,7 @@ def test_image_only_assistant_response_is_valid(monkeypatch):
 
     assert result.image_count == 1
     assert result.text == ""
+
 
 
 def test_wait_clean_ready_tolerates_transient_snapshot_error(monkeypatch):

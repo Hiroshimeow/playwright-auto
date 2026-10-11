@@ -32,7 +32,6 @@ from .chatgpt_composer import (
 from .chatgpt_errors import (
     AuthenticationRequiredError,
     ChatGPTAutomationError,
-    ChoicePromptBlockedError,
     ComposerConflictError,
     ConversationTranscriptNotReadyError,
     IncompleteResponseTimeoutError,
@@ -1293,47 +1292,6 @@ async def click_send_button(
     await record_page_action(page, "send", "complete", detail=method)
     return method
 
-async def click_safe_choice_prompt(page: Any) -> str:
-    result = await page.evaluate(
-        r"""() => {
-          const visible = (element) => Boolean(
-            element && (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
-          );
-          const overlaySelector = [
-            '#playwright-auto-role-badge-v3',
-            '#playwright-auto-role-control-v1',
-            '#playwright-auto-role-badge',
-            '#playwright-auto-role-badge-v2'
-          ].join(',');
-          const positive = /\b(?:continue|proceed|start|yes|ok|okay|accept|approve|allow|run)\b|\bgo ahead\b|\b(?:make|create|use) a plan\b/i;
-          const negative = /\b(?:cancel|stop|dismiss|close|delete|remove|archive|share|copy)\b|\b(?:not now|no thanks)\b/i;
-          const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-          const candidateLabel = (button) => {
-            const textLabel = normalize(button.innerText || button.textContent);
-            const ariaLabel = normalize(button.getAttribute('aria-label'));
-            const testId = normalize(button.getAttribute('data-testid'));
-            if ([textLabel, ariaLabel, testId].some((label) => negative.test(label))) return '';
-            return [textLabel, ariaLabel].find((label) => positive.test(label)) || '';
-          };
-          const candidates = [...document.querySelectorAll('button,[role="button"]')]
-            .map((button) => ({button, label: candidateLabel(button)}))
-            .filter(({button, label}) =>
-              label && visible(button) && !button.disabled &&
-              button.getAttribute('aria-disabled') !== 'true' &&
-              !button.closest(overlaySelector) &&
-              Boolean(button.closest('main,[role="dialog"],[data-testid^="modal-"]'))
-            );
-          if (candidates.length !== 1) return {ok: false, label: ''};
-          const target = candidates[0];
-          target.button.click();
-          return {ok: true, label: target.label};
-        }"""
-    )
-    if not result.get("ok"):
-        raise ChoicePromptBlockedError("safe positive choice prompt is missing or ambiguous")
-    return str(result.get("label") or "safe choice")
-
-
 async def click_preferred_mcp_allow(
     page: Any,
     *,
@@ -1740,16 +1698,6 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
           const dialogs = [...document.querySelectorAll('[role="dialog"], [data-testid^="modal-"]')]
             .filter(element => element.id !== 'playwright-auto-role-control-v1')
             .filter(visible).slice(-4).map((element) => boundedText(element, 240) || 'dialog');
-          const overlaySelector = '#playwright-auto-role-badge-v3,#playwright-auto-role-control-v1,#playwright-auto-role-badge,#playwright-auto-role-badge-v2';
-          const positiveChoice = /\b(?:continue|proceed|start|yes|ok|okay|accept|approve|allow|run)\b|\bgo ahead\b|\b(?:make|create|use) a plan\b/i;
-          const negativeChoice = /\b(?:cancel|stop|dismiss|close|delete|remove|archive|share|copy)\b|\b(?:not now|no thanks)\b/i;
-          const choiceLabel = (element) => {
-            const textLabel = boundedText(element, 120);
-            const ariaLabel = (element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().slice(0, 120);
-            const testId = (element.getAttribute('data-testid') || '').replace(/\s+/g, ' ').trim().slice(0, 120);
-            if ([textLabel, ariaLabel, testId].some((label) => negativeChoice.test(label))) return '';
-            return [textLabel, ariaLabel].find((label) => positiveChoice.test(label)) || '';
-          };
           const normalizeLabel = (value) => String(value || '').replace(/\s+/g, ' ').trim();
           const mcpConversationAllow = /^Allow\b.*\bconversation\b/i;
           const mcpPermissionNodes = [...document.querySelectorAll('button[aria-label]')]
@@ -1782,20 +1730,6 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
               return permissionControls.length === 1 ? {primary, permission: permissionControls[0]} : null;
             })
             .filter(Boolean);
-          const mcpPermissionControls = new Set(
-            mcpPermissionGroups.flatMap(({primary, permission}) => [primary, permission])
-          );
-          const choices = composer ? [] : [...document.querySelectorAll('button,[role="button"]')]
-            .filter((element) =>
-              visible(element) && !element.disabled &&
-              element.getAttribute('aria-disabled') !== 'true' &&
-              !element.closest(overlaySelector) &&
-              !mcpPermissionControls.has(element) &&
-              Boolean(element.closest('main,[role="dialog"],[data-testid^="modal-"]'))
-            )
-            .map(choiceLabel)
-            .filter(Boolean)
-            .slice(0, 8);
           const attachmentCount = composerRoot ? composerRoot.querySelectorAll(
             '[data-filename], [data-file-name], [data-testid*="attachment"], [data-testid*="file"]'
           ).length : 0;
@@ -1836,7 +1770,6 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             transport_active: Boolean(stop) || Boolean(projection.active),
             error_texts: errors,
             blocking_dialogs: dialogs,
-            choice_prompt_labels: [...new Set(choices)],
             mcp_permission_allow_count: mcpPermissionGroups.length + splitApprovalSurfaces.length,
             mcp_permission_node_count: mcpPermissionNodes.length + splitApprovalSurfaces.length,
             last_user_message_id: userIdentity.messageId,
@@ -1928,7 +1861,6 @@ async def inspect_chatgpt_wait_probe(
         transport_active=bool(raw.get("transport_active")),
         error_texts=tuple(str(value) for value in raw.get("error_texts") or ()),
         blocking_dialogs=tuple(str(value) for value in raw.get("blocking_dialogs") or ()),
-        choice_prompt_labels=tuple(str(value) for value in raw.get("choice_prompt_labels") or ()),
         mcp_permission_allow_count=max(0, int(raw.get("mcp_permission_allow_count") or 0)),
         mcp_permission_node_count=max(0, int(raw.get("mcp_permission_node_count") or 0)),
         last_user_message_id=(str(raw["last_user_message_id"]) if raw.get("last_user_message_id") else None),
@@ -2093,27 +2025,6 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             return 0;
           });
           const attachmentMarkers = attachmentRecords.map((item) => item.filename);
-
-          const choiceOverlaySelector = '#playwright-auto-role-badge-v3,#playwright-auto-role-control-v1,#playwright-auto-role-badge,#playwright-auto-role-badge-v2';
-          const positiveChoice = /\b(?:continue|proceed|start|yes|ok|okay|accept|approve|allow|run)\b|\bgo ahead\b|\b(?:make|create|use) a plan\b/i;
-          const negativeChoice = /\b(?:cancel|stop|dismiss|close|delete|remove|archive|share|copy)\b|\b(?:not now|no thanks)\b/i;
-          const choiceLabel = (button) => {
-            const textLabel = text(button).slice(0, 120);
-            const ariaLabel = (button.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().slice(0, 120);
-            const testId = (button.getAttribute('data-testid') || '').replace(/\s+/g, ' ').trim().slice(0, 120);
-            if ([textLabel, ariaLabel, testId].some((label) => negativeChoice.test(label))) return '';
-            return [textLabel, ariaLabel].find((label) => positiveChoice.test(label)) || '';
-          };
-          const choicePromptLabels = composer ? [] : [...document.querySelectorAll('button,[role="button"]')]
-            .filter((button) =>
-              visible(button) && !button.disabled &&
-              button.getAttribute('aria-disabled') !== 'true' &&
-              !button.closest(choiceOverlaySelector) &&
-              Boolean(button.closest('main,[role="dialog"],[data-testid^="modal-"]'))
-            )
-            .map(choiceLabel)
-            .filter(Boolean)
-            .slice(0, 12);
 
           const latestTurnRoot = [...document.querySelectorAll('[data-turn-key],[data-turn-id],[data-turn-id-container]')]
             .filter(visible).at(-1) || null;
@@ -2282,7 +2193,6 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             stop_visible: Boolean(stop),
             blocking_dialogs: [...new Set(blockingDialogs)],
             attachment_markers: attachmentMarkers,
-            choice_prompt_labels: [...new Set(choicePromptLabels)],
             error_present: Boolean(authCallbackError || alertError),
             mcp_permission_node_count: [...document.querySelectorAll('button')]
               .filter(b => /^Allow\b.*\bconversation\b/i.test(text(b) || (b.getAttribute('aria-label') || '').trim())).length +
@@ -2375,9 +2285,6 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
         ),
         error_texts=tuple(str(value) for value in raw.get("error_texts") or []),
         messages=messages,
-        choice_prompt_labels=tuple(
-            str(value) for value in raw.get("choice_prompt_labels") or []
-        ),
         retry_visible=bool(raw.get("retry_visible")),
         mcp_permission_allow_count=max(0, int(raw.get("mcp_permission_allow_count") or 0)),
         mcp_permission_node_count=max(0, int(raw.get("mcp_permission_node_count") or 0)),
@@ -2751,7 +2658,6 @@ class ChatGPTPage:
             return "error_or_dialog"
         if (
             probe.manual_input_pending != previous.manual_input_pending
-            or probe.choice_prompt_pending != previous.choice_prompt_pending
             or probe.composer_text != previous.composer_text
             or probe.attachment_count != previous.attachment_count
         ):
@@ -2806,7 +2712,6 @@ class ChatGPTPage:
             blocking_dialogs=probe.blocking_dialogs,
             attachment_markers=markers,
             error_texts=probe.error_texts,
-            choice_prompt_labels=probe.choice_prompt_labels,
             response_activity_text=probe.response_activity_tail,
             response_activity_structure=f"bounded:{probe.response_activity_length}",
             response_activity_turn_id=probe.response_activity_turn_id,
@@ -2901,7 +2806,6 @@ class ChatGPTPage:
                     transport_active=bool(full.response_activity_turn_id),
                     error_texts=full.error_texts,
                     blocking_dialogs=full.blocking_dialogs,
-                    choice_prompt_labels=full.choice_prompt_labels,
                     mcp_permission_allow_count=full.mcp_permission_allow_count,
                     mcp_permission_node_count=full.mcp_permission_node_count,
                     retry_visible=full.retry_visible,
@@ -3011,7 +2915,6 @@ class ChatGPTPage:
             current.composer_present
             or current.stop_visible
             or current.messages
-            or current.choice_prompt_pending
         ):
             return PageHealth(True, "healthy", "none")
         return PageHealth(False, "empty_snapshot", "reload")
@@ -3148,174 +3051,75 @@ class ChatGPTPage:
 
 
 
-    async def resolve_choice_prompt(
-        self, *, timeout_ms: int | None = None
-    ) -> str:
-        timeout = timeout_ms or self.timeout_ms
-        async with self.mutation_guard():
-            before = await self.assert_ownership()
-            if not before.choice_prompt_pending:
-                raise ChoicePromptBlockedError("no safe choice prompt is pending")
-            label = await click_safe_choice_prompt(self.page)
-            deadline = time.monotonic() + timeout / 1000
-            while time.monotonic() < deadline:
-                current = await self.assert_ownership()
-                if current.composer_present or not current.choice_prompt_pending:
-                    return label
-                await asyncio.sleep(0.1)
-            raise ChoicePromptBlockedError(
-                f"safe choice {label!r} was clicked but the prompt remained blocked"
-            )
-
     async def wait_until_clean_ready(
-        self,
-        *,
-        timeout_ms: int | None = None,
-        poll_ms: int = 100,
-        resolve_choice_prompt: bool = False,
+        self, *, timeout_ms: int | None = None, poll_ms: int = 100,
     ) -> ChatGPTSnapshot:
         timeout = timeout_ms or self.timeout_ms
         deadline = time.monotonic() + timeout / 1000
-        last_snapshot: ChatGPTSnapshot | None = None
         last_error: BaseException | None = None
         manual_pending = False
-        choice_pending = False
-
         while time.monotonic() < deadline:
             if await cloudflare_challenge_visible(self.page):
-                raise RateLimitBlockedError(
-                    "Cloudflare challenge blocked ChatGPT page readiness"
-                )
+                raise RateLimitBlockedError("Cloudflare challenge blocked ChatGPT page readiness")
             try:
-                last_snapshot = await self.assert_ownership()
-            except (
-                PageOwnershipError,
-                AuthenticationRequiredError,
-                ComposerConflictError,
-                ManualInputPendingError,
-                ChoicePromptBlockedError,
-            ):
+                current = await self.assert_ownership()
+            except (PageOwnershipError, AuthenticationRequiredError, ComposerConflictError, ManualInputPendingError):
                 raise
             except Exception as exc:
                 last_error = exc
                 await asyncio.sleep(poll_ms / 1000)
                 continue
-
-            manual_pending = last_snapshot.manual_input_pending
-            choice_pending = last_snapshot.choice_prompt_pending
-            if rate_limit_dialogs(last_snapshot):
+            manual_pending = current.manual_input_pending
+            if rate_limit_dialogs(current):
                 await dismiss_rate_limit_dialog(self.page, timeout_ms=min(timeout, 10_000))
                 await asyncio.sleep(poll_ms / 1000)
                 continue
-            if choice_pending and resolve_choice_prompt:
-                await self.resolve_choice_prompt(timeout_ms=timeout)
-                choice_pending = False
-                continue
-            if (
-                last_snapshot.composer_present
-                and last_snapshot.composer_editable
-                and not last_snapshot.stop_visible
-                and not manual_pending
-                and not choice_pending
-                and not last_snapshot.blocking_dialogs
-                and last_snapshot.state is not ChatGPTState.ERROR
-            ):
-                return last_snapshot
+            if (current.composer_present and current.composer_editable and not current.stop_visible
+                and not manual_pending and not current.blocking_dialogs
+                and current.state is not ChatGPTState.ERROR):
+                return current
             await asyncio.sleep(poll_ms / 1000)
-
         if manual_pending:
-            raise ManualInputPendingError(
-                "composer still contains manual text or attachments; automated mutation blocked"
-            )
-        if choice_pending:
-            raise ChoicePromptBlockedError(
-                f"choice prompt is still pending: {list(last_snapshot.choice_prompt_labels)!r}"
-            )
+            raise ManualInputPendingError("composer still contains manual text or attachments; automated mutation blocked")
         if last_error is not None:
             from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-
             if isinstance(last_error, (TimeoutError, PlaywrightTimeoutError)):
-                raise type(last_error)(
-                    "clean-ready check failed after transient timeout: "
-                    f"{type(last_error).__name__}: {last_error}"
-                ) from last_error
-            raise RuntimeError(
-                f"clean-ready check failed after transient errors: "
-                f"{type(last_error).__name__}: {last_error}"
-            ) from last_error
+                raise type(last_error)(f"clean-ready check failed after transient timeout: {type(last_error).__name__}: {last_error}") from last_error
+            raise RuntimeError(f"clean-ready check failed after transient errors: {type(last_error).__name__}: {last_error}") from last_error
         raise TimeoutError(f"ChatGPT tab did not become clean-ready within {timeout} ms")
 
     async def recover_page(
-        self,
-        *,
-        allow_new_chat: bool = False,
-        resolve_choice_prompt: bool = True,
-        timeout_ms: int | None = None,
+        self, *, allow_new_chat: bool = False, timeout_ms: int | None = None,
     ) -> PageHealth:
         timeout = timeout_ms or self.timeout_ms
         initial = await self.health()
-        if initial.action == "manual_login":
+        if initial.action == "manual_login" or initial.healthy:
             return initial
-        if initial.healthy:
-            if resolve_choice_prompt:
-                current = await self.assert_ownership()
-                if current.choice_prompt_pending:
-                    await self.resolve_choice_prompt(timeout_ms=timeout)
-                    return await self.health()
-            return initial
-
         try:
             await self.refresh(timeout_ms=timeout)
             await asyncio.sleep(0.25)
             refreshed = await self.health()
             if refreshed.healthy:
-                if refreshed.state == "healthy" and resolve_choice_prompt:
-                    current = await self.assert_ownership()
-                    if current.choice_prompt_pending:
-                        await self.resolve_choice_prompt(timeout_ms=timeout)
-                return await self.health()
+                return refreshed
         except PageOwnershipError:
             raise
         except Exception:
             pass
-
         if allow_new_chat:
             current = await self.assert_ownership()
             if current.manual_input_pending:
-                return PageHealth(
-                    False,
-                    "manual_input_pending",
-                    "manual_clear_required",
-                )
+                return PageHealth(False, "manual_input_pending", "manual_clear_required")
             if current.blocking_dialogs:
-                return PageHealth(
-                    False,
-                    "blocking_dialog",
-                    "manual_intervention",
-                    "; ".join(current.blocking_dialogs),
-                )
+                return PageHealth(False, "blocking_dialog", "manual_intervention", "; ".join(current.blocking_dialogs))
             try:
                 await self.new_chat()
                 return await self.health()
             except PageOwnershipError:
                 raise
             except Exception as exc:
-                return PageHealth(
-                    False,
-                    "recovery_failed",
-                    "fresh_tab_or_rerole_required",
-                    f"{type(exc).__name__}: {exc}",
-                )
-
+                return PageHealth(False, "recovery_failed", "fresh_tab_or_rerole_required", f"{type(exc).__name__}: {exc}")
         final = await self.health()
-        if final.healthy:
-            return final
-        return PageHealth(
-            False,
-            final.state,
-            "fresh_tab_or_rerole_required",
-            final.detail,
-        )
+        return final if final.healthy else PageHealth(False, final.state, "fresh_tab_or_rerole_required", final.detail)
 
     async def set_role(
         self,
@@ -4069,7 +3873,6 @@ class ChatGPTPage:
                             after.composer_present
                             or after.stop_visible
                             or bool(after.messages)
-                            or after.choice_prompt_pending
                         )
                     )
                     return exact_identity and committed and usable
@@ -4697,7 +4500,6 @@ class ChatGPTPage:
         active_reload_after_ms: int | None = None,
         reload_wait_ms: int = 750,
         skeptical_after_reload: bool = True,
-        resolve_choice_prompt: bool = False,
         stale_response_baseline: Mapping[str, Any] | None = None,
         candidate_validator: Callable[[MessageSnapshot], None] | None = None,
         minimum_samples: int = 1,
@@ -4735,7 +4537,6 @@ class ChatGPTPage:
         saw_stale_assistant = False
         recovery_baseline = merge_response_recovery_baselines(stale_response_baseline)
         manual_input_pending = False
-        choice_prompt_pending = False
         last_snapshot: ChatGPTSnapshot | None = None
         last_error: BaseException | None = None
         unchanged_ticks = 0
@@ -4761,7 +4562,6 @@ class ChatGPTPage:
                 unchanged_ticks = 0
                 continue
             manual_input_pending = snapshot.manual_input_pending
-            choice_prompt_pending = snapshot.choice_prompt_pending
 
             current_activity, _activity_length = response_activity_signature(
                 snapshot,
@@ -4775,17 +4575,6 @@ class ChatGPTPage:
             else:
                 activity_samples += 1
                 unchanged_ticks += 1
-
-            if choice_prompt_pending:
-                if resolve_choice_prompt:
-                    await self.resolve_choice_prompt(timeout_ms=min(timeout, 10_000))
-                    choice_prompt_pending = False
-                    candidate_fingerprint = ""
-                    candidate_since = None
-                    candidate_samples = 0
-                    continue
-                await asyncio.sleep(self._adaptive_wait_seconds(poll_ms, unchanged_ticks))
-                continue
 
             if receipt.user_message_id or receipt.user_turn_id:
                 candidate, binding_error = bound_assistant_for_receipt(
@@ -4968,11 +4757,6 @@ class ChatGPTPage:
         if manual_input_pending:
             raise ManualInputPendingError(
                 "manual composer text or attachments remained while waiting for response"
-            )
-        if choice_prompt_pending:
-            labels = list(last_snapshot.choice_prompt_labels) if last_snapshot else []
-            raise ChoicePromptBlockedError(
-                f"choice prompt blocked response completion: {labels!r}"
             )
         if last_snapshot and last_snapshot.stop_visible:
             raise TimeoutError(

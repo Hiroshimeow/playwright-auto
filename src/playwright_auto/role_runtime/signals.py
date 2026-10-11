@@ -167,7 +167,6 @@ class RoleSignals:
         response = self.network_response or {}
         errors = tuple(str(v)[:240] for v in getattr(snapshot, "error_texts", ()) or ())
         dialogs = tuple(str(v)[:240] for v in getattr(snapshot, "blocking_dialogs", ()) or ())
-        choices = tuple(str(v)[:160] for v in getattr(snapshot, "choice_prompt_labels", ()) or ())
         diagnostics = {
             str(key): int(value)
             for key, value in (self.diagnostics or {}).items()
@@ -192,7 +191,6 @@ class RoleSignals:
             "dom_retry_visible": bool(getattr(snapshot, "retry_visible", False)),
             "dom_errors": list(errors),
             "dom_dialogs": list(dialogs),
-            "dom_choices": list(choices),
             "dom_permission_count": int(
                 getattr(snapshot, "mcp_permission_node_count", 0) or 0
             ),
@@ -248,9 +246,6 @@ def probe_values(probe: Any) -> dict[str, Any]:
         "requires_login": bool(getattr(probe, "requires_login", False)),
         "error_count": len(tuple(getattr(probe, "error_texts", ()) or ())),
         "dialog_count": len(tuple(getattr(probe, "blocking_dialogs", ()) or ())),
-        "choice_count": len(
-            tuple(getattr(probe, "choice_prompt_labels", ()) or ())
-        ),
         "mcp_permission_node_count": int(
             getattr(probe, "mcp_permission_node_count", 0) or 0
         ),

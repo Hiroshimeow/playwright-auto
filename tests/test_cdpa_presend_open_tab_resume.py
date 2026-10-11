@@ -49,7 +49,6 @@ def _scenario(tmp_path: Path):
                             attachment_markers=(),
                             stop_visible=False,
                             manual_input_pending=False,
-                            choice_prompt_pending=False,
                             blocking_dialogs=(),
                         )
 

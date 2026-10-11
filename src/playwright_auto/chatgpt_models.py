@@ -224,7 +224,6 @@ class ChatGPTSnapshot:
     attachment_markers: tuple[str, ...]
     error_texts: tuple[str, ...]
     messages: tuple[MessageSnapshot, ...]
-    choice_prompt_labels: tuple[str, ...] = ()
     retry_visible: bool = False
     mcp_permission_allow_count: int = 0
     mcp_permission_node_count: int = 0
@@ -255,10 +254,6 @@ class ChatGPTSnapshot:
     @property
     def manual_input_pending(self) -> bool:
         return bool(self.composer_text.strip() or self.attachment_markers)
-
-    @property
-    def choice_prompt_pending(self) -> bool:
-        return bool(self.choice_prompt_labels) and not self.composer_present
 
     @property
     def image_count(self) -> int:
@@ -293,8 +288,6 @@ class ChatGPTSnapshot:
             "stop_visible": self.stop_visible,
             "blocking_dialogs": list(self.blocking_dialogs),
             "attachment_markers": list(self.attachment_markers),
-            "choice_prompt_pending": self.choice_prompt_pending,
-            "choice_prompt_labels": list(self.choice_prompt_labels),
             "retry_visible": self.retry_visible,
             "mcp_permission_allow_count": self.mcp_permission_allow_count,
             "mcp_permission_node_count": self.mcp_permission_node_count,
@@ -321,7 +314,6 @@ class WaitProbe:
     transport_active: bool
     error_texts: tuple[str, ...]
     blocking_dialogs: tuple[str, ...]
-    choice_prompt_labels: tuple[str, ...]
     mcp_permission_allow_count: int
     mcp_permission_node_count: int
     last_user_message_id: str | None
@@ -349,10 +341,6 @@ class WaitProbe:
     @property
     def manual_input_pending(self) -> bool:
         return bool(self.composer_text.strip() or self.attachment_count)
-
-    @property
-    def choice_prompt_pending(self) -> bool:
-        return bool(self.choice_prompt_labels) and not self.composer_present
 
     @property
     def identity_signature(self) -> tuple[str | None, ...]:

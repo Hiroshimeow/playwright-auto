@@ -115,7 +115,6 @@ from .cdpa_workflow_agents import task_workflow_definitions
 from .chatgpt import (
     ChatGPTAutomationError,
     ChatGPTPage,
-    ChoicePromptBlockedError,
     ComposerConflictError,
     PageOwnershipError,
     SendRecoveryError,
@@ -6019,7 +6018,6 @@ class CDPAWorker:
             and not tuple(getattr(snapshot, "attachment_markers", ()) or ())
             and not getattr(snapshot, "stop_visible", False)
             and not getattr(snapshot, "manual_input_pending", False)
-            and not getattr(snapshot, "choice_prompt_pending", False)
             and not tuple(getattr(snapshot, "blocking_dialogs", ()) or ())
         )
 

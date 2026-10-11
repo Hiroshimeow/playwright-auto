@@ -56,9 +56,5 @@ class ManualInputPendingError(ChatGPTAutomationError):
     pass
 
 
-class ChoicePromptBlockedError(ChatGPTAutomationError):
-    pass
-
-
 class TaskBindingError(ChatGPTAutomationError):
     pass

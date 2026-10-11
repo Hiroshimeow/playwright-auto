@@ -126,8 +126,6 @@ def test_route_repair_uses_clean_empty_composer_despite_stale_generation_error(t
         send_enabled=True,
         stop_visible=False,
         manual_input_pending=False,
-        choice_prompt_pending=False,
-        choice_prompt_labels=(),
         blocking_dialogs=(),
         attachment_markers=(),
         error_texts=("ChatGPT stream recovery polling timed out",),

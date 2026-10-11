@@ -40,6 +40,30 @@ async def _with_page(body: str, callback):
             await browser.close()
 
 
+def test_start_voice_button_does_not_block_generic_composer_readiness():
+    async def run(page):
+        client = ChatGPTPage(page, timeout_ms=1_000)
+        client.binding = PageBinding("page-1", "DEV")
+        snapshot = await client.wait_until_clean_ready(timeout_ms=500, poll_ms=10)
+        return snapshot
+
+    snapshot = asyncio.run(
+        _with_page(
+            """
+            <main>
+              <button aria-label="Start Voice"></button>
+              <div contenteditable="true" role="textbox"></div>
+            </main>
+            """,
+            run,
+        )
+    )
+
+    assert snapshot.composer_present is True
+    assert snapshot.composer_editable is True
+    assert snapshot.stop_visible is False
+
+
 def test_auto_allow_uses_listen_action_without_dom_permission_button():
     async def run(page):
         client = ChatGPTPage(page, timeout_ms=5_000)

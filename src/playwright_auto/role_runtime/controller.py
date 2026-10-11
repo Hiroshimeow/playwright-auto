@@ -113,8 +113,6 @@ class RoleController:
             )
         if blocking_dialogs and not ctx.permission_present:
             return self._remember(ctx, Decision(Action.WAIT, "blocking_dialog_wait"))
-        if getattr(snapshot, "choice_prompt_labels", ()) and not ctx.permission_present:
-            return self._remember(ctx, Decision(Action.WAIT, "choice_prompt_wait"))
         if phase == "waiting":
             timeout.observe(ctx)
             if getattr(snapshot, "retry_visible", False):
