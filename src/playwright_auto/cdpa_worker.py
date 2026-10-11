@@ -4102,6 +4102,12 @@ class CDPAWorker:
     ) -> None:
         if is_independent_task(state) or str(state.get("status") or "").upper() != "BLOCKED":
             return
+        if state.get("conversation_mode") == "temporary":
+            # Same invariant as RoleController's temporary_no_refresh path:
+            # a Temporary Chat document is ephemeral. BLOCKED must preserve the
+            # exact live tab for operator recovery; closing it destroys context
+            # that cannot be reopened from its URL.
+            return
         try:
             hop = _active_hop(state)
         except Exception:

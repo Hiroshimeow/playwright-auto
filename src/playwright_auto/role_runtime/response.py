@@ -65,15 +65,24 @@ def observe_candidate(
     ctx.candidate = candidate
     ctx.validation_error = None
     ctx.candidate_stable = False
-    key = fingerprint(candidate)
-    ctx.candidate_key = key
     key_name, at_name, samples_name = _keys(source)
 
-    if not key:
+    # ChatGPT may mount an empty assistant shell before any response content
+    # exists. It is UI scaffolding, not a response candidate, and must never be
+    # validated as route output or consume a format-repair attempt.
+    if candidate is None or (
+        not str(getattr(candidate, "text", "") or "").strip()
+        and not int(getattr(candidate, "image_count", 0) or 0)
+    ):
+        ctx.candidate = None
+        ctx.candidate_key = ""
         ctx.wait.pop(key_name, None)
         ctx.wait.pop(at_name, None)
         ctx.wait.pop(samples_name, None)
         return
+
+    key = fingerprint(candidate)
+    ctx.candidate_key = key
 
     if ctx.wait.get(key_name) != key:
         bound_progress = ctx.wait.get("bound_assistant_progress")

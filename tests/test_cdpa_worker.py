@@ -260,6 +260,20 @@ class FakeActions:
         return len(selected)
 
 
+def test_blocked_temporary_workflow_preserves_live_tab(tmp_path: Path):
+    _config, _store, state, worker = setup_task(tmp_path, task_id="task-temp-block")
+    state["status"] = "BLOCKED"
+    state["kanban_column"] = "BLOCKED"
+    state["conversation_mode"] = "temporary"
+    actions = FakeActions()
+
+    asyncio.run(worker._release_blocked_workflow_tabs(state, actions))
+
+    assert actions.preflight_calls == 0
+    assert actions.closed_teams == 0
+    assert actions.pages == ["assigned-page"]
+
+
 def setup_task(
     tmp_path: Path,
     *,

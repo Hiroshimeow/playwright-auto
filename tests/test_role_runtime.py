@@ -692,6 +692,24 @@ def test_reload_settle_window_is_twenty_seconds():
     assert step(snapshot(retry_visible=True), wait, 20).reason == "wait_response"
 
 
+def test_empty_bound_assistant_while_listen_streaming_waits_without_format_repair():
+    current = snapshot(messages=(
+        MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
+        MessageSnapshot("assistant", "placeholder", "answer-turn", "", ()),
+    ))
+    wait = {}
+    result = step(
+        current,
+        wait,
+        validate=invalid,
+        network_status="IS_STREAMING",
+    )
+    assert result.action is Action.WAIT
+    assert result.reason == "wait_response"
+    assert "result_seen_key" not in wait
+    assert "response_binding_error" not in wait
+
+
 def test_empty_assistant_placeholder_does_not_hide_completed_result():
     current = snapshot(messages=(
         MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
