@@ -390,7 +390,7 @@ def test_completed_job_closes_after_one_minute_and_next_trigger_reopens_saved_ur
     assert reopen_actions.events == [
         ("reopen", False, False),
         ("wake", saved_page_url),
-        ("clean_ready", round(worker.config.workspace_timeout_seconds * 1000)),
+        ("clean_ready", 30000),
     ]
     assert _active_hop(running)["state"] == "sending"
 
@@ -541,8 +541,8 @@ def test_board_uses_operator_labels_run_task_and_restored_settings():
     assert 'body: {trigger_type: "manual", instruction}' in app
     assert '/api/independent-agents/${encodeURIComponent(taskId)}/reset' in app
     assert '.filter(item => !item.agent?.deleted_at)' in app
-    assert 'app.js?v=20260923-live-transcript-v1' in html
-    assert 'dashboard.css?v=20260923-live-transcript-v1' in html
+    assert 'app.js?v=20261011-p0012-challenge-confirm-v1' in html
+    assert 'dashboard.css?v=20261011-change-role-url-v1' in html
     assert 'function addEditedBrowserEndpoint(body, select, values)' in app
     assert 'if (selected !== initial) body.browser_endpoint_id = selected || null;' in app
     assert "new_chat_next_job" not in html[html.index('id="agent-settings-dialog"') :]
