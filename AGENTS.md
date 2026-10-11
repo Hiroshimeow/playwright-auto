@@ -60,4 +60,4 @@ Use the HCUW DIRECT / BOUNDED / SPEC scope that matches the change. Prefer the e
 
 Before editing, inspect branch/status/diff and the owning source/tests. Establish root cause before bug repair. Run the narrowest proving checks first, then broader checks only where the changed boundary warrants them. Review the final diff and run `git diff --check`.
 
-Do not reset, stash, clean, mass-revert, switch branches, push, release, or mutate unrelated runtime state without explicit authority. Commit only when the task/workflow authorizes a checkpoint; checkpoint rules live in `.hcu/rules.md` and the operator guide in `README.md`.
+Do not reset, stash, clean, mass-revert, switch branches, push, release, or mutate unrelated runtime state without explicit authority. The operator authorizes local checkpoint commits by default: at each verified change gate/handoff, commit all task-owned changes (never unrelated dirty work) so code cannot be orphaned and each gate remains revertible. Do not push unless asked. Checkpoint rules live in `.hcu/rules.md` and the operator guide in `README.md`.

@@ -7,6 +7,7 @@ import unicodedata
 from dataclasses import asdict, dataclass, fields
 from typing import Any, Mapping, Sequence
 from urllib.parse import unquote, urlparse
+from uuid import UUID
 
 COMMAND_ORIGINS = frozenset({"operator", "independent_agent", "worker", "repair_task"})
 COMMAND_STATES = frozenset(
@@ -131,6 +132,18 @@ def normalize_chatgpt_conversation_url(value: Any) -> str | None:
     ):
         return None
     return exact
+
+
+def normalize_saved_chatgpt_conversation_url(value: Any) -> str | None:
+    """Require a canonical UUID so saved Team roles can never fall through to Fresh Chat."""
+    normalized = normalize_chatgpt_conversation_url(value)
+    if normalized is None:
+        return None
+    raw_id = normalized.rstrip("/").rsplit("/", 1)[-1]
+    try:
+        return normalized if str(UUID(raw_id)) == raw_id.lower() else None
+    except ValueError:
+        return None
 
 
 def _active_hop(state: Mapping[str, Any]) -> Mapping[str, Any] | None:

@@ -120,6 +120,14 @@ function createWorkflowMode() {
   return roots.workflowModeInputs.find(input => input.checked)?.value === "solo" ? "solo" : "team";
 }
 
+function syncTeamStartRoleOptions() {
+  const field = roots.form.elements.initial_role;
+  const selected = field.value || "PLAN";
+  const roles = selectedWorkflowRoles();
+  field.replaceChildren(...roles.map(role => new Option(role, role)));
+  field.value = roles.includes(selected) ? selected : (roles.includes("PLAN") ? "PLAN" : (roles[0] || ""));
+}
+
 function syncSoloRoleOptions() {
   const selected = roots.soloRole.value;
   const options = [new Option("Select role", "")];
@@ -149,6 +157,7 @@ function syncCreateMode() {
   }
   roots.soloRole.required = solo;
   roots.browserEndpointSelect.required = solo;
+  if (!solo) syncTeamStartRoleOptions();
   if (solo) roots.reuseTeam.value = "";
   roots.requestedTeam.disabled = existingSolo || (!solo && Boolean(roots.reuseTeam.value));
   syncBootstrapInlineFields();
@@ -573,6 +582,7 @@ function renderAgents(current) {
   renderWorkflowAgentOptions(roots.workflowAgentOptions, current.agents?.workflow || []);
   roots.roleInputs = [...roots.workflowAgentOptions.querySelectorAll('input[name="roles"]')];
   syncSoloRoleOptions();
+  syncTeamStartRoleOptions();
   const selected = roots.agentSelect.value;
   const signature = JSON.stringify([
     current.agents?.workflow || [], current.agents?.independent || [],
@@ -1866,6 +1876,39 @@ roots.form.addEventListener("submit", event => {
       depends_on_task_ids: dependencies,
     };
     body.roles = selectedWorkflowRoles();
+    const startRole = String(values.get("initial_role") || "PLAN").trim().toUpperCase();
+    const roleUrls = {};
+    const putUrl = (role, url) => {
+      if (!body.roles.includes(role)) throw new Error(`Select workflow role ${role} before attaching its URL.`);
+      if (roleUrls[role]) throw new Error(`Duplicate URL assignment for ${role}.`);
+      roleUrls[role] = url;
+    };
+    try {
+      const startUrl = String(values.get("initial_role_url") || "").trim();
+      if (!body.roles.includes(startRole)) throw new Error("Initial role must be selected.");
+      if (startUrl) putUrl(startRole, startUrl);
+      for (const line of String(values.get("role_url_lines") || "").split(/\r?\n/)) {
+        if (!line.trim()) continue;
+        const sep = line.indexOf("=");
+        if (sep < 1) throw new Error("Role URLs must use ROLE=https://chatgpt.com/.../c/...");
+        putUrl(line.slice(0, sep).trim().toUpperCase(), line.slice(sep + 1).trim());
+      }
+    } catch (error) {
+      showCreateValidation(error.message);
+      return;
+    }
+    body.initial_role = startRole;
+    if (Object.keys(roleUrls).length) {
+      if (!browserEndpointId) {
+        showCreateValidation("Choose a browser endpoint before attaching an existing conversation.");
+        return;
+      }
+      if (values.get("temporary") === "on") {
+        showCreateValidation("Existing conversations cannot use Temporary chat.");
+        return;
+      }
+      body.role_conversation_urls = roleUrls;
+    }
     if (browserEndpointId) body.browser_endpoint_id = browserEndpointId;
     if (values.get("temporary") === "on") body.temporary = true;
     if (reuseTeam) body.reuse_team = reuseTeam;
@@ -1887,8 +1930,8 @@ roots.form.addEventListener("submit", event => {
 });
 
 roots.form.addEventListener("input", event => {
-  if (event.target.matches('input[name="conversation_url"]')) syncCreateMode();
-  if (event.target.matches('input[name="roles"], input[name="depends_on_task_ids"], textarea[name="task"], input[name="requested_team"], select[name="solo_role"], select[name="browser_endpoint_id"], input[name="conversation_url"]')) {
+  if (event.target.matches('input[name="conversation_url"], input[name="roles"]')) syncCreateMode();
+  if (event.target.matches('input[name="roles"], input[name="initial_role_url"], textarea[name="role_url_lines"], select[name="initial_role"], input[name="depends_on_task_ids"], textarea[name="task"], input[name="requested_team"], select[name="solo_role"], select[name="browser_endpoint_id"], input[name="conversation_url"]')) {
     showCreateValidation();
     updateCreateSummary();
   }
@@ -1900,6 +1943,10 @@ for (const input of roots.workflowModeInputs) {
   });
 }
 roots.soloRole.addEventListener("change", updateCreateSummary);
+roots.form.addEventListener("change", event => {
+  if (event.target.matches('input[name="roles"]')) syncTeamStartRoleOptions();
+  if (event.target.matches('select[name="initial_role"]')) updateCreateSummary();
+});
 roots.bootstrapSelect.addEventListener("change", () => {
   syncBootstrapInlineFields();
   showCreateValidation();

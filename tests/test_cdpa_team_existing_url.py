@@ -52,6 +52,7 @@ def test_durable_team_start_can_use_any_selected_role_url(tmp_path):
 
 @pytest.mark.parametrize("extra", [
     {"role_conversation_urls": {"REVIEW": "https://chatgpt.com/"}},
+    {"role_conversation_urls": {"REVIEW": "https://chatgpt.com/c/not-a-uuid"}},
     {"role_conversation_urls": {"REVIEW": URL1, "PLAN": URL1}},
     {"role_conversation_urls": {"AUDIT": URL1}},
     {"initial_role": "AUDIT"},
@@ -87,6 +88,24 @@ def test_durable_reservation_rejects_second_active_owner(tmp_path):
         )
 
 
+def test_team_reservation_rejects_existing_solo_url(tmp_path):
+    _config, store, _team, _worker = _task(tmp_path)
+    solo_url = "https://chatgpt.com/c/33333333-3333-4333-8333-333333333333"
+    store.create_task(
+        "Solo owner", task_id="solo-owner", requested_team="solo-owner",
+        workflow_mode="solo", roles=("REVIEW",),
+        browser_endpoint_id="legacy", conversation_url=solo_url,
+    )
+    with pytest.raises(ValueError, match="already reserved"):
+        store.create_task(
+            "Team duplicate", task_id="team-duplicate", requested_team="team-duplicate",
+            workflow_mode="team", roles=("PLAN", "REVIEW"),
+            browser_endpoint_id="legacy",
+            governing_objective="Team duplicate", governing_directives=[],
+            role_conversation_urls={"PLAN": solo_url},
+        )
+
+
 def test_team_adopts_url_on_first_role_without_fresh_chat(tmp_path):
     _config, _store, state, worker = _task(tmp_path)
     hop = _active_hop(state)
@@ -113,6 +132,31 @@ def test_team_adopts_url_on_first_role_without_fresh_chat(tmp_path):
     assert state["roles"]["REVIEW"]["page_id"] == "existing-page"
     assert state["roles"]["REVIEW"]["conversation_generation"] == 0
     assert hop["state"] == "waiting"
+
+
+def test_later_team_role_adopts_its_own_preassigned_url(tmp_path):
+    _config, _store, state, worker = _task(tmp_path)
+    hop = worker._append_hop(
+        state, source_role="REVIEW", target_role="PLAN",
+        handoff="Continue via the PLAN conversation.",
+    )
+    acquired = AcquiredRole(
+        client=SimpleNamespace(), page_id="plan-page", url=URL2,
+        created=False, new_chat=False,
+    )
+    actions = SimpleNamespace(
+        preflight_role=AsyncMock(return_value=[]),
+        adopt_conversation=AsyncMock(return_value=acquired),
+        fresh_chat=AsyncMock(),
+        acquire=AsyncMock(),
+    )
+    worker.role_controller.run = AsyncMock(
+        return_value=SimpleNamespace(reason="response_in_progress")
+    )
+    asyncio.run(worker._pre_send(state, hop, actions))
+    assert actions.adopt_conversation.await_args.kwargs["url"] == URL2
+    assert state["roles"]["PLAN"]["page_url"] == URL2
+    actions.fresh_chat.assert_not_awaited()
 
 
 def test_existing_unowned_browser_tab_is_claimed_not_duplicated(tmp_path, monkeypatch):
@@ -167,3 +211,163 @@ def test_existing_foreign_owned_tab_is_never_rebound(tmp_path, monkeypatch):
         asyncio.run(actions.adopt_conversation(state, "REVIEW", url=URL1))
     workspace.bind.assert_not_awaited()
     workspace.open_role.assert_not_awaited()
+
+
+def test_manual_draft_prevents_existing_tab_takeover(tmp_path, monkeypatch):
+    from playwright_auto.cdpa_actions import ComposerConflictError
+
+    config, _store, state, _worker = _task(tmp_path)
+    page = SimpleNamespace(url=URL1, is_closed=lambda: False)
+    actions = CDPATabActions(SimpleNamespace(pages=[page]), config)
+    workspace = SimpleNamespace(bind=AsyncMock(), open_role=AsyncMock())
+    monkeypatch.setattr(actions_module, "ChatGPTWorkspace", lambda: workspace)
+    monkeypatch.setattr(
+        actions_module, "inspect_page_metadata",
+        AsyncMock(return_value={"team": None, "task_id": None}),
+    )
+    monkeypatch.setattr(
+        actions_module, "ChatGPTPage",
+        lambda *_a, **_kw: SimpleNamespace(
+            snapshot=AsyncMock(return_value=SimpleNamespace(
+                manual_input_pending=True, composer_text="Don't delete my draft", stop_visible=False,
+            )),
+        ),
+    )
+    with pytest.raises(ComposerConflictError, match="manual draft"):
+        asyncio.run(actions.adopt_conversation(state, "REVIEW", url=URL1))
+    workspace.bind.assert_not_awaited()
+    workspace.open_role.assert_not_awaited()
+
+
+def test_browser_adoption_reuses_same_unowned_tab_without_navigation(tmp_path):
+    from playwright.async_api import async_playwright
+
+    config, _store, state, _worker = _task(tmp_path)
+    html = """
+    <main>
+      <form onsubmit="event.preventDefault()">
+        <div id="prompt-textarea" role="textbox" contenteditable="true"></div>
+        <button type="submit" data-testid="send-button">Send</button>
+      </form>
+    </main>
+    """
+
+    async def exercise():
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                context = await browser.new_context()
+                page = await context.new_page()
+
+                async def serve(route):
+                    await route.fulfill(status=200, content_type="text/html", body=html)
+
+                await page.route("https://chatgpt.com/**", serve)
+                await page.goto(URL1)
+                original_page_count = len(context.pages)
+                actions = CDPATabActions(context, config)
+                adopted = await actions.adopt_conversation(state, "REVIEW", url=URL1)
+                assert adopted.created is False
+                assert adopted.client.page is page
+                assert len(context.pages) == original_page_count
+                snapshot = await adopted.client.assert_ownership()
+                assert snapshot.page_task_id == state["task_id"]
+                assert snapshot.page_team == state["team"]
+                assert snapshot.page_role == state["roles"]["REVIEW"]["physical_role"]
+                assert snapshot.url == URL1
+            finally:
+                await browser.close()
+
+    asyncio.run(exercise())
+
+
+def test_team_url_api_normalization_and_rejections(tmp_path):
+    from playwright_auto.dashboard_api import APIError, DashboardAPI
+
+    config, _store, _state, _worker = _task(tmp_path)
+    api = DashboardAPI(config)
+    base = {
+        "workflow_mode": "team",
+        "task": "Continue accepted conversation",
+        "governing_objective": "Continue accepted conversation",
+        "governing_directives": [],
+        "roles": ["PLAN", "REVIEW"],
+        "initial_role": "REVIEW",
+        "browser_endpoint_id": "9222",
+        "role_conversation_urls": {"REVIEW": URL1, "PLAN": URL2},
+    }
+    normalized = api.normalize_create(base)
+    assert normalized["initial_role"] == "REVIEW"
+    assert normalized["role_conversation_urls"] == base["role_conversation_urls"]
+    for invalid in (
+        {**base, "role_conversation_urls": {"REVIEW": "https://example.org/"}},
+        {**base, "role_conversation_urls": {"REVIEW": "https://chatgpt.com/"}},
+        {**base, "role_conversation_urls": {"REVIEW": "https://chatgpt.com/c/not-a-uuid"}},
+        {**base, "browser_endpoint_id": None},
+        {**base, "temporary": True},
+        {**base, "workflow_mode": "solo", "role": "REVIEW"},
+    ):
+        with pytest.raises(APIError):
+            api.normalize_create(invalid)
+
+
+def test_team_role_urls_pass_through_cli_submission(tmp_path, monkeypatch):
+    import playwright_auto.cdpa_cli as cli
+    posted = []
+    monkeypatch.setattr(
+        cli, "_post",
+        lambda _config, path, payload, **_kwargs:
+            posted.append((path, payload)) or {"status": "queued"},
+    )
+    config = SimpleNamespace(repository_root=tmp_path.resolve())
+    cli.submit_task(
+        config,
+        task="Continue role discussion", repository=tmp_path,
+        team="existing-url-team", new_roles=(), new_all=False,
+        browser_endpoint_id="9222", initial_role="REVIEW",
+        role_conversation_urls={"REVIEW": URL1, "PLAN": URL2},
+        governing_objective="Continue role discussion", governing_directives=[],
+    )
+    assert posted[0][0] == "/api/tasks"
+    assert posted[0][1]["initial_role"] == "REVIEW"
+    assert posted[0][1]["role_conversation_urls"]["PLAN"] == URL2
+
+
+def test_team_role_url_cli_flags_forward_exact_mapping(tmp_path, monkeypatch):
+    import playwright_auto.cdpa_cli as cli
+
+    config = SimpleNamespace(
+        repository_root=tmp_path.resolve(),
+        dashboard_api_host="127.0.0.1",
+        dashboard_api_port=9225,
+        dashboard_url="http://127.0.0.1:9224",
+    )
+    seen = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "load_cdpa_config", lambda *_a, **_kw: config)
+    monkeypatch.setattr(
+        cli, "submit_task",
+        lambda _config, **kw: seen.append(kw) or {"status": "queued"},
+    )
+    assert cli.main([
+        "Continue existing discussion",
+        "--governing-objective", "Continue existing discussion",
+        "--browser", "9222",
+        "--start-role", "REVIEW",
+        "--role-url", f"REVIEW={URL1}",
+        "--role-url", f"PLAN={URL2}",
+    ]) == 0
+    assert seen[0]["initial_role"] == "REVIEW"
+    assert seen[0]["role_conversation_urls"] == {"REVIEW": URL1, "PLAN": URL2}
+
+
+def test_team_create_ui_exposes_initial_role_and_exact_role_url_fields():
+    from pathlib import Path
+
+    html = Path("src/playwright_auto/dashboard.html").read_text(encoding="utf-8")
+    app = Path("src/playwright_auto/dashboard_assets/app.js").read_text(encoding="utf-8")
+    assert 'name="initial_role"' in html
+    assert 'name="initial_role_url"' in html
+    assert 'name="role_url_lines"' in html
+    assert "body.role_conversation_urls = roleUrls" in app
+    assert "body.initial_role = startRole" in app

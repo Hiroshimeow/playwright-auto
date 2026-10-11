@@ -22,7 +22,10 @@ from .cdpa_bootstraps import (
     normalize_bootstrap_record,
     resolve_default_bootstrap_id,
 )
-from .cdpa_commands import RepairRequest, normalize_chatgpt_conversation_url
+from .cdpa_commands import (
+    RepairRequest, normalize_chatgpt_conversation_url,
+    normalize_saved_chatgpt_conversation_url,
+)
 from .cdpa_config import CDPAConfig, declared_repository_from_task, load_cdpa_config
 from .cdpa_endpoints import BrowserEndpointRegistry
 from .cdpa_identity import generate_idempotent_task_id, validate_task_id
@@ -348,6 +351,8 @@ class DashboardAPI:
             "role",
             "goal",
             "conversation_url",
+            "initial_role",
+            "role_conversation_urls",
             "conversation_mode",
             "context_policy",
             "governing_objective",
@@ -443,6 +448,8 @@ class DashboardAPI:
             )
         if workflow_mode == "solo":
             conflicting = {
+                "initial_role",
+                "role_conversation_urls",
                 "roles",
                 "reuse_team",
                 "new_roles",
@@ -476,8 +483,38 @@ class DashboardAPI:
                 "invalid_request",
                 "role, goal, and conversation_url are valid only for Solo Task",
             )
-        elif "roles" in raw:
-            normalized["roles"] = self._workflow_roles(raw.get("roles"))
+        if workflow_mode == "team":
+            initial_role = raw.get("initial_role")
+            if initial_role is not None:
+                role = str(initial_role).strip().upper()
+                if role not in self._active_workflow_routes():
+                    raise APIError(400, "invalid_request", "initial_role must be a known workflow role")
+                normalized["initial_role"] = role
+            role_urls = raw.get("role_conversation_urls")
+            if role_urls is not None:
+                if not isinstance(role_urls, dict):
+                    raise APIError(400, "invalid_request", "role_conversation_urls must be a role-to-URL object")
+                validated: dict[str, str] = {}
+                for name, url in role_urls.items():
+                    role = str(name).strip().upper()
+                    if role not in self._active_workflow_routes() or role in validated:
+                        raise APIError(400, "invalid_request", f"unknown or duplicate workflow role: {role!r}")
+                    normalized_url = normalize_saved_chatgpt_conversation_url(url)
+                    if normalized_url is None:
+                        raise APIError(400, "invalid_request", f"role {role}: URL must be an exact ChatGPT /c/<id> URL")
+                    validated[role] = normalized_url
+                if validated and not raw.get("browser_endpoint_id"):
+                    raise APIError(400, "invalid_request", "Team role URL adoption requires an explicit browser endpoint")
+                if validated and raw.get("temporary"):
+                    raise APIError(400, "invalid_request", "existing ChatGPT conversations cannot be Temporary")
+                normalized["role_conversation_urls"] = validated
+            if "roles" in raw:
+                normalized["roles"] = self._workflow_roles(raw.get("roles"))
+            selected_roles = set(normalized.get("roles") or self._active_workflow_routes())
+            if normalized.get("initial_role") and normalized["initial_role"] not in selected_roles:
+                raise APIError(400, "invalid_request", "initial_role must be a selected workflow role")
+            if set(normalized.get("role_conversation_urls") or ()) - selected_roles:
+                raise APIError(400, "invalid_request", "role_conversation_urls must reference selected roles")
         if "temporary" in raw:
             if type(raw.get("temporary")) is not bool:
                 raise APIError(400, "invalid_request", "temporary must be a boolean")

@@ -123,6 +123,8 @@ def submit_task(
     solo_role: str | None = None,
     goal: str | None = None,
     conversation_url: str | None = None,
+    initial_role: str | None = None,
+    role_conversation_urls: Mapping[str, str] | None = None,
     conversation_mode: str | None = None,
     context_policy: str | None = None,
     governing_objective: str | None = None,
@@ -130,6 +132,8 @@ def submit_task(
 ) -> Mapping[str, Any]:
     mode = str(workflow_mode or "team").strip().lower()
     if mode == "solo":
+        if initial_role or role_conversation_urls:
+            raise ValueError("Team role URLs and initial role are unavailable for Solo Tasks")
         if not solo_role or not str(solo_role).strip():
             raise ValueError("Solo Task requires --solo ROLE")
         if not browser_endpoint_id:
@@ -175,6 +179,10 @@ def submit_task(
     }
     if repository is not None:
         payload["repository"] = str(repository.expanduser().resolve())
+    if initial_role:
+        payload["initial_role"] = str(initial_role).strip().upper()
+    if role_conversation_urls:
+        payload["role_conversation_urls"] = dict(role_conversation_urls)
     if temporary and conversation_mode is not None:
         raise ValueError("temporary and conversation_mode are mutually exclusive")
     if temporary:
@@ -806,6 +814,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="create a Solo Task using exactly this existing workflow role",
     )
     parser.add_argument("--goal", default=None, help="optional Solo Task goal")
+    parser.add_argument("--start-role", default=None, help="initial Team role (default PLAN)")
+    parser.add_argument(
+        "--role-url", action="append", default=[], metavar="ROLE=URL",
+        help="attach a persistent ChatGPT conversation to a selected Team role; repeat",
+    )
     parser.add_argument(
         "--conversation-url",
         default=None,
@@ -905,6 +918,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.solo,
                 args.goal,
                 args.conversation_url,
+                args.start_role,
+                args.role_url,
                 args.temp,
                 args.browser,
                 args.depends_on,
@@ -930,13 +945,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else None
             )
             existing_solo = False
+            role_urls = admission.get("role_conversation_urls") or {}
+            initial_role = admission.get("initial_role")
         else:
             task = str(args.task_option or args.task or "")
             new_roles = parse_new_roles(args.new_roles)
             dependencies = parse_dependency_ids(args.depends_on)
             existing_solo = bool(args.solo and args.conversation_url)
+            initial_role = args.start_role
+            role_urls = {}
+            for item in args.role_url:
+                role, separator, url = item.partition("=")
+                role = role.strip().upper()
+                if not separator or not role or not url.strip() or role in role_urls:
+                    raise ValueError("--role-url must be unique ROLE=https://chatgpt.com/.../c/<id>")
+                role_urls[role] = url.strip()
         if task or existing_solo:
             if args.solo and (
+                initial_role or role_urls or
                 new_roles
                 or args.new_all
                 or args.temp
@@ -975,6 +1001,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 solo_role=args.solo,
                 goal=args.goal,
                 conversation_url=args.conversation_url,
+                initial_role=initial_role,
+                role_conversation_urls=role_urls,
                 conversation_mode=(admission.get("conversation_mode") if admission is not None else None),
                 context_policy=(admission.get("context_policy") if admission is not None else None),
                 governing_objective=(
@@ -998,6 +1026,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 or args.solo is not None
                 or args.goal is not None
                 or args.conversation_url is not None
+                or initial_role is not None
+                or role_urls
             ):
                 raise ValueError(
                     "--temp and --browser are invalid in taskless resume mode; "

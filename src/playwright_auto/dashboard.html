@@ -167,6 +167,16 @@
           </div>
           <div id="workflow-agent-options" class="workflow-agent-grid" aria-live="polite"></div>
           <p class="form-help">PLAN is required. PLAN, DEV, and REVIEW are selected by default. Custom workflow agents start unchecked.</p>
+          <div class="form-grid">
+            <label>Start with role<select name="initial_role"><option value="PLAN">PLAN</option></select></label>
+            <label>Existing ChatGPT URL for that role<input name="initial_role_url" autocomplete="off" placeholder="https://chatgpt.com/g/.../c/..."></label>
+          </div>
+          <details>
+            <summary>Attach URLs to additional roles (optional)</summary>
+            <label>One ROLE=URL per line<textarea name="role_url_lines" rows="3" placeholder="REVIEW=https://chatgpt.com/c/...
+DEV=https://chatgpt.com/g/.../c/..."></textarea></label>
+          </details>
+          <p class="form-help">A supplied URL must be a persistent ChatGPT conversation on the selected browser endpoint. A free matching tab is reused without duplicating it; tabs already owned by another task are refused.</p>
         </section>
 
         <section class="create-section" data-create-section="dependencies-output" data-team-only aria-labelledby="dependency-title">

@@ -19,11 +19,13 @@ from .cdpa_bootstraps import (
     normalize_legacy_bootstrap_record,
 )
 from .cdpa_commands import (
+    conversation_identity,
     RepairRequest,
     WorkerCommand,
     command_snapshot,
     workflow_control_eligibility,
     normalize_chatgpt_conversation_url,
+    normalize_saved_chatgpt_conversation_url,
 )
 from .cdpa_config import CDPAConfig
 from .cdpa_endpoints import BrowserEndpointRegistry
@@ -3324,10 +3326,13 @@ class TaskStore(IndependentAgentStoreMixin):
             role = str(key).strip().upper()
             if not role or role in normalized_urls:
                 raise ValueError("role_conversation_urls contains an invalid or duplicate role")
-            normalized_urls[role] = _optional_solo_conversation_url(value) or ""
+            normalized = normalize_saved_chatgpt_conversation_url(value)
+            if normalized is None:
+                raise ValueError(f"role {role} requires an exact persistent ChatGPT UUID URL")
+            normalized_urls[role] = normalized
         if normalized_urls and not browser_endpoint_id:
             raise ValueError("adopting Team role URLs requires an explicitly selected browser endpoint")
-        if len({url.rsplit("/", 1)[-1].lower() for url in normalized_urls.values()}) != len(normalized_urls):
+        if len({str(conversation_identity(url)).lower() for url in normalized_urls.values()}) != len(normalized_urls):
             raise ValueError("one ChatGPT conversation cannot belong to multiple Team roles")
         requested_initial_role = str(initial_role or "").strip().upper() or None
         text = canonicalize_task_text(task)
@@ -3600,7 +3605,10 @@ class TaskStore(IndependentAgentStoreMixin):
             if set(normalized_new) - set(workflow_roles):
                 raise ValueError("new_roles must be selected workflow roles")
             if normalized_urls:
-                requested_ids = {url.rsplit("/", 1)[-1].lower() for url in normalized_urls.values()}
+                requested_ids = {
+                    str(conversation_identity(url)).lower()
+                    for url in normalized_urls.values()
+                }
                 for existing_task in manifests:
                     if str(existing_task.get("status") or "").upper() in TERMINAL:
                         continue
@@ -3614,8 +3622,8 @@ class TaskStore(IndependentAgentStoreMixin):
                         if isinstance(item, Mapping)
                     ]
                     if any(
-                        candidate and candidate.rsplit("/", 1)[-1].lower() in requested_ids
-                        and normalize_chatgpt_conversation_url(candidate) is not None
+                        candidate and normalize_chatgpt_conversation_url(candidate) is not None
+                        and str(conversation_identity(candidate)).lower() in requested_ids
                         for candidate in occupied
                     ):
                         raise ValueError(

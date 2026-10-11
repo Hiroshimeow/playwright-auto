@@ -54,7 +54,22 @@ cdpa "<task>" --temp
 
 `--temp` forces Temporary Chat. Normally it is unnecessary when the selected endpoint already has `temporary_default=true`.
 
-Bootstrap selection is temporarily disabled. New workflow tasks always use Fresh context.
+Bootstrap selection is temporarily disabled. New workflow tasks normally use Fresh context.
+
+### Start a Team from an existing ChatGPT conversation
+
+A completed manual discussion can become the first Team role without repeating its history. Select the browser endpoint/account containing that tab; the Team must be persistent and still include PLAN so it can eventually finish.
+
+```powershell
+cdpa "Continue the approved discussion and complete the implementation review" `
+  --team discussion-review --browser 9212 --start-role REVIEW `
+  --role-url "REVIEW=https://chatgpt.com/g/<project>/c/<conversation-uuid>" `
+  --governing-objective "Verify the approved plan and deliver the remaining work"
+```
+
+Repeat `--role-url ROLE=URL` to preassign conversations to other selected roles (for example PLAN or DEV), or use **Create task > Team Task > Workflow agents > Existing ChatGPT URL** on the dashboard. REST task creation accepts `initial_role` and `role_conversation_urls` (role-to-URL object). Each role is assigned its own URL, and the Team remains on one endpoint.
+
+CDPA reuses a uniquely matching, **unowned** open ChatGPT tab on that endpoint; if it is not open, it navigates to the saved conversation. It does not overwrite manual drafts, seize tabs owned by another task, or silently substitute New Chat. A role URL is registered **when creating a Team**; changing an already-running Team's role owner is not part of this operation.
 
 ### Solo Tasks
 
@@ -258,7 +273,7 @@ Reports are file-backed under:
 
 ### Checkpoint commits
 
-When the active task explicitly authorizes repository checkpointing, every role that changes task-owned repository files commits only those task-owned changes before handoff. REVIEW/TEST/AUDIT make no empty commits. Final PLAN requires task-owned repository changes committed and a clean worktree except explicitly allowed generated/runtime files.
+Local checkpoint commits are authorized by default. After each verified change gate and before a role handoff, commit only task-owned repository changes so each gate can be reverted independently. REVIEW/TEST/AUDIT make no empty commits. Final PLAN requires task-owned repository changes committed and a clean worktree except explicitly allowed generated/runtime files.
 
 Checkpoint authority does not authorize push, merge, release, reset, stash, clean, branch switching, or touching unrelated work.
 
