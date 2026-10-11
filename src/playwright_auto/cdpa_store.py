@@ -6454,24 +6454,24 @@ class TaskStore(IndependentAgentStoreMixin):
                     continue
                 other_id = conversation_identity(record.get("page_url"))
                 if other_id is None:
-                    active = next(
-                        (
-                            hop for hop in other.get("hops") or ()
-                            if isinstance(hop, Mapping)
-                            and hop.get("hop_id") == other.get("active_hop_id")
-                            and str(hop.get("target_role") or "").upper() == str(other_role).upper()
-                        ),
-                        None,
-                    )
-                    if active is not None and str(active.get("state") or "") in {
-                        "sending", "sent", "waiting", "responded",
-                    }:
-                        other_id = conversation_identity(active.get("conversation_url"))
-                        receipt = active.get("receipt") if isinstance(active.get("receipt"), Mapping) else {}
+                    # An unallocated role or a paused/offline task can have
+                    # its only durable conversation identity in a hop, not
+                    # page_url. Never permit stealing that reserved UUID.
+                    for hop in reversed(other.get("hops") or ()):
+                        if (
+                            not isinstance(hop, Mapping)
+                            or str(hop.get("target_role") or "").upper() != str(other_role).upper()
+                            or str(hop.get("state") or "") == "abandoned"
+                        ):
+                            continue
+                        other_id = conversation_identity(hop.get("conversation_url"))
+                        receipt = hop.get("receipt") if isinstance(hop.get("receipt"), Mapping) else {}
                         if other_id is None and receipt.get("conversation_id"):
                             other_id = conversation_identity(
                                 f"https://chatgpt.com/c/{receipt['conversation_id']}"
                             )
+                        if other_id is not None:
+                            break
                 if other_id == target_id:
                     raise ValueError(
                         f"conversation already reserved by {other.get('task_id')}/{other_role}"

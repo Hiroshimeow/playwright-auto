@@ -141,6 +141,26 @@ def test_change_role_url_rejects_foreign_owner_and_wrong_endpoint(tmp_path):
         )
 
 
+def test_change_url_rejects_other_task_hop_only_reservation(tmp_path):
+    _config, store, state, _worker = pinned_task(tmp_path, task_id="url-target")
+    solo = store.create_task(
+        "Solo with existing conversation",
+        requested_team="solo-existing-reservation",
+        task_id="solo-existing-reservation",
+        workflow_mode="solo", roles=("REVIEW",),
+        browser_endpoint_id="legacy",
+        conversation_url=URL,
+    )
+    assert solo["roles"]["REVIEW"]["page_url"] is None
+    assert solo["hops"][0]["conversation_url"] == URL
+    with pytest.raises(ValueError, match="already reserved"):
+        store.change_role_url(
+            state["manifest_path"], role="PLAN", url=PLAIN,
+            expected_browser_endpoint_id=state["browser_endpoint_id"],
+            external_command_id="cmd-url-reservation-collision",
+        )
+
+
 def test_role_url_api_requires_url_role_and_endpoint(tmp_path):
     config, _store, _state, _worker = pinned_task(tmp_path)
     payload, version = DashboardAPI.normalize_role_url_change({
