@@ -31,6 +31,17 @@ function changeGoalButton(task) {
   return node;
 }
 
+function changeUrlButton(task) {
+  const node = el("button", "Change URL");
+  node.type = "button";
+  node.dataset.changeRoleUrl = task.task_id;
+  node.dataset.version = String(task.version || 0);
+  node.disabled = ["DONE", "STOPPED"].includes(task.status)
+    || task.conversation_mode === "temporary";
+  if (node.disabled) node.title = "Change URL requires a nonterminal persistent Solo/Team task.";
+  return node;
+}
+
 function independentButton(action, label, task, {disabled = false, emphasized = false} = {}) {
   const node = el("button", label);
   node.type = "button";
@@ -1041,6 +1052,7 @@ function workflowOverview(detail, timeline, selectedRole, endpoints) {
       disabled: eligibility.eligible !== true,
       reason: eligibility.reason || null,
     }));
+    if (action === "open_tab") controls.append(changeUrlButton(detail));
   }
   operations.append(controls);
   fragment.append(operations);

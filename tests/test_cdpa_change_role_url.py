@@ -209,6 +209,34 @@ def test_role_url_api_endpoint_enqueues_idempotent_command(tmp_path):
         thread.join(timeout=5)
 
 
+def test_change_url_ui_is_role_scoped_and_endpoint_readonly():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "src" / "playwright_auto"
+    html = (root / "dashboard.html").read_text(encoding="utf-8")
+    app = (root / "dashboard_assets" / "app.js").read_text(encoding="utf-8")
+    detail = (root / "dashboard_assets" / "views" / "task_detail.js").read_text(encoding="utf-8")
+    assert 'id="change-url-dialog"' in html
+    assert 'name="expected_browser_endpoint_id"' in html
+    assert 'id="change-url-endpoint-name"' in html
+    assert 'id="change-url-endpoint-id"' in html
+    assert 'id="change-url-endpoint-address"' in html
+    assert 'name="current_url" type="text" readonly' in html
+    assert 'name="url" type="url" required' in html
+    assert 'data.change_role_url' not in html
+    assert 'node.dataset.changeRoleUrl = task.task_id' in detail
+    assert 'const missing = !role || !endpointId || changeUrlDetail?.endpoint_pinned === false;' in app
+    assert 'state.runtime?.browser?.endpoints' in app
+    assert 'expected_browser_endpoint_id: endpointId' in app
+    assert '/role-url' in app
+    assert '20261011-change-role-url-v1' in html
+    assert '20261011-change-role-url-v1' in app
+
+
+def test_change_role_url_does_not_change_existing_ten_minute_timeout():
+    from playwright_auto.role_runtime.model import Policy
+    assert Policy().timeout_seconds == 600.0
+
+
 def test_change_role_url_runtime_command_idempotent_without_browser(tmp_path):
     _config, store, state, worker = pinned_task(tmp_path, task_id="url-command")
     worker.hydrate_runtime()

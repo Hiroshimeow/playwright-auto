@@ -7,7 +7,7 @@ import {
 } from "./store.js?v=20260914-goal2-ops-v1";
 import {renderBoard, refreshElapsed} from "./views/board.js?v=20260915-operator-ux-v1";
 import {renderBrowserManager, renderBrowserScope, syncCreateBrowserOptions, creationUsesTemporary} from "./views/browsers.js?v=20260915-endpoint-all-v1";
-import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260925-live-sse-v1";
+import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20261011-change-role-url-v1";
 import {renderHistory} from "./views/history.js";
 import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20260925-live-sse-v1";
 import {renderRuntime} from "./views/runtime.js?v=20260906-listen-controls-v1";
@@ -33,6 +33,8 @@ const roots = {
   form: document.querySelector("#create-form"),
   changeGoalDialog: document.querySelector("#change-goal-dialog"),
   changeGoalForm: document.querySelector("#change-goal-form"),
+  changeUrlDialog: document.querySelector("#change-url-dialog"),
+  changeUrlForm: document.querySelector("#change-url-form"),
   dependencyOptions: document.querySelector("#dependency-options"),
   reuseTeam: document.querySelector('#create-form select[name="reuse_team"]'),
   requestedTeam: document.querySelector('#create-form input[name="requested_team"]'),
@@ -1360,6 +1362,59 @@ function closeChangeGoal() {
   if (roots.changeGoalDialog.open) roots.changeGoalDialog.close();
 }
 
+let changeUrlDetail = null;
+
+function refreshChangeUrlRole() {
+  const form = roots.changeUrlForm;
+  const roleKey = String(form.elements.role.value || "").toUpperCase();
+  const role = (changeUrlDetail?.roles || []).find(item => item.logical_role === roleKey);
+  const endpointId = String(
+    role?.browser_endpoint_id
+    || changeUrlDetail?.requested_browser_endpoint_id
+    || changeUrlDetail?.browser_endpoint_id || "",
+  ).trim();
+  const browser = (state.runtime?.browser?.endpoints || [])
+    .find(item => item.endpoint_id === endpointId);
+  const name = browser?.label || endpointId || "Endpoint not assigned";
+  form.elements.expected_browser_endpoint_id.value = endpointId;
+  form.elements.current_url.value = role?.chat_url || role?.page_url || "";
+  document.querySelector("#change-url-endpoint-name").textContent = name;
+  document.querySelector("#change-url-endpoint-id").textContent = endpointId
+    ? "Endpoint ID: " + endpointId
+    : "No fixed endpoint";
+  document.querySelector("#change-url-endpoint-address").textContent = browser?.cdp_url
+    ? "CDP: " + browser.cdp_url
+    : "Endpoint details unavailable; verify the selected task's browser.";
+  const error = document.querySelector("#change-url-validation");
+  const missing = !role || !endpointId || changeUrlDetail?.endpoint_pinned === false;
+  error.hidden = !missing;
+  error.textContent = missing ? "This role has no pinned endpoint. Change URL is unavailable." : "";
+  form.querySelector('button[type="submit"]').disabled = missing;
+}
+
+function openChangeUrl(detail) {
+  if (!detail || detail.task_mode === "independent"
+      || ["DONE", "STOPPED"].includes(detail.status)
+      || detail.conversation_mode === "temporary") return;
+  const form = roots.changeUrlForm;
+  changeUrlDetail = detail;
+  form.elements.task_id.value = detail.task_id;
+  form.elements.expected_task_version.value = String(detail.version || 0);
+  const roles = (detail.roles || []).map(item => item.logical_role).filter(Boolean);
+  form.elements.role.replaceChildren(...roles.map(role => new Option(role, role)));
+  const initial = selectedRole(state) || detail.active_role || roles[0];
+  form.elements.role.value = roles.includes(initial) ? initial : roles[0] || "";
+  form.elements.url.value = "";
+  refreshChangeUrlRole();
+  roots.changeUrlDialog.showModal();
+  form.elements.url.focus();
+}
+
+function closeChangeUrl() {
+  if (roots.changeUrlDialog.open) roots.changeUrlDialog.close();
+  changeUrlDetail = null;
+}
+
 function openBrowserManager(focusAdd = false) {
   if (!roots.browserDialog.open) roots.browserDialog.showModal();
   if (focusAdd) requestAnimationFrame(() => roots.browserManager.querySelector('[data-browser-add] input[name="address"]')?.focus());
@@ -1461,6 +1516,11 @@ roots.detail.addEventListener("click", async event => {
         label: `Remove parent · ${parentTaskId}`,
       });
     }
+    return;
+  }
+  const changeRoleUrl = event.target.closest("[data-change-role-url]");
+  if (changeRoleUrl) {
+    openChangeUrl(state.selectedDetail);
     return;
   }
   const changeGoal = event.target.closest("[data-change-goal]");
@@ -2108,6 +2168,58 @@ roots.agentCommandDialog.addEventListener("click", event => {
 });
 roots.agentSettingsDialog.addEventListener("click", event => {
   if (event.target === roots.agentSettingsDialog) roots.agentSettingsDialog.close();
+});
+
+roots.changeUrlForm.elements.role.addEventListener("change", () => {
+  roots.changeUrlForm.elements.url.value = "";
+  refreshChangeUrlRole();
+});
+roots.changeUrlForm.addEventListener("submit", async event => {
+  event.preventDefault();
+  const form = roots.changeUrlForm;
+  const taskId = form.elements.task_id.value;
+  const role = form.elements.role.value;
+  const url = String(form.elements.url.value || "").trim();
+  const endpointId = form.elements.expected_browser_endpoint_id.value;
+  const info = document.querySelector("#change-url-validation");
+  try {
+    const parsed = new URL(url);
+    const correctHost = parsed.protocol === "https:"
+      && ["chatgpt.com", "www.chatgpt.com"].includes(parsed.hostname);
+    const correctPath = new RegExp("^/(?:g/[^/]+/)?c/[0-9a-fA-F-]{36}$").test(parsed.pathname);
+    if (!correctHost || !correctPath || parsed.search || parsed.hash) {
+      throw new Error("Paste an exact HTTPS ChatGPT conversation URL ending in /c/<UUID>.");
+    }
+    if (!endpointId) throw new Error("Selected role has no fixed browser endpoint.");
+  } catch (error) {
+    info.textContent = error.message;
+    info.hidden = false;
+    return;
+  }
+  info.hidden = true;
+  const pending = await queueCommand({
+    kind: "change_role_url",
+    taskId,
+    endpoint: `/api/tasks/${encodeURIComponent(taskId)}/role-url`,
+    body: {
+      role, url,
+      expected_browser_endpoint_id: endpointId,
+      expected_task_version: Number(form.elements.expected_task_version.value),
+    },
+    label: `Change URL ${role} - ${changeUrlDetail?.team || taskId}`,
+  });
+  if (pending?.status === "failed") return;
+  closeChangeUrl();
+});
+for (const close of document.querySelectorAll("[data-close-change-url]")) {
+  close.addEventListener("click", closeChangeUrl);
+}
+roots.changeUrlDialog.addEventListener("click", event => {
+  if (event.target === roots.changeUrlDialog) closeChangeUrl();
+});
+roots.changeUrlDialog.addEventListener("cancel", event => {
+  event.preventDefault();
+  closeChangeUrl();
 });
 
 roots.changeGoalForm.addEventListener("submit", event => {

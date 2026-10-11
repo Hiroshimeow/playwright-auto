@@ -69,7 +69,30 @@ cdpa "Continue the approved discussion and complete the implementation review" `
 
 Repeat `--role-url ROLE=URL` to preassign conversations to other selected roles (for example PLAN or DEV), or use **Create task > Team Task > Workflow agents > Existing ChatGPT URL** on the dashboard. REST task creation accepts `initial_role` and `role_conversation_urls` (role-to-URL object). Each role is assigned its own URL, and the Team remains on one endpoint.
 
-CDPA reuses a uniquely matching, **unowned** open ChatGPT tab on that endpoint; if it is not open, it navigates to the saved conversation. It does not overwrite manual drafts, seize tabs owned by another task, or silently substitute New Chat. A role URL is registered **when creating a Team**; changing an already-running Team's role owner is not part of this operation.
+CDPA reuses a uniquely matching, **unowned** open ChatGPT tab on that endpoint; if it is not open, it navigates to the saved conversation. It does not overwrite manual drafts, seize tabs owned by another task, or silently substitute New Chat.
+
+### Change URL for a role on an existing task
+
+In the dashboard, open a nonterminal Solo/Team task and choose **Operational state > Change URL**. Select the target role, review the fixed **endpoint name, ID and CDP address**, and paste the existing ChatGPT `/c/<UUID>` URL (plain or Project-scoped). **Save URL** only updates durable metadata; it does not change the endpoint, click Send, automatically Resume, or reload the page. A user can inspect the new URL in **Roles / tabs** before separately resuming the task.
+
+Agents/operators can use the same durable API, without interacting with the dashboard. First GET `/api/tasks/<task-id>` to find the role and its pinned `browser_endpoint_id` and current task `version`. Then POST:
+
+```http
+POST /api/tasks/<task-id>/role-url
+Content-Type: application/json
+Idempotency-Key: <stable-unique-key>
+
+{
+  "role": "REVIEW",
+  "url": "https://chatgpt.com/g/<project>/c/<conversation-uuid>",
+  "expected_browser_endpoint_id": "<role-browser-endpoint-id>",
+  "expected_task_version": 30
+}
+```
+
+The API returns **202 queued**, *not* proof that the change was applied. Poll `GET /api/commands/<command_id>` for `applied`, then GET the task to confirm the saved URL. Reuse the same idempotency key to retry an uncertain response; do not submit duplicates with new keys.
+
+For safety, an accepted or in-flight request **cannot be moved to another conversation UUID**. An existing bound role also cannot switch to an unrelated conversation while its old binding remains. Switching from a plain URL to the Project URL for the **same conversation UUID** is permitted, including on a PAUSED task with an in-flight request; the request ledger, receipt, prompt, and task status remain unchanged. Assigning an unrelated conversation to a role that already owns another tab requires explicitly releasing that ownership safely first. A conversation already reserved by a different live task/role is rejected. Temporary Chat and terminal tasks are not eligible.
 
 ### Solo Tasks
 

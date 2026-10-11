@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>CDPA Control Center</title>
-  <link rel="stylesheet" href="/assets/dashboard.css?v=20260925-live-sse-v1">
+  <link rel="stylesheet" href="/assets/dashboard.css?v=20261011-change-role-url-v1">
 </head>
 <body>
   <header class="app-header">
@@ -225,6 +225,40 @@ DEV=https://chatgpt.com/g/.../c/..."></textarea></label>
     </form>
   </dialog>
 
+  <dialog id="change-url-dialog" class="create-dialog change-url-dialog" aria-labelledby="change-url-title">
+    <form id="change-url-form" method="dialog" class="create-form">
+      <header class="secondary-header">
+        <div>
+          <p class="eyebrow">Existing Solo / Team task</p>
+          <h2 id="change-url-title">Change role URL</h2>
+          <p class="detail-subtitle">Attach a saved conversation to a role without changing its browser endpoint.</p>
+        </div>
+        <button type="button" class="button icon-button" data-close-change-url aria-label="Close Change URL dialog">Close</button>
+      </header>
+      <input type="hidden" name="task_id">
+      <input type="hidden" name="expected_task_version">
+      <input type="hidden" name="expected_browser_endpoint_id">
+      <div class="change-url-body">
+        <label>Target role<select name="role" required></select></label>
+        <section class="change-url-endpoint" aria-live="polite" aria-label="Fixed browser endpoint">
+          <span class="change-url-endpoint-label">Fixed browser endpoint</span>
+          <strong id="change-url-endpoint-name"></strong>
+          <code id="change-url-endpoint-id"></code>
+          <span id="change-url-endpoint-address" class="form-help"></span>
+        </section>
+        <label>Current conversation URL<input name="current_url" type="text" readonly aria-label="Current role URL"></label>
+        <label>New conversation URL<input name="url" type="url" required
+          placeholder="https://chatgpt.com/g/.../c/<uuid>" autocomplete="off" spellcheck="false"></label>
+        <p class="form-help">Verify that this ChatGPT conversation belongs to the fixed endpoint above. This action only saves the URL. It does not Resume, reload, Send or change the browser endpoint. Accepted or in-flight requests cannot move to a different conversation.</p>
+        <p id="change-url-validation" class="form-help" role="status" hidden></p>
+      </div>
+      <footer class="dialog-actions change-url-footer">
+        <button type="button" class="button" data-close-change-url>Cancel</button>
+        <button type="submit" class="button primary">Save URL</button>
+      </footer>
+    </form>
+  </dialog>
+
   <section id="agents-panel" class="agents-panel surface" hidden aria-labelledby="agents-panel-title">
     <header class="secondary-header agents-panel-header">
       <div><p class="eyebrow">Agent catalog</p><h2 id="agents-panel-title">Add Agents</h2></div>
@@ -375,6 +409,6 @@ DEV=https://chatgpt.com/g/.../c/..."></textarea></label>
   <datalist id="workflow-task-team-options"></datalist>
 
   <div id="toast" class="toast" hidden role="status"></div>
-  <script type="module" src="/assets/app.js?v=20260925-live-sse-v1"></script>
+  <script type="module" src="/assets/app.js?v=20261011-change-role-url-v1"></script>
 </body>
 </html>
