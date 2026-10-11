@@ -375,6 +375,7 @@ def test_team_create_ui_exposes_initial_role_and_exact_role_url_fields():
 @pytest.mark.parametrize('fault,expected', [
     (BrowserChallengeError('confirmed Cloudflare'), 'BROWSER_CHALLENGE'),
     (TimeoutError('saved canonical unavailable'), 'SESSION_UNAVAILABLE'),
+    (RoleOwnershipError('saved canonical redirected', code='conversation_identity_unavailable'), 'SESSION_UNAVAILABLE'),
 ])
 def test_team_preassigned_url_recovery_typed_pause(tmp_path, fault, expected):
     _config, _store, state, worker = _task(tmp_path)
@@ -389,4 +390,42 @@ def test_team_preassigned_url_recovery_typed_pause(tmp_path, fault, expected):
     assert state['block_code'] == expected
     assert hop['conversation_url'] == URL1
     assert state['roles']['REVIEW']['page_url'] == URL1
+    actions.fresh_chat.assert_not_awaited()
+
+
+def test_team_saved_url_reopen_identity_unavailable_pauses_without_fresh(tmp_path):
+    _config, _store, state, worker = _task(tmp_path)
+    hop = _active_hop(state)
+    state['roles']['REVIEW']['page_id'] = 'old-page'
+    actions = SimpleNamespace(
+        preflight_role=AsyncMock(return_value=[]),
+        reopen=AsyncMock(side_effect=RoleOwnershipError(
+            'saved canonical redirected', code='conversation_identity_unavailable',
+        )),
+        adopt_conversation=AsyncMock(), fresh_chat=AsyncMock(), acquire=AsyncMock(),
+    )
+    asyncio.run(worker._pre_send(state, hop, actions))
+    assert state['status'] == 'PAUSED'
+    assert state['block_code'] == 'SESSION_UNAVAILABLE'
+    assert hop['conversation_url'] == URL1
+    assert state['roles']['REVIEW']['page_url'] == URL1
+    actions.adopt_conversation.assert_not_awaited()
+    actions.fresh_chat.assert_not_awaited()
+
+
+def test_team_preassigned_foreign_owner_error_is_not_downgraded_to_session_unavailable(tmp_path):
+    _config, _store, state, worker = _task(tmp_path)
+    hop = _active_hop(state)
+    actions = SimpleNamespace(
+        preflight_role=AsyncMock(return_value=[]),
+        adopt_conversation=AsyncMock(side_effect=RoleOwnershipError(
+            'requested conversation tab is already task-owned',
+            code='conversation_owned_by_other_task',
+        )),
+        reopen=AsyncMock(), fresh_chat=AsyncMock(), acquire=AsyncMock(),
+    )
+    with pytest.raises(RoleOwnershipError) as caught:
+        asyncio.run(worker._pre_send(state, hop, actions))
+    assert caught.value.code == 'conversation_owned_by_other_task'
+    assert state['status'] != 'PAUSED'
     actions.fresh_chat.assert_not_awaited()

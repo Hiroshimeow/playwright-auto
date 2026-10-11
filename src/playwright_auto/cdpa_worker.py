@@ -6297,7 +6297,10 @@ class CDPAWorker:
               and _preferred_saved_url(hop.get('conversation_url'), state['roles'][role].get('page_url'))):
             try:
                 acquired = await actions.reopen(state, role, require_clean_ready=False)
-            except (BrowserChallengeError, TimeoutError, PlaywrightTimeoutError) as exc:
+            except (BrowserChallengeError, TimeoutError, PlaywrightTimeoutError, RoleOwnershipError) as exc:
+                if (isinstance(exc, RoleOwnershipError)
+                        and str(getattr(exc, "code", "") or "") != "conversation_identity_unavailable"):
+                    raise
                 if is_cdp_disconnect(exc):
                     raise
                 self._pause_recovery(state, code=(
@@ -6332,7 +6335,10 @@ class CDPAWorker:
                     role,
                     url=candidate_url,
                 )
-            except (BrowserChallengeError, TimeoutError, PlaywrightTimeoutError) as exc:
+            except (BrowserChallengeError, TimeoutError, PlaywrightTimeoutError, RoleOwnershipError) as exc:
+                if (isinstance(exc, RoleOwnershipError)
+                        and str(getattr(exc, "code", "") or "") != "conversation_identity_unavailable"):
+                    raise
                 if is_cdp_disconnect(exc):
                     raise
                 self._pause_recovery(state, code=(
@@ -6420,7 +6426,10 @@ class CDPAWorker:
                     acquired = await actions.reopen(state, role, require_clean_ready=False)
                 else:
                     acquired = await actions.adopt_conversation(state, role, url=saved_url)
-            except (BrowserChallengeError, TimeoutError, PlaywrightTimeoutError) as exc:
+            except (BrowserChallengeError, TimeoutError, PlaywrightTimeoutError, RoleOwnershipError) as exc:
+                if (isinstance(exc, RoleOwnershipError)
+                        and str(getattr(exc, "code", "") or "") != "conversation_identity_unavailable"):
+                    raise
                 if is_cdp_disconnect(exc):
                     raise
                 self._pause_recovery(state, code=(
