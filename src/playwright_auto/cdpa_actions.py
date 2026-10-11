@@ -436,7 +436,9 @@ class CDPATabActions:
                 f"request rate limit blocks target composer cleanup: {list(limited)!r}"
             )
         if snapshot.stop_visible:
-            raise UnsafePageStateError("page is already responding")
+            # Active response is live work, not a fatal cleanup error. Leave the
+            # composer untouched and let the pre-send controller enter WAIT.
+            return
         if snapshot.attachment_markers:
             await client.clear(
                 force=True,
@@ -1099,8 +1101,9 @@ class CDPATabActions:
                 raise ComposerConflictError(
                     "conversation has a manual draft or attachment; adoption requires a clean composer"
                 )
-            if preflight.stop_visible:
-                raise UnsafePageStateError("page is already responding")
+            # A response already running on an explicitly selected existing
+            # conversation is not an adoption failure. Bind ownership without
+            # touching the response; the pre-send controller will WAIT.
             client = await workspace.bind(
                 physical, page,
                 timeout_ms=round(self.config.workspace_timeout_seconds * 1000),

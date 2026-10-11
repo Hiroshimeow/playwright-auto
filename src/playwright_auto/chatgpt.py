@@ -962,7 +962,7 @@ async def click_send_button(
             const errorAlert = [...document.querySelectorAll('[role="alert"]')]
               .filter(visible)
               .find((element) => /error|failed|issue|try again/i.test(text(element))) || null;
-            if (errorAlert) {
+            if (errorAlert && !retry) {
               return {ok: false, method: 'page_state_conflict', reason: 'error_state'};
             }
             if (firstVisible('[role="dialog"]:not(#playwright-auto-role-control-v1), [data-testid^="modal-"]')) {
@@ -3078,9 +3078,19 @@ class ChatGPTPage:
                 await dismiss_rate_limit_dialog(self.page, timeout_ms=min(timeout, 10_000))
                 await asyncio.sleep(poll_ms / 1000)
                 continue
-            if (current.composer_present and current.composer_editable and not current.stop_visible
-                and not manual_pending and not current.blocking_dialogs
-                and current.state is not ChatGPTState.ERROR):
+            if (
+                current.composer_present
+                and current.composer_editable
+                and not current.stop_visible
+                and not manual_pending
+                and not current.blocking_dialogs
+                and (
+                    current.state is not ChatGPTState.ERROR
+                    or current.retry_visible
+                )
+            ):
+                # A stale Retry/error banner from a failed older generation does
+                # not make an otherwise usable composer unsafe for a new Send.
                 return current
             await asyncio.sleep(poll_ms / 1000)
         if manual_pending:
@@ -3328,7 +3338,8 @@ class ChatGPTPage:
                     .filter(visible)
                     .map((element) => element.innerText || '')
                     .filter((value) => /error|failed|issue|try again/i.test(value));
-                  if (firstVisible('[data-testid="regenerate-thread-error-button"]') || errorTexts.length) {
+                  const retryError = firstVisible('[data-testid="regenerate-thread-error-button"]');
+                  if (errorTexts.length && !retryError) {
                     return {written: false, reason: 'error_state'};
                   }
                   const composerHost = composer.closest('form') || composer.parentElement;
@@ -3519,9 +3530,14 @@ class ChatGPTPage:
     ) -> None:
         if snapshot.requires_login or snapshot.state is ChatGPTState.AUTH_REQUIRED:
             raise AuthenticationRequiredError("ChatGPT sign-in is required")
-        if snapshot.state is ChatGPTState.ERROR and not (
-            snapshot.retry_visible and not snapshot.error_texts
-        ):
+        stale_retry_error = bool(
+            snapshot.state is ChatGPTState.ERROR
+            and snapshot.retry_visible
+            and snapshot.composer_present
+            and snapshot.composer_editable
+            and not snapshot.stop_visible
+        )
+        if snapshot.state is ChatGPTState.ERROR and not stale_retry_error:
             raise UnsafePageStateError(
                 f"page is in error state: {list(snapshot.error_texts)!r}"
             )

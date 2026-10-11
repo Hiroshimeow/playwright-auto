@@ -5089,6 +5089,78 @@ def test_dashboard_actions_snapshot_tracks_browser_and_command_changes(tmp_path:
     }
 
 
+def test_route_repair_send_race_with_active_response_waits_instead_of_blocking(
+    tmp_path: Path, monkeypatch
+):
+    _config, _store, state, worker = setup_task(
+        tmp_path, task_id="task-route-repair-send-race"
+    )
+    hop = _active_hop(state)
+    hop["kind"] = "route_repair"
+    hop["prompt"] = "repair route only"
+    hop["prompt_sha256"] = worker_module._sha(hop["prompt"])
+    hop["state"] = "sending"
+    hop["timestamps"]["sending_at"] = utc_now()
+    state["status"] = "RUNNING"
+    state["active_action"] = "send"
+
+    ledger = RequestLedger(hop["ledger_path"])
+    constructor = worker_module.task_workflow_definitions(
+        state, worker.config
+    )[hop["target_role"]]["system_prompt"]
+    record = ledger.begin(
+        role=hop["physical_role"],
+        prompt=hop["prompt"],
+        source_context={
+            "task_id": state["task_id"],
+            "team": state["team"],
+            "hop_id": hop["hop_id"],
+            "manifest": state["manifest_path"],
+        },
+        role_prompt_hash=worker_module._sha(constructor),
+        request_id=hop["request_id"],
+        render_request_marker=False,
+    )
+    assert record.status is RequestStatus.NEW
+    assert record.attempts == 0
+
+    acquired = AcquiredRole(
+        client=SimpleNamespace(),
+        page_id="page-plan",
+        url="https://chatgpt.com/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        created=False,
+        new_chat=False,
+    )
+
+    async def owned(*_args, **_kwargs):
+        return acquired
+
+    async def no_rate_limit(_acquired):
+        return None
+
+    async def no_observer(*_args, **_kwargs):
+        return None
+
+    async def active_before_click(_self, _context):
+        raise UnsafePageStateError("page is already responding")
+
+    monkeypatch.setattr(worker, "_owned_or_block", owned)
+    monkeypatch.setattr(worker, "_dismiss_known_rate_limit_on_existing", no_rate_limit)
+    monkeypatch.setattr(worker, "_arm_passive_request_observer", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker_module.DurableSendBlock, "run", active_before_click)
+
+    asyncio.run(worker._sending(state, hop, FakeActions()))
+
+    durable = ledger.get(hop["request_id"])
+    assert durable.status is RequestStatus.NEW
+    assert durable.attempts == 0
+    assert state["status"] == "RUNNING"
+    assert state["active_action"] == "wait_response"
+    assert hop["state"] == "waiting"
+    assert hop["observed_existing_response"] is True
+    assert hop.get("receipt") is None
+
+
 def test_resume_endpointless_only_for_durable_state_only_transitions(tmp_path: Path):
     _config, _store, state, _worker = setup_task(
         tmp_path, task_id="task-resume-endpointless"

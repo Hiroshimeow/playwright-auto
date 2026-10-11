@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from playwright_auto.chatgpt import MessageSnapshot
+from playwright_auto.chatgpt import ChatGPTState, MessageSnapshot
 from playwright_auto.role_runtime import Action, Decision, Policy, RoleController
 from playwright_auto.role_runtime.allow import activity
 from test_operational_contract import snapshot, receipt
@@ -292,6 +292,32 @@ def test_retry_ui_repairs_after_five_stable_seconds_and_does_not_block_presend()
     assert step(current, {}, phase="pre_send").reason == "ready"
     dirty = snapshot(composer_text="stale target draft", attachment_markers=("stale.txt",))
     assert step(dirty, {}, phase="pre_send").reason == "ready"
+
+
+def test_presend_stale_retry_error_with_usable_composer_is_ready():
+    current = snapshot(
+        state=ChatGPTState.ERROR,
+        retry_visible=True,
+        error_texts=("Message delivery timed out. Please try again. Retry",),
+        composer_present=True,
+        composer_editable=True,
+        stop_visible=False,
+    )
+    result = step(current, {}, phase="pre_send")
+    assert result.action is Action.WAIT
+    assert result.reason == "ready"
+
+
+def test_presend_active_response_waits_instead_of_blocking_or_sending():
+    current = snapshot(
+        state=ChatGPTState.RESPONDING,
+        stop_visible=True,
+        composer_present=True,
+        composer_editable=True,
+    )
+    result = step(current, {}, phase="pre_send")
+    assert result.action is Action.WAIT
+    assert result.reason == "response_in_progress"
 
 
 def test_retry_stability_resets_when_retry_disappears():

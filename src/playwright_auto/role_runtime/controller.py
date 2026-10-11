@@ -148,14 +148,15 @@ class RoleController:
             return self._remember(ctx, Decision(Action.WAIT, "history_observation"))
 
         if phase == "pre_send":
-            # Streaming/Stop are recovery diagnostics, never authority to block a
-            # new hop. Pre-send only requires an editable composer after the
-            # response/UI interruption checks above.
-            if error_texts:
-                key = hashlib.sha256("|".join(error_texts).encode()).hexdigest()
-                if wait.get("ui_error_refreshed_key") != key:
-                    return self._remember(ctx, Decision(Action.REFRESH, "ui_error"))
-                return self._remember(ctx, Decision(Action.WAIT, "ui_error_waiting_for_composer"))
+            # Pre-send is intentionally simple: an actually active response means
+            # WAIT; otherwise a usable composer is ready even if ChatGPT still
+            # renders a stale Retry/error banner from an older generation.
+            page_state = getattr(snapshot, "state", None)
+            page_state_value = str(
+                getattr(page_state, "value", page_state) or ""
+            ).lower()
+            if bool(getattr(snapshot, "stop_visible", False)) or page_state_value == "responding":
+                return self._remember(ctx, Decision(Action.WAIT, "response_in_progress"))
             if ctx.signals.composer_ambiguous:
                 return self._remember(ctx, Decision(Action.WAIT, "composer_ambiguous"))
             reason = "ready" if ctx.composer_ready else "composer_pending"

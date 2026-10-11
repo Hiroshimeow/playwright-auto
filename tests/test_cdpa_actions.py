@@ -75,7 +75,7 @@ class FakePage:
     def is_closed(self):
         return self.closed
 
-    async def evaluate(self, _script):
+    async def evaluate(self, _script, *_args):
         snap = self.snapshot_value
         return {
             "url": self.url,
@@ -319,6 +319,7 @@ class FakeWorkspace:
         *,
         timeout_ms=0,
         force_new_page_id=False,
+        allow_rebind=False,
     ):
         page_id = (
             f"fresh-page-{page.generated_index}"
@@ -816,6 +817,28 @@ def test_adopt_conversation_opens_exact_url_binds_without_send(tmp_path, monkeyp
     assert adopted.client.page.goto_calls == [url]
     assert adopted.client.bind_calls == [("task-1", "new-team")]
     assert adopted.client.send_calls == []
+
+
+def test_adopt_existing_responding_conversation_binds_without_blocking(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    monkeypatch.setattr(actions_module, "ChatGPTWorkspace", FakeWorkspace)
+    url = "https://chatgpt.com/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    page = FakePage(page_id=None, role=None, team=None, task_id=None)
+    page.url = url
+    page.snapshot_value.url = url
+    page.snapshot_value.stop_visible = True
+    page.snapshot_value.state = ChatGPTState.RESPONDING
+    context = FakeContext([page])
+    actions = CDPATabActions(context, config)
+    state = manifest(page_id=None, page_url=None, conversation_url=url)
+
+    adopted = asyncio.run(actions.adopt_conversation(state, "PLAN", url=url))
+
+    assert context.new_page_calls == 0
+    assert adopted.url == url
+    assert adopted.new_chat is False
+    assert adopted.client.bind_calls == [("task-1", "new-team")]
+    assert page.snapshot_value.stop_visible is True
 
 
 def test_adopt_conversation_redirect_fails_closed_and_closes_page(tmp_path, monkeypatch):

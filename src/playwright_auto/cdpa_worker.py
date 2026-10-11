@@ -7189,26 +7189,16 @@ class CDPAWorker:
             return
         except UnsafePageStateError as exc:
             current_record = ledger.peek(str(hop["request_id"]))
-            adopted_existing_url = (
-                str(hop.get("kind") or "") == "task"
-                and (
-                    (
-                        str(state.get("workflow_mode") or "team").lower() == "solo"
-                        and bool(hop.get("conversation_url"))
-                    )
-                    or bool(_preferred_saved_url(
-                        hop.get("conversation_url"),
-                        state["roles"][role].get("page_url"),
-                    ))
-                )
-            )
             if (
-                adopted_existing_url
-                and self._should_observe_existing_response(exc)
+                self._should_observe_existing_response(exc)
                 and self._is_pristine_preboundary_sending_record(
                     state, hop, current_record
                 )
             ):
+                # A response can start in the race between pre-send readiness and
+                # the atomic click for any hop kind (including route/report
+                # repair). The request has not crossed the Send boundary, so
+                # observe that live response instead of BLOCKING or replaying.
                 self._observe_existing_response(state, hop)
                 return
             raise

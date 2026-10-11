@@ -34,6 +34,8 @@ def make_snapshot(
     response_activity_text="",
     response_activity_structure="",
     response_activity_length=0,
+    retry_visible=False,
+    error_texts=(),
 ):
     return ChatGPTSnapshot(
         url="https://chatgpt.com/c/test-session",
@@ -50,7 +52,8 @@ def make_snapshot(
         stop_visible=stop_visible,
         blocking_dialogs=(),
         attachment_markers=tuple(attachments),
-        error_texts=(),
+        error_texts=tuple(error_texts),
+        retry_visible=retry_visible,
         messages=tuple(messages),
         response_activity_turn_id=response_activity_turn_id,
         response_activity_text=response_activity_text,
@@ -272,6 +275,28 @@ def test_wait_clean_ready_tolerates_transient_snapshot_error(monkeypatch):
 
     assert result.state is ChatGPTState.NEW_CHAT
     assert page.inspect_calls == 2
+
+
+def test_stale_retry_error_is_clean_ready_when_composer_is_usable(monkeypatch):
+    page = SequencePage([
+        make_snapshot(
+            state=ChatGPTState.ERROR,
+            retry_visible=True,
+            error_texts=("Message delivery timed out. Please try again. Retry",),
+            composer_present=True,
+            composer_editable=True,
+            stop_visible=False,
+        )
+    ])
+    install_sequence(monkeypatch, page)
+
+    result = asyncio.run(
+        bind(page).wait_until_clean_ready(timeout_ms=20, poll_ms=1)
+    )
+
+    assert result.state is ChatGPTState.ERROR
+    assert result.retry_visible is True
+    ChatGPTPage._assert_interaction_safe(result)
 
 
 def test_page_observer_wait_consumes_dom_or_network_wake():
