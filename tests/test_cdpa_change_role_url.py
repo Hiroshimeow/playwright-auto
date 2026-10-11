@@ -248,8 +248,8 @@ def test_change_url_ui_is_role_scoped_and_endpoint_readonly():
     assert 'state.runtime?.browser?.endpoints' in app
     assert 'expected_browser_endpoint_id: endpointId' in app
     assert '/role-url' in app
-    assert '20261011-change-role-url-v1' in html
-    assert '20261011-change-role-url-v1' in app
+    assert '/assets/app.js?v=20261011-p0012-challenge-confirm-v1' in html
+    assert './views/task_detail.js?v=20261011-p0012-challenge-confirm-v1' in app
 
 
 def test_change_role_url_does_not_change_existing_ten_minute_timeout():
