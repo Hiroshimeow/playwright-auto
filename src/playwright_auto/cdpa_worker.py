@@ -29,6 +29,7 @@ from .cdpa_actions import (
     BranchBootstrapError,
     BranchTargetUnresolvedError,
     CDPATabActions,
+    BrowserChallengeError,
     RoleOwnershipError,
     TeamCloseError,
     is_transient_page_lifecycle_error,
@@ -2402,6 +2403,15 @@ class CDPAWorker:
                 pass
         return state
 
+    def _pause_recovery(self, state: dict[str, Any], *, code: str, reason: str) -> None:
+        state['status'] = 'PAUSED'
+        state['kanban_column'] = 'PAUSED'
+        state['active_action'] = 'paused'
+        state['block_code'] = code
+        state['block_retryable'] = False
+        state['block_reason'] = reason
+        state['pause_reason'] = f'{code}: {reason} Inspect the exact role on its assigned endpoint and Resume; do not resend.'
+
     def _wait_queue_error(
         self,
         state: dict[str, Any],
@@ -2599,14 +2609,11 @@ class CDPAWorker:
             str(hop.get("conversation_url") or "").strip(),
             str(role_record.get("page_url") or "").strip(),
         )
-        expected_conversation = next(
-            (
-                identity
-                for value in candidate_urls
-                if (identity := _recoverable_conversation_identity(value)) is not None
-            ),
-            None,
-        )
+        saved = {_recoverable_conversation_identity(value) for value in candidate_urls}
+        saved.discard(None)
+        if len(saved) > 1:
+            raise RoleOwnershipError('saved canonical conversation identities conflict')
+        expected_conversation = next(iter(saved), None)
         receipt = hop.get("receipt") if isinstance(hop.get("receipt"), Mapping) else {}
         binding = receipt.get("binding") if isinstance(receipt, Mapping) else {}
         expected_page_id = str(
@@ -2641,10 +2648,8 @@ class CDPAWorker:
             raise RoleOwnershipError(
                 "automatic role recovery reopened a different conversation"
             )
-        if expected_page_id is not None and str(acquired.page_id) != expected_page_id:
-            raise RoleOwnershipError(
-                "automatic role recovery did not restore the recorded page identity"
-            )
+        # The original receipt remains immutable; a newly restored runtime page
+        # may have a distinct ID once the canonical conversation is verified.
         if not foreground:
             await actions.wake(acquired)
             if require_clean_ready:
@@ -2674,6 +2679,7 @@ class CDPAWorker:
         *,
         admitted: list[bool] | None = None,
     ) -> AcquiredRole | None:
+        expected_conversation = None
         try:
             hop, expected_conversation, expected_page_id, _ = (
                 self._active_recovery_context(state, role)
@@ -2804,6 +2810,10 @@ class CDPAWorker:
                     and await self._temporary_document_token(acquired.client) != token
                 )
                 if acquired is None or lost_document:
+                    if (hop.get('receipt') or hop.get('state') in {'sent', 'waiting'}
+                            or token or state['roles'][role].get('page_id')):
+                        self._pause_recovery(state, code='SESSION_UNAVAILABLE', reason='Original Temporary document is unavailable; preserving saved identity and Send evidence.')
+                        return None
                     endpoint = self._execution_endpoint_id(state, role) or self.store.endpoint_id_for(state)
                     if self._prepare_cross_endpoint_recovery(
                         state, endpoint, reason="Temporary generation lost by tab loss or document reload",
@@ -2849,14 +2859,13 @@ class CDPAWorker:
             needs_reopen = (
                 acquired is None
                 or (expected_conversation is not None and live_conversation != expected_conversation)
-                or (expected_page_id is not None and str(acquired.page_id) != expected_page_id)
             )
             if needs_reopen:
                 role_record = state["roles"][role]
                 fresh_policy = state.get("context_policy") == "fresh" or (
                     state.get("bootstrap") is None and state.get("context_policy") != "bootstrap"
                 ) or hop.get("kind") == "execution_recovery"
-                if acquired is None and fresh_policy and hop.get("state") == "sending" and hop.get("receipt") is None:
+                if acquired is None and expected_conversation is None and fresh_policy and hop.get("state") == "sending" and hop.get("receipt") is None:
                     durable = RequestLedger(str(hop["ledger_path"])).peek(str(hop["request_id"]))
                     pristine = self._is_pristine_preboundary_sending_record(state, hop, durable)
                     owns_attachments = role_record.get("attachments_uploaded_generation") is not None and (
@@ -2880,6 +2889,9 @@ class CDPAWorker:
                             role_record["temporary_document_id"] = await self._temporary_document_token(acquired.client, create=True)
                         return acquired
                 if expected_conversation is None:
+                    if role_record.get('page_id') or role_record.get('temporary_document_id'):
+                        self._pause_recovery(state, code='SESSION_UNAVAILABLE', reason='Recorded role session is unavailable; refusing Fresh Chat.')
+                        return None
                     self._wait_queue_error(
                         state,
                         "Owned role tab is temporarily unavailable; waiting to reconnect on the same team endpoint.",
@@ -2893,6 +2905,9 @@ class CDPAWorker:
                 if admitted is not None:
                     admitted.append(True)
                 acquired = await self._recover_active_role(state, role, actions)
+        except BrowserChallengeError as exc:
+            self._pause_recovery(state, code='BROWSER_CHALLENGE', reason=sanitize_exception(exc))
+            return None
         except RateLimitBlockedError as exc:
             await self._enter_rate_limit_cooldown(state, actions, exc)
             state["active_action"] = "rate_limit_cooldown"
@@ -2900,6 +2915,9 @@ class CDPAWorker:
         except Exception as exc:
             if is_cdp_disconnect(exc):
                 raise
+            if expected_conversation is not None:
+                self._pause_recovery(state, code='SESSION_UNAVAILABLE', reason=sanitize_exception(exc))
+                return None
             if is_transient_page_lifecycle_error(exc):
                 wait = hop.setdefault("wait", {})
                 wait["ownership_retry_at"] = (
@@ -2920,7 +2938,9 @@ class CDPAWorker:
                 if isinstance(binding, Mapping)
                 else ""
             )
-            if sent_page_id and sent_page_id != acquired.page_id:
+            if (sent_page_id and sent_page_id != acquired.page_id
+                and not (expected_conversation is not None
+                         and _recoverable_conversation_identity(acquired.url) == expected_conversation)):
                 self._block(
                     state,
                     "in-flight receipt belongs to another runtime page; refusing transfer",
@@ -6132,6 +6152,11 @@ class CDPAWorker:
         )
         if route_repair_stale_error_ready:
             acquired = route_repair_owned
+        elif (state.get('conversation_mode') != 'temporary'
+              and state['roles'][role].get('page_id')
+              and _preferred_saved_url(hop.get('conversation_url'), state['roles'][role].get('page_url'))):
+            acquired = await actions.reopen(state, role, require_clean_ready=False)
+            await self._dismiss_known_rate_limit_on_existing(acquired)
         elif solo_existing_url or team_existing_url:
             candidate_url = (
                 _preferred_saved_url(hop.get("conversation_url"), state["roles"][role].get("page_url"))
@@ -6192,6 +6217,9 @@ class CDPAWorker:
             if acquired is not None and token and await self._temporary_document_token(acquired.client) != token:
                 acquired = None
             if acquired is None:
+                if token or state['roles'][role].get('page_id'):
+                    self._pause_recovery(state, code='SESSION_UNAVAILABLE', reason='Original Temporary document is unavailable; refusing replacement.')
+                    return
                 if self._rate_limit_gate_active(state=state):
                     state["active_action"] = "rate_limit_cooldown"
                     return

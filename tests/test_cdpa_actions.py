@@ -798,7 +798,7 @@ def test_adopt_conversation_opens_exact_url_binds_without_send(tmp_path, monkeyp
         "random_delay",
         lambda *_args, **_kwargs: asyncio.sleep(0),
     )
-    url = "https://chatgpt.com/c/solo-adopt-exact"
+    url = "https://chatgpt.com/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     context = FakeContext()
     actions = CDPATabActions(context, config)
     state = manifest(
@@ -812,7 +812,7 @@ def test_adopt_conversation_opens_exact_url_binds_without_send(tmp_path, monkeyp
     assert context.new_page_calls == 1
     assert adopted.url == url
     assert adopted.new_chat is False
-    assert adopted.conversation_id == "solo-adopt-exact"
+    assert adopted.conversation_id == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     assert adopted.client.page.goto_calls == [url]
     assert adopted.client.bind_calls == [("task-1", "new-team")]
     assert adopted.client.send_calls == []
@@ -834,7 +834,7 @@ def test_adopt_conversation_redirect_fails_closed_and_closes_page(tmp_path, monk
         "random_delay",
         lambda *_args, **_kwargs: asyncio.sleep(0),
     )
-    url = "https://chatgpt.com/c/solo-adopt-redirect"
+    url = "https://chatgpt.com/c/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
     context = FakeContext()
     actions = CDPATabActions(context, config)
 
@@ -854,7 +854,7 @@ def test_restart_exact_reopens_same_conversation_with_fresh_page_identity(tmp_pa
         "random_delay",
         lambda *_args, **_kwargs: asyncio.sleep(0),
     )
-    url = "https://chatgpt.com/c/exact-solo-conversation"
+    url = "https://chatgpt.com/c/cccccccc-cccc-4ccc-8ccc-cccccccccccc"
     old_page = FakePage(
         page_id="old-page",
         role="PLAN",
@@ -890,6 +890,8 @@ def test_reopen_existing_conversation_never_uses_branch_composer_cleanup(tmp_pat
         task_id="task-1",
     )
     page.snapshot_value.composer_text = "manual existing draft"
+    page.url = TARGET_CONVERSATION_URL
+    page.snapshot_value.url = TARGET_CONVERSATION_URL
     client = FakeClient(page, timeout_ms=1234)
     client.binding = SimpleNamespace(page_id="recorded-page", role="new-team-plan")
     context = FakeContext([page])
@@ -1649,7 +1651,7 @@ def test_recorded_offline_role_requires_controlled_reopen(tmp_path, monkeypatch)
     state = manifest(
         page_id="closed-page",
         page_url="https://chatgpt.com/",
-        conversation_url="https://chatgpt.com/c/exact-conversation",
+        conversation_url="https://chatgpt.com/c/dddddddd-dddd-4ddd-8ddd-dddddddddddd",
     )
 
     with pytest.raises(RoleOwnershipError, match="Open tab"):
@@ -1660,10 +1662,8 @@ def test_recorded_offline_role_requires_controlled_reopen(tmp_path, monkeypatch)
     assert reopened.page_id == "closed-page"
     assert reopened.created is True
     assert reopened.client.binding.page_id == "closed-page"
-    assert reopened.url == "https://chatgpt.com/c/exact-conversation"
-    assert reopened.client.clean_ready_calls == [
-        round(config.workspace_timeout_seconds * 1000)
-    ]
+    assert reopened.url == "https://chatgpt.com/c/dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+    assert reopened.client.clean_ready_calls == [30000]
     assert reopened.client.page.snapshot_value.page_task_id == "task-1"
     assert reopened.client.page.snapshot_value.page_team == "new-team"
     assert reopened.client.page.front is True
@@ -1692,7 +1692,7 @@ def test_recorded_offline_project_conversation_reopens_by_canonical_identity(tmp
     monkeypatch.setattr(actions_module, "random_delay", lambda *_args, **_kwargs: asyncio.sleep(0))
     actions = CDPATabActions(FakeContext(), config)
     project_url = (
-        "https://chatgpt.com/g/g-p-project-private-vault/c/exact-conversation"
+        "https://chatgpt.com/g/g-p-project-private-vault/c/dddddddd-dddd-4ddd-8ddd-dddddddddddd"
     )
     state = manifest(
         page_id="closed-page",
@@ -1813,15 +1813,15 @@ def test_reopen_accepted_waiting_skips_clean_composer_requirement(tmp_path, monk
     actions = CDPATabActions(FakeContext(), config)
     state = manifest(
         page_id="closed-page",
-        page_url="https://chatgpt.com/c/exact-conversation",
-        conversation_url="https://chatgpt.com/c/exact-conversation",
+        page_url="https://chatgpt.com/c/dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        conversation_url="https://chatgpt.com/c/dddddddd-dddd-4ddd-8ddd-dddddddddddd",
     )
 
     reopened = asyncio.run(
         actions.reopen(state, "PLAN", require_clean_ready=False)
     )
 
-    assert reopened.url == "https://chatgpt.com/c/exact-conversation"
+    assert reopened.url == "https://chatgpt.com/c/dddddddd-dddd-4ddd-8ddd-dddddddddddd"
     assert reopened.client.clean_ready_calls == []
 
 
@@ -1836,8 +1836,8 @@ def test_automatic_reopen_stays_background_until_explicit_wake(tmp_path, monkeyp
     actions = CDPATabActions(FakeContext(), config)
     state = manifest(
         page_id="closed-page",
-        page_url="https://chatgpt.com/c/exact-conversation",
-        conversation_url="https://chatgpt.com/c/exact-conversation",
+        page_url="https://chatgpt.com/c/dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        conversation_url="https://chatgpt.com/c/dddddddd-dddd-4ddd-8ddd-dddddddddddd",
     )
 
     reopened = asyncio.run(

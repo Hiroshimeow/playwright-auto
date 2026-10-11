@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import warnings
+from uuid import uuid4
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ from urllib.parse import unquote, urlparse
 from uuid import UUID
 
 from .cdpa_browser_projection import inspect_page_metadata
-from .cdpa_commands import conversation_identity
+from .cdpa_commands import conversation_identity, normalize_saved_chatgpt_conversation_url
 from .cdpa_config import CDPAConfig
 from .cdpa_independent import is_independent_task
 from .chatgpt import (
@@ -65,10 +66,9 @@ def _reopenable_conversation_identity(value: Any) -> str | None:
         or parsed.query or parsed.fragment
     ):
         return None
-    identity = conversation_identity(value)
-    if identity is None or unquote(identity.rsplit("/", 1)[-1]).lower().startswith(("web:", "local-chatgpt:")):
+    if normalize_saved_chatgpt_conversation_url(value) is None:
         return None
-    return identity
+    return conversation_identity(value)
 
 
 class BranchBootstrapError(RuntimeError):
@@ -82,6 +82,10 @@ class BootstrapDonorUnavailableError(BranchBootstrapError):
 
 class BranchTargetUnresolvedError(BranchBootstrapError):
     pass
+
+
+class BrowserChallengeError(RuntimeError):
+    """Confirmed Cloudflare challenge, not ordinary UI readiness failure."""
 
 
 class RoleOwnershipError(RuntimeError):
@@ -750,6 +754,21 @@ class CDPATabActions:
         require_clean_ready: bool = True,
         foreground: bool = True,
     ) -> AcquiredRole:
+        # Entire navigation, readiness, and ownership restoration share one budget.
+        async with asyncio.timeout(30):
+            return await self._reopen_impl(
+                manifest, logical_role,
+                require_clean_ready=require_clean_ready, foreground=foreground,
+            )
+
+    async def _reopen_impl(
+        self,
+        manifest: Mapping[str, Any],
+        logical_role: str,
+        *,
+        require_clean_ready: bool = True,
+        foreground: bool = True,
+    ) -> AcquiredRole:
         logical_role = str(logical_role).upper()
         role_record = manifest["roles"][logical_role]
         physical = str(role_record["physical_role"])
@@ -768,12 +787,19 @@ class CDPATabActions:
             str((active_hop or {}).get("conversation_url") or "").strip(),
             str(role_record.get("page_url") or "").strip(),
         )
+        identities = {
+            identity for value in candidate_urls
+            if (identity := _reopenable_conversation_identity(value)) is not None
+        }
+        if len(identities) > 1:
+            raise RoleOwnershipError("saved conversation identities conflict")
         page_url = next(
-            (value for value in candidate_urls if _reopenable_conversation_identity(value) is not None),
-            next((value for value in candidate_urls if value), ""),
+            (value for value in reversed(candidate_urls) if _reopenable_conversation_identity(value) is not None
+             and "/g/" in urlparse(value).path),
+            next((value for value in candidate_urls if _reopenable_conversation_identity(value) is not None), ""),
         )
-        if not page_id or not page_url:
-            raise RoleOwnershipError("role has no recorded page identity to reopen")
+        if not page_url:
+            raise RoleOwnershipError("role has no saved canonical conversation to reopen")
         expected_conversation = _reopenable_conversation_identity(page_url)
         if expected_conversation is None:
             raise RoleOwnershipError(
@@ -781,7 +807,33 @@ class CDPATabActions:
             )
         conversation_id = expected_conversation.rsplit("/", 1)[-1]
 
+        # Recovery may rebind a runtime page ID only for an exact, unique
+        # task/team/role owner on the same canonical conversation.
+        matches = []
+        for candidate in self.browser_context.pages:
+            if candidate.is_closed() or not self._supported(candidate):
+                continue
+            if _reopenable_conversation_identity(candidate.url) != expected_conversation:
+                continue
+            metadata = await inspect_page_metadata(candidate)
+            if any(metadata.get(key) and str(metadata[key]) != expected for key, expected in (
+                ("role", physical), ("task_id", str(manifest["task_id"])),
+                ("team", str(manifest["team"])),
+            )):
+                raise RoleOwnershipError("saved conversation is owned by another role/task/team")
+            if metadata.get("page_id") and all(metadata.get(key) for key in ("role", "task_id", "team")):
+                matches.append(candidate)
+        if len(matches) > 1:
+            raise RoleOwnershipError("multiple exact saved conversation tabs claim the role")
         existing = await self.locate_owned(manifest, logical_role)
+        if matches and existing is None:
+            candidate = matches[0]
+            metadata = await inspect_page_metadata(candidate)
+            client = ChatGPTPage(candidate, timeout_ms=30000)
+            client.binding = PageBinding(str(metadata["page_id"]), physical)
+            existing = AcquiredRole(client, str(metadata["page_id"]), str(candidate.url), False, False)
+        if existing is not None and _reopenable_conversation_identity(existing.url) != expected_conversation:
+            raise RoleOwnershipError("owned page changed canonical conversation")
         created = existing is None
         if created:
             await random_delay(action_delay_multiplier("open_tab"))
@@ -807,7 +859,7 @@ class CDPATabActions:
         else:
             client = existing.client
             page = client.page
-        timeout = round(self.config.workspace_timeout_seconds * 1000)
+        timeout = 30000
         try:
             exact_url = (
                 _reopenable_conversation_identity(page.url) == expected_conversation
@@ -834,7 +886,7 @@ class CDPATabActions:
                     state="visible", timeout=timeout
                 )
                 if await cloudflare_challenge_visible(page):
-                    raise RateLimitBlockedError(
+                    raise BrowserChallengeError(
                         "Cloudflare challenge blocked recorded ChatGPT conversation reopen"
                     )
                 if _reopenable_conversation_identity(page.url) != expected_conversation:
@@ -843,7 +895,7 @@ class CDPATabActions:
                         f"{page.url!r}"
                     )
                 await client.restore_identity(
-                    page_id=page_id,
+                    page_id=page_id or str(uuid4()),
                     role=physical,
                     task_id=str(manifest["task_id"]),
                     team=str(manifest["team"]),
@@ -851,28 +903,38 @@ class CDPATabActions:
                 )
             else:
                 if await cloudflare_challenge_visible(page):
-                    raise RateLimitBlockedError(
+                    raise BrowserChallengeError(
                         "Cloudflare challenge blocked recorded ChatGPT conversation reopen"
                     )
                 snapshot = await client.assert_ownership()
                 if (
-                    str(snapshot.page_id or "") != page_id
-                    or str(snapshot.page_role or "") != physical
+                    str(snapshot.page_role or "") != physical
                     or str(snapshot.page_task_id or "") != str(manifest["task_id"])
                     or str(snapshot.page_team or "") != str(manifest["team"])
                 ):
                     await client.restore_identity(
-                        page_id=page_id,
+                        page_id=str(snapshot.page_id or page_id or uuid4()),
                         role=physical,
                         task_id=str(manifest["task_id"]),
                         team=str(manifest["team"]),
                         binding_id=str(role_record.get("binding_id") or "") or None,
                     )
             if require_clean_ready:
-                await client.wait_until_clean_ready(timeout_ms=timeout)
+                try:
+                    await client.wait_until_clean_ready(timeout_ms=timeout)
+                except RateLimitBlockedError as exc:
+                    if await cloudflare_challenge_visible(page):
+                        raise BrowserChallengeError(
+                            'Cloudflare challenge blocked recorded conversation readiness'
+                        ) from exc
+                    raise
+            if await cloudflare_challenge_visible(page):
+                raise BrowserChallengeError('Cloudflare challenge blocked saved conversation')
             snapshot = await client.assert_ownership()
+            page_id = str(snapshot.page_id or "")
             if (
-                str(snapshot.page_id or "") != page_id
+                not page_id
+                or _reopenable_conversation_identity(snapshot.url) != expected_conversation
                 or str(snapshot.page_role or "") != physical
                 or str(snapshot.page_task_id or "") != str(manifest["task_id"])
                 or str(snapshot.page_team or "") != str(manifest["team"])
