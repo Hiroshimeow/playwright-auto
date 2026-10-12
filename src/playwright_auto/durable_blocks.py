@@ -264,8 +264,14 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
         context: WorkflowContext[ChatGPTPage],
         record: Any,
         snapshot: Any,
+        *,
+        allow_cleanup: bool,
     ) -> Any:
-        if not snapshot.composer_text.strip() or not self._allows_pristine_composer_cleanup(record):
+        if (
+            not allow_cleanup
+            or not snapshot.composer_text.strip()
+            or not self._allows_pristine_composer_cleanup(record)
+        ):
             return snapshot
         if snapshot.attachment_markers:
             raise DurableRequestError(
@@ -360,6 +366,7 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
                 paths,
                 identities,
                 file_snapshots,
+                allow_pristine_composer_cleanup=existing is None,
             )
 
     async def _run_record(
@@ -370,6 +377,8 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
         paths: list[str],
         identities: tuple[FileIdentity, ...],
         file_snapshots: tuple[FileSnapshot, ...],
+        *,
+        allow_pristine_composer_cleanup: bool,
     ) -> dict[str, Any]:
         context.variables[self.record_key] = record
         context.variables[f"{self.record_key}_marker"] = record.marker
@@ -421,7 +430,12 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
             )
 
         snapshot = await context.client.assert_ownership()
-        snapshot = await self._clear_pristine_composer(context, record, snapshot)
+        snapshot = await self._clear_pristine_composer(
+            context,
+            record,
+            snapshot,
+            allow_cleanup=allow_pristine_composer_cleanup,
+        )
         recovery = classify_recovery_state(record, snapshot)
         context.variables[self.recovery_key] = recovery
 

@@ -738,6 +738,150 @@ def test_pristine_new_dirty_composer_with_attachment_fails_closed_without_clear(
     assert client.send_calls == []
 
 
+def _begin_preexisting_pristine_request(
+    ledger_path: Path, *, prompt: str, request_id: str,
+):
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(
+        role="DEV",
+        prompt=prompt,
+        request_id=request_id,
+    )
+    assert record.status is RequestStatus.NEW
+    assert record.attempts == 0
+    return ledger, record
+
+
+def test_preexisting_pristine_new_manual_draft_is_preserved_without_send(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    prompt = "persisted durable prompt"
+    ledger, record = _begin_preexisting_pristine_request(
+        ledger_path, prompt=prompt, request_id="request-preexisting-manual",
+    )
+    client = FakeDurableClient(
+        snapshot(text="OPERATOR MANUAL DRAFT", state=ChatGPTState.DRAFT)
+    )
+
+    with pytest.raises(Exception) as captured:
+        run_block(
+            DurableSendBlock(
+                prompt,
+                ledger_path=ledger_path,
+                request_id=record.request_id,
+                wait_for_response=False,
+            ),
+            client,
+        )
+
+    current = ledger.get(record.request_id)
+    assert isinstance(captured.value.cause, DurableRequestError)
+    assert "manual_composer_dirty" in str(captured.value.cause)
+    assert current is not None
+    assert current.request_id == record.request_id
+    assert current.status is RequestStatus.NEW
+    assert current.attempts == 0
+    assert client.current.composer_text == "OPERATOR MANUAL DRAFT"
+    assert client.clear_calls == 0
+    assert client.set_calls == []
+    assert client.send_calls == []
+
+
+def test_preexisting_pristine_new_manual_attachment_is_preserved_without_send(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    prompt = "persisted durable prompt"
+    ledger, record = _begin_preexisting_pristine_request(
+        ledger_path, prompt=prompt, request_id="request-preexisting-attachment",
+    )
+    client = FakeDurableClient(
+        snapshot(
+            text="",
+            attachments=("operator-manual.pdf",),
+            state=ChatGPTState.DRAFT,
+        )
+    )
+
+    with pytest.raises(Exception) as captured:
+        run_block(
+            DurableSendBlock(
+                prompt,
+                ledger_path=ledger_path,
+                request_id=record.request_id,
+                wait_for_response=False,
+            ),
+            client,
+        )
+
+    current = ledger.get(record.request_id)
+    assert isinstance(captured.value.cause, DurableRequestError)
+    assert "composer_attachments_without_marker" in str(captured.value.cause)
+    assert current is not None
+    assert current.request_id == record.request_id
+    assert current.status is RequestStatus.NEW
+    assert current.attempts == 0
+    assert client.current.attachment_markers == ("operator-manual.pdf",)
+    assert client.clear_calls == 0
+    assert client.set_calls == []
+    assert client.send_calls == []
+
+
+def test_preexisting_pristine_new_exact_prompt_resumes_same_request_without_clear(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    prompt = "persisted durable prompt"
+    ledger, record = _begin_preexisting_pristine_request(
+        ledger_path, prompt=prompt, request_id="request-preexisting-exact",
+    )
+    client = FakeDurableClient(
+        snapshot(text=record.rendered_prompt, state=ChatGPTState.DRAFT)
+    )
+
+    run_block(
+        DurableSendBlock(
+            prompt,
+            ledger_path=ledger_path,
+            request_id=record.request_id,
+            wait_for_response=False,
+        ),
+        client,
+    )
+
+    current = ledger.get(record.request_id)
+    assert current is not None
+    assert current.request_id == record.request_id
+    assert current.status is RequestStatus.SENT
+    assert current.attempts == 1
+    assert client.clear_calls == 0
+    assert client.set_calls == []
+    assert len(client.send_calls) == 1
+
+
+def test_preexisting_pristine_new_empty_composer_resumes_same_request(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    prompt = "persisted durable prompt"
+    ledger, record = _begin_preexisting_pristine_request(
+        ledger_path, prompt=prompt, request_id="request-preexisting-empty",
+    )
+    client = FakeDurableClient(snapshot())
+
+    run_block(
+        DurableSendBlock(
+            prompt,
+            ledger_path=ledger_path,
+            request_id=record.request_id,
+            wait_for_response=False,
+        ),
+        client,
+    )
+
+    current = ledger.get(record.request_id)
+    assert current is not None
+    assert current.request_id == record.request_id
+    assert current.status is RequestStatus.SENT
+    assert current.attempts == 1
+    assert client.clear_calls == 0
+    assert client.set_calls == [record.rendered_prompt]
+    assert len(client.send_calls) == 1
+
+
 def test_dirty_composer_with_prior_attempt_never_clears_or_resends(tmp_path):
     ledger_path = tmp_path / "ledger.json"
     ledger = RequestLedger(ledger_path)

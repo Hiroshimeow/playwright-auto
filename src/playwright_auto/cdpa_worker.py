@@ -5698,10 +5698,14 @@ class CDPAWorker:
         state: dict[str, Any],
         role: str,
         actions: CDPATabActions,
+        *,
+        preserve_existing_composer: bool = False,
     ) -> AcquiredRole | None:
         existing = await actions.locate_owned(state, role)
         if existing is not None:
             await self._dismiss_known_rate_limit_on_existing(existing)
+            if preserve_existing_composer:
+                return existing
         elif self._rate_limit_gate_active(state=state):
             state["active_action"] = "rate_limit_cooldown"
             return None
@@ -6033,6 +6037,8 @@ class CDPAWorker:
         state: dict[str, Any],
         role: str,
         actions: CDPATabActions,
+        *,
+        preserve_existing_composer: bool = False,
     ) -> AcquiredRole | None:
         """Acquire one workflow role without bootstrap branching.
 
@@ -6047,7 +6053,12 @@ class CDPAWorker:
             or int(role_record.get("conversation_generation") or 0) > 0
         )
         if has_durable_context:
-            return await self._acquire_existing_role(state, role, actions)
+            return await self._acquire_existing_role(
+                state,
+                role,
+                actions,
+                preserve_existing_composer=preserve_existing_composer,
+            )
 
         owned = await actions.locate_owned(state, role)
         if owned is not None:
@@ -6230,6 +6241,31 @@ class CDPAWorker:
             # Acquisition did not return a binding; never implicitly allocate again.
             return
         role = str(hop["target_role"])
+        resume_pristine_durable = False
+        ledger_path = str(hop.get("ledger_path") or "").strip()
+        request_id = str(hop.get("request_id") or "").strip()
+        if (
+            str(hop.get("state") or "") == "pre_send"
+            and ledger_path
+            and request_id
+            and Path(ledger_path).exists()
+        ):
+            try:
+                durable = RequestLedger(ledger_path).peek(request_id)
+            except Exception as exc:
+                self._block(
+                    state,
+                    f"pre_send durable request identity cannot be reconciled during acquisition: {sanitize_exception(exc)}",
+                    code="pre_send_request_recovery_required",
+                    retryable=False,
+                )
+                return
+            resume_pristine_durable = self._is_pristine_preboundary_request_record(
+                state, hop, durable
+            )
+            if durable is not None and not resume_pristine_durable:
+                self._pre_send_request_identity_is_safe(state, hop)
+                return
         hop_kind = str(hop.get("kind") or "")
         prompt_kind = (
             str(hop.get("recovered_parent_kind") or "")
@@ -6404,7 +6440,7 @@ class CDPAWorker:
                         return
                     self._handle_pre_send_fresh_chat_timeout(state, hop, exc)
                     return
-            else:
+            elif not resume_pristine_durable:
                 acquired = await actions.acquire(state, role, clean_for_send=True)
             await self._dismiss_known_rate_limit_on_existing(acquired)
         elif (
@@ -6466,6 +6502,7 @@ class CDPAWorker:
             elif (
                 hop.get("kind") == "execution_recovery"
                 or hop.get("rebuild_prompt_after_relocation") is True
+                or resume_pristine_durable
             ):
                 pass
             else:
@@ -6529,7 +6566,12 @@ class CDPAWorker:
             independent["new_chat_deferred_task_id"] = None
         else:
             try:
-                acquired = await self._acquire_workflow_role(state, role, actions)
+                acquired = await self._acquire_workflow_role(
+                    state,
+                    role,
+                    actions,
+                    preserve_existing_composer=resume_pristine_durable,
+                )
             except Exception as exc:
                 if (
                     not isinstance(exc, (TimeoutError, PlaywrightTimeoutError))
@@ -6601,7 +6643,11 @@ class CDPAWorker:
             state["kanban_column"] = _column_for(role)
             state["active_action"] = "wait_response"
             return
-        if solo_existing_url and preparation_reason == "ready":
+        if (
+            solo_existing_url
+            and preparation_reason == "ready"
+            and not resume_pristine_durable
+        ):
             acquired = await actions.acquire(state, role, clean_for_send=True)
             self._record_acquired(state, role, acquired)
         if preparation_reason != "ready":

@@ -3492,6 +3492,86 @@ def test_pre_send_exact_pristine_durable_request_resumes_same_identity(
     assert state["status"] != "BLOCKED"
 
 
+@pytest.mark.parametrize("live_kind", ["manual_text", "manual_attachment"])
+def test_pristine_durable_pre_send_existing_owned_page_preserves_live_composer(
+    tmp_path: Path, live_kind: str,
+):
+    config, _store, state, worker = setup_task(
+        tmp_path,
+        task_id=f"task-pre-send-preserve-{live_kind}",
+    )
+    hop = _active_hop(state)
+    role = str(hop["target_role"])
+    prompt = "same durable request before send"
+    hop["prompt"] = prompt
+    hop["prompt_sha256"] = worker_module._sha(prompt)
+    source_context = {
+        "task_id": state["task_id"],
+        "team": state["team"],
+        "hop_id": hop["hop_id"],
+        "manifest": state["manifest_path"],
+    }
+    role_prompt_hash = worker_module._sha(
+        str(worker_module.task_workflow_definitions(state, config)[role]["system_prompt"])
+    )
+    ledger = RequestLedger(hop["ledger_path"])
+    record = ledger.begin(
+        role=str(hop["physical_role"]),
+        prompt=prompt,
+        source_context=source_context,
+        role_prompt_hash=role_prompt_hash,
+        request_id=hop["request_id"],
+        render_request_marker=False,
+    )
+    live = {
+        "text": "OPERATOR MANUAL DRAFT" if live_kind == "manual_text" else "",
+        "attachments": ("operator-manual.pdf",) if live_kind == "manual_attachment" else (),
+    }
+    acquired = AcquiredRole(
+        client=SimpleNamespace(),
+        page_id="owned-page",
+        url="https://chatgpt.com/",
+        created=False,
+        new_chat=False,
+    )
+
+    class PreserveActions(FakeActions):
+        def __init__(self):
+            super().__init__()
+            self.clean_acquire_calls = 0
+
+        async def locate_owned(self, _state, _role):
+            return acquired
+
+        async def acquire(self, _state, _role, *, clean_for_send=False):
+            self.clean_acquire_calls += 1
+            if clean_for_send:
+                live["text"] = ""
+                live["attachments"] = ()
+            return acquired
+
+    actions = PreserveActions()
+    worker.role_controller.run = AsyncMock(
+        return_value=SimpleNamespace(reason="composer_pending")
+    )
+
+    asyncio.run(worker._pre_send(state, hop, actions))
+
+    current = ledger.get(record.request_id)
+    assert actions.clean_acquire_calls == 0
+    assert live["text"] == (
+        "OPERATOR MANUAL DRAFT" if live_kind == "manual_text" else ""
+    )
+    assert live["attachments"] == (
+        ("operator-manual.pdf",) if live_kind == "manual_attachment" else ()
+    )
+    assert current is not None
+    assert current.request_id == record.request_id
+    assert current.attempts == 0
+    assert current.status is RequestStatus.NEW
+    assert hop["state"] == "pre_send"
+
+
 def test_pre_send_with_durable_record_fails_closed_without_rebuilding_prompt(
     tmp_path: Path,
 ):
