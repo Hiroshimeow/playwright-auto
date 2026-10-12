@@ -1,7 +1,7 @@
 ---
 hcu_baseline: "0.5"
-derived_at: "2026-10-02"
-evidence_fingerprint: "sha256:3fe3b6d9e3cad635ecaa87984291f32bb41b49c91455f4718f6adffc50593f0b"
+derived_at: "2026-10-12"
+evidence_fingerprint: "sha256:5c0f0169a24037d8476df879eecfefed18c3308c35dd8277a0bff385cb94af26"
 ---
 
 # CDPA Project Rules
