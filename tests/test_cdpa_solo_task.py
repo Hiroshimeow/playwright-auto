@@ -813,6 +813,8 @@ def test_solo_existing_url_send_race_observes_active_response_then_retries_goal(
     assert hop["state"] == "pre_send"
     assert "observed_existing_response" not in hop
     assert state["active_action"] == "queued"
+    assert worker._pre_send_request_identity_is_safe(state, hop) is True
+    assert state["status"] != "BLOCKED"
 
 
 def test_solo_existing_idle_url_sends_full_first_goal_prompt(tmp_path: Path, monkeypatch):

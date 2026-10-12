@@ -958,7 +958,7 @@ class CDPAWorker:
                 durable = RequestLedger(ledger_path).peek(request_id)
             except Exception:
                 return False
-            return self._is_pristine_preboundary_sending_record(
+            return self._is_pristine_preboundary_request_record(
                 state, hop, durable
             )
         if request_id and ledger_path:
@@ -1779,7 +1779,7 @@ class CDPAWorker:
         if not child_request_id or not child_ledger_path:
             raise DurableRequestError("execution recovery child has no durable identity")
         child_record = RequestLedger(child_ledger_path).peek(child_request_id)
-        if not self._is_pristine_preboundary_sending_record(
+        if not self._is_pristine_preboundary_request_record(
             state, validation_hop, child_record
         ):
             raise DurableRequestError(
@@ -2944,7 +2944,7 @@ class CDPAWorker:
                     # A truly pristine request can reacquire a surface without being replayed.
                     ledger = RequestLedger(str(hop["ledger_path"]))
                     durable = ledger.peek(str(hop["request_id"]))
-                    if self._is_pristine_preboundary_sending_record(state, hop, durable):
+                    if self._is_pristine_preboundary_request_record(state, hop, durable):
                         await self._acquire_endpoint_admission(state, role)
                         if admitted is not None:
                             admitted.append(True)
@@ -2988,7 +2988,7 @@ class CDPAWorker:
                 ) or hop.get("kind") == "execution_recovery"
                 if acquired is None and expected_conversation is None and fresh_policy and hop.get("state") == "sending" and hop.get("receipt") is None:
                     durable = RequestLedger(str(hop["ledger_path"])).peek(str(hop["request_id"]))
-                    pristine = self._is_pristine_preboundary_sending_record(state, hop, durable)
+                    pristine = self._is_pristine_preboundary_request_record(state, hop, durable)
                     owns_attachments = role_record.get("attachments_uploaded_generation") is not None and (
                         role_record.get("attachments_uploaded_generation") == role_record.get("conversation_generation")
                     )
@@ -5642,22 +5642,24 @@ class CDPAWorker:
             return False
         if record is None:
             return True
+
+        # A durable NEW/PROMPT_SET row is intentionally created before the
+        # irreversible Send boundary. If every immutable request component still
+        # matches and no attempt/acceptance evidence exists, this is the same
+        # pristine request and may resume from pre_send without replay.
+        if self._is_pristine_preboundary_request_record(state, hop, record):
+            return True
+
         if hop.get("rebuild_prompt_after_relocation") is True:
-            validation_hop = dict(hop)
-            validation_hop["state"] = "sending"
-            if self._is_pristine_preboundary_sending_record(
-                state, validation_hop, record
-            ):
-                return True
             intent = hop.get("prompt_rebind_intent")
             if isinstance(intent, Mapping):
                 intended_prompt = str(intent.get("prompt") or "")
                 intended_sha = str(intent.get("prompt_sha256") or "")
                 if intended_prompt and intended_sha == _sha(intended_prompt):
-                    intended_hop = dict(validation_hop)
+                    intended_hop = dict(hop)
                     intended_hop["prompt"] = intended_prompt
                     intended_hop["prompt_sha256"] = intended_sha
-                    if self._is_pristine_preboundary_sending_record(
+                    if self._is_pristine_preboundary_request_record(
                         state, intended_hop, record
                     ):
                         return True
@@ -5670,7 +5672,7 @@ class CDPAWorker:
             return False
         self._block(
             state,
-            f"pre_send hop already has durable request identity in status {record.status.value}; exact request recovery is required before any send",
+            f"pre_send durable request in status {record.status.value} is not provably pristine; exact request recovery is required before any send",
             code="pre_send_request_recovery_required",
             retryable=False,
         )
@@ -5716,8 +5718,9 @@ class CDPAWorker:
                 ledger = RequestLedger(str(hop["ledger_path"]))
                 durable = ledger.peek(str(hop["request_id"]))
                 pristine = (
-                    str(hop.get("state") or "") == "pre_send"
-                    or self._is_pristine_preboundary_sending_record(state, hop, durable)
+                    str(hop.get("state") or "") == "pre_send" and durable is None
+                ) or self._is_pristine_preboundary_request_record(
+                    state, hop, durable
                 )
                 owns_attachments = role_record.get("attachments_uploaded_generation") is not None and (
                     role_record.get("attachments_uploaded_generation") == role_record.get("conversation_generation")
@@ -6922,7 +6925,7 @@ class CDPAWorker:
             current = durable.peek(request_id)
             intended_hop = dict(hop)
             intended_hop.update(state="sending", prompt=prompt, prompt_sha256=intent["prompt_sha256"])
-            if not self._is_pristine_preboundary_sending_record(state, intended_hop, current):
+            if not self._is_pristine_preboundary_request_record(state, intended_hop, current):
                 if current is None or current.status not in {RequestStatus.NEW, RequestStatus.PROMPT_SET} or current.attempts != 0:
                     raise DurableRequestError("relocated request is no longer pristine")
                 durable.rebind_pristine(
@@ -6953,7 +6956,7 @@ class CDPAWorker:
             record = RequestLedger(hop["ledger_path"]).peek(hop["request_id"])
         except Exception:
             return False
-        if not self._is_pristine_preboundary_sending_record(state, hop, record):
+        if not self._is_pristine_preboundary_request_record(state, hop, record):
             return False
         hop["state"] = "sending"
         hop["pristine_sent_projection_reconciled_at"] = utc_now()
@@ -6970,7 +6973,7 @@ class CDPAWorker:
             record = RequestLedger(hop["ledger_path"]).peek(hop["request_id"])
         except Exception:
             return False
-        if not self._is_pristine_preboundary_sending_record(state, hop, record):
+        if not self._is_pristine_preboundary_request_record(state, hop, record):
             return False
         recovery = hop.setdefault("preboundary_recovery", {
             "attempts": 0, "failures": 0, "request_id": hop["request_id"],
@@ -7001,7 +7004,7 @@ class CDPAWorker:
             # The durable block observes/reconciles these states; it never repeats Send.
             recovery["phase"] = "complete"
             return False
-        if not self._is_pristine_preboundary_sending_record(state, hop, record):
+        if not self._is_pristine_preboundary_request_record(state, hop, record):
             self._block(state, "Pre-Send recovery can no longer prove pristine durable ownership.",
                         code="preboundary_recovery_provenance_changed", retryable=False)
             return True
@@ -7106,7 +7109,7 @@ class CDPAWorker:
             if current is None:
                 hop["rebuild_prompt_after_relocation"] = False
             else:
-                if not self._is_pristine_preboundary_sending_record(state, hop, current):
+                if not self._is_pristine_preboundary_request_record(state, hop, current):
                     raise DurableRequestError("relocated request is no longer pristine")
                 hop["state"] = "pre_send"
                 hop["relocated_pre_send_at"] = utc_now()
@@ -7200,7 +7203,7 @@ class CDPAWorker:
             current_record = ledger.peek(str(hop["request_id"]))
             if (
                 self._should_observe_existing_response(exc)
-                and self._is_pristine_preboundary_sending_record(
+                and self._is_pristine_preboundary_request_record(
                     state, hop, current_record
                 )
             ):
@@ -8819,7 +8822,7 @@ class CDPAWorker:
             postcondition="response_consumed" if decision.action is Action.ACCEPT else "observation_rearmed",
         )
 
-    def _is_pristine_preboundary_sending_record(
+    def _is_pristine_preboundary_request_record(
         self,
         state: Mapping[str, Any],
         hop: Mapping[str, Any],
@@ -8827,7 +8830,7 @@ class CDPAWorker:
     ) -> bool:
         if is_independent_task(state):
             return False
-        if str(hop.get("state") or "") not in {"sending", "sent"}:
+        if str(hop.get("state") or "") not in {"pre_send", "sending", "sent"}:
             return False
         if record is None or record.status not in {RequestStatus.NEW, RequestStatus.PROMPT_SET}:
             return False
@@ -9804,7 +9807,7 @@ class CDPAWorker:
             state, hop, control, actions, ledger, record
         ):
             return
-        if self._is_pristine_preboundary_sending_record(state, hop, record):
+        if self._is_pristine_preboundary_request_record(state, hop, record):
             if (
                 hop.get("kind") == "execution_recovery"
                 and len(str(hop.get("prompt") or "")) > _EXECUTION_RECOVERY_PROMPT_MAX_CHARS
@@ -12364,7 +12367,7 @@ class CDPAWorker:
                     record = RequestLedger(ledger_path).peek(request_id)
                 except Exception:
                     return True
-            if hop_state == "sending" and self._is_pristine_preboundary_sending_record(state, hop, record):
+            if hop_state == "sending" and self._is_pristine_preboundary_request_record(state, hop, record):
                 continue
             if record is not None and record.status in {RequestStatus.COMPLETED, RequestStatus.FAILED_FINAL}:
                 continue

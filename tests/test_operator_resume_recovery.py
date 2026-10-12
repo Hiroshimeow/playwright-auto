@@ -1965,30 +1965,34 @@ def test_preboundary_classifier_rejects_nonpristine_and_crossed_records(tmp_path
     )
     pristine = ledger.get(hop["request_id"])
     assert pristine is not None
-    assert worker._is_pristine_preboundary_sending_record(state, hop, pristine) is True
-    assert worker._is_pristine_preboundary_sending_record(
+    assert worker._is_pristine_preboundary_request_record(state, hop, pristine) is True
+    original_hop_state = hop["state"]
+    hop["state"] = "pre_send"
+    assert worker._is_pristine_preboundary_request_record(state, hop, pristine) is True
+    hop["state"] = original_hop_state
+    assert worker._is_pristine_preboundary_request_record(
         state, hop, replace(pristine, attempts=1)
     ) is False
-    assert worker._is_pristine_preboundary_sending_record(
+    assert worker._is_pristine_preboundary_request_record(
         state,
         hop,
         replace(pristine, binding=PageBinding("WEB:unexpected", hop["physical_role"])),
     ) is False
-    assert worker._is_pristine_preboundary_sending_record(
+    assert worker._is_pristine_preboundary_request_record(
         state, hop, replace(pristine, idempotency_key="0" * 64)
     ) is False
     original_mode = state.get("task_mode")
     state["task_mode"] = "independent"
-    assert worker._is_pristine_preboundary_sending_record(state, hop, pristine) is False
+    assert worker._is_pristine_preboundary_request_record(state, hop, pristine) is False
     if original_mode is None:
         state.pop("task_mode", None)
     else:
         state["task_mode"] = original_mode
     original_prompt_hash = hop["prompt_sha256"]
     hop["prompt_sha256"] = "0" * 64
-    assert worker._is_pristine_preboundary_sending_record(state, hop, pristine) is False
+    assert worker._is_pristine_preboundary_request_record(state, hop, pristine) is False
     hop["prompt_sha256"] = original_prompt_hash
-    assert worker._is_pristine_preboundary_sending_record(state, hop, pristine) is True
+    assert worker._is_pristine_preboundary_request_record(state, hop, pristine) is True
 
     malformed_path = tmp_path / "malformed-ledger.json"
     malformed_ledger = RequestLedger(malformed_path)
@@ -2005,7 +2009,7 @@ def test_preboundary_classifier_rejects_nonpristine_and_crossed_records(tmp_path
         request_id=hop["request_id"],
         render_request_marker=False,
     )
-    assert worker._is_pristine_preboundary_sending_record(state, hop, malformed) is False
+    assert worker._is_pristine_preboundary_request_record(state, hop, malformed) is False
 
     state["attachments"] = [
         {
@@ -2016,9 +2020,9 @@ def test_preboundary_classifier_rejects_nonpristine_and_crossed_records(tmp_path
             "mime_type": "text/plain",
         }
     ]
-    assert worker._is_pristine_preboundary_sending_record(state, hop, pristine) is False
+    assert worker._is_pristine_preboundary_request_record(state, hop, pristine) is False
     state["attachments"] = []
-    assert worker._is_pristine_preboundary_sending_record(state, hop, pristine) is True
+    assert worker._is_pristine_preboundary_request_record(state, hop, pristine) is True
 
     ledger.update(
         hop["request_id"],
@@ -2030,7 +2034,7 @@ def test_preboundary_classifier_rejects_nonpristine_and_crossed_records(tmp_path
     )
     sending = ledger.get(hop["request_id"])
     assert sending is not None
-    assert worker._is_pristine_preboundary_sending_record(state, hop, sending) is False
+    assert worker._is_pristine_preboundary_request_record(state, hop, sending) is False
 
     ledger.update(
         hop["request_id"],
@@ -2050,7 +2054,7 @@ def test_preboundary_classifier_rejects_nonpristine_and_crossed_records(tmp_path
     )
     sent = ledger.get(hop["request_id"])
     assert sent is not None
-    assert worker._is_pristine_preboundary_sending_record(state, hop, sent) is False
+    assert worker._is_pristine_preboundary_request_record(state, hop, sent) is False
 
     ledger.update(
         hop["request_id"],
@@ -2061,7 +2065,7 @@ def test_preboundary_classifier_rejects_nonpristine_and_crossed_records(tmp_path
     )
     completed = ledger.get(hop["request_id"])
     assert completed is not None
-    assert worker._is_pristine_preboundary_sending_record(state, hop, completed) is False
+    assert worker._is_pristine_preboundary_request_record(state, hop, completed) is False
 
 
 def _prepare_sending_record(tmp_path: Path, *, task_id: str, bootstrap=None):

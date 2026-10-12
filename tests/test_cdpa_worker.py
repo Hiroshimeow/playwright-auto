@@ -3451,6 +3451,47 @@ def test_pre_send_with_legacy_receipt_fails_closed_without_rebuilding_prompt(
     assert not Path(hop["ledger_path"]).exists()
 
 
+def test_pre_send_exact_pristine_durable_request_resumes_same_identity(
+    tmp_path: Path,
+):
+    config, _store, state, worker = setup_task(
+        tmp_path,
+        task_id="task-pre-send-pristine-durable",
+    )
+    hop = _active_hop(state)
+    role = str(hop["target_role"])
+    prompt = "same durable request before send"
+    hop["prompt"] = prompt
+    hop["prompt_sha256"] = worker_module._sha(prompt)
+    source_context = {
+        "task_id": state["task_id"],
+        "team": state["team"],
+        "hop_id": hop["hop_id"],
+        "manifest": state["manifest_path"],
+    }
+    role_prompt_hash = worker_module._sha(
+        str(worker_module.task_workflow_definitions(state, config)[role]["system_prompt"])
+    )
+    ledger = RequestLedger(hop["ledger_path"])
+    record = ledger.begin(
+        role=str(hop["physical_role"]),
+        prompt=prompt,
+        source_context=source_context,
+        role_prompt_hash=role_prompt_hash,
+        request_id=hop["request_id"],
+        render_request_marker=False,
+    )
+
+    assert record.status is RequestStatus.NEW
+    assert record.attempts == 0
+    assert worker._pre_send_request_identity_is_safe(state, hop) is True
+    assert state["status"] != "BLOCKED"
+
+    ledger.update(record.request_id, status=RequestStatus.PROMPT_SET)
+    assert worker._pre_send_request_identity_is_safe(state, hop) is True
+    assert state["status"] != "BLOCKED"
+
+
 def test_pre_send_with_durable_record_fails_closed_without_rebuilding_prompt(
     tmp_path: Path,
 ):
