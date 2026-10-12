@@ -58,6 +58,12 @@ def test_independent_prompt_constructor_rule_once_and_context_every_cycle(tmp_pa
     assert later.constructor_included is False
     assert "Use @mcp-g8" not in later.text
     assert "INDEPENDENT_AGENT_OPERATING_RULE" not in later.text
+    # A new interval may share the same conversation: every turn must explain
+    # the explicit control-plane completion required to free its scheduler slot.
+    assert "INDEPENDENT_JOB_COMPLETION" in first.text
+    assert "INDEPENDENT_JOB_COMPLETION" in later.text
+    assert "independent_complete" in later.text
+    assert "independent_continue" in later.text
     assert '"trigger_type": "recovery"' in first.text
     assert '"target_team": "alpha"' in later.text
     assert '"occurrence_count": 3' in later.text

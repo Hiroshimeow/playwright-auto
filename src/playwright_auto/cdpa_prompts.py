@@ -335,6 +335,19 @@ class PromptBuilder:
             "INDEPENDENT_AGENT_TRIGGER_CONTEXT\n"
             + json.dumps(context, ensure_ascii=False, indent=2, sort_keys=True)
         )
+        # The constructor is sent only once per conversation generation, but
+        # each scheduled job must explicitly release its own active event.
+        sections.append(
+            "INDEPENDENT_JOB_COMPLETION\n"
+            "A final chat response does not release this job or permit the next "
+            "scheduled trigger. After this exact event is finished, invoke the "
+            "authorized `independent_complete` control for this task_id with an "
+            "accurate outcome and summary. Verify the control was applied and "
+            "the agent is WAITING or has started a new event. Invoke "
+            "`independent_continue` only if another turn is needed on the same "
+            "event. If the control is unavailable, report the blocker rather "
+            "than claiming completion."
+        )
         return BuiltPrompt("\n\n".join(sections).strip(), include, generation)
 
     def _sanitize_validation_error(
