@@ -656,6 +656,11 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
         validated_upload_receipt = (
             _validate_upload_receipt(record, identities) if identities else None
         )
+        if source_task_id is not None and isinstance(context.client, ChatGPTPage):
+            await context.client.ensure_extra_high(
+                expected_prompt=record.rendered_prompt, allow_attachments=bool(identities),
+            )
+            before_send = await context.client.assert_ownership()
         baseline = capture_message_baseline(
             before_send.messages, before_send.logical_turn_ids
         )

@@ -825,6 +825,7 @@ async def click_send_button(
     expected_attachment_ownership_token: str | None = None,
     expected_attachment_count: int = 0,
     expected_attachment_names: Sequence[str] | None = None,
+    require_extra_high: bool = False,
 ) -> str:
     expected_names, expected_count = _expected_attachment_contract(
         expected_attachment_names, expected_attachment_count
@@ -866,7 +867,7 @@ async def click_send_button(
                expectedHostname, expectedPath, expectedPageId, expectedRole,
                expectedTaskId, expectedTeam, expectedAttachmentToken,
                roleKey, pageIdKey, taskIdKey, teamKey, windowNamePrefix,
-               attachmentOwnershipKey]) => {
+               attachmentOwnershipKey, requireExtraHigh]) => {
           const visible = (element) => {
             const style = element ? window.getComputedStyle(element) : null;
             return Boolean(
@@ -958,6 +959,11 @@ async def click_send_button(
             return null;
           };
           const validatePageState = () => {
+            if (requireExtraHigh) {
+              const models = [...document.querySelectorAll('button[aria-label="Select ChatGPT model"]')].filter(visible);
+              if (models.length !== 1 || text(models[0]) !== 'Extra High')
+                return {ok: false, method: 'page_state_conflict', reason: 'model_extra_high_not_verified'};
+            }
             const retry = firstVisible('[data-testid="regenerate-thread-error-button"]');
             const errorAlert = [...document.querySelectorAll('[role="alert"]')]
               .filter(visible)
@@ -1265,6 +1271,7 @@ async def click_send_button(
             TEAM_STORAGE_KEY,
             WINDOW_NAME_PREFIX,
             ATTACHMENT_OWNERSHIP_WINDOW_KEY,
+            require_extra_high,
         ],
     )
     if not result.get("ok"):
@@ -1688,7 +1695,10 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
           };
           const assistantText = lastAssistant ? boundedText(lastAssistant, 24000) : (semanticAssistant?.text || '');
           const projectedActivityText = projection.segments.map((segment) => segment.text).join(' ').slice(0, 24000);
-          const activityText = projectedActivityText || (activeResponse ? boundedText(activeResponse, 24000) : (semanticAssistant?.text || ''));
+          const interruption = [...document.querySelectorAll('main [role="status"]')]
+            .filter(visible).map(n => boundedText(n, 240))
+            .find(t => /connection interrupted|waiting for the complete answer/i.test(t)) || '';
+          const activityText = [projectedActivityText || (activeResponse ? boundedText(activeResponse, 24000) : (semanticAssistant?.text || '')), interruption].filter(Boolean).join(' ');
           const assistantShape = {
             length: assistantText.length,
             tail: assistantText.slice(-160),
@@ -1699,6 +1709,12 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
           };
           const errors = [...document.querySelectorAll('[role="alert"]')]
             .filter(visible).slice(-4).map((element) => boundedText(element, 240)).filter(Boolean);
+          if (!composer) {
+            const loadError = [...document.querySelectorAll('main h1,main h2,main [role="status"]')]
+              .filter(visible).map(n => boundedText(n, 240))
+              .find(t => /could not load this chatgpt conversation|unable to load conversation/i.test(t));
+            if (loadError) errors.push(loadError);
+          }
           const dialogs = [...document.querySelectorAll('[role="dialog"], [data-testid^="modal-"]')]
             .filter(element => element.id !== 'playwright-auto-role-control-v1')
             .filter(visible).slice(-4).map((element) => boundedText(element, 240) || 'dialog');
@@ -1935,6 +1951,11 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             .filter(visible)
             .map(text)
             .filter(Boolean);
+          if (!composer) {
+            const loadError = [...document.querySelectorAll('main h1,main h2,main [role="status"]')]
+              .filter(visible).map(text).find(t => /could not load this chatgpt conversation|unable to load conversation/i.test(t));
+            if (loadError) errorTexts.push(loadError);
+          }
           const blockingDialogs = [...document.querySelectorAll('[role="dialog"], [data-testid^="modal-"]')]
             .filter(element => element.id !== 'playwright-auto-role-control-v1')
             .filter(visible)
@@ -2137,7 +2158,10 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
           const projection = (__CDPA_RESPONSE_PROJECTION__);
           const semanticAssistant = semanticMessages.filter((message) => message.role === 'assistant').at(-1) || null;
           const projectedActivityText = projection.segments.map((segment) => segment.text).join(' ').slice(0, 24000);
-          const responseActivityText = projectedActivityText || (activeResponse ? text(activeResponse) : (semanticAssistant?.text || ''));
+          const interruption = [...chatRoot.querySelectorAll('[role="status"]')]
+            .filter(visible).map(n => text(n))
+            .find(t => /connection interrupted|waiting for the complete answer/i.test(t)) || '';
+          const responseActivityText = [projectedActivityText || (activeResponse ? text(activeResponse) : (semanticAssistant?.text || '')), interruption].filter(Boolean).join(' ');
           const responseActivityStructure = activeResponse
             ? [...activeResponse.querySelectorAll('[data-testid]')]
                 .filter(visible)
@@ -4064,6 +4088,62 @@ class ChatGPTPage:
             self._owned_composer_text = prompt
             return
 
+    async def ensure_extra_high(
+        self, *, timeout_ms: int | None = None, expected_prompt: str = "",
+        allow_attachments: bool = False,
+    ) -> None:
+        """Pre-send UI mutation only; observation paths never open the model menu."""
+        async with self.mutation_guard():
+            await self._ensure_extra_high_locked(
+                timeout_ms=timeout_ms or self.timeout_ms, expected_prompt=expected_prompt,
+                allow_attachments=allow_attachments,
+            )
+
+    async def _ensure_extra_high_locked(
+        self, *, timeout_ms: int, expected_prompt: str = "", allow_attachments: bool = False,
+    ) -> None:
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+        snapshot = await self.assert_ownership()
+        self._assert_interaction_safe(snapshot, allow_attachments=allow_attachments)
+        if snapshot.composer_text.strip() and not visible_text_matches(snapshot.composer_text, expected_prompt):
+            raise ComposerConflictError("model selection would mutate an operator-owned draft")
+        selector = self.page.get_by_role("button", name="Select ChatGPT model", exact=True)
+        if await selector.count() != 1:
+            raise UnsafePageStateError("Extra High model selector is missing or ambiguous")
+        if normalize_visible_text(await selector.inner_text()) == "Extra High":
+            return
+        try:
+            await selector.click(timeout=timeout_ms)
+            # Official rendered menu only; never invoke internal React/model APIs.
+            option = self.page.locator(
+                '[role="menu"] [role="menuitemradio"], [role="menu"] [role="menuitem"], '
+                '[role="dialog"] [role="radio"], [role="menu"] button'
+            ).filter(has_text=re.compile(r"^\s*Extra High\s*$"))
+            await option.first.wait_for(state="visible", timeout=timeout_ms)
+            if await option.count() != 1:
+                raise UnsafePageStateError("Extra High option is missing or ambiguous")
+            current = await self.assert_ownership()
+            self._assert_interaction_safe(
+                current, allow_dialogs=True, allow_attachments=allow_attachments,
+            )
+            if current.url != snapshot.url or current.composer_text != snapshot.composer_text or current.attachment_markers != snapshot.attachment_markers:
+                raise ComposerConflictError("page or composer changed before model selection")
+            await option.click(timeout=timeout_ms)
+            await self.page.wait_for_function(
+                """() => [...document.querySelectorAll('button[aria-label="Select ChatGPT model"]')]
+                    .filter(b => b.innerText.trim() === 'Extra High').length === 1""",
+                timeout=timeout_ms,
+            )
+        except PlaywrightTimeoutError as exc:
+            raise UnsafePageStateError("Extra High selection could not be verified; Send refused") from exc
+        post = await self.assert_ownership()
+        self._assert_interaction_safe(post, allow_attachments=allow_attachments)
+        if post.url != snapshot.url or post.composer_text != snapshot.composer_text or post.attachment_markers != snapshot.attachment_markers:
+            raise ComposerConflictError("page or composer changed during model selection")
+        if normalize_visible_text(await selector.inner_text()) != "Extra High":
+            raise UnsafePageStateError("Extra High selection changed before Send")
+
     async def send(
         self,
         text: str,
@@ -4155,6 +4235,11 @@ class ChatGPTPage:
                         expected_attachment_count=expected_count,
                         expected_attachment_names=expected_names,
                     )
+                    if explicit_task_id is not None:
+                        await self._ensure_extra_high_locked(
+                            timeout_ms=timeout, expected_prompt=prompt,
+                            allow_attachments=expected_count > 0,
+                        )
                     pre_send = await self.assert_ownership()
                     baseline = capture_message_baseline(
                         pre_send.messages, pre_send.logical_turn_ids
@@ -4180,6 +4265,7 @@ class ChatGPTPage:
                             expected_attachment_ownership_token=explicit_attachment_token,
                             expected_attachment_count=expected_count,
                             expected_attachment_names=expected_names,
+                            require_extra_high=explicit_task_id is not None,
                         )
                     except Exception:
                         click_outcome_ambiguous = True
@@ -4799,10 +4885,14 @@ class ChatGPTPage:
             f"no accepted-user-identity assistant response within {timeout} ms"
         )
 
-    async def stop(self, *, timeout_ms: int | None = None) -> str:
+    async def stop(
+        self, *, timeout_ms: int | None = None, preserve_manual_input: bool = False,
+    ) -> str:
         timeout = timeout_ms or self.timeout_ms
         async with self.mutation_guard():
             snapshot = await self.assert_ownership()
+            if preserve_manual_input and snapshot.manual_input_pending:
+                raise ComposerConflictError("automatic Stop preserves manual draft or attachments")
             if not snapshot.stop_visible:
                 raise UnsafePageStateError("Stop button is not visible")
             return await stop_response(self.page, timeout_ms=timeout)

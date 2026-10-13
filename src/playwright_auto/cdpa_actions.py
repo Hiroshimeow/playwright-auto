@@ -754,7 +754,7 @@ class CDPATabActions:
         logical_role: str,
         *,
         require_clean_ready: bool = True,
-        foreground: bool = True,
+        foreground: bool = False,
     ) -> AcquiredRole:
         # Entire navigation, readiness, and ownership restoration share one budget.
         async with asyncio.timeout(30):
@@ -769,7 +769,7 @@ class CDPATabActions:
         logical_role: str,
         *,
         require_clean_ready: bool = True,
-        foreground: bool = True,
+        foreground: bool = False,
     ) -> AcquiredRole:
         logical_role = str(logical_role).upper()
         role_record = manifest["roles"][logical_role]

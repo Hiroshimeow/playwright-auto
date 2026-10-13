@@ -35,6 +35,40 @@ def _rearm_wait(ctx: Context) -> Decision:
     return Decision(Action.WAIT, "response_still_active")
 
 
+def recovery(ctx: Context) -> Decision | None:
+    """A notice or inactive edge is evidence, never content progress or replay authority."""
+    if ctx.phase != "waiting":
+        return None
+    active = bool(getattr(ctx.snapshot, "stop_visible", False)) or bool(
+        getattr(ctx.snapshot, "response_projection_active", False)
+    )
+    previous_active = ctx.wait.get("last_stop_visible")
+    ctx.wait["last_stop_visible"] = active
+    if active:
+        ctx.wait.pop("inactive_since", None)
+    elif previous_active:
+        ctx.wait.setdefault("inactive_since", ctx.now.isoformat())
+    inactive_since = parse_time(ctx.wait.get("inactive_since"))
+    progress = parse_time(ctx.wait.get("controller_progress_at"))
+    inactive_anchor = max(inactive_since, progress) if inactive_since and progress else inactive_since
+    if inactive_anchor and (ctx.now - inactive_anchor).total_seconds() >= ctx.policy.response_stable_seconds:
+        return Decision(Action.REPAIR, "inactive_response")
+
+    notice = " ".join((
+        str(getattr(ctx.snapshot, "response_activity_text", "") or ""),
+        *tuple(getattr(ctx.snapshot, "error_texts", ()) or ()),
+    )).casefold()
+    progress_at = parse_time(ctx.wait.get("controller_progress_at")) or parse_time(ctx.wait.get("started_at"))
+    if progress_at is None:
+        progress_at = ctx.now
+        ctx.wait["controller_progress_at"] = progress_at.isoformat()
+    if ("connection interrupted" in notice or "waiting for the complete answer" in notice) and (
+        ctx.now - progress_at
+    ).total_seconds() >= min(ctx.policy.timeout_seconds, 300):
+        return Decision(Action.REPAIR, "interrupted_response")
+    return None
+
+
 def handle(ctx: Context) -> Decision | None:
     if ctx.phase != "waiting":
         return None

@@ -245,6 +245,11 @@ def test_send_reuses_hydrated_existing_conversation_baseline(monkeypatch):
     client.binding = PageBinding("page-1", "DEV")
     reads = 0
 
+    async def fake_model(self, **kwargs):
+        assert kwargs["expected_prompt"] == "prompt"
+
+    client._ensure_extra_high_locked = types.MethodType(fake_model, client)
+
     async def fake_assert(self):
         nonlocal reads
         reads += 1

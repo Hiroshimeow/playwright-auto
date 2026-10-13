@@ -4043,7 +4043,7 @@ class CDPAWorker:
                     )
                 )
                 if saved_identity:
-                    acquired = await actions.reopen(state, role)
+                    acquired = await actions.reopen(state, role, foreground=True)
                     reopened = True
                 else:
                     acquired = await actions.acquire(state, role)
@@ -5041,7 +5041,7 @@ class CDPAWorker:
                         )
                     current = await actions.locate_owned(state, role)
                     if current is None:
-                        return await actions.reopen(state, role)
+                        return await actions.reopen(state, role, foreground=True)
                     await actions.open_tab(current)
                     return current
 
@@ -8251,6 +8251,11 @@ class CDPAWorker:
         *,
         decision: Any = None,
     ) -> None:
+        if hop.get("state") == "routed" or any(
+            item.get("parent_hop_id") == hop.get("hop_id") and item.get("kind") == "route_repair"
+            for item in state.get("hops", ())
+        ):
+            return
         self._complete_request_response(hop)
         validation_error = sanitize_text(error, max_chars=2000)
         hop["validation_error"] = validation_error

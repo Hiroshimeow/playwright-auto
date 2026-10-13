@@ -1689,8 +1689,11 @@ def test_recorded_offline_role_requires_controlled_reopen(tmp_path, monkeypatch)
     assert reopened.client.clean_ready_calls == [30000]
     assert reopened.client.page.snapshot_value.page_task_id == "task-1"
     assert reopened.client.page.snapshot_value.page_team == "new-team"
-    assert reopened.client.page.front is True
-    assert actions.browser_context.lifecycle_calls == [
+    assert reopened.client.page.front is False
+    assert actions.browser_context.lifecycle_calls == []
+    explicit = asyncio.run(actions.reopen(state, "PLAN", foreground=True))
+    assert explicit.client.page.front is True
+    assert actions.browser_context.lifecycle_calls[-2:] == [
         (
             reopened.client.page,
             "Page.setWebLifecycleState",
@@ -1706,7 +1709,7 @@ def test_recorded_offline_role_requires_controlled_reopen(tmp_path, monkeypatch)
             "new-team",
         ),
     ]
-    assert actions.browser_context.detached_sessions == 1
+    assert actions.browser_context.detached_sessions == 2
 
 
 def test_recorded_offline_project_conversation_reopens_by_canonical_identity(tmp_path, monkeypatch):

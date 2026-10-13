@@ -51,6 +51,26 @@ class RoleController:
         dialogs = tuple(getattr(snapshot, "blocking_dialogs", ()) or ())
         error_texts = tuple(getattr(snapshot, "error_texts", ()) or ())
 
+        if not getattr(snapshot, "composer_present", False) and any(
+            marker in " ".join(error_texts).casefold()
+            for marker in ("could not load this chatgpt conversation", "unable to load conversation")
+        ):
+            if phase == "history":
+                return self._remember(ctx, Decision(Action.WAIT, "history_observation"))
+            if parse_qs(urlsplit(str(getattr(snapshot, "url", ""))).query).get("temporary-chat") == ["true"]:
+                return self._remember(ctx, Decision(Action.BLOCK, "temporary_conversation_unavailable"))
+            if wait.get("ui_error_refreshed_key") == "conversation_load_recheck":
+                return self._remember(ctx, Decision(Action.BLOCK, "conversation_unavailable"))
+            seen_at = parse_time(wait.get("ui_error_seen_at"))
+            if seen_at is None:
+                wait["ui_error_seen_at"] = ctx.now.isoformat()
+                seen_at = ctx.now
+            if ctx.draft_present:
+                return self._remember(ctx, Decision(Action.WAIT, "manual_draft_preserved"))
+            if (ctx.now - seen_at).total_seconds() < 600:
+                return self._remember(ctx, Decision(Action.WAIT, "conversation_load_grace"))
+            return self._remember(ctx, Decision(Action.REFRESH, "conversation_load_recheck"))
+
         # After F5, wait for the page to settle before reading either response source.
         ready_at = parse_time(wait.get("refresh_ready_at"))
         if phase == "waiting" and ready_at is not None and ctx.now < ready_at:
@@ -58,6 +78,8 @@ class RoleController:
         if ready_at is not None:
             wait.pop("refresh_ready_at", None)
 
+        # Track the DOM edge even while result stability short-circuits decisions.
+        timeout.recovery(ctx)
         listen_pending = False
         dom_pending = False
         if phase == "waiting":
@@ -123,6 +145,10 @@ class RoleController:
                     return self._remember(ctx, Decision(Action.REPAIR, "retry_visible_stable"))
             else:
                 wait.pop("retry_seen_at", None)
+
+        recovery = timeout.recovery(ctx)
+        if recovery is not None:
+            return self._remember(ctx, recovery)
 
         if ctx.candidate is not None and ctx.validation_error is not None:
             # A cached LISTEN stream status can outlive the rendered response.
@@ -397,6 +423,34 @@ class RoleController:
             await worker._enter_rate_limit_cooldown(state, actions, RateLimitBlockedError("Too many requests"))
             state["active_action"] = "rate_limit_cooldown"
             return decision
+        if decision.action is Action.REFRESH and decision.reason == "conversation_load_recheck":
+            if state.get("conversation_mode") == "temporary":
+                worker._block(state, "temporary conversation cannot be reloaded safely", code="temporary_conversation_unavailable", retryable=False)
+                return Decision(Action.BLOCK, "temporary_conversation_unavailable")
+            # Consume the existing error-refresh token durably BEFORE the reload.
+            # A crash after this claim fails closed rather than doing F5 twice.
+            def claim(current):
+                current_hop = next(item for item in current["hops"] if item["hop_id"] == hop["hop_id"])
+                if current.get("active_hop_id") != hop["hop_id"] or current_hop.get("request_id") != hop.get("request_id"):
+                    raise ValueError("load recovery execution changed")
+                current_wait = current_hop.setdefault("wait", {})
+                if current_wait.get("ui_error_refreshed_key") == decision.reason:
+                    raise ValueError("conversation load reload already consumed")
+                current_wait["ui_error_seen_at"] = wait["ui_error_seen_at"]
+                current_wait["ui_error_refreshed_key"] = decision.reason
+                begin_refresh(current_wait)
+                return current
+            saved = worker.store.update(state["manifest_path"], claim)
+            durable_hop = next(item for item in saved["hops"] if item["hop_id"] == hop["hop_id"])
+            wait.update(durable_hop["wait"])
+            try:
+                await client.refresh(reason=decision.reason)
+            except Exception as exc:
+                finish_refresh(wait, error=type(exc).__name__)
+                raise
+            finish_refresh(wait)
+            # Reinspection happens on the next bounded controller step; no Send.
+            return decision
         if decision.action in {Action.ALLOW, Action.REFRESH}:
             result = await self.browser_action(client, snapshot, wait, permission, decision)
             if decision.action is Action.ALLOW:
@@ -406,6 +460,39 @@ class RoleController:
         if decision.action is Action.STATUS:
             wait["timeout_status_checked"] = True
             wait["timeout_status"] = await worker._one_shot_stream_status(actions, receipt) if receipt else None
+            return decision
+        if decision.action is Action.REPAIR and decision.reason in {"interrupted_response", "inactive_response"}:
+            if receipt is None or hop.get("state") not in {None, "waiting"}:
+                return Decision(Action.WAIT, "recovery_requires_accepted_execution")
+            # Re-read exact ownership and content before Stop. A result or progress
+            # that raced the timeout wins; never stop from a stale cached snapshot.
+            current = await client.assert_ownership()
+            rechecked = self.decide(
+                current, wait, receipt=receipt,
+                validate=lambda candidate: worker._validate_response_candidate(state, hop, candidate),
+            )
+            if rechecked.action is not Action.REPAIR or rechecked.reason != decision.reason:
+                return rechecked
+            if bool(getattr(current, "manual_input_pending", False)) or bool(
+                getattr(current, "composer_text", "") or getattr(current, "attachment_markers", ())
+            ):
+                return Decision(Action.WAIT, "manual_draft_preserved")
+            if getattr(current, "stop_visible", False):
+                await client.stop(preserve_manual_input=True)
+                # Stop is idempotent at the exact page boundary: after a crash the
+                # inactive edge is reconciled, never an original Send replay.
+                return Decision(Action.WAIT, "stop_verification_pending")
+            if getattr(current, "response_projection_active", False):
+                return Decision(Action.WAIT, "stop_verification_pending")
+            worker._queue_format_repair(
+                state, hop, None,
+                RouteContractError(
+                    "Continue (tiếp tục) the interrupted accepted execution from the existing "
+                    f"workspace/report state. Parent request: {hop.get('request_id')}; "
+                    f"accepted user: {receipt.user_message_id}; conversation: {receipt.conversation_id}. "
+                    "Do not replay the original prompt or redo completed work."
+                ),
+            )
             return decision
         if decision.action is Action.REPAIR and decision.reason != "malformed_result":
             retryable = decision.reason in {"retry_visible_stable", "stream_failure_recovery"}
