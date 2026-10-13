@@ -362,7 +362,7 @@ def test_timeout_refreshes_at_ten_minutes_regardless_of_stop(stop):
     assert step(current, wait, 600).action is Action.REFRESH
 
 
-def test_bound_dom_progress_restarts_stall_clock_but_not_on_first_observation():
+def test_bound_dom_content_progress_restarts_stall_clock():
     wait = {"started_at": NOW.isoformat(), "controller_progress_at": NOW.isoformat()}
     def streaming(text):
         return snapshot(messages=(

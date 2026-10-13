@@ -46,6 +46,101 @@ def test_real_content_progress_not_attributes_resets_interruption_clock():
     assert step(current_result("{growing", stop_visible=True, response_activity_text=NOTICE), wait, 590, validate=invalid).reason == "interrupted_response"
 
 
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_current_permission_suppresses_recovery_without_extending_progress(interrupted):
+    wait = {}
+    step(snapshot(stop_visible=True), wait)
+    current = snapshot(mcp_permission_node_count=1, stop_visible=interrupted,
+                       response_activity_text=NOTICE if interrupted else "")
+    step(current, wait, 1)
+    decision = step(current, wait, 300 if interrupted else 6)
+    assert decision.action is Action.ALLOW
+    assert wait["controller_progress_at"] == NOW.isoformat()
+    wait.update(mcp_allow_clicked_target="__dom__",
+                mcp_allow_clicked_at=(NOW + timedelta(seconds=300 if interrupted else 6)).isoformat())
+    assert step(current, wait, 301 if interrupted else 7).reason == "mcp_allow_post_click"
+    assert step(snapshot(stop_visible=interrupted, response_activity_text=current.response_activity_text), wait,
+                305 if interrupted else 11).action is Action.REPAIR
+
+
+def test_first_bound_content_near_interruption_deadline_restarts_clock():
+    wait = {}
+    empty = current_result("", stop_visible=True, response_activity_text=NOTICE)
+    step(empty, wait)
+    partial = current_result("{partial", stop_visible=True, response_activity_text=NOTICE)
+    assert step(partial, wait, 290, validate=invalid).action is Action.WAIT
+    assert wait["controller_progress_at"] == (NOW + timedelta(seconds=290)).isoformat()
+    assert step(partial, wait, 300, validate=invalid).action is Action.WAIT
+    assert step(partial, wait, 589, validate=invalid).action is Action.WAIT
+    assert step(partial, wait, 590, validate=invalid).reason == "interrupted_response"
+    # A legitimate stable terminal result still outranks the old inactive edge.
+    terminal = current_result("result")
+    assert step(terminal, wait, 591).action is Action.WAIT
+    assert step(terminal, wait, 596).action is Action.ACCEPT
+
+
+def test_permission_on_inactive_edge_executes_allow_without_repair_child(tmp_path):
+    from types import SimpleNamespace
+    from datetime import datetime, timezone
+    from test_cdpa_worker import _prepare_sent_waiting_task
+    from playwright_auto.role_runtime import RoleController
+    _, state, worker, _, hop, _, _ = _prepare_sent_waiting_task(tmp_path, task_id="approval-edge")
+    controller = RoleController()
+    controller.decide(snapshot(stop_visible=True), hop["wait"])
+    controller.decide(snapshot(mcp_permission_node_count=1), hop["wait"])
+    hop["wait"]["inactive_since"] = (datetime.now(timezone.utc) - timedelta(seconds=6)).isoformat()
+    hop["wait"]["controller_progress_at"] = hop["wait"]["inactive_since"]
+    current = snapshot(mcp_permission_node_count=1)
+    original_receipt = dict(hop["receipt"])
+    class Client:
+        allows = 0
+        async def assert_ownership(self):
+            return current
+        async def auto_allow_mcp_permission(self, *, passive_action=None):
+            self.allows += 1
+            return {"dispatched": True}
+    client = Client()
+    before = len(state["hops"])
+    result = asyncio.run(controller.run(worker, state, hop,
+                        SimpleNamespace(client=client, page_id="page-1"), None,
+                        snapshot=current, wait_ms=0))
+    assert result.action is Action.ALLOW
+    assert client.allows == 1
+    assert len(state["hops"]) == before
+    assert hop["receipt"] == original_receipt
+
+
+def test_first_bound_content_in_final_ownership_recheck_cancels_stop(tmp_path):
+    from types import SimpleNamespace
+    from datetime import datetime, timezone
+    from test_cdpa_worker import _prepare_sent_waiting_task
+    from playwright_auto.chatgpt import MessageSnapshot
+    from playwright_auto.role_runtime import RoleController
+    _, state, worker, _, hop, _, _ = _prepare_sent_waiting_task(tmp_path, task_id="content-before-stop")
+    empty = snapshot(stop_visible=True, response_activity_text=NOTICE)
+    current = snapshot(stop_visible=True, response_activity_text=NOTICE, messages=(
+        MessageSnapshot("user", "u1", "t1", hop["prompt"], ()),
+        MessageSnapshot("assistant", "answer", "answer-turn", "{partial", ()),
+    ))
+    hop["wait"]["controller_progress_at"] = (datetime.now(timezone.utc) - timedelta(seconds=310)).isoformat()
+    class Client:
+        stops = 0
+        async def assert_ownership(self):
+            return current
+        async def stop(self, *, preserve_manual_input):
+            self.stops += 1
+    client = Client()
+    before = len(state["hops"])
+    result = asyncio.run(RoleController().run(worker, state, hop,
+                        SimpleNamespace(client=client, page_id="page-1"), None,
+                        snapshot=empty, wait_ms=0))
+    assert result.action is Action.WAIT
+    assert result.reason == "malformed_result_stability"
+    assert client.stops == 0
+    assert len(state["hops"]) == before
+    assert hop["wait"]["bound_assistant_progress"]["text"] == "{partial"
+
+
 def test_interruption_status_reaches_full_and_sparse_owned_page_readers():
     from playwright_auto.chatgpt import inspect_chatgpt_page, inspect_chatgpt_wait_probe
     async def run(page):

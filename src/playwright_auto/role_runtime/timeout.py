@@ -48,6 +48,10 @@ def recovery(ctx: Context) -> Decision | None:
         ctx.wait.pop("inactive_since", None)
     elif previous_active:
         ctx.wait.setdefault("inactive_since", ctx.now.isoformat())
+    # A current approval request owns continuation; keep the edge for later,
+    # but neither recover nor count permission/UI activity as content progress.
+    if ctx.permission_present:
+        return None
     inactive_since = parse_time(ctx.wait.get("inactive_since"))
     progress = parse_time(ctx.wait.get("controller_progress_at"))
     inactive_anchor = max(inactive_since, progress) if inactive_since and progress else inactive_since

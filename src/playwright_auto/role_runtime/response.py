@@ -86,17 +86,22 @@ def observe_candidate(
 
     if ctx.wait.get(key_name) != key:
         bound_progress = ctx.wait.get("bound_assistant_progress")
-        if source == "dom" and ctx.phase == "waiting" and isinstance(bound_progress, dict):
+        if source == "dom" and ctx.phase == "waiting":
+            bound_progress = bound_progress if isinstance(bound_progress, dict) else {}
             previous_key = bound_progress.get("fingerprint")
             previous_text = str(bound_progress.get("text") or "")
             if not previous_key and len(previous_text) < 8000:
                 previous_key = hashlib.sha256(previous_text.encode("utf-8")).hexdigest()
-            if previous_key and previous_key != key and (
+            # First non-empty content is progress too, but only for the exact
+            # bound assistant; remounts with unchanged content keep the clock.
+            if previous_key != key and (
                 (ctx.wait.get("bound_assistant_message_id")
-                 and bound_progress.get("message_id") == ctx.wait.get("bound_assistant_message_id")
+                 and (not bound_progress or bound_progress.get("message_id")
+                      == ctx.wait.get("bound_assistant_message_id"))
                  and getattr(candidate, "message_id", None) == ctx.wait.get("bound_assistant_message_id"))
                 or (ctx.wait.get("bound_assistant_turn_id")
-                    and bound_progress.get("turn_id") == ctx.wait.get("bound_assistant_turn_id")
+                    and (not bound_progress or bound_progress.get("turn_id")
+                         == ctx.wait.get("bound_assistant_turn_id"))
                     and getattr(candidate, "turn_id", None) == ctx.wait.get("bound_assistant_turn_id"))
             ):
                 ctx.wait["controller_progress_at"] = ctx.now.isoformat()
@@ -166,12 +171,12 @@ def _bound_assistant(ctx: Context, receipt: Any) -> Any | None:
     ).strip()
     if old_identity and new_identity and old_identity != new_identity:
         # A user injected a continuation into the running conversation. Reset
-        # only response-observation stability; the original Send receipt and
+        # only response-observation stability, retaining prior progress identity
+        # so the rebind itself cannot extend the clock; the original Send receipt and
         # RequestLedger remain unchanged and must never be replayed.
         for key in (
             "result_seen_key", "result_seen_at", "result_samples",
             "listen_result_seen_key", "listen_result_seen_at", "listen_result_samples",
-            "bound_assistant_progress",
         ):
             ctx.wait.pop(key, None)
         ctx.wait["user_steering_rebind_count"] = int(
