@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -3588,6 +3589,174 @@ def test_crossed_durable_receipt_blocks_nonacceptance_replacement(tmp_path: Path
     assert current.receipt == crossed.to_dict()
 
 
+
+
+def _write_report_revision(root: Path, relative: str, text: str) -> tuple[Path, str]:
+    target = root / Path(relative)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    digest = hashlib.sha256(target.read_bytes()).hexdigest()
+    return target, digest
+
+
+def test_operator_fresh_route_candidate_accepts_same_path_new_hash_only(
+    tmp_path: Path,
+):
+    _store, state, worker, _path, hop, _ledger, _binding, _baseline = _prepare_sending_record(
+        tmp_path, task_id="task-operator-fresh-route-candidate"
+    )
+    handoff = str(hop["expected_report_path"])
+    _target, old_sha = _write_report_revision(tmp_path, handoff, "# old\n")
+    state["reports"] = [
+        {
+            "path": handoff,
+            "sha256": old_sha,
+            "role": "PLAN",
+            "physical_role": hop["physical_role"],
+            "turn": hop["turn"],
+        }
+    ]
+    _target, new_sha = _write_report_revision(tmp_path, handoff, "# revised\n")
+    response = MessageSnapshot(
+        "assistant",
+        "a-fresh-route",
+        "t-fresh-route",
+        json.dumps({"route": "REVIEW", "handoff": handoff}),
+        (),
+    )
+    snapshot = SimpleNamespace(messages=(response,))
+
+    candidate = worker._operator_fresh_route_candidate(state, hop, snapshot)
+
+    assert candidate is not None
+    candidate_response, decision, evidence = candidate
+    assert candidate_response.message_id == "a-fresh-route"
+    assert decision.route == "REVIEW"
+    assert decision.handoff == handoff
+    assert evidence.path == handoff
+    assert evidence.sha256 == new_sha
+    assert new_sha != old_sha
+
+    state["reports"].append(
+        {
+            "path": handoff,
+            "sha256": new_sha,
+            "role": "PLAN",
+            "physical_role": hop["physical_role"],
+            "turn": hop["turn"],
+        }
+    )
+    assert worker._operator_fresh_route_candidate(state, hop, snapshot) is None
+
+
+def test_operator_resume_routes_fresh_handoff_revision_without_send(
+    tmp_path: Path,
+):
+    store, state, worker, _path, hop, ledger, binding, _baseline = _prepare_sending_record(
+        tmp_path, task_id="task-operator-fresh-route-resume"
+    )
+    ledger.update(
+        hop["request_id"],
+        error=(
+            "ComposerConflictError: composer changed or became unavailable "
+            "inside the atomic send boundary"
+        ),
+    )
+    state = _queue_blocked_resume(
+        store,
+        state,
+        code="manual_composer_conflict",
+        reason="operator discussed and produced a revised handoff",
+    )
+    hop = _active_hop(state)
+    control = state["controls"][-1]
+    handoff = str(hop["expected_report_path"])
+    _target, old_sha = _write_report_revision(tmp_path, handoff, "# old decision\n")
+    state["reports"] = [
+        {
+            "path": handoff,
+            "sha256": old_sha,
+            "role": "PLAN",
+            "physical_role": hop["physical_role"],
+            "turn": hop["turn"],
+        }
+    ]
+    _target, new_sha = _write_report_revision(
+        tmp_path,
+        handoff,
+        "# revised decision\n\nRoute REVIEW.\n",
+    )
+    response = MessageSnapshot(
+        "assistant",
+        "a-operator-route",
+        "t-operator-route",
+        json.dumps({"route": "REVIEW", "handoff": handoff}),
+        (),
+    )
+    snapshot = SimpleNamespace(
+        state=ChatGPTState.WAITING_PROMPT,
+        page_id=binding.page_id,
+        page_role=binding.role,
+        page_task_id=state["task_id"],
+        page_team=state["team"],
+        composer_text="",
+        composer_empty=True,
+        manual_input_pending=False,
+        attachment_markers=(),
+        blocking_dialogs=(),
+        messages=(response,),
+        logical_turn_ids=("t-operator-route",),
+        send_enabled=False,
+        stop_visible=False,
+        session_id="exact",
+        url="https://chatgpt.com/c/exact",
+        conversation_url="https://chatgpt.com/c/exact",
+    )
+
+    class Client:
+        def __init__(self):
+            self.binding = binding
+            self.send_calls = 0
+
+        async def assert_ownership(self):
+            return snapshot
+
+        async def send(self, *_args, **_kwargs):
+            self.send_calls += 1
+            raise AssertionError("fresh operator handoff must route without Send replay")
+
+    client = Client()
+
+    class Actions:
+        async def locate_owned(self, _state, _role):
+            return AcquiredRole(
+                client,
+                binding.page_id,
+                snapshot.url,
+                False,
+                False,
+            )
+
+    asyncio.run(worker._recover_resume_sending(state, hop, control, Actions()))
+
+    assert client.send_calls == 0
+    assert control["status"] == "applied"
+    assert control["result"]["action"] == "route_fresh_handoff"
+    assert state["status"] == "RUNNING"
+    assert state["active_role"] == "REVIEW"
+    child = _active_hop(state)
+    assert child["target_role"] == "REVIEW"
+    assert child["handoff"] == handoff
+    parent = next(item for item in state["hops"] if item["hop_id"] == child["parent_hop_id"])
+    assert parent["state"] == "routed"
+    assert parent["route"] == "REVIEW"
+    assert parent["report_path"] == handoff
+    assert parent["report_sha256"] == new_sha
+    assert parent["operator_route_override"]["handoff_sha256"] == new_sha
+    current = ledger.get(parent["request_id"])
+    assert current is not None
+    assert current.status is RequestStatus.FAILED_FINAL
+    assert current.error == "superseded_by_operator_fresh_handoff_route"
 
 
 def test_operator_resume_adopts_live_manual_composer_after_proven_nonacceptance(

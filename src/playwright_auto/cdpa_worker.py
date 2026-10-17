@@ -8638,6 +8638,236 @@ class CDPAWorker:
             postcondition=None,
         )
 
+    @staticmethod
+    def _consumed_report_revisions(state: Mapping[str, Any]) -> set[tuple[str, str]]:
+        revisions: set[tuple[str, str]] = set()
+        for item in tuple(state.get("hops") or ()) + tuple(state.get("reports") or ()):
+            if not isinstance(item, Mapping):
+                continue
+            path = str(item.get("report_path") or item.get("path") or "").strip()
+            digest = str(item.get("report_sha256") or item.get("sha256") or "").strip().lower()
+            if path and len(digest) == 64:
+                revisions.add((PurePosixPath(path.replace("\\", "/")).as_posix(), digest))
+        return revisions
+
+    def _validate_operator_handoff_revision(
+        self,
+        state: Mapping[str, Any],
+        hop: Mapping[str, Any],
+        handoff: str,
+    ) -> Any:
+        role = str(hop.get("target_role") or "").strip().upper()
+        role_record = state.get("roles", {}).get(role)
+        physical_role = str(
+            (role_record.get("physical_role") if isinstance(role_record, Mapping) else None)
+            or hop.get("physical_role")
+            or ""
+        ).strip()
+        task_id = str(state.get("task_id") or "").strip()
+        normalized = PurePosixPath(str(handoff or "").strip().replace("\\", "/"))
+        if normalized.is_absolute() or ".." in normalized.parts:
+            raise RouteContractError("operator handoff path must remain inside the assigned team")
+        prefix = f"{physical_role}_turn"
+        suffix = f"_{task_id}.md"
+        name = normalized.name
+        if not physical_role or not task_id or not name.startswith(prefix) or not name.endswith(suffix):
+            raise RouteContractError("operator handoff does not identify this role/task report")
+        turn_text = name[len(prefix) : len(name) - len(suffix)]
+        if not turn_text.isdigit() or int(turn_text) < 1:
+            raise RouteContractError("operator handoff has an invalid report turn")
+        report_repository, report_plans_root = _workflow_report_roots(self.config, state)
+        return validate_file_report(
+            normalized.as_posix(),
+            repository_root=report_repository,
+            plans_root=report_plans_root,
+            team=str(state["team"]),
+            physical_role=physical_role,
+            turn=int(turn_text),
+            task_id=task_id,
+        )
+
+    def _operator_fresh_route_candidate(
+        self,
+        state: Mapping[str, Any],
+        hop: Mapping[str, Any],
+        snapshot: Any,
+    ) -> tuple[MessageSnapshot, RouteDecision, Any] | None:
+        if str(state.get("workflow_mode") or "team").strip().lower() != "team":
+            return None
+        role = str(hop.get("target_role") or "").strip().upper()
+        allowed_routes = tuple(task_workflow_definitions(state, self.config)) + ("PAUSE", "DONE")
+        latest: tuple[MessageSnapshot, Any] | None = None
+        for message in reversed(tuple(getattr(snapshot, "messages", ()) or ())):
+            if not isinstance(message, MessageSnapshot) or message.role != "assistant" or not message.text.strip():
+                continue
+            try:
+                parsed = parse_role_response(
+                    message.text,
+                    source_role=role,
+                    report_mode=_report_mode(state),
+                    allowed_routes=allowed_routes,
+                )
+            except (RouteContractError, ValueError):
+                continue
+            latest = (message, parsed)
+            break
+        if latest is None:
+            return None
+        response, parsed = latest
+        if parsed.inline_report is not None:
+            return None
+        try:
+            evidence = self._validate_operator_handoff_revision(
+                state,
+                hop,
+                parsed.decision.handoff,
+            )
+        except (RouteContractError, OSError):
+            return None
+        revision = (
+            PurePosixPath(str(evidence.path).replace("\\", "/")).as_posix(),
+            str(evidence.sha256).lower(),
+        )
+        if revision in self._consumed_report_revisions(state):
+            return None
+        return response, parsed.decision, evidence
+
+    def _apply_operator_fresh_route(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        control: dict[str, Any],
+        ledger: RequestLedger,
+        record: Any,
+        response: MessageSnapshot,
+        decision: RouteDecision,
+        evidence: Any,
+    ) -> None:
+        role = str(hop["target_role"]).strip().upper()
+        approval = dict(record.approval or {})
+        approval.update(
+            {
+                "kind": "operator_fresh_handoff_route",
+                "control_id": control.get("control_id"),
+                "routed_at": utc_now(),
+                "handoff": evidence.path,
+                "handoff_sha256": evidence.sha256,
+                "route": decision.route,
+            }
+        )
+        ledger.update(
+            record.request_id,
+            status=RequestStatus.FAILED_FINAL,
+            error="superseded_by_operator_fresh_handoff_route",
+            approval=approval,
+        )
+        hop["response"] = response.text
+        hop["response_sha256"] = _sha(response.text)
+        hop["response_record"] = response.to_dict()
+        hop["message_identity"] = {
+            "message_id": response.message_id,
+            "turn_id": response.turn_id,
+        }
+        hop["report_path"] = evidence.path
+        hop["report_sha256"] = evidence.sha256
+        hop["report_size"] = evidence.size
+        hop["routed_handoff"] = evidence.path
+        hop["route"] = decision.route
+        hop["state"] = "routed"
+        hop["validation_error"] = None
+        hop["operator_route_override"] = {
+            "control_id": control.get("control_id"),
+            "route": decision.route,
+            "handoff": evidence.path,
+            "handoff_sha256": evidence.sha256,
+            "accepted_at": utc_now(),
+        }
+        hop.setdefault("timestamps", {})["responded_at"] = utc_now()
+        hop["timestamps"]["routed_at"] = utc_now()
+
+        report_name = PurePosixPath(str(evidence.path)).name
+        report_prefix = f"{str(hop.get('physical_role') or '')}_turn"
+        report_suffix = f"_{str(state.get('task_id') or '')}.md"
+        report_turn = int(
+            report_name[len(report_prefix) : len(report_name) - len(report_suffix)]
+        )
+        hop["operator_route_override"]["report_turn"] = report_turn
+
+        if not any(
+            isinstance(item, Mapping)
+            and str(item.get("path") or "") == str(evidence.path)
+            and str(item.get("sha256") or "").lower() == str(evidence.sha256).lower()
+            for item in state.get("reports") or ()
+        ):
+            state.setdefault("reports", []).append(
+                {
+                    "report_id": len(state.get("reports") or []) + 1,
+                    "role": role,
+                    "physical_role": hop.get("physical_role"),
+                    "turn": report_turn,
+                    "path": evidence.path,
+                    "sha256": evidence.sha256,
+                    "size": evidence.size,
+                    "created_at": utc_now(),
+                    "kind": "operator_revision",
+                }
+            )
+        state.setdefault("route_timeline", []).append(
+            {
+                "at": utc_now(),
+                "hop_id": hop["hop_id"],
+                "source_role": role,
+                "route": decision.route,
+                "report_path": evidence.path,
+                "report_sha256": evidence.sha256,
+                "kind": "operator_fresh_handoff",
+            }
+        )
+        state["roles"][role]["status"] = "idle"
+        state["block_code"] = None
+        state["block_retryable"] = False
+        state["block_reason"] = None
+        state["pause_reason"] = None
+
+        if decision.route == "DONE":
+            state["status"] = "DONE"
+            state["terminal_state"] = "DONE"
+            state["kanban_column"] = "DONE_STOPPED"
+            state["completed_at"] = utc_now()
+            state["last_role_activity_at"] = state["completed_at"]
+            state["active_role"] = None
+            state["active_hop_id"] = None
+            state["active_action"] = "done"
+            postcondition = "done"
+        elif decision.route == "PAUSE":
+            state["status"] = "PAUSED"
+            state["kanban_column"] = "PAUSED"
+            state["active_role"] = role
+            state["active_hop_id"] = hop["hop_id"]
+            state["active_action"] = "paused"
+            state["pause_reason"] = evidence.path
+            postcondition = "paused"
+        else:
+            if self._execution_budget_exhausted(state):
+                self._renew_execution_budget(state)
+            child = self._append_hop(
+                state,
+                source_role=role,
+                target_role=decision.route,
+                handoff=evidence.path,
+            )
+            postcondition = f"child_hop_appended:{child['hop_id']}"
+
+        self._finish_resume_control(
+            state,
+            control,
+            outcome="continued",
+            action="route_fresh_handoff",
+            reason_code=None,
+            reason="Operator Resume accepted a fresh validated handoff revision instead of replaying the stale durable Send.",
+            postcondition=postcondition,
+        )
+
     def _record_resume_send_acceptance(
         self,
         state: dict[str, Any],
@@ -10205,10 +10435,26 @@ class CDPAWorker:
             )
             return
 
+        operator_resume = str(control.get("origin") or "") == "operator"
+        if operator_resume:
+            candidate = self._operator_fresh_route_candidate(state, hop, snapshot)
+            if candidate is not None:
+                response, decision, evidence = candidate
+                self._apply_operator_fresh_route(
+                    state,
+                    hop,
+                    control,
+                    ledger,
+                    record,
+                    response,
+                    decision,
+                    evidence,
+                )
+                return
+
         expected_names = tuple(item.name for item in record.files)
         actual_names = tuple(getattr(snapshot, "attachment_markers", ()) or ())
         live_composer = str(getattr(snapshot, "composer_text", "") or "")
-        operator_resume = str(control.get("origin") or "") == "operator"
         composer_adopted = False
         if not visible_text_matches(live_composer, record.rendered_prompt):
             if not operator_resume:
