@@ -10211,7 +10211,7 @@ class CDPAWorker:
         operator_resume = str(control.get("origin") or "") == "operator"
         composer_adopted = False
         if not visible_text_matches(live_composer, record.rendered_prompt):
-            if not operator_resume or not live_composer.strip():
+            if not operator_resume:
                 self._require_resume_recovery(
                     state,
                     control,
@@ -10221,27 +10221,43 @@ class CDPAWorker:
                     next_safe_action="Preserve the composer and resolve the manual-input mismatch.",
                 )
                 return
-            previous_prompt_sha256 = _sha(record.rendered_prompt)
-            record = ledger.adopt_operator_draft(
-                record.request_id,
-                prompt=live_composer,
-                approval={
-                    "kind": "operator_composer_override",
+            if live_composer.strip():
+                previous_prompt_sha256 = _sha(record.rendered_prompt)
+                record = ledger.adopt_operator_draft(
+                    record.request_id,
+                    prompt=live_composer,
+                    approval={
+                        "kind": "operator_composer_override",
+                        "control_id": control.get("control_id"),
+                        "adopted_at": utc_now(),
+                        "previous_prompt_sha256": previous_prompt_sha256,
+                        "prompt_sha256": _sha(live_composer.strip()),
+                    },
+                )
+                hop["prompt"] = record.prompt
+                hop["prompt_sha256"] = _sha(record.prompt)
+                hop["operator_prompt_override"] = {
                     "control_id": control.get("control_id"),
                     "adopted_at": utc_now(),
                     "previous_prompt_sha256": previous_prompt_sha256,
-                    "prompt_sha256": _sha(live_composer.strip()),
-                },
-            )
-            hop["prompt"] = record.prompt
-            hop["prompt_sha256"] = _sha(record.prompt)
-            hop["operator_prompt_override"] = {
-                "control_id": control.get("control_id"),
-                "adopted_at": utc_now(),
-                "previous_prompt_sha256": previous_prompt_sha256,
-                "prompt_sha256": hop["prompt_sha256"],
-            }
-            composer_adopted = True
+                    "prompt_sha256": hop["prompt_sha256"],
+                }
+                composer_adopted = True
+            else:
+                approval = dict(record.approval or {})
+                approval.update(
+                    {
+                        "kind": "operator_resume_override",
+                        "control_id": control.get("control_id"),
+                        "composer_cleared": True,
+                        "approved_at": utc_now(),
+                    }
+                )
+                record = ledger.update(record.request_id, approval=approval)
+                hop["operator_composer_cleared"] = {
+                    "control_id": control.get("control_id"),
+                    "approved_at": utc_now(),
+                }
 
         live_baseline = capture_message_baseline(
             snapshot.messages, snapshot.logical_turn_ids

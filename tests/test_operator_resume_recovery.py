@@ -3723,9 +3723,9 @@ def test_operator_resume_rebases_manual_transcript_before_unaccepted_send(
         page_role=binding.role,
         page_task_id=state["task_id"],
         page_team=state["team"],
-        composer_text=hop["prompt"],
-        composer_empty=False,
-        manual_input_pending=True,
+        composer_text="",
+        composer_empty=True,
+        manual_input_pending=False,
         attachment_markers=(),
         blocking_dialogs=(),
         messages=(manual_message,),
@@ -3779,6 +3779,102 @@ def test_operator_resume_rebases_manual_transcript_before_unaccepted_send(
     assert current.approval["kind"] == "operator_resume_override"
     assert current.approval["baseline_rebased_at"]
     assert current.approval["composer_adopted"] is False
+    assert hop["operator_transcript_rebase"]["control_id"] == control["control_id"]
+
+
+
+
+def test_operator_resume_rebases_manual_transcript_and_continues_once(
+    tmp_path: Path,
+):
+    store, state, worker, path, hop, ledger, binding, _baseline = _prepare_sending_record(
+        tmp_path, task_id="task-resume-operator-manual-transcript"
+    )
+    ledger.update(
+        hop["request_id"],
+        error=(
+            "ComposerConflictError: composer changed or became unavailable "
+            "inside the atomic send boundary"
+        ),
+    )
+    state = _queue_blocked_resume(
+        store,
+        state,
+        code="manual_composer_conflict",
+        reason="operator discussed and edited before Resume",
+    )
+    hop = _active_hop(state)
+    control = state["controls"][-1]
+    manual_prompt = "Continue from Spec 007 using the operator-approved discussion."
+    discussion = (
+        MessageSnapshot("user", "u-discuss", "t-discuss", "Review Spec 007 first.", ()),
+        MessageSnapshot("assistant", "a-discuss", "t-discuss-a", "Spec 007 reviewed.", ()),
+    )
+    logical_turn_ids = ("t-discuss", "t-discuss-a")
+    rebased = capture_message_baseline(discussion, logical_turn_ids)
+
+    snapshot = SimpleNamespace(
+        state=ChatGPTState.DRAFT,
+        page_id=binding.page_id,
+        page_role=binding.role,
+        page_task_id=state["task_id"],
+        page_team=state["team"],
+        composer_text=manual_prompt,
+        composer_empty=False,
+        manual_input_pending=True,
+        attachment_markers=(),
+        blocking_dialogs=(),
+        messages=discussion,
+        logical_turn_ids=logical_turn_ids,
+        send_enabled=True,
+        stop_visible=False,
+        session_id="exact",
+        url="https://chatgpt.com/c/exact",
+        conversation_url="https://chatgpt.com/c/exact",
+    )
+
+    class Client:
+        def __init__(self):
+            self.binding = binding
+            self.send_calls = 0
+
+        async def assert_ownership(self):
+            return snapshot
+
+        async def send(self, prompt, **kwargs):
+            self.send_calls += 1
+            assert prompt == manual_prompt
+            return SendReceipt(
+                prompt=prompt,
+                prompt_sha256=worker_module._sha(prompt),
+                binding=binding,
+                baseline=rebased,
+                attempts=1,
+                accepted_via="user_message_identity",
+                session_id_before="exact",
+                user_message_id="u-after-resume",
+                user_turn_id="t-after-resume",
+            )
+
+    client = Client()
+
+    class Actions:
+        async def locate_owned(self, _state, _role):
+            return AcquiredRole(
+                client, binding.page_id, snapshot.url, False, False
+            )
+
+    asyncio.run(worker._recover_resume_sending(state, hop, control, Actions()))
+
+    current = ledger.get(hop["request_id"])
+    assert client.send_calls == 1
+    assert control["status"] == "applied"
+    assert current is not None
+    assert current.status is RequestStatus.SENT
+    assert current.baseline == rebased
+    assert current.approval["kind"] == "operator_resume_override"
+    assert current.approval["control_id"] == control["control_id"]
+    assert current.approval["composer_adopted"] is True
     assert hop["operator_transcript_rebase"]["control_id"] == control["control_id"]
 
 
