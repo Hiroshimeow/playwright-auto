@@ -17,6 +17,17 @@ This file contains only active/unresolved root causes. Track one entry per stabl
 
 ## Active problems
 
+### P-045 — Pre-send format-repair hop blocked by stale ChatGPT delivery-timeout banner
+
+- **Status:** `OPEN`
+- **Priority:** `HIGH`
+- **Affected task:** `cdpa-idem-52db86a2e2c44b7f811a8d4d`, DEV hop 2, pinned endpoint `56b44af5-6790-430f-afe3-4f78766d58be`, conversation `6ac78a4c-2470-83e8-bf27-378def9b43aa`.
+- **Concrete evidence:** durable manifest records `unexpected_error` / `UnsafePageStateError: page is in error state: ['Message delivery timed out. Please try again. Retry']`; hop 2 RequestLedger remains `new`, `attempts=0`, `accepted_at=null`, `binding=null`, `receipt=null`. Hop 1 is `completed`, accepted via exact user message and has a captured terminal response. Hop 2 is only JSON-format repair of hop 1's malformed route, not substantive work.
+- **Impact:** a recoverable-looking UI error banner prevents a zero-attempt format-repair turn from beginning and strands the active task. The banner's provenance has not been proven; do not click Retry, restart, rebind, or replay the completed hop based on the string alone.
+- **Owner:** unresolved; no independent lifecycle control or repair-task creation capability was exposed in this session. Preserve pinned endpoint, exact request/branch ownership, and explicit operator decisions.
+- **Next verification:** read-only inspect the pinned tab/current composer, error-banner provenance, controller runtime and exact request ledger. If hop 2 is still provably pre-send and tab ownership matches, use one authorized `independent_task_control` release. Then verify the task advances without resending hop 1. If the banner handling recurs, create one deduplicated PLAN/DEV/REVIEW repair task using `independent_create_repair` to classify prior-turn transport errors separately from the new hop's send admission.
+
+
 ### P-008 — Worker state transitions and invariants are distributed across large mutable-dict branches
 
 - **Status:** `OPEN`
