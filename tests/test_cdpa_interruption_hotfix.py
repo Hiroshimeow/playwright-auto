@@ -214,14 +214,18 @@ def test_automatic_reopen_is_background_by_default():
     assert inspect.signature(CDPATabActions.reopen).parameters["foreground"].default is False
 
 
-@pytest.mark.parametrize("initial", ["Medium", "Extra High"])
-def test_extra_high_selection_is_verified_and_already_correct_does_not_click(initial):
+@pytest.mark.parametrize(
+    ("initial", "expected_clicks"),
+    [("Medium", 1), ("Extra High", 0), ("5.6 Extra High", 0), ("GPT-5.6 Extra High", 0)],
+)
+def test_extra_high_selection_is_verified_and_already_correct_does_not_click(initial, expected_clicks):
     async def run(page):
         client = ChatGPTPage(page, timeout_ms=1000)
         client.binding = PageBinding("page-1", "DEV")
         await client.ensure_extra_high()
-        assert await page.get_by_role("button", name="Select ChatGPT model", exact=True).inner_text() == "Extra High"
-        assert await page.evaluate("window.clicks || 0") == int(initial != "Extra High")
+        selected = await page.get_by_role("button", name="Select ChatGPT model", exact=True).inner_text()
+        assert selected in {"Extra High", "5.6 Extra High", "GPT-5.6 Extra High"}
+        assert await page.evaluate("window.clicks || 0") == expected_clicks
     body = f'''<main><div contenteditable="true" role="textbox"></div></main>
     <button aria-label="Select ChatGPT model" onclick="window.clicks=(window.clicks||0)+1;document.querySelector('[role=menu]').hidden=false">{initial}</button>
     <div role="menu" hidden><button role="menuitemradio" onclick="document.querySelector('button[aria-label]').textContent='Extra High';this.parentElement.hidden=true">Extra High</button></div>'''
@@ -283,6 +287,19 @@ def test_controller_stops_then_verifies_and_queues_one_child(tmp_path, draft):
     assert _active_hop(state)["kind"] == "route_repair"
     assert len(state["hops"]) == before + 1
     assert client.stops == 1
+
+
+def test_atomic_send_accepts_version_prefixed_extra_high(monkeypatch):
+    import playwright_auto.chatgpt as module
+    async def no_delay(*args, **kwargs):
+        pass
+    monkeypatch.setattr(module, "action_delay", no_delay)
+    async def run(page):
+        await module.click_send_button(page, expected_prompt="prompt", require_extra_high=True)
+        assert await page.evaluate("window.sent || 0") == 1
+    asyncio.run(_with_page('''<button aria-label="Select ChatGPT model">5.6 Extra High</button>
+        <main><form><div contenteditable="true" role="textbox">prompt</div>
+        <button type="button" aria-label="Send" onclick="window.sent=1">Send</button></form></main>''', run))
 
 
 def test_atomic_send_refuses_model_downgrade_before_dispatch(monkeypatch):

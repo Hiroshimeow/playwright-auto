@@ -104,6 +104,15 @@ TASK_ID_STORAGE_KEY = "playwright-auto:task-id"
 TEAM_STORAGE_KEY = "playwright-auto:team"
 BINDING_ID_STORAGE_KEY = "playwright-auto:binding-id"
 ATTACHMENT_OWNERSHIP_WINDOW_KEY = "__playwrightAutoAttachmentOwnershipV1"
+_EXTRA_HIGH_LABEL_PATTERN = re.compile(
+    r"^(?:(?:GPT[- ]?)?\d+(?:\.\d+)*\s+)?Extra High$",
+    re.IGNORECASE,
+)
+
+
+def _is_extra_high_label(value: str) -> bool:
+    return bool(_EXTRA_HIGH_LABEL_PATTERN.fullmatch(normalize_visible_text(value)))
+
 
 SELECTORS = {
     "composer": '[contenteditable="true"][role="textbox"]',
@@ -882,6 +891,8 @@ async def click_send_button(
           );
           const editable = (element) => Boolean(element && element.isContentEditable);
           const text = (element) => (element?.innerText || '').replace(/\s+/g, ' ').trim();
+          const isExtraHighLabel = (value) =>
+            /^(?:(?:GPT[- ]?)?\d+(?:\.\d+)*\s+)?Extra High$/i.test(String(value || '').replace(/\s+/g, ' ').trim());
 
           const conversationId = (path) => {
             const match = String(path || '').match(
@@ -961,7 +972,7 @@ async def click_send_button(
           const validatePageState = () => {
             if (requireExtraHigh) {
               const models = [...document.querySelectorAll('button[aria-label="Select ChatGPT model"]')].filter(visible);
-              if (models.length !== 1 || text(models[0]) !== 'Extra High')
+              if (models.length !== 1 || !isExtraHighLabel(text(models[0])))
                 return {ok: false, method: 'page_state_conflict', reason: 'model_extra_high_not_verified'};
             }
             const retry = firstVisible('[data-testid="regenerate-thread-error-button"]');
@@ -4111,7 +4122,7 @@ class ChatGPTPage:
         selector = self.page.get_by_role("button", name="Select ChatGPT model", exact=True)
         if await selector.count() != 1:
             raise UnsafePageStateError("Extra High model selector is missing or ambiguous")
-        if normalize_visible_text(await selector.inner_text()) == "Extra High":
+        if _is_extra_high_label(await selector.inner_text()):
             return
         try:
             await selector.click(timeout=timeout_ms)
@@ -4119,7 +4130,7 @@ class ChatGPTPage:
             option = self.page.locator(
                 '[role="menu"] [role="menuitemradio"], [role="menu"] [role="menuitem"], '
                 '[role="dialog"] [role="radio"], [role="menu"] button'
-            ).filter(has_text=re.compile(r"^\s*Extra High\s*$"))
+            ).filter(has_text=re.compile(r"^\s*(?:(?:GPT[- ]?)?\d+(?:\.\d+)*\s+)?Extra High\s*$", re.IGNORECASE))
             await option.first.wait_for(state="visible", timeout=timeout_ms)
             if await option.count() != 1:
                 raise UnsafePageStateError("Extra High option is missing or ambiguous")
@@ -4132,7 +4143,7 @@ class ChatGPTPage:
             await option.click(timeout=timeout_ms)
             await self.page.wait_for_function(
                 """() => [...document.querySelectorAll('button[aria-label="Select ChatGPT model"]')]
-                    .filter(b => b.innerText.trim() === 'Extra High').length === 1""",
+                    .filter(b => /^(?:(?:GPT[- ]?)?\\d+(?:\\.\\d+)*\\s+)?Extra High$/i.test((b.innerText || '').replace(/\\s+/g, ' ').trim())).length === 1""",
                 timeout=timeout_ms,
             )
         except PlaywrightTimeoutError as exc:
@@ -4141,7 +4152,7 @@ class ChatGPTPage:
         self._assert_interaction_safe(post, allow_attachments=allow_attachments)
         if post.url != snapshot.url or post.composer_text != snapshot.composer_text or post.attachment_markers != snapshot.attachment_markers:
             raise ComposerConflictError("page or composer changed during model selection")
-        if normalize_visible_text(await selector.inner_text()) != "Extra High":
+        if not _is_extra_high_label(await selector.inner_text()):
             raise UnsafePageStateError("Extra High selection changed before Send")
 
     async def send(
