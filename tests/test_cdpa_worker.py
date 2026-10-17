@@ -2061,6 +2061,20 @@ def test_unselected_route_enters_safe_repair_without_recording_report(tmp_path: 
     assert not (tmp_path / hop["expected_report_path"]).exists()
 
 
+def test_timeout_continuation_repair_uses_exact_generic_prompt(tmp_path: Path):
+    _store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-generic-continuation"
+    )
+
+    worker._queue_continuation_repair(state, hop, "retry_visible_stable")
+    repair = _active_hop(state)
+
+    assert repair["kind"] == "route_repair"
+    assert repair["minimal_continuation_prompt"] is True
+    asyncio.run(worker._pre_send(state, repair, FakeActions()))
+    assert repair["prompt"] == "Continue from the current state."
+
+
 def test_malformed_response_creates_same_turn_guide_only_repair(tmp_path: Path):
     _, _, state, worker = setup_task(tmp_path)
     hop = _active_hop(state)

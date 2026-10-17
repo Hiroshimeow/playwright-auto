@@ -16,34 +16,34 @@ from test_chatgpt_mcp_permission import _with_page
 NOTICE = "Connection interrupted. Waiting for the complete answer"
 
 
-def test_interrupted_stale_stop_continues_after_five_minutes_without_content():
+def test_connection_interrupted_is_not_a_stop_or_repair_signal():
     current = snapshot(stop_visible=True, response_activity_text=NOTICE)
     wait = {}
     assert step(current, wait).action is Action.WAIT
-    assert step(current, wait, 299).action is Action.WAIT
-    decision = step(current, wait, 300)
-    assert decision.action is Action.REPAIR
-    assert decision.reason == "interrupted_response"
-    # A restart loads the same clock, not another five-minute grace.
-    assert step(current, dict(wait), 301).reason == "interrupted_response"
+    assert step(current, wait, 599).action is Action.WAIT
+    decision = step(current, wait, 600)
+    assert decision.action is Action.REFRESH
+    assert decision.reason == "response_timeout_recheck"
 
 
-def test_empty_response_after_stop_edge_continues_but_complete_result_wins():
-    wait = {}
-    step(snapshot(stop_visible=True), wait)
-    assert step(snapshot(), wait, 1).action is Action.WAIT
-    assert step(snapshot(), wait, 6).reason == "inactive_response"
-    finished = {}
+def test_explicit_stop_waits_for_composer_then_continues_but_complete_result_wins():
+    wait = {"stop_requested_at": NOW.isoformat()}
+    assert step(snapshot(stop_visible=True), wait, 1).reason == "stop_verification_pending"
+    assert step(snapshot(), wait, 4).reason == "stop_settle"
+    assert step(snapshot(), wait, 5).reason == "stopped_response_continue"
+    finished = {"stop_requested_at": NOW.isoformat()}
     step(current_result(stop_visible=True), finished)
     assert step(current_result(), finished, 5).action is Action.ACCEPT
 
 
-def test_real_content_progress_not_attributes_resets_interruption_clock():
+def test_real_content_progress_resets_only_the_ten_minute_timeout_clock():
     wait = {}
     step(current_result("{", stop_visible=True, response_activity_text=NOTICE), wait, validate=invalid)
     step(current_result("{growing", stop_visible=True, response_activity_text=NOTICE), wait, 290, validate=invalid)
-    assert step(current_result("{growing", stop_visible=True, response_activity_text=NOTICE), wait, 300, validate=invalid).action is Action.WAIT
-    assert step(current_result("{growing", stop_visible=True, response_activity_text=NOTICE), wait, 590, validate=invalid).reason == "interrupted_response"
+    assert step(current_result("{growing", stop_visible=True, response_activity_text=NOTICE), wait, 889, validate=invalid).action is Action.WAIT
+    decision = step(current_result("{growing", stop_visible=True, response_activity_text=NOTICE), wait, 890, validate=invalid)
+    assert decision.action is Action.REFRESH
+    assert decision.reason == "response_timeout_recheck"
 
 
 @pytest.mark.parametrize("interrupted", [False, True])
@@ -60,7 +60,9 @@ def test_current_permission_suppresses_recovery_without_extending_progress(inter
                 mcp_allow_clicked_at=(NOW + timedelta(seconds=300 if interrupted else 6)).isoformat())
     assert step(current, wait, 301 if interrupted else 7).reason == "mcp_allow_post_click"
     assert step(snapshot(stop_visible=interrupted, response_activity_text=current.response_activity_text), wait,
-                305 if interrupted else 11).action is Action.REPAIR
+                305 if interrupted else 11).action is Action.WAIT
+    assert step(snapshot(stop_visible=interrupted, response_activity_text=current.response_activity_text), wait,
+                600).action is Action.REFRESH
 
 
 def test_first_bound_content_near_interruption_deadline_restarts_clock():
@@ -71,12 +73,12 @@ def test_first_bound_content_near_interruption_deadline_restarts_clock():
     assert step(partial, wait, 290, validate=invalid).action is Action.WAIT
     assert wait["controller_progress_at"] == (NOW + timedelta(seconds=290)).isoformat()
     assert step(partial, wait, 300, validate=invalid).action is Action.WAIT
-    assert step(partial, wait, 589, validate=invalid).action is Action.WAIT
-    assert step(partial, wait, 590, validate=invalid).reason == "interrupted_response"
-    # A legitimate stable terminal result still outranks the old inactive edge.
+    assert step(partial, wait, 889, validate=invalid).action is Action.WAIT
+    assert step(partial, wait, 890, validate=invalid).reason == "response_timeout_recheck"
+    # A legitimate stable terminal result still outranks the timeout gate.
     terminal = current_result("result")
-    assert step(terminal, wait, 591).action is Action.WAIT
-    assert step(terminal, wait, 596).action is Action.ACCEPT
+    assert step(terminal, wait, 891).action is Action.WAIT
+    assert step(terminal, wait, 896).action is Action.ACCEPT
 
 
 def test_permission_on_inactive_edge_executes_allow_without_repair_child(tmp_path):
@@ -122,7 +124,8 @@ def test_first_bound_content_in_final_ownership_recheck_cancels_stop(tmp_path):
         MessageSnapshot("user", "u1", "t1", hop["prompt"], ()),
         MessageSnapshot("assistant", "answer", "answer-turn", "{partial", ()),
     ))
-    hop["wait"]["controller_progress_at"] = (datetime.now(timezone.utc) - timedelta(seconds=310)).isoformat()
+    hop["wait"]["controller_progress_at"] = (datetime.now(timezone.utc) - timedelta(seconds=605)).isoformat()
+    hop["wait"]["refresh_count"] = 2
     class Client:
         stops = 0
         async def assert_ownership(self):
@@ -264,7 +267,8 @@ def test_controller_stops_then_verifies_and_queues_one_child(tmp_path, draft):
                        composer_text="operator draft" if draft else "")
     # Use the fixture's accepted user so the full ownership read can bind correctly.
     current = replace(current, messages=())
-    hop["wait"]["controller_progress_at"] = (datetime.now(timezone.utc) - timedelta(seconds=310)).isoformat()
+    hop["wait"]["controller_progress_at"] = (datetime.now(timezone.utc) - timedelta(seconds=605)).isoformat()
+    hop["wait"]["refresh_count"] = 2
     class Client:
         stops = 0
         async def assert_ownership(self):
@@ -283,10 +287,39 @@ def test_controller_stops_then_verifies_and_queues_one_child(tmp_path, draft):
         assert result.reason == "manual_draft_preserved"
         return
     current = replace(current, stop_visible=False)
+    hop["wait"]["stop_requested_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=6)
+    ).isoformat()
     asyncio.run(controller.run(worker, state, hop, acquired, None, snapshot=current, wait_ms=0))
-    assert _active_hop(state)["kind"] == "route_repair"
+    child = _active_hop(state)
+    assert child["kind"] == "route_repair"
+    assert child["minimal_continuation_prompt"] is True
     assert len(state["hops"]) == before + 1
     assert client.stops == 1
+
+
+def test_stop_action_uses_same_aria_label_fallback_as_stop_probe():
+    from playwright_auto.chatgpt import stop_response
+
+    async def run(page):
+        result = await stop_response(page, timeout_ms=100)
+        assert result == "dom"
+        assert await page.locator('button[aria-label="Stop"]').count() == 0
+
+    asyncio.run(_with_page(
+        '<main><button aria-label="Stop" style="width:20px;height:20px" '
+        'onclick="this.remove()"></button></main>',
+        run,
+    ))
+
+
+def test_stop_action_treats_button_disappearance_as_completed_transition():
+    from playwright_auto.chatgpt import stop_response
+
+    async def run(page):
+        assert await stop_response(page, timeout_ms=100) == "already_gone"
+
+    asyncio.run(_with_page('<main></main>', run))
 
 
 def test_atomic_send_accepts_version_prefixed_extra_high(monkeypatch):

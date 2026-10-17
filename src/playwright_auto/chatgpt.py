@@ -118,7 +118,7 @@ SELECTORS = {
     "composer": '[contenteditable="true"][role="textbox"]',
     "submit": "#composer-submit-button",
     "send": 'button[data-testid="send-button"]',
-    "stop": 'button[data-testid="stop-button"]',
+    "stop": 'button[data-testid="stop-button"], button[aria-label*="Stop"]',
     "new_chat": '[data-testid="create-new-chat-button"]',
     "login": '[data-testid="login-button"]',
     "message": "[data-message-author-role][data-message-id]",
@@ -1488,29 +1488,21 @@ async def delete_current_chat(page: Any, timeout_ms: int = 15_000) -> str:
 
 async def stop_response(page: Any, timeout_ms: int = 5_000) -> str:
     await record_page_action(page, "stop", "click")
-    stop = page.locator(SELECTORS["stop"])
-    await stop.wait_for(state="visible", timeout=timeout_ms)
-    clicked = await page.evaluate(
+    method = await page.evaluate(
         """selector => {
-          const button = document.querySelector(selector);
-          if (!button) return false;
+          const visible = (element) => Boolean(
+            element && (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
+          );
+          const button = Array.from(document.querySelectorAll(selector)).find(visible);
+          if (!button) return "already_gone";
           button.click();
-          return true;
+          return "dom";
         }""",
         SELECTORS["stop"],
     )
-    if not clicked:
-        raise RuntimeError("visible Stop button disappeared before DOM click")
-    await page.wait_for_function(
-        """selector => {
-          const button = document.querySelector(selector);
-          return !button || !(button.offsetWidth || button.offsetHeight || button.getClientRects().length);
-        }""",
-        arg=SELECTORS["stop"],
-        timeout=timeout_ms,
-    )
-    await record_page_action(page, "stop", "complete", detail="dom")
-    return "dom"
+    method = str(method or "already_gone")
+    await record_page_action(page, "stop", "complete", detail=method)
+    return method
 
 
 async def dismiss_rate_limit_dialog(page: Any, *, timeout_ms: int = 10_000) -> str:
@@ -4905,6 +4897,8 @@ class ChatGPTPage:
             if preserve_manual_input and snapshot.manual_input_pending:
                 raise ComposerConflictError("automatic Stop preserves manual draft or attachments")
             if not snapshot.stop_visible:
+                if preserve_manual_input:
+                    return "already_gone"
                 raise UnsafePageStateError("Stop button is not visible")
             return await stop_response(self.page, timeout_ms=timeout)
 

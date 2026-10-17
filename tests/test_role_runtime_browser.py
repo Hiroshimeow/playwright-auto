@@ -493,7 +493,7 @@ def test_no_terminal_result_timeout_queues_route_repair_without_replaying_send()
     assert hop["receipt"] == request().to_dict()
 
 
-def test_genuine_retry_and_stream_failure_remain_retryable_without_format_repair():
+def test_retry_repairs_with_continuation_but_stream_failure_remains_retryable():
     class Client:
         async def install_page_observer(self):
             return None
@@ -501,31 +501,43 @@ def test_genuine_retry_and_stream_failure_remain_retryable_without_format_repair
         def page_observation(self):
             return {}
 
-    for reason, evidence in (
-        ("retry_visible_stable", {"retry_visible": True}),
-        ("stream_failure_recovery", {}),
-    ):
-        state, hop, worker, acquired = environment(Client())
-        queued = []
-        worker._queue_format_repair = lambda *_: queued.append(True)
-        worker._block = lambda _state, message, **kwargs: _state.update(
-            block_reason=message, block_code=kwargs.get("code"), retryable=kwargs.get("retryable")
-        )
-        if reason == "retry_visible_stable":
-            hop["wait"]["retry_seen_at"] = (datetime.now(timezone.utc) - timedelta(seconds=6)).isoformat()
-        else:
-            hop["wait"].update(
-                controller_progress_at=(datetime.now(timezone.utc) - timedelta(seconds=601)).isoformat(),
-                timeout_refreshed=True, timeout_status_checked=True, timeout_status="FAILURE",
-            )
-        result = asyncio.run(RoleController().run(
-            worker, state, hop, acquired, None, snapshot=snapshot(**evidence), wait_ms=0,
-        ))
-        assert result.reason == reason
-        assert state["block_code"] == reason
-        assert state["retryable"] is True
-        assert queued == []
-        assert hop["receipt"] == request().to_dict()
+    state, hop, worker, acquired = environment(Client())
+    continuations = []
+    worker._queue_continuation_repair = (
+        lambda _state, _hop, reason: continuations.append(reason)
+    )
+    worker._block = lambda _state, message, **kwargs: _state.update(
+        block_reason=message, block_code=kwargs.get("code"), retryable=kwargs.get("retryable")
+    )
+    hop["wait"]["retry_seen_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=6)
+    ).isoformat()
+    result = asyncio.run(RoleController().run(
+        worker, state, hop, acquired, None,
+        snapshot=snapshot(retry_visible=True), wait_ms=0,
+    ))
+    assert result.reason == "retry_visible_stable"
+    assert continuations == ["retry_visible_stable"]
+    assert "block_code" not in state
+    assert hop["receipt"] == request().to_dict()
+
+    state, hop, worker, acquired = environment(Client())
+    worker._block = lambda _state, message, **kwargs: _state.update(
+        block_reason=message, block_code=kwargs.get("code"), retryable=kwargs.get("retryable")
+    )
+    hop["wait"].update(
+        controller_progress_at=(datetime.now(timezone.utc) - timedelta(seconds=601)).isoformat(),
+        timeout_refreshed=True,
+        timeout_status_checked=True,
+        timeout_status="FAILURE",
+    )
+    result = asyncio.run(RoleController().run(
+        worker, state, hop, acquired, None, snapshot=snapshot(), wait_ms=0,
+    ))
+    assert result.reason == "stream_failure_recovery"
+    assert state["block_code"] == "stream_failure_recovery"
+    assert state["retryable"] is True
+    assert hop["receipt"] == request().to_dict()
 
 
 def test_codex_allow_once_without_options_dispatches_directly():

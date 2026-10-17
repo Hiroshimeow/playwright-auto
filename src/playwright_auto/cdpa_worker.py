@@ -6851,7 +6851,11 @@ class CDPAWorker:
                 # Legacy persisted fresh fallbacks may still contain executable context.
                 # Keep donor/endpoint audit evidence, never re-inject abandoned instructions.
                 recovery_metadata.pop("prewarm_context", None)
-        if prompt_kind == "route_repair":
+        if hop.get("minimal_continuation_prompt") is True:
+            bounded_context = ""
+            prompt = "Continue from the current state."
+            included = False
+        elif prompt_kind == "route_repair":
             bounded_context = ""  # Format repair never reintroduces the original goal or handoff.
             repair_prompt = self.prompts.repair(
                 task_id=str(state["task_id"]),
@@ -7829,6 +7833,25 @@ class CDPAWorker:
                 validation_error=str(error),
             )
         self._repair_route(state, hop, error)
+
+    def _queue_continuation_repair(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        reason: str,
+    ) -> None:
+        self._queue_format_repair(
+            state,
+            hop,
+            None,
+            RouteContractError(str(reason).strip() or "continuation recovery"),
+        )
+        child = _active_hop(state)
+        if (
+            child.get("kind") == "route_repair"
+            and child.get("parent_hop_id") == hop.get("hop_id")
+        ):
+            child["minimal_continuation_prompt"] = True
 
 
 

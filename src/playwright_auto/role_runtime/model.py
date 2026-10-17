@@ -35,7 +35,7 @@ class Policy:
     response_stable_seconds: float = 5.0
     minimum_samples: int = 2
     timeout_seconds: float = 600.0
-    reload_settle_seconds: float = 20.0
+    reload_settle_seconds: float = 30.0
 
 
 @dataclass

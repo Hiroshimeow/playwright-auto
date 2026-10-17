@@ -463,12 +463,48 @@ def test_timeout_after_refresh_keeps_waiting_and_rearms_when_stop_and_listener_a
         "timeout_refreshed": True,
         "timeout_status_checked": True,
         "timeout_status": "IS_STREAMING",
+        "refresh_count": 1,
     }
     assert step(snapshot(stop_visible=True), wait).action is Action.WAIT
     assert wait["controller_progress_at"] == NOW.isoformat()
+    assert wait["refresh_count"] == 1
     assert "timeout_refreshed" not in wait
     assert "timeout_status_checked" not in wait
     assert "timeout_status" not in wait
+
+
+def test_timeout_refreshes_twice_then_stops_once_at_third_ten_minute_gate():
+    current = snapshot(stop_visible=True)
+    wait = {"controller_progress_at": NOW.isoformat(), "refresh_count": 0}
+
+    first = step(current, wait, 600)
+    assert first.action is Action.REFRESH
+    wait.update(refresh_count=1, timeout_refreshed=True)
+    after_first = step(current, wait, 630)
+    assert after_first.reason == "response_still_active"
+
+    second = step(current, wait, 1230)
+    assert second.action is Action.REFRESH
+    wait.update(refresh_count=2, timeout_refreshed=True)
+    after_second = step(current, wait, 1260)
+    assert after_second.reason == "response_still_active"
+
+    final = step(current, wait, 1860)
+    assert final.action is Action.REPAIR
+    assert final.reason == "response_timeout_stop"
+
+
+def test_retry_after_reload_repairs_only_when_not_responding():
+    wait = {
+        "refresh_count": 1,
+        "last_refresh_at": NOW.isoformat(),
+        "refresh_ready_at": (NOW + timedelta(seconds=30)).isoformat(),
+        "controller_progress_at": NOW.isoformat(),
+    }
+    assert step(snapshot(retry_visible=True, stop_visible=True), wait, 29).action is Action.WAIT
+    decision = step(snapshot(retry_visible=True), wait, 30)
+    assert decision.action is Action.REPAIR
+    assert decision.reason == "retry_visible_stable"
 
 
 def test_later_human_turn_reanchors_already_bound_assistant():
@@ -706,16 +742,16 @@ def test_timeout_refresh_preserves_clock_until_post_reload_state_changes():
 
 def test_valid_result_is_read_after_reload_settle_then_stabilized():
     current = current_result()
-    wait = {"refresh_ready_at": (NOW + timedelta(seconds=20)).isoformat()}
+    wait = {"refresh_ready_at": (NOW + timedelta(seconds=30)).isoformat()}
     assert step(current, wait).reason == "reload_settle"
-    assert step(current, wait, 20).reason == "result_stability"
-    assert step(current, wait, 25).action is Action.ACCEPT
+    assert step(current, wait, 30).reason == "result_stability"
+    assert step(current, wait, 35).action is Action.ACCEPT
 
 
-def test_reload_settle_window_is_twenty_seconds():
-    wait = {"refresh_ready_at": (NOW + timedelta(seconds=20)).isoformat()}
-    assert step(snapshot(retry_visible=True), wait, 19).reason == "reload_settle"
-    assert step(snapshot(retry_visible=True), wait, 20).reason == "wait_response"
+def test_reload_settle_window_is_thirty_seconds():
+    wait = {"refresh_ready_at": (NOW + timedelta(seconds=30)).isoformat()}
+    assert step(snapshot(retry_visible=True), wait, 29).reason == "reload_settle"
+    assert step(snapshot(retry_visible=True), wait, 30).reason == "retry_visible_stable"
 
 
 def test_empty_bound_assistant_while_listen_streaming_waits_without_format_repair():

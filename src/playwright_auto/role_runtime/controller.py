@@ -71,12 +71,14 @@ class RoleController:
                 return self._remember(ctx, Decision(Action.WAIT, "conversation_load_grace"))
             return self._remember(ctx, Decision(Action.REFRESH, "conversation_load_recheck"))
 
-        # After F5, wait for the page to settle before reading either response source.
+        # After F5, give the UI a full observation window before any recovery gate.
         ready_at = parse_time(wait.get("refresh_ready_at"))
+        settled_refresh = False
         if phase == "waiting" and ready_at is not None and ctx.now < ready_at:
             return self._remember(ctx, Decision(Action.WAIT, "reload_settle"))
         if ready_at is not None:
             wait.pop("refresh_ready_at", None)
+            settled_refresh = True
 
         # Track the DOM edge even while result stability short-circuits decisions.
         timeout.recovery(ctx)
@@ -137,8 +139,24 @@ class RoleController:
             return self._remember(ctx, Decision(Action.WAIT, "blocking_dialog_wait"))
         if phase == "waiting":
             timeout.observe(ctx)
-            if getattr(snapshot, "retry_visible", False):
+
+            # Once Stop was attempted, never click it again. A terminal response
+            # still wins above; otherwise wait for Stop to disappear and the
+            # composer to become usable before sending one continuation.
+            if wait.get("stop_requested_at"):
+                recovery = timeout.recovery(ctx)
+                if recovery is not None:
+                    return self._remember(ctx, recovery)
+                if bool(getattr(snapshot, "stop_visible", False)):
+                    return self._remember(ctx, Decision(Action.WAIT, "stop_verification_pending"))
+                return self._remember(ctx, Decision(Action.WAIT, "stop_settle"))
+
+            # Retry is a recovery signal only when the page is no longer
+            # responding. A visible Stop/current stream always wins.
+            if getattr(snapshot, "retry_visible", False) and not ctx.transport_active:
                 retry_seen_at = parse_time(wait.get("retry_seen_at"))
+                if settled_refresh:
+                    return self._remember(ctx, Decision(Action.REPAIR, "retry_visible_stable"))
                 if retry_seen_at is None:
                     wait["retry_seen_at"] = ctx.now.isoformat()
                 elif (ctx.now - retry_seen_at).total_seconds() >= 5:
@@ -159,6 +177,9 @@ class RoleController:
                 or str(getattr(page_state, "value", page_state) or "").lower() == "responding"
                 or not ctx.candidate_stable
             ):
+                timeout_decision = timeout.handle(ctx)
+                if timeout_decision is not None:
+                    return self._remember(ctx, timeout_decision)
                 return self._remember(ctx, Decision(Action.WAIT, "malformed_result_stability"))
             return self._remember(ctx, Decision(
                 Action.REPAIR, "malformed_result", ctx.candidate, ctx.validation_error,
@@ -461,11 +482,11 @@ class RoleController:
             wait["timeout_status_checked"] = True
             wait["timeout_status"] = await worker._one_shot_stream_status(actions, receipt) if receipt else None
             return decision
-        if decision.action is Action.REPAIR and decision.reason in {"interrupted_response", "inactive_response"}:
+        if decision.action is Action.REPAIR and decision.reason == "response_timeout_stop":
             if receipt is None or hop.get("state") not in {None, "waiting"}:
                 return Decision(Action.WAIT, "recovery_requires_accepted_execution")
-            # Re-read exact ownership and content before Stop. A result or progress
-            # that raced the timeout wins; never stop from a stale cached snapshot.
+            # Re-read exact ownership/content immediately before the single Stop.
+            # A result or Retry that raced the timeout wins over the stale decision.
             current = await client.assert_ownership()
             rechecked = self.decide(
                 current, wait, receipt=receipt,
@@ -477,25 +498,17 @@ class RoleController:
                 getattr(current, "composer_text", "") or getattr(current, "attachment_markers", ())
             ):
                 return Decision(Action.WAIT, "manual_draft_preserved")
+            wait["stop_requested_at"] = datetime.now(timezone.utc).isoformat()
             if getattr(current, "stop_visible", False):
                 await client.stop(preserve_manual_input=True)
-                # Stop is idempotent at the exact page boundary: after a crash the
-                # inactive edge is reconciled, never an original Send replay.
-                return Decision(Action.WAIT, "stop_verification_pending")
-            if getattr(current, "response_projection_active", False):
-                return Decision(Action.WAIT, "stop_verification_pending")
-            worker._queue_format_repair(
-                state, hop, None,
-                RouteContractError(
-                    "Continue (tiếp tục) the interrupted accepted execution from the existing "
-                    f"workspace/report state. Parent request: {hop.get('request_id')}; "
-                    f"accepted user: {receipt.user_message_id}; conversation: {receipt.conversation_id}. "
-                    "Do not replay the original prompt or redo completed work."
-                ),
-            )
+            return Decision(Action.WAIT, "stop_verification_pending")
+        if decision.action is Action.REPAIR and decision.reason in {
+            "retry_visible_stable", "stopped_response_continue"
+        }:
+            worker._queue_continuation_repair(state, hop, decision.reason)
             return decision
         if decision.action is Action.REPAIR and decision.reason != "malformed_result":
-            retryable = decision.reason in {"retry_visible_stable", "stream_failure_recovery"}
+            retryable = decision.reason in {"stream_failure_recovery"}
             if decision.reason == "state_repair":
                 worker._queue_format_repair(
                     state,
