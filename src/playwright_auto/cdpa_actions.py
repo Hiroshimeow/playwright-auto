@@ -809,9 +809,11 @@ class CDPATabActions:
             )
         conversation_id = expected_conversation.rsplit("/", 1)[-1]
 
-        # Recovery may rebind a runtime page ID only for an exact, unique
-        # task/team/role owner on the same canonical conversation.
+        # Recovery prefers an already-open exact canonical conversation,
+        # even when its CDPA metadata was lost. A stale owned homepage/tab must
+        # never force creation of another duplicate canonical tab.
         matches = []
+        reusable_exact = []
         for candidate in self.browser_context.pages:
             if candidate.is_closed() or not self._supported(candidate):
                 continue
@@ -823,19 +825,58 @@ class CDPATabActions:
                 ("team", str(manifest["team"])),
             )):
                 raise RoleOwnershipError("saved conversation is owned by another role/task/team")
+            reusable_exact.append((candidate, metadata))
             if metadata.get("page_id") and all(metadata.get(key) for key in ("role", "task_id", "team")):
                 matches.append(candidate)
         if len(matches) > 1:
             raise RoleOwnershipError("multiple exact saved conversation tabs claim the role")
+
         existing = await self.locate_owned(manifest, logical_role)
-        if matches and existing is None:
+        if existing is not None and _reopenable_conversation_identity(existing.url) != expected_conversation:
+            wrong_page = existing.client.page
+            closing = await record_page_action(
+                wrong_page,
+                "close_tab",
+                "start",
+                reason="saved_conversation_binding_mismatch",
+            )
+            try:
+                await wrong_page.close()
+            except Exception as exc:
+                await record_page_action(
+                    wrong_page,
+                    "close_tab",
+                    "error",
+                    reason="saved_conversation_binding_mismatch",
+                    identity=closing,
+                    detail=type(exc).__name__,
+                )
+                raise
+            await record_page_action(
+                wrong_page,
+                "close_tab",
+                "complete",
+                reason="saved_conversation_binding_mismatch",
+                identity=closing,
+            )
+            existing = None
+
+        if existing is None and matches:
             candidate = matches[0]
             metadata = await inspect_page_metadata(candidate)
             client = ChatGPTPage(candidate, timeout_ms=30000)
             client.binding = PageBinding(str(metadata["page_id"]), physical)
             existing = AcquiredRole(client, str(metadata["page_id"]), str(candidate.url), False, False)
-        if existing is not None and _reopenable_conversation_identity(existing.url) != expected_conversation:
-            raise RoleOwnershipError("owned page changed canonical conversation")
+        elif existing is None and reusable_exact:
+            candidate, metadata = reusable_exact[0]
+            client = ChatGPTPage(candidate, timeout_ms=30000)
+            existing = AcquiredRole(
+                client,
+                str(metadata.get("page_id") or ""),
+                str(candidate.url),
+                False,
+                False,
+            )
         created = existing is None
         if created:
             await random_delay(action_delay_multiplier("open_tab"))

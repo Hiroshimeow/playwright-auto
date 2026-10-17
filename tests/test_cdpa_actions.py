@@ -954,6 +954,53 @@ def test_reopen_existing_conversation_never_uses_branch_composer_cleanup(tmp_pat
     assert page.snapshot_value.composer_text == "manual existing draft"
 
 
+def test_reopen_rebinds_open_canonical_tab_after_wrong_runtime_binding(
+    tmp_path, monkeypatch
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    monkeypatch.setattr(
+        actions_module,
+        "random_delay",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+
+    wrong = FakePage(
+        page_id="recorded-page",
+        role="new-team-plan",
+        team="new-team",
+        task_id="task-1",
+    )
+    wrong.url = "https://chatgpt.com/"
+    wrong.snapshot_value.url = wrong.url
+
+    canonical = FakePage(page_id=None, role=None, team=None, task_id=None)
+    canonical.url = TARGET_CONVERSATION_URL
+    canonical.snapshot_value.url = TARGET_CONVERSATION_URL
+
+    context = FakeContext([wrong, canonical])
+    actions = CDPATabActions(context, config)
+    state = manifest(
+        physical_role="new-team-plan",
+        page_id="recorded-page",
+        page_url=TARGET_CONVERSATION_URL,
+        conversation_url=TARGET_CONVERSATION_URL,
+    )
+
+    reopened = asyncio.run(
+        actions.reopen(state, "PLAN", require_clean_ready=False)
+    )
+
+    assert wrong.closed is True
+    assert canonical.closed is False
+    assert context.new_page_calls == 0
+    assert reopened.url == TARGET_CONVERSATION_URL
+    assert reopened.client.page is canonical
+    assert canonical.snapshot_value.page_role == "new-team-plan"
+    assert canonical.snapshot_value.page_task_id == "task-1"
+    assert canonical.snapshot_value.page_team == "new-team"
+
+
 def test_branch_from_anchor_uses_backend_uuid_while_frontend_remains_provisional(
     tmp_path, monkeypatch
 ):

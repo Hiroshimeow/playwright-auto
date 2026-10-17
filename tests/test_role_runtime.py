@@ -740,6 +740,40 @@ def test_timeout_refresh_preserves_clock_until_post_reload_state_changes():
     assert wait["timeout_refreshed"] is True
 
 
+def test_response_timeout_reload_timeout_enters_observation_window():
+    class Client:
+        async def refresh(self, *, reason=None):
+            assert reason == "response_timeout_recheck"
+            raise TimeoutError("Page.reload timed out")
+
+    wait = {"controller_progress_at": NOW.isoformat()}
+    decision = Decision(Action.REFRESH, "response_timeout_recheck")
+    result = asyncio.run(
+        RoleController().browser_action(Client(), snapshot(), wait, None, decision)
+    )
+
+    assert result.action is Action.WAIT
+    assert result.reason == "reload_timeout_observe"
+    assert wait["timeout_refreshed"] is True
+    assert wait["refresh_count"] == 1
+    assert wait["last_refresh_result"]["status"] == "failed"
+    assert wait["last_refresh_result"]["error"] == "TimeoutError"
+    assert wait["refresh_ready_at"]
+    assert wait["controller_progress_at"] == NOW.isoformat()
+
+
+def test_non_timeout_recovery_refresh_timeout_still_raises():
+    class Client:
+        async def refresh(self, *, reason=None):
+            raise TimeoutError("reload timed out")
+
+    decision = Decision(Action.REFRESH, "ui_error")
+    with pytest.raises(TimeoutError, match="reload timed out"):
+        asyncio.run(
+            RoleController().browser_action(Client(), snapshot(), {}, None, decision)
+        )
+
+
 def test_valid_result_is_read_after_reload_settle_then_stabilized():
     current = current_result()
     wait = {"refresh_ready_at": (NOW + timedelta(seconds=30)).isoformat()}

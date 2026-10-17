@@ -274,6 +274,23 @@ def test_blocked_temporary_workflow_preserves_live_tab(tmp_path: Path):
     assert actions.pages == ["assigned-page"]
 
 
+def test_blocked_persistent_inflight_workflow_preserves_team_tabs(tmp_path: Path):
+    _config, _store, state, worker = setup_task(
+        tmp_path, task_id="task-persistent-block"
+    )
+    state["status"] = "BLOCKED"
+    state["kanban_column"] = "BLOCKED"
+    state["conversation_mode"] = "persistent"
+    _active_hop(state)["state"] = "waiting"
+    actions = FakeActions()
+
+    asyncio.run(worker._release_blocked_workflow_tabs(state, actions))
+
+    assert actions.preflight_calls == 0
+    assert actions.closed_teams == 0
+    assert actions.pages == ["assigned-page"]
+
+
 def setup_task(
     tmp_path: Path,
     *,

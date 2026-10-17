@@ -4142,11 +4142,10 @@ class CDPAWorker:
             hop = _active_hop(state)
         except Exception:
             hop = None
-        if (
-            isinstance(hop, Mapping)
-            and str(hop.get("state") or "") == "sending"
-            and self._sending_hop_durable_boundary_state(hop) != "preboundary"
-        ):
+        if isinstance(hop, Mapping) and str(hop.get("state") or "") in IN_FLIGHT:
+            # A blocked persistent workflow may still have useful live browser
+            # context. Preserve it for Resume/reconciliation instead of turning
+            # one recoverable controller error into an offline whole-team reset.
             return
         try:
             selected = await actions.preflight_team(state)

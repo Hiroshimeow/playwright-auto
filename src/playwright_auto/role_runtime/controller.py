@@ -571,6 +571,7 @@ class RoleController:
         return decision
 
     async def browser_action(self, client, snapshot, wait, permission, decision) -> Decision:
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
         from ..connection import is_cdp_disconnect
         if decision.action is Action.ALLOW:
             try:
@@ -636,6 +637,21 @@ class RoleController:
             begin_refresh(wait)
             try:
                 await client.refresh(reason=decision.reason)
+            except (TimeoutError, PlaywrightTimeoutError) as exc:
+                finish_refresh(wait, error=type(exc).__name__)
+                if decision.reason != "response_timeout_recheck":
+                    raise
+                # F5 was already attempted. A slow ChatGPT navigation is not a
+                # terminal controller failure; let the normal 30s observation
+                # window reconcile the resulting page state.
+                now = datetime.now(timezone.utc)
+                wait["refresh_ready_at"] = (
+                    now + timedelta(seconds=self.policy.reload_settle_seconds)
+                ).isoformat()
+                wait["controller_last_refresh_at"] = now.isoformat()
+                for key in ("mcp_allow_clicked_at", "mcp_allow_seen_at", "mcp_allow_retry_at"):
+                    wait.pop(key, None)
+                return Decision(Action.WAIT, "reload_timeout_observe")
             except Exception as exc:
                 finish_refresh(wait, error=type(exc).__name__)
                 raise
