@@ -3649,6 +3649,47 @@ def test_operator_fresh_route_candidate_accepts_same_path_new_hash_only(
     assert worker._operator_fresh_route_candidate(state, hop, snapshot) is None
 
 
+
+
+def test_operator_fresh_route_candidate_rejects_route_older_than_latest_user_turn(
+    tmp_path: Path,
+):
+    _store, state, worker, _path, hop, _ledger, _binding, _baseline = _prepare_sending_record(
+        tmp_path, task_id="task-operator-fresh-route-stale-response"
+    )
+    handoff = str(hop["expected_report_path"])
+    _target, old_sha = _write_report_revision(tmp_path, handoff, "# old\n")
+    state["reports"] = [
+        {
+            "path": handoff,
+            "sha256": old_sha,
+            "role": "PLAN",
+            "physical_role": hop["physical_role"],
+            "turn": hop["turn"],
+        }
+    ]
+    _target, new_sha = _write_report_revision(tmp_path, handoff, "# revised by operator\n")
+    assert new_sha != old_sha
+
+    stale_response = MessageSnapshot(
+        "assistant",
+        "a-old-route",
+        "t-old-route",
+        json.dumps({"route": "PLAN", "handoff": handoff}),
+        (),
+    )
+    newer_user = MessageSnapshot(
+        "user",
+        "u-new-manual",
+        "t-new-manual",
+        "Operator supplied a new Spec 007 discussion after the old route.",
+        (),
+    )
+    snapshot = SimpleNamespace(messages=(stale_response, newer_user))
+
+    assert worker._operator_fresh_route_candidate(state, hop, snapshot) is None
+
+
 def test_operator_resume_routes_fresh_handoff_revision_without_send(
     tmp_path: Path,
 ):

@@ -8696,8 +8696,18 @@ class CDPAWorker:
             return None
         role = str(hop.get("target_role") or "").strip().upper()
         allowed_routes = tuple(task_workflow_definitions(state, self.config)) + ("PAUSE", "DONE")
+        messages = tuple(getattr(snapshot, "messages", ()) or ())
+        last_user_index = max(
+            (
+                index
+                for index, message in enumerate(messages)
+                if isinstance(message, MessageSnapshot) and message.role == "user"
+            ),
+            default=-1,
+        )
         latest: tuple[MessageSnapshot, Any] | None = None
-        for message in reversed(tuple(getattr(snapshot, "messages", ()) or ())):
+        for index in range(len(messages) - 1, last_user_index, -1):
+            message = messages[index]
             if not isinstance(message, MessageSnapshot) or message.role != "assistant" or not message.text.strip():
                 continue
             try:
