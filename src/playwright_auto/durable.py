@@ -472,6 +472,52 @@ class RequestLedger:
             data["records"][request_id] = rebound.to_dict()
             return rebound
 
+    def adopt_operator_draft(
+        self,
+        request_id: str,
+        *,
+        prompt: str,
+        approval: Mapping[str, Any],
+    ) -> DurableRequestRecord:
+        """Adopt one operator-approved unsent composer draft into an existing SENDING record."""
+        normalized = normalize_prompt(prompt)
+        if not normalized:
+            raise ValueError("operator-approved durable prompt must not be empty")
+        normalized_approval = canonical_json_value(dict(approval))
+        with self._locked() as data:
+            value = data["records"].get(request_id)
+            if not value:
+                raise KeyError(request_id)
+            current = DurableRequestRecord.from_dict(value)
+            if current.status is not RequestStatus.SENDING or current.attempts < 1:
+                raise DurableRequestError(
+                    "operator draft adoption requires a crossed but unaccepted SENDING record"
+                )
+            if any(
+                item is not None
+                for item in (current.accepted_at, current.receipt, current.response)
+            ):
+                raise DurableRequestError(
+                    "operator draft adoption is forbidden after accepted-send evidence"
+                )
+            key = build_idempotency_key(
+                role=current.role,
+                prompt=normalized,
+                source_context=current.source_context,
+                role_prompt_hash=current.role_prompt_hash,
+                files=current.files,
+            )
+            adopted = replace(
+                current,
+                idempotency_key=key,
+                prompt=normalized,
+                rendered_prompt=normalized,
+                approval=normalized_approval,
+                updated_at=time.time(),
+            )
+            data["records"][request_id] = adopted.to_dict()
+            return adopted
+
     def peek(self, request_id: str) -> DurableRequestRecord | None:
         try:
             raw = json.loads(read_shared_bytes(self.path))

@@ -3588,6 +3588,200 @@ def test_crossed_durable_receipt_blocks_nonacceptance_replacement(tmp_path: Path
     assert current.receipt == crossed.to_dict()
 
 
+
+
+def test_operator_resume_adopts_live_manual_composer_after_proven_nonacceptance(
+    tmp_path: Path,
+):
+    store, state, worker, path, hop, ledger, binding, baseline = _prepare_sending_record(
+        tmp_path, task_id="task-resume-operator-manual-composer"
+    )
+    ledger.update(
+        hop["request_id"],
+        error=(
+            "ComposerConflictError: composer changed or became unavailable "
+            "inside the atomic send boundary"
+        ),
+    )
+    state = _queue_blocked_resume(
+        store,
+        state,
+        code="manual_composer_conflict",
+        reason="operator edited the composer before acceptance",
+    )
+    hop = _active_hop(state)
+    control = state["controls"][-1]
+    manual_prompt = "Operator-approved manual continuation after discussion."
+
+    snapshot = SimpleNamespace(
+        state=ChatGPTState.DRAFT,
+        page_id=binding.page_id,
+        page_role=binding.role,
+        page_task_id=state["task_id"],
+        page_team=state["team"],
+        composer_text=manual_prompt,
+        composer_empty=False,
+        manual_input_pending=True,
+        attachment_markers=(),
+        blocking_dialogs=(),
+        messages=(),
+        logical_turn_ids=(),
+        send_enabled=True,
+        stop_visible=False,
+        session_id="exact",
+        url="https://chatgpt.com/c/exact",
+        conversation_url="https://chatgpt.com/c/exact",
+    )
+
+    class Client:
+        def __init__(self):
+            self.binding = binding
+            self.send_calls = 0
+
+        async def assert_ownership(self):
+            return snapshot
+
+        async def send(self, prompt, **kwargs):
+            self.send_calls += 1
+            assert prompt == manual_prompt
+            assert kwargs["max_attempts"] == 1
+            return SendReceipt(
+                prompt=prompt,
+                prompt_sha256=worker_module._sha(prompt),
+                binding=binding,
+                baseline=baseline,
+                attempts=1,
+                accepted_via="user_message_identity",
+                session_id_before="exact",
+                user_message_id="u-operator-manual",
+                user_turn_id="t-operator-manual",
+            )
+
+    client = Client()
+    acquired = AcquiredRole(
+        client, binding.page_id, snapshot.url, False, False
+    )
+
+    class Actions:
+        async def locate_owned(self, _state, _role):
+            return acquired
+
+    asyncio.run(worker._recover_resume_sending(state, hop, control, Actions()))
+
+    current = ledger.get(hop["request_id"])
+    assert client.send_calls == 1
+    assert control["status"] == "applied"
+    assert control["result"]["postcondition"] == "draft_accepted_once"
+    assert current is not None
+    assert current.status is RequestStatus.SENT
+    assert current.prompt == manual_prompt
+    assert current.rendered_prompt == manual_prompt
+    assert current.approval["kind"] == "operator_composer_override"
+    assert current.approval["control_id"] == control["control_id"]
+    assert hop["prompt"] == manual_prompt
+    assert hop["prompt_sha256"] == worker_module._sha(manual_prompt)
+    assert hop["operator_prompt_override"]["control_id"] == control["control_id"]
+
+
+
+
+def test_operator_resume_rebases_manual_transcript_before_unaccepted_send(
+    tmp_path: Path,
+):
+    store, state, worker, path, hop, ledger, binding, _baseline = _prepare_sending_record(
+        tmp_path, task_id="task-resume-operator-transcript-rebase"
+    )
+    ledger.update(
+        hop["request_id"],
+        error=(
+            "ComposerConflictError: composer changed or became unavailable "
+            "inside the atomic send boundary"
+        ),
+    )
+    state = _queue_blocked_resume(
+        store,
+        state,
+        code="manual_composer_conflict",
+        reason="operator discussed manually before resuming",
+    )
+    hop = _active_hop(state)
+    control = state["controls"][-1]
+    manual_message = MessageSnapshot(
+        "user",
+        "u-manual-discussion",
+        "t-manual-discussion",
+        "Manual discussion that happened before Resume.",
+        (),
+    )
+    live_baseline = capture_message_baseline(
+        (manual_message,), ("t-manual-discussion",)
+    )
+
+    snapshot = SimpleNamespace(
+        state=ChatGPTState.DRAFT,
+        page_id=binding.page_id,
+        page_role=binding.role,
+        page_task_id=state["task_id"],
+        page_team=state["team"],
+        composer_text=hop["prompt"],
+        composer_empty=False,
+        manual_input_pending=True,
+        attachment_markers=(),
+        blocking_dialogs=(),
+        messages=(manual_message,),
+        logical_turn_ids=("t-manual-discussion",),
+        send_enabled=True,
+        stop_visible=False,
+        session_id="exact",
+        url="https://chatgpt.com/c/exact",
+        conversation_url="https://chatgpt.com/c/exact",
+    )
+
+    class Client:
+        def __init__(self):
+            self.binding = binding
+            self.send_calls = 0
+
+        async def assert_ownership(self):
+            return snapshot
+
+        async def send(self, prompt, **kwargs):
+            self.send_calls += 1
+            return SendReceipt(
+                prompt=prompt,
+                prompt_sha256=worker_module._sha(prompt),
+                binding=binding,
+                baseline=live_baseline,
+                attempts=1,
+                accepted_via="user_message_identity",
+                session_id_before="exact",
+                user_message_id="u-after-resume",
+                user_turn_id="t-after-resume",
+            )
+
+    client = Client()
+    acquired = AcquiredRole(
+        client, binding.page_id, snapshot.url, False, False
+    )
+
+    class Actions:
+        async def locate_owned(self, _state, _role):
+            return acquired
+
+    asyncio.run(worker._recover_resume_sending(state, hop, control, Actions()))
+
+    current = ledger.get(hop["request_id"])
+    assert client.send_calls == 1
+    assert control["status"] == "applied"
+    assert current is not None
+    assert current.status is RequestStatus.SENT
+    assert current.baseline == live_baseline
+    assert current.approval["kind"] == "operator_resume_override"
+    assert current.approval["baseline_rebased_at"]
+    assert current.approval["composer_adopted"] is False
+    assert hop["operator_transcript_rebase"]["control_id"] == control["control_id"]
+
+
 def test_exact_owned_sending_draft_without_user_or_listen_evidence_is_not_resent(tmp_path: Path, monkeypatch):
     store, state, worker, path, hop, ledger, binding, baseline = _prepare_sending_record(
         tmp_path, task_id="task-resume-owned-draft"

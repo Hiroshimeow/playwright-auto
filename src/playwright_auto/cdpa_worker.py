@@ -10207,30 +10207,74 @@ class CDPAWorker:
 
         expected_names = tuple(item.name for item in record.files)
         actual_names = tuple(getattr(snapshot, "attachment_markers", ()) or ())
-        if not visible_text_matches(
-            getattr(snapshot, "composer_text", ""), record.rendered_prompt
-        ):
-            self._require_resume_recovery(
-                state,
-                control,
-                action="none",
-                reason_code="manual_composer_conflict",
-                reason="The composer does not match the exact persisted durable prompt.",
-                next_safe_action="Preserve the composer and resolve the manual-input mismatch.",
+        live_composer = str(getattr(snapshot, "composer_text", "") or "")
+        operator_resume = str(control.get("origin") or "") == "operator"
+        composer_adopted = False
+        if not visible_text_matches(live_composer, record.rendered_prompt):
+            if not operator_resume or not live_composer.strip():
+                self._require_resume_recovery(
+                    state,
+                    control,
+                    action="none",
+                    reason_code="manual_composer_conflict",
+                    reason="The composer does not match the exact persisted durable prompt.",
+                    next_safe_action="Preserve the composer and resolve the manual-input mismatch.",
+                )
+                return
+            previous_prompt_sha256 = _sha(record.rendered_prompt)
+            record = ledger.adopt_operator_draft(
+                record.request_id,
+                prompt=live_composer,
+                approval={
+                    "kind": "operator_composer_override",
+                    "control_id": control.get("control_id"),
+                    "adopted_at": utc_now(),
+                    "previous_prompt_sha256": previous_prompt_sha256,
+                    "prompt_sha256": _sha(live_composer.strip()),
+                },
             )
-            return
-        if capture_message_baseline(
+            hop["prompt"] = record.prompt
+            hop["prompt_sha256"] = _sha(record.prompt)
+            hop["operator_prompt_override"] = {
+                "control_id": control.get("control_id"),
+                "adopted_at": utc_now(),
+                "previous_prompt_sha256": previous_prompt_sha256,
+                "prompt_sha256": hop["prompt_sha256"],
+            }
+            composer_adopted = True
+
+        live_baseline = capture_message_baseline(
             snapshot.messages, snapshot.logical_turn_ids
-        ) != record.baseline:
-            self._require_resume_recovery(
-                state,
-                control,
-                action="none",
-                reason_code="transcript_baseline_mismatch",
-                reason="The transcript baseline changed before the durable SENDING draft was accepted.",
-                next_safe_action="Inspect the transcript; do not send until accepted-turn provenance is unambiguous.",
+        )
+        if live_baseline != record.baseline:
+            if not operator_resume:
+                self._require_resume_recovery(
+                    state,
+                    control,
+                    action="none",
+                    reason_code="transcript_baseline_mismatch",
+                    reason="The transcript baseline changed before the durable SENDING draft was accepted.",
+                    next_safe_action="Inspect the transcript; do not send until accepted-turn provenance is unambiguous.",
+                )
+                return
+            approval = dict(record.approval or {})
+            approval.update(
+                {
+                    "kind": "operator_resume_override",
+                    "control_id": control.get("control_id"),
+                    "baseline_rebased_at": utc_now(),
+                    "composer_adopted": composer_adopted,
+                }
             )
-            return
+            record = ledger.update(
+                record.request_id,
+                baseline=live_baseline,
+                approval=approval,
+            )
+            hop["operator_transcript_rebase"] = {
+                "control_id": control.get("control_id"),
+                "rebased_at": utc_now(),
+            }
         if not attachment_names_match(actual_names, expected_names):
             self._require_resume_recovery(
                 state,
