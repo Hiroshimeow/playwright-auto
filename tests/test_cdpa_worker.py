@@ -4706,6 +4706,111 @@ def test_runtime_worker_stale_result_preserves_newer_requested_control_until_com
     asyncio.run(scenario())
 
 
+def test_runtime_worker_publishes_applied_pause_before_unrelated_slow_cycle_drains(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _config, store, slow, worker = setup_task(
+        tmp_path, task_id="task-runtime-projection-slow"
+    )
+    target = store.create_task(
+        "pause projection target",
+        requested_team="projection-target",
+        task_id="task-runtime-projection-target",
+        governing_objective="pause projection target",
+        governing_directives=(),
+    )
+    target = store.update(
+        target["manifest_path"],
+        lambda current: current.update(
+            status="RUNNING",
+            kanban_column="PLAN",
+            active_action="send",
+        ),
+    )
+    slow_path = Path(slow["manifest_path"]).resolve()
+    target_path = Path(target["manifest_path"]).resolve()
+
+    worker.hydrate_runtime()
+    assert worker.registry is not None
+    assert worker.runtime_db.get_task_detail(target["task_id"])["status"] == "RUNNING"
+    worker.registry._due_at[slow["task_id"]] = time.time() - 1.0
+    worker.registry._due_at.pop(target["task_id"], None)
+
+    slow_started = asyncio.Event()
+    pause_applied = asyncio.Event()
+    release_slow = asyncio.Event()
+    original_advance = worker.advance
+
+    async def mixed_advance(path, browser_context, *, scheduling_tasks=None):
+        resolved = Path(path).resolve()
+        if resolved == slow_path:
+            slow_started.set()
+            await release_slow.wait()
+            return store.load(path)
+        assert resolved == target_path
+        result = await original_advance(
+            path,
+            browser_context,
+            scheduling_tasks=scheduling_tasks,
+        )
+        if result is not None and result.get("status") == "PAUSED":
+            pause_applied.set()
+        return result
+
+    monkeypatch.setattr(worker, "advance", mixed_advance)
+    monkeypatch.setattr(
+        worker_module,
+        "CDPATabActions",
+        lambda *_args, **_kwargs: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_run_automated_send",
+        AsyncMock(side_effect=AssertionError("Pause must not Send")),
+    )
+
+    worker.runtime_db.enqueue_command(
+        command_id="cmd-runtime-pause-projection",
+        idempotency_key="runtime-pause-projection",
+        kind="task_control",
+        task_id=target["task_id"],
+        expected_task_version=None,
+        payload={"action": "pause", "reason": "prove prompt projection publication"},
+    )
+
+    async def scenario():
+        cycle = asyncio.create_task(worker.run_once(SimpleNamespace(pages=[])))
+        await asyncio.wait_for(slow_started.wait(), timeout=1.0)
+
+        command = worker.dispatch_command_once()
+        assert command is not None and command["status"] == "running"
+        assert worker.runtime_db.get_task_detail(target["task_id"])["status"] == "RUNNING"
+
+        await asyncio.wait_for(pause_applied.wait(), timeout=1.5)
+        assert cycle.done() is False
+        assert store.load(target_path)["status"] == "PAUSED"
+        projection_deadline = time.monotonic() + 0.75
+        while (
+            worker.runtime_db.get_task_detail(target["task_id"])["status"] != "PAUSED"
+            and time.monotonic() < projection_deadline
+        ):
+            await asyncio.sleep(0.01)
+        assert worker.runtime_db.get_task_detail(target["task_id"])["status"] == "PAUSED"
+
+        applied = worker.runtime_db.get_command("cmd-runtime-pause-projection")
+        assert applied is not None and applied["status"] == "applied"
+
+        release_slow.set()
+        await asyncio.wait_for(cycle, timeout=1.0)
+        assert worker.runtime_db.get_task_detail(target["task_id"])["status"] == "PAUSED"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        worker.runtime_db.close()
+
+
 def test_runtime_worker_consumes_new_requested_control_during_unrelated_slow_cycle(
     tmp_path: Path,
     monkeypatch,

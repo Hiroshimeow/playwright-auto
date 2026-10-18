@@ -14547,6 +14547,7 @@ class CDPAWorker:
                                             now=time.time(),
                                         )
                                     )
+                self._publish_affected(affected)
                 # A completed execution releases endpoint capacity. Rescan the
                 # full due frontier so browser-pool waiters can enter before
                 # unrelated running tasks drain; active/version guards prevent
