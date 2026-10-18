@@ -5095,6 +5095,22 @@ class CDPAWorker:
                 else:
                     acquired = await actions.new_chat(state, role)
                     await self._dismiss_known_rate_limit_on_existing(acquired)
+                    record = state["roles"][role]
+                    if isinstance(record.get("role_url_binding"), Mapping):
+                        # Only the successful explicit control supersedes URL
+                        # intent; ordinary acquisitions must preserve it.
+                        self.store._record_role_url_intent(
+                            state, role=role, url="https://chatgpt.com/",
+                            browser_endpoint_id=str(
+                                record.get("browser_endpoint_id")
+                                or state.get("browser_endpoint_id") or ""
+                            ),
+                            external_command_id=str(
+                                control.get("external_command_id")
+                                or (command.command_id if command else f"new-chat-control-{control_id}")
+                            ),
+                        )
+                        record["role_url_binding"]["page_id"] = acquired.page_id
                     self._record_acquired(state, role, acquired)
                     state["roles"][role]["constructor_sent_generation"] = None
                     result = {"page_id": acquired.page_id, "new_chat": True}

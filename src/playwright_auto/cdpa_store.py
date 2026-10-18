@@ -6422,6 +6422,37 @@ class TaskStore(IndependentAgentStoreMixin):
 
         return self.update(path, mutate)
 
+    @staticmethod
+    def _record_role_url_intent(
+        state: dict[str, Any],
+        *,
+        role: str,
+        url: str,
+        browser_endpoint_id: str,
+        external_command_id: str,
+    ) -> None:
+        record = state["roles"][role]
+        previous_url = str(record.get("page_url") or "").strip() or None
+        generation = int(record.get("role_url_generation") or 0) + 1
+        record["role_url_generation"] = generation
+        fresh = conversation_identity(url) is None
+        record["page_url"] = None if fresh else url
+        record["role_url_binding"] = {
+            "generation": generation,
+            "requested_url": url,
+            "status": "NEW_PENDING" if fresh else "PENDING",
+            "observed_url": None,
+            "error": None,
+        }
+        state.setdefault("role_url_revisions", []).append({
+            "role": role,
+            "url": url,
+            "previous_url": previous_url,
+            "browser_endpoint_id": browser_endpoint_id,
+            "changed_at": utc_now(),
+            "external_command_id": external_command_id,
+        })
+
     def change_role_url(
         self,
         path: str | Path,
@@ -6557,24 +6588,10 @@ class TaskStore(IndependentAgentStoreMixin):
                     and target_id in reserved_ids(state, str(other_role).upper(), other)
                 ):
                     raise ValueError(f"conversation is already assigned to role {other_role}")
-            generation = int(record.get("role_url_generation") or 0) + 1
-            record["role_url_generation"] = generation
-            record["page_url"] = None if target_id is None else normalized
-            record["role_url_binding"] = {
-                "generation": generation,
-                "requested_url": normalized,
-                "status": "NEW_PENDING" if target_id is None else "PENDING",
-                "observed_url": None,
-                "error": None,
-            }
-            state.setdefault("role_url_revisions", []).append({
-                "role": role,
-                "url": normalized,
-                "previous_url": current_url or None,
-                "browser_endpoint_id": pinned,
-                "changed_at": utc_now(),
-                "external_command_id": command_id,
-            })
+            self._record_role_url_intent(
+                state, role=role, url=normalized,
+                browser_endpoint_id=pinned, external_command_id=command_id,
+            )
             self._record_external_command(state, command_id)
             return state
 

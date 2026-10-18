@@ -311,6 +311,177 @@ def test_home_url_is_pending_not_durable_homepage(tmp_path):
     assert store.load(state["manifest_path"])["roles"]["PLAN"] == role
 
 
+@pytest.mark.parametrize("binding_status", ["PENDING", "BOUND", "NEW_PENDING"])
+def test_legacy_new_chat_supersedes_prior_url_intent_only_after_success(tmp_path, binding_status):
+    import asyncio
+    from copy import deepcopy
+    from pathlib import Path
+    from test_cdpa_worker import FakeActions
+
+    _config, store, state, worker = pinned_task(tmp_path, task_id="legacy-new-chat")
+
+    def paused(current):
+        parent = _active_hop(current)
+        parent.update(state="routed", conversation_url=PLAIN,
+                      receipt={"conversation_id": CID, "attempts": 1,
+                               "user_message_id": "accepted-user"})
+        worker._append_hop(current, source_role="PLAN", target_role="PLAN",
+                           handoff="Continue without replay", kind="handoff")
+        current.update(status="PAUSED", kanban_column="PAUSED",
+                       pause_reason="operator pause")
+        return current
+
+    state = store.update(state["manifest_path"], paused)
+    state = store.change_role_url(
+        state["manifest_path"], role="PLAN",
+        url="https://chatgpt.com/" if binding_status == "NEW_PENDING" else URL,
+        expected_browser_endpoint_id=state["browser_endpoint_id"],
+        external_command_id="prior-url",
+    )
+    state = store.update(state["manifest_path"], lambda current: (
+        current["roles"]["PLAN"]["role_url_binding"].update(
+            status=binding_status, page_id="old-page", error="previous binding error"
+        ), current
+    )[-1])
+    state = store.request_control(
+        state["manifest_path"], "new_chat", role="PLAN",
+        external_command_id="later-new-chat",
+    )
+    before = deepcopy(state)
+    actions = FakeActions()
+    asyncio.run(worker._apply_control(state, actions, Path(state["manifest_path"])))
+    saved = store.load(state["manifest_path"])
+    role = saved["roles"]["PLAN"]
+    control = saved["controls"][-1]
+    assert control["status"] == "applied"
+    assert control["result"]["new_chat"] is True
+    assert role["role_url_binding"] == {
+        "generation": 2, "requested_url": "https://chatgpt.com/",
+        "status": "NEW_PENDING", "observed_url": None, "error": None,
+        "page_id": control["result"]["page_id"],
+    }
+    assert role["page_url"] is None
+    assert role["page_id"] == control["result"]["page_id"]
+    assert role["role_url_generation"] == 2
+    assert role["conversation_generation"] == (
+        int(before["roles"]["PLAN"].get("conversation_generation") or 0) + 1
+    )
+    assert role["constructor_sent_generation"] is None
+    assert saved["browser_endpoint_id"] == before["browser_endpoint_id"]
+    assert saved["status"] == "PAUSED"
+    assert saved["pause_reason"] == before["pause_reason"]
+    assert saved["hops"] == before["hops"]
+    assert saved["role_url_revisions"][:-1] == before["role_url_revisions"]
+    revision = saved["role_url_revisions"][-1]
+    assert revision["url"] == "https://chatgpt.com/"
+    assert revision["previous_url"] == before["roles"]["PLAN"]["page_url"]
+    assert revision["external_command_id"] == "later-new-chat"
+    located = list(actions.located_roles)
+    asyncio.run(worker._reconcile_role_url_bindings(
+        saved, actions, endpoint_id=saved["browser_endpoint_id"],
+    ))
+    assert actions.located_roles == located
+    assert actions.fresh_calls == []
+    assert saved["hops"] == before["hops"]
+
+
+def test_legacy_new_chat_supersedes_prior_url_mailbox_command(tmp_path):
+    import asyncio
+    from pathlib import Path
+    from test_cdpa_worker import FakeActions
+
+    _config, store, state, worker = pinned_task(tmp_path, task_id="legacy-new-chat-mailbox")
+    worker.hydrate_runtime()
+    worker.runtime_db.enqueue_command(
+        command_id="old-url", idempotency_key="old-url",
+        kind="change_role_url", task_id=state["task_id"],
+        expected_task_version=None,
+        payload={"role": "PLAN", "url": URL,
+                 "expected_browser_endpoint_id": state["browser_endpoint_id"]},
+    )
+    assert worker.dispatch_command_once()["status"] == "accepted"
+    state = store.request_control(state["manifest_path"], "new_chat", role="PLAN")
+    asyncio.run(worker._apply_control(state, FakeActions(), Path(state["manifest_path"])))
+    saved = store.load(state["manifest_path"])
+    assert saved["controls"][-1]["status"] == "applied"
+    worker._sync_role_url_command(saved)
+    prior = worker.runtime_db.get_command("old-url")
+    assert prior["status"] == "failed"
+    assert "supersed" in prior["error"].lower()
+    assert saved["role_url_revisions"][-1]["external_command_id"] == (
+        state["controls"][-1]["command"]["command_id"]
+    )
+
+
+def test_concurrent_change_url_fences_legacy_new_chat_persistence(tmp_path):
+    import asyncio
+    from pathlib import Path
+    from test_cdpa_worker import FakeActions
+
+    _config, store, state, worker = pinned_task(tmp_path, task_id="legacy-new-chat-race")
+    state = store.change_role_url(
+        state["manifest_path"], role="PLAN", url=URL,
+        expected_browser_endpoint_id=state["browser_endpoint_id"],
+        external_command_id="prior-url",
+    )
+    state = store.request_control(
+        state["manifest_path"], "new_chat", role="PLAN",
+        external_command_id="queued-new-chat",
+    )
+
+    class ConcurrentActions(FakeActions):
+        async def new_chat(self, current, role):
+            store.change_role_url(
+                current["manifest_path"], role=role, url=OTHER_URL,
+                expected_browser_endpoint_id=current["browser_endpoint_id"],
+                external_command_id="concurrent-url",
+            )
+            return await super().new_chat(current, role)
+
+    with pytest.raises(ValueError, match="task changed"):
+        asyncio.run(worker._apply_control(
+            state, ConcurrentActions(), Path(state["manifest_path"]),
+        ))
+    saved = store.load(state["manifest_path"])
+    assert saved["roles"]["PLAN"]["page_url"] == OTHER_URL
+    assert saved["roles"]["PLAN"]["role_url_generation"] == 2
+    assert saved["roles"]["PLAN"]["role_url_binding"]["requested_url"] == OTHER_URL
+    assert saved["controls"][-1]["status"] == "requested"
+    assert [item["external_command_id"] for item in saved["role_url_revisions"]] == [
+        "prior-url", "concurrent-url",
+    ]
+
+
+def test_failed_legacy_new_chat_preserves_prior_url_intent(tmp_path):
+    import asyncio
+    from copy import deepcopy
+    from pathlib import Path
+    from test_cdpa_worker import FakeActions
+
+    _config, store, state, worker = pinned_task(tmp_path, task_id="failed-legacy-new-chat")
+    state = store.change_role_url(
+        state["manifest_path"], role="PLAN", url=URL,
+        expected_browser_endpoint_id=state["browser_endpoint_id"],
+        external_command_id="prior-url",
+    )
+    state = store.request_control(
+        state["manifest_path"], "new_chat", role="PLAN",
+        external_command_id="failed-new-chat",
+    )
+    before = deepcopy(state)
+
+    class FailedActions(FakeActions):
+        async def new_chat(self, *_args):
+            raise RuntimeError("New Chat failed before acquisition")
+
+    asyncio.run(worker._apply_control(state, FailedActions(), Path(state["manifest_path"])))
+    saved = store.load(state["manifest_path"])
+    assert saved["controls"][-1]["status"] == "rejected"
+    assert "New Chat failed" in saved["controls"][-1]["result"]
+    for key in ("roles", "role_url_revisions", "hops", "status"):
+        assert saved[key] == before[key]
+
+
 def test_stale_receipt_cannot_replace_new_desired_role_url(tmp_path):
     _config, store, state, worker = pinned_task(tmp_path, task_id="url-stale-receipt")
     state = store.update(state["manifest_path"], lambda s: (
