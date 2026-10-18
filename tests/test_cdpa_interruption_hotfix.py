@@ -219,7 +219,10 @@ def test_automatic_reopen_is_background_by_default():
 
 @pytest.mark.parametrize(
     ("initial", "expected_clicks"),
-    [("Medium", 1), ("Extra High", 0), ("5.6 Extra High", 0), ("GPT-5.6 Extra High", 0)],
+    [
+        ("Medium", 1), ("High", 0), ("5.6 High", 0), ("GPT-5.6 High", 0),
+        ("Extra High", 0), ("5.6 Extra High", 0), ("GPT-5.6 Extra High", 0),
+    ],
 )
 def test_extra_high_selection_is_verified_and_already_correct_does_not_click(initial, expected_clicks):
     async def run(page):
@@ -227,11 +230,12 @@ def test_extra_high_selection_is_verified_and_already_correct_does_not_click(ini
         client.binding = PageBinding("page-1", "DEV")
         await client.ensure_extra_high()
         selected = await page.get_by_role("button", name="Select ChatGPT model", exact=True).inner_text()
-        assert selected in {"Extra High", "5.6 Extra High", "GPT-5.6 Extra High"}
+        assert selected.endswith("High")
         assert await page.evaluate("window.clicks || 0") == expected_clicks
     body = f'''<main><div contenteditable="true" role="textbox"></div></main>
     <button aria-label="Select ChatGPT model" onclick="window.clicks=(window.clicks||0)+1;document.querySelector('[role=menu]').hidden=false">{initial}</button>
-    <div role="menu" hidden><button role="menuitemradio" onclick="document.querySelector('button[aria-label]').textContent='Extra High';this.parentElement.hidden=true">Extra High</button></div>'''
+    <div role="menu" hidden><button role="menuitemradio" onclick="document.querySelector('button[aria-label]').textContent='High';this.parentElement.hidden=true">High</button>
+    <button role="menuitemradio" onclick="document.querySelector('button[aria-label]').textContent='Extra High';this.parentElement.hidden=true">Extra High</button></div>'''
     asyncio.run(_with_page(body, run))
 
 
@@ -322,7 +326,8 @@ def test_stop_action_treats_button_disappearance_as_completed_transition():
     asyncio.run(_with_page('<main></main>', run))
 
 
-def test_atomic_send_accepts_version_prefixed_extra_high(monkeypatch):
+@pytest.mark.parametrize("model_label", ["5.6 Extra High", "GPT-5.6 High"])
+def test_atomic_send_accepts_allowed_version_prefixed_model(monkeypatch, model_label):
     import playwright_auto.chatgpt as module
     async def no_delay(*args, **kwargs):
         pass
@@ -330,12 +335,13 @@ def test_atomic_send_accepts_version_prefixed_extra_high(monkeypatch):
     async def run(page):
         await module.click_send_button(page, expected_prompt="prompt", require_extra_high=True)
         assert await page.evaluate("window.sent || 0") == 1
-    asyncio.run(_with_page('''<button aria-label="Select ChatGPT model">5.6 Extra High</button>
+    asyncio.run(_with_page(f'''<button aria-label="Select ChatGPT model">{model_label}</button>
         <main><form><div contenteditable="true" role="textbox">prompt</div>
         <button type="button" aria-label="Send" onclick="window.sent=1">Send</button></form></main>''', run))
 
 
-def test_atomic_send_refuses_model_downgrade_before_dispatch(monkeypatch):
+@pytest.mark.parametrize("model_label", ["Medium", "Auto", "Pro", "Super High-ish"])
+def test_atomic_send_refuses_model_downgrade_before_dispatch(monkeypatch, model_label):
     import playwright_auto.chatgpt as module
     async def no_delay(*args, **kwargs):
         pass
@@ -344,7 +350,7 @@ def test_atomic_send_refuses_model_downgrade_before_dispatch(monkeypatch):
         with pytest.raises(UnsafePageStateError, match="model"):
             await module.click_send_button(page, expected_prompt="prompt", require_extra_high=True)
         assert await page.evaluate("window.sent || 0") == 0
-    asyncio.run(_with_page('''<button aria-label="Select ChatGPT model">Medium</button>
+    asyncio.run(_with_page(f'''<button aria-label="Select ChatGPT model">{model_label}</button>
         <main><form><div contenteditable="true" role="textbox">prompt</div>
         <button aria-label="Send" onclick="window.sent=1">Send</button></form></main>''', run))
 
@@ -364,10 +370,84 @@ def test_model_selection_never_mutates_streaming_or_manual_draft(active, draft):
     asyncio.run(_with_page(body, run))
 
 
-def test_missing_extra_high_fails_closed_without_send():
+def test_missing_allowed_model_selector_fails_closed_without_send():
     async def run(page):
         client = ChatGPTPage(page, timeout_ms=100)
         client.binding = PageBinding("page-1", "DEV")
-        with pytest.raises(UnsafePageStateError, match="Extra High"):
+        with pytest.raises(
+            UnsafePageStateError,
+            match="model_selection_unverified:menu_open",
+        ):
             await client.ensure_extra_high()
     asyncio.run(_with_page('<main><div contenteditable="true" role="textbox"></div></main>', run))
+
+
+
+
+
+@pytest.mark.parametrize(
+    ("stage", "body"),
+    [
+        (
+            "menu_open",
+            '''<main><div contenteditable="true" role="textbox"></div></main>
+            <button aria-label="Select ChatGPT model" disabled>Medium</button>''',
+        ),
+        (
+            "option_find",
+            '''<main><div contenteditable="true" role="textbox"></div></main>
+            <button aria-label="Select ChatGPT model" onclick="document.querySelector('[role=menu]').hidden=false">Medium</button>
+            <div role="menu" hidden><button role="menuitemradio">Medium</button></div>''',
+        ),
+        (
+            "option_click",
+            '''<main><div contenteditable="true" role="textbox"></div></main>
+            <button aria-label="Select ChatGPT model" onclick="document.querySelector('[role=menu]').hidden=false">Medium</button>
+            <div role="menu" hidden><button role="menuitemradio" disabled>Extra High</button></div>''',
+        ),
+        (
+            "label_verify",
+            '''<main><div contenteditable="true" role="textbox"></div></main>
+            <button aria-label="Select ChatGPT model" onclick="document.querySelector('[role=menu]').hidden=false">Medium</button>
+            <div role="menu" hidden><button role="menuitemradio">Extra High</button></div>''',
+        ),
+    ],
+)
+def test_model_selection_failure_reports_exact_stage(stage, body):
+    async def run(page):
+        client = ChatGPTPage(page, timeout_ms=100)
+        client.binding = PageBinding("page-1", "DEV")
+        with pytest.raises(UnsafePageStateError, match=rf"model_selection_unverified:{stage}"):
+            await client.ensure_extra_high()
+
+    asyncio.run(_with_page(body, run))
+
+
+
+
+
+
+def test_model_selection_does_not_touch_menu_with_manual_attachment():
+    from dataclasses import replace
+    from playwright_auto.chatgpt import ComposerConflictError
+
+    class DummyPage:
+        touched = False
+
+        def get_by_role(self, *_args, **_kwargs):
+            self.touched = True
+            raise AssertionError("model selector must not be touched")
+
+    class Client(ChatGPTPage):
+        def __init__(self):
+            self.page = DummyPage()
+            self.timeout_ms = 100
+            self.binding = PageBinding("page-1", "DEV")
+
+        async def assert_ownership(self):
+            return replace(snapshot(), attachment_markers=("manual.pdf",))
+
+    client = Client()
+    with pytest.raises(ComposerConflictError, match="attachments"):
+        asyncio.run(client.ensure_extra_high())
+    assert client.page.touched is False

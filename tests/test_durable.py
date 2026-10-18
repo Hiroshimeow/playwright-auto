@@ -1457,3 +1457,92 @@ def test_frontend_identity_callback_does_not_mutate_completed_record(tmp_path):
         return result
 
     asyncio.run(run())
+
+def test_model_preflight_precedes_composer_and_reuses_same_pristine_request(tmp_path):
+    from dataclasses import replace
+    from playwright_auto.chatgpt import ChatGPTPage
+
+    class DummyPage:
+        pass
+
+    class Client(ChatGPTPage):
+        def __init__(self):
+            self.page = DummyPage()
+            self.binding = PageBinding("page-1", "DEV")
+            self.current = replace(
+                snapshot(), page_task_id="task-model", page_team="alpha"
+            )
+            self.model_ready = False
+            self.events = []
+            self.send_options = None
+
+        async def assert_ownership(self):
+            return self.current
+
+        async def ensure_extra_high(self, **_options):
+            self.events.append("model")
+            if not self.model_ready:
+                raise UnsafePageStateError(
+                    "model_selection_unverified:label_verify: injected pre-Send failure"
+                )
+
+        async def set_text(self, text):
+            self.events.append("set_text")
+            self.current = replace(
+                self.current,
+                composer_text=text,
+                send_visible=True,
+                send_enabled=True,
+                state=ChatGPTState.DRAFT,
+            )
+
+        async def send(self, text, **options):
+            self.events.append("send")
+            self.send_options = options
+            return SendReceipt(
+                prompt=text,
+                prompt_sha256=prompt_digest(text),
+                binding=self.binding,
+                baseline=capture_message_baseline(self.current.messages),
+                attempts=1,
+                accepted_via="assistant_activity",
+                session_id_before=self.current.session_id,
+            )
+
+    client = Client()
+    ledger_path = tmp_path / "model-preflight.json"
+    block = DurableSendBlock(
+        "model before composer",
+        ledger_path=ledger_path,
+        request_id="request-model-preflight",
+        source_context={
+            "task_id": "task-model",
+            "team": "alpha",
+            "hop_id": 1,
+            "manifest": "manifest.json",
+        },
+        render_request_marker=False,
+        wait_for_response=False,
+        max_attempts=1,
+        recovery_reload=False,
+    )
+
+    with pytest.raises(WorkflowExecutionError) as captured:
+        run_block(block, client)
+    assert isinstance(captured.value.cause, UnsafePageStateError)
+    before = RequestLedger(ledger_path).get("request-model-preflight")
+    assert before is not None
+    assert before.status is RequestStatus.NEW
+    assert before.attempts == 0
+    assert client.events == ["model"]
+
+    client.model_ready = True
+    run_block(block, client)
+
+    after = RequestLedger(ledger_path).get("request-model-preflight")
+    assert after is not None
+    assert after.request_id == before.request_id
+    assert after.status is RequestStatus.SENT
+    assert after.attempts == 1
+    assert client.events == ["model", "model", "set_text", "send"]
+    assert client.send_options["model_preverified"] is True

@@ -429,7 +429,65 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
                 f"{record.error}"
             )
 
+        source_task_id: str | None = None
+        source_team: str | None = None
+        preboundary_model_check = bool(
+            int(record.attempts or 0) == 0
+            and record.status
+            not in {RequestStatus.SENDING, RequestStatus.SENT, RequestStatus.COMPLETED}
+        )
+        if preboundary_model_check and isinstance(record.source_context, Mapping):
+            raw_task_id = record.source_context.get("task_id")
+            raw_team = record.source_context.get("team")
+            if raw_task_id is not None or raw_team is not None:
+                provenance_task_id = str(raw_task_id or "").strip() or None
+                provenance_team = str(raw_team or "").strip() or None
+                if provenance_task_id is None or provenance_team is None:
+                    raise DurableRequestError(
+                        "durable source context has incomplete task/team ownership"
+                    )
+                if context.client.binding.role != "MAINTAINERS":
+                    source_task_id = provenance_task_id
+                    source_team = provenance_team
+
         snapshot = await context.client.assert_ownership()
+        model_preverified = False
+        if (
+            source_task_id is not None
+            and isinstance(context.client, ChatGPTPage)
+            and preboundary_model_check
+        ):
+            if (
+                snapshot.page_task_id != source_task_id
+                or snapshot.page_team != source_team
+            ):
+                raise DurableRequestError(
+                    "durable task/team ownership does not match before model selection"
+                )
+            expected_before_model = tuple(item.name for item in identities)
+            if (
+                snapshot.attachment_markers
+                and not attachment_names_match(
+                    snapshot.attachment_markers, expected_before_model
+                )
+            ):
+                raise DurableRequestError(
+                    "durable attachment identity changed before model selection"
+                )
+            await context.client.ensure_extra_high(
+                expected_prompt=record.rendered_prompt,
+                allow_attachments=bool(identities),
+            )
+            snapshot = await context.client.assert_ownership()
+            if (
+                snapshot.page_task_id != source_task_id
+                or snapshot.page_team != source_team
+            ):
+                raise DurableRequestError(
+                    "durable task/team ownership changed during model selection"
+                )
+            model_preverified = True
+
         snapshot = await self._clear_pristine_composer(
             context,
             record,
@@ -622,28 +680,13 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
                 before_send,
                 context.client.assert_ownership,
             )
-        source_task_id: str | None = None
-        source_team: str | None = None
-        if isinstance(record.source_context, Mapping):
-            raw_task_id = record.source_context.get("task_id")
-            raw_team = record.source_context.get("team")
-            if raw_task_id is not None or raw_team is not None:
-                provenance_task_id = str(raw_task_id or "").strip() or None
-                provenance_team = str(raw_team or "").strip() or None
-                if provenance_task_id is None or provenance_team is None:
-                    raise DurableRequestError(
-                        "durable source context has incomplete task/team ownership"
-                    )
-                if context.client.binding.role != "MAINTAINERS":
-                    source_task_id = provenance_task_id
-                    source_team = provenance_team
-                    if (
-                        before_send.page_task_id != source_task_id
-                        or before_send.page_team != source_team
-                    ):
-                        raise DurableRequestError(
-                            "durable task/team ownership does not match before send"
-                        )
+        if source_task_id is not None and (
+            before_send.page_task_id != source_task_id
+            or before_send.page_team != source_team
+        ):
+            raise DurableRequestError(
+                "durable task/team ownership does not match before send"
+            )
         if not visible_text_matches(before_send.composer_text, record.rendered_prompt):
             raise DurableRequestError(
                 "exact durable prompt ownership was lost before send"
@@ -656,11 +699,14 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
         validated_upload_receipt = (
             _validate_upload_receipt(record, identities) if identities else None
         )
-        if source_task_id is not None and isinstance(context.client, ChatGPTPage):
-            await context.client.ensure_extra_high(
-                expected_prompt=record.rendered_prompt, allow_attachments=bool(identities),
+        if (
+            source_task_id is not None
+            and isinstance(context.client, ChatGPTPage)
+            and not model_preverified
+        ):
+            raise DurableRequestError(
+                "task-owned durable Send reached boundary without model verification"
             )
-            before_send = await context.client.assert_ownership()
         baseline = capture_message_baseline(
             before_send.messages, before_send.logical_turn_ids
         )
@@ -679,6 +725,8 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
                 "expected_task_id": source_task_id,
                 "expected_team": source_team,
             }
+            if isinstance(context.client, ChatGPTPage):
+                send_ownership["model_preverified"] = model_preverified
         if self.require_existing_conversation_baseline:
             send_ownership["require_existing_conversation_baseline"] = True
         if validated_upload_receipt is not None:

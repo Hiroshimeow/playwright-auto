@@ -7510,6 +7510,21 @@ class CDPAWorker:
         except UnsafePageStateError as exc:
             current_record = ledger.peek(str(hop["request_id"]))
             if (
+                str(exc).startswith("model_selection_unverified:")
+                and self._is_pristine_preboundary_request_record(
+                    state, hop, current_record
+                )
+            ):
+                self._pause_recovery(
+                    state,
+                    code="model_selection_unverified",
+                    reason=(
+                        f"{sanitize_exception(exc)} "
+                        "Set High or Extra High manually on the exact owned tab, then Resume."
+                    ),
+                )
+                return
+            if (
                 self._should_observe_existing_response(exc)
                 and self._is_pristine_preboundary_request_record(
                     state, hop, current_record

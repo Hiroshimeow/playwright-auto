@@ -105,14 +105,18 @@ TASK_ID_STORAGE_KEY = "playwright-auto:task-id"
 TEAM_STORAGE_KEY = "playwright-auto:team"
 BINDING_ID_STORAGE_KEY = "playwright-auto:binding-id"
 ATTACHMENT_OWNERSHIP_WINDOW_KEY = "__playwrightAutoAttachmentOwnershipV1"
-_EXTRA_HIGH_LABEL_PATTERN = re.compile(
-    r"^(?:(?:GPT[- ]?)?\d+(?:\.\d+)*\s+)?Extra High$",
+_ALLOWED_THINKING_LEVEL_LABEL_PATTERN = re.compile(
+    r"^(?:(?:GPT[- ]?)?\d+(?:\.\d+)*\s+)?(?:Extra High|High)$",
     re.IGNORECASE,
 )
 
 
-def _is_extra_high_label(value: str) -> bool:
-    return bool(_EXTRA_HIGH_LABEL_PATTERN.fullmatch(normalize_visible_text(value)))
+def _is_allowed_thinking_level_label(value: str) -> bool:
+    return bool(
+        _ALLOWED_THINKING_LEVEL_LABEL_PATTERN.fullmatch(
+            normalize_visible_text(value)
+        )
+    )
 
 
 SELECTORS = {
@@ -892,8 +896,10 @@ async def click_send_button(
           );
           const editable = (element) => Boolean(element && element.isContentEditable);
           const text = (element) => (element?.innerText || '').replace(/\s+/g, ' ').trim();
-          const isExtraHighLabel = (value) =>
-            /^(?:(?:GPT[- ]?)?\d+(?:\.\d+)*\s+)?Extra High$/i.test(String(value || '').replace(/\s+/g, ' ').trim());
+          const isAllowedThinkingLevelLabel = (value) =>
+            /^(?:(?:GPT[- ]?)?\d+(?:\.\d+)*\s+)?(?:Extra High|High)$/i.test(
+              String(value || '').replace(/\s+/g, ' ').trim()
+            );
 
           const conversationId = (path) => {
             const match = String(path || '').match(
@@ -973,8 +979,8 @@ async def click_send_button(
           const validatePageState = () => {
             if (requireExtraHigh) {
               const models = [...document.querySelectorAll('button[aria-label="Select ChatGPT model"]')].filter(visible);
-              if (models.length !== 1 || !isExtraHighLabel(text(models[0])))
-                return {ok: false, method: 'page_state_conflict', reason: 'model_extra_high_not_verified'};
+              if (models.length !== 1 || !isAllowedThinkingLevelLabel(text(models[0])))
+                return {ok: false, method: 'page_state_conflict', reason: 'model_allowed_level_not_verified'};
             }
             const retry = firstVisible('[data-testid="regenerate-thread-error-button"]');
             const errorAlert = [...document.querySelectorAll('[role="alert"]')]
@@ -4119,39 +4125,98 @@ class ChatGPTPage:
             raise ComposerConflictError("model selection would mutate an operator-owned draft")
         selector = self.page.get_by_role("button", name="Select ChatGPT model", exact=True)
         if await selector.count() != 1:
-            raise UnsafePageStateError("Extra High model selector is missing or ambiguous")
-        if _is_extra_high_label(await selector.inner_text()):
+            raise UnsafePageStateError(
+                "model_selection_unverified:menu_open: model selector is missing or ambiguous"
+            )
+        if _is_allowed_thinking_level_label(await selector.inner_text()):
             return
         try:
             await selector.click(timeout=timeout_ms)
-            # Official rendered menu only; never invoke internal React/model APIs.
-            option = self.page.locator(
-                '[role="menu"] [role="menuitemradio"], [role="menu"] [role="menuitem"], '
-                '[role="dialog"] [role="radio"], [role="menu"] button'
-            ).filter(has_text=re.compile(r"^\s*(?:(?:GPT[- ]?)?\d+(?:\.\d+)*\s+)?Extra High\s*$", re.IGNORECASE))
-            await option.first.wait_for(state="visible", timeout=timeout_ms)
-            if await option.count() != 1:
-                raise UnsafePageStateError("Extra High option is missing or ambiguous")
-            current = await self.assert_ownership()
-            self._assert_interaction_safe(
-                current, allow_dialogs=True, allow_attachments=allow_attachments,
+        except PlaywrightTimeoutError as exc:
+            raise UnsafePageStateError(
+                "model_selection_unverified:menu_open: model menu could not be opened"
+            ) from exc
+
+        option_selector = (
+            '[role="menu"] [role="menuitemradio"], [role="menu"] [role="menuitem"], '
+            '[role="dialog"] [role="radio"], [role="menu"] button'
+        )
+        options = self.page.locator(option_selector)
+        extra_high = options.filter(
+            has_text=re.compile(
+                r"^\s*(?:(?:GPT[- ]?)?\d+(?:\.\d+)*\s+)?Extra High\s*$",
+                re.IGNORECASE,
             )
-            if current.url != snapshot.url or current.composer_text != snapshot.composer_text or current.attachment_markers != snapshot.attachment_markers:
-                raise ComposerConflictError("page or composer changed before model selection")
+        )
+        high = options.filter(
+            has_text=re.compile(
+                r"^\s*(?:(?:GPT[- ]?)?\d+(?:\.\d+)*\s+)?High\s*$",
+                re.IGNORECASE,
+            )
+        )
+        extra_count = await extra_high.count()
+        high_count = await high.count()
+        if extra_count == 1:
+            option = extra_high.first
+        elif extra_count > 1:
+            raise UnsafePageStateError(
+                "model_selection_unverified:option_find: Extra High option is ambiguous"
+            )
+        elif high_count == 1:
+            option = high.first
+        elif high_count > 1:
+            raise UnsafePageStateError(
+                "model_selection_unverified:option_find: High option is ambiguous"
+            )
+        else:
+            raise UnsafePageStateError(
+                "model_selection_unverified:option_find: no High or Extra High option is available"
+            )
+
+        try:
+            await option.wait_for(state="visible", timeout=timeout_ms)
+        except PlaywrightTimeoutError as exc:
+            raise UnsafePageStateError(
+                "model_selection_unverified:option_find: allowed model option is not visible"
+            ) from exc
+
+        current = await self.assert_ownership()
+        self._assert_interaction_safe(
+            current, allow_dialogs=True, allow_attachments=allow_attachments,
+        )
+        if (
+            current.url != snapshot.url
+            or current.composer_text != snapshot.composer_text
+            or current.attachment_markers != snapshot.attachment_markers
+        ):
+            raise ComposerConflictError("page or composer changed before model selection")
+
+        try:
             await option.click(timeout=timeout_ms)
+        except PlaywrightTimeoutError as exc:
+            raise UnsafePageStateError(
+                "model_selection_unverified:option_click: allowed model option could not be clicked"
+            ) from exc
+
+        try:
             await self.page.wait_for_function(
                 """() => [...document.querySelectorAll('button[aria-label="Select ChatGPT model"]')]
-                    .filter(b => /^(?:(?:GPT[- ]?)?\\d+(?:\\.\\d+)*\\s+)?Extra High$/i.test((b.innerText || '').replace(/\\s+/g, ' ').trim())).length === 1""",
+                    .filter(b => /^(?:(?:GPT[- ]?)?\\d+(?:\\.\\d+)*\\s+)?(?:Extra High|High)$/i.test((b.innerText || '').replace(/\\s+/g, ' ').trim())).length === 1""",
                 timeout=timeout_ms,
             )
         except PlaywrightTimeoutError as exc:
-            raise UnsafePageStateError("Extra High selection could not be verified; Send refused") from exc
+            raise UnsafePageStateError(
+                "model_selection_unverified:label_verify: selected model label did not verify"
+            ) from exc
+
         post = await self.assert_ownership()
         self._assert_interaction_safe(post, allow_attachments=allow_attachments)
         if post.url != snapshot.url or post.composer_text != snapshot.composer_text or post.attachment_markers != snapshot.attachment_markers:
             raise ComposerConflictError("page or composer changed during model selection")
-        if not _is_extra_high_label(await selector.inner_text()):
-            raise UnsafePageStateError("Extra High selection changed before Send")
+        if not _is_allowed_thinking_level_label(await selector.inner_text()):
+            raise UnsafePageStateError(
+                "model_selection_unverified:label_verify: selected model changed before Send"
+            )
 
     async def send(
         self,
@@ -4167,6 +4232,7 @@ class ChatGPTPage:
         expected_attachment_count: int = 0,
         expected_attachment_names: Sequence[str] | None = None,
         require_existing_conversation_baseline: bool = False,
+        model_preverified: bool = False,
     ) -> SendReceipt:
         prompt = text.strip()
         if not prompt:
@@ -4238,17 +4304,18 @@ class ChatGPTPage:
 
             for attempt in range(1, max_attempts + 1):
                 try:
+                    if explicit_task_id is not None and not model_preverified:
+                        await self._ensure_extra_high_locked(
+                            timeout_ms=timeout,
+                            expected_prompt=prompt,
+                            allow_attachments=expected_count > 0,
+                        )
                     await self._prepare_prompt_locked(
                         prompt,
                         timeout,
                         expected_attachment_count=expected_count,
                         expected_attachment_names=expected_names,
                     )
-                    if explicit_task_id is not None:
-                        await self._ensure_extra_high_locked(
-                            timeout_ms=timeout, expected_prompt=prompt,
-                            allow_attachments=expected_count > 0,
-                        )
                     pre_send = await self.assert_ownership()
                     baseline = capture_message_baseline(
                         pre_send.messages, pre_send.logical_turn_ids

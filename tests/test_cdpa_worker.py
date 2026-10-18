@@ -7064,3 +7064,73 @@ def test_normal_cdpa_send_uses_single_attempt_no_recovery_reload(tmp_path: Path)
     assert client.send_recovery_reload == [False], (
         f"Normal CDPA send must use recovery_reload=False, got {client.send_recovery_reload}"
     )
+
+
+
+@pytest.mark.parametrize("stage", ["menu_open", "option_find", "option_click", "label_verify"])
+def test_model_selection_preboundary_failure_pauses_without_crossing_send(
+    tmp_path: Path, monkeypatch, stage: str
+):
+    _config, _store, state, worker = setup_task(
+        tmp_path, task_id=f"task-model-pause-{stage}"
+    )
+    hop = _active_hop(state)
+    hop["prompt"] = "model pause prompt"
+    hop["prompt_sha256"] = worker_module._sha(hop["prompt"])
+    hop["state"] = "sending"
+    state["status"] = "RUNNING"
+    state["active_action"] = "send"
+
+    ledger = RequestLedger(hop["ledger_path"])
+    constructor = worker_module.task_workflow_definitions(
+        state, worker.config
+    )[hop["target_role"]]["system_prompt"]
+    record = ledger.begin(
+        role=hop["physical_role"],
+        prompt=hop["prompt"],
+        source_context={
+            "task_id": state["task_id"],
+            "team": state["team"],
+            "hop_id": hop["hop_id"],
+            "manifest": state["manifest_path"],
+        },
+        role_prompt_hash=worker_module._sha(constructor),
+        request_id=hop["request_id"],
+        render_request_marker=False,
+    )
+
+    acquired = AcquiredRole(
+        client=SimpleNamespace(),
+        page_id="page-plan",
+        url="https://chatgpt.com/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        created=False,
+        new_chat=False,
+    )
+
+    async def owned(*_args, **_kwargs):
+        return acquired
+
+    async def fail_model(_self, _context):
+        raise UnsafePageStateError(
+            f"model_selection_unverified:{stage}: injected failure"
+        )
+
+    monkeypatch.setattr(worker, "_owned_or_block", owned)
+    monkeypatch.setattr(
+        worker, "_dismiss_known_rate_limit_on_existing", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(
+        worker, "_arm_passive_request_observer", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(worker_module.DurableSendBlock, "run", fail_model)
+
+    asyncio.run(worker._sending(state, hop, FakeActions()))
+
+    durable = ledger.get(record.request_id)
+    assert durable is not None
+    assert durable.status is RequestStatus.NEW
+    assert durable.attempts == 0
+    assert state["status"] == "PAUSED"
+    assert state["block_code"] == "model_selection_unverified"
+    assert stage in state["block_reason"]
+    assert "High or Extra High" in state["pause_reason"]
