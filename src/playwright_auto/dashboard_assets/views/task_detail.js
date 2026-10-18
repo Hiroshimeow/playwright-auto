@@ -334,6 +334,17 @@ function rolesSection(detail, selectedRole, endpoints = []) {
     } else {
       urlArea.append(el("span", item.unallocated ? "No tab allocated" : "No conversation URL yet", "muted role-url-empty"));
     }
+    const binding = role.url_binding;
+    if (binding && binding.status !== 'BOUND') {
+      urlArea.append(el('span', `Change URL: ${binding.status}`, 'muted'));
+      if (binding.requested_url && !role.chat_url) {
+        urlArea.append(el('code', binding.requested_url, 'role-url'));
+      }
+      if (binding.error) urlArea.append(el('span', binding.error, 'muted'));
+    }
+    if (role.observed_chat_url && role.observed_chat_url !== role.chat_url) {
+      urlArea.append(el('span', `Observed browser: ${role.observed_chat_url}`, 'muted'));
+    }
     row.append(urlArea);
     roleList.append(row);
   }

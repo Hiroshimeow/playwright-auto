@@ -38,9 +38,31 @@ COMPOSER_RESOLVER_JS = r"""() => {
 }"""
 
 
+# Read exactly the editor's semantic text, excluding only ChatGPT-generated
+# rich-link icon chrome. Restore presentation before returning from the same JS turn.
+COMPOSER_SEMANTIC_TEXT_JS = r"""element => {
+  if (!element) return '';
+  const icons = [...element.querySelectorAll(
+    '[data-rich-text-generated-autolink][text-link-href] [data-inline-url-icon]'
+  )];
+  if (!icons.length) return element.innerText || '';
+  const styles = icons.map(icon => icon.getAttribute('style'));
+  try {
+    icons.forEach(icon => icon.style.setProperty('display', 'none', 'important'));
+    return element.innerText || '';
+  } finally {
+    icons.forEach((icon, index) => {
+      if (styles[index] === null) icon.removeAttribute('style');
+      else icon.setAttribute('style', styles[index]);
+    });
+  }
+}"""
+
+
 COMPOSER_REPLACE_TEXT_JS = r"""targetText => {
   const resolve = __CDPA_COMPOSER_RESOLVER__;
   const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
+  const semanticText = (__CDPA_COMPOSER_SEMANTIC_TEXT__);
   const result = (owner, status, text = null) => ({
     status,
     text,
@@ -51,7 +73,7 @@ COMPOSER_REPLACE_TEXT_JS = r"""targetText => {
   if (owner.ambiguous) return result(owner, 'ambiguous');
   const element = owner.element;
   if (!element) return result(owner, 'missing');
-  const before = normalize(element.innerText);
+  const before = normalize(semanticText(element));
   element.focus();
   const afterFocus = resolve();
   if (!element.isConnected || afterFocus.element !== element) {
@@ -60,8 +82,8 @@ COMPOSER_REPLACE_TEXT_JS = r"""targetText => {
   if (document.activeElement !== element && !element.contains(document.activeElement)) {
     return result(afterFocus, 'focus_stolen', before);
   }
-  if (normalize(element.innerText) !== before) {
-    return result(afterFocus, 'content_changed', normalize(element.innerText));
+  if (normalize(semanticText(element)) !== before) {
+    return result(afterFocus, 'content_changed', normalize(semanticText(element)));
   }
   const expected = normalize(targetText);
   if (before === expected) return result(afterFocus, 'unchanged', before);
@@ -73,8 +95,10 @@ COMPOSER_REPLACE_TEXT_JS = r"""targetText => {
   // mutation and readback stay in one callback, so no later keyboard event can
   // be redirected to another editable node.
   const edited = document.execCommand(targetText ? 'insertText' : 'delete', false, targetText);
-  return result(afterFocus, edited ? 'edited' : 'unsupported', normalize(element.innerText));
-}""".replace('__CDPA_COMPOSER_RESOLVER__', COMPOSER_RESOLVER_JS)
+  return result(afterFocus, edited ? 'edited' : 'unsupported', normalize(semanticText(element)));
+}""".replace('__CDPA_COMPOSER_RESOLVER__', COMPOSER_RESOLVER_JS).replace(
+    '__CDPA_COMPOSER_SEMANTIC_TEXT__', COMPOSER_SEMANTIC_TEXT_JS
+)
 
 
 async def replace_owned_composer_text(

@@ -27,6 +27,7 @@ from .chatgpt_backend import (
 from .chatgpt_composer import (
     COMPOSER_REPLACE_TEXT_JS as _COMPOSER_REPLACE_TEXT_JS,
     COMPOSER_RESOLVER_JS as _COMPOSER_RESOLVER_JS,
+    COMPOSER_SEMANTIC_TEXT_JS as _COMPOSER_SEMANTIC_TEXT_JS,
     replace_owned_composer_text as _replace_owned_composer_text,
 )
 from .chatgpt_errors import (
@@ -1613,8 +1614,9 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             element && window.getComputedStyle(element).visibility !== 'hidden' &&
             (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
           );
+          const semanticText = (__CDPA_COMPOSER_SEMANTIC_TEXT__);
           const boundedText = (element, limit = 512) => {
-            const value = (element?.innerText || element?.textContent || '')
+            const value = (element?.isContentEditable ? semanticText(element) : (element?.innerText || element?.textContent || ''))
               .replace(/\s+/g, ' ').trim();
             return value.length <= limit ? value : value.slice(0, limit);
           };
@@ -1813,6 +1815,8 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
           };
           return true;
         }""".replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS).replace(
+            '__CDPA_COMPOSER_SEMANTIC_TEXT__', _COMPOSER_SEMANTIC_TEXT_JS
+        ).replace(
             '__CDPA_RESPONSE_PROJECTION__', RESPONSE_PROJECTION_JS
         ).replace('__CDPA_RETRY_RESOLVER__', RETRY_RESOLVER_JS)
 
@@ -1924,7 +1928,8 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
               (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
             );
           };
-          const text = (element) => (element?.innerText || "").replace(/\s+/g, " ").trim();
+          const semanticText = (__CDPA_COMPOSER_SEMANTIC_TEXT__);
+          const text = (element) => (element ? semanticText(element) : '').replace(/\s+/g, " ").trim();
           const firstVisible = (selector) => [...document.querySelectorAll(selector)].find(visible) || null;
 
           const composerOwner = (__CDPA_COMPOSER_RESOLVER__)();
@@ -2244,6 +2249,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
           };
         }
         """.replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS)
+          .replace('__CDPA_COMPOSER_SEMANTIC_TEXT__', _COMPOSER_SEMANTIC_TEXT_JS)
           .replace('__CDPA_RESPONSE_PROJECTION__', RESPONSE_PROJECTION_JS)
           .replace('__CDPA_RETRY_RESOLVER__', RETRY_RESOLVER_JS),
         [
