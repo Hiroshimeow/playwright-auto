@@ -2190,7 +2190,8 @@ roots.changeUrlForm.addEventListener("submit", async event => {
     const parsed = new URL(url);
     const correctHost = parsed.protocol === "https:"
       && ["chatgpt.com", "www.chatgpt.com"].includes(parsed.hostname);
-    const correctPath = new RegExp("^/(?:g/[^/]+/)?c/[0-9a-fA-F-]{36}$").test(parsed.pathname);
+    const correctPath = parsed.pathname === "/"
+      || new RegExp("^/(?:g/[^/]+/)?c/[0-9a-fA-F-]{36}$").test(parsed.pathname);
     if (!correctHost || !correctPath || parsed.search || parsed.hash) {
       throw new Error("Paste an exact HTTPS ChatGPT conversation URL ending in /c/<UUID>.");
     }

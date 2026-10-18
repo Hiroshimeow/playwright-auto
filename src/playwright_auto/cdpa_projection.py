@@ -360,9 +360,9 @@ def _roles(
                 "status": str(value.get("status") or "unknown"),
                 "turn": int(value.get("turn") or 0),
                 "online": online,
-                "chat_url": _public_chat_url(
-                    (page or {}).get("url") or value.get("page_url")
-                ),
+                "chat_url": _public_chat_url(value.get("page_url")),
+                "observed_chat_url": _public_chat_url((page or {}).get("url")),
+                "url_binding": value.get("role_url_binding"),
                 "last_error": sanitize_text(value.get("last_error"), max_chars=500) or None,
                 "last_activity_at": value.get("last_activity_at"),
             }

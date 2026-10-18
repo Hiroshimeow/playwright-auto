@@ -2082,9 +2082,14 @@ class TaskStore(IndependentAgentStoreMixin):
         *,
         expected_updated_at: str | None = None,
         mutable_fields: frozenset[str] = frozenset(),
+        allocation_check: Callable[[], Mapping[str, Any] | None] | None = None,
     ) -> dict[str, Any]:
         self.root.mkdir(parents=True, exist_ok=True)
         with exclusive_file_lock(self.allocation_lock):
+            if allocation_check is not None:
+                admitted = allocation_check()
+                if admitted is not None:
+                    return dict(admitted)
             with exclusive_file_lock(self._lock_path(target)):
                 current = self._load_current_manifest_unlocked(target)
                 self._assert_manifest_mutable_unlocked(target, current)
@@ -6426,16 +6431,14 @@ class TaskStore(IndependentAgentStoreMixin):
         expected_browser_endpoint_id: str,
         external_command_id: str,
     ) -> dict[str, Any]:
-        """Change one persistent role URL without moving its endpoint or replaying a Send.
-
-        A role that owns an existing page can only change the URL spelling for
-        the same conversation. Moving that role to a different conversation
-        requires its old binding to be safely released first.
-        """
+        """Persist operator intent; external browser binding is verified separately."""
         role = validate_workflow_route_key(str(role or "").strip().upper())
-        normalized = normalize_saved_chatgpt_conversation_url(url)
+        requested = str(url or "").strip()
+        normalized = normalize_saved_chatgpt_conversation_url(requested)
+        if normalized is None and requested in {"https://chatgpt.com", "https://chatgpt.com/", "https://www.chatgpt.com", "https://www.chatgpt.com/"}:
+            normalized = "https://chatgpt.com/"
         if normalized is None:
-            raise ValueError("Change URL requires an exact ChatGPT /c/<UUID> HTTPS URL")
+            raise ValueError("Change URL requires an exact ChatGPT conversation URL or homepage")
         target_id = conversation_identity(normalized)
         endpoint_id = str(expected_browser_endpoint_id or "").strip()
         command_id = str(external_command_id or "").strip()
@@ -6443,43 +6446,78 @@ class TaskStore(IndependentAgentStoreMixin):
             raise ValueError("Change URL requires expected_browser_endpoint_id and external_command_id")
         target = Path(path).expanduser().resolve()
 
-        # Same-worker task creation and command dispatch share this canonical
-        # store; check other live reservations before the per-task atomic update.
-        for other in self.discover():
-            if str(other.get("status") or "").upper() in TERMINAL:
-                continue
-            for other_role, record in (other.get("roles") or {}).items():
+        def reserved_ids(state: Mapping[str, Any], owner_role: str, record: Mapping[str, Any]) -> set[str]:
+            """Reserve only current desired and active/in-flight conversation identities."""
+            ids = set()
+            desired = conversation_identity(record.get("page_url"))
+            if desired is not None:
+                ids.add(desired)
+            for hop in state.get("hops") or ():
                 if (
-                    str(other.get("manifest_path") or "") == str(target)
-                    and str(other_role).upper() == role
+                    not isinstance(hop, Mapping)
+                    or str(hop.get("target_role") or "").upper() != owner_role
                 ):
                     continue
-                if not isinstance(record, Mapping):
+                hop_state = str(hop.get("state") or "")
+                active = hop.get("hop_id") == state.get("active_hop_id")
+                receipt = hop.get("receipt") if isinstance(hop.get("receipt"), Mapping) else {}
+                inflight = hop_state in {"sending", "sent", "waiting", "responded"}
+                if not active and not inflight:
                     continue
-                other_id = conversation_identity(record.get("page_url"))
-                if other_id is None:
-                    # An unallocated role or a paused/offline task can have
-                    # its only durable conversation identity in a hop, not
-                    # page_url. Never permit stealing that reserved UUID.
-                    for hop in reversed(other.get("hops") or ()):
-                        if (
-                            not isinstance(hop, Mapping)
-                            or str(hop.get("target_role") or "").upper() != str(other_role).upper()
-                            or str(hop.get("state") or "") == "abandoned"
-                        ):
-                            continue
-                        other_id = conversation_identity(hop.get("conversation_url"))
-                        receipt = hop.get("receipt") if isinstance(hop.get("receipt"), Mapping) else {}
-                        if other_id is None and receipt.get("conversation_id"):
-                            other_id = conversation_identity(
-                                f"https://chatgpt.com/c/{receipt['conversation_id']}"
-                            )
-                        if other_id is not None:
-                            break
-                if other_id == target_id:
-                    raise ValueError(
-                        f"conversation already reserved by {other.get('task_id')}/{other_role}"
-                    )
+                hop_id = conversation_identity(hop.get("conversation_url"))
+                if hop_id is not None:
+                    ids.add(hop_id)
+                receipt_id = (
+                    conversation_identity(f"https://chatgpt.com/c/{receipt['conversation_id']}")
+                    if receipt.get("conversation_id")
+                    else None
+                )
+                if receipt_id is not None:
+                    ids.add(receipt_id)
+            return ids
+
+        def replay_if_applied(state: Mapping[str, Any]) -> Mapping[str, Any] | None:
+            if command_id not in state.get("applied_command_ids", []):
+                return None
+            records = [
+                item for item in state.get("role_url_revisions") or []
+                if isinstance(item, Mapping)
+                and item.get("external_command_id") == command_id
+            ]
+            if (
+                len(records) != 1
+                or records[0].get("role") != role
+                or records[0].get("url") != normalized
+                or records[0].get("browser_endpoint_id") != endpoint_id
+            ):
+                raise ValueError("Change URL replay provenance does not match its payload")
+            return state
+
+        # Reservation checking occurs under the SAME allocation lock as write.
+        # Replay provenance is resolved first, so a historical no-op cannot be
+        # rejected by ownership changes that happened after it was accepted.
+        def check_reservations() -> Mapping[str, Any] | None:
+            current = self.load(target)
+            replay = replay_if_applied(current)
+            if replay is not None:
+                return replay
+            for other in self.discover():
+                if str(other.get("status") or "").upper() in TERMINAL:
+                    continue
+                for other_role, record in (other.get("roles") or {}).items():
+                    if (
+                        str(other.get("manifest_path") or "") == str(target)
+                        and str(other_role).upper() == role
+                    ):
+                        continue
+                    if not isinstance(record, Mapping):
+                        continue
+                    if target_id is not None and target_id in reserved_ids(
+                        other, str(other_role).upper(), record
+                    ):
+                        raise ValueError(
+                            f"conversation already reserved by {other.get('task_id')}/{other_role}"
+                        )
 
         def mutate(state: dict[str, Any]) -> dict[str, Any]:
             revisions = state.get("role_url_revisions") or []
@@ -6510,61 +6548,25 @@ class TaskStore(IndependentAgentStoreMixin):
             if state.get("endpoint_pinned") is False:
                 raise ValueError("role endpoint must be pinned before Change URL")
             current_url = str(record.get("page_url") or "").strip()
-            if current_url == normalized:
+            if current_url == normalized and not record.get("role_url_binding"):
                 raise ValueError("role already has this URL")
-            current_id = conversation_identity(current_url)
-            history_ids: set[str] = set()
-            for hop in state.get("hops") or ():
-                if not isinstance(hop, Mapping) or str(hop.get("target_role") or "").upper() != role:
-                    continue
-                receipt = hop.get("receipt") if isinstance(hop.get("receipt"), Mapping) else {}
-                receipt_id = str(receipt.get("conversation_id") or "").strip()
-                identity = conversation_identity(hop.get("conversation_url"))
-                if identity is None and receipt_id:
-                    identity = conversation_identity(f"https://chatgpt.com/c/{receipt_id}")
-                if identity is not None:
-                    history_ids.add(identity)
-            known_id = current_id or (next(iter(history_ids)) if len(history_ids) == 1 else None)
-            active_hop = next(
-                (
-                    hop for hop in state.get("hops") or ()
-                    if isinstance(hop, dict)
-                    and hop.get("hop_id") == state.get("active_hop_id")
-                    and str(hop.get("target_role") or "").upper() == role
-                ),
-                None,
-            )
-            active_state = str((active_hop or {}).get("state") or "")
-            # A durable Send boundary is never transferable to a different chat.
-            active_receipt = (
-                active_hop.get("receipt")
-                if isinstance((active_hop or {}).get("receipt"), Mapping)
-                else {}
-            )
-            active_id = conversation_identity((active_hop or {}).get("conversation_url"))
-            if active_receipt.get("conversation_id"):
-                active_id = conversation_identity(
-                    f"https://chatgpt.com/c/{active_receipt['conversation_id']}"
-                )
-            if (
-                active_state in {"sending", "sent", "waiting", "responded"}
-                and (active_id or known_id) != target_id
-            ):
-                raise ValueError("active request is in flight; cannot change its conversation identity")
-            if record.get("page_id") and known_id != target_id:
-                raise ValueError(
-                    "role still has a recorded page binding; cannot replace it with a different conversation"
-                )
             for other_role, other in state["roles"].items():
-                if other_role != role and conversation_identity(other.get("page_url")) == target_id:
+                if (
+                    other_role != role and target_id is not None
+                    and isinstance(other, Mapping)
+                    and target_id in reserved_ids(state, str(other_role).upper(), other)
+                ):
                     raise ValueError(f"conversation is already assigned to role {other_role}")
-            record["page_url"] = normalized
-            if (
-                active_hop is not None and active_state == "pre_send"
-                and active_hop.get("receipt") is None
-                and active_hop.get("message_identity") is None
-            ):
-                active_hop["conversation_url"] = normalized
+            generation = int(record.get("role_url_generation") or 0) + 1
+            record["role_url_generation"] = generation
+            record["page_url"] = None if target_id is None else normalized
+            record["role_url_binding"] = {
+                "generation": generation,
+                "requested_url": normalized,
+                "status": "NEW_PENDING" if target_id is None else "PENDING",
+                "observed_url": None,
+                "error": None,
+            }
             state.setdefault("role_url_revisions", []).append({
                 "role": role,
                 "url": normalized,
@@ -6576,7 +6578,7 @@ class TaskStore(IndependentAgentStoreMixin):
             self._record_external_command(state, command_id)
             return state
 
-        return self.update(target, mutate)
+        return self._mutate_manifest(target, mutate, allocation_check=check_reservations)
 
     def request_control(
         self,

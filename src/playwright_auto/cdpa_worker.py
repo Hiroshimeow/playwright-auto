@@ -2638,6 +2638,139 @@ class CDPAWorker:
             return None
         return paths
 
+    async def _reconcile_role_url_bindings(
+        self,
+        state: dict[str, Any],
+        actions: CDPATabActions,
+        *,
+        endpoint_id: str | None,
+    ) -> bool:
+        """Rebind current operator intent only after exact browser verification.
+
+        Historical hops/receipts are not a source of desired role URL.
+        Return True while pending work takes precedence over the ordinary hop.
+        """
+        for role, record in state.get("roles", {}).items():
+            binding = record.get("role_url_binding")
+            if not isinstance(binding, dict) or binding.get("status") == "BOUND":
+                continue
+            if int(binding.get("generation") or 0) != int(record.get("role_url_generation") or 0):
+                continue
+            assigned = str(record.get("browser_endpoint_id") or state.get("browser_endpoint_id") or "")
+            if endpoint_id is not None and assigned != str(endpoint_id):
+                binding["error"] = "Pinned browser endpoint is unavailable for Change URL"
+                continue
+            try:
+                active = _active_hop(state)
+            except RuntimeError:
+                active = {}
+            old_send = (
+                str(active.get("target_role") or "") == role
+                and str(active.get("state") or "") in {"sending", "sent", "waiting", "responded"}
+                and (str(active.get("state") or "") != "sending"
+                     or self._sending_hop_durable_boundary_state(active) != "preboundary")
+            )
+            # Accepted A may continue on its own tab while an independently
+            # verified B is bound. Never replace, navigate, or Send on A.
+            target = _official_saved_url(record.get("page_url"))
+            fresh = binding.get("status") == "NEW_PENDING"
+            if not fresh and target is None:
+                binding["error"] = "Operator target is not a canonical ChatGPT conversation"
+                continue
+            if fresh and binding.get("page_id"):
+                # The fresh homepage is already allocated. A receipt may later
+                # canonicalize it, but never allocate a second chat here.
+                continue
+            try:
+                current = None if old_send else await actions.locate_owned(state, role)
+                if current is not None:
+                    snapshot = await current.client.assert_ownership()
+                    if (
+                        str(snapshot.page_id or "") != str(current.page_id)
+                        or str(snapshot.page_role or "") != str(record.get("physical_role") or "")
+                        or str(snapshot.page_task_id or "") != str(state.get("task_id") or "")
+                        or str(snapshot.page_team or "") != str(state.get("team") or "")
+                    ):
+                        raise RoleOwnershipError("Current role tab ownership changed")
+                    if str(getattr(snapshot, "composer_text", "") or "").strip() or getattr(snapshot, "attachment_markers", ()):
+                        raise ComposerConflictError("Manual composer draft/attachment blocks Change URL")
+                    if getattr(snapshot, "stop_visible", False):
+                        raise RoleOwnershipError("Current role is responding; cannot replace the active tab")
+                if fresh and old_send:
+                    binding["error"] = "accepted Send still owns its original tab; New Chat allocation deferred"
+                    continue
+                if fresh:
+                    acquired = await actions.fresh_chat(
+                        state, role, url="https://chatgpt.com/", clean_for_send=True,
+                        require_clean_existing=True,
+                    )
+                else:
+                    acquired = await actions.reopen(
+                        state, role, requested_url=str(record["page_url"]),
+                        require_clean_ready=False, require_clean_existing=not old_send,
+                        preserve_existing=old_send,
+                    )
+                verified = await acquired.client.assert_ownership()
+                if (
+                    str(verified.page_id or "") != str(acquired.page_id)
+                    or str(verified.page_role or "") != str(record.get("physical_role") or "")
+                    or str(verified.page_task_id or "") != str(state.get("task_id") or "")
+                    or str(verified.page_team or "") != str(state.get("team") or "")
+                ):
+                    raise RoleOwnershipError("Change URL rebind did not verify exact role ownership")
+                observed = _official_saved_url(verified.url)
+                if fresh:
+                    if observed is not None:
+                        raise RoleOwnershipError("Fresh homepage already has an unproven conversation identity")
+                    binding["page_id"] = acquired.page_id
+                    binding["error"] = None
+                elif observed is None or observed[0] != target[0] or (
+                    getattr(verified, "session_id", None)
+                    and str(verified.session_id) != target[0]
+                ):
+                    raise RoleOwnershipError("Change URL browser conversation identity mismatch")
+                else:
+                    binding.update(status="BOUND", observed_url=verified.url, error=None)
+                record["page_id"] = acquired.page_id
+                record["online"] = True
+                if (
+                    str(active.get("target_role") or "") == role
+                    and active.get("state") == "pre_send"
+                    and state.get("status") in {"INBOX", "RUNNING"}
+                    and self._execution_is_pristine_pre_send(state, allow_prepared_ledger=True)
+                ):
+                    generation = int(record.get("role_url_generation") or 0)
+                    if int(active.get("role_url_generation") or 0) != generation:
+                        previous_id = active["hop_id"]
+                        new_hop = self._append_hop(
+                            state, source_role=role, target_role=role,
+                            handoff=str(active.get("handoff") or ""),
+                            kind=str(active.get("kind") or "handoff"),
+                            turn=int(active.get("turn") or 1),
+                        )
+                        active["superseded_by_hop_id"] = new_hop["hop_id"]
+                        active["superseded_reason"] = "operator_change_role_url"
+                if not fresh:
+                    record["page_url"] = _preferred_saved_url(
+                        record.get("page_url"), verified.url, conversation_id=target[0]
+                    )
+            except Exception as exc:
+                if is_cdp_disconnect(exc):
+                    raise
+                binding["error"] = sanitize_exception(exc)
+        active_role = str(state.get("active_role") or "")
+        active_binding = (state.get("roles") or {}).get(active_role, {}).get("role_url_binding")
+        if not isinstance(active_binding, Mapping) or active_binding.get("status") == "BOUND":
+            return False
+        hop = _active_hop(state)
+        if str(hop.get("state") or "") != "pre_send":
+            return False  # older accepted/ambiguous Send still owns its original wait path
+        return not (
+            active_binding.get("status") == "NEW_PENDING"
+            and active_binding.get("page_id")
+            and int(hop.get("role_url_generation") or 0) == int(active_binding.get("generation") or 0)
+        )
+
     def _record_acquired(
         self,
         state: dict[str, Any],
@@ -2645,6 +2778,16 @@ class CDPAWorker:
         acquired: AcquiredRole,
     ) -> None:
         record = state["roles"][logical_role]
+        binding = record.get("role_url_binding")
+        if isinstance(binding, Mapping) and binding.get("status") == "BOUND":
+            active = next((hop for hop in state.get("hops") or ()
+                           if hop.get("hop_id") == state.get("active_hop_id")), None)
+            if (active is not None
+                    and str(active.get("target_role") or "") == logical_role
+                    and int(active.get("role_url_generation") or 0) < int(binding.get("generation") or 0)
+                    and str(acquired.page_id) != str(record.get("page_id") or "")):
+                return  # accepted old-generation observation is not operator-owned B
+        binding_pending = isinstance(binding, dict)
         saved_page_url = str(acquired.url)
         if state.get("conversation_mode") != "temporary":
             existing = None if acquired.new_chat else _official_saved_url(record.get("page_url"))
@@ -2675,6 +2818,10 @@ class CDPAWorker:
         if record.get("reset_requested"):
             record["reset_applied_generation"] = generation
             record["reset_requested"] = False
+        if binding_pending:
+            # Browser observations never authorize an operator binding. Only
+            # explicitly verified navigation or the accepted-Send proof may BOUND.
+            saved_page_url = record.get("page_url")
         record.update(
             {
                 "status": "active",
@@ -2706,9 +2853,11 @@ class CDPAWorker:
         ):
             raise RoleOwnershipError("active hop is not at a recoverable role boundary")
         role_record = state["roles"][logical_role]
+        current_generation = int(role_record.get("role_url_generation") or 0)
+        older_hop = int(hop.get("role_url_generation") or 0) < current_generation
         candidate_urls = (
             str(hop.get("conversation_url") or "").strip(),
-            str(role_record.get("page_url") or "").strip(),
+            "" if older_hop else str(role_record.get("page_url") or "").strip(),
         )
         saved = {_recoverable_conversation_identity(value) for value in candidate_urls}
         saved.discard(None)
@@ -2816,7 +2965,27 @@ class CDPAWorker:
                         retryable=False,
                     )
                     return None
-            acquired = await actions.locate_owned(state, role)
+            owner_view = state
+            role_owner = state["roles"][role]
+            if (
+                isinstance(hop.get("receipt"), Mapping)
+                and int(hop.get("role_url_generation") or 0)
+                < int(role_owner.get("role_url_generation") or 0)
+            ):
+                receipt_binding = (hop["receipt"].get("binding") or {})
+                old_page_id = str(receipt_binding.get("page_id") or "")
+                if not old_page_id or expected_conversation is None:
+                    self._block(state, "Accepted old Send lacks exact page/conversation identity",
+                                code="accepted_receipt_provenance_divergence", retryable=False)
+                    return None
+                owner_view = {
+                    **state,
+                    "roles": {**state["roles"], role: {
+                        **role_owner, "page_id": old_page_id,
+                        "page_url": str(hop.get("conversation_url") or ""),
+                    }},
+                }
+            acquired = await actions.locate_owned(owner_view, role)
             temporary = state.get("conversation_mode") == "temporary"
             receipt_payload = hop.get("receipt")
             accepted_identity_pending = (
@@ -2973,7 +3142,7 @@ class CDPAWorker:
                     hop["conversation_url"] = (
                         _preferred_saved_url(
                             acquired.url, hop.get("conversation_url"),
-                            state["roles"][role].get("page_url"),
+                            conversation_id=live_conversation.rsplit("/", 1)[-1],
                         )
                         or str(acquired.url)
                     )
@@ -3025,7 +3194,7 @@ class CDPAWorker:
                 await self._acquire_endpoint_admission(state, role)
                 if admitted is not None:
                     admitted.append(True)
-                acquired = await self._recover_active_role(state, role, actions)
+                acquired = await self._recover_active_role(owner_view, role, actions)
         except BrowserChallengeError as exc:
             self._pause_recovery(state, code='BROWSER_CHALLENGE', reason=sanitize_exception(exc))
             return None
@@ -3069,7 +3238,8 @@ class CDPAWorker:
                     retryable=False,
                 )
                 return None
-        self._record_acquired(state, role, acquired)
+        if owner_view is state:
+            self._record_acquired(state, role, acquired)
         return acquired
 
     def _cleanup_control(
@@ -3859,6 +4029,36 @@ class CDPAWorker:
         self._remember_manifest(manifest_path, saved)
         return saved
 
+    def _sync_role_url_command(self, state: Mapping[str, Any]) -> None:
+        """Project verified aggregate binding into its exact mailbox command."""
+        if not self._runtime_ready:
+            return
+        for revision in state.get("role_url_revisions") or ():
+            command_id = str(revision.get("external_command_id") or "")
+            role = str(revision.get("role") or "")
+            command = self.runtime_db.get_command(command_id) if command_id else None
+            if not command or command.get("kind") != "change_role_url" or command.get("status") != "accepted":
+                continue
+            role_record = (state.get("roles") or {}).get(role) or {}
+            binding = role_record.get("role_url_binding") or {}
+            # Revision order is per role, not global across roles.
+            latest = next((rev for rev in reversed(state.get("role_url_revisions") or ())
+                           if rev.get("role") == role), None)
+            if latest is not revision and (
+                latest is None or latest.get("external_command_id") != command_id
+            ):
+                self.runtime_db.finish_command(command_id, error="Superseded by newer operator Change URL")
+            elif str(binding.get("error") or "").startswith("role_ownership_conflict:"):
+                self.runtime_db.finish_command(command_id, error=str(binding["error"]))
+            elif binding.get("status") == "BOUND" and binding.get("requested_url") == revision.get("url"):
+                self.runtime_db.finish_command(command_id, status="applied", result={
+                    "task_id": state.get("task_id"), "role": role,
+                    "url": role_record.get("page_url"),
+                    "binding_status": "BOUND",
+                    "generation": binding.get("generation"),
+                    "page_id": role_record.get("page_id"),
+                })
+
     def _persist_transport_result(
         self,
         manifest_path: Path,
@@ -3886,6 +4086,30 @@ class CDPAWorker:
                             f"task changed at {key}; reload before applying transport state"
                         )
                     current.pop(key)
+                elif key == "roles" and all(
+                    isinstance(item, Mapping)
+                    for item in (current.get(key), before[key], after[key])
+                ):
+                    # A concurrent operator override owns the whole role binding.
+                    # Older transport observations may still enrich immutable hops,
+                    # but cannot overwrite the newer role generation or page.
+                    aligned = dict(after[key])
+                    for role, old_role in before[key].items():
+                        live_role = current[key].get(role)
+                        result_role = after[key].get(role)
+                        if (
+                            isinstance(old_role, Mapping)
+                            and isinstance(live_role, Mapping)
+                            and isinstance(result_role, Mapping)
+                            and int(live_role.get("role_url_generation") or 0)
+                            != int(old_role.get("role_url_generation") or 0)
+                            and int(result_role.get("role_url_generation") or 0)
+                            == int(old_role.get("role_url_generation") or 0)
+                        ):
+                            aligned[role] = old_role
+                    current[key] = self._merge_control_delta(
+                        current[key], before[key], aligned, path=key
+                    )
                 else:
                     current[key] = self._merge_control_delta(
                         current.get(key),
@@ -3906,6 +4130,7 @@ class CDPAWorker:
         )
         self._record_controller_live_transition(before, saved)
         self._remember_manifest(manifest_path, saved)
+        self._sync_role_url_command(saved)
         return saved
 
     async def _apply_independent_control(
@@ -4132,6 +4357,13 @@ class CDPAWorker:
     ) -> None:
         if is_independent_task(state) or str(state.get("status") or "").upper() != "BLOCKED":
             return
+        if any(
+            isinstance(role, Mapping)
+            and isinstance(role.get("role_url_binding"), Mapping)
+            and role["role_url_binding"].get("status") in {"PENDING", "NEW_PENDING"}
+            for role in (state.get("roles") or {}).values()
+        ):
+            return  # Operator rebinding must inspect the original owned tab first.
         if state.get("conversation_mode") == "temporary":
             # Same invariant as RoleController's temporary_no_refresh path:
             # a Temporary Chat document is ephemeral. BLOCKED must preserve the
@@ -5535,6 +5767,7 @@ class CDPAWorker:
             "target_role": target_role,
             "physical_role": role_record["physical_role"],
             "turn": target_turn,
+            "role_url_generation": int(role_record.get("role_url_generation") or 0),
             "kind": kind,
             "handoff": str(handoff),
             "state": "pre_send",
@@ -6227,6 +6460,32 @@ class CDPAWorker:
         hop: dict[str, Any],
         actions: CDPATabActions,
     ) -> None:
+        role = str(hop.get("target_role") or "")
+        generation = int((state.get("roles") or {}).get(role, {}).get("role_url_generation") or 0)
+        if generation != int(hop.get("role_url_generation") or 0):
+            binding = (state.get("roles") or {}).get(role, {}).get("role_url_binding") or {}
+            if (
+                state.get("status") in {"INBOX", "RUNNING"}
+                and binding.get("status") == "BOUND"
+                and int(binding.get("generation") or 0) == generation
+                and self._execution_is_pristine_pre_send(state, allow_prepared_ledger=True)
+            ):
+                new_hop = self._append_hop(
+                    state, source_role=role, target_role=role,
+                    handoff=str(hop.get("handoff") or ""),
+                    kind=str(hop.get("kind") or "handoff"),
+                    turn=int(hop.get("turn") or 1),
+                )
+                hop["superseded_by_hop_id"] = new_hop["hop_id"]
+                hop["superseded_reason"] = "operator_change_role_url"
+                return
+            self._block(
+                state,
+                "Operator Change URL superseded this pre-Send hop; a fresh hop is required, never replay the old request.",
+                code="operator_url_override_requires_fresh_hop",
+                retryable=False,
+            )
+            return
         if not self._pre_send_request_identity_is_safe(state, hop):
             return
         retry_at = parse_time((hop.get("wait") or {}).get("pre_send_retry_at"))
@@ -7336,12 +7595,9 @@ class CDPAWorker:
                 new_chat=False,
             ),
         )
-        hop["conversation_url"] = (
-            str(state["roles"][role]["page_url"])
-            if state.get("conversation_mode") != "temporary"
-            else post_send.conversation_url or str(post_send.url)
-        )
+        hop["conversation_url"] = post_send.conversation_url or str(post_send.url)
         hop["receipt"] = output["receipt"]
+        self._bind_verified_new_chat(state, hop, post_send)
         if isinstance(hop.get("preboundary_recovery"), dict):
             hop["preboundary_recovery"]["phase"] = "complete"
         self._canonicalize_receipt_conversation_url(state, hop)
@@ -7571,6 +7827,42 @@ class CDPAWorker:
         )
 
     @staticmethod
+    def _bind_verified_new_chat(
+        state: dict[str, Any], hop: dict[str, Any], snapshot: Any
+    ) -> None:
+        """Confirm fresh operator target only from the accepted exact Send and page."""
+        record = (state.get("roles") or {}).get(str(hop.get("target_role") or ""))
+        if not isinstance(record, dict):
+            return
+        binding = record.get("role_url_binding")
+        if not isinstance(binding, dict) or binding.get("status") != "NEW_PENDING":
+            return
+        if hop.get("role_url_generation") != binding.get("generation"):
+            return
+        payload = hop.get("receipt")
+        if not isinstance(payload, Mapping):
+            return
+        receipt = SendReceipt.from_dict(payload)
+        saved = _official_saved_url(snapshot.url)
+        if (
+            receipt.attempts < 1 or not receipt.accepted_via
+            or saved is None
+            or saved[0] != receipt.conversation_id
+            or str(binding.get("page_id") or "") != str(receipt.binding.page_id)
+            or str(getattr(snapshot, "page_id", "") or "") != str(receipt.binding.page_id)
+            or str(getattr(snapshot, "page_role", "") or "") != str(record.get("physical_role") or "")
+            or str(getattr(snapshot, "page_team", "") or "") != str(state.get("team") or "")
+            or str(getattr(snapshot, "page_task_id", "") or "") != str(state.get("task_id") or "")
+            or (snapshot.session_id and str(snapshot.session_id) != saved[0])
+        ):
+            return
+        url = _preferred_saved_url(
+            snapshot.url, hop.get("conversation_url"), conversation_id=saved[0]
+        ) or str(snapshot.url)
+        record["page_url"] = url
+        binding.update(status="BOUND", observed_url=str(snapshot.url), error=None)
+
+    @staticmethod
     def _canonicalize_receipt_conversation_url(
         state: dict[str, Any], hop: dict[str, Any]
     ) -> None:
@@ -7592,7 +7884,21 @@ class CDPAWorker:
         ) or fallback
         hop["conversation_url"] = exact_url
         if isinstance(role_record, dict):
+            binding = role_record.get("role_url_binding")
+            if isinstance(binding, Mapping):
+                # Only browser-verified operator binding may change the desired
+                # URL; receipts enrich the historical hop independently.
+                if (
+                    binding.get("status") != "BOUND"
+                    or hop.get("role_url_generation") != binding.get("generation")
+                ):
+                    return
+                requested = _official_saved_url(binding.get("requested_url"))
+                if requested is not None and requested[0] != conversation_id:
+                    return
             role_record["page_url"] = exact_url
+            if isinstance(binding, dict):
+                binding.update(status="BOUND", observed_url=exact_url, error=None)
 
     def _reconcile_hop_conversation_identity(
         self, state: dict[str, Any], hop: dict[str, Any]
@@ -7687,11 +7993,16 @@ class CDPAWorker:
             )
         conversation_id = saved[0]
         role_record = state.get("roles", {}).get(role)
+        binding = role_record.get("role_url_binding") if isinstance(role_record, Mapping) else None
+        matches_generation = (
+            not isinstance(binding, Mapping)
+            or hop.get("role_url_generation") == binding.get("generation")
+        )
         prior_ids = {
             parsed[0]
             for value in (
                 hop.get("conversation_url"),
-                role_record.get("page_url") if isinstance(role_record, Mapping) else None,
+                role_record.get("page_url") if matches_generation and isinstance(role_record, Mapping) else None,
             )
             if (parsed := _official_saved_url(value)) is not None
         }
@@ -7703,13 +8014,19 @@ class CDPAWorker:
             raise _AcceptedConversationIdentityConflict(
                 "canonical ChatGPT URL and page snapshot disagree"
             )
-        if isinstance(role_record, dict):
-            role_record["page_url"] = (
-                _preferred_saved_url(
-                    snapshot.url, role_record.get("page_url"),
-                    conversation_id=conversation_id,
-                ) or str(snapshot.url)
-            )
+        if isinstance(role_record, dict) and matches_generation:
+            if not isinstance(binding, Mapping) or binding.get("status") != "NEW_PENDING" or (
+                binding.get("page_id") == receipt.binding.page_id
+                and hop.get("role_url_generation") == binding.get("generation")
+            ):
+                role_record["page_url"] = (
+                    _preferred_saved_url(
+                        snapshot.url, role_record.get("page_url"),
+                        conversation_id=conversation_id,
+                    ) or str(snapshot.url)
+                )
+                if isinstance(binding, dict) and binding.get("status") == "NEW_PENDING":
+                    binding.update(status="BOUND", observed_url=snapshot.url, error=None)
         ledger.enrich_receipt_conversation_id(
             request_id,
             accepted_receipt=receipt,
@@ -11160,9 +11477,15 @@ class CDPAWorker:
                 recovering_resume_present = _next_recovering_resume_control(state) is not None
                 requested_control = _next_requested_control(state) is not None
                 control_in_flight = requested_control or recovering_resume_present
-                if scheduling_changed and not control_in_flight:
+                role_url_due = any(
+                    isinstance(item, Mapping)
+                    and isinstance(item.get("role_url_binding"), Mapping)
+                    and item["role_url_binding"].get("status") in {"PENDING", "NEW_PENDING"}
+                    for item in (state.get("roles") or {}).values()
+                )
+                if scheduling_changed and not control_in_flight and not role_url_due:
                     return state
-                if state.get("status") == "WAITING" and not control_in_flight:
+                if state.get("status") == "WAITING" and not control_in_flight and not role_url_due:
                     return state
                 transport_baseline = state
                 active_hop_id = state.get("active_hop_id")
@@ -11324,6 +11647,17 @@ class CDPAWorker:
                         return saved
                     else:
                         raise RuntimeError("control result was not persisted atomically")
+                pending_role_url = await self._reconcile_role_url_bindings(
+                    state, actions, endpoint_id=endpoint_id,
+                )
+                if pending_role_url or state != transport_baseline:
+                    if state != transport_baseline:
+                        saved = self._persist_transport_result(path, transport_baseline, state)
+                        state.clear()
+                        state.update(saved)
+                        if pending_role_url:
+                            return saved
+                        transport_baseline = saved
                 if state.get("status") == "WAITING":
                     return state
                 if state.get("status") in TERMINAL:
@@ -12887,14 +13221,19 @@ class CDPAWorker:
                 if str(command.get("kind") or "") in {"resume_team", "task_control"}:
                     self._sync_control_commands(replay_state)
                     return self.runtime_db.get_command(command_id)
-                self.runtime_db.finish_command(
-                    command_id,
-                    result={
-                        "task_id": replay_state.get("task_id"),
-                        "status": replay_state.get("status"),
-                        "reconciled": True,
-                    },
-                )
+                replay_result = {
+                    "task_id": replay_state.get("task_id"),
+                    "status": replay_state.get("status"),
+                    "reconciled": True,
+                }
+                if command.get("kind") == "change_role_url":
+                    role = str(command["payload"].get("role") or "")
+                    binding = (replay_state.get("roles") or {}).get(role, {}).get("role_url_binding") or {}
+                    replay_result["binding_status"] = binding.get("status")
+                    self.runtime_db.finish_command(command_id, result=replay_result,
+                        status="applied" if binding.get("status") == "BOUND" else "accepted")
+                else:
+                    self.runtime_db.finish_command(command_id, result=replay_result)
                 return self.runtime_db.get_command(command_id)
             expected = command.get("expected_task_version")
             if expected is not None:
@@ -13295,6 +13634,7 @@ class CDPAWorker:
                     "url": payload.get("url"),
                     "browser_endpoint_id": payload.get("expected_browser_endpoint_id"),
                     "status": state.get("status"),
+                    "binding_status": state["roles"][str(payload["role"])]["role_url_binding"]["status"],
                 }
             elif kind == "change_goal":
                 if task_id is None:
@@ -13371,7 +13711,12 @@ class CDPAWorker:
                 return self.runtime_db.get_command(command_id)
             else:
                 raise ValueError(f"unsupported command kind: {kind}")
-            self.runtime_db.finish_command(command_id, result=result)
+            self.runtime_db.finish_command(
+                command_id, result=result,
+                status="accepted" if kind == "change_role_url" else None,
+            )
+            if kind == "change_role_url":
+                self._sync_role_url_command(state)
         except Exception as exc:
             self.runtime_db.finish_command(
                 command_id, error=sanitize_text(f"{type(exc).__name__}: {exc}", max_chars=2000)

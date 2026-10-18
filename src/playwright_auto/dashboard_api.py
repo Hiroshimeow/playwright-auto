@@ -1010,9 +1010,12 @@ class DashboardAPI:
             role = validate_workflow_route_key(str(raw.get("role") or "").strip().upper())
         except ValueError as exc:
             raise APIError(400, "invalid_request", str(exc)) from exc
-        url = normalize_saved_chatgpt_conversation_url(raw.get("url"))
+        requested = str(raw.get("url") or "").strip()
+        url = normalize_saved_chatgpt_conversation_url(requested)
+        if url is None and requested in {"https://chatgpt.com", "https://chatgpt.com/", "https://www.chatgpt.com", "https://www.chatgpt.com/"}:
+            url = "https://chatgpt.com/"
         if url is None:
-            raise APIError(400, "invalid_request", "URL must be an exact ChatGPT /c/<UUID> HTTPS URL")
+            raise APIError(400, "invalid_request", "URL must be an exact ChatGPT /c/<UUID> HTTPS URL or https://chatgpt.com/")
         endpoint_id = str(raw.get("expected_browser_endpoint_id") or "").strip()
         if not endpoint_id:
             raise APIError(400, "invalid_request", "expected_browser_endpoint_id is required")
