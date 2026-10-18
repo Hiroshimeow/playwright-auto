@@ -43,7 +43,7 @@ COMMAND_KINDS = frozenset(
         "reload_catalog",
     }
 )
-COMMAND_STATUSES = frozenset({"queued", "running", "applied", "failed", "recovery_required"})
+COMMAND_STATUSES = frozenset({"queued", "running", "accepted", "applied", "failed", "recovery_required"})
 SCHEMA_VERSION = 1
 
 
@@ -620,8 +620,11 @@ class RuntimeDB:
         *,
         result: Mapping[str, Any] | None = None,
         error: str | None = None,
+        status: str | None = None,
     ) -> None:
-        status = "failed" if error is not None else "applied"
+        status = status or ("failed" if error is not None else "applied")
+        if status not in {"accepted", "failed", "applied"}:
+            raise ValueError("unsupported terminal command status")
         result_json = _json(result or {}) if result is not None else None
         with self.connection() as connection:
             cursor = connection.execute(

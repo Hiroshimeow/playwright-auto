@@ -755,12 +755,18 @@ class CDPATabActions:
         *,
         require_clean_ready: bool = True,
         foreground: bool = False,
+        requested_url: str | None = None,
+        require_clean_existing: bool = False,
+        preserve_existing: bool = False,
     ) -> AcquiredRole:
         # Entire navigation, readiness, and ownership restoration share one budget.
         async with asyncio.timeout(30):
             return await self._reopen_impl(
                 manifest, logical_role,
                 require_clean_ready=require_clean_ready, foreground=foreground,
+                requested_url=requested_url,
+                require_clean_existing=require_clean_existing,
+                preserve_existing=preserve_existing,
             )
 
     async def _reopen_impl(
@@ -770,6 +776,9 @@ class CDPATabActions:
         *,
         require_clean_ready: bool = True,
         foreground: bool = False,
+        requested_url: str | None = None,
+        require_clean_existing: bool = False,
+        preserve_existing: bool = False,
     ) -> AcquiredRole:
         logical_role = str(logical_role).upper()
         role_record = manifest["roles"][logical_role]
@@ -786,7 +795,7 @@ class CDPATabActions:
             None,
         )
         candidate_urls = (
-            str((active_hop or {}).get("conversation_url") or "").strip(),
+            str(requested_url).strip() if requested_url else str((active_hop or {}).get("conversation_url") or "").strip(),
             str(role_record.get("page_url") or "").strip(),
         )
         identities = {
@@ -830,8 +839,12 @@ class CDPATabActions:
                 matches.append(candidate)
         if len(matches) > 1:
             raise RoleOwnershipError("multiple exact saved conversation tabs claim the role")
+        if preserve_existing and len(reusable_exact) > 1:
+            raise RoleOwnershipError("multiple exact requested conversation tabs are ambiguous")
 
-        existing = await self.locate_owned(manifest, logical_role)
+        # An accepted older Send still owns its original tab. Never locate or
+        # close that page when explicitly binding the next generation.
+        existing = None if preserve_existing else await self.locate_owned(manifest, logical_role)
         if existing is not None and _reopenable_conversation_identity(existing.url) != expected_conversation:
             wrong_page = existing.client.page
             closing = await record_page_action(
@@ -841,6 +854,12 @@ class CDPATabActions:
                 reason="saved_conversation_binding_mismatch",
             )
             try:
+                if require_clean_existing:
+                    snapshot = await existing.client.assert_ownership()
+                    if (str(getattr(snapshot, 'composer_text', '') or '').strip()
+                            or getattr(snapshot, 'attachment_markers', ())
+                            or getattr(snapshot, 'stop_visible', False)):
+                        raise ManualInputPendingError('manual draft, attachment or active response blocks Change URL')
                 await wrong_page.close()
             except Exception as exc:
                 await record_page_action(
@@ -938,7 +957,7 @@ class CDPATabActions:
                         f"{page.url!r}"
                     )
                 await client.restore_identity(
-                    page_id=page_id or str(uuid4()),
+                    page_id=str(uuid4()) if preserve_existing else (page_id or str(uuid4())),
                     role=physical,
                     task_id=str(manifest["task_id"]),
                     team=str(manifest["team"]),
@@ -1197,6 +1216,7 @@ class CDPATabActions:
         *,
         url: str,
         clean_for_send: bool = False,
+        require_clean_existing: bool = False,
     ) -> AcquiredRole:
         logical_role = str(logical_role).upper()
         record = manifest["roles"][logical_role]
@@ -1206,7 +1226,8 @@ class CDPATabActions:
         selected = await self.preflight_role(role_scope, logical_role)
         if selected:
             await self.close_team(
-                role_scope, preflighted_pages=selected, reason="fresh_role_replacement"
+                role_scope, preflighted_pages=selected, reason="fresh_role_replacement",
+                require_clean_existing=require_clean_existing,
             )
             if await self.preflight_role(role_scope, logical_role):
                 raise TeamCloseError("fresh chat could not close the previous owned role tab")
@@ -1562,6 +1583,7 @@ class CDPATabActions:
         *,
         preflighted_pages: Sequence[Any] | None = None,
         reason: str = "owned_team_cleanup",
+        require_clean_existing: bool = False,
     ) -> int:
         selected = (
             list(preflighted_pages)
@@ -1575,8 +1597,19 @@ class CDPATabActions:
                 page, "close_tab", "start", reason=reason
             )
             try:
+                if require_clean_existing:
+                    metadata = await inspect_page_metadata(page)
+                    client = ChatGPTPage(page, timeout_ms=30000)
+                    client.binding = PageBinding(str(metadata.get('page_id') or ''), str(metadata.get('role') or ''))
+                    snapshot = await client.assert_ownership()
+                    if (str(getattr(snapshot, 'composer_text', '') or '').strip()
+                            or getattr(snapshot, 'attachment_markers', ())
+                            or getattr(snapshot, 'stop_visible', False)):
+                        raise ManualInputPendingError('manual draft, attachment or active response blocks Change URL')
                 await page.close()
             except Exception as exc:
+                if require_clean_existing and isinstance(exc, ManualInputPendingError):
+                    raise
                 await record_page_action(
                     page, "close_tab", "error", reason=reason,
                     identity=closing, detail=type(exc).__name__,

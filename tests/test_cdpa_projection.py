@@ -1117,7 +1117,8 @@ def test_role_projection_matches_composite_endpoint_and_page_identity(tmp_path: 
 
     role = projection.detail["roles"][0]
     assert role["online"] is False
-    assert role["chat_url"] == "https://chatgpt.com/c/a"
+    assert role["chat_url"] == "https://chatgpt.com/c/abc"  # canonical desired
+    assert role["observed_chat_url"] == "https://chatgpt.com/c/a"
 
 
 def test_role_projection_marks_known_disconnected_endpoint_unknown(tmp_path: Path):

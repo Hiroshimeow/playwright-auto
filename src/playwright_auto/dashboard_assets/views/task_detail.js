@@ -1050,7 +1050,7 @@ function workflowOverview(detail, timeline, selectedRole, endpoints) {
   if (detail.status === "RUNNING") controls.append(changeGoalButton(detail));
   for (const [action, label] of [
     ["pause", "Pause"], ["resume", "Resume"], ["retry", "Retry hop"],
-    ["restart_role", "Restart role"], ["new_chat", "New chat"],
+    ["restart_role", "Restart role"],
     ["open_tab", "Open tab"], ["route_plan", "Route PLAN"],
     ["stop", "Stop"], ["clear_team", "Clear team"],
     ["archive_worktree", "Archive worktree"],

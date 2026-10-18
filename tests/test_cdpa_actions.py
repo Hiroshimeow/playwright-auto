@@ -1942,3 +1942,143 @@ def test_automatic_reopen_stays_background_until_explicit_wake(tmp_path, monkeyp
             "new-team",
         ),
     ]
+
+
+@pytest.mark.parametrize("late_change", ["manual text", "attachment"])
+def test_operator_reopen_rechecks_owned_draft_immediately_before_closing(
+    tmp_path, monkeypatch, late_change
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    old = FakePage(page_id="recorded-page", role="new-team-plan", team="new-team", task_id="task-1")
+    old.url = "https://chatgpt.com/"
+    old.snapshot_value.url = old.url
+    target = FakePage(page_id=None, role=None, team=None, task_id=None)
+    target.url = TARGET_CONVERSATION_URL
+    target.snapshot_value.url = TARGET_CONVERSATION_URL
+    context = FakeContext([old, target])
+    actions = CDPATabActions(context, config)
+    original_record = actions_module.record_page_action
+
+    async def inject_late_draft(page, action, phase, **kwargs):
+        if page is old and action == "close_tab" and phase == "start":
+            if late_change == "manual text":
+                old.snapshot_value.composer_text = "operator draft typed after preflight"
+            else:
+                old.snapshot_value.attachment_markers = ("operator upload",)
+        return await original_record(page, action, phase, **kwargs)
+
+    monkeypatch.setattr(actions_module, "record_page_action", inject_late_draft)
+    state = manifest(
+        physical_role="new-team-plan", page_id="recorded-page",
+        page_url=TARGET_CONVERSATION_URL, conversation_url=TARGET_CONVERSATION_URL,
+    )
+    with pytest.raises((ManualInputPendingError, ComposerConflictError), match="manual|draft|attachment"):
+        asyncio.run(actions.reopen(
+            state, "PLAN", requested_url=TARGET_CONVERSATION_URL,
+            require_clean_ready=False, require_clean_existing=True,
+        ))
+    assert old.closed is False
+    assert target.closed is False
+    assert context.new_page_calls == 0
+
+
+@pytest.mark.parametrize("late_change", ["manual text", "attachment"])
+def test_operator_fresh_chat_rechecks_draft_immediately_before_closing(
+    tmp_path, monkeypatch, late_change
+):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    old = FakePage(page_id="recorded-page", role="new-team-plan", team="new-team", task_id="task-1")
+    actions = CDPATabActions(FakeContext([old]), config)
+    original_record = actions_module.record_page_action
+
+    async def inject_late_draft(page, action, phase, **kwargs):
+        if page is old and action == "close_tab" and phase == "start":
+            if late_change == "manual text":
+                old.snapshot_value.composer_text = "new operator draft"
+            else:
+                old.snapshot_value.attachment_markers = ("uploaded-file",)
+        return await original_record(page, action, phase, **kwargs)
+
+    monkeypatch.setattr(actions_module, "record_page_action", inject_late_draft)
+    with pytest.raises((ManualInputPendingError, ComposerConflictError), match="manual|draft|attachment"):
+        asyncio.run(actions.fresh_chat(
+            manifest(physical_role="new-team-plan", page_id="recorded-page"),
+            "PLAN", url="https://chatgpt.com/", clean_for_send=True,
+            require_clean_existing=True,
+        ))
+    assert old.closed is False
+    assert actions.browser_context.new_page_calls == 0
+
+def test_operator_reopen_preserves_accepted_owned_page_and_reuses_verified_new_target(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    old_url = "https://chatgpt.com/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    old = FakePage(page_id="accepted-old-page", role="new-team-plan", team="new-team", task_id="task-1")
+    old.url = old_url
+    old.snapshot_value.url = old_url
+    old.snapshot_value.stop_visible = True
+    target = FakePage(page_id="already-owned-target", role="new-team-plan", team="new-team", task_id="task-1")
+    target.url = TARGET_CONVERSATION_URL
+    target.snapshot_value.url = target.url
+    context = FakeContext([old, target])
+    actions = CDPATabActions(context, config)
+    state = manifest(physical_role="new-team-plan", page_id="accepted-old-page",
+                     page_url=TARGET_CONVERSATION_URL, conversation_url=old_url)
+    result = asyncio.run(actions.reopen(
+        state, "PLAN", requested_url=TARGET_CONVERSATION_URL,
+        preserve_existing=True, require_clean_ready=False,
+    ))
+    assert result.page_id == "already-owned-target"
+    assert result.url == TARGET_CONVERSATION_URL
+    assert old.closed is False
+    assert target.closed is False
+    assert context.new_page_calls == 0
+
+
+def test_operator_reopen_preserves_accepted_page_and_allocates_distinct_target(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    monkeypatch.setattr(actions_module, "random_delay", lambda *_args, **_kwargs: asyncio.sleep(0))
+    old_url = "https://chatgpt.com/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    old = FakePage(page_id="accepted-old-page", role="new-team-plan", team="new-team", task_id="task-1")
+    old.url = old_url
+    old.snapshot_value.url = old_url
+    old.snapshot_value.stop_visible = True
+    context = FakeContext([old])
+    actions = CDPATabActions(context, config)
+    state = manifest(physical_role="new-team-plan", page_id="accepted-old-page",
+                     page_url=TARGET_CONVERSATION_URL, conversation_url=old_url)
+    result = asyncio.run(actions.reopen(
+        state, "PLAN", requested_url=TARGET_CONVERSATION_URL,
+        preserve_existing=True, require_clean_ready=False,
+    ))
+    assert context.new_page_calls == 1
+    assert result.page_id != "accepted-old-page"
+    assert result.url == TARGET_CONVERSATION_URL
+    assert old.closed is False
+    assert context.pages[-1].closed is False
+
+
+def test_operator_reopen_preserves_old_page_and_rejects_foreign_target(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    old = FakePage(page_id="accepted-old-page", role="new-team-plan", team="new-team", task_id="task-1")
+    old.url = "https://chatgpt.com/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    old.snapshot_value.url = old.url
+    foreign = FakePage(page_id="foreign-page", role="review", team="foreign-team", task_id="foreign-task")
+    foreign.url = TARGET_CONVERSATION_URL
+    foreign.snapshot_value.url = foreign.url
+    context = FakeContext([old, foreign])
+    actions = CDPATabActions(context, config)
+    state = manifest(physical_role="new-team-plan", page_id="accepted-old-page",
+                     page_url=TARGET_CONVERSATION_URL, conversation_url=old.url)
+    with pytest.raises(RoleOwnershipError, match="owned by another"):
+        asyncio.run(actions.reopen(
+            state, "PLAN", requested_url=TARGET_CONVERSATION_URL,
+            preserve_existing=True, require_clean_ready=False,
+        ))
+    assert old.closed is False
+    assert foreign.closed is False
+    assert context.new_page_calls == 0

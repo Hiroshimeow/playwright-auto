@@ -114,6 +114,13 @@ class CDPARuntimeRegistry:
         if cleanup_state == "CLEARING":
             return now + MINIMUM_DEADLINE_SECONDS
         status = str(state.get("status") or "INBOX").upper()
+        if status not in TERMINAL and any(
+            isinstance(role.get("role_url_binding"), Mapping)
+            and role["role_url_binding"].get("status") in {"PENDING", "NEW_PENDING"}
+            for role in (state.get("roles") or {}).values()
+            if isinstance(role, Mapping)
+        ):
+            return now + MINIMUM_DEADLINE_SECONDS
         if status in TERMINAL:
             if cleanup_state == "CLEARED":
                 return None
