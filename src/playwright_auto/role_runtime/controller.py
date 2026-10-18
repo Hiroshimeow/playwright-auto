@@ -178,6 +178,7 @@ class RoleController:
             page_state = getattr(snapshot, "state", None)
             if (
                 bool(getattr(snapshot, "stop_visible", False))
+                or bool(getattr(snapshot, "response_projection_active", False))
                 or str(getattr(page_state, "value", page_state) or "").lower() == "responding"
                 or not ctx.candidate_stable
             ):

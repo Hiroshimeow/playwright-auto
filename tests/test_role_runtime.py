@@ -242,6 +242,50 @@ def test_permission_preempts_intermediate_malformed_result_stability():
     assert decision.reason == "mcp_allow_ready"
 
 
+def test_active_response_projection_keeps_stable_malformed_result_waiting():
+    current = current_result(
+        "progress not route",
+        response_projection_active=True,
+    )
+    wait = {}
+
+    first = step(current, wait, validate=invalid)
+    stable = step(current, wait, 5, validate=invalid)
+
+    assert first.action is Action.WAIT
+    assert first.reason == "malformed_result_stability"
+    assert stable.action is Action.WAIT
+    assert stable.reason == "malformed_result_stability"
+
+
+def test_active_malformed_progress_can_become_valid_final_on_same_bound_turn():
+    def validate(candidate):
+        if candidate.text != "valid route":
+            raise ValueError("route JSON missing")
+
+    wait = {}
+    progress = current_result(
+        "progress not route",
+        response_projection_active=True,
+    )
+    assert step(progress, wait, validate=validate).action is Action.WAIT
+    assert step(progress, wait, 5, validate=validate).action is Action.WAIT
+
+    final = current_result(
+        "valid route",
+        response_projection_active=False,
+    )
+    changed = step(final, wait, 6, validate=validate)
+    accepted = step(final, wait, 11, validate=validate)
+
+    assert changed.action is Action.WAIT
+    assert changed.reason == "result_stability"
+    assert accepted.action is Action.ACCEPT
+    assert accepted.reason == "valid_bound_result"
+    assert accepted.response.message_id == "answer"
+    assert wait["bound_assistant_turn_id"] == "answer-turn"
+
+
 def test_stable_malformed_result_repairs_with_exact_validation_error_without_reload():
     current = current_result("not JSON")
     wait = {}
