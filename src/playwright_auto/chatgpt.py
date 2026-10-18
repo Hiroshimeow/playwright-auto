@@ -4137,11 +4137,20 @@ class ChatGPTPage:
                 "model_selection_unverified:menu_open: model menu could not be opened"
             ) from exc
 
-        option_selector = (
-            '[role="menu"] [role="menuitemradio"], [role="menu"] [role="menuitem"], '
-            '[role="dialog"] [role="radio"], [role="menu"] button'
+        menu_surface = self.page.locator(
+            '[role="menu"]:visible, '
+            '[role="dialog"]:not(#playwright-auto-role-control-v1):visible'
+        ).first
+        try:
+            await menu_surface.wait_for(state="visible", timeout=timeout_ms)
+        except PlaywrightTimeoutError as exc:
+            raise UnsafePageStateError(
+                "model_selection_unverified:menu_open: model menu did not render"
+            ) from exc
+
+        options = menu_surface.locator(
+            '[role="menuitemradio"], [role="menuitem"], [role="radio"], button'
         )
-        options = self.page.locator(option_selector)
         extra_high = options.filter(
             has_text=re.compile(
                 r"^\s*(?:(?:GPT[- ]?)?\d+(?:\.\d+)*\s+)?Extra High\s*$",

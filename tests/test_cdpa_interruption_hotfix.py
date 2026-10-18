@@ -372,7 +372,7 @@ def test_model_selection_never_mutates_streaming_or_manual_draft(active, draft):
 
 def test_missing_allowed_model_selector_fails_closed_without_send():
     async def run(page):
-        client = ChatGPTPage(page, timeout_ms=100)
+        client = ChatGPTPage(page, timeout_ms=300)
         client.binding = PageBinding("page-1", "DEV")
         with pytest.raises(
             UnsafePageStateError,
@@ -421,6 +421,25 @@ def test_model_selection_failure_reports_exact_stage(stage, body):
             await client.ensure_extra_high()
 
     asyncio.run(_with_page(body, run))
+
+
+def test_model_selection_click_without_rendered_menu_reports_menu_open():
+    async def run(page):
+        client = ChatGPTPage(page, timeout_ms=100)
+        client.binding = PageBinding("page-1", "DEV")
+        with pytest.raises(
+            UnsafePageStateError,
+            match="model_selection_unverified:menu_open",
+        ):
+            await client.ensure_extra_high()
+        assert await page.evaluate("window.clicked || 0") == 1
+
+    asyncio.run(_with_page(
+        '''<main><div contenteditable="true" role="textbox"></div></main>
+        <button aria-label="Select ChatGPT model"
+          onclick="window.clicked=(window.clicked||0)+1">Medium</button>''',
+        run,
+    ))
 
 
 
