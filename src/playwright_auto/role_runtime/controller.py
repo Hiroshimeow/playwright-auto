@@ -169,6 +169,10 @@ class RoleController:
             return self._remember(ctx, recovery)
 
         if ctx.candidate is not None and ctx.validation_error is not None:
+            if ctx.permission_present:
+                permission_decision = allow.handle(ctx)
+                if permission_decision is not None:
+                    return self._remember(ctx, permission_decision)
             # A cached LISTEN stream status can outlive the rendered response.
             # Only current-page activity prevents repairing a stable DOM candidate.
             page_state = getattr(snapshot, "state", None)

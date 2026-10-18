@@ -235,6 +235,13 @@ def invalid(_candidate):
     raise ValueError("route JSON missing")
 
 
+def test_permission_preempts_intermediate_malformed_result_stability():
+    current = current_result("progress not route", mcp_permission_node_count=1)
+    decision = step(current, {}, validate=invalid)
+    assert decision.action is Action.ALLOW
+    assert decision.reason == "mcp_allow_ready"
+
+
 def test_stable_malformed_result_repairs_with_exact_validation_error_without_reload():
     current = current_result("not JSON")
     wait = {}
