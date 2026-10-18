@@ -4484,6 +4484,80 @@ def test_runtime_worker_discovers_once_and_idle_cycles_do_not_scan(tmp_path: Pat
     assert recover_calls == 1
 
 
+def test_runtime_worker_lock_skipped_task_rearms_deadline_during_slow_cycle(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _config, store, first, worker = setup_task(
+        tmp_path, task_id="task-runtime-lock-skip-a"
+    )
+    second = store.create_task(
+        "slow unrelated task",
+        requested_team="beta",
+        task_id="task-runtime-lock-skip-b",
+        governing_objective="slow unrelated task",
+        governing_directives=(),
+    )
+    worker.hydrate_runtime()
+    assert worker.registry is not None
+    worker.registry.update_task(first, now=0.0)
+    worker.registry.update_task(second, now=0.0)
+
+    calls = {first["task_id"]: 0, second["task_id"]: 0}
+    first_active = False
+    second_lock_skip = asyncio.Event()
+    third_first_call = asyncio.Event()
+    slow_started = asyncio.Event()
+    release_slow = asyncio.Event()
+
+    async def scheduler_advance(path, _browser_context, *, scheduling_tasks=None):
+        nonlocal first_active
+        assert scheduling_tasks is not None
+        task_id = store.load(path)["task_id"]
+        calls[task_id] += 1
+        if task_id == second["task_id"]:
+            slow_started.set()
+            await release_slow.wait()
+            return store.load(path)
+
+        assert first_active is False
+        first_active = True
+        try:
+            if calls[task_id] == 1:
+                return store.update(
+                    path,
+                    lambda current: current.update(
+                        status="WAITING",
+                        kanban_column="WAITING",
+                    ),
+                )
+            if calls[task_id] == 2:
+                second_lock_skip.set()
+                return None
+            third_first_call.set()
+            return store.load(path)
+        finally:
+            first_active = False
+
+    monkeypatch.setattr(worker, "advance", scheduler_advance)
+
+    async def scenario():
+        cycle = asyncio.create_task(worker.run_once(SimpleNamespace(pages=[])))
+        await asyncio.wait_for(slow_started.wait(), timeout=1.0)
+        await asyncio.wait_for(second_lock_skip.wait(), timeout=1.0)
+        await asyncio.sleep(worker_module.MINIMUM_DEADLINE_SECONDS / 2)
+        assert calls[first["task_id"]] == 2
+        await asyncio.wait_for(third_first_call.wait(), timeout=1.0)
+        assert cycle.done() is False
+        assert calls == {first["task_id"]: 3, second["task_id"]: 1}
+        release_slow.set()
+        await asyncio.wait_for(cycle, timeout=1.0)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        worker.runtime_db.close()
+
 def test_runtime_worker_hung_dom_probe_revisits_expired_second_task_past_bound(
     tmp_path: Path,
     monkeypatch,

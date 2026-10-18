@@ -14537,6 +14537,16 @@ class CDPAWorker:
                                 )
                         else:
                             affected.add(task_id)
+                            if result is None:
+                                scheduled_versions.pop(task_id, None)
+                                current = self.registry.tasks_by_id.get(task_id)
+                                if current is not None:
+                                    affected.update(
+                                        self.registry.update_task(
+                                            current,
+                                            now=time.time(),
+                                        )
+                                    )
                 # A completed execution releases endpoint capacity. Rescan the
                 # full due frontier so browser-pool waiters can enter before
                 # unrelated running tasks drain; active/version guards prevent
