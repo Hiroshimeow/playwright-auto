@@ -75,6 +75,85 @@ def test_valid_result_wins_over_permission_evidence_after_five_second_stability(
     assert result.response.text == "result"
 
 
+_CONVERSATION_CAPACITY_BANNER = (
+    "You've reached the maximum length for this conversation, but you can keep "
+    "talking by starting a new chat. Start new chat"
+)
+
+
+@pytest.mark.parametrize("seconds", [5, 601])
+def test_valid_bound_native_route_wins_over_exact_capacity_banner(tmp_path, seconds):
+    import json
+
+    from playwright_auto.cdpa_routes import parse_route_response, validate_file_report
+
+    handoff = ".plan/team/team-dev_turn40_task.md"
+    report = tmp_path / handoff
+    report.parent.mkdir(parents=True)
+    report.write_text("# DEV report\nCompleted work ready for review.\n", encoding="utf-8")
+    current = current_result(
+        json.dumps({"route": "REVIEW", "handoff": handoff}),
+        url="https://chatgpt.com/?temporary-chat=true",
+        state=ChatGPTState.ERROR,
+        error_texts=(_CONVERSATION_CAPACITY_BANNER,),
+    )
+    validated = []
+
+    def validate(candidate):
+        route = parse_route_response(candidate.text, source_role="DEV")
+        assert route.route == "REVIEW"
+        validate_file_report(
+            route.handoff, repository_root=tmp_path, plans_root=".plan", team="team",
+            physical_role="team-dev", turn=40, task_id="task",
+        )
+        validated.append(candidate.message_id)
+
+    wait = {
+        "started_at": (NOW - timedelta(hours=1)).isoformat(),
+        "controller_progress_at": (NOW - timedelta(hours=1)).isoformat(),
+        "timeout_refreshed": True,
+        "timeout_status_checked": True,
+        "timeout_status": None,
+    }
+    assert step(current, wait, validate=validate).action is Action.WAIT
+    result = step(current, wait, seconds, validate=validate)
+    assert validated == ["answer", "answer"]
+    assert wait["bound_assistant_message_id"] == "answer"
+    assert wait["bound_assistant_turn_id"] == "answer-turn"
+    assert result.action is Action.ACCEPT
+    assert result.reason == "valid_bound_result"
+    assert result.response.message_id == "answer"
+
+
+@pytest.mark.parametrize("changes", [
+    {"stop_visible": True},
+    {"response_activity_turn_id": "answer-turn"},
+    {"response_projection_active": True},
+    {"retry_visible": True},
+    {"error_texts": (_CONVERSATION_CAPACITY_BANNER, "Something went wrong")},
+    {"error_texts": ("Message delivery timed out. Please try again. Retry",)},
+    {"error_texts": (_CONVERSATION_CAPACITY_BANNER + " Connection interrupted",)},
+])
+def test_capacity_banner_does_not_override_active_or_delivery_error_guards(changes):
+    current = current_result(**{
+        "error_texts": (_CONVERSATION_CAPACITY_BANNER,), **changes,
+    })
+    wait = {}
+    step(current, wait)
+    assert step(current, wait, 5).action is not Action.ACCEPT
+
+
+@pytest.mark.parametrize("text", [None, "", "{", "unvalidated progress"])
+def test_capacity_banner_does_not_admit_missing_or_malformed_result(text):
+    current = (
+        snapshot(error_texts=(_CONVERSATION_CAPACITY_BANNER,))
+        if text is None else current_result(text, error_texts=(_CONVERSATION_CAPACITY_BANNER,))
+    )
+    wait = {}
+    step(current, wait, validate=invalid)
+    assert step(current, wait, 5, validate=invalid).action is not Action.ACCEPT
+
+
 def test_allow_disappearance_returns_to_normal_wait_without_refresh():
     current = snapshot()
     wait = {"mcp_allow_clicked_at": NOW.isoformat(), "mcp_allow_clicked_target": "target"}

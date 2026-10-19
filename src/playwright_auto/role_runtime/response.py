@@ -9,6 +9,12 @@ from ..chatgpt_models import bound_assistant_for_receipt
 from .model import Action, Context, Decision
 
 
+_CONVERSATION_CAPACITY_BANNER = (
+    "You've reached the maximum length for this conversation, but you can keep "
+    "talking by starting a new chat. Start new chat"
+)
+
+
 def current_assistant(messages: Sequence[Any], baseline: Any = None) -> Any | None:
     """Use the newest non-empty assistant after the newest rendered user.
 
@@ -217,7 +223,12 @@ def handle(ctx: Context) -> Decision | None:
         or bool(getattr(ctx.snapshot, "stop_visible", False))
         or bool(getattr(ctx.snapshot, "response_projection_active", False))
         or bool(getattr(ctx.snapshot, "retry_visible", False))
-        or bool(getattr(ctx.snapshot, "error_texts", ()))
+        # This exact ambient warning limits future turns; it does not invalidate
+        # the stable validated bound result. Other errors still veto admission.
+        or any(
+            " ".join(str(text).split()) != _CONVERSATION_CAPACITY_BANNER
+            for text in (getattr(ctx.snapshot, "error_texts", ()) or ())
+        )
     ):
         return None
     return Decision(Action.ACCEPT, "valid_bound_result", candidate)
