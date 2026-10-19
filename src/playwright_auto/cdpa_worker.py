@@ -2722,6 +2722,7 @@ class CDPAWorker:
                 if fresh:
                     if observed is not None:
                         raise RoleOwnershipError("Fresh homepage already has an unproven conversation identity")
+                    self._record_acquired(state, role, acquired)
                     binding["page_id"] = acquired.page_id
                     binding["error"] = None
                 elif observed is None or observed[0] != target[0] or (
@@ -2741,15 +2742,7 @@ class CDPAWorker:
                 ):
                     generation = int(record.get("role_url_generation") or 0)
                     if int(active.get("role_url_generation") or 0) != generation:
-                        previous_id = active["hop_id"]
-                        new_hop = self._append_hop(
-                            state, source_role=role, target_role=role,
-                            handoff=str(active.get("handoff") or ""),
-                            kind=str(active.get("kind") or "handoff"),
-                            turn=int(active.get("turn") or 1),
-                        )
-                        active["superseded_by_hop_id"] = new_hop["hop_id"]
-                        active["superseded_reason"] = "operator_change_role_url"
+                        self._supersede_pristine_url_hop(state, active)
                 if not fresh:
                     record["page_url"] = _preferred_saved_url(
                         record.get("page_url"), verified.url, conversation_id=target[0]
@@ -2765,9 +2758,20 @@ class CDPAWorker:
         hop = _active_hop(state)
         if str(hop.get("state") or "") != "pre_send":
             return False  # older accepted/ambiguous Send still owns its original wait path
-        return not (
+        fresh_ready = (
             active_binding.get("status") == "NEW_PENDING"
-            and active_binding.get("page_id")
+            and bool(active_binding.get("page_id"))
+        )
+        if (
+            fresh_ready
+            and state.get("status") in {"INBOX", "RUNNING"}
+            and int(hop.get("role_url_generation") or 0) != int(active_binding.get("generation") or 0)
+            and self._execution_is_pristine_pre_send(state, allow_prepared_ledger=True)
+        ):
+            self._supersede_pristine_url_hop(state, hop)
+            hop = _active_hop(state)
+        return not (
+            fresh_ready
             and int(hop.get("role_url_generation") or 0) == int(active_binding.get("generation") or 0)
         )
 
@@ -6470,6 +6474,29 @@ class CDPAWorker:
             retryable=False,
         )
 
+    def _supersede_pristine_url_hop(
+        self, state: dict[str, Any], hop: dict[str, Any]
+    ) -> None:
+        """A new URL request replaces transport identity, not the repair contract."""
+        role = str(hop["target_role"])
+        replacement = self._append_hop(
+            state, source_role=role, target_role=role,
+            handoff=str(hop.get("handoff") or ""),
+            kind=str(hop.get("kind") or "handoff"),
+            turn=int(hop.get("turn") or 1),
+            repair_attempt=int(hop.get("repair_attempt") or 0),
+            validation_error=hop.get("validation_error"),
+        )
+        if hop.get("kind") in {"route_repair", "report_repair"}:
+            for key in (
+                "expected_report_path", "locked_route", "locked_handoff",
+                "conversation_generation",
+            ):
+                if key in hop:
+                    replacement[key] = copy.deepcopy(hop[key])
+        hop["superseded_by_hop_id"] = replacement["hop_id"]
+        hop["superseded_reason"] = "operator_change_role_url"
+
     async def _pre_send(
         self,
         state: dict[str, Any],
@@ -6482,18 +6509,14 @@ class CDPAWorker:
             binding = (state.get("roles") or {}).get(role, {}).get("role_url_binding") or {}
             if (
                 state.get("status") in {"INBOX", "RUNNING"}
-                and binding.get("status") == "BOUND"
+                and (
+                    binding.get("status") == "BOUND"
+                    or (binding.get("status") == "NEW_PENDING" and binding.get("page_id"))
+                )
                 and int(binding.get("generation") or 0) == generation
                 and self._execution_is_pristine_pre_send(state, allow_prepared_ledger=True)
             ):
-                new_hop = self._append_hop(
-                    state, source_role=role, target_role=role,
-                    handoff=str(hop.get("handoff") or ""),
-                    kind=str(hop.get("kind") or "handoff"),
-                    turn=int(hop.get("turn") or 1),
-                )
-                hop["superseded_by_hop_id"] = new_hop["hop_id"]
-                hop["superseded_reason"] = "operator_change_role_url"
+                self._supersede_pristine_url_hop(state, hop)
                 return
             self._block(
                 state,
@@ -6887,6 +6910,14 @@ class CDPAWorker:
                 return
         self._record_acquired(state, role, acquired)
         generation = int(state["roles"][role].get("conversation_generation") or 0)
+        continuation_context_changed = (
+            acquired.new_chat
+            or (hop.get("conversation_generation") is not None
+                and int(hop["conversation_generation"]) != generation)
+        )
+        if hop.get("minimal_continuation_prompt") is True and continuation_context_changed:
+            # Persist the invalidation before readiness can defer this cycle.
+            hop.pop("minimal_continuation_prompt", None)
         if hop.get("conversation_generation") != generation:
             hop["conversation_generation"] = generation
             hop["generation_started_here"] = bool(acquired.new_chat)
@@ -7141,7 +7172,10 @@ class CDPAWorker:
                 report_mode=_report_mode(state),
                 allowed_routes=allowed_routes,
             )
-            prompt = (bounded_context + "\n\n" if bounded_context else "") + repair_prompt
+            prompt = (
+                self.prompts.filesystem_scope(str(state["repository"]), expected)
+                + "\n\n" + repair_prompt
+            )
             included = False
         elif prompt_kind == "report_repair":
             locked_route = str(hop.get("locked_route") or "").strip().upper()
@@ -8199,6 +8233,8 @@ class CDPAWorker:
             and child.get("parent_hop_id") == hop.get("hop_id")
         ):
             child["minimal_continuation_prompt"] = True
+            if hop.get("conversation_generation") is not None:
+                child["conversation_generation"] = hop["conversation_generation"]
 
 
 
