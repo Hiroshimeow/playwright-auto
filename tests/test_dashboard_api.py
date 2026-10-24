@@ -70,8 +70,18 @@ def projection(tmp_path: Path, *, report: Path | None = None) -> TaskProjection:
     )
 
 
-def start_api(tmp_path: Path, *, report: Path | None = None):
+def start_api(
+    tmp_path: Path,
+    *,
+    report: Path | None = None,
+    independent_activation_enabled: bool | None = None,
+):
     config = load_cdpa_config(None, repository_root=tmp_path)
+    if independent_activation_enabled is not None:
+        config = replace(
+            config,
+            independent_activation_enabled=independent_activation_enabled,
+        )
     db = RuntimeDB(config.runtime_database)
     db.ensure_schema()
     db.replace_task_projections(
@@ -209,7 +219,16 @@ def test_agents_api_etag_and_workflow_catalog_commands(tmp_path: Path):
     try:
         status, headers, body = request(server, "GET", "/api/agents")
         assert status == 200
-        assert json.loads(body) == {"workflow": workflow, "independent": []}
+        assert json.loads(body) == {
+            "workflow": workflow,
+            "independent": [],
+            "independent_migration": {
+                "activation_enabled": False,
+                "replacement": "TeamTask + CronJob/Heartbeat",
+                "runtime_v2": "migration_only",
+                "surface": "independent_agent",
+            },
+        }
         etag = headers["ETag"]
         status, _headers, body = request(
             server,
@@ -504,7 +523,7 @@ def test_board_etag_304_and_worker_offline_last_known_good(tmp_path: Path):
         health = json.loads(body)
         assert status == 200
         assert health["ok"] is True
-        assert health["independent_activation_enabled"] is True
+        assert health["independent_activation_enabled"] is False
         assert health["worker_online"] is False
         assert health["worker_stale"] is True
     finally:
@@ -844,7 +863,9 @@ def test_tasks_api_is_file_only_for_same_and_cross_workspace(tmp_path: Path):
 def test_independent_create_accepts_initial_triggers_and_preserves_idempotency(
     tmp_path: Path,
 ):
-    _config, db, server, thread = start_api(tmp_path)
+    _config, db, server, thread = start_api(
+        tmp_path, independent_activation_enabled=True
+    )
     body = {
         "name": "Initial Trigger Agent",
         "system_prompt": "Inspect only matching work.",
@@ -923,7 +944,9 @@ def test_independent_create_accepts_initial_triggers_and_preserves_idempotency(
 
 
 def test_independent_bind_endpoint_queues_exact_event_and_target(tmp_path: Path):
-    _config, db, server, thread = start_api(tmp_path)
+    _config, db, server, thread = start_api(
+        tmp_path, independent_activation_enabled=True
+    )
     body = {
         "event_key": "check-all:monitor:42",
         "target_task_id": "workflow-target",
