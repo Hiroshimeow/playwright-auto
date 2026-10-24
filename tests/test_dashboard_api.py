@@ -6,6 +6,7 @@ import http.client
 import json
 import os
 import threading
+from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -503,8 +504,40 @@ def test_board_etag_304_and_worker_offline_last_known_good(tmp_path: Path):
         health = json.loads(body)
         assert status == 200
         assert health["ok"] is True
+        assert health["independent_activation_enabled"] is True
         assert health["worker_online"] is False
         assert health["worker_stale"] is True
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_runtime_v2_bridge_policy_hides_and_rejects_independent_activation(tmp_path: Path):
+    config = replace(
+        load_cdpa_config(None, repository_root=tmp_path),
+        independent_activation_enabled=False,
+    )
+    db = RuntimeDB(config.runtime_database)
+    db.ensure_schema()
+    server = create_server(config, host="127.0.0.1", port=0, db=db)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, _headers, body = request(server, "GET", "/health")
+        assert status == 200
+        assert json.loads(body)["independent_activation_enabled"] is False
+
+        status, _headers, body = request(server, "GET", "/api/agents")
+        assert status == 200
+        payload = json.loads(body)
+        assert payload["independent"] == []
+        assert payload["independent_migration"]["activation_enabled"] is False
+
+        status, _headers, body = request(
+            server, "POST", "/api/independent-agents", body={"name": "legacy"}
+        )
+        assert status == 410
+        assert json.loads(body)["error"]["code"] == "independent_agent_deprecated"
     finally:
         server.shutdown()
         thread.join(timeout=5)

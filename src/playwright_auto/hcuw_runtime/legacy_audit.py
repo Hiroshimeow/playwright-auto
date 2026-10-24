@@ -35,6 +35,27 @@ class LegacyObservationAudit:
             if isinstance(item, dict) and item.get("task_id")
         }
 
+    def task_detail(self, task_id: str) -> dict[str, Any] | None:
+        """Read one existing legacy task projection without mutating runtime state."""
+        identifier = str(task_id or "").strip()
+        if not identifier:
+            return None
+        try:
+            return self._read_json(
+                f"http://127.0.0.1:{self.config.legacy_api_port}/api/tasks/{identifier}"
+            )
+        except RuntimeError:
+            return None
+
+    def runtime_state(self) -> dict[str, Any] | None:
+        """Read legacy worker/browser liveness for runtime-v2 diagnostics only."""
+        try:
+            return self._read_json(
+                f"http://127.0.0.1:{self.config.legacy_api_port}/api/state"
+            )
+        except RuntimeError:
+            return None
+
     def _read_legacy_board(self) -> dict[str, Any]:
         try:
             return self._read_json(f"http://127.0.0.1:{self.config.legacy_api_port}/api/tasks")
@@ -160,6 +181,8 @@ class LegacyObservationAudit:
             "active_action": item.get("active_action"),
             "block_code": item.get("block_code"),
             "updated_at": item.get("updated_at"),
+            "browser_control": item.get("browser_control"),
+            "async_continuation": item.get("async_continuation"),
             "roles": [self._role_summary(role) for role in roles],
         }
 

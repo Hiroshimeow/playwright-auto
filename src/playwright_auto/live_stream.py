@@ -178,11 +178,17 @@ class LiveLogFollower:
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            if not self._active:
+            # Reading and publishing must share the hub lock with unsubscribe
+            # and reactivation. Otherwise an old read can publish into a new
+            # stream epoch after the last subscriber has departed.
+            with self.hub.lock:
+                active = self._active
+                if active:
+                    self._read_once()
+            if not active:
                 self._wake.wait(1.0)
                 self._wake.clear()
                 continue
-            self._read_once()
             self._stop.wait(self.poll_seconds)
 
 

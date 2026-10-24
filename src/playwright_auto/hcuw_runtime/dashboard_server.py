@@ -255,8 +255,8 @@ def _dashboard_body() -> str:
   <section>
     <h2>Submitted tasks</h2>
     <table>
-      <thead><tr><th>Latest</th><th>Runtime task</th><th>Legacy task</th><th>Team</th><th>Roles</th><th>Start role</th><th>Active role</th><th>Status</th><th>Block code</th><th>Updated</th></tr></thead>
-      <tbody id="task-rows"><tr><td colspan="10">Loading...</td></tr></tbody>
+      <thead><tr><th>Latest</th><th>Runtime task</th><th>Legacy task</th><th>Team</th><th>Roles</th><th>Start role</th><th>Active role</th><th>Status</th><th>Block code</th><th>Browser control / WAIT</th><th>Updated</th></tr></thead>
+      <tbody id="task-rows"><tr><td colspan="11">Loading...</td></tr></tbody>
     </table>
   </section>
 
@@ -280,7 +280,8 @@ def _dashboard_body() -> str:
     <section><h3>Actions</h3><p class="status" id="actions-status">Loading...</p><pre id="actions-source">Loading...</pre></section>
   </div>
   <section><h2>Timeline</h2><pre id="audit-events">Loading...</pre></section>
-  <section><h2>Diagnostics</h2><pre id="diagnostics">No diagnostics loaded yet.</pre></section>
+  <section><h2>Gate B Runtime Diagnostics</h2><p>Shows Cron/Heartbeat triggers, TeamTask dependency/continuation state, and migration-only Independent Agent status. No second dependency graph is stored.</p><pre id="gateb-diagnostics">Loading...</pre></section>
+  <section><h2>API diagnostics</h2><pre id="diagnostics">No diagnostics loaded yet.</pre></section>
 """
 
 
@@ -312,11 +313,32 @@ def _dashboard_script(refresh_seconds: int) -> str:
       renderSource(snapshot, 'actions', 'actions-status', 'actions-source');
       showJson('audit-events', snapshot.data.events);
     }}
+    function controlSummary(item) {{
+      const control = item.browser_control || {{}};
+      const wait = item.async_continuation || null;
+      const parts = [];
+      if (item.browser_control) {{
+        parts.push('stop=' + control.stop_visible, 'retry=' + control.retry_visible,
+          'allow=' + (control.permission_prompt_count || 0) + '/' + (control.permission_click_count || 0) + ' clicked');
+        if (control.last_permission_click) parts.push('last allow=' + control.last_permission_click.result);
+        if (control.retry_decision) parts.push('retry decision=' + control.retry_decision.result);
+        if (control.controller_decision || control.controller_reason) parts.push(
+          'controller=' + [control.controller_decision, control.controller_reason].filter(Boolean).join('/')
+        );
+        if (control.terminal_reconciliation) parts.push('terminal=' + control.terminal_reconciliation.result + '@' + control.terminal_reconciliation.source);
+      }}
+      if (wait) {{
+        parts.push('wait ' + wait.continuation_id + '=' + wait.state,
+          'callback=' + (wait.callback ? wait.callback.status : 'pending'),
+          'wake=' + (wait.wake ? wait.wake.status : 'none'));
+      }}
+      return parts.join('; ');
+    }}
     function renderTasks(payload) {{
       const body = document.getElementById('task-rows');
       const items = (payload && payload.data && payload.data.items) || [];
       if (!items.length) {{
-        body.innerHTML = '<tr><td colspan="10">No runtime-v2 tasks submitted yet.</td></tr>';
+        body.innerHTML = '<tr><td colspan="11">No runtime-v2 tasks submitted yet.</td></tr>';
         return;
       }}
       body.textContent = '';
@@ -327,7 +349,7 @@ def _dashboard_script(refresh_seconds: int) -> str:
         const cells = [
           item.latest ? 'current' : 'older', item.runtime_task_id, item.legacy_task_id, item.team,
           (item.roles || []).join(','), item.start_role, item.active_role, item.status,
-          item.block_code, item.updated_at,
+          item.block_code, controlSummary(item), item.updated_at,
         ];
         for (const value of cells) {{
           row.insertCell().textContent = value == null ? '' : String(value);
@@ -358,6 +380,12 @@ def _dashboard_script(refresh_seconds: int) -> str:
         diagnostics.push({{ code: 'tasks_unavailable', message: String(error) }});
       }}
       try {{
+        showJson('gateb-diagnostics', await loadJson('/api/diagnostics'));
+      }} catch (error) {{
+        document.getElementById('gateb-diagnostics').textContent = 'diagnostics unavailable: ' + error;
+        diagnostics.push({{ code: 'gateb_diagnostics_unavailable', message: String(error) }});
+      }}
+      try {{
         await refreshAudit();
       }} catch (error) {{
         diagnostics.push({{ code: 'audit_unavailable', message: String(error) }});
@@ -371,7 +399,6 @@ def _dashboard_script(refresh_seconds: int) -> str:
       const routeTargets = parseRoleList(document.getElementById('route-targets').value);
       const payload = {{
         task: document.getElementById('task-text').value,
-        team: 'hcuw-v2-dashboard-smoke',
         browser: '9222',
         roles
       }};

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .cdpa_dependencies import terminal_event_from_state
 from .cdpa_independent import is_independent_task
 from .cdpa_team import dispatch_order_key, is_active_team_owner
 
@@ -83,6 +84,26 @@ class CDPARuntimeRegistry:
             for parent_id in parent_ids
         )
 
+    def _teamtask_continuation_ready(self, state: Mapping[str, Any]) -> bool:
+        if str(state.get("waiting_code") or "") != "async_callback":
+            return False
+        waiting = state.get("waiting") if isinstance(state.get("waiting"), Mapping) else {}
+        continuation_id = str(waiting.get("continuation_id") or "")
+        registry = state.get("async_continuations")
+        record = registry.get(continuation_id) if isinstance(registry, Mapping) else None
+        if not isinstance(record, Mapping) or record.get("source_kind") != "teamtask":
+            return False
+        source_ids = tuple(str(item) for item in record.get("source_refs") or ())
+        if not source_ids:
+            return False
+        events = [
+            terminal_event_from_state(self.tasks_by_id[source_id])
+            if source_id in self.tasks_by_id
+            else None
+            for source_id in source_ids
+        ]
+        return all(event is not None for event in events)
+
     def _team_ready(self, task_id: str, state: Mapping[str, Any]) -> bool:
         team = str(state.get("team") or "")
         for sibling_id in self.team_members.get(team, ()):
@@ -150,6 +171,12 @@ class CDPARuntimeRegistry:
         ):
             return now + MINIMUM_DEADLINE_SECONDS
         if status == "WAITING":
+            if str(state.get("waiting_code") or "") == "async_callback":
+                return (
+                    now + MINIMUM_DEADLINE_SECONDS
+                    if self._teamtask_continuation_ready(state)
+                    else None
+                )
             if self._dependencies_ready(state) and self._team_ready(task_id, state):
                 return now + MINIMUM_DEADLINE_SECONDS
             return None
@@ -173,6 +200,20 @@ class CDPARuntimeRegistry:
     def affected_by(self, task_id: str) -> set[str]:
         affected = {task_id}
         affected.update(self.dependency_children.get(task_id, ()))
+        # TeamTask-source continuation links are derived from canonical task state;
+        # do not persist a parallel dependency graph.
+        for target_id, target in self.tasks_by_id.items():
+            registry = target.get("async_continuations")
+            if not isinstance(registry, Mapping):
+                continue
+            if any(
+                isinstance(record, Mapping)
+                and record.get("source_kind") == "teamtask"
+                and task_id in tuple(str(item) for item in record.get("source_refs") or ())
+                and str(record.get("state") or "") not in {"delivered", "cancelled", "superseded"}
+                for record in registry.values()
+            ):
+                affected.add(target_id)
         state = self.tasks_by_id.get(task_id)
         if state is not None:
             affected.update(self.team_members.get(str(state.get("team") or ""), ()))

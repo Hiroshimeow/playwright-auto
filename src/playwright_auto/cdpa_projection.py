@@ -11,8 +11,9 @@ from urllib.parse import urlsplit, urlunsplit
 
 from .cdpa_commands import workflow_control_matrix
 from .cdpa_config import CDPA_ROLES, declared_repository_from_task, remote_repository_from_task
-from .cdpa_dependencies import dependency_parent_ids
+from .cdpa_dependencies import dependency_parent_ids, dependency_readiness
 from .cdpa_independent import independent_tags, is_independent_task
+from .cdpa_materials import task_context_materials
 from .cdpa_safety import sanitize_text, sanitize_value
 from .cdpa_team import (
     dispatch_order_key,
@@ -289,7 +290,12 @@ def _roles(
 
 def _timeline(raw: Mapping[str, Any]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for field, level in (("route_timeline", "ROUTE"), ("dependency_events", "DEPENDENCY"), ("queue_events", "QUEUE")):
+    for field, level in (
+        ("route_timeline", "ROUTE"),
+        ("dependency_events", "DEPENDENCY"),
+        ("queue_events", "QUEUE"),
+        ("control_events", "CONTROL"),
+    ):
         for index, event in enumerate(raw.get(field) or []):
             if not isinstance(event, Mapping):
                 continue
@@ -300,6 +306,11 @@ def _timeline(raw: Mapping[str, Any]) -> list[dict[str, Any]]:
                 message = f"{source} → {destination}"
             elif level == "ROUTE" and destination:
                 message = f"Route → {destination}"
+            elif level == "CONTROL":
+                message = _public_text(
+                    f"{kind.replace('_', ' ')}: {event.get('result') or event.get('route') or 'recorded'}",
+                    max_chars=1000,
+                )
             else:
                 message = _public_text(
                     event.get("message") or event.get("reason") or event.get("error") or kind.replace("_", " "),
@@ -379,6 +390,152 @@ def _surface(
     if replaced or status in TERMINAL:
         return ("offline_recoverable", "terminal_tab_present") if online else ("history", "terminal")
     return ("active", "online") if online else ("offline_recoverable", "offline")
+
+
+def _latest_wait_value(raw: Mapping[str, Any], key: str) -> tuple[Any, Mapping[str, Any] | None]:
+    for hop in reversed(list(raw.get("hops") or ())):
+        wait = hop.get("wait") if isinstance(hop, Mapping) else None
+        if isinstance(wait, Mapping) and wait.get(key):
+            return wait.get(key), hop
+    return None, None
+
+
+def _browser_control(raw: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Phase 1.5 evidence derived from the existing DOM projection stored on hops."""
+    dom, dom_hop = _latest_wait_value(raw, "browser_control")
+    allow_last, _ = _latest_wait_value(raw, "mcp_allow_last")
+    retry, _ = _latest_wait_value(raw, "provider_retry")
+    deferred, _ = _latest_wait_value(raw, "provider_retry_deferred")
+    reconciliation, _ = _latest_wait_value(raw, "terminal_reconciliation")
+    if not any((dom, allow_last, retry, deferred, reconciliation)):
+        return None
+    dom = dom if isinstance(dom, Mapping) else {}
+    wait = dom_hop.get("wait") if isinstance(dom_hop, Mapping) else {}
+    clicks = sum(
+        int((hop.get("wait") or {}).get("mcp_allow_click_count") or 0)
+        for hop in raw.get("hops") or ()
+        if isinstance(hop, Mapping) and isinstance(hop.get("wait"), Mapping)
+    )
+    retry_decision = (
+        {key: retry.get(key) for key in ("result", "attempted_at", "completed_at", "error", "original_prompt_resent")}
+        if isinstance(retry, Mapping)
+        else {"result": "deferred", "reason": deferred.get("reason")}
+        if isinstance(deferred, Mapping)
+        else None
+    )
+    return _public_value(
+        {
+            "hop_id": (dom_hop or {}).get("hop_id"),
+            "stop_visible": dom.get("stop_visible"),
+            "retry_visible": dom.get("retry_visible"),
+            "composer_nonempty": dom.get("composer_nonempty"),
+            "permission_prompt_count": max(
+                int(dom.get("permission_node_count") or 0),
+                int(dom.get("permission_allow_count") or 0),
+            ),
+            "permission_click_count": clicks,
+            "last_permission_click": dict(allow_last) if isinstance(allow_last, Mapping) else None,
+            "controller_decision": (wait or {}).get("controller_decision"),
+            "controller_reason": (wait or {}).get("controller_reason"),
+            "retry_decision": retry_decision,
+            "terminal_reconciliation": (
+                {
+                    key: reconciliation.get(key)
+                    for key in ("source", "result", "route", "report", "continuation_id", "error", "checked_at")
+                }
+                if isinstance(reconciliation, Mapping)
+                else None
+            ),
+        }
+    )
+
+
+def _async_continuations(raw: Mapping[str, Any]) -> list[dict[str, Any]]:
+    registry = raw.get("async_continuations")
+    records = (
+        [item for item in (registry or {}).values() if isinstance(item, Mapping)]
+        if isinstance(registry, Mapping)
+        else []
+    )
+    records.sort(key=lambda item: str(item.get("registered_at") or ""), reverse=True)
+    projected = []
+    for record in records[:20]:
+        callback = record.get("callback") if isinstance(record.get("callback"), Mapping) else None
+        source_results = (
+            record.get("source_results")
+            if isinstance(record.get("source_results"), Mapping)
+            else {}
+        )
+        projected.append(
+            _public_value(
+                {
+                    "continuation_id": record.get("continuation_id"),
+                    "state": record.get("state"),
+                    "role": record.get("role_key"),
+                    "source_kind": record.get("source_kind") or "external_script",
+                    "source_refs": list(record.get("source_refs") or ()),
+                    "source_results": dict(source_results),
+                    "source_acknowledged_at": record.get("source_acknowledged_at"),
+                    "target_ref": dict(record.get("target_ref") or {}),
+                    "completion_policy": record.get("completion_policy") or "all",
+                    "timeout_at": record.get("timeout_at"),
+                    "cycle_validation": dict(record.get("cycle_validation") or {}),
+                    "job_id": record.get("job_id"),
+                    "provider_job_id": record.get("provider_job_id"),
+                    "wake_policy": record.get("wake_policy"),
+                    "failure_policy": record.get("failure_policy"),
+                    "registered_at": record.get("registered_at"),
+                    "waiting_since": record.get("waiting_since"),
+                    "callback": (
+                        {
+                            key: callback.get(key)
+                            for key in (
+                                "status",
+                                "exit_code",
+                                "summary",
+                                "material_ids",
+                                "received_at",
+                            )
+                        }
+                        if callback is not None
+                        else None
+                    ),
+                    "wake": dict(record.get("wake") or {}) or None,
+                }
+            )
+        )
+    return projected
+
+
+def _provider_jobs(raw: Mapping[str, Any]) -> list[dict[str, Any]]:
+    registry = raw.get("provider_jobs")
+    if not isinstance(registry, Mapping):
+        return []
+    jobs = [dict(item) for item in registry.values() if isinstance(item, Mapping)]
+    jobs.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    return [
+        _public_value(
+            {
+                key: job.get(key)
+                for key in (
+                    "provider_job_id",
+                    "provider_id",
+                    "execution_mode",
+                    "state",
+                    "created_at",
+                    "started_at",
+                    "deadline_at",
+                    "completed_at",
+                    "stdout_ref",
+                    "stderr_ref",
+                    "result_ref",
+                    "error",
+                    "metadata",
+                )
+            }
+        )
+        for job in jobs[:50]
+    ]
 
 
 def _problem(raw: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -1028,6 +1185,36 @@ def build_waiting_order(
     return records
 
 
+def _v11_lifecycle(raw: Mapping[str, Any], status: str) -> dict[str, str | None]:
+    """Project the five v11 lifecycle states without mutating legacy manifests.
+
+    Existing schedulers, durable continuations and browser leases still consume
+    legacy statuses until migration is independently tested. Unknown old WAITING
+    records must not be silently interpreted as no-lease durable callbacks.
+    """
+    state = status.upper()
+    reason: str | None = None
+    outcome: str | None = None
+    if state == "INBOX":
+        state = "QUEUED"
+    elif state == "WAITING":
+        waiting = raw.get("waiting") if isinstance(raw.get("waiting"), Mapping) else {}
+        code = str(waiting.get("reason") or raw.get("waiting_code") or "").lower()
+        if code in {"async_callback", "browser_pool", "team_busy"} or "dependency" in code:
+            reason = code
+        else:
+            state, reason = "PAUSED", "migration_unresolved"
+    elif state in {"PAUSED", "BLOCKED"}:
+        reason = "legacy_paused" if state == "PAUSED" else "legacy_blocked"
+        state = "PAUSED"
+    elif state in {"DONE", "STOPPED"}:
+        outcome = "done" if state == "DONE" else "stopped"
+        state = "TERMINAL"
+    elif state != "RUNNING":
+        state, reason = "PAUSED", "migration_unresolved"
+    return {"state": state, "reason_code": reason, "terminal_outcome": outcome}
+
+
 def build_task_projection(
     raw: Mapping[str, Any],
     *,
@@ -1064,11 +1251,14 @@ def build_task_projection(
         )
     maintenance_reports, maintenance_private = _maintenance_reports(raw)
     raw_materials = raw.get("materials") if isinstance(raw.get("materials"), Mapping) else {}
-    materials_private = {
-        str(material_id): dict(locator)
-        for material_id, locator in raw_materials.items()
-        if isinstance(locator, Mapping)
-    }
+    materials_private = task_context_materials(raw, tuple(tasks))
+    materials_private.update(
+        {
+            str(material_id): dict(locator)
+            for material_id, locator in raw_materials.items()
+            if isinstance(locator, Mapping)
+        }
+    )
     materials_public = [
         {
             "material_id": material_id,
@@ -1076,7 +1266,7 @@ def build_task_projection(
             "material_type": locator.get("material_type"),
             "version": locator.get("version"),
             "content_length": locator.get("content_length"),
-            "url": f"/api/report/{task_id}/{material_id}",
+            "url": f"/api/materials/{task_id}/{material_id}",
         }
         for material_id, locator in materials_private.items()
     ]
@@ -1121,6 +1311,16 @@ def build_task_projection(
             }
         )
     timeline = _timeline(raw)
+    async_continuations = _async_continuations(raw)
+    provider_jobs = _provider_jobs(raw)
+    readiness = dependency_readiness(raw, tasks)
+    dependency_diagnostics = {
+        "state": readiness.projection_state,
+        "ready": readiness.ready,
+        "waiting_on": list(readiness.waiting_on),
+        "stopped": list(readiness.stopped),
+        "missing": list(readiness.missing),
+    }
     public_waiting_reason = _public_text(raw.get("waiting_reason"), max_chars=500) or None
     if public_waiting_reason:
         for item in tasks:
@@ -1196,6 +1396,9 @@ def build_task_projection(
     elif status == "WAITING" and waiting.get("reason") == "browser_pool":
         lifecycle_kind = "capacity_wait"
         lifecycle_label = "Waiting for browser capacity"
+    elif status == "WAITING" and waiting.get("reason") == "async_callback":
+        lifecycle_kind = "async_wait"
+        lifecycle_label = "Waiting for async callback"
     elif status == "STOPPED" and any(word in stop_code for word in ("supersed", "abandon", "obsolete")):
         lifecycle_kind = "superseded"
         lifecycle_label = "Superseded / abandoned"
@@ -1213,6 +1416,7 @@ def build_task_projection(
         "task_id": task_id,
         "team": team,
         "status": status,
+        "v11_lifecycle": _v11_lifecycle(raw, status),
         "column": column,
         "surface": surface,
         "active_role": raw.get("active_role"),
@@ -1277,6 +1481,8 @@ def build_task_projection(
             else None
         ),
         "has_reports": bool(reports or maintenance_reports or materials_public),
+        "browser_control": _browser_control(raw),
+        "async_continuation": (async_continuations[0] if async_continuations else None),
         "task_title": title,
         "version": 0,
     }
@@ -1467,6 +1673,9 @@ def build_task_projection(
         "self_route_policy": _public_value(raw.get("self_route_policy") or {}),
         "self_route_counts": _public_value(raw.get("self_route_counts") or {}),
         "route_repair_count": int(raw.get("route_repair_count") or 0),
+        "dependency_diagnostics": dependency_diagnostics,
+        "async_continuations": async_continuations,
+        "provider_jobs": provider_jobs,
         "independent_history": independent_history,
         "maintenance_reports": maintenance_reports,
         "depends_on_task_ids": [str(item) for item in raw.get("depends_on_task_ids") or []],

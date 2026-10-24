@@ -179,8 +179,22 @@ def test_dependency_readiness_preserves_explicit_missing_stopped_and_done_states
     assert stopped["waiting_code"] == "dependency_stopped"
     assert stopped["waiting"]["stopped"] == [parent["task_id"]]
 
+    # DONE is a different terminal outcome, not a legal transition from STOPPED.
+    # Use an independent parent/child scenario instead of rewriting terminal history.
+    done_parent = store.create_task(
+        "Done parent", requested_team="done-parent", task_id="done-parent-task"
+    )
+    done_child = store.create_task(
+        "Done child",
+        requested_team="done-child",
+        task_id="done-child-task",
+        depends_on_task_ids=(done_parent["task_id"],),
+    )
+    done_waiting = done_child
+    assert done_waiting["status"] == "WAITING"
+    assert done_waiting["waiting_code"] == "dependency"
     done_parent = store.update(
-        parent["manifest_path"],
+        done_parent["manifest_path"],
         lambda state: {
             **state,
             "status": "DONE",
@@ -188,12 +202,11 @@ def test_dependency_readiness_preserves_explicit_missing_stopped_and_done_states
             "kanban_column": "DONE",
             "active_role": None,
             "active_hop_id": None,
-            "stopped_at": None,
             "completed_at": state["updated_at"],
         },
     )
     released, changed = store.refresh_scheduling(
-        child["manifest_path"], tasks=[done_parent, stopped], state=stopped
+        done_child["manifest_path"], tasks=[done_parent, done_waiting], state=done_waiting
     )
     assert changed is True
     assert released["status"] == "INBOX"

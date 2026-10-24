@@ -188,12 +188,11 @@ class CDPATabActions:
             "reason_detail": "The acquired client has no production session capability observer.",
         }
 
-    async def _set_page_active(self, page: Any) -> None:
+    async def _activate_page_lifecycle(self, page: Any) -> None:
         try:
             session = await self.browser_context.new_cdp_session(page)
             try:
                 await session.send("Page.setWebLifecycleState", {"state": "active"})
-                await session.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
             finally:
                 await session.detach()
         except Exception as exc:
@@ -204,9 +203,6 @@ class CDPATabActions:
                     RuntimeWarning,
                     stacklevel=2,
                 )
-
-    async def wake(self, acquired: AcquiredRole) -> None:
-        await self._set_page_active(acquired.client.page)
 
     @staticmethod
     def _supported(page: Any) -> bool:
@@ -407,7 +403,6 @@ class CDPATabActions:
         if not matches:
             return None
         client, snapshot = matches[0]
-        await self._set_page_active(client.page)
         return AcquiredRole(
             client=client,
             page_id=str(snapshot.page_id),
@@ -730,7 +725,6 @@ class CDPATabActions:
         if snapshot.page_team != team or snapshot.page_task_id != task_id:
             raise RoleOwnershipError("task/team ownership did not persist on acquired role tab")
         assert client.binding is not None
-        await self._set_page_active(client.page)
         return AcquiredRole(
             client=client,
             page_id=client.binding.page_id,
@@ -745,7 +739,7 @@ class CDPATabActions:
         logical_role: str,
         *,
         require_clean_ready: bool = True,
-        foreground: bool = True,
+        foreground: bool = False,
     ) -> AcquiredRole:
         logical_role = str(logical_role).upper()
         role_record = manifest["roles"][logical_role]
@@ -857,8 +851,9 @@ class CDPATabActions:
                 raise RoleOwnershipError(
                     "conversation reopen did not restore exact role/task ownership"
                 )
+            # Keep this exact owned page unfrozen without stealing window focus.
+            await self._activate_page_lifecycle(page)
             if foreground:
-                await self._set_page_active(page)
                 await page.bring_to_front()
             return AcquiredRole(
                 client=client,
@@ -1000,7 +995,6 @@ class CDPATabActions:
                     code="conversation_identity_unavailable",
                 )
             assert client.binding is not None
-            await self._set_page_active(client.page)
             return AcquiredRole(
                 client=client,
                 page_id=client.binding.page_id,
@@ -1054,7 +1048,6 @@ class CDPATabActions:
             )
             snapshot = await client.assert_ownership()
             assert client.binding is not None
-            await self._set_page_active(client.page)
             return AcquiredRole(
                 client=client,
                 page_id=client.binding.page_id,

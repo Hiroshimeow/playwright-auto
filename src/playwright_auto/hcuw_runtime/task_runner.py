@@ -14,7 +14,9 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from ..cdpa_commands import teamtask_trigger_idempotency_key
 from ..cdpa_config import load_cdpa_config
+from ..cdpa_provider_runtime import ProviderRuntimeError, select_provider, select_work_owner
 from ..cdpa_role_policy import RolePolicyError, RolePolicyResult, build_role_policy
 from ..cdpa_workflow_agents import (
     WorkflowAgentCatalog,
@@ -118,8 +120,18 @@ class RuntimeTaskRunner:
     audit_timeline: AuditTimeline
 
     def submit_task(
-        self, payload: dict[str, Any], *, idempotency_key: str | None = None
+        self,
+        payload: dict[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        trigger: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if isinstance(trigger, dict) and trigger.get("kind") == "child_teamtask":
+            if select_work_owner(independent_route_contract=True).owner != "team_task":
+                raise RuntimeTaskRunnerError(
+                    "invalid_task_request",
+                    "independent routed sub-work must be owned by a child TeamTask",
+                )
         stable_key = _required_idempotency_key(idempotency_key)
         request = self._validate_payload(payload, idempotency_key=stable_key)
         existing = self._record_for_idempotency_key(stable_key)
@@ -133,7 +145,7 @@ class RuntimeTaskRunner:
         runtime = self.ensure_legacy_runtime()
         result = self._submit_team_with_legacy_api(request, idempotency_key=stable_key)
         record = self._build_task_record(
-            request, runtime, result, idempotency_key=stable_key
+            request, runtime, result, idempotency_key=stable_key, trigger=trigger
         )
         self.state_store.save_task_record(record)
         self.audit_timeline.record_event(
@@ -147,9 +159,46 @@ class RuntimeTaskRunner:
                 "browser": request.browser,
                 "roles": list(request.roles),
                 "start_role": request.start_role,
+                "trigger": trigger,
             },
         )
         return record
+
+    def submit_cron_job(
+        self, cron_id: str, scheduled_for: str, task_payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        cron = _required_identity(cron_id, "cron_id")
+        occurrence = _normalized_timestamp(scheduled_for, "scheduled_for")
+        key = teamtask_trigger_idempotency_key("cron", cron, occurrence)
+        return self.submit_task(
+            task_payload,
+            idempotency_key=key,
+            trigger={"kind": "cron", "cron_id": cron, "scheduled_for": occurrence},
+        )
+
+    def submit_heartbeat_recovery(
+        self,
+        subject_kind: str,
+        subject_id: str,
+        stale_episode_started_at: str,
+        task_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        kind = _required_identity(subject_kind, "subject_kind")
+        subject = _required_identity(subject_id, "subject_id")
+        episode = _normalized_timestamp(stale_episode_started_at, "stale_episode_started_at")
+        key = teamtask_trigger_idempotency_key(
+            "heartbeat", subject, episode, subject_kind=kind
+        )
+        return self.submit_task(
+            task_payload,
+            idempotency_key=key,
+            trigger={
+                "kind": "stale_heartbeat",
+                "subject_kind": kind,
+                "subject_id": subject,
+                "stale_episode_started_at": episode,
+            },
+        )
 
     def _record_for_idempotency_key(self, key: str) -> dict[str, Any] | None:
         matches = [
@@ -219,11 +268,16 @@ class RuntimeTaskRunner:
             raise RuntimeTaskRunnerError("invalid_task_request", "team is required")
         if not browser:
             raise RuntimeTaskRunnerError("invalid_task_request", "browser is required")
-        if provider_id != "chatgpt_web":
+        try:
+            provider = select_provider(
+                explicit_provider_id=provider_id, required_capabilities=("browser",)
+            )
+        except ProviderRuntimeError as exc:
             raise RuntimeTaskRunnerError(
                 "invalid_task_request",
-                "Gate A supports provider_id='chatgpt_web' only; other providers start in Gate B",
-            )
+                "TeamTask role turns require a browser provider; non-browser execution belongs to ProviderJob",
+            ) from exc
+        provider_id = provider.provider_id
 
         _definitions, semantic_routes, default_repairs = self._role_policy_source()
         try:
@@ -438,6 +492,7 @@ class RuntimeTaskRunner:
         result: dict[str, Any],
         *,
         idempotency_key: str | None = None,
+        trigger: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         parsed = dict(result.get("parsed") or {})
         now = _utc_now()
@@ -449,6 +504,7 @@ class RuntimeTaskRunner:
             ),
             "idempotency_key": idempotency_key,
             "request_fingerprint": self._request_fingerprint(request),
+            "trigger": trigger,
             "mode": "team",
             "status": "submitted",
             "created_at": now,
@@ -514,6 +570,7 @@ class RuntimeTaskRunner:
         source["repositories"] = repositories
         independent_agents = dict(source.get("independent_agents") or {})
         independent_agents["seed_builtins"] = False
+        independent_agents["activation_enabled"] = False
         source["independent_agents"] = independent_agents
         bridge_path.write_text(
             json.dumps(source, ensure_ascii=False, indent=2, sort_keys=True),
@@ -537,17 +594,24 @@ class RuntimeTaskRunner:
         return f"http://127.0.0.1:{self.config.legacy_api_port}"
 
 
+def _required_identity(value: object, field: str) -> str:
+    text = str(value or "").strip()
+    if not text or len(text) > 200:
+        raise RuntimeTaskRunnerError(
+            "invalid_task_request", f"{field} must contain 1 to 200 characters"
+        )
+    return text
+
+
 def _required_idempotency_key(value: object) -> str:
     key = str(value or "").strip()
     if not key:
         raise RuntimeTaskRunnerError(
-            "idempotency_key_required",
-            "Idempotency-Key is required for TeamTask submission",
+            "idempotency_key_required", "Idempotency-Key is required for TeamTask submission"
         )
     if len(key) > 200:
         raise RuntimeTaskRunnerError(
-            "invalid_idempotency_key",
-            "Idempotency-Key must contain at most 200 characters",
+            "invalid_idempotency_key", "Idempotency-Key must contain at most 200 characters"
         )
     return key
 
@@ -555,6 +619,19 @@ def _required_idempotency_key(value: object) -> str:
 def _default_team_for_idempotency_key(idempotency_key: str) -> str:
     digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:12]
     return f"hcuw-v2-team-{digest}"
+
+
+def _normalized_timestamp(value: object, field: str) -> str:
+    text = str(value or "").strip()
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RuntimeTaskRunnerError(
+            "invalid_task_request", f"{field} must be an ISO-8601 timestamp"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
 
 
 def _legacy_error_message(raw: bytes) -> str:

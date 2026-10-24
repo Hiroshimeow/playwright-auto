@@ -80,8 +80,11 @@ def allocate_team(
 def is_active_team_owner(manifest: Mapping[str, Any]) -> bool:
     status = str(manifest.get("status") or "").upper()
     waiting = manifest.get("waiting")
+    # A task waiting for its async callback still owns the parent role conversations.
     return status in ACTIVE_TEAM_OWNER_STATUSES or (
-        status == "WAITING" and isinstance(waiting, Mapping) and waiting.get("reason") == "browser_pool"
+        status == "WAITING"
+        and isinstance(waiting, Mapping)
+        and waiting.get("reason") in {"browser_pool", "async_callback"}
     )
 
 

@@ -1029,6 +1029,44 @@ function scheduleWorkflowLivePatch(root, currentLive, detail, selectedRole, live
   });
 }
 
+export function browserControlFields(detail = {}) {
+  const control = detail.browser_control || null;
+  const waits = detail.async_continuations || (detail.async_continuation ? [detail.async_continuation] : []);
+  const fields = [];
+  if (control) {
+    fields.push(["Stop visible", String(control.stop_visible)]);
+    fields.push(["Retry visible", String(control.retry_visible)]);
+    fields.push(["Allow prompts", `${control.permission_prompt_count || 0} visible · ${control.permission_click_count || 0} clicked`]);
+    if (control.last_permission_click) {
+      fields.push(["Last Allow", [control.last_permission_click.result, control.last_permission_click.at].filter(Boolean).join(" · ")]);
+    }
+    if (control.retry_decision) fields.push(["Retry decision", control.retry_decision.result || "—"]);
+    if (control.controller_decision || control.controller_reason) {
+      fields.push(["Controller decision", [control.controller_decision, control.controller_reason].filter(Boolean).join(" · ")]);
+    }
+    if (control.terminal_reconciliation) {
+      const terminal = control.terminal_reconciliation;
+      fields.push(["Terminal route", [terminal.result, terminal.source, terminal.route].filter(Boolean).join(" · ")]);
+    }
+  }
+  for (const wait of waits) {
+    fields.push(["Async WAIT", `${wait.continuation_id} · ${wait.state}`]);
+    fields.push(["Callback", wait.callback ? [wait.callback.status, `exit ${wait.callback.exit_code ?? "—"}`].join(" · ") : "pending"]);
+    fields.push(["Wake", wait.wake ? [wait.wake.status, wait.wake.code, wait.wake.reason].filter(Boolean).join(" · ") : "not scheduled"]);
+  }
+  return fields;
+}
+
+function browserControlSection(detail) {
+  const fields = browserControlFields(detail);
+  if (!fields.length) return null;
+  const section = detailCard("Browser control / WAIT", {className: "operational-state-card"});
+  const grid = el("div", null, "operational-state-grid");
+  for (const [label, value] of fields) grid.append(operationalField(label, value));
+  section.append(grid);
+  return section;
+}
+
 function workflowOverview(detail, timeline, selectedRole, endpoints) {
   const fragment = document.createDocumentFragment();
   const operations = operationalStateSection(detail, endpoints);
@@ -1054,6 +1092,8 @@ function workflowOverview(detail, timeline, selectedRole, endpoints) {
   fragment.append(operations);
   const dependencies = dependencySection(detail);
   if (dependencies) fragment.append(dependencies);
+  const browserControl = browserControlSection(detail);
+  if (browserControl) fragment.append(browserControl);
 
   const taskSection = detailCard("Task / goal", {className: "task-goal-section"});
   for (const block of taskGoalBlocks(detail)) {

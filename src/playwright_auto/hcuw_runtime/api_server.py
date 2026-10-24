@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .audit import AuditTimeline
 from .config import RuntimeConfig
+from ..cdpa_independent import runtime_v2_migration_policy
 from .endpoint_inventory import EndpointInventory, EndpointInventoryError
 from .legacy_audit import LegacyObservationAudit
 from .state import RuntimeStateStore, StateStoreError
@@ -65,6 +66,34 @@ class RuntimeApiServer:
                     _decode_json_body(body), idempotency_key=idempotency_key
                 )
                 return self._success_response(record, status=202)
+            if request_path.startswith("/api/independent-agents"):
+                return self._error_response(
+                    410,
+                    "independent_agent_deprecated",
+                    "runtime-v2 Independent Agent activation is disabled; use TeamTask with CronJob/Heartbeat",
+                )
+            parts = [part for part in request_path.strip("/").split("/") if part]
+            if len(parts) == 4 and parts[:2] == ["api", "cron-jobs"] and parts[3] == "occurrences":
+                payload = _decode_json_body(body)
+                task = payload.get("task")
+                if not isinstance(task, dict):
+                    raise RuntimeTaskRunnerError("invalid_task_request", "task must be a TeamTask request object")
+                record = self._task_runner().submit_cron_job(
+                    parts[2], str(payload.get("scheduled_for") or ""), task
+                )
+                return self._success_response(record, status=202)
+            if len(parts) == 4 and parts[:2] == ["api", "heartbeat-recovery"]:
+                payload = _decode_json_body(body)
+                task = payload.get("task")
+                if not isinstance(task, dict):
+                    raise RuntimeTaskRunnerError("invalid_task_request", "task must be a TeamTask request object")
+                record = self._task_runner().submit_heartbeat_recovery(
+                    parts[2],
+                    parts[3],
+                    str(payload.get("stale_episode_started_at") or ""),
+                    task,
+                )
+                return self._success_response(record, status=202)
             return self._error_response(
                 404,
                 "route_not_found",
@@ -112,6 +141,14 @@ class RuntimeApiServer:
             return self._success_response({"items": self.state_store.list_runs()})
         if request_path == "/api/tasks":
             return self._success_response({"items": self._projected_task_records()})
+        if request_path == "/api/diagnostics":
+            return self._success_response(self._runtime_diagnostics())
+        if request_path.startswith("/api/independent-agents"):
+            return self._error_response(
+                410,
+                "independent_agent_deprecated",
+                "runtime-v2 Independent Agent surfaces are migration-only",
+            )
         if request_path == "/api/endpoints":
             result = self.endpoint_inventory.summarize_endpoints(probe=True)
             self._record_action(
@@ -159,11 +196,90 @@ class RuntimeApiServer:
                     status=summary.get("status"),
                     active_role=summary.get("active_role"),
                     block_code=summary.get("block_code"),
+                    browser_control=summary.get("browser_control"),
+                    async_continuation=summary.get("async_continuation"),
                     updated_at=summary.get("updated_at") or item["updated_at"],
                     legacy=summary,
                 )
             items.append(item)
         return items
+
+    def _runtime_diagnostics(self) -> dict[str, Any]:
+        scheduler: list[dict[str, Any]] = []
+        task_diagnostics: list[dict[str, Any]] = []
+        for record in self.state_store.list_task_records():
+            trigger = record.get("trigger")
+            if isinstance(trigger, dict):
+                scheduler.append(
+                    {
+                        "runtime_task_id": record.get("runtime_task_id"),
+                        "legacy_task_id": record.get("legacy_task_id"),
+                        "trigger": trigger,
+                        "idempotency_key": record.get("idempotency_key"),
+                    }
+                )
+            legacy_task_id = str(record.get("legacy_task_id") or "")
+            if not legacy_task_id or self.legacy_audit is None:
+                continue
+            detail_reader = getattr(self.legacy_audit, "task_detail", None)
+            detail = detail_reader(legacy_task_id) if callable(detail_reader) else None
+            if not isinstance(detail, dict):
+                continue
+            task_diagnostics.append(
+                {
+                    "runtime_task_id": record.get("runtime_task_id"),
+                    "legacy_task_id": legacy_task_id,
+                    "dependency": detail.get("dependency_diagnostics"),
+                    "continuations": detail.get("async_continuations") or [],
+                    "provider_jobs": detail.get("provider_jobs") or [],
+                }
+            )
+        cron_jobs = [
+            item for item in scheduler if (item.get("trigger") or {}).get("kind") == "cron"
+        ]
+        heartbeat_recoveries = [
+            item
+            for item in scheduler
+            if (item.get("trigger") or {}).get("kind") == "stale_heartbeat"
+        ]
+        return {
+            "scheduler": scheduler,
+            "cron_jobs": cron_jobs,
+            "heartbeat_recoveries": heartbeat_recoveries,
+            "heartbeats": self._heartbeat_records(),
+            "tasks": task_diagnostics,
+            "dependency_graph": {
+                "stored_owner": "TeamTask.depends_on_task_ids",
+                "continuation_edges": "derived_only",
+            },
+            "independent_agent": runtime_v2_migration_policy(activation_enabled=False),
+        }
+
+    def _heartbeat_records(self) -> list[dict[str, Any]]:
+        if self.legacy_audit is None:
+            return [{"subject_type": "worker", "subject_id": "legacy-worker", "status": "unknown"}]
+        reader = getattr(self.legacy_audit, "runtime_state", None)
+        state = reader() if callable(reader) else None
+        if not isinstance(state, dict):
+            return [{"subject_type": "worker", "subject_id": "legacy-worker", "status": "unknown"}]
+        heartbeat_at = state.get("worker_heartbeat_at")
+        if state.get("worker_stale") is True:
+            status = "stale"
+        elif state.get("worker_online") is True:
+            status = "healthy"
+        elif heartbeat_at:
+            status = "offline"
+        else:
+            status = "unknown"
+        return [
+            {
+                "subject_type": "worker",
+                "subject_id": "legacy-worker",
+                "status": status,
+                "heartbeat_at": heartbeat_at,
+                "source": "legacy_runtime_state",
+            }
+        ]
 
     def _runtime_legacy_task_ids(self) -> frozenset[str]:
         return frozenset(

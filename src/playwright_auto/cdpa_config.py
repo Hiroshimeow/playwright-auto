@@ -327,7 +327,9 @@ def load_cdpa_config(
         independent_seed_builtins=bool(
             independent_agents.get("seed_builtins", True)
         ),
-        independent_activation_enabled=bool(independent_agents.get("activation_enabled", True)),
+        independent_activation_enabled=bool(
+            independent_agents.get("activation_enabled", True)
+        ),
         independent_idle_close_seconds=float(
             _positive(
                 independent_agents.get("idle_close_seconds", 60),

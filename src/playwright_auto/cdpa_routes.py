@@ -111,9 +111,10 @@ def parse_route_response(
         allowed = ROUTES
     else:
         try:
+            # WAIT is a reserved control token that appears only when the caller admits it.
             allowed = frozenset(
                 str(item).strip().upper()
-                if str(item).strip().upper() in {"PAUSE", "DONE"}
+                if str(item).strip().upper() in {"PAUSE", "DONE", "WAIT"}
                 else validate_workflow_route_key(item)
                 for item in allowed_routes
             )

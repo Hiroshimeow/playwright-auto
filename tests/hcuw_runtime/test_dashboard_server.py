@@ -101,11 +101,26 @@ def test_dashboard_team_task_form_and_task_table_show_roles_and_block_state(tmp_
     assert "crypto.randomUUID()" in text
     assert "'Idempotency-Key': pendingTaskSubmitKey" in text
     assert "if (response.ok) pendingTaskSubmitKey = null" in text
+    assert "hcuw-v2-dashboard-smoke" not in text
     for header in ("Roles", "Start role", "Status", "Block code", "Updated"):
         assert f"<th>{header}</th>" in text
     assert "item.latest ? 'current' : 'older'" in text
     assert "document.visibilityState === 'visible' && document.hasFocus()" in text
     assert "window.setInterval(lazyRefreshTick, 500)" in text
+
+
+def test_dashboard_post_proxy_preserves_api_validation_error(monkeypatch, tmp_path: Path) -> None:
+    dashboard = DashboardServer(load_runtime_config(repository_root=tmp_path))
+    body = json.dumps({"ok": False, "error": {"code": "invalid_task_request"}}).encode("utf-8")
+
+    def reject(path: str, payload: bytes, *, idempotency_key: str | None = None) -> bytes:
+        raise urllib.error.HTTPError(path, 400, "Bad Request", {}, io.BytesIO(body))
+
+    monkeypatch.setattr(dashboard, "_post_api_bytes", reject)
+    response = dashboard.proxy_post_api_request("/api/tasks", b"{}")
+
+    assert response.status == 400
+    assert json.loads(response.body.decode("utf-8"))["error"]["code"] == "invalid_task_request"
 
 
 def test_dashboard_post_proxy_forwards_idempotency_key(monkeypatch, tmp_path: Path) -> None:
@@ -127,17 +142,3 @@ def test_dashboard_post_proxy_forwards_idempotency_key(monkeypatch, tmp_path: Pa
         "payload": b"{}",
         "idempotency_key": "dashboard-submit-1",
     }
-
-
-def test_dashboard_post_proxy_preserves_api_validation_error(monkeypatch, tmp_path: Path) -> None:
-    dashboard = DashboardServer(load_runtime_config(repository_root=tmp_path))
-    body = json.dumps({"ok": False, "error": {"code": "invalid_task_request"}}).encode("utf-8")
-
-    def reject(path: str, payload: bytes, *, idempotency_key: str | None = None) -> bytes:
-        raise urllib.error.HTTPError(path, 400, "Bad Request", {}, io.BytesIO(body))
-
-    monkeypatch.setattr(dashboard, "_post_api_bytes", reject)
-    response = dashboard.proxy_post_api_request("/api/tasks", b"{}")
-
-    assert response.status == 400
-    assert json.loads(response.body.decode("utf-8"))["error"]["code"] == "invalid_task_request"
