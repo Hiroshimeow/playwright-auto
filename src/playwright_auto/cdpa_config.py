@@ -143,6 +143,7 @@ class CDPAConfig:
     response_stable_ms: int
     response_poll_ms: int
     independent_seed_builtins: bool
+    independent_activation_enabled: bool
     independent_idle_close_seconds: float
     cleanup_terminal_idle_seconds: float
     worker_poll_seconds: float
@@ -325,6 +326,9 @@ def load_cdpa_config(
         response_poll_ms=int(_positive(response.get("poll_ms", 5000), "response.poll_ms", integer=True)),
         independent_seed_builtins=bool(
             independent_agents.get("seed_builtins", True)
+        ),
+        independent_activation_enabled=bool(
+            independent_agents.get("activation_enabled", True)
         ),
         independent_idle_close_seconds=float(
             _positive(

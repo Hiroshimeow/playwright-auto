@@ -39,17 +39,29 @@ async def inspect_page_metadata(page: Any) -> dict[str, Any]:
             "online": False,
             "supported": False,
         }
-    try:
-        raw = await page.evaluate(_STORAGE_SCRIPT)
-    except Exception:
+    page_url = str(getattr(page, "url", "") or "")
+    hostname = (urlsplit(page_url).hostname or "").lower()
+    if hostname not in {"chatgpt.com", "www.chatgpt.com"}:
         raw = {
-            "url": getattr(page, "url", ""),
+            "url": page_url,
             "title": "",
             "role": None,
             "page_id": None,
             "task_id": None,
             "team": None,
         }
+    else:
+        try:
+            raw = await page.evaluate(_STORAGE_SCRIPT)
+        except Exception:
+            raw = {
+                "url": page_url,
+                "title": "",
+                "role": None,
+                "page_id": None,
+                "task_id": None,
+                "team": None,
+            }
     if not isinstance(raw, Mapping):
         raw = {}
     url = _safe_url(raw.get("url") or getattr(page, "url", ""))

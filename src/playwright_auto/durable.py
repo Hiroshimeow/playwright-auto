@@ -213,6 +213,23 @@ class DurableRequestRecord:
     response: dict[str, Any] | None = None
     error: str | None = None
 
+    def pristine_before_dispatch(self) -> bool:
+        """True only if the durable request cannot have crossed a Send boundary.
+
+        Never infer an unattempted Send from a visible composer or missing DOM
+        receipt. Only durable NEW/PROMPT_SET with zero attempts and no page,
+        upload, or acceptance evidence may be placed before first execution.
+        """
+        return (
+            self.status in {RequestStatus.NEW, RequestStatus.PROMPT_SET}
+            and self.attempts == 0
+            and all(value is None for value in (
+                self.binding, self.baseline, self.receipt, self.accepted_at,
+                self.upload_receipt, self.approval, self.response,
+                self.session_id_before, self.error,
+            ))
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "request_id": self.request_id,

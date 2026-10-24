@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from . import cdpa_async_continuation as async_continuation
 from .cdpa_bootstraps import (
     BootstrapCatalog,
     normalize_bootstrap_record,
@@ -30,16 +31,19 @@ from .cdpa_materials import (
     MaterialRefError,
     bounded_material_payload,
     missing_material_payload,
+    registered_file_content,
 )
+from .cdpa_provider_runtime import ProviderInvocation, ProviderRuntimeError, select_provider
 from .cdpa_independent import (
     normalize_agent_name,
     normalize_completion_request,
     normalize_manual_instruction,
     normalize_max_cycles,
     normalize_system_prompt,
+    runtime_v2_migration_policy,
     validate_trigger_settings,
 )
-from .cdpa_role_policy import RolePolicyError, normalize_role_list
+from .cdpa_role_policy import RolePolicyError, canonicalize_role_key, normalize_role_list
 from .cdpa_routes import effective_report_mode
 from .cdpa_runtime_db import IdempotencyConflict, RuntimeDB, RuntimeDBError
 from .observability import mcp_allow_click_summary, read_recent_live_events
@@ -410,7 +414,19 @@ class DashboardAPI:
             provider_id = raw.get("provider_id")
             if not isinstance(provider_id, str) or not provider_id.strip():
                 raise APIError(400, "invalid_request", "provider_id must be a non-empty string")
-            normalized["provider_id"] = provider_id.strip()
+            try:
+                provider = select_provider(
+                    explicit_provider_id=provider_id.strip(),
+                    required_capabilities=("browser",),
+                    execution_mode="browser_dom",
+                )
+            except ProviderRuntimeError as exc:
+                raise APIError(
+                    400,
+                    "invalid_request",
+                    "TeamTask role turns require a browser provider; use /api/tasks/{task_id}/provider-jobs for non-browser execution",
+                ) from exc
+            normalized["provider_id"] = provider.provider_id
         for field, minimum in (("max_routes", 1), ("max_route_repairs", 0)):
             if field not in raw:
                 continue
@@ -942,6 +958,189 @@ class DashboardAPI:
         return payload
 
     @staticmethod
+    def normalize_provider_dispatch(task_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        allowed = {
+            "provider_id",
+            "trigger_provider_id",
+            "required_capabilities",
+            "role_key",
+            "task_text",
+            "execution_mode",
+            "material_refs",
+            "timeout_seconds",
+            "output_limit_bytes",
+            "environment_policy",
+            "provider_options",
+        }
+        unknown = set(raw) - allowed
+        if unknown:
+            raise APIError(400, "invalid_request", f"unknown fields: {sorted(unknown)!r}")
+        required_capabilities = raw.get("required_capabilities") or []
+        if (
+            not isinstance(required_capabilities, list)
+            or len(required_capabilities) > 20
+            or not all(isinstance(item, str) and item.strip() for item in required_capabilities)
+        ):
+            raise APIError(
+                400,
+                "invalid_request",
+                "required_capabilities must contain up to 20 non-empty strings",
+            )
+        try:
+            role_key = canonicalize_role_key(raw.get("role_key"))
+        except RolePolicyError as exc:
+            raise APIError(400, "invalid_request", exc.message) from exc
+        invocation_raw = {
+            "provider_id": raw.get("provider_id"),
+            "task_id": task_id,
+            "role_key": role_key,
+            "task_text": raw.get("task_text"),
+            "execution_mode": raw.get("execution_mode"),
+            "material_refs": raw.get("material_refs") or [],
+            "timeout_seconds": raw.get("timeout_seconds"),
+            "output_limit_bytes": raw.get("output_limit_bytes"),
+            "environment_policy": raw.get("environment_policy") or "inherit-safe",
+            "provider_options": raw.get("provider_options") or {},
+        }
+        try:
+            invocation = ProviderInvocation.from_mapping(invocation_raw)
+        except ProviderRuntimeError as exc:
+            raise APIError(400, "invalid_request", exc.message) from exc
+        if not invocation.task_text.strip():
+            raise APIError(400, "invalid_request", "task_text must not be empty")
+        if invocation.execution_mode not in {"acp", "exec", "http", "custom"}:
+            raise APIError(
+                400,
+                "invalid_request",
+                "provider-jobs accept non-browser acp|exec|http|custom execution only",
+            )
+        trigger_provider_id = str(raw.get("trigger_provider_id") or "").strip() or None
+        return {
+            "invocation": {
+                "provider_id": invocation.provider_id,
+                "task_id": task_id,
+                "role_key": invocation.role_key,
+                "task_text": invocation.task_text,
+                "execution_mode": invocation.execution_mode,
+                "material_refs": list(invocation.material_refs),
+                "timeout_seconds": invocation.timeout_seconds,
+                "output_limit_bytes": invocation.output_limit_bytes,
+                "environment_policy": invocation.environment_policy,
+                "provider_options": dict(invocation.provider_options),
+            },
+            "trigger_provider_id": trigger_provider_id,
+            "required_capabilities": list(dict.fromkeys(item.strip() for item in required_capabilities)),
+        }
+
+    @staticmethod
+    def normalize_async_spawn(
+        task_id: str, raw: Mapping[str, Any], *, spawn_idempotency_key: str
+    ) -> dict[str, Any]:
+        allowed = {
+            "role", "job_id", "wake_prompt", "failure_policy",
+            "source_kind", "source_refs", "completion_policy", "timeout_at",
+        }
+        unknown = set(raw) - allowed
+        if unknown:
+            raise APIError(400, "invalid_request", f"unknown fields: {sorted(unknown)!r}")
+        spawn_key = str(spawn_idempotency_key or "").strip()
+        if not spawn_key or len(spawn_key) > 200:
+            raise APIError(400, "idempotency_key_required", "Idempotency-Key header is required")
+        try:
+            role = canonicalize_role_key(raw.get("role"))
+        except ValueError as exc:
+            raise APIError(400, "invalid_request", str(exc)) from exc
+        source_kind = str(raw.get("source_kind") or "external_script").strip().lower()
+        if source_kind not in async_continuation.SOURCE_KINDS:
+            raise APIError(400, "invalid_request", "source_kind is unsupported")
+        job_id = str(raw.get("job_id") or "").strip()
+        source_refs = raw.get("source_refs") or []
+        if source_kind == "external_script":
+            if not job_id or len(job_id) > 200:
+                raise APIError(400, "invalid_request", "job_id must contain 1 to 200 characters")
+            if source_refs:
+                raise APIError(400, "invalid_request", "external_script uses job_id, not source_refs")
+        else:
+            if job_id:
+                raise APIError(400, "invalid_request", "Gate-B sources use source_refs, not job_id")
+            if (
+                not isinstance(source_refs, list)
+                or not source_refs
+                or len(source_refs) > 20
+                or not all(isinstance(item, str) and 0 < len(item.strip()) <= 200 for item in source_refs)
+            ):
+                raise APIError(400, "invalid_request", "source_refs must contain 1 to 20 source ids")
+        wake_prompt = raw.get("wake_prompt")
+        if wake_prompt is not None and (not isinstance(wake_prompt, str) or len(wake_prompt) > 4000):
+            raise APIError(400, "invalid_request", "wake_prompt must be a string up to 4000 characters")
+        failure_policy = str(raw.get("failure_policy") or "block").strip()
+        if failure_policy not in async_continuation.FAILURE_POLICIES:
+            raise APIError(400, "invalid_request", "failure_policy must be block or same_role_failure_handoff")
+        completion_policy = str(raw.get("completion_policy") or "all").strip().lower()
+        if completion_policy not in async_continuation.COMPLETION_POLICIES:
+            raise APIError(400, "invalid_request", "completion_policy must be all or each")
+        timeout_at = raw.get("timeout_at")
+        if timeout_at is not None:
+            if not isinstance(timeout_at, str) or not timeout_at.strip():
+                raise APIError(400, "invalid_request", "timeout_at must be an ISO-8601 timestamp")
+            try:
+                parsed_timeout = datetime.fromisoformat(timeout_at.strip().replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise APIError(400, "invalid_request", "timeout_at must be an ISO-8601 timestamp") from exc
+            if parsed_timeout.tzinfo is None:
+                parsed_timeout = parsed_timeout.replace(tzinfo=timezone.utc)
+            timeout_at = parsed_timeout.astimezone(timezone.utc).isoformat()
+        return {
+            "continuation_id": async_continuation.continuation_id_for(task_id, spawn_key),
+            "role": role,
+            "job_id": job_id or None,
+            "spawn_idempotency_key": spawn_key,
+            "source_kind": source_kind,
+            "source_refs": list(dict.fromkeys(item.strip() for item in source_refs)),
+            "completion_policy": completion_policy,
+            "timeout_at": timeout_at,
+            "wake_prompt": (wake_prompt.strip() or None) if isinstance(wake_prompt, str) else None,
+            "failure_policy": failure_policy,
+        }
+
+    @staticmethod
+    def normalize_async_callback(continuation_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        identifier = str(continuation_id or "").strip()
+        if not re.fullmatch(r"ac-[0-9a-f]{24}", identifier):
+            raise APIError(400, "invalid_request", "continuation_id is invalid")
+        status = str(raw.get("status") or "").strip().lower()
+        if status not in async_continuation.CALLBACK_STATUSES:
+            raise APIError(400, "invalid_request", "status is not a supported terminal source status")
+        if "source_ref" in raw:
+            raise APIError(
+                400,
+                "invalid_request",
+                "ProviderJob and TeamTask terminal state is source-owned; complete the source owner, not the continuation",
+            )
+        allowed = {"status", "exit_code", "stdout", "stderr", "result_refs", "summary"}
+        unknown = set(raw) - allowed
+        if unknown:
+            raise APIError(400, "invalid_request", f"unknown fields: {sorted(unknown)!r}")
+        exit_code = raw.get("exit_code")
+        if exit_code is not None and (isinstance(exit_code, bool) or not isinstance(exit_code, int)):
+            raise APIError(400, "invalid_request", "exit_code must be an integer")
+        payload: dict[str, Any] = {"continuation_id": identifier, "status": status, "exit_code": exit_code}
+        for field, limit in (("stdout", 200_000), ("stderr", 200_000), ("summary", 2000)):
+            value = raw.get(field)
+            if value is not None and (not isinstance(value, str) or len(value) > limit):
+                raise APIError(400, "invalid_request", f"{field} must be a string up to {limit} characters")
+            payload[field] = value
+        refs = raw.get("result_refs") or []
+        if (
+            not isinstance(refs, list)
+            or len(refs) > async_continuation.MAX_RESULT_REFS
+            or not all(isinstance(item, str) and 0 < len(item) <= 1000 for item in refs)
+        ):
+            raise APIError(400, "invalid_request", "result_refs must be up to 20 non-empty strings")
+        payload["result_refs"] = list(refs)
+        return payload
+
+    @staticmethod
     def normalize_goal_change(raw: Mapping[str, Any]) -> tuple[dict[str, Any], int | None]:
         if set(raw) - {"goal", "expected_task_version"}:
             raise APIError(400, "invalid_request", "goal change accepts only goal and expected_task_version")
@@ -1028,6 +1227,47 @@ class DashboardAPI:
         except IdempotencyConflict as exc:
             raise APIError(409, "idempotency_conflict", str(exc)) from exc
 
+    def material_catalog(self, task_id: str) -> dict[str, Any]:
+        """List only registered/projected materials for one task; never enumerate paths."""
+        validated_task_id = validate_task_id(task_id)
+        private = self.db.get_task_private(validated_task_id)
+        if private is None:
+            raise APIError(404, "task_not_found", "task does not exist")
+        items: dict[str, dict[str, Any]] = {}
+        materials = private.get("materials")
+        if isinstance(materials, Mapping):
+            for material_id, locator in materials.items():
+                if not isinstance(locator, Mapping):
+                    continue
+                identifier = str(material_id)
+                items[identifier] = {
+                    "material_id": identifier,
+                    "source_kind": locator.get("source_kind"),
+                    "material_type": locator.get("material_type"),
+                    "version": locator.get("version"),
+                    "mime_type": locator.get("mime_type"),
+                    "content_length": locator.get("content_length"),
+                    "role_key": locator.get("role_key"),
+                    "url": f"/api/materials/{validated_task_id}/{identifier}",
+                }
+        reports = private.get("reports")
+        if isinstance(reports, Mapping):
+            for report_id, locator in reports.items():
+                identifier = str(report_id)
+                if identifier in items or not isinstance(locator, Mapping):
+                    continue
+                items[identifier] = {
+                    "material_id": identifier,
+                    "source_kind": "inline" if "content" in locator else "file",
+                    "material_type": "report",
+                    "version": "v1",
+                    "mime_type": "text/markdown",
+                    "content_length": locator.get("size"),
+                    "role_key": locator.get("role_key"),
+                    "url": f"/api/materials/{validated_task_id}/{identifier}",
+                }
+        return {"task_id": validated_task_id, "items": list(items.values())}
+
     def report_material(self, task_id: str, material_id: str) -> dict[str, Any]:
         validated_task_id = validate_task_id(task_id)
         private = self.db.get_task_private(validated_task_id)
@@ -1037,15 +1277,25 @@ class DashboardAPI:
         locator = materials.get(material_id) if isinstance(materials, Mapping) else None
         if isinstance(locator, Mapping):
             try:
+                content: bytes | str | None
+                if locator.get("content") is not None:
+                    content = str(locator.get("content") or "")
+                elif locator.get("content_ref") and locator.get("source_kind") == "file":
+                    content = registered_file_content(private, locator)
+                else:
+                    content = None
                 return bounded_material_payload(
                     task_id=validated_task_id,
                     material_id=material_id,
                     locator=locator,
-                    content=locator.get("content") if "content" in locator else None,
+                    content=content,
                 )
             except MaterialRefError as exc:
-                payload = missing_material_payload(
-                    task_id=validated_task_id, material_id=material_id
+                payload = bounded_material_payload(
+                    task_id=validated_task_id,
+                    material_id=material_id,
+                    locator=locator,
+                    content=None,
                 )
                 payload["error"] = {"code": exc.code, "message": exc.message}
                 return payload
@@ -1338,6 +1588,8 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "database": "ok",
                     "pid": os.getpid(),
+                    "repository_root": str(app.config.repository_root.resolve()),
+                    "independent_activation_enabled": app.config.independent_activation_enabled,
                     **health,
                 },
             )
@@ -1395,6 +1647,11 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                 if snapshot is not None
                 else {"degraded": True, "workflow": [], "independent": []}
             )
+            if not self.application.config.independent_activation_enabled:
+                payload["independent"] = []
+                payload["independent_migration"] = runtime_v2_migration_policy(
+                    activation_enabled=False
+                )
             self._json(200, payload, headers={"ETag": etag})
             return
         if path == "/api/tasks":
@@ -1511,7 +1768,10 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                 headers={"Cache-Control": "no-store"},
             )
             return
-        if len(parts) == 4 and parts[:2] == ["api", "report"]:
+        if len(parts) == 3 and parts[:2] == ["api", "materials"]:
+            self._json(200, app.material_catalog(parts[2]))
+            return
+        if len(parts) == 4 and parts[:2] in (["api", "report"], ["api", "materials"]):
             self._json(200, app.report_material(parts[2], parts[3]))
             return
         if len(parts) == 4 and parts[:2] == ["api", "reports"]:
@@ -1538,6 +1798,15 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
         raw = self._body()
         key = self.headers.get("Idempotency-Key", "")
         task_id: str | None = None
+        if (
+            not app.config.independent_activation_enabled
+            and (path == "/api/independent-agents" or path.startswith("/api/independent-agents/"))
+        ):
+            raise APIError(
+                410,
+                "independent_agent_deprecated",
+                "Independent Agent is migration-only; use TeamTask with CronJob/Heartbeat",
+            )
         if path == "/api/tasks":
             payload = app.normalize_create(raw)
             command = app.enqueue(
@@ -1682,6 +1951,43 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                 )
             else:
                 if (
+                    len(parts) == 4
+                    and parts[:2] == ["api", "tasks"]
+                    and parts[3] == "provider-jobs"
+                ):
+                    task_id = validate_task_id(parts[2])
+                    payload = app.normalize_provider_dispatch(task_id, raw)
+                    command = app.enqueue(
+                        idempotency_key=key,
+                        kind="provider_dispatch",
+                        task_id=task_id,
+                        payload=payload,
+                    )
+                elif (
+                    len(parts) in {4, 6}
+                    and parts[:2] == ["api", "tasks"]
+                    and parts[3] == "async-continuations"
+                ):
+                    task_id = validate_task_id(parts[2])
+                    if len(parts) == 4:
+                        payload = app.normalize_async_spawn(task_id, raw, spawn_idempotency_key=key)
+                        kind = "async_continuation_register"
+                    elif parts[5] == "complete":
+                        payload = app.normalize_async_callback(parts[4], raw)
+                        kind = "async_continuation_complete"
+                    else:
+                        raise APIError(404, "not_found", "endpoint does not exist")
+                    command = app.enqueue(
+                        idempotency_key=key,
+                        kind=kind,
+                        task_id=task_id,
+                        payload=payload,
+                    )
+                    command = {**command, "continuation_id": payload["continuation_id"]}
+                    if kind == "async_continuation_register":
+                        # The exact final route JSON the role returns after this confirmed spawn.
+                        command["wait_route"] = {"route": "WAIT", "handoff": payload["continuation_id"]}
+                elif (
                     len(parts) == 6
                     and parts[:2] == ["api", "tasks"]
                     and parts[3] == "parents"
@@ -1766,6 +2072,11 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                 "command_id": command["command_id"],
                 "task_id": command["task_id"],
                 "status": command["status"],
+                **{
+                    key: command[key]
+                    for key in ("continuation_id", "wait_route")
+                    if command.get(key)
+                },
             },
         )
 

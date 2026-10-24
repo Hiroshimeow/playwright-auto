@@ -24,6 +24,7 @@ from uuid import UUID
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from . import cdpa_async_continuation as async_continuation
 from .cdpa_actions import (
     AcquiredRole,
     BranchBootstrapError,
@@ -48,11 +49,18 @@ from .cdpa_commands import (
     workflow_control_eligibility,
 )
 from .cdpa_config import CDPAConfig, load_cdpa_config, remote_repository_from_task
+from .cdpa_dependencies import terminal_event_from_state
 from .cdpa_browser_projection import build_browser_projection
 from .cdpa_endpoint_pool import EndpointPool
 from .cdpa_endpoints import normalize_endpoint_record
 from .cdpa_managed_browser import ManagedBrowserLifecycle
 from .cdpa_materials import register_material
+from .cdpa_provider_runtime import (
+    ProviderDispatcher,
+    ProviderInvocation,
+    ProviderJobManager,
+    select_work_owner,
+)
 from .cdpa_independent import (
     BUILTIN_MAINTAINERS_PROMPT,
     BUILTIN_MONITOR_PROMPT,
@@ -352,6 +360,8 @@ def _waiting_working_copy(state: Mapping[str, Any]) -> dict[str, Any]:
         "dependency_events",
         "queue_events",
         "repair_wait",
+        "control_events",
+        "async_continuations",
     ):
         value = state.get(key)
         if isinstance(value, (dict, list)):
@@ -515,6 +525,12 @@ class CDPAWorker:
             response_stable_seconds=config.response_stable_ms / 1000,
             timeout_seconds=config.response_refresh_after_seconds,
         ))
+        self.provider_jobs = ProviderJobManager(self.store)
+        self.provider_dispatcher = ProviderDispatcher(
+            endpoints=self.store.endpoints,
+            jobs=self.provider_jobs,
+            role_controller=self.role_controller,
+        )
         self.runtime_db = RuntimeDB(config.runtime_database)
         self.registry: CDPARuntimeRegistry | None = None
         self.runtime_degraded = False
@@ -557,12 +573,44 @@ class CDPAWorker:
             Path, tuple[tuple[int, int, int, int], dict[str, Any]]
         ] = {}
 
+    async def _dispatch_browser_provider(
+        self,
+        state: Mapping[str, Any],
+        hop: Mapping[str, Any],
+        acquired: AcquiredRole,
+        actions: CDPATabActions,
+        **controller_kwargs: Any,
+    ) -> Any:
+        """Enter the canonical provider owner while preserving RoleController browser ownership."""
+        if select_work_owner(delegated_role=True).owner != "role_slot":
+            raise RuntimeError("browser role turns must remain RoleSlot-owned")
+        role = str(hop.get("target_role") or state.get("active_role") or "").upper()
+        invocation = ProviderInvocation(
+            provider_id=str(state.get("provider_id") or "chatgpt_web"),
+            task_id=str(state.get("task_id") or ""),
+            role_key=role,
+            task_text=str(hop.get("prompt") or state.get("task_text") or ""),
+            execution_mode="browser_dom",
+            endpoint_id=str(getattr(acquired, "endpoint_id", "") or self._execution_endpoint_id(state, role) or ""),
+        )
+        return await self.provider_dispatcher.dispatch(
+            invocation,
+            browser_context={
+                "worker": self,
+                "state": state,
+                "hop": hop,
+                "acquired": acquired,
+                "actions": actions,
+                "controller_kwargs": controller_kwargs,
+            },
+        )
+
     def _frozen_route_contract(
         self, state: Mapping[str, Any], role: str
     ) -> Any | None:
         if not str(state.get("route_contract_id") or "").strip():
             return None
-        return build_route_contract(
+        contract = build_route_contract(
             current_role=role,
             reachable_roles=tuple(state.get("reachable_roles") or ()),
             closing_role=state.get("closing_role"),
@@ -575,6 +623,12 @@ class CDPAWorker:
             self_route_policy=state.get("self_route_policy", "forbidden"),
             self_route_counts=state.get("self_route_counts") or {},
         )
+        if async_continuation.wait_admissible(state, str(role).upper()):
+            return replace(
+                contract,
+                allowed_routes=(*contract.allowed_routes, async_continuation.WAIT_ROUTE),
+            )
+        return contract
 
     def _gate_a_route_contract(
         self, state: Mapping[str, Any], role: str
@@ -887,29 +941,10 @@ class CDPAWorker:
                 durable = RequestLedger(ledger_path).peek(request_id)
             except Exception:
                 return False
-            if durable is not None:
-                if not allow_prepared_ledger:
-                    # Safe restore and relocation keep the stricter contract:
-                    # any durable request identity blocks replacement/replay.
-                    return False
-                if durable.status not in {RequestStatus.NEW, RequestStatus.PROMPT_SET}:
-                    return False
-                if int(durable.attempts or 0) != 0:
-                    return False
-                if any(
-                    value is not None
-                    for value in (
-                        durable.binding,
-                        durable.baseline,
-                        durable.receipt,
-                        durable.accepted_at,
-                        durable.upload_receipt,
-                        durable.response,
-                        durable.session_id_before,
-                        durable.error,
-                    )
-                ):
-                    return False
+            if durable is not None and (
+                not allow_prepared_ledger or not durable.pristine_before_dispatch()
+            ):
+                return False
         return True
 
     def _execution_can_relocate(
@@ -919,7 +954,9 @@ class CDPAWorker:
             if state.get("endpoint_pinned", True) is True:
                 home = str(state.get("browser_endpoint_id") or "").strip() or self.store.endpoint_id_for(state)
                 return bool(home and target_endpoint_id == home)
-            return self._execution_is_pristine_pre_send(state)
+            return self._execution_is_pristine_pre_send(
+                state, allow_prepared_ledger=True
+            )
         role = str(state.get("active_role") or "").upper()
         record = (state.get("roles") or {}).get(role) if role else None
         if not isinstance(record, Mapping):
@@ -988,14 +1025,23 @@ class CDPAWorker:
                 if endpoint_id != home:
                     return False
             else:
+                # This is only the local projection. The authoritative first
+                # placement is persisted by TaskStore before browser I/O.
+                if not self._execution_is_pristine_pre_send(
+                    state, allow_prepared_ledger=True
+                ):
+                    return False
+                selected_endpoint = self.store.endpoints.get(endpoint_id)
+                next_mode = state.get("conversation_mode")
+                if not state.get("conversation_mode_explicit", False):
+                    next_mode = "temporary" if selected_endpoint.get("temporary_default") else "persistent"
+                if next_mode == "temporary" and state.get("context_policy") == "bootstrap":
+                    return False
+                if state.get("context_policy") == "bootstrap" and endpoint_id != state.get("browser_endpoint_id"):
+                    return False
                 state["browser_endpoint_id"] = endpoint_id
                 state["endpoint_pinned"] = True
-                if not state.get("conversation_mode_explicit", False):
-                    endpoint = self.store.endpoints.get(endpoint_id)
-                    state["conversation_mode"] = (
-                        "temporary" if endpoint.get("temporary_default") else "persistent"
-                    )
-                state["context_policy"] = "fresh"
+                state["conversation_mode"] = next_mode
         role = str(state.get("active_role") or "").upper()
         record = state.get("roles", {}).get(role) if role else None
         if not isinstance(record, dict):
@@ -2594,12 +2640,10 @@ class CDPAWorker:
             raise RoleOwnershipError(
                 "automatic role recovery did not restore the recorded page identity"
             )
-        if not foreground:
-            await actions.wake(acquired)
-            if require_clean_ready:
-                await acquired.client.wait_until_clean_ready(
-                    timeout_ms=round(self.config.workspace_timeout_seconds * 1000)
-                )
+        if require_clean_ready:
+            await acquired.client.wait_until_clean_ready(
+                timeout_ms=round(self.config.workspace_timeout_seconds * 1000)
+            )
         self._record_acquired(state, role, acquired)
         return acquired
 
@@ -5762,6 +5806,45 @@ class CDPAWorker:
             retryable=False,
         )
 
+    async def _acquire_async_wake_page(
+        self,
+        state: dict[str, Any],
+        hop: Mapping[str, Any],
+        role: str,
+        actions: CDPATabActions,
+    ) -> AcquiredRole | None:
+        """Wake only on the exact parent role conversation; never open a fallback chat."""
+        continuation = async_continuation.get(state, str(hop.get("async_continuation_id") or ""))
+        if continuation is None:
+            self._block(
+                state,
+                "async wake hop has no registered continuation; no new chat or task was opened",
+                code="ASYNC_WAKE_IDENTITY_MISMATCH",
+                retryable=False,
+            )
+            return None
+        acquired = None
+        error = async_continuation.parent_identity_error(state, continuation)
+        if error is None:
+            if await actions.locate_owned(state, role) is None:
+                error = "parent role page is unavailable"
+            else:
+                acquired = await actions.acquire(state, role, clean_for_send=True)
+                error = async_continuation.page_identity_error(
+                    continuation, url=acquired.url, new_chat=bool(acquired.new_chat)
+                )
+        if error is not None:
+            self._block_async_wake(state, continuation, error, code="ASYNC_WAKE_IDENTITY_MISMATCH")
+            return None
+        continuation["state"] = "waking"
+        if (continuation.get("wake") or {}).get("status") != "verified":
+            continuation["wake"] = {
+                **dict(continuation.get("wake") or {}),
+                "status": "verified",
+                "verified_at": utc_now(),
+            }
+        return acquired
+
     async def _pre_send(
         self,
         state: dict[str, Any],
@@ -5841,6 +5924,10 @@ class CDPAWorker:
             )
             hop["conversation_url"] = acquired.url
             await self._dismiss_known_rate_limit_on_existing(acquired)
+        elif hop.get("kind") == "async_wake":
+            acquired = await self._acquire_async_wake_page(state, hop, role, actions)
+            if acquired is None:
+                return
         elif isinstance(independent, dict) and independent.get("temporary_chat") is True:
             if hop.get("kind") == "independent_cycle":
                 acquired = await actions.locate_owned(state, role)
@@ -6035,8 +6122,8 @@ class CDPAWorker:
         if route_repair_stale_error_ready:
             preparation_reason = "ready"
         else:
-            preparation = await self.role_controller.run(
-                self, state, hop, acquired, actions, phase="pre_send", wait_ms=0,
+            preparation = await self._dispatch_browser_provider(
+                state, hop, acquired, actions, phase="pre_send", wait_ms=0,
             )
             preparation_reason = preparation.reason
         if solo_existing_url and preparation_reason == "response_in_progress":
@@ -6973,6 +7060,73 @@ class CDPAWorker:
             closing_role=(str(state.get("closing_role") or "") or None),
         )
 
+    def _validated_report_evidence(
+        self, state: Mapping[str, Any], hop: Mapping[str, Any], handoff: str
+    ) -> tuple[str, str, int]:
+        """Exact local report file, or the captured remote mirror, for the active hop."""
+        if remote_repository_from_task(str(state.get("task_text") or "")) is None:
+            report_repository, report_plans_root = _workflow_report_roots(self.config, state)
+            evidence = validate_file_report(
+                handoff,
+                repository_root=report_repository,
+                plans_root=report_plans_root,
+                team=str(state["team"]),
+                physical_role=str(hop["physical_role"]),
+                turn=int(hop["turn"]),
+                task_id=str(state["task_id"]),
+            )
+            return handoff, evidence.sha256, evidence.size
+        return self._validated_remote_report_mirror(state, hop, decision_handoff=handoff)
+
+    def _terminal_route_evidence(
+        self,
+        state: Mapping[str, Any],
+        hop: Mapping[str, Any],
+        response: MessageSnapshot,
+    ) -> dict[str, Any]:
+        """Terminal-route reconciliation evidence for the active accepted turn.
+
+        Raises ValueError/OSError (fail closed) unless the response is a RouteContract-valid
+        route whose exact expected report already exists and is non-empty.
+        """
+        if (
+            is_independent_task(state)
+            or str(state.get("workflow_mode") or "team").strip().lower() != "team"
+            or str(hop.get("kind") or "") == "report_repair"
+        ):
+            raise ValueError("terminal-route reconciliation applies only to TeamTask route turns")
+        role = str(hop["target_role"])
+        route_contract = self._frozen_route_contract(state, role)
+        if route_contract is None:
+            raise ValueError("terminal-route reconciliation requires a frozen RouteContract")
+        parsed = parse_role_response(
+            response.text,
+            source_role=role,
+            report_mode=_report_mode(state),
+            allowed_routes=route_contract.allowed_routes,
+            closing_role=(str(state.get("closing_role") or "") or None),
+        )
+        decision = parsed.decision
+        if parsed.inline_report is not None:
+            raise ValueError("inline route reports are not reconcilable")
+        if decision.route == async_continuation.WAIT_ROUTE:
+            record = async_continuation.wait_continuation(state, hop, decision.handoff)
+            return {"route": decision.route, "continuation_id": record["continuation_id"]}
+        if decision.route not in {"PAUSE", "DONE"} and decision.route not in state["roles"]:
+            raise RouteContractError(f"route {decision.route!r} is not selected for this task")
+        expected = str(hop.get("expected_report_path") or "").strip()
+        if not expected or decision.handoff != expected:
+            raise RouteContractError("terminal route handoff does not match the active hop's expected report")
+        report_path, report_sha256, report_size = self._validated_report_evidence(
+            state, hop, decision.handoff
+        )
+        return {
+            "route": decision.route,
+            "report": Path(report_path).name,
+            "report_sha256": report_sha256,
+            "report_size": report_size,
+        }
+
     @staticmethod
     def _canonicalize_receipt_conversation_url(
         state: dict[str, Any], hop: dict[str, Any]
@@ -7316,6 +7470,16 @@ class CDPAWorker:
         ):
             raise RuntimeError("receiptless waiting hop is missing its existing wait budget")
         self._reconcile_hop_conversation_identity(state, hop)
+        if hop.get("kind") == "async_wake":
+            wake_record = async_continuation.get(state, str(hop.get("async_continuation_id") or ""))
+            if wake_record is not None and wake_record.get("state") == "waking":
+                # The wake Send was accepted by the existing exactly-once Send owner.
+                wake_record["state"] = "completed"
+                wake_record["wake"] = {
+                    **dict(wake_record.get("wake") or {}),
+                    "status": "sent",
+                    "sent_at": utc_now(),
+                }
         admitted: list[bool] = []
         acquired = await self._owned_or_block(
             state, str(hop["target_role"]), actions, admitted=admitted
@@ -7323,7 +7487,7 @@ class CDPAWorker:
         if acquired is None or admitted:
             # A reopened page is persisted before ordinary response observation resumes.
             return
-        await self.role_controller.run(self, state, hop, acquired, actions)
+        await self._dispatch_browser_provider(state, hop, acquired, actions)
         if hop.get("state") == "responded" and not is_independent_task(state):
             self._responded(state, hop)
 
@@ -7691,6 +7855,314 @@ class CDPAWorker:
             validation_error=validation_error,
         )
 
+    def _commit_async_wait(
+        self, state: dict[str, Any], hop: dict[str, Any], continuation: dict[str, Any]
+    ) -> None:
+        """End the browser turn on a contract-valid WAIT; the task waits for its callback."""
+        role = str(hop["target_role"])
+        continuation_id = str(continuation["continuation_id"])
+        now = utc_now()
+        self._complete_request_response(hop)
+        hop.update(route=async_continuation.WAIT_ROUTE, state="routed", async_continuation_id=continuation_id)
+        hop["timestamps"]["routed_at"] = now
+        continuation["parent"] = async_continuation.parent_identity(state, hop)
+        state.setdefault("route_timeline", []).append(
+            {
+                "at": now,
+                "hop_id": hop["hop_id"],
+                "source_role": role,
+                "route": async_continuation.WAIT_ROUTE,
+                "kind": "async_wait",
+                "message": f"WAIT for async continuation {continuation_id}",
+            }
+        )
+        state["roles"][role]["status"] = "idle"
+        identity_error = async_continuation.parent_identity_error(state, continuation)
+        if identity_error is not None:
+            self._block_async_wake(state, continuation, identity_error, code="ASYNC_WAKE_IDENTITY_MISMATCH")
+            return
+        if continuation.get("callback") is not None or continuation.get("state") == "source_terminal":
+            # Terminal source evidence raced ahead of WAIT; wake exactly once now.
+            self._schedule_async_wake(state, continuation)
+            return
+        continuation["state"] = "waiting"
+        continuation["waiting_since"] = now
+        state.update(
+            status="WAITING",
+            kanban_column="WAITING",
+            waiting_code=async_continuation.WAITING_CODE,
+            waiting_reason=f"Waiting for async callback {continuation_id}",
+            waiting={
+                "reason": async_continuation.WAITING_CODE,
+                "since": now,
+                "continuation_id": continuation_id,
+            },
+            active_action="waiting_async_callback",
+            block_code=None,
+            block_retryable=False,
+            block_reason=None,
+            pause_reason=None,
+        )
+
+    def _schedule_async_wake(self, state: dict[str, Any], continuation: dict[str, Any]) -> None:
+        """Queue exactly one same-role wake hop on the exact parent role conversation."""
+        callback = continuation.get("callback") or {}
+        if not async_continuation.wake_allowed(continuation):
+            continuation["state"] = str(callback.get("status") or "failed")
+            self._block_async_wake(
+                state,
+                continuation,
+                f"async callback {callback.get('status')} without a failure handoff policy",
+                code="ASYNC_CALLBACK_FAILED",
+            )
+            return
+        identity_error = async_continuation.parent_identity_error(state, continuation)
+        if identity_error is not None:
+            self._block_async_wake(state, continuation, identity_error, code="ASYNC_WAKE_IDENTITY_MISMATCH")
+            return
+        if self._execution_budget_exhausted(state):
+            self._block_async_wake(
+                state,
+                continuation,
+                "autonomous execution budget is exhausted before the async wake",
+                code="ASYNC_WAKE_BUDGET_EXHAUSTED",
+            )
+            return
+        role = str(continuation["role_key"])
+        state.update(waiting=None, waiting_code=None, waiting_reason=None)
+        wake = self._append_hop(
+            state,
+            source_role=role,
+            target_role=role,
+            handoff=async_continuation.wake_handoff(continuation),
+            kind="async_wake",
+        )
+        wake["async_continuation_id"] = continuation["continuation_id"]
+        continuation["state"] = "wake_scheduled"
+        continuation["wake"] = {"status": "scheduled", "hop_id": wake["hop_id"], "at": utc_now()}
+
+    def _block_async_wake(
+        self, state: dict[str, Any], continuation: dict[str, Any], reason: str, *, code: str
+    ) -> None:
+        continuation["wake"] = {"status": "blocked", "code": code, "reason": reason, "at": utc_now()}
+        state.update(waiting=None, waiting_code=None, waiting_reason=None)
+        self._block(state, f"{code}: {reason}; no new chat or task was opened", code=code, retryable=False)
+
+    def _route_async_callback(self, state: dict[str, Any], continuation: dict[str, Any]) -> None:
+        """Decide the wake for a newly recorded callback; never opens a fallback task/chat."""
+        status = str(state.get("status") or "").upper()
+        waiting = state.get("waiting") if isinstance(state.get("waiting"), Mapping) else {}
+        now = utc_now()
+        if status in TERMINAL:
+            continuation["state"] = "completed"
+            continuation["wake"] = {"status": "not_woken", "reason": "parent task is terminal", "at": now}
+        elif (
+            status == "WAITING"
+            and state.get("waiting_code") == async_continuation.WAITING_CODE
+            and waiting.get("continuation_id") == continuation["continuation_id"]
+        ):
+            self._schedule_async_wake(state, continuation)
+        elif status == "RUNNING" and state.get("active_hop_id") == continuation.get("hop_id"):
+            # The role has not returned WAIT yet; WAIT commit consumes this callback.
+            continuation["wake"] = {"status": "pending_wait", "at": now}
+        elif status == "BLOCKED" and state.get("active_hop_id") == continuation.get("hop_id"):
+            # Route/contract validation may block before WAIT commits. Keep the
+            # source-owned terminal evidence intact so a later valid WAIT can
+            # consume it; blocking is not a semantic route away from this turn.
+            continuation["wake"] = {"status": "pending_wait", "at": now}
+        else:
+            continuation["state"] = "superseded"
+            continuation["wake"] = {
+                "status": "not_scheduled",
+                "reason": "parent task is not waiting on this continuation",
+                "at": now,
+            }
+
+    def _resume_provider_continuation(
+        self, path: Path, state: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """Schedule wake from ProviderJob-owned terminal evidence; never re-run the provider."""
+        if (
+            str(state.get("status") or "").upper() != "WAITING"
+            or state.get("waiting_code") != async_continuation.WAITING_CODE
+        ):
+            return None
+        waiting = state.get("waiting") if isinstance(state.get("waiting"), Mapping) else {}
+        continuation_id = str(waiting.get("continuation_id") or "")
+        record = async_continuation.get(state, continuation_id)
+        if (
+            not isinstance(record, Mapping)
+            or record.get("source_kind") != "provider_job"
+            or record.get("state") != "source_terminal"
+        ):
+            return None
+
+        changed = False
+
+        def consume(current: dict[str, Any]) -> dict[str, Any]:
+            nonlocal changed
+            current_record = async_continuation.get(current, continuation_id)
+            if (
+                isinstance(current_record, dict)
+                and current_record.get("source_kind") == "provider_job"
+                and current_record.get("state") == "source_terminal"
+            ):
+                self._schedule_async_wake(current, current_record)
+                changed = True
+            return current
+
+        saved = self.store.update(path, consume)
+        if not changed:
+            return None
+        self._remember_manifest(path, saved)
+        return saved
+
+    def _resume_teamtask_continuation(
+        self,
+        path: Path,
+        state: Mapping[str, Any],
+        scheduling_tasks: Sequence[Mapping[str, Any]] | None,
+    ) -> dict[str, Any] | None:
+        """Consume canonical TeamTask terminal state; never poll a second source."""
+        if (
+            str(state.get("status") or "").upper() != "WAITING"
+            or state.get("waiting_code") != async_continuation.WAITING_CODE
+            or scheduling_tasks is None
+        ):
+            return None
+        waiting = state.get("waiting") if isinstance(state.get("waiting"), Mapping) else {}
+        continuation_id = str(waiting.get("continuation_id") or "")
+        record = async_continuation.get(state, continuation_id)
+        if not isinstance(record, Mapping) or record.get("source_kind") != "teamtask":
+            return None
+        sources = {str(item.get("task_id") or ""): item for item in scheduling_tasks}
+        source_events = {
+            str(source_id): terminal_event_from_state(sources[str(source_id)])
+            for source_id in record.get("source_refs") or ()
+            if str(source_id) in sources
+        }
+        if not all(
+            source_events.get(str(source_id)) is not None
+            for source_id in record.get("source_refs") or ()
+        ):
+            return None
+
+        changed = False
+
+        def consume(current: dict[str, Any]) -> dict[str, Any]:
+            nonlocal changed
+            current_record = async_continuation.get(current, continuation_id)
+            if not isinstance(current_record, dict) or current_record.get("source_kind") != "teamtask":
+                return current
+            for source_id in current_record.get("source_refs") or ():
+                source = sources.get(str(source_id))
+                event = source_events.get(str(source_id))
+                if source is None or event is None:
+                    return current
+                material_ids = tuple(
+                    str(item)
+                    for item in (source.get("materials") or {}).keys()
+                )[: async_continuation.MAX_RESULT_REFS]
+                _record, recorded = async_continuation.record_source_terminal(
+                    current,
+                    continuation_id,
+                    str(source_id),
+                    status="succeeded" if event.status == "DONE" else "failed",
+                    material_ids=material_ids,
+                    summary=f"TeamTask {source_id} terminal event: {event.status}",
+                    now=utc_now(),
+                )
+                changed = changed or recorded
+            current_record = async_continuation.get(current, continuation_id)
+            if isinstance(current_record, dict) and current_record.get("state") == "source_terminal":
+                self._schedule_async_wake(current, current_record)
+                changed = True
+            return current
+
+        saved = self.store.update(path, consume)
+        if not changed:
+            return None
+        self._remember_manifest(path, saved)
+        return saved
+
+    def _apply_async_continuation_command(
+        self, kind: str, task_id: str, payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        current = self._command_task_state(task_id)
+        if current is None:
+            raise ValueError(f"task does not exist: {task_id}")
+        continuation_id = str(payload.get("continuation_id") or "")
+        outcome: dict[str, Any] = {}
+
+        def mutate(state: dict[str, Any]) -> dict[str, Any]:
+            if kind == "async_continuation_register":
+                source_kind = str(payload.get("source_kind") or "external_script").strip().lower()
+                if source_kind == "external_script":
+                    record = async_continuation.register_spawn(
+                        state,
+                        continuation_id=continuation_id,
+                        role=str(payload.get("role") or "").strip().upper(),
+                        job_id=str(payload.get("job_id") or ""),
+                        spawn_idempotency_key=str(payload.get("spawn_idempotency_key") or ""),
+                        wake_prompt=payload.get("wake_prompt"),
+                        failure_policy=str(payload.get("failure_policy") or "block"),
+                        now=utc_now(),
+                    )
+                    from .cdpa_provider_runtime import adopt_external_script_spawn
+
+                    adopt_external_script_spawn(state, record)
+                else:
+                    all_tasks = (
+                        list(self.registry.tasks_by_id.values())
+                        if self.registry is not None
+                        else [state]
+                    )
+                    record = async_continuation.register_source(
+                        state,
+                        continuation_id=continuation_id,
+                        role=str(payload.get("role") or "").strip().upper(),
+                        source_kind=source_kind,
+                        source_refs=tuple(payload.get("source_refs") or ()),
+                        wake_prompt=payload.get("wake_prompt"),
+                        failure_policy=str(payload.get("failure_policy") or "block"),
+                        completion_policy=str(payload.get("completion_policy") or "all"),
+                        timeout_at=(str(payload.get("timeout_at")) if payload.get("timeout_at") else None),
+                        now=utc_now(),
+                        all_tasks=all_tasks,
+                    )
+            elif payload.get("source_ref"):
+                raise ValueError(
+                    "ProviderJob and TeamTask terminal state is source-owned; "
+                    "continuations may only observe the source owner's terminal transition"
+                )
+            else:
+                callback = {
+                    key: payload.get(key)
+                    for key in ("status", "exit_code", "stdout", "stderr", "result_refs", "summary")
+                }
+                record, recorded = async_continuation.record_callback(
+                    state, continuation_id, callback, now=utc_now()
+                )
+                if recorded or not record.get("provider_job_id"):
+                    from .cdpa_provider_runtime import adopt_external_script_callback
+
+                    adopt_external_script_callback(state, record)
+                outcome["duplicate"] = not recorded
+                outcome["provider_job_id"] = record.get("provider_job_id")
+                if recorded:
+                    self._route_async_callback(state, record)
+            outcome.update(state=record.get("state"), wake=copy.deepcopy(record.get("wake")))
+            return state
+
+        state = self.store.update(current["manifest_path"], mutate)
+        self._publish_command_state(state)
+        return {
+            "task_id": task_id,
+            "continuation_id": continuation_id,
+            "status": state.get("status"),
+            **outcome,
+        }
+
     def _responded(self, state: dict[str, Any], hop: dict[str, Any]) -> None:
         if is_independent_task(state):
             if not str(hop.get("response") or "").strip():
@@ -7791,8 +8263,15 @@ class CDPAWorker:
                     raise RouteContractError(
                         "report repair handoff must preserve the exact expected report path"
                     )
-                if locked_route == "PAUSE":
-                    decision = RouteDecision("PAUSE", locked_handoff)
+                if decision.route != locked_route:
+                    raise RouteContractError(
+                        "report repair must preserve the locked route"
+                    )
+                decision = RouteDecision(locked_route, locked_handoff)
+            if decision.route == async_continuation.WAIT_ROUTE:
+                continuation = async_continuation.wait_continuation(state, hop, decision.handoff)
+                self._commit_async_wait(state, hop, continuation)
+                return
             if decision.route not in {"PAUSE", "DONE"} and decision.route not in state["roles"]:
                 raise RouteContractError(
                     f"route {decision.route!r} is not selected for this task"
@@ -7805,28 +8284,9 @@ class CDPAWorker:
                     )
                 routed_handoff = decision.handoff
                 try:
-                    if remote_repository_from_task(str(state.get("task_text") or "")) is None:
-                        report_repository, report_plans_root = _workflow_report_roots(
-                            self.config, state
-                        )
-                        evidence = validate_file_report(
-                            decision.handoff,
-                            repository_root=report_repository,
-                            plans_root=report_plans_root,
-                            team=str(state["team"]),
-                            physical_role=str(hop["physical_role"]),
-                            turn=int(hop["turn"]),
-                            task_id=str(state["task_id"]),
-                        )
-                        report_path = decision.handoff
-                        report_sha256 = evidence.sha256
-                        report_size = evidence.size
-                    else:
-                        report_path, report_sha256, report_size = self._validated_remote_report_mirror(
-                            state,
-                            hop,
-                            decision_handoff=decision.handoff,
-                        )
+                    report_path, report_sha256, report_size = self._validated_report_evidence(
+                        state, hop, decision.handoff
+                    )
                 except (RouteContractError, OSError) as exc:
                     self._repair_report(state, hop, exc, decision=decision)
                     return
@@ -8251,7 +8711,9 @@ class CDPAWorker:
             return
         wait["resume_allow_missing_completion_action"] = True
         try:
-            decision = await self.role_controller.run(self, state, hop, acquired, actions, wait_ms=0)
+            decision = await self._dispatch_browser_provider(
+                state, hop, acquired, actions, wait_ms=0
+            )
         finally:
             wait.pop("resume_allow_missing_completion_action", None)
         if state.get("status") == "BLOCKED":
@@ -10227,7 +10689,37 @@ class CDPAWorker:
                 if scheduling_changed and not control_in_flight:
                     return state
                 if state.get("status") == "WAITING" and not control_in_flight:
-                    return state
+                    resumed = self._resume_provider_continuation(path, state)
+                    if resumed is None:
+                        resumed = self._resume_teamtask_continuation(
+                            path, state, scheduling_tasks
+                        )
+                    return resumed if resumed is not None else state
+                if (
+                    endpoint_id is not None
+                    and not is_independent_task(state)
+                    and state.get("endpoint_pinned") is False
+                ):
+                    # The scheduler's lease is not durable. Persist first
+                    # placement, under the task-store lock, before any page
+                    # acquisition or irreversible Send can begin.
+                    try:
+                        state = self.store.pin_workflow_endpoint(
+                            path,
+                            endpoint_id,
+                            expected_updated_at=str(state.get("updated_at") or ""),
+                        )
+                        self._remember_manifest(path, state)
+                    except ValueError as exc:
+                        baseline = state
+                        state = json.loads(json.dumps(state, ensure_ascii=False, default=str))
+                        self._block(
+                            state,
+                            f"Cannot safely bind selected browser endpoint: {exc}",
+                            code="endpoint_binding_unresolved",
+                            retryable=False,
+                        )
+                        return self._persist_transport_result(path, baseline, state)
                 transport_baseline = state
                 active_hop_id = state.get("active_hop_id")
                 initial_hop = (
@@ -10921,6 +11413,8 @@ class CDPAWorker:
         self,
         discovered: Sequence[Mapping[str, Any]] | None = None,
     ) -> bool:
+        if not self.config.independent_activation_enabled:
+            return False
         if not self.config.independent_seed_builtins:
             return False
         existing_keys: set[str] = set()
@@ -10959,6 +11453,8 @@ class CDPAWorker:
         return seeded
 
     def _activate_independent_agents(self) -> set[str]:
+        if not self.config.independent_activation_enabled:
+            return set()
         if self.registry is None:
             return set()
         changed: set[str] = set()
@@ -12298,6 +12794,35 @@ class CDPAWorker:
                         state.get("depends_on_task_ids") or []
                     ),
                 }
+            elif kind == "provider_dispatch":
+                if task_id is None:
+                    raise ValueError("provider_dispatch requires task_id")
+                current = self._command_task_state(task_id)
+                if current is None:
+                    raise ValueError(f"task does not exist: {task_id}")
+                if select_work_owner().owner != "provider_job":
+                    raise RuntimeError("non-browser provider execution must be ProviderJob-owned")
+                invocation_payload = dict(payload.get("invocation") or {})
+                invocation_payload["task_id"] = task_id
+                invocation_payload["workspace"] = str(current.get("repository") or "") or None
+                invocation = ProviderInvocation.from_mapping(invocation_payload)
+                if invocation.role_key not in (current.get("roles") or {}):
+                    raise ValueError("provider role_key must belong to the owner TeamTask")
+                provider_result = asyncio.run(
+                    self.provider_dispatcher.dispatch(
+                        invocation,
+                        trigger_provider_id=payload.get("trigger_provider_id"),
+                        required_capabilities=tuple(payload.get("required_capabilities") or ()),
+                    )
+                )
+                refreshed = self.store.load_task_id(task_id)
+                if refreshed is not None:
+                    self._publish_command_state(refreshed)
+                result = {"task_id": task_id, **provider_result.to_dict()}
+            elif kind in {"async_continuation_register", "async_continuation_complete"}:
+                if task_id is None:
+                    raise ValueError(f"{kind} requires task_id")
+                result = self._apply_async_continuation_command(kind, task_id, payload)
             elif kind == "resume_team":
                 state = self.store.resume_team(
                     str(payload.get("team") or ""),
@@ -12381,6 +12906,9 @@ class CDPAWorker:
                     "independent_create_repair",
                     "independent_task_control",
                     "resume_team",
+                    "provider_dispatch",
+                    "async_continuation_register",
+                    "async_continuation_complete",
                 )
             )
             if rejected is None:
@@ -12399,6 +12927,7 @@ class CDPAWorker:
                     "change_goal",
                     "remove_parent_dependency",
                     "resume_team",
+                    "provider_dispatch",
                     "task_control",
                     *endpoint_commands,
                 )
@@ -12423,7 +12952,10 @@ class CDPAWorker:
             "independent_create_repair",
             "independent_task_control",
             "resume_team",
+            "provider_dispatch",
             "task_control",
+            "async_continuation_register",
+            "async_continuation_complete",
             "browser_endpoint_add",
             "browser_endpoint_update",
             "browser_endpoint_remove",
@@ -12675,6 +13207,8 @@ class CDPAWorker:
         for page in tuple(browser_context.pages):
             if page.is_closed():
                 continue
+            if urlparse(str(page.url)).hostname not in {"chatgpt.com", "www.chatgpt.com"}:
+                continue
             key = id(page)
             live.add(key)
             due = now >= self._ambient_next_probe_at.get(key, 0)
@@ -12814,7 +13348,9 @@ class CDPAWorker:
             if endpoint_pool is not None:
                 for current_endpoint_id, context in list(contexts.items()):
                     try:
-                        await self._maintain_ambient_page_automation(context, endpoint_id=current_endpoint_id)
+                        await self._maintain_ambient_page_automation(
+                            context, endpoint_id=current_endpoint_id
+                        )
                     except Exception as exc:
                         if not is_cdp_disconnect(exc):
                             raise

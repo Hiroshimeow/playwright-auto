@@ -104,6 +104,16 @@ _ALLOWED_TEAM_STATES = frozenset(
 _ALLOWED_ROLES = frozenset({"PLAN", "DEV", "TEST", "REVIEW", "AUDIT"})
 
 
+def runtime_v2_migration_policy(*, activation_enabled: bool) -> dict[str, Any]:
+    """Read-only migration evidence for the deprecated Independent Agent runtime."""
+    return {
+        "surface": "independent_agent",
+        "runtime_v2": "migration_only",
+        "activation_enabled": bool(activation_enabled),
+        "replacement": "TeamTask + CronJob/Heartbeat",
+    }
+
+
 def task_mode(state: Mapping[str, Any]) -> str:
     value = str(state.get("task_mode") or TASK_MODE_WORKFLOW).strip().lower()
     if value not in {TASK_MODE_WORKFLOW, TASK_MODE_INDEPENDENT}:

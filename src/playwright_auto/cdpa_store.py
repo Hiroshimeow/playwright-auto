@@ -30,6 +30,8 @@ from .cdpa_endpoints import BrowserEndpointRegistry
 from .cdpa_dependencies import (
     DependencyReadiness,
     dependency_readiness,
+    terminal_transition,
+    validate_combined_wait_for_graph,
     validate_new_dependencies,
 )
 from .cdpa_identity import generate_task_id
@@ -814,8 +816,13 @@ class TaskStore(IndependentAgentStoreMixin):
                 "bootstrap",
                 "browser_pool",
                 "role_reconnect",
+                "async_callback",
             }:
                 return "waiting reason is invalid"
+            if waiting.get("reason") == "async_callback" and not str(
+                waiting.get("continuation_id") or ""
+            ).strip():
+                return "async_callback waiting requires its continuation_id"
             if waiting.get("reason") == "browser_pool" and (
                 waiting.get("resume_status") not in {"INBOX", "RUNNING"}
                 or not isinstance(waiting.get("resume_column"), str)
@@ -1701,6 +1708,19 @@ class TaskStore(IndependentAgentStoreMixin):
                 [other for other in tasks if other is not item],
                 allow_missing=True,
             )
+        # AsyncContinuation TeamTask-source edges are derived, never a second
+        # persisted prerequisite graph, but cycles across both relations fail closed.
+        if all(
+            all(
+                str(source_id) in {str(task.get("task_id") or "") for task in tasks}
+                for record in (item.get("async_continuations") or {}).values()
+                if isinstance(record, Mapping) and record.get("source_kind") == "teamtask"
+                for source_id in record.get("source_refs") or ()
+            )
+            for item in tasks
+            if isinstance(item.get("async_continuations"), Mapping)
+        ):
+            validate_combined_wait_for_graph(tasks)
 
     def _dependency_graph_error(
         self,
@@ -1951,6 +1971,86 @@ class TaskStore(IndependentAgentStoreMixin):
             role_since.isoformat() if role_since is not None else None
         )
 
+    @staticmethod
+    def _validate_existing_status_transition(
+        original: Mapping[str, Any],
+        candidate: Mapping[str, Any],
+    ) -> None:
+        """Own persisted TeamTask status admission without changing legacy vocabulary.
+
+        V11 still stores the legacy TaskStatus values for compatibility.  The
+        store, not individual controls/workers, is the final authority that a
+        persisted task may cross a lifecycle boundary.  Terminal tasks may
+        receive bookkeeping metadata, but their terminal outcome is immutable.
+        """
+        if is_independent_task(original):
+            # Legacy Independent Agent normalization has its own migration owner.
+            # R9 status admission applies only to v11 workflow TeamTasks.
+            return
+        before = str(original.get("status") or "").upper()
+        after = str(candidate.get("status") or "").upper()
+        if before in TERMINAL and after != before:
+            raise ValueError("terminal task status is immutable")
+
+    def _prepare_existing_transition(
+        self,
+        original: Mapping[str, Any],
+        candidate: dict[str, Any],
+        *,
+        transition_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Apply lifecycle-owned fields before any existing-manifest write.
+
+        Ordinary single-file persistence and journaled multi-file transactions
+        have different durability mechanics, but they share one status-admission
+        and transition-derived metadata owner.
+        """
+        if candidate == original:
+            return candidate
+        self._validate_existing_status_transition(original, candidate)
+        before_status = str(original.get("status") or "").upper()
+        after_status = str(candidate.get("status") or "").upper()
+        at = transition_at or utc_now()
+        event = terminal_transition(original, candidate)
+        if event is not None:
+            events = candidate.setdefault("terminal_events", [])
+            if not isinstance(events, list):
+                raise ValueError("terminal_events must be an array")
+            events.append(
+                {
+                    "at": at,
+                    "task_id": event.task_id,
+                    "status": event.status,
+                    "kind": "teamtask_terminal",
+                }
+            )
+        self._apply_running_clocks(original, candidate, at=at)
+        if after_status == "BLOCKED":
+            if before_status != "BLOCKED":
+                candidate["blocked_at"] = at
+            elif not candidate.get("blocked_at"):
+                candidate["blocked_at"] = str(original.get("updated_at") or at)
+        else:
+            candidate.pop("blocked_at", None)
+        return candidate
+
+    def _persist_existing_unlocked(
+        self,
+        target: Path,
+        original: Mapping[str, Any],
+        candidate: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one existing workflow manifest through the lifecycle owner.
+
+        Callers may construct candidate state, but status admission and the
+        transition-derived clocks/events live here.  New task creation keeps its
+        dedicated raw-save path.
+        """
+        if candidate == original:
+            return dict(original)
+        self._prepare_existing_transition(original, candidate)
+        return self._save_unlocked(target, candidate)
+
     def _mutate_manifest(
         self,
         target: Path,
@@ -2003,22 +2103,9 @@ class TaskStore(IndependentAgentStoreMixin):
                     )
                 if candidate == original:
                     return original
-                before_status = str(original.get("status") or "").upper()
-                after_status = str(candidate.get("status") or "").upper()
-                transition_at = utc_now()
-                self._apply_running_clocks(original, candidate, at=transition_at)
-                if after_status == "BLOCKED":
-                    if before_status != "BLOCKED":
-                        candidate["blocked_at"] = transition_at
-                    elif not candidate.get("blocked_at"):
-                        candidate["blocked_at"] = str(
-                            original.get("updated_at") or utc_now()
-                        )
-                else:
-                    candidate.pop("blocked_at", None)
-                if candidate == original:
-                    return original
-                saved = self._save_unlocked(target, candidate)
+                saved = self._persist_existing_unlocked(
+                    target, original, candidate
+                )
             self._catalog_saved_manifest_unlocked(saved)
             return saved
 
@@ -2048,6 +2135,80 @@ class TaskStore(IndependentAgentStoreMixin):
     ) -> dict[str, Any]:
         target = Path(path).expanduser().resolve()
         return self._mutate_manifest(target, mutator)
+
+    def pin_workflow_endpoint(
+        self,
+        path: str | Path,
+        endpoint_id: str,
+        *,
+        expected_updated_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Commit a team's first endpoint selection before page/Send ownership exists.
+
+        Scheduler admission may choose a non-default endpoint for an unpinned
+        task. Ordinary ``update`` must keep endpoint and context identity
+        immutable; this narrowly scoped pre-send mutation is the only exception.
+        """
+        endpoint = self.endpoints.get(endpoint_id)
+        if endpoint.get("draining") or endpoint.get("removed"):
+            raise ValueError("browser endpoint is unavailable")
+
+        def pin(state: dict[str, Any]) -> dict[str, Any]:
+            if is_independent_task(state):
+                raise ValueError("independent agents cannot acquire v11 workflow endpoints")
+            if state.get("endpoint_pinned", True):
+                if str(state.get("browser_endpoint_id") or "") != endpoint_id:
+                    raise ValueError("workflow endpoint is already pinned")
+                return state
+            if str(state.get("status") or "").upper() in TERMINAL | {"BLOCKED", "PAUSED"}:
+                raise ValueError("inactive workflow cannot acquire endpoint")
+            hops = state.get("hops") or []
+            if len(hops) != 1 or not isinstance(hops[0], dict):
+                raise ValueError("endpoint placement requires the first unstarted hop")
+            hop = hops[0]
+            if (
+                hop.get("hop_id") != state.get("active_hop_id")
+                or hop.get("state") != "pre_send"
+                or any(hop.get(key) for key in ("receipt", "message_identity", "conversation_url"))
+            ):
+                raise ValueError("endpoint placement is no longer pre-send")
+            from .durable import RequestLedger
+            request_id = str(hop.get("request_id") or "").strip()
+            ledger_path = str(hop.get("ledger_path") or "").strip()
+            if not request_id or not ledger_path:
+                raise ValueError("missing durable request identity")
+            prepared = RequestLedger(ledger_path).peek(request_id)
+            if prepared is not None and not prepared.pristine_before_dispatch():
+                raise ValueError("durable Send intent prevents endpoint relocation")
+            roles = state.get("roles") or {}
+            for record in roles.values():
+                if not isinstance(record, dict) or any(
+                    record.get(key)
+                    for key in ("page_id", "page_url", "attachments_uploaded_generation")
+                ) or int(record.get("conversation_generation") or 0) != 0:
+                    raise ValueError("owned role identity prevents endpoint relocation")
+            previous = str(state.get("browser_endpoint_id") or "")
+            if state.get("context_policy") == "bootstrap" and previous != endpoint_id:
+                raise ValueError("bootstrap context is bound to the original endpoint")
+            selected_mode = str(state.get("conversation_mode") or "persistent")
+            if not state.get("conversation_mode_explicit", False):
+                selected_mode = "temporary" if endpoint.get("temporary_default") else "persistent"
+            if selected_mode == "temporary" and state.get("context_policy") == "bootstrap":
+                raise ValueError("bootstrap cannot use a temporary endpoint")
+            state["browser_endpoint_id"] = endpoint_id
+            state["endpoint_pinned"] = True
+            state["conversation_mode"] = selected_mode
+            for record in roles.values():
+                record["browser_endpoint_id"] = endpoint_id
+            hop["browser_endpoint_id"] = endpoint_id
+            return state
+
+        return self._mutate_manifest(
+            Path(path).expanduser().resolve(),
+            pin,
+            expected_updated_at=expected_updated_at,
+            mutable_fields=frozenset({"browser_endpoint_id", "conversation_mode"}),
+        )
 
     def update_for_control(
         self,
@@ -2146,10 +2307,18 @@ class TaskStore(IndependentAgentStoreMixin):
                     replacement.get("depends_on_task_ids")
                 ):
                     raise ValueError("task dependencies changed; reload before cleanup")
-                saved = self._save_unlocked(target, replacement)
+                saved = self._persist_existing_unlocked(target, current, replacement)
             catalog["entries"][self._catalog_key(target)] = self._catalog_entry(saved)
             self._write_catalog_unlocked(catalog)
             return saved, True
+
+    @staticmethod
+    def _is_async_callback_waiting(state: Mapping[str, Any]) -> bool:
+        # Only the registered callback may release this wait; dependency scheduling never does.
+        return (
+            str(state.get("status") or "").upper() == "WAITING"
+            and state.get("waiting_code") == "async_callback"
+        )
 
     @staticmethod
     def _is_dependency_waiting_state(state: Mapping[str, Any]) -> bool:
@@ -2297,6 +2466,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 is_independent_task(current)
                 or status in TERMINAL
                 or status == "PAUSED"
+                or self._is_async_callback_waiting(current)
                 or (
                     not queue_pending
                     and not dependencies
@@ -2311,7 +2481,7 @@ class TaskStore(IndependentAgentStoreMixin):
             status = str(current.get("status") or "").upper()
             if is_independent_task(current):
                 return current, False
-            if status in TERMINAL or status == "PAUSED":
+            if status in TERMINAL or status == "PAUSED" or self._is_async_callback_waiting(current):
                 return current, False
             dependencies = normalize_dependency_ids(current.get("depends_on_task_ids"))
             dependency_waiting_origin = self._is_dependency_waiting_state(current)
@@ -2343,7 +2513,7 @@ class TaskStore(IndependentAgentStoreMixin):
                     latest = self._load_current_manifest_unlocked(target)
                     if latest.get("updated_at") != current.get("updated_at"):
                         raise ValueError("task changed while refreshing scheduling state")
-                    saved = self._save_unlocked(target, next_state)
+                    saved = self._persist_existing_unlocked(target, latest, next_state)
                 self._catalog_saved_manifest_unlocked(saved)
                 return saved, True
             team = str(current.get("team") or "")
@@ -2599,7 +2769,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 latest = self._load_current_manifest_unlocked(target)
                 if latest.get("updated_at") != current.get("updated_at"):
                     raise ValueError("task changed while refreshing scheduling state")
-                saved = self._save_unlocked(target, next_state)
+                saved = self._persist_existing_unlocked(target, latest, next_state)
             self._catalog_saved_manifest_unlocked(saved)
             return saved, True
 
@@ -4219,6 +4389,12 @@ class TaskStore(IndependentAgentStoreMixin):
                 repair_path = (
                     self.root / team / repair_id / f"{slugify(task_text)}.json"
                 ).resolve()
+                repair_roles = ordered_system_routes(self.config)
+                repair_policy = build_role_policy(
+                    repair_roles,
+                    closing_role=workflow_closing_role(repair_roles),
+                    max_route_repairs=self.config.route_repair_attempts,
+                )
                 repair_state = self._initial_task_state(
                     text=task_text,
                     requested_team=base,
@@ -4230,10 +4406,20 @@ class TaskStore(IndependentAgentStoreMixin):
                     reusable_teams=[],
                     target=repair_path,
                     normalized_new=(),
-                    workflow_roles=ordered_system_routes(self.config),
+                    workflow_roles=repair_policy.roles,
+                    submitted_roles=repair_policy.submitted_roles,
+                    route_targets=repair_policy.route_targets,
+                    reachable_roles=repair_policy.reachable_roles,
+                    closing_role=repair_policy.closing_role,
+                    route_contract_id=repair_policy.route_contract_id,
+                    semantic_routes=repair_policy.semantic_routes,
+                    provider_id="chatgpt_web",
+                    max_routes=repair_policy.max_routes,
+                    max_route_repairs=repair_policy.max_route_repairs,
+                    self_route_policy=repair_policy.self_route_policy,
                     new_all=False,
-                    workflow_agents=self.workflow_agents.resolve(
-                        ordered_system_routes(self.config)
+                    workflow_agents=self.workflow_agents.resolve_for_task(
+                        repair_policy.reachable_roles
                     ),
                     normalized_report_mode="file",
                     normalized_dependencies=(),
@@ -4672,6 +4858,13 @@ class TaskStore(IndependentAgentStoreMixin):
                         "request_id": active_request_id,
                     }
                 )
+
+            # Repair uses a multi-file journal for atomicity, but the affected
+            # existing task must still pass through the same lifecycle owner as
+            # ordinary TaskStore.update/save writes.
+            self._prepare_existing_transition(
+                affected, affected_after, transition_at=now
+            )
 
             writes = {repair_path: repair_state, affected_path: affected_after}
             for path, value in writes.items():
@@ -5577,7 +5770,7 @@ class TaskStore(IndependentAgentStoreMixin):
                     {"kind": "parent_removed", **event}
                 )
                 self._record_external_command(next_state, command_id)
-                saved = self._save_unlocked(target, next_state)
+                saved = self._persist_existing_unlocked(target, current, next_state)
             catalog["entries"][self._catalog_key(target)] = self._catalog_entry(saved)
             self._write_catalog_unlocked(catalog)
 
@@ -5888,7 +6081,7 @@ class TaskStore(IndependentAgentStoreMixin):
                     external_command_id=external_command_id,
                 )
                 self._record_external_command(queued, external_command_id)
-                saved = self._save_unlocked(target, queued)
+                saved = self._persist_existing_unlocked(target, current, queued)
             catalog["entries"][self._catalog_key(target)] = self._catalog_entry(saved)
             self._write_catalog_unlocked(catalog)
             return saved

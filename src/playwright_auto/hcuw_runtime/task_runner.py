@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import socket
 import subprocess
@@ -8,11 +9,14 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from ..cdpa_commands import teamtask_trigger_idempotency_key
 from ..cdpa_config import load_cdpa_config
+from ..cdpa_provider_runtime import ProviderRuntimeError, select_provider, select_work_owner
 from ..cdpa_role_policy import RolePolicyError, RolePolicyResult, build_role_policy
 from ..cdpa_workflow_agents import (
     WorkflowAgentCatalog,
@@ -115,11 +119,34 @@ class RuntimeTaskRunner:
     state_store: RuntimeStateStore
     audit_timeline: AuditTimeline
 
-    def submit_task(self, payload: dict[str, Any]) -> dict[str, Any]:
-        request = self._validate_payload(payload)
+    def submit_task(
+        self,
+        payload: dict[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        trigger: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if isinstance(trigger, dict) and trigger.get("kind") == "child_teamtask":
+            if select_work_owner(independent_route_contract=True).owner != "team_task":
+                raise RuntimeTaskRunnerError(
+                    "invalid_task_request",
+                    "independent routed sub-work must be owned by a child TeamTask",
+                )
+        stable_key = _required_idempotency_key(idempotency_key)
+        request = self._validate_payload(payload, idempotency_key=stable_key)
+        existing = self._record_for_idempotency_key(stable_key)
+        if existing is not None:
+            if existing.get("request_fingerprint") != self._request_fingerprint(request):
+                raise RuntimeTaskRunnerError(
+                    "idempotency_conflict",
+                    "runtime-v2 idempotency key belongs to another TeamTask request",
+                )
+            return existing
         runtime = self.ensure_legacy_runtime()
-        result = self._submit_team_with_legacy_api(request)
-        record = self._build_task_record(request, runtime, result)
+        result = self._submit_team_with_legacy_api(request, idempotency_key=stable_key)
+        record = self._build_task_record(
+            request, runtime, result, idempotency_key=stable_key, trigger=trigger
+        )
         self.state_store.save_task_record(record)
         self.audit_timeline.record_event(
             source="actions",
@@ -132,9 +159,58 @@ class RuntimeTaskRunner:
                 "browser": request.browser,
                 "roles": list(request.roles),
                 "start_role": request.start_role,
+                "trigger": trigger,
             },
         )
         return record
+
+    def submit_cron_job(
+        self, cron_id: str, scheduled_for: str, task_payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        cron = _required_identity(cron_id, "cron_id")
+        occurrence = _normalized_timestamp(scheduled_for, "scheduled_for")
+        key = teamtask_trigger_idempotency_key("cron", cron, occurrence)
+        return self.submit_task(
+            task_payload,
+            idempotency_key=key,
+            trigger={"kind": "cron", "cron_id": cron, "scheduled_for": occurrence},
+        )
+
+    def submit_heartbeat_recovery(
+        self,
+        subject_kind: str,
+        subject_id: str,
+        stale_episode_started_at: str,
+        task_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        kind = _required_identity(subject_kind, "subject_kind")
+        subject = _required_identity(subject_id, "subject_id")
+        episode = _normalized_timestamp(stale_episode_started_at, "stale_episode_started_at")
+        key = teamtask_trigger_idempotency_key(
+            "heartbeat", subject, episode, subject_kind=kind
+        )
+        return self.submit_task(
+            task_payload,
+            idempotency_key=key,
+            trigger={
+                "kind": "stale_heartbeat",
+                "subject_kind": kind,
+                "subject_id": subject,
+                "stale_episode_started_at": episode,
+            },
+        )
+
+    def _record_for_idempotency_key(self, key: str) -> dict[str, Any] | None:
+        matches = [
+            record
+            for record in self.state_store.list_task_records()
+            if record.get("idempotency_key") == key
+        ]
+        if len(matches) > 1:
+            raise RuntimeTaskRunnerError(
+                "state_conflict", f"duplicate runtime-v2 idempotency record: {key}"
+            )
+        return matches[0] if matches else None
 
     def ensure_legacy_runtime(self) -> dict[str, Any]:
         if self._legacy_api_is_healthy():
@@ -147,7 +223,9 @@ class RuntimeTaskRunner:
         self._wait_for_legacy_api(process.pid)
         return {"status": "started", "api": self._legacy_api_url(), "pid": process.pid}
 
-    def _validate_payload(self, payload: dict[str, Any]) -> TaskSubmissionRequest:
+    def _validate_payload(
+        self, payload: dict[str, Any], *, idempotency_key: str | None = None
+    ) -> TaskSubmissionRequest:
         supplied = set(payload)
         legacy_fields = sorted(supplied & _LEGACY_PUBLIC_FIELDS)
         derived_fields = sorted(supplied & _DERIVED_TASK_FIELDS)
@@ -176,18 +254,30 @@ class RuntimeTaskRunner:
         task = str(payload.get("task") or "").strip()
         if not task:
             raise RuntimeTaskRunnerError("invalid_task_request", "task is required")
-        team = str(payload.get("team") or f"hcuw-v2-team-{uuid.uuid4().hex[:8]}").strip()
+        team = str(
+            payload.get("team")
+            or (
+                _default_team_for_idempotency_key(idempotency_key)
+                if idempotency_key
+                else f"hcuw-v2-team-{uuid.uuid4().hex[:8]}"
+            )
+        ).strip()
         browser = str(payload.get("browser") or "9222").strip()
         provider_id = str(payload.get("provider_id") or "chatgpt_web").strip()
         if not team:
             raise RuntimeTaskRunnerError("invalid_task_request", "team is required")
         if not browser:
             raise RuntimeTaskRunnerError("invalid_task_request", "browser is required")
-        if provider_id != "chatgpt_web":
+        try:
+            provider = select_provider(
+                explicit_provider_id=provider_id, required_capabilities=("browser",)
+            )
+        except ProviderRuntimeError as exc:
             raise RuntimeTaskRunnerError(
                 "invalid_task_request",
-                "Gate A supports provider_id='chatgpt_web' only; other providers start in Gate B",
-            )
+                "TeamTask role turns require a browser provider; non-browser execution belongs to ProviderJob",
+            ) from exc
+        provider_id = provider.provider_id
 
         _definitions, semantic_routes, default_repairs = self._role_policy_source()
         try:
@@ -239,12 +329,41 @@ class RuntimeTaskRunner:
 
     def _legacy_api_is_healthy(self) -> bool:
         try:
-            with urlopen(Request(f"{self._legacy_api_url()}/health", method="GET"), timeout=1.0):
-                return True
-        except URLError:
+            with urlopen(Request(f"{self._legacy_api_url()}/health", method="GET"), timeout=1.0) as response:
+                health = json.load(response)
+        except (URLError, OSError):
             return False
-        except OSError:
-            return False
+        except (ValueError, UnicodeError) as exc:
+            raise RuntimeTaskRunnerError(
+                "legacy_runtime_incompatible", "legacy health response is not valid JSON"
+            ) from exc
+        # HTTP 200 alone cannot prove this is our backend or that obsolete
+        # Independent Agent execution has been disabled on an existing process.
+        if not isinstance(health, dict) or health.get("ok") is not True:
+            raise RuntimeTaskRunnerError(
+                "legacy_runtime_incompatible", "legacy health contract is incomplete"
+            )
+        if health.get("independent_activation_enabled") is not False:
+            raise RuntimeTaskRunnerError(
+                "legacy_runtime_incompatible", "legacy backend must disable Independent Agent execution"
+            )
+        repository = health.get("repository_root")
+        try:
+            matches_repository = (
+                isinstance(repository, str)
+                and Path(repository).resolve() == self.config.repository_root
+            )
+        except (OSError, ValueError):
+            matches_repository = False
+        if not matches_repository:
+            raise RuntimeTaskRunnerError(
+                "legacy_runtime_incompatible", "legacy backend owns a different or unknown repository"
+            )
+        if health.get("worker_reload_required") is True:
+            raise RuntimeTaskRunnerError(
+                "legacy_runtime_source_drift", "legacy worker source drift requires an operator restart"
+            )
+        return True
 
     def _legacy_api_port_is_bound(self) -> bool:
         try:
@@ -302,7 +421,9 @@ class RuntimeTaskRunner:
             f"legacy CDPA API did not become healthy {owner}",
         )
 
-    def _submit_team_with_legacy_api(self, request: TaskSubmissionRequest) -> dict[str, Any]:
+    def _submit_team_with_legacy_api(
+        self, request: TaskSubmissionRequest, *, idempotency_key: str
+    ) -> dict[str, Any]:
         payload = {
             "workflow_mode": "team",
             "task": request.task,
@@ -320,7 +441,9 @@ class RuntimeTaskRunner:
             "depends_on_task_ids": list(request.depends_on_task_ids),
             "report_mode": "file",
         }
-        command = self._post_legacy_api("/api/tasks", payload)
+        command = self._post_legacy_api(
+            "/api/tasks", payload, idempotency_key=idempotency_key
+        )
         return {
             "command": ["POST", f"{self._legacy_api_url()}/api/tasks"],
             "returncode": 0,
@@ -333,14 +456,16 @@ class RuntimeTaskRunner:
             },
         }
 
-    def _post_legacy_api(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post_legacy_api(
+        self, path: str, payload: dict[str, Any], *, idempotency_key: str
+    ) -> dict[str, Any]:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = Request(
             f"{self._legacy_api_url()}{path}",
             data=body,
             headers={
                 "Content-Type": "application/json",
-                "Idempotency-Key": str(uuid.uuid4()),
+                "Idempotency-Key": idempotency_key,
             },
             method="POST",
         )
@@ -365,11 +490,21 @@ class RuntimeTaskRunner:
         request: TaskSubmissionRequest,
         runtime: dict[str, Any],
         result: dict[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        trigger: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         parsed = dict(result.get("parsed") or {})
         now = _utc_now()
         return {
-            "runtime_task_id": f"rtask-{uuid.uuid4().hex[:12]}",
+            "runtime_task_id": (
+                f"rtask-{hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest()[:16]}"
+                if idempotency_key
+                else f"rtask-{uuid.uuid4().hex[:12]}"
+            ),
+            "idempotency_key": idempotency_key,
+            "request_fingerprint": self._request_fingerprint(request),
+            "trigger": trigger,
             "mode": "team",
             "status": "submitted",
             "created_at": now,
@@ -402,6 +537,26 @@ class RuntimeTaskRunner:
             "submit_command": result.get("command", []),
         }
 
+    @staticmethod
+    def _request_fingerprint(request: TaskSubmissionRequest) -> str:
+        payload = {
+            "task": request.task,
+            "team": request.team,
+            "browser": request.browser,
+            "provider_id": request.provider_id,
+            "depends_on_task_ids": list(request.depends_on_task_ids),
+            "roles": list(request.roles),
+            "route_targets": list(request.policy.route_targets),
+            "start_role": request.start_role,
+            "closing_role": request.closing_role,
+            "max_routes": request.policy.max_routes,
+            "max_route_repairs": request.policy.max_route_repairs,
+            "self_route_policy": request.policy.self_route_policy,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
     def _legacy_config_path(self) -> str:
         bridge_path = self.state_store.task_runner_dir() / "legacy-cdpa-bridge.json"
         bridge_path.parent.mkdir(parents=True, exist_ok=True)
@@ -415,6 +570,7 @@ class RuntimeTaskRunner:
         source["repositories"] = repositories
         independent_agents = dict(source.get("independent_agents") or {})
         independent_agents["seed_builtins"] = False
+        independent_agents["activation_enabled"] = False
         source["independent_agents"] = independent_agents
         bridge_path.write_text(
             json.dumps(source, ensure_ascii=False, indent=2, sort_keys=True),
@@ -436,6 +592,46 @@ class RuntimeTaskRunner:
 
     def _legacy_api_url(self) -> str:
         return f"http://127.0.0.1:{self.config.legacy_api_port}"
+
+
+def _required_identity(value: object, field: str) -> str:
+    text = str(value or "").strip()
+    if not text or len(text) > 200:
+        raise RuntimeTaskRunnerError(
+            "invalid_task_request", f"{field} must contain 1 to 200 characters"
+        )
+    return text
+
+
+def _required_idempotency_key(value: object) -> str:
+    key = str(value or "").strip()
+    if not key:
+        raise RuntimeTaskRunnerError(
+            "idempotency_key_required", "Idempotency-Key is required for TeamTask submission"
+        )
+    if len(key) > 200:
+        raise RuntimeTaskRunnerError(
+            "invalid_idempotency_key", "Idempotency-Key must contain at most 200 characters"
+        )
+    return key
+
+
+def _default_team_for_idempotency_key(idempotency_key: str) -> str:
+    digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:12]
+    return f"hcuw-v2-team-{digest}"
+
+
+def _normalized_timestamp(value: object, field: str) -> str:
+    text = str(value or "").strip()
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RuntimeTaskRunnerError(
+            "invalid_task_request", f"{field} must be an ISO-8601 timestamp"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
 
 
 def _legacy_error_message(raw: bytes) -> str:
