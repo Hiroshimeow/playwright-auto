@@ -97,11 +97,12 @@ class PromptBuilder:
         if source_physical_role and str(source_physical_role).strip() == str(physical_role).strip():
             continuation = " Continue from the handoff; do not restate prior work."
         directive = "Work first." + continuation + " Write the report, then return exactly one valid route JSON object."
-        if normalized == "PLAN":
-            directive += " If acceptance is satisfied after clean REVIEW, route DONE; otherwise route the smallest role with concrete remaining work."
-        elif normalized == "REVIEW":
-            clean_route = "to PLAN" if closing_role == "PLAN" else "DONE when acceptance is satisfied"
-            directive += f" Clean work routes {clean_route}; a concrete reproducible defect routes to DEV."
+        if closing_role is not None:
+            closer = validate_workflow_route_key(closing_role)
+            if normalized == closer:
+                directive += " This is the closing role; DONE is available only when acceptance is satisfied."
+            else:
+                directive += f" DONE authority belongs to {closer}; semantic completion returns control to that closing role."
         return directive
 
     @staticmethod
@@ -122,6 +123,7 @@ class PromptBuilder:
         physical_role: str,
         turn: int,
         allowed_routes: Sequence[str],
+        closing_role: str | None = None,
         workspace: str,
         source_physical_role: str | None,
         handoff: str,
@@ -137,8 +139,6 @@ class PromptBuilder:
     ) -> BuiltPrompt:
         role = validate_workflow_route_key(logical_role)
         allowed = tuple(str(item).strip().upper() for item in allowed_routes)
-        if role not in allowed:
-            raise ValueError(f"workflow role {role!r} is not in allowed_routes")
         handoff = str(handoff).strip()
         original_goal = str(goal).strip()
         expected_report_path = (
@@ -152,12 +152,12 @@ class PromptBuilder:
         turn_number = int(turn)
         path_type = PureWindowsPath if PureWindowsPath(workspace).drive else PurePosixPath
         report_destination = path_type(str(workspace).strip()) / expected_report_path
-        closing_role = workflow_closing_role(allowed)
-        prompt_routes = tuple(
-            item
-            for item in allowed
-            if item != "PAUSE" and (item != "DONE" or role == closing_role)
+        normalized_closing_role = (
+            validate_workflow_route_key(closing_role)
+            if closing_role is not None
+            else workflow_closing_role(allowed)
         )
+        prompt_routes = allowed
         context = [
             f"Turn: {turn_number}",
             f"Workspace: {str(workspace).strip()} (resolve relative report paths here)",
@@ -206,7 +206,7 @@ class PromptBuilder:
                 role,
                 physical_role=str(physical_role).strip(),
                 source_physical_role=source_physical_role,
-                closing_role=closing_role,
+                closing_role=normalized_closing_role,
             )
         )
         return BuiltPrompt(

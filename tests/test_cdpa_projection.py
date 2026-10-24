@@ -809,6 +809,7 @@ def test_projection_summary_is_compact_and_deterministic(tmp_path: Path):
         "availability", "primary_problem", "waiting_reason", "block_code",
         "stop_reason", "lifecycle_kind", "lifecycle_label",
         "queue_position", "queue_length", "queue_reason", "queue_since", "waiting_order", "roles", "requested_browser_endpoint_id", "required_browser_endpoint_id", "browser_endpoint_ids", "has_reports", "task_title",
+        "submitted_roles", "initial_roles", "reachable_roles", "start_role", "closing_role", "route_seq", "max_routes", "max_route_repairs",
         "version", "projection_sha256",
     }
 

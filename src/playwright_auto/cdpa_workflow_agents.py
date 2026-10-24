@@ -18,6 +18,19 @@ _ROUTE_KEY = re.compile(r"^[A-Z][A-Z0-9_]{0,31}$")
 _CUSTOM_PREFIX = "WF_"
 _MAX_DISPLAY_NAME = 80
 SYSTEM_WORKFLOW_ROUTE_ORDER = ("PLAN", "DEV", "TEST", "REVIEW", "AUDIT")
+_GENERIC_ROLE_PROMPT = (
+    "Execute the assigned work for this TeamTask role. Follow the task goal, current handoff, "
+    "report contract, and closed route contract supplied by the runtime. Do not invent route "
+    "destinations outside the allowed route enum."
+)
+_SEMANTIC_ROUTE_TO = re.compile(
+    r"\broute(?:s|d|ing)?\b[^\n.!?]{0,160}?\bto\s+`?([A-Z][A-Z0-9_]{0,31})`?",
+    re.IGNORECASE,
+)
+_SEMANTIC_ROUTE_DIRECT = re.compile(
+    r"\broute(?:s|d|ing)?\s+`?([A-Z][A-Z0-9_]{0,31})`?\b",
+    re.IGNORECASE,
+)
 
 
 def ordered_system_routes(config: CDPAConfig) -> tuple[str, ...]:
@@ -90,6 +103,20 @@ def normalize_workflow_definition(
     }
 
 
+def generic_workflow_definition(route_key: Any) -> dict[str, Any]:
+    """Return the deterministic fallback definition for an unregistered valid role key."""
+    role = validate_workflow_route_key(route_key)
+    if role in {"PAUSE", "DONE"}:
+        raise ValueError(f"workflow route key {role!r} is a reserved lifecycle route")
+    return {
+        "route_key": role,
+        "display_name": role,
+        "system_prompt": _GENERIC_ROLE_PROMPT,
+        "is_system": False,
+        "deleted_at": None,
+    }
+
+
 def workflow_snapshot(
     definitions: Sequence[Mapping[str, Any]],
 ) -> dict[str, dict[str, Any]]:
@@ -102,7 +129,40 @@ def workflow_snapshot(
         if route_key in result:
             raise ValueError("workflow agent snapshot contains duplicate route keys")
         result[route_key] = definition
-    require_team_closing_role(result)
+    return result
+
+
+def semantic_routes_from_workflow_definitions(
+    definitions: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, str]]:
+    """Extract route destinations from the existing prompt/template owner.
+
+    The prompt text remains the semantic source of truth. This helper only freezes a
+    conservative machine-readable destination snapshot for RolePolicy/RouteContract.
+    """
+    available = {str(key).strip().upper() for key in definitions}
+    destinations = available | {"DONE"}
+    result: dict[str, dict[str, str]] = {}
+    for raw_source, definition in definitions.items():
+        source = validate_workflow_route_key(raw_source)
+        prompt = str(definition.get("system_prompt") or "")
+        found: list[str] = []
+        # Treat the role template as the semantic-route owner, but never infer a
+        # destination from explicit negative policy prose (for example
+        # "do not route PLAN to PLAN" or "AUDIT never routes DONE").
+        segments = re.split(r"(?<=[.!?])\s+|[\r\n]+", prompt)
+        for segment in segments:
+            if re.search(r"\b(?:do\s+not|don't|never)\s+route(?:s|d|ing)?\b", segment, re.IGNORECASE):
+                continue
+            for pattern in (_SEMANTIC_ROUTE_TO, _SEMANTIC_ROUTE_DIRECT):
+                for match in pattern.finditer(segment):
+                    destination = match.group(1).strip().upper()
+                    if destination in destinations and destination not in found:
+                        found.append(destination)
+        result[source] = {
+            f"declared_{index}": destination
+            for index, destination in enumerate(found, start=1)
+        }
     return result
 
 
@@ -148,8 +208,6 @@ def task_workflow_definitions(
     workflow_mode = str(state.get("workflow_mode") or "team").strip().lower()
     if workflow_mode not in {"team", "solo"}:
         raise ValueError("workflow_mode must be team or solo")
-    if workflow_mode == "team":
-        require_team_closing_role(result)
     if workflow_mode == "solo" and len(result) != 1:
         raise ValueError("solo workflow task must include exactly one role")
     return result
@@ -320,6 +378,24 @@ class WorkflowAgentCatalog:
                     raise ValueError(
                         f"deleted or missing workflow agent: {route_key}"
                     )
+                result[route_key] = definition
+            return result
+
+    def resolve_for_task(self, route_keys: Sequence[str]) -> dict[str, dict[str, Any]]:
+        """Resolve task role definitions, using the frozen generic fallback for unregistered keys."""
+        requested = [validate_workflow_route_key(item) for item in route_keys]
+        if len(set(requested)) != len(requested):
+            raise ValueError("workflow roles must not contain duplicates")
+        with exclusive_file_lock(self.lock_path):
+            value = self._load_unlocked()
+            result: dict[str, dict[str, Any]] = {}
+            for route_key in requested:
+                definition = self._effective_from(value, route_key)
+                if definition is None:
+                    historical = self._effective_from(value, route_key, include_deleted=True)
+                    if historical is not None:
+                        raise ValueError(f"deleted or missing workflow agent: {route_key}")
+                    definition = generic_workflow_definition(route_key)
                 result[route_key] = definition
             return result
 

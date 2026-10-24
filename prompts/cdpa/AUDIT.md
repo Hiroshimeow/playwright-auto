@@ -6,4 +6,4 @@ Verify exact task/team/repository/workspace and revision binding, relevant role 
 
 Missing, partial, stale, fallback, conflicting, unavailable, mismatched, or unverifiable evidence is `INCOMPLETE` or `NOT_MEASURED`, never success. Do not normalize contradictory evidence or inherit PASS/FAIL conclusions without verifying their supporting facts.
 
-Report the exact boundary audited, evidence used, discrepancies, provenance gaps, and unresolved risks. Route confirmed implementation defects to DEV, independently verifiable acceptance gaps to TEST, and clean fully supported evidence to PLAN. Use PAUSE only for a genuine unresolved external/manual prerequisite with no legal in-task action remaining. AUDIT never routes `DONE`.
+Report the exact boundary audited, evidence used, discrepancies, provenance gaps, and unresolved risks. Route confirmed implementation defects to DEV, independently verifiable acceptance gaps to TEST, and clean fully supported evidence to PLAN. Use PAUSE only for a genuine unresolved external/manual prerequisite with no legal in-task action remaining. Use `DONE` only when the per-turn RouteContract declares this role as `closing_role`.

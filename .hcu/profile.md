@@ -1,40 +1,24 @@
-# playwright-auto - HCUW Project Profile
+# playwright-auto - HCUW Compatibility Profile
 
-This file stores factual project identity and declared engineering intent. It is
-not the rulebook. Durable normative policy belongs in `.hcu/rules.md`.
+This file stores HCUW-facing project identity and compatibility metadata. It is not the rulebook.
 
 ## Identity
 
-- Project: playwright-auto
+- Project: playwright-auto / CDPA
 - Stack: Python
-- Existing repository instructions: AGENTS.md present
-- README: present
+- Canonical agent root: `.agents/`
+- Canonical project rulebook: `.agents/rules/project.md`
+- Project skill root: `.agents/skills/`
+- Feature specification root: `specs/`
+- Human/operator guide: `README.md`
 
-## Declared engineering intent
+## Compatibility
 
-Keep CDPA small and direct. One concept has one owner and one live path. Do not add duplicate states, gates, recovery paths, functions, services, or control layers. Preserve exactly-once send and ambiguous-side-effect safety. Prefer deletion and consolidation over parallel mechanisms.
+HCUW tools may continue to inspect `.hcu/profile.md` and `.hcu/rules.md`. `.hcu/rules.md` delegates to `.agents/rules/project.md`; project-wide policy must not be duplicated under `.hcu/`.
 
-## Spec persistence
-
-Completed `.hcu/specs/<change>/` artifacts are historical records by default.
-Treat a spec as a living contract only when the repository or user explicitly
-says so.
-
-## Verification hints discovered at install
+## Verification hints
 
 Tests:
-- uv run pytest -q
-
-Build:
-- None detected
-
-Other checks:
-- None detected
+- `uv run pytest -q`
 
 These are hints only. Repository-local instructions and actual configuration are authoritative.
-
-## Maintenance
-
-Update this profile when project identity, platform, explicit engineering
-intent, or spec-persistence policy changes. Do not copy task-specific facts or
-temporary incidents here.

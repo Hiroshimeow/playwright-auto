@@ -1385,7 +1385,7 @@ def test_pre_send_lazily_acquires_only_plan_with_compact_prompt(tmp_path: Path):
         for line in hop["prompt"].splitlines()
         if line.startswith('{"route":')
     )
-    assert route_contract.split("|") == ["PLAN", "DEV", "TEST", "REVIEW", "AUDIT", "DONE"]
+    assert route_contract.split("|") == ["DEV", "TEST", "REVIEW", "AUDIT", "PAUSE", "DONE"]
     assert "PAUSE requires an external/manual prerequisite" in hop["prompt"]
     assert state["roles"]["PLAN"]["page_id"] == "page-alpha-plan"
     assert state["roles"]["DEV"]["status"] == "unallocated"
@@ -1664,7 +1664,7 @@ def test_pre_send_limits_allowed_routes_to_selected_workflow_roles(tmp_path: Pat
         if line.startswith('{"route":')
     )
 
-    assert route_contract.split("|") == ["PLAN", "REVIEW", "DONE"]
+    assert route_contract.split("|") == ["REVIEW", "PAUSE", "DONE"]
     assert "PAUSE requires an external/manual prerequisite" in hop["prompt"]
     assert hop["prompt"].count("Constructor for PLAN") == 1
     assert f"Before replying, write a non-empty report to exactly: {report_path}" in hop["prompt"]
@@ -1895,6 +1895,57 @@ def test_missing_local_file_report_preserves_route_and_queues_report_repair(tmp_
     assert repair["route"] == "REVIEW"
     assert _active_hop(state)["target_role"] == "REVIEW"
     assert _active_hop(state)["kind"] == "handoff"
+
+
+def test_gate_a_report_repair_rejects_default_forbidden_self_route(tmp_path: Path):
+    _store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-report-repair-self-route"
+    )
+    handoff = str(hop["expected_report_path"])
+    hop["response"] = json.dumps({"route": "DEV", "handoff": handoff})
+    hop["state"] = "responded"
+    worker._responded(state, hop)
+
+    repair = _active_hop(state)
+    report = tmp_path / handoff
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("# PLAN report\n\n- recovered artifact\n", encoding="utf-8")
+    repair["response"] = json.dumps({"route": "PLAN", "handoff": handoff})
+    repair["state"] = "responded"
+
+    worker._responded(state, repair)
+
+    route_repair = _active_hop(state)
+    assert state["route_seq"] == 0
+    assert state["route_repair_count"] == 1
+    assert "not selected or unavailable" in repair["validation_error"]
+    assert route_repair["kind"] == "route_repair"
+    assert route_repair["target_role"] == "PLAN"
+
+
+def test_gate_a_report_repair_budget_exhausted_closer_allows_done_only(tmp_path: Path):
+    _store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-report-repair-budget"
+    )
+    handoff = str(hop["expected_report_path"])
+    hop["response"] = json.dumps({"route": "DEV", "handoff": handoff})
+    hop["state"] = "responded"
+    worker._responded(state, hop)
+
+    repair = _active_hop(state)
+    state["route_seq"] = state["max_routes"]
+    contract = worker._frozen_route_contract(state, "PLAN")
+    assert contract is not None
+    assert contract.allowed_routes == ("DONE",)
+
+    repair["response"] = json.dumps({"route": "DEV", "handoff": handoff})
+    repair["state"] = "responded"
+    worker._responded(state, repair)
+
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "ROUTE_BUDGET_EXHAUSTED"
+    assert state["route_repair_count"] == 0
+    assert state["route_seq"] == state["max_routes"]
 
 
 def test_empty_local_file_report_enters_report_repair_without_advancing(tmp_path: Path):

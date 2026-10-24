@@ -241,23 +241,25 @@ def test_workflow_role_subset_is_canonical_and_exact_team_reuse_inherits(tmp_pat
         task_id="task-subset",
         roles=("REVIEW", "PLAN"),
     )
-    assert list(first["roles"]) == ["PLAN", "REVIEW"]
-    assert list(store.load(first["manifest_path"])["roles"]) == ["PLAN", "REVIEW"]
+    assert list(first["roles"]) == ["REVIEW", "PLAN"]
+    reloaded_first = store.load(first["manifest_path"])
+    assert reloaded_first["initial_roles"] == ["REVIEW", "PLAN"]
+    assert set(reloaded_first["roles"]) == {"REVIEW", "PLAN"}
 
     inherited = store.create_task(
         "reuse subset",
         reuse_team="alpha",
         task_id="task-subset-reuse",
     )
-    assert list(inherited["roles"]) == ["PLAN", "REVIEW"]
+    assert list(inherited["roles"]) == ["REVIEW", "PLAN"]
 
     matched = store.create_task(
         "reuse matching subset",
         reuse_team="alpha",
         task_id="task-subset-match",
-        roles=("PLAN", "REVIEW"),
+        roles=("REVIEW", "PLAN"),
     )
-    assert list(matched["roles"]) == ["PLAN", "REVIEW"]
+    assert list(matched["roles"]) == ["REVIEW", "PLAN"]
 
     with pytest.raises(ValueError, match="role composition"):
         store.create_task(
@@ -266,20 +268,22 @@ def test_workflow_role_subset_is_canonical_and_exact_team_reuse_inherits(tmp_pat
             task_id="task-subset-mismatch",
             roles=("PLAN", "DEV"),
         )
-    with pytest.raises(ValueError, match="must include PLAN"):
-        store.create_task(
-            "missing plan",
-            requested_team="missing-plan",
-            task_id="task-missing-plan",
-            roles=("DEV",),
-        )
-    with pytest.raises(ValueError, match="must not contain duplicates"):
-        store.create_task(
-            "duplicate plan",
-            requested_team="duplicate-plan",
-            task_id="task-duplicate-plan",
-            roles=("PLAN", "PLAN"),
-        )
+    dev_only = store.create_task(
+        "missing plan is valid in Gate A",
+        requested_team="missing-plan",
+        task_id="task-missing-plan",
+        roles=("DEV",),
+    )
+    assert list(dev_only["initial_roles"]) == ["DEV"]
+    assert dev_only["closing_role"] == "DEV"
+
+    duplicate = store.create_task(
+        "duplicate roles collapse",
+        requested_team="duplicate-plan",
+        task_id="task-duplicate-plan",
+        roles=("PLAN", "PLAN"),
+    )
+    assert list(duplicate["initial_roles"]) == ["PLAN"]
 
     legacy = store.create_task(
         "legacy full workflow",
@@ -289,7 +293,7 @@ def test_workflow_role_subset_is_canonical_and_exact_team_reuse_inherits(tmp_pat
     assert set(store.load(legacy["manifest_path"])["roles"]) == set(config.roles)
 
 
-def test_dev_review_team_starts_with_dev_and_review_closes(tmp_path: Path):
+def test_gate_a_preserves_dev_review_order_and_first_role_closes(tmp_path: Path):
     from playwright_auto.cdpa_commands import workflow_control_eligibility
     from playwright_auto.cdpa_prompts import PromptBuilder
     from playwright_auto.cdpa_routes import RouteContractError, parse_route_response
@@ -302,10 +306,12 @@ def test_dev_review_team_starts_with_dev_and_review_closes(tmp_path: Path):
         task_id="task-dev-review",
         roles=("REVIEW", "DEV"),
     )
-    assert list(state["roles"]) == ["DEV", "REVIEW"]
-    assert state["active_role"] == "DEV"
-    assert state["hops"][0]["target_role"] == "DEV"
-    assert state["roles"]["DEV"]["status"] == "pending"
+    assert list(state["roles"]) == ["REVIEW", "DEV"]
+    assert state["active_role"] == "REVIEW"
+    assert state["hops"][0]["target_role"] == "REVIEW"
+    assert state["closing_role"] == "REVIEW"
+    assert state["roles"]["REVIEW"]["status"] == "pending"
+    assert state["roles"]["DEV"]["status"] == "unallocated"
     assert workflow_control_eligibility(state, "route_plan")["eligible"] is False
 
     review_first = store.create_task(
@@ -318,9 +324,10 @@ def test_dev_review_team_starts_with_dev_and_review_closes(tmp_path: Path):
     assert list(review_first["roles"]) == ["DEV", "REVIEW"]
     assert review_first["active_role"] == "REVIEW"
     assert review_first["hops"][0]["target_role"] == "REVIEW"
+    assert review_first["closing_role"] == "DEV"
     assert review_first["roles"]["REVIEW"]["status"] == "pending"
     assert review_first["roles"]["DEV"]["status"] == "unallocated"
-    with pytest.raises(ValueError, match="start_role must be one of the selected"):
+    with pytest.raises(ValueError, match="start_role must belong to normalized initial roles"):
         store.create_task(
             "unselected start",
             requested_team="duo-bad-start",
@@ -329,22 +336,29 @@ def test_dev_review_team_starts_with_dev_and_review_closes(tmp_path: Path):
             start_role="PLAN",
         )
 
-    with pytest.raises(ValueError, match="must include PLAN or REVIEW"):
-        store.create_task(
-            "no closer",
-            requested_team="no-closer",
-            task_id="task-no-closer",
-            roles=("DEV", "TEST"),
-        )
+    no_special = store.create_task(
+        "no special closer role names",
+        requested_team="no-closer",
+        task_id="task-no-closer",
+        roles=("DEV", "TEST"),
+    )
+    assert no_special["closing_role"] == "DEV"
 
     allowed = ("DEV", "REVIEW", "PAUSE", "DONE")
     done = '{"route":"DONE","handoff":"r.md"}'
-    assert parse_route_response(done, source_role="REVIEW", allowed_routes=allowed).route == "DONE"
+    assert parse_route_response(
+        done, source_role="REVIEW", allowed_routes=allowed, closing_role="REVIEW"
+    ).route == "DONE"
     with pytest.raises(RouteContractError, match="only REVIEW may route DONE"):
-        parse_route_response(done, source_role="DEV", allowed_routes=allowed)
+        parse_route_response(
+            done, source_role="DEV", allowed_routes=allowed, closing_role="REVIEW"
+        )
     with pytest.raises(RouteContractError, match="only PLAN may route DONE"):
         parse_route_response(
-            done, source_role="REVIEW", allowed_routes=("PLAN", "DEV", "REVIEW", "PAUSE", "DONE")
+            done,
+            source_role="REVIEW",
+            allowed_routes=("PLAN", "DEV", "REVIEW", "PAUSE", "DONE"),
+            closing_role="PLAN",
         )
 
     common = dict(
@@ -352,18 +366,28 @@ def test_dev_review_team_starts_with_dev_and_review_closes(tmp_path: Path):
         task_id="task-dev-review",
         team="duo",
         turn=1,
-        allowed_routes=allowed,
+        closing_role="REVIEW",
         workspace=str(tmp_path),
         source_physical_role=None,
         handoff="handoff",
         goal="goal",
         expected_report_path=".plan/duo/r.md",
     )
-    review = PromptBuilder(config).build(logical_role="REVIEW", physical_role="duo-review", **common)
-    dev = PromptBuilder(config).build(logical_role="DEV", physical_role="duo-dev", **common)
-    assert '"route":"DEV|REVIEW|DONE"' in review.text
-    assert "Clean work routes DONE when acceptance is satisfied" in review.text
-    assert '"route":"DEV|REVIEW"' in dev.text
+    review = PromptBuilder(config).build(
+        logical_role="REVIEW",
+        physical_role="duo-review",
+        allowed_routes=("DEV", "PAUSE", "DONE"),
+        **common,
+    )
+    dev = PromptBuilder(config).build(
+        logical_role="DEV",
+        physical_role="duo-dev",
+        allowed_routes=("REVIEW", "PAUSE"),
+        **common,
+    )
+    assert '"route":"DEV|PAUSE|DONE"' in review.text
+    assert "This is the closing role; DONE is available only when acceptance is satisfied." in review.text
+    assert '"route":"REVIEW|PAUSE"' in dev.text
 
 
 def test_task_bootstrap_snapshot_is_optional_immutable_and_validated(tmp_path: Path):
@@ -547,7 +571,8 @@ def test_same_role_continuation_prompt_rejects_report_only_turn(tmp_path: Path):
 
     assert "Continue from the handoff; do not restate prior work." in prompt
     assert "Goal:" not in prompt
-    assert prompt.rstrip().endswith("Write the report, then return exactly one valid route JSON object.")
+    assert "Write the report, then return exactly one valid route JSON object." in prompt
+    assert "DONE authority belongs to PLAN" in prompt
 
 
 def test_exact_team_resume_preserves_identity_and_creation_still_allocates(tmp_path: Path):

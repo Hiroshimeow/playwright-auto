@@ -5,7 +5,7 @@ description: Maintain and reconcile a repository's persistent HCUW engineering r
 
 # HCU Rules
 
-Maintain `.hcu/rules.md` as concise repository-owned policy. Do not turn this skill into an implementation workflow.
+Maintain `.agents/rules/project.md` as concise repository-owned policy. Do not turn this skill into an implementation workflow.
 
 ## Scope guard
 
@@ -22,11 +22,11 @@ Read once:
 
 1. repository `AGENTS.md`;
 2. `.hcu/profile.md`;
-3. `.hcu/rules.md` if present;
+3. `.agents/rules/project.md` if present;
 4. `hcuw fingerprint .`;
 5. only repository evidence needed for the requested policy decision.
 
-Explicit current user instructions and more-specific repository instructions outrank HCUW. Project rules outrank the managed generic baseline, but conflicts should be surfaced rather than silently hidden.
+Explicit current user/task instructions outrank repository policy. More-specific repository instructions and active feature specs may strengthen or specialize behavior within their scope, but they must not silently override `.agents/rules/project.md`. Project rules outrank the managed generic baseline, and material conflicts must be surfaced rather than silently hidden.
 
 ## Provenance
 
@@ -68,7 +68,7 @@ A fingerprint mismatch is a staleness signal, not a failure gate. Do not block u
 
 ## Missing rulebook
 
-If `.hcu/rules.md` is missing, follow the first-load bootstrap in `hcu-work`. Prepare a candidate and use `hcuw claim-rules` so concurrent agents cannot overwrite each other.
+If `.agents/rules/project.md` is missing, follow the first-load bootstrap in `hcu-work`. Create one candidate under `.agents/rules/`, then atomically install it only if the canonical file is still absent; if another agent already created the file, discard the candidate and load the existing rulebook.
 
 ## Profile versus rules
 
@@ -76,11 +76,11 @@ Use `.hcu/profile.md` for relatively factual identity and declared intent:
 
 - project purpose;
 - stack/platform;
-- explicit engineering character;
-- spec persistence policy;
+- declared engineering intent only when it is factual context, not a duplicate rule;
+- compatibility/tooling roots;
 - stable environment facts.
 
-Use `.hcu/rules.md` only for repository-specific normative policy that is not already owned by deterministic tooling.
+Use `.agents/rules/project.md` only for repository-specific normative policy that is not already owned by deterministic tooling.
 
 For polyglot or monorepo projects, keep the root rulebook cross-cutting. Language/package-specific conventions belong in local repository instructions or the relevant tool configuration unless the user deliberately promotes them to project-wide policy.
 

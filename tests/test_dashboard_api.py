@@ -715,11 +715,30 @@ def test_mutations_require_idempotency_and_reuse_identical_command(tmp_path: Pat
         assert status == 202
         explicit = json.loads(explicit_data)
         assert db.get_command(explicit["command_id"])["payload"]["roles"] == [
-            "PLAN",
             "REVIEW",
+            "PLAN",
         ]
 
-        for index, roles in enumerate(([], ["DEV"], ["PLAN", "UNKNOWN"], ["PLAN", "PLAN"])):
+        custom_body = {
+            **body,
+            "task": "custom roles",
+            "roles": ["CUSTOM_REVIEW"],
+            "route_targets": ["CUSTOM_DEV"],
+        }
+        status, _headers, custom_data = request(
+            server,
+            "POST",
+            "/api/tasks",
+            body=custom_body,
+            headers={"Idempotency-Key": "custom-role-key"},
+        )
+        assert status == 202
+        custom = json.loads(custom_data)
+        custom_payload = db.get_command(custom["command_id"])["payload"]
+        assert custom_payload["roles"] == ["CUSTOM_REVIEW"]
+        assert custom_payload["route_targets"] == ["CUSTOM_DEV"]
+
+        for index, roles in enumerate(([], ["PLAN", "DONE"])):
             status, _headers, _data = request(
                 server,
                 "POST",
@@ -1046,11 +1065,11 @@ def test_create_team_roles_may_omit_plan_and_select_start_role(tmp_path: Path):
     api = DashboardAPI(load_cdpa_config(None, repository_root=tmp_path))
 
     payload = api.normalize_create({"task": "duo", "roles": ["REVIEW", "DEV"], "start_role": "review"})
-    assert payload["roles"] == ["DEV", "REVIEW"]
+    assert payload["roles"] == ["REVIEW", "DEV"]
     assert payload["start_role"] == "REVIEW"
 
-    with pytest.raises(APIError, match="PLAN or REVIEW"):
-        api.normalize_create({"task": "no closer", "roles": ["DEV", "TEST"]})
+    no_special = api.normalize_create({"task": "no special roles", "roles": ["DEV", "TEST"]})
+    assert no_special["roles"] == ["DEV", "TEST"]
     with pytest.raises(APIError, match="start_role must be one of the selected"):
         api.normalize_create({"task": "bad start", "roles": ["DEV", "REVIEW"], "start_role": "PLAN"})
     with pytest.raises(APIError, match="Team Task fields"):

@@ -7,20 +7,20 @@ description: Use when simplifying, reviewing, or refactoring CDPA implementation
 
 Reduce CDPA complexity only after proving current behavior and safety boundaries.
 
+## Authority
+
+Before reducing orchestration, read the repository `.agents/rules/project.md`. It is the sole repository-specific normative policy source. This skill provides procedure only and must not maintain a second copy of CDPA safety rules.
+
 ## Core workflow
 
 1. **Investigate first.** Use ORIENT / TRACE / IMPACT / VERIFY from [references/investigate.md](references/investigate.md). Build claims from source and runtime evidence; label uncertainty.
 2. **Account for the whole mechanism.** Identify every state owner, recovery path, policy decision, compatibility path, and irreversible boundary involved.
-3. **Define conserved behavior.** Write the behaviors and invariants that must survive before proposing deletion or unification.
-4. **Derive the minimum mechanism.** Prefer deleting obsolete paths, unifying duplicated decisions, reducing representations, state space, and decision space, and removing pass-through layers.
+3. **Define conserved behavior.** Map the change to the applicable `.agents/rules/project.md` IDs and feature-specific contracts before proposing deletion or unification.
+4. **Derive the minimum mechanism.** Prefer deleting obsolete paths, unifying duplicated decisions, reducing representations/state/decision space, and removing pass-through layers.
 5. **Apply separate gates.**
-   - **Behavior gate:** required behavior and safety invariants still hold.
+   - **Behavior gate:** required feature behavior and canonical HCU rules still hold.
    - **Mechanism gate:** the implementation has genuinely less state, branching, duplication, or machinery.
 6. **Record the reduction.** Use [templates/reduction-ledger.md](templates/reduction-ledger.md) for non-trivial changes.
-
-## Required CDPA boundary
-
-Before reducing orchestration, read [references/cdpa-policy.md](references/cdpa-policy.md). Never trade away accepted/ambiguous Send non-replay, durable request identity, exact endpoint/page ownership, atomic persistence/idempotency, restart reconciliation, or browser-capacity/locking correctness.
 
 ## Reduction targets
 
@@ -29,10 +29,10 @@ Prioritize:
 - dead legacy paths and obsolete workflow implementations;
 - redundant durable/in-memory representations;
 - pass-through wrappers without an independent invariant;
-- supervisory heuristics that can safely become agent policy instead of code;
+- supervisory heuristics that can safely become agent procedure instead of code;
 - branches made unnecessary by one authoritative state model.
 
-Do not optimize for line count alone. The target is the smallest mechanism that remains complete, observable, and recoverable.
+Do not optimize for line count alone. The target is the smallest mechanism that remains complete, observable, and recoverable. Follow `HCU-ARCH-*` and `HCU-CODE-*` from `.agents/rules/project.md` for owner and readability constraints.
 
 ## References
 

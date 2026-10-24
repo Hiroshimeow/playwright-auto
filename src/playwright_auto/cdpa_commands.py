@@ -8,6 +8,8 @@ from dataclasses import asdict, dataclass, fields
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 
+from .cdpa_route_contract import route_budget_exhausted, route_repair_budget_exhausted
+
 COMMAND_ORIGINS = frozenset({"operator", "independent_agent", "worker", "repair_task"})
 COMMAND_STATES = frozenset(
     {"PENDING", "RUNNING", "APPLIED", "INEFFECTIVE", "REJECTED", "SUSPENDED"}
@@ -618,6 +620,7 @@ _WORKFLOW_CONTROL_ACTIONS = (
     "stop",
     "clear_team",
     "archive_worktree",
+    "increase_route_limits",
 )
 _WORKFLOW_TERMINAL = frozenset({"DONE", "STOPPED"})
 _WORKFLOW_IN_FLIGHT = frozenset({"sending", "sent", "waiting"})
@@ -678,8 +681,26 @@ def workflow_control_eligibility(
             "dependency_waiting",
         }:
             return no("Resume cannot bypass unfinished dependencies.")
+        if status == "BLOCKED" and block_code == "ROUTE_BUDGET_EXHAUSTED":
+            if route_budget_exhausted(state):
+                return no("Raise max_routes above the consumed route_seq before Resume.")
+        if status == "BLOCKED" and block_code == "ROUTE_VALIDATION_EXHAUSTED":
+            if route_repair_budget_exhausted(state):
+                return no(
+                    "Raise max_route_repairs above the consumed repair count before Resume."
+                )
         if hop is None:
             return no("Resume requires an active durable hop.")
+        return yes()
+
+    if normalized_action == "increase_route_limits":
+        if status != "BLOCKED" or block_code not in {
+            "ROUTE_BUDGET_EXHAUSTED",
+            "ROUTE_VALIDATION_EXHAUSTED",
+        }:
+            return no(
+                "Route limits may be increased only for a route-budget or route-validation exhaustion block."
+            )
         return yes()
 
     if normalized_action == "retry":

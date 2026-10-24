@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
 from .cdpa_dependencies import dependency_readiness
+from .cdpa_role_policy import canonicalize_role_key
 
 TERMINAL_STATUSES = frozenset({"DONE", "STOPPED"})
 ACTIVE_TEAM_OWNER_STATUSES = frozenset({"INBOX", "RUNNING", "PAUSED", "BLOCKED"})
@@ -229,10 +230,7 @@ def queued_team_tasks(
 
 
 def physical_role(logical_role: str, team_base: str, team_suffix: int) -> str:
-    role = str(logical_role).strip().upper()
-    builtins = {"PLAN", "DEV", "REVIEW", "TEST", "AUDIT", "AGENT"}
-    if role not in builtins and re.fullmatch(r"WF_[A-Z0-9]{12}", role) is None:
-        raise ValueError(f"unsupported CDPA role {role!r}")
+    role = canonicalize_role_key(logical_role)
     suffix = int(team_suffix)
     if suffix <= 0:
         raise ValueError("team suffix must be positive")

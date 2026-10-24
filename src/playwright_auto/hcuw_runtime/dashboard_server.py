@@ -251,14 +251,11 @@ def _dashboard_body() -> str:
     <h2>Real CDPA Task via 9227</h2>
     <p>This submits a Team Task through <code>POST /api/tasks</code>. Solo Task and Independent Agent paths are disabled here. It may start legacy CDPA 9225 when needed.</p>
     <textarea id="task-text" rows="5">Review this repository at a high level. Do not modify files. Return a concise risk summary and stop.</textarea>
-    <p><label>Roles
-      <label><input type="checkbox" name="team-role" value="PLAN"> PLAN</label>
-      <label><input type="checkbox" name="team-role" value="DEV" checked> DEV</label>
-      <label><input type="checkbox" name="team-role" value="TEST"> TEST</label>
-      <label><input type="checkbox" name="team-role" value="REVIEW" checked> REVIEW</label>
-      <label><input type="checkbox" name="team-role" value="AUDIT"> AUDIT</label>
-    </label> (must include PLAN or REVIEW)</p>
-    <p><label>Start role <select id="start-role"><option value="">first selected</option><option>PLAN</option><option>DEV</option><option>TEST</option><option>REVIEW</option><option>AUDIT</option></select></label></p><p><button id="submit-task">Submit real CDPA team task</button></p>
+    <p><label>Roles <input id="team-roles" value="DEV,REVIEW" size="42" placeholder="ROLE_A,ROLE_B"></label> (comma-separated role keys; first role is the default start/closer)</p>
+    <p><label>Route targets <input id="route-targets" value="" size="32" placeholder="optional lazy role keys"></label></p>
+    <p><label>Start role <input id="start-role" value="" size="20" placeholder="first normalized role"></label></p>
+    <p><label>Closing role <input id="closing-role" value="" size="20" placeholder="first normalized role"></label></p>
+    <p><button id="submit-task">Submit real CDPA team task</button></p>
     <pre id="task-submit">No task submitted from dashboard yet.</pre>
   </section>
 
@@ -355,15 +352,20 @@ def _dashboard_script(refresh_seconds: int) -> str:
       document.getElementById('last-refresh').textContent = 'Last refresh: ' + new Date().toISOString();
     }}
     async function submitTask() {{
-      const roles = [...document.querySelectorAll('input[name="team-role"]:checked')].map((input) => input.value);
+      const parseRoleList = (value) => value.split(',').map((item) => item.trim()).filter(Boolean);
+      const roles = parseRoleList(document.getElementById('team-roles').value);
+      const routeTargets = parseRoleList(document.getElementById('route-targets').value);
       const payload = {{
         task: document.getElementById('task-text').value,
         team: 'hcuw-v2-dashboard-smoke',
         browser: '9222',
         roles
       }};
-      const startRole = document.getElementById('start-role').value;
+      if (routeTargets.length) payload.route_targets = routeTargets;
+      const startRole = document.getElementById('start-role').value.trim();
+      const closingRole = document.getElementById('closing-role').value.trim();
       if (startRole) payload.start_role = startRole;
+      if (closingRole) payload.closing_role = closingRole;
       try {{
         const response = await fetch('/api/tasks', {{
           method: 'POST',

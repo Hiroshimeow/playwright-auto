@@ -54,6 +54,7 @@ from .cdpa_independent import (
     validate_independent_object,
     validate_trigger_settings,
 )
+from .cdpa_role_policy import RolePolicyError, build_role_policy, normalize_role_list
 from .cdpa_routes import effective_report_mode, normalize_report_mode
 from .cdpa_safety import sanitize_text
 from .cdpa_store_common import TERMINAL, _validate_task_id, slugify, utc_now
@@ -61,9 +62,10 @@ from .cdpa_workflow_agents import (
     WorkflowAgentCatalog,
     normalize_workflow_display_name,
     ordered_system_routes,
-    require_team_closing_role,
+    semantic_routes_from_workflow_definitions,
     task_workflow_definitions,
     validate_workflow_route_key,
+    workflow_closing_role,
 )
 from .cdpa_team import (
     allocate_team,
@@ -114,22 +116,10 @@ def normalize_workflow_roles(
     available = tuple(str(role).strip().upper() for role in configured_roles)
     if value is None:
         return available
-    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
-        raise ValueError("roles must be a list of workflow roles")
-    requested: list[str] = []
-    for item in value:
-        if not isinstance(item, str) or not item.strip():
-            raise ValueError("roles must contain non-empty strings")
-        requested.append(item.strip().upper())
-    if not requested:
-        raise ValueError("roles must not be empty")
-    if len(set(requested)) != len(requested):
-        raise ValueError("roles must not contain duplicates")
-    unknown = set(requested) - set(available)
-    if unknown:
-        raise ValueError(f"unknown workflow roles: {sorted(unknown)!r}")
-    selected = set(requested)
-    return tuple(role for role in available if role in selected)
+    try:
+        return normalize_role_list(value, field="roles")
+    except RolePolicyError as exc:
+        raise ValueError(exc.message) from exc
 
 
 def normalize_dependency_ids(value: Any) -> tuple[str, ...]:
@@ -2634,6 +2624,16 @@ class TaskStore(IndependentAgentStoreMixin):
         target: Path,
         normalized_new: tuple[str, ...],
         workflow_roles: tuple[str, ...],
+        submitted_roles: tuple[str, ...],
+        route_targets: tuple[str, ...],
+        reachable_roles: tuple[str, ...],
+        closing_role: str,
+        route_contract_id: str,
+        semantic_routes: Mapping[str, Mapping[str, str]],
+        provider_id: str,
+        max_routes: int,
+        max_route_repairs: int,
+        self_route_policy: Mapping[str, Any],
         new_all: bool,
         normalized_report_mode: str,
         normalized_dependencies: tuple[str, ...],
@@ -2674,12 +2674,16 @@ class TaskStore(IndependentAgentStoreMixin):
             raise ValueError("temporary workflows do not support bootstrap context")
         initial_role = initial_role or workflow_roles[0]
         roles = {}
-        for logical in workflow_roles:
+        role_slots = {}
+        for logical in reachable_roles:
+            materialized = logical == initial_role
             roles[logical] = {
                 "logical_role": logical,
                 "physical_role": physical_role(logical, base, suffix),
                 "binding_id": str(uuid4()),
-                "status": "pending" if logical == initial_role else "unallocated",
+                "status": "pending" if materialized else "unallocated",
+                "slot_state": "materialized" if materialized else "declared",
+                "materialized_at": now if materialized else None,
                 "turn": 0,
                 "page_id": None,
                 "page_url": None,
@@ -2691,6 +2695,11 @@ class TaskStore(IndependentAgentStoreMixin):
                 "reset_applied_generation": None,
                 "last_activity_at": None,
                 "last_error": None,
+            }
+            role_slots[logical] = {
+                "role_key": logical,
+                "state": "materialized" if materialized else "declared",
+                "materialized_at": now if materialized else None,
             }
         hop = {
             "hop_id": 1,
@@ -2760,6 +2769,22 @@ class TaskStore(IndependentAgentStoreMixin):
             "schema_version": SCHEMA_VERSION,
             "task_mode": TASK_MODE_WORKFLOW,
             "workflow_mode": workflow_mode,
+            "provider_id": provider_id,
+            "submitted_roles": list(submitted_roles),
+            "initial_roles": list(workflow_roles),
+            "route_targets": list(route_targets),
+            "reachable_roles": list(reachable_roles),
+            "start_role": initial_role,
+            "closing_role": closing_role,
+            "route_contract_id": route_contract_id,
+            "semantic_routes": json.loads(json.dumps(dict(semantic_routes), ensure_ascii=False)),
+            "max_routes": max_routes,
+            "max_route_repairs": max_route_repairs,
+            "route_seq": 0,
+            "route_repair_count": 0,
+            "self_route_policy": dict(self_route_policy),
+            "self_route_counts": {role: 0 for role in reachable_roles},
+            "role_slots": role_slots,
             "browser_endpoint_id": endpoint["endpoint_id"],
             **(
                 {"required_browser_endpoint_id": required_endpoint["endpoint_id"]}
@@ -2983,6 +3008,12 @@ class TaskStore(IndependentAgentStoreMixin):
         requested_team: str | None = None,
         reuse_team: str | None = None,
         roles: Sequence[str] | None = None,
+        route_targets: Sequence[str] = (),
+        closing_role: str | None = None,
+        provider_id: str = "chatgpt_web",
+        max_routes: int = 8,
+        max_route_repairs: int | None = None,
+        self_route_policy: Any = "forbidden",
         new_roles: Sequence[str] = (),
         new_all: bool = False,
         repository: str | Path | None = None,
@@ -3028,6 +3059,8 @@ class TaskStore(IndependentAgentStoreMixin):
         catalog_routes = tuple(
             item["route_key"] for item in self.workflow_agents.list_agents()
         )
+        catalog_definitions = self.workflow_agents.resolve(catalog_routes)
+        semantic_routes = semantic_routes_from_workflow_definitions(catalog_definitions)
         if normalized_workflow_mode == "solo" and (
             roles is None
             or isinstance(roles, (str, bytes))
@@ -3040,8 +3073,20 @@ class TaskStore(IndependentAgentStoreMixin):
             if roles is not None
             else None
         )
-        if normalized_workflow_mode == "team" and requested_roles is not None:
-            require_team_closing_role(requested_roles)
+        try:
+            normalized_route_targets = normalize_role_list(
+                route_targets, field="route_targets", allow_empty=True
+            )
+        except RolePolicyError as exc:
+            raise ValueError(exc.message) from exc
+        normalized_provider_id = str(provider_id or "").strip()
+        if not normalized_provider_id:
+            raise ValueError("provider_id must be a non-empty string")
+        normalized_max_route_repairs = (
+            self.config.route_repair_attempts
+            if max_route_repairs is None
+            else max_route_repairs
+        )
         if normalized_workflow_mode == "solo":
             if requested_roles is None or len(requested_roles) != 1:
                 raise ValueError("solo workflow task requires exactly one selected role")
@@ -3184,7 +3229,10 @@ class TaskStore(IndependentAgentStoreMixin):
                     )
                 base, suffix = identities.pop()
                 compositions = {
-                    tuple(task_workflow_definitions(item, self.config))
+                    tuple(
+                        item.get("initial_roles")
+                        or tuple(task_workflow_definitions(item, self.config))
+                    )
                     for item in exact_states
                 }
                 if len(compositions) != 1:
@@ -3283,13 +3331,41 @@ class TaskStore(IndependentAgentStoreMixin):
                 )
             if set(normalized_new) - set(workflow_roles):
                 raise ValueError("new_roles must be selected workflow roles")
-            initial_role = (
-                str(start_role).strip().upper() if start_role is not None else workflow_roles[0]
+            submitted_role_values = (
+                tuple(str(item) for item in roles)
+                if roles is not None and not isinstance(roles, (str, bytes))
+                else tuple(workflow_roles)
             )
-            if initial_role not in workflow_roles:
-                raise ValueError("start_role must be one of the selected workflow roles")
+            try:
+                role_policy = build_role_policy(
+                    workflow_roles,
+                    route_targets=(
+                        () if normalized_workflow_mode == "solo" else normalized_route_targets
+                    ),
+                    semantic_routes=(
+                        {} if normalized_workflow_mode == "solo" else semantic_routes
+                    ),
+                    start_role=start_role,
+                    closing_role=(
+                        workflow_roles[0]
+                        if normalized_workflow_mode == "solo"
+                        else closing_role
+                    ),
+                    max_routes=max_routes,
+                    max_route_repairs=normalized_max_route_repairs,
+                    self_route_policy=(
+                        "forbidden"
+                        if normalized_workflow_mode == "solo"
+                        else self_route_policy
+                    ),
+                )
+            except RolePolicyError as exc:
+                raise ValueError(f"{exc.code}: {exc.message}") from exc
+            initial_role = role_policy.start_role
             selected_mode = conversation_mode or ("temporary" if temporary or endpoint["temporary_default"] else "persistent")
-            workflow_agent_snapshot = self.workflow_agents.resolve(workflow_roles)
+            workflow_agent_snapshot = self.workflow_agents.resolve_for_task(
+                role_policy.reachable_roles
+            )
             title_slug = slugify(text)
             target = (self.root / team / task_id / f"{title_slug}.json").resolve()
             if target.exists():
@@ -3306,7 +3382,17 @@ class TaskStore(IndependentAgentStoreMixin):
                 reusable_teams=reusable_teams,
                 target=target,
                 normalized_new=normalized_new,
-                workflow_roles=workflow_roles,
+                workflow_roles=role_policy.roles,
+                submitted_roles=submitted_role_values,
+                route_targets=role_policy.route_targets,
+                reachable_roles=role_policy.reachable_roles,
+                closing_role=role_policy.closing_role,
+                route_contract_id=role_policy.route_contract_id,
+                semantic_routes=role_policy.semantic_routes,
+                provider_id=normalized_provider_id,
+                max_routes=role_policy.max_routes,
+                max_route_repairs=role_policy.max_route_repairs,
+                self_route_policy=role_policy.self_route_policy,
                 initial_role=initial_role,
                 new_all=new_all,
                 normalized_report_mode=normalized_report_mode,
@@ -4887,6 +4973,16 @@ class TaskStore(IndependentAgentStoreMixin):
                 now = utc_now()
                 repository_path = Path(target_state["repository"]).expanduser().resolve()
                 report_mode = "file"
+                target_definitions = task_workflow_definitions(target_state, self.config)
+                inherited_initial_roles = tuple(
+                    target_state.get("initial_roles") or tuple(target_definitions)
+                )
+                inherited_reachable_roles = tuple(
+                    target_state.get("reachable_roles") or tuple(target_definitions)
+                )
+                inherited_workflow_agents = {
+                    role: target_definitions[role] for role in inherited_reachable_roles
+                }
                 replacement_state = self._initial_task_state(
                     text=task_text,
                     requested_team=target_state.get("requested_team"),
@@ -4898,13 +4994,37 @@ class TaskStore(IndependentAgentStoreMixin):
                     reusable_teams=reusable_teams,
                     target=replacement_path,
                     normalized_new=(),
-                    workflow_roles=tuple(
-                        task_workflow_definitions(target_state, self.config)
+                    workflow_roles=inherited_initial_roles,
+                    submitted_roles=tuple(
+                        target_state.get("submitted_roles") or inherited_initial_roles
+                    ),
+                    route_targets=tuple(target_state.get("route_targets") or ()),
+                    reachable_roles=inherited_reachable_roles,
+                    closing_role=str(
+                        target_state.get("closing_role")
+                        or workflow_closing_role(target_definitions)
+                        or inherited_initial_roles[0]
+                    ),
+                    route_contract_id=str(target_state.get("route_contract_id") or ""),
+                    semantic_routes=(
+                        target_state.get("semantic_routes")
+                        if isinstance(target_state.get("semantic_routes"), Mapping)
+                        else {}
+                    ),
+                    provider_id=str(target_state.get("provider_id") or "chatgpt_web"),
+                    max_routes=int(target_state.get("max_routes") or 8),
+                    max_route_repairs=(
+                        int(target_state["max_route_repairs"])
+                        if "max_route_repairs" in target_state
+                        else self.config.route_repair_attempts
+                    ),
+                    self_route_policy=(
+                        target_state.get("self_route_policy")
+                        if isinstance(target_state.get("self_route_policy"), Mapping)
+                        else {"mode": "forbidden", "max_self_routes": 0}
                     ),
                     new_all=False,
-                    workflow_agents=task_workflow_definitions(
-                        target_state, self.config
-                    ),
+                    workflow_agents=inherited_workflow_agents,
                     normalized_report_mode=report_mode,
                     normalized_dependencies=dependencies,
                     normalized_replaces=target_id,
@@ -5923,6 +6043,84 @@ class TaskStore(IndependentAgentStoreMixin):
 
         return self.update(path, mutate)
 
+    def increase_route_limits(
+        self,
+        path: str | Path,
+        *,
+        max_routes: int | None = None,
+        max_route_repairs: int | None = None,
+        external_command_id: str | None = None,
+    ) -> dict[str, Any]:
+        if max_routes is None and max_route_repairs is None:
+            raise ValueError("increase_route_limits requires max_routes and/or max_route_repairs")
+
+        def mutate(state: dict[str, Any]) -> dict[str, Any]:
+            if external_command_id in state.get("applied_command_ids", []):
+                return state
+            eligibility = workflow_control_eligibility(state, "increase_route_limits")
+            if not eligibility["eligible"]:
+                raise ValueError(str(eligibility["reason"] or "route-limit increase is not eligible"))
+            proposed: dict[str, int] = {}
+            checks = (
+                ("max_routes", max_routes, int(state.get("route_seq") or 0)),
+                (
+                    "max_route_repairs",
+                    max_route_repairs,
+                    int(state.get("route_repair_count") or 0),
+                ),
+            )
+            for field, value, consumed in checks:
+                if value is None:
+                    continue
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError(f"{field} must be an integer")
+                current = int(state.get(field) or 0)
+                if value <= current or value <= consumed:
+                    raise ValueError(
+                        f"{field} must be strictly above current limit {current} and consumed count {consumed}"
+                    )
+                proposed[field] = value
+            if not proposed:
+                raise ValueError("increase_route_limits requires a non-empty valid payload")
+            before = {
+                "max_routes": int(state.get("max_routes") or 0),
+                "max_route_repairs": int(state.get("max_route_repairs") or 0),
+                "route_seq": int(state.get("route_seq") or 0),
+                "route_repair_count": int(state.get("route_repair_count") or 0),
+                "self_route_counts": dict(state.get("self_route_counts") or {}),
+            }
+            state.update(proposed)
+            state.setdefault("controls", []).append(
+                {
+                    "control_id": len(state.get("controls") or []) + 1,
+                    "action": "increase_route_limits",
+                    "role": str(state.get("active_role") or "").upper() or None,
+                    "reason": "route limits increased",
+                    "confirmed": True,
+                    "origin": "operator",
+                    "command": None,
+                    "command_state": "APPLIED",
+                    "status": "applied",
+                    "requested_at": utc_now(),
+                    "applied_at": utc_now(),
+                    "result": {
+                        "before": before,
+                        "after": {
+                            **before,
+                            "max_routes": int(state.get("max_routes") or 0),
+                            "max_route_repairs": int(state.get("max_route_repairs") or 0),
+                        },
+                    },
+                    "external_command_id": str(external_command_id).strip()
+                    if external_command_id
+                    else None,
+                }
+            )
+            self._record_external_command(state, external_command_id)
+            return state
+
+        return self.update(path, mutate)
+
     def request_control(
         self,
         path: str | Path,
@@ -5931,9 +6129,11 @@ class TaskStore(IndependentAgentStoreMixin):
         role: str | None = None,
         reason: str | None = None,
         confirmed: bool = False,
+        max_routes: int | None = None,
+        max_route_repairs: int | None = None,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
-        allowed = {"pause", "resume", "retry", "stop", "reset", "restart_role", "open_tab", "close_tab", "new_chat", "route_plan", "release_required_browser_endpoint", "clear_team", "archive_worktree"}
+        allowed = {"pause", "resume", "retry", "stop", "reset", "restart_role", "open_tab", "close_tab", "new_chat", "route_plan", "release_required_browser_endpoint", "clear_team", "archive_worktree", "increase_route_limits"}
         action = str(action).strip().lower()
         if action not in allowed:
             raise ValueError(f"unsupported control action {action!r}")
@@ -5945,6 +6145,13 @@ class TaskStore(IndependentAgentStoreMixin):
             return self.request_resume(
                 path,
                 reason=reason or "resume requested",
+                external_command_id=external_command_id,
+            )
+        if action == "increase_route_limits":
+            return self.increase_route_limits(
+                path,
+                max_routes=max_routes,
+                max_route_repairs=max_route_repairs,
                 external_command_id=external_command_id,
             )
 

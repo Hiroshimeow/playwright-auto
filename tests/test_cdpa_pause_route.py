@@ -85,7 +85,7 @@ def test_pause_is_lifecycle_route_but_not_workflow_role_definition(tmp_path: Pat
         source_role="WF_CUSTOM",
         allowed_routes=("PLAN", "WF_CUSTOM", "PAUSE", "DONE"),
     ).route == "PAUSE"
-    with pytest.raises(ValueError, match="unknown workflow roles"):
+    with pytest.raises(ValueError, match="reserved by the runtime"):
         setup_task(
             tmp_path,
             task_id="task-pause-is-not-role",
@@ -389,7 +389,7 @@ def test_non_operator_resume_cannot_release_role_pause(tmp_path: Path):
     assert len(queued["hops"]) == 1
 
 
-def test_pause_prompt_contract_is_shared_and_plan_never_self_routes_to_wait():
+def test_pause_prompt_contract_is_shared_and_route_contract_owns_done_authority():
     root = Path(__file__).resolve().parents[1]
     guides = [
         root / "prompts/cdpa/RESPONSE_GUIDE.md",
@@ -397,13 +397,15 @@ def test_pause_prompt_contract_is_shared_and_plan_never_self_routes_to_wait():
     ]
     for path in guides:
         text = path.read_text(encoding="utf-8")
-        assert "PLAN|DEV|TEST|REVIEW|AUDIT|PAUSE|DONE" in text
+        assert "<closed enum from the current RouteContract>" in text
         assert "Return exactly one valid JSON object" in text
+        assert "closing_role" in text
 
     for path in (
         root / "prompts/cdpa/PLAN.md",
         root / "src/playwright_auto/cdpa_defaults/prompts/cdpa/PLAN.md",
     ):
         text = path.read_text(encoding="utf-8")
-        assert "PLAN -> PAUSE" in text
-        assert "PLAN -> PLAN" in text
+        assert "RouteContract" in text
+        assert "closing_role" in text
+        assert "PLAN -> PLAN" not in text
