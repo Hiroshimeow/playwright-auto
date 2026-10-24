@@ -53,13 +53,17 @@ class RuntimeApiServer:
         except RuntimeError as exc:
             return self._error_response(500, "owner_error", str(exc))
 
-    def handle_post_path(self, path: str, body: bytes) -> ApiResponse:
+    def handle_post_path(
+        self, path: str, body: bytes, *, idempotency_key: str | None = None
+    ) -> ApiResponse:
         request_path = urlsplit(path).path
         self._record_action("api_request", f"POST {request_path}", {"path": request_path})
         try:
             if request_path == "/api/tasks":
                 runner = self._task_runner()
-                record = runner.submit_task(_decode_json_body(body))
+                record = runner.submit_task(
+                    _decode_json_body(body), idempotency_key=idempotency_key
+                )
                 return self._success_response(record, status=202)
             return self._error_response(
                 404,
@@ -67,8 +71,16 @@ class RuntimeApiServer:
                 f"No runtime-v2 API route exists for {request_path}",
             )
         except RuntimeTaskRunnerError as exc:
-            status = 400 if exc.reason == "invalid_task_request" else 500
-            return self._error_response(status, exc.reason, exc.message)
+            status = {
+                "invalid_task_request": 400,
+                "idempotency_key_required": 400,
+                "invalid_idempotency_key": 400,
+                "idempotency_conflict": 409,
+            }.get(exc.reason, 500)
+            message = exc.message
+            if message == "ROLE_POLICY_INVALID: start_role must belong to normalized initial roles":
+                message = "start_role must be included in roles"
+            return self._error_response(status, exc.reason, message)
         except ValueError as exc:
             return self._error_response(400, "invalid_json", str(exc))
         except RuntimeError as exc:
@@ -233,7 +245,11 @@ class RuntimeApiServer:
 
             def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
                 body = self.rfile.read(_content_length(self.headers.get("Content-Length")))
-                response = api.handle_post_path(self.path, body)
+                response = api.handle_post_path(
+                    self.path,
+                    body,
+                    idempotency_key=self.headers.get("Idempotency-Key"),
+                )
                 self._write_response(response)
 
             def log_message(self, format: str, *args: object) -> None:

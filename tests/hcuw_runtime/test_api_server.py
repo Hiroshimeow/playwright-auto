@@ -139,13 +139,28 @@ def test_post_tasks_invalid_role_set_is_400_error_envelope(tmp_path: Path) -> No
     server = _server_with_runner(tmp_path)
     body = json.dumps({"task": "x", "roles": ["DEV", "REVIEW"], "start_role": "PLAN"}).encode("utf-8")
 
-    response = server.handle_post_path("/api/tasks", body)
+    response = server.handle_post_path(
+        "/api/tasks", body, idempotency_key="invalid-role-set"
+    )
     payload = response_json(response)
 
     assert response.status == 400
     assert payload["ok"] is False
     assert payload["error"]["code"] == "invalid_task_request"
     assert payload["error"]["message"] == "start_role must be included in roles"
+    assert server.state_store.list_task_records() == []
+
+
+def test_post_tasks_requires_idempotency_key(tmp_path: Path) -> None:
+    server = _server_with_runner(tmp_path)
+    body = json.dumps({"task": "x", "roles": ["REVIEW"]}).encode("utf-8")
+
+    response = server.handle_post_path("/api/tasks", body)
+    payload = response_json(response)
+
+    assert response.status == 400
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "idempotency_key_required"
     assert server.state_store.list_task_records() == []
 
 

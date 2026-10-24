@@ -1338,6 +1338,8 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "database": "ok",
                     "pid": os.getpid(),
+                    "repository_root": str(app.config.repository_root.resolve()),
+                    "independent_activation_enabled": app.config.independent_activation_enabled,
                     **health,
                 },
             )
@@ -1538,6 +1540,15 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
         raw = self._body()
         key = self.headers.get("Idempotency-Key", "")
         task_id: str | None = None
+        if (
+            not app.config.independent_activation_enabled
+            and (path == "/api/independent-agents" or path.startswith("/api/independent-agents/"))
+        ):
+            raise APIError(
+                410,
+                "independent_agent_deprecated",
+                "Independent Agent is migration-only; use TeamTask with CronJob/Heartbeat",
+            )
         if path == "/api/tasks":
             payload = app.normalize_create(raw)
             command = app.enqueue(

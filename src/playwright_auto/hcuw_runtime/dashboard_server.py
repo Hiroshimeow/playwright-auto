@@ -131,7 +131,11 @@ class DashboardServer:
                     )
                     self._write_response(response)
                     return
-                response = dashboard.proxy_post_api_request(self.path, self._read_body())
+                response = dashboard.proxy_post_api_request(
+                    self.path,
+                    self._read_body(),
+                    idempotency_key=self.headers.get("Idempotency-Key"),
+                )
                 self._write_response(response)
 
             def log_message(self, format: str, *args: object) -> None:
@@ -153,9 +157,13 @@ class DashboardServer:
 
         return DashboardRequestHandler
 
-    def proxy_post_api_request(self, path: str, body: bytes) -> DashboardResponse:
+    def proxy_post_api_request(
+        self, path: str, body: bytes, *, idempotency_key: str | None = None
+    ) -> DashboardResponse:
         try:
-            response_body = self._post_api_bytes(path, body)
+            response_body = self._post_api_bytes(
+                path, body, idempotency_key=idempotency_key
+            )
         except urllib.error.HTTPError as exc:
             # API validation errors keep their own status and envelope.
             return DashboardResponse(
@@ -175,12 +183,17 @@ class DashboardServer:
             body=response_body,
         )
 
-    def _post_api_bytes(self, path: str, body: bytes) -> bytes:
+    def _post_api_bytes(
+        self, path: str, body: bytes, *, idempotency_key: str | None = None
+    ) -> bytes:
         url = f"http://{self.config.api_host}:{self.config.api_port}{path}"
+        headers = {"Content-Type": "application/json"}
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
         request = urllib.request.Request(
             url,
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=90) as response:
@@ -275,6 +288,7 @@ def _dashboard_script(refresh_seconds: int) -> str:
     return f"""
   <script>
     const minRefreshSeconds = {refresh_seconds};
+    let pendingTaskSubmitKey = null;
     async function loadJson(path) {{
       const response = await fetch(path, {{ cache: 'no-store' }});
       return await response.json();
@@ -367,12 +381,17 @@ def _dashboard_script(refresh_seconds: int) -> str:
       if (startRole) payload.start_role = startRole;
       if (closingRole) payload.closing_role = closingRole;
       try {{
+        if (!pendingTaskSubmitKey) pendingTaskSubmitKey = crypto.randomUUID();
         const response = await fetch('/api/tasks', {{
           method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
+          headers: {{
+            'Content-Type': 'application/json',
+            'Idempotency-Key': pendingTaskSubmitKey,
+          }},
           body: JSON.stringify(payload)
         }});
         const data = await response.json();
+        if (response.ok) pendingTaskSubmitKey = null;
         showJson('task-submit', data);
         await refreshOnce();
       }} catch (error) {{
