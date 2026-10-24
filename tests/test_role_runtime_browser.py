@@ -1,8 +1,10 @@
 """Browser integration at the actual adapter/controller boundaries, not synthetic counters."""
 import asyncio
+from tempfile import TemporaryDirectory
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+from playwright_auto.cdpa_runtime_db import RuntimeDB
 from playwright_auto.chatgpt import (
     ChatGPTPage,
     MessageBaseline,
@@ -29,9 +31,14 @@ def request():
 
 def environment(client):
     state = {"task_id": "task-1", "team": "team-1", "status": "RUNNING", "active_action": "wait_response"}
-    hop = {"receipt": request().to_dict(), "request_id": "task-hop1", "physical_role": "DEV", "target_role": "DEV", "wait": {}}
+    hop = {"hop_id": 1, "receipt": request().to_dict(), "request_id": "task-hop1", "physical_role": "DEV", "target_role": "DEV", "wait": {}}
+    db_dir = TemporaryDirectory()
+    runtime_db = RuntimeDB(__import__("pathlib").Path(db_dir.name) / "runtime.sqlite")
+    runtime_db.ensure_schema()
     worker = SimpleNamespace(
+        runtime_db=runtime_db, _runtime_db_dir=db_dir,
         _validate_response_candidate=lambda *_: None,
+        _terminal_route_evidence=lambda *_: (_ for _ in ()).throw(ValueError("no exact report evidence")),
         _queue_format_repair=lambda _state, _hop, _response, error: _state.update(repair=str(error)),
         _capture_passive_remote_report_if_available=lambda *_: None,
         _record_response=lambda _state, _hop, response: _hop.update(response=response.text, state="responded"),
@@ -196,7 +203,7 @@ def test_malformed_result_queues_exact_parser_error_with_original_receipt_intact
     assert hop["receipt"] == request().to_dict()
 
 
-def test_no_terminal_result_timeout_queues_route_repair_without_replaying_send():
+def test_missing_terminal_timeout_blocks_without_repair_or_replaying_send():
     class Client:
         async def install_page_observer(self):
             return None
@@ -217,76 +224,92 @@ def test_no_terminal_result_timeout_queues_route_repair_without_replaying_send()
     result = asyncio.run(RoleController().run(
         worker, state, hop, acquired, None, snapshot=snapshot(error_texts=("provider failed",)), wait_ms=0,
     ))
-    assert result.reason == "state_repair"
-    assert len(queued) == 1
-    assert queued[0][2] is None
-    assert "terminal result" in str(queued[0][3]).lower()
-    assert "block_code" not in state
+    assert (result.action, result.reason) == (Action.BLOCK, "response_terminal_missing")
+    assert queued == []
+    assert state["block_code"] == "response_terminal_missing"
     assert hop["receipt"] == request().to_dict()
 
 
-def test_genuine_retry_and_stream_failure_remain_retryable_without_format_repair():
+def test_stable_retry_invokes_provider_retry_once_and_missing_terminal_blocks(tmp_path):
     class Client:
+        retries = []
+
         async def install_page_observer(self):
             return None
 
         def page_observation(self):
             return {}
 
-    for reason, evidence in (
-        ("retry_visible_stable", {"retry_visible": True}),
-        ("stream_failure_recovery", {}),
-    ):
-        state, hop, worker, acquired = environment(Client())
-        queued = []
-        worker._queue_format_repair = lambda *_: queued.append(True)
-        worker._block = lambda _state, message, **kwargs: _state.update(
-            block_reason=message, block_code=kwargs.get("code"), retryable=kwargs.get("retryable")
-        )
-        if reason == "retry_visible_stable":
-            hop["wait"]["retry_seen_at"] = (datetime.now(timezone.utc) - timedelta(seconds=6)).isoformat()
-        else:
-            hop["wait"].update(
-                controller_progress_at=(datetime.now(timezone.utc) - timedelta(seconds=601)).isoformat(),
-                timeout_refreshed=True, timeout_status_checked=True, timeout_status="FAILURE",
-            )
-        result = asyncio.run(RoleController().run(
-            worker, state, hop, acquired, None, snapshot=snapshot(**evidence), wait_ms=0,
-        ))
-        assert result.reason == reason
-        assert state["block_code"] == reason
-        assert state["retryable"] is True
-        assert queued == []
-        assert hop["receipt"] == request().to_dict()
+        async def retry_generation(self, receipt, *, expected_task_id, expected_team):
+            self.retries.append((receipt.user_message_id, expected_task_id, expected_team))
+            return {"progress": True, "transport_active": True}
+
+    state, hop, worker, acquired = environment(Client())
+    worker.runtime_db = RuntimeDB(tmp_path / "runtime.sqlite3")
+    worker.runtime_db.ensure_schema()
+    queued = []
+    worker._queue_format_repair = lambda *_: queued.append(True)
+    worker._block = lambda _state, message, **kwargs: _state.update(block_code=kwargs.get("code"))
+    hop["wait"]["retry_seen_at"] = (datetime.now(timezone.utc) - timedelta(seconds=6)).isoformat()
+    result = asyncio.run(RoleController().run(
+        worker, state, hop, acquired, None, snapshot=snapshot(retry_visible=True), wait_ms=0,
+    ))
+    assert result.reason == "provider_retry_clicked"
+    assert Client.retries == [("user-original", "task-1", "team-1")]
+    assert "block_code" not in state
+    assert queued == []
+    assert hop["receipt"] == request().to_dict()
+
+    state, hop, worker, acquired = environment(Client())
+    worker._queue_format_repair = lambda *_: queued.append(True)
+    worker._block = lambda _state, message, **kwargs: _state.update(
+        block_reason=message, block_code=kwargs.get("code"), retryable=kwargs.get("retryable")
+    )
+    hop["wait"].update(
+        controller_progress_at=(datetime.now(timezone.utc) - timedelta(seconds=601)).isoformat(),
+        timeout_refreshed=True, timeout_status_checked=True, timeout_status="FAILURE",
+    )
+    result = asyncio.run(RoleController().run(
+        worker, state, hop, acquired, None, snapshot=snapshot(), wait_ms=0,
+    ))
+    assert result.reason == "response_terminal_missing"
+    assert state["block_code"] == "response_terminal_missing"
+    assert state["retryable"] is True
+    assert queued == []
+    assert hop["receipt"] == request().to_dict()
 
 
-def test_hidden_allow_real_dom_snapshot_reaches_dispatch_after_five_seconds():
+def test_visible_allow_real_dom_snapshot_uses_one_shot_dom_click_with_intent():
     async def run(page):
         client = ChatGPTPage(page, timeout_ms=5_000)
         client.binding = PageBinding("page-1", "DEV")
         await page.evaluate("""() => {
-            const button = document.querySelector('button[aria-label]');
-            button.__reactProps$test = {
-                onSelectOption: (_event, action) => {window.approved = action;},
+            document.querySelector('button[aria-label]').__reactProps$test = {
+                onSelectOption: (_event, action) => { window.approved = action; },
                 splitActionOptions: [{action:{type:'allow',target_message_id:'hidden',remember_answer:true}}],
             };
         }""")
         state, hop, worker, acquired = environment(client)
-        controller = RoleController()
-        result = await controller.run(worker, state, hop, acquired, None, wait_ms=0)
+        result = await RoleController().run(worker, state, hop, acquired, None, wait_ms=0)
         assert result.action is Action.ALLOW
-        approved = await page.evaluate("window.approved")
-        assert approved["target_message_id"] == "hidden"
-        assert approved["remember_answer"] is True
+        # React data and LISTEN cannot authorize a conversation-wide grant.
+        assert await page.evaluate("window.approved || null") is None
+        assert await page.evaluate("window.__onceClicks || 0") == 1
         assert hop["wait"].get("mcp_allow_clicked_at")
+        with worker.runtime_db.connection() as connection:
+            intents = connection.execute(
+                "SELECT status FROM command_queue WHERE kind='mcp_allow'"
+            ).fetchall()
+        assert [row["status"] for row in intents] == ["applied"]
     asyncio.run(_with_page("""
         <main><div data-message-author-role="user" data-message-id="user-original">original task</div>
-        <div style="display:none"><button>Allow</button><button aria-label="Allow mcp-g8 for this conversation"></button></div>
+        <div><button onclick="window.__onceClicks=(window.__onceClicks||0)+1">Allow</button>
+             <button aria-label="Allow mcp-g8 for this conversation"></button></div>
         <div contenteditable="true" role="textbox"> </div></main>
     """, run))
 
 
-def test_no_result_timeout_queues_route_repair_without_retry_click_or_replay(monkeypatch):
+def test_no_result_timeout_blocks_without_retry_click_or_replay(monkeypatch):
     import playwright_auto.chatgpt as module
     async def no_delay(*args, **kwargs):
         return 0
@@ -306,9 +329,9 @@ def test_no_result_timeout_queues_route_repair_without_retry_click_or_replay(mon
             block_reason=reason, block_code=kwargs.get("code")
         )
         result = await controller.run(worker, state, hop, acquired, None, wait_ms=0)
-        assert result.action is Action.REPAIR
-        assert "block_code" not in state
-        assert "terminal result" in state["repair"].lower()
+        assert result.action is Action.BLOCK
+        assert state["block_code"] == "response_terminal_missing"
+        assert "repair" not in state
         assert hop["receipt"] == request().to_dict()
         assert await page.evaluate("window.retryClicks || 0") == 0
         assert await page.evaluate("window.sentPrompts || []") == []
@@ -378,33 +401,28 @@ def test_temporary_workflow_never_executes_automatic_refresh(monkeypatch):
 
 
 def test_page_observer_only_wakes_on_dom_changes_without_semantic_transcript_logging(monkeypatch):
+    import playwright_auto.role_runtime.page_observer as observer_module
     import playwright_auto.role_runtime.signals as signal_module
 
     events = []
+    monkeypatch.setattr(signal_module, "append_live_event", lambda source, kind, **kwargs: events.append((source, kind, kwargs)))
+    # Synthetic about:blank page: alter only the origin guard in this fixture.
     monkeypatch.setattr(
-        signal_module,
-        "append_live_event",
-        lambda source, kind, **kwargs: events.append((source, kind, kwargs)),
+        observer_module, "DOM_SCRIPT",
+        observer_module.DOM_SCRIPT.replace("!['chatgpt.com','www.chatgpt.com'].includes(location.hostname)", "false"),
     )
 
     async def run(page):
-        async def serve(route):
-            await route.fulfill(status=200, content_type="text/html", body="""
-                <main>
-                  <section data-turn-id="turn-1">
-                    <div data-message-author-role="assistant" data-message-id="msg-1">
-                      <span id="assistant-text">A</span>
-                    </div>
-                  </section>
-                  <div contenteditable="true" role="textbox"></div>
-                </main>
-            """)
-
-        await page.context.route("https://chatgpt.com/**", serve)
-        await page.goto("https://chatgpt.com/c/live-transcript")
+        await page.set_content("""<main>
+            <section data-turn-id="turn-1">
+              <div data-message-author-role="assistant" data-message-id="msg-1">
+                <span id="assistant-text">A</span>
+              </div>
+            </section>
+            <div contenteditable="true" role="textbox"></div>
+        </main>""")
         client = ChatGPTPage(page, timeout_ms=5_000)
         await client.install_page_observer()
-
         await page.evaluate("document.querySelector('#assistant-text').firstChild.data = 'AB'")
         assert await client.wait_for_page_observation(timeout_ms=500) is True
         assert not [event for event in events if event[0] == "TRANSCRIPT"]
@@ -412,25 +430,22 @@ def test_page_observer_only_wakes_on_dom_changes_without_semantic_transcript_log
     asyncio.run(_with_page("<main></main>", run))
 
 
-def test_page_observer_replaces_legacy_dom_observer_on_live_page():
-    async def run(page):
-        async def serve(route):
-            await route.fulfill(status=200, content_type="text/html", body="""
-                <main>
-                  <section data-turn-id="turn-legacy">
-                    <div data-message-author-role="assistant" data-message-id="msg-legacy">ready</div>
-                  </section>
-                  <div contenteditable="true" role="textbox"></div>
-                </main>
-            """)
+def test_page_observer_replaces_legacy_dom_observer_on_live_page(monkeypatch):
+    import playwright_auto.role_runtime.page_observer as observer_module
 
-        await page.context.route("https://chatgpt.com/**", serve)
-        await page.goto("https://chatgpt.com/c/live-legacy")
+    monkeypatch.setattr(
+        observer_module, "DOM_SCRIPT",
+        observer_module.DOM_SCRIPT.replace("!['chatgpt.com','www.chatgpt.com'].includes(location.hostname)", "false"),
+    )
+
+    async def run(page):
+        await page.set_content("""<main>
+            <section data-turn-id="turn-legacy">
+                <div data-message-author-role="assistant" data-message-id="msg-legacy">ready</div>
+            </section>
+            <div contenteditable="true" role="textbox"></div>
+        </main>""")
         await page.evaluate("""() => {
-            sessionStorage.setItem('playwright-auto:role', 'DEV');
-            sessionStorage.setItem('playwright-auto:page-id', 'page-1');
-            sessionStorage.setItem('playwright-auto:task-id', 'task-1');
-            sessionStorage.setItem('playwright-auto:team', 'team-1');
             window.__CDPA_ROLE_DOM_V1__ = {disconnect: () => { window.__legacyDisconnected = true; }};
         }""")
         client = ChatGPTPage(page, timeout_ms=5_000)
