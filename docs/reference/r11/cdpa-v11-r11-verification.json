@@ -1,0 +1,48 @@
+{
+  "product_version": "v11",
+  "checkpoint": "R11",
+  "date": "2026-10-15",
+  "source": "ChatGPT internal Library /cdpa/source",
+  "parent_checkpoint": "R10",
+  "parent_archive": "cdpa-v11-internal-convergence-r10-20261015.zip",
+  "parent_archive_sha256": "ff22ad9228422c86ba69c98f5eefa000f5bde795398c36b5fd5f92163b20fdd6",
+  "archive": "cdpa-v11-internal-convergence-r11-20261015.zip",
+  "archive_sha256": "259bbc3a7aa2e975454806acb8a9ccab10f852c2bb0da8d264a19ecb0fcebd28",
+  "archive_bytes": 5681734,
+  "archive_files": 761,
+  "patch": "cdpa-v11-convergence-r11.patch",
+  "patch_sha256": "efc31607e0755511f4a701bcf3a712f24fde708bac956f2a7e32cfa67df61aa2",
+  "patch_bytes": 30693,
+  "git_head": "0a80878fec4c7c92ed70fdb7e59ff98498be615e",
+  "git_branch": "refactor/hcuw-runtime-v2",
+  "git_history_and_wip_preserved": true,
+  "defects": [
+    "generic runtime-v2 TeamTask could invent a new random Idempotency-Key after lost acknowledgment",
+    "stable idempotency key plus omitted team generated a different implicit team on retry"
+  ],
+  "production_source_changes": [
+    "src/playwright_auto/hcuw_runtime/task_runner.py",
+    "src/playwright_auto/hcuw_runtime/api_server.py",
+    "src/playwright_auto/hcuw_runtime/dashboard_server.py"
+  ],
+  "test_changes": [
+    "tests/hcuw_runtime/test_task_runner.py",
+    "tests/hcuw_runtime/test_api_server.py",
+    "tests/hcuw_runtime/test_dashboard_server.py",
+    "tests/test_v11_runtime_attach_e2e.py"
+  ],
+  "verification": {
+    "runner_api_dashboard_attach": "63 passed",
+    "runtime_v2_gate_b_dependency_lifecycle_attach": "164 passed",
+    "full_suite_prefix": "573 passed, 25 skipped; stopped only because Playwright Chromium headless-shell binary is absent",
+    "compileall": "pass",
+    "git_diff_check": "pass",
+    "patch_apply_check_against_r10": "pass",
+    "archive_git_fsck": "pass",
+    "archive_roundtrip_critical_tests": "6 passed"
+  },
+  "broad_baseline": "R9 1570 passed, 42 skipped non-browser shards; R8 1905 passed, 54 skipped complete browser-capable internal suite",
+  "opus_review": "no new R11 review; latest new M365 Opus review attempt failed before Send",
+  "official_windows_e2e": "NOT EXECUTED in R11",
+  "remote_export": "NOT EXECUTED"
+}
