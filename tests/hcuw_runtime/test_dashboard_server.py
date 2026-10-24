@@ -97,6 +97,11 @@ def test_dashboard_team_task_form_and_task_table_show_roles_and_block_state(tmp_
     assert "payload.start_role = startRole" in text
     assert "payload.closing_role = closingRole" in text
     assert "payload.route_targets = routeTargets" in text
+    assert "let pendingTaskSubmitKey = null" in text
+    assert "crypto.randomUUID()" in text
+    assert "'Idempotency-Key': pendingTaskSubmitKey" in text
+    assert "if (response.ok) pendingTaskSubmitKey = null" in text
+    assert "hcuw-v2-dashboard-smoke" not in text
     for header in ("Roles", "Start role", "Status", "Block code", "Updated"):
         assert f"<th>{header}</th>" in text
     assert "item.latest ? 'current' : 'older'" in text
@@ -108,7 +113,7 @@ def test_dashboard_post_proxy_preserves_api_validation_error(monkeypatch, tmp_pa
     dashboard = DashboardServer(load_runtime_config(repository_root=tmp_path))
     body = json.dumps({"ok": False, "error": {"code": "invalid_task_request"}}).encode("utf-8")
 
-    def reject(path: str, payload: bytes) -> bytes:
+    def reject(path: str, payload: bytes, *, idempotency_key: str | None = None) -> bytes:
         raise urllib.error.HTTPError(path, 400, "Bad Request", {}, io.BytesIO(body))
 
     monkeypatch.setattr(dashboard, "_post_api_bytes", reject)
@@ -116,3 +121,24 @@ def test_dashboard_post_proxy_preserves_api_validation_error(monkeypatch, tmp_pa
 
     assert response.status == 400
     assert json.loads(response.body.decode("utf-8"))["error"]["code"] == "invalid_task_request"
+
+
+def test_dashboard_post_proxy_forwards_idempotency_key(monkeypatch, tmp_path: Path) -> None:
+    dashboard = DashboardServer(load_runtime_config(repository_root=tmp_path))
+    seen: dict[str, object] = {}
+
+    def accept(path: str, payload: bytes, *, idempotency_key: str | None = None) -> bytes:
+        seen.update(path=path, payload=payload, idempotency_key=idempotency_key)
+        return json.dumps({"ok": True, "data": {"status": "queued"}}).encode("utf-8")
+
+    monkeypatch.setattr(dashboard, "_post_api_bytes", accept)
+    response = dashboard.proxy_post_api_request(
+        "/api/tasks", b"{}", idempotency_key="dashboard-submit-1"
+    )
+
+    assert response.status == 202
+    assert seen == {
+        "path": "/api/tasks",
+        "payload": b"{}",
+        "idempotency_key": "dashboard-submit-1",
+    }

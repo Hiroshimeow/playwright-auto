@@ -12,6 +12,11 @@ from playwright_auto.cdpa_config import load_cdpa_config
 from playwright_auto.dashboard import ASSET_ROOT, DASHBOARD_HTML_PATH, create_server
 
 
+def test_dashboard_assets_declare_es_module_boundary():
+    package = json.loads((Path(__file__).resolve().parents[1] / "package.json").read_text())
+    assert package == {"private": True, "type": "module"}
+
+
 class UpstreamHandler(__import__("http.server").server.BaseHTTPRequestHandler):
     def log_message(self, _format, *_args):
         return
@@ -263,7 +268,7 @@ def test_public_login_rejects_wrong_password_and_accepts_opaque_secure_session(t
         assert status == 401
         assert "Set-Cookie" not in headers
         login_html = body.decode()
-        assert "あなたは誰？<br>ここで何をしているの？" in login_html
+        assert "<h1>誰？<br></h1>" in login_html
         assert "https://" not in login_html
         assert "<script" not in login_html
         assert "@media (max-width: 480px)" in login_html
@@ -658,7 +663,10 @@ def test_workflow_report_availability_distinguishes_remote_without_fetchable_url
         "Report stored on remote execution host / not mirrored.",
         "Report is unavailable on this dashboard host.",
     ]
-    assert "if (!report.url || reportBodies.has(report.url)) return;" in app
+    # Materials may now be mirrored without a remotely fetchable report.url.
+    assert "const cacheKey = report.url || report.material_url;" in app
+    assert "const endpoint = report.material_url || report.url;" in app
+    assert "if (!endpoint || !cacheKey || reportBodies.has(cacheKey)) return;" in app
 
 
 def test_workflow_report_polish_uses_coverage_rail_and_responsive_selector():
@@ -684,6 +692,17 @@ def test_workflow_report_polish_uses_coverage_rail_and_responsive_selector():
     mobile = css.split("@media (max-width: 720px)", 1)[1]
     assert ".workflow-detail-tabs.detail-tabs" in mobile
     assert "grid-template-columns: repeat(2, minmax(0, 1fr));" in mobile
+
+
+def test_phase15_browser_control_fields_expose_repair_and_async_wait_evidence():
+    detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
+    assert 'fields.push(["Controller decision"' in detail
+    assert 'control.controller_decision' in detail
+    assert 'control.controller_reason' in detail
+    assert 'fields.push(["Terminal route"' in detail
+    assert 'fields.push(["Async WAIT"' in detail
+    assert 'fields.push(["Callback"' in detail
+    assert 'fields.push(["Wake"' in detail
 
 
 def test_task_goal_blocks_dedupe_and_disclosure_state_contract_is_keyed():
