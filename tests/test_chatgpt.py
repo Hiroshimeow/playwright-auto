@@ -935,14 +935,23 @@ def test_wait_probe_wait_wakes_on_assistant_character_data_change():
     from test_chatgpt_mcp_permission import _with_page
 
     async def run(page):
-        body = await page.locator("main").evaluate("node => node.outerHTML")
-
-        async def serve(route):
-            await route.fulfill(status=200, content_type="text/html", body=body)
-
-        await page.context.route("https://chatgpt.com/**", serve)
-        await page.goto("https://chatgpt.com/c/wait-probe")
+        # The page supplied by _with_page is a disposable local DOM fixture.
+        # Do not navigate to the public ChatGPT origin: sandbox/network policy
+        # may reject navigation even with a mocked route. Mutation semantics
+        # under test are identical on the already-mounted fixture.
         first = await chatgpt_module.inspect_chatgpt_wait_probe(page)
+        from playwright_auto.role_runtime.page_observer import DOM_SCRIPT
+
+        # The production script deliberately restricts observation to
+        # ChatGPT-origin pages. Adapt that hostname guard only inside this
+        # isolated local fixture so the real MutationObserver path is tested
+        # without navigating to blocked external infrastructure.
+        fixture_script = DOM_SCRIPT.replace(
+            "if (window !== window.top || !['chatgpt.com','www.chatgpt.com'].includes(location.hostname)) return;",
+            "if (window !== window.top) return;",
+        )
+        assert fixture_script != DOM_SCRIPT
+        await page.evaluate(fixture_script)
         pending = asyncio.create_task(chatgpt_module.inspect_chatgpt_wait_probe(
             page,
             previous_probe=first,

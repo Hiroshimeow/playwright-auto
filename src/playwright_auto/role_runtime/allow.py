@@ -22,9 +22,19 @@ def handle(ctx: Context) -> Decision | None:
     if not ctx.permission_present:
         wait.pop("mcp_allow_clicked_target", None)
         wait.pop("mcp_allow_clicked_at", None)
+        wait.pop("mcp_allow_pending_target", None)
+        wait.pop("mcp_allow_pending_at", None)
         return None
 
-    target = str((ctx.permission or {}).get("target_message_id") or "__dom__")
+    if (int(getattr(ctx.snapshot, "mcp_permission_allow_count", 0) or 0) > 1
+            and not getattr(ctx.snapshot, "mcp_permission_surface_key", None)):
+        return Decision(Action.BLOCK, "permission_surface_ambiguous")
+    target = str(getattr(ctx.snapshot, "mcp_permission_surface_key", None) or "__dom__")
+    # LISTEN target IDs are never authority for DOM approval identity.
+    if str(wait.get("mcp_allow_pending_target") or "") == target:
+        # The DOM still shows a permission whose previous dispatch produced no
+        # click receipt. Do not repeatedly dispatch a potentially ambiguous action.
+        return None
     clicked_target = str(wait.get("mcp_allow_clicked_target") or "")
     if clicked_target == target:
         # Same permission was already dispatched. Do not click-loop; ordinary

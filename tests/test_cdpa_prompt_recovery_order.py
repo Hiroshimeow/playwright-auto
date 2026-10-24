@@ -30,8 +30,8 @@ def test_recovery_snapshot_precedes_delivery_and_final_directive(tmp_path):
     prompt = str(hop["prompt"])
     assert "RECOVERY_SNAPSHOT" in prompt
     assert prompt.index("RECOVERY_SNAPSHOT") < prompt.index("REPORT")
-    assert prompt.index("Work first.") < prompt.index("If acceptance is satisfied after clean REVIEW")
+    assert prompt.index("RECOVERY_SNAPSHOT") < prompt.index("Complete substantive work before returning a route.")
     assert prompt.endswith(
-        "If acceptance is satisfied after clean REVIEW, route DONE; otherwise route the smallest role with concrete remaining work."
+        "This is the closing role; DONE is available only when acceptance is satisfied."
     )
     assert _active_hop(state)["request_id"] == hop["request_id"]

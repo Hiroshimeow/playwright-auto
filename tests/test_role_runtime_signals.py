@@ -37,7 +37,7 @@ def _snapshot(**overrides):
     return SimpleNamespace(**values)
 
 
-def test_role_signals_normalizes_dom_and_listen_evidence():
+def test_role_signals_keeps_network_diagnostics_without_granting_permission_authority():
     frame = RoleSignals.from_sources(
         _snapshot(stop_visible=True, retry_visible=True),
         {
@@ -58,7 +58,8 @@ def test_role_signals_normalizes_dom_and_listen_evidence():
     )
 
     assert frame.transport_active is True
-    assert frame.permission_present is True
+    # LISTEN may report an old allow target; only current DOM controls Allow.
+    assert frame.permission_present is False
     assert frame.network_status == "IS_STREAMING"
     assert frame.network_response["id"] == "assistant-1"
     assert frame.listen_values() == {
@@ -74,6 +75,13 @@ def test_role_signals_normalizes_dom_and_listen_evidence():
     assert values["listen_status"] == "IS_STREAMING"
     assert values["listener_attached"] is True
     assert values["streaming_supported"] is True
+
+    # A current DOM Allow count is authoritative, independent of passive LISTEN.
+    current_permission = RoleSignals.from_sources(
+        _snapshot(mcp_permission_allow_count=1), {"status": "COMPLETE"}
+    )
+    assert current_permission.permission_present is True
+    assert current_permission.transport_active is False
 
 
 def test_signal_trace_records_network_transcript_and_decision_once(monkeypatch):

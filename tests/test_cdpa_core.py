@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -529,7 +530,7 @@ def test_normal_prompt_is_compact_and_constructor_assets_are_not_injected(tmp_pa
     assert "REPOSITORY_SKILLS" not in later.text
     assert "Establish the root cause before changing or judging code" not in later.text
     assert "Discover, load, and use the relevant skills for this responsibility." in later.text
-    assert "Work first." in later.text
+    assert "Complete substantive work before returning a route." in later.text
     assert "block_code" in later.text
     assert "resume_condition" in later.text
     assert ".plan/alpha/alpha-plan_turn1_task-a.md" not in first.text
@@ -571,7 +572,7 @@ def test_same_role_continuation_prompt_rejects_report_only_turn(tmp_path: Path):
 
     assert "Continue from the handoff; do not restate prior work." in prompt
     assert "Goal:" not in prompt
-    assert "Write the report, then return exactly one valid route JSON object." in prompt
+    assert "write the report and emit route JSON only for a real handoff or closure." in prompt
     assert "DONE authority belongs to PLAN" in prompt
 
 
@@ -694,6 +695,7 @@ def test_task_discovery_reads_manifest_with_replacement_safe_reader(tmp_path: Pa
     assert manifest in observed
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only sharing/replace semantics; verify on FJP")
 def test_resume_manifest_replace_retries_transient_windows_permission_error(tmp_path: Path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
@@ -728,6 +730,7 @@ def test_resume_manifest_replace_retries_transient_windows_permission_error(tmp_
     assert "cmd-resume-replace" in persisted["applied_command_ids"]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only sharing/replace semantics; verify on FJP")
 def test_manifest_replace_contention_exhaustion_preserves_old_target_and_tmp(tmp_path: Path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
@@ -1417,6 +1420,7 @@ def test_noop_manifest_update_performs_no_replace_or_timestamp_write(tmp_path: P
     assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only sharing/replace semantics; verify on FJP")
 def test_manifest_replace_retries_windows_access_denied(tmp_path: Path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)

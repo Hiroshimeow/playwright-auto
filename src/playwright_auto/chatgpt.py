@@ -1257,90 +1257,54 @@ async def click_preferred_mcp_allow(
     page: Any,
     *,
     passive_action: Mapping[str, Any] | None = None,
+    expected_surface_key: str | None = None,
 ) -> dict[str, str] | None:
-    """Dispatch the current MCP Allow with minimal friction."""
-    result = await page.evaluate(
-        r"""async (passiveAction) => {
+    """Click exactly one currently visible MCP approval, never a LISTEN action.
+
+    The passive_action argument is accepted for old callers but is not an
+    authority for selecting or fabricating a browser operation. Never select
+    a conversation-wide grant automatically; use the visible one-shot control.
+    """
+    script = r"""(expectedSurfaceKey) => {
+          __CDPA_MCP_PERMISSION_SURFACE__
+          if (expectedSurfaceKey && cdpaMcpSurfaceKey !== expectedSurfaceKey) return null;
           const visible = (e) => Boolean(e && getComputedStyle(e).visibility !== 'hidden' &&
             (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
           const norm = (v) => String(v || '').replace(/\s+/g, ' ').trim();
-          const target = passiveAction?.type === 'allow' ? String(passiveAction.target_message_id || '') : '';
-          const roots = [...document.querySelectorAll('button[aria-label^="Allow "][aria-label$=" for this conversation"], [data-message-id]')];
-          for (const root of roots) {
-            let node = root, fiber = null, handler = null, handlerKind = null;
-            const containers = [];
-            for (let i = 0; node && i < 10; i += 1, node = node.parentElement) {
-              const pk = Object.keys(node).find(k => k.startsWith('__reactProps'));
-              const fk = Object.keys(node).find(k => k.startsWith('__reactFiber'));
-              if (pk) containers.push(node[pk]);
-              if (!fiber && fk) fiber = node[fk];
-            }
-            for (let i = 0; fiber && i < 40; i += 1, fiber = fiber.return) {
-              containers.push(fiber.memoizedProps, fiber.pendingProps);
-            }
-            for (const props of containers) {
-              if (!props || typeof props !== 'object') continue;
-              if (typeof props.onSelectOption === 'function') {
-                handler = props.onSelectOption; handlerKind = 'select'; break;
-              }
-              if (!handler && typeof props.handleUserAction === 'function') {
-                handler = props.handleUserAction; handlerKind = 'user_action';
-              }
-            }
-            if (!handler) continue;
-            const seen = new Set(), found = [];
-            const walk = (value, depth = 0) => {
-              if (!value || typeof value !== 'object' || seen.has(value) || depth > 6) return;
-              seen.add(value);
-              if (value.type === 'allow' && typeof value.target_message_id === 'string') found.push(value);
-              if (value.action?.type === 'allow' && typeof value.action.target_message_id === 'string') found.push(value.action);
-              for (const child of Object.values(value)) walk(child, depth + 1);
-            };
-            for (const props of containers) walk(props);
-            if (passiveAction?.type === 'allow') found.push(passiveAction);
-            const candidates = found.filter(a => !target || a.target_message_id === target)
-              .sort((a,b) => Number(b.remember_answer === true) - Number(a.remember_answer === true));
-            if (!candidates.length) continue;
-            const chosen = candidates[0];
-            if (handlerKind === 'user_action') {
-              await handler(chosen);
-            } else {
-              await handler({preventDefault(){}, stopPropagation(){}, currentTarget:root, target:root}, chosen);
-            }
-            return {method:'react_handler', target_message_id:chosen.target_message_id,
-              remember_answer:chosen.remember_answer === true ? 'true' : 'false'};
+          const enabled = (b) => visible(b) && !b.disabled &&
+            b.getAttribute('aria-disabled') !== 'true';
+          const grantForConversation = /^Allow\b.*\bconversation\b/i;
+
+          const split = [...document.querySelectorAll('[data-codex-approval-surface="true"]')]
+            .filter(visible);
+          const groups = [...document.querySelectorAll('button')].map((button) => {
+            if (!enabled(button) || norm(button.innerText || button.textContent) !== 'Allow' ||
+                button.closest('[data-codex-approval-surface="true"]') ||
+                !button.closest('main,[role="dialog"],[data-testid^="modal-"]')) return null;
+            const parent = button.parentElement;
+            if (!parent) return null;
+            const permissions = [...parent.querySelectorAll('button[aria-label]')].filter(
+              (peer) => peer !== button && enabled(peer) &&
+                grantForConversation.test(norm(peer.getAttribute('aria-label')))
+            );
+            return permissions.length === 1 ? button : null;
+          }).filter(Boolean);
+
+          // Multiple concurrent offers cannot be matched to one accepted tool
+          // call by element order; require an unambiguous single visible offer.
+          if (split.length + groups.length !== 1) return null;
+          if (split.length === 1) {
+            const buttons = [...split[0].querySelectorAll('button')].filter(enabled);
+            const once = buttons.filter((button) =>
+              /^Allow once\b/i.test(norm(button.innerText || button.textContent)));
+            if (once.length !== 1) return null;
+            once[0].click();
+            return {method:'dom_click_once', target_message_id:'', remember_answer:'false'};
           }
-          const conversationPattern = /^Allow\b.*\bconversation\b/i;
-          const conversationButtons = () => [...document.querySelectorAll('button,[role="menuitem"],[role="option"]')]
-            .filter(e => visible(e) && !e.disabled && e.getAttribute('aria-disabled') !== 'true' &&
-              conversationPattern.test(norm(e.innerText || e.textContent || e.getAttribute('aria-label'))));
-          const direct = conversationButtons();
-          if (direct.length === 1) { direct[0].click(); return {method:'dom_click_conversation', target_message_id:'', remember_answer:'true'}; }
-          const surfaces = [...document.querySelectorAll('[data-codex-approval-surface="true"]')].filter(visible);
-          if (surfaces.length === 1) {
-            const surface = surfaces[0];
-            const options = [...surface.querySelectorAll('button')].find(e => visible(e) && !e.disabled &&
-              e.getAttribute('aria-disabled') !== 'true' && norm(e.getAttribute('aria-label')) === 'Approval options');
-            const once = [...surface.querySelectorAll('button')].find(e => visible(e) && !e.disabled &&
-              e.getAttribute('aria-disabled') !== 'true' && /^Allow once\b/i.test(norm(e.innerText || e.textContent)));
-            if (options && once) {
-              options.click();
-              for (let i = 0; i < 20; i += 1) {
-                await new Promise(resolve => setTimeout(resolve, 50));
-                const candidates = conversationButtons();
-                if (candidates.length === 1) { candidates[0].click(); return {method:'dom_click_conversation_menu', target_message_id:'', remember_answer:'true'}; }
-                if (candidates.length > 1) { once.click(); return {method:'dom_click_once_fallback_ambiguous', target_message_id:'', remember_answer:'false'}; }
-              }
-              once.click(); return {method:'dom_click_once_fallback_missing', target_message_id:'', remember_answer:'false'};
-            }
-          }
-          const plain = [...document.querySelectorAll('button')]
-            .find(e => visible(e) && !e.disabled && e.getAttribute('aria-disabled') !== 'true' && norm(e.innerText || e.textContent) === 'Allow');
-          if (plain) { plain.click(); return {method:'dom_click', target_message_id:'', remember_answer:'false'}; }
-          return null;
-        }""",
-        dict(passive_action) if isinstance(passive_action, Mapping) else None,
-    )
+          groups[0].click();
+          return {method:'dom_click_mcp_group', target_message_id:'', remember_answer:'false'};
+        }""".replace('__CDPA_MCP_PERMISSION_SURFACE__', _MCP_PERMISSION_SURFACE_JS)
+    result = await page.evaluate(script, expected_surface_key)
     if not isinstance(result, Mapping):
         return None
     detail = f"{result.get('method')}:{result.get('target_message_id') or ''}"
@@ -1553,6 +1517,81 @@ async def assign_page_role(
     return assigned
 
 
+_MCP_PERMISSION_SURFACE_JS = r"""
+          // The only normalization of actionable DOM permission identity/count.
+          // Sparse and full probes, and the final click, share this same result.
+          const cdpaMcpSurface = (() => {
+            const shown = (el) => Boolean(el && getComputedStyle(el).visibility !== 'hidden' &&
+              (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+            const normalize = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+            const enabled = (b) => shown(b) && !b.disabled &&
+              b.getAttribute('aria-disabled') !== 'true';
+            const approvalRoots = [...document.querySelectorAll('[data-codex-approval-surface="true"]')]
+              .filter(shown);
+            const actionableSplit = approvalRoots.filter((root) =>
+              [...root.querySelectorAll('button')].filter((button) =>
+                enabled(button) && /^Allow once\b/i.test(normalize(button.innerText || button.textContent))
+              ).length === 1);
+            const conversationLabel = /^Allow\b.*\bconversation\b/i;
+            const conversationControls = [...document.querySelectorAll('button[aria-label]')].filter((button) =>
+              enabled(button) && !button.closest('[data-codex-approval-surface="true"]') &&
+              conversationLabel.test(normalize(button.getAttribute('aria-label'))));
+            const actionableGroups = [...document.querySelectorAll('button')].filter((button) => {
+              if (!enabled(button) || button.closest('[data-codex-approval-surface="true"]') ||
+                  normalize(button.innerText || button.textContent) !== 'Allow' ||
+                  !button.closest('main,[role="dialog"],[data-testid^="modal-"]')) return false;
+              const parent = button.parentElement;
+              if (!parent) return false;
+              return [...parent.querySelectorAll('button[aria-label]')].filter((peer) =>
+                peer !== button && enabled(peer) &&
+                conversationLabel.test(normalize(peer.getAttribute('aria-label')))).length === 1;
+            });
+            const roots = approvalRoots.length ? approvalRoots :
+              [...new Set([...actionableGroups, ...conversationControls])].map((button) =>
+                button.closest('[data-message-id]') || button.parentElement || button);
+            const distinct = [...new Set(roots)];
+            let key = null;
+            if (distinct.length === 1) {
+              const root = distinct[0];
+              const owner = root.closest('[data-message-id],[data-turn-id],[data-turn-key]');
+              const identity = owner?.getAttribute('data-message-id') ||
+                owner?.getAttribute('data-turn-id') || owner?.getAttribute('data-turn-key') || '';
+              const content = normalize(root.innerText || root.textContent).slice(0, 1000);
+              if (identity || content) {
+                let hash = 2166136261;
+                const text = identity + '|' + content;
+                for (let i = 0; i < text.length; i++)
+                  hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
+                key = 'surface:' + (hash >>> 0).toString(16) + ':' + normalize(identity).slice(0, 90);
+              }
+            }
+            return {
+              key,
+              nodeCount: conversationControls.length + approvalRoots.length,
+              allowCount: actionableGroups.length + actionableSplit.length,
+            };
+          })();
+          const cdpaMcpSurfaceKey = cdpaMcpSurface.key;
+          const cdpaMcpNodeCount = cdpaMcpSurface.nodeCount;
+          const cdpaMcpAllowCount = cdpaMcpSurface.allowCount;
+"""
+
+_CONNECTION_INTERRUPTION_JS = r"""
+          // Inspect only visible provider UI; quoted user/assistant/tool content
+          // and the composer must never become a control-plane interruption.
+          const connectionInterruptedVisible = [...document.querySelectorAll(
+            '[role="alert"],[role="status"],p,span'
+          )].some((node) => {
+            if (!visible(node) || node.closest(
+              '[data-message-author-role],[data-turn-key],[data-turn-id],'
+              + '[data-chatgpt-search-unit-key],form,[contenteditable="true"]'
+            )) return false;
+            const label = (node.innerText || node.textContent || '')
+              .replace(/\s+/g, ' ').trim().toLowerCase();
+            return label === 'connection interrupted. waiting for the complete answer';
+          });
+"""
+
 _WAIT_PROBE_READ_SCRIPT = "() => window.__PLAYWRIGHT_AUTO_WAIT_PROBE__?.() || null"
 _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windowNamePrefix]) => {
           window.__PLAYWRIGHT_AUTO_WAIT_PROBE__ = () => {
@@ -1654,6 +1693,7 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             length: activityText.length,
             tail: activityText.slice(-160),
           };
+          __CDPA_CONNECTION_INTERRUPTION__
           const errors = [...document.querySelectorAll('[role="alert"]')]
             .filter(visible).slice(-4).map((element) => boundedText(element, 240)).filter(Boolean);
           const dialogs = [...document.querySelectorAll('[role="dialog"], [data-testid^="modal-"]')]
@@ -1672,18 +1712,20 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
           const normalizeLabel = (value) => String(value || '').replace(/\s+/g, ' ').trim();
           const mcpConversationAllow = /^Allow\b.*\bconversation\b/i;
           const mcpPermissionNodes = [...document.querySelectorAll('button[aria-label]')]
-            .filter((button) => mcpConversationAllow.test(normalizeLabel(button.getAttribute('aria-label'))));
+            .filter((button) => visible(button) &&
+              !button.closest('[data-codex-approval-surface="true"]') &&
+              mcpConversationAllow.test(normalizeLabel(button.getAttribute('aria-label'))));
           const splitApprovalSurfaces = [...document.querySelectorAll('[data-codex-approval-surface="true"]')]
             .filter(visible)
             .filter((surface) => {
               const buttons = [...surface.querySelectorAll('button')].filter((button) =>
                 visible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true');
-              return buttons.some((button) => /^Allow once\b/i.test(normalizeLabel(button.innerText || button.textContent))) &&
-                buttons.some((button) => normalizeLabel(button.getAttribute('aria-label')) === 'Approval options');
+              return buttons.some((button) => /^Allow once\b/i.test(normalizeLabel(button.innerText || button.textContent)));
             });
           const mcpPermissionGroups = [...document.querySelectorAll('button')]
             .map((primary) => {
               if (
+                primary.closest('[data-codex-approval-surface="true"]') ||
                 !visible(primary) || primary.disabled ||
                 primary.getAttribute('aria-disabled') === 'true' ||
                 !primary.closest('main,[role="dialog"],[data-testid^="modal-"]')
@@ -1701,6 +1743,7 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
               return permissionControls.length === 1 ? {primary, permission: permissionControls[0]} : null;
             })
             .filter(Boolean);
+          __CDPA_MCP_PERMISSION_SURFACE__
           const mcpPermissionControls = new Set(
             mcpPermissionGroups.flatMap(({primary, permission}) => [primary, permission])
           );
@@ -1752,12 +1795,17 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             attachment_count: attachmentCount,
             stop_visible: Boolean(stop),
             retry_visible: Boolean(retry),
+            connection_interrupted_visible: connectionInterruptedVisible,
             transport_active: Boolean(activeResponse),
             error_texts: errors,
             blocking_dialogs: dialogs,
             choice_prompt_labels: [...new Set(choices)],
-            mcp_permission_allow_count: mcpPermissionGroups.length + splitApprovalSurfaces.length,
-            mcp_permission_node_count: mcpPermissionNodes.length + splitApprovalSurfaces.length,
+            mcp_permission_allow_count: cdpaMcpAllowCount,
+            mcp_permission_node_count: cdpaMcpNodeCount,
+            mcp_permission_surface_key: cdpaMcpSurfaceKey,
+            // Only explicit provider alert UI can tighten the Allow policy.
+            mcp_provider_risk: errors.some((value) =>
+              /suspicious instruction|unsafe tool|prompt injection/i.test(value)),
             last_user_message_id: userIdentity.messageId,
             last_user_turn_id: userIdentity.turnId,
             last_assistant_message_id: assistantIdentity.messageId,
@@ -1777,7 +1825,9 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
           return true;
         }""".replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS).replace(
             '__CDPA_RESPONSE_PROJECTION__', RESPONSE_PROJECTION_JS
-        ).replace('__CDPA_RETRY_RESOLVER__', RETRY_RESOLVER_JS)
+        ).replace('__CDPA_RETRY_RESOLVER__', RETRY_RESOLVER_JS).replace(
+            '__CDPA_MCP_PERMISSION_SURFACE__', _MCP_PERMISSION_SURFACE_JS
+        ).replace('__CDPA_CONNECTION_INTERRUPTION__', _CONNECTION_INTERRUPTION_JS)
 
 
 async def inspect_chatgpt_wait_probe(
@@ -1850,6 +1900,8 @@ async def inspect_chatgpt_wait_probe(
         choice_prompt_labels=tuple(str(value) for value in raw.get("choice_prompt_labels") or ()),
         mcp_permission_allow_count=max(0, int(raw.get("mcp_permission_allow_count") or 0)),
         mcp_permission_node_count=max(0, int(raw.get("mcp_permission_node_count") or 0)),
+        mcp_permission_surface_key=(str(raw["mcp_permission_surface_key"]) if raw.get("mcp_permission_surface_key") else None),
+        mcp_provider_risk=bool(raw.get("mcp_provider_risk")),
         last_user_message_id=(str(raw["last_user_message_id"]) if raw.get("last_user_message_id") else None),
         last_user_turn_id=(str(raw["last_user_turn_id"]) if raw.get("last_user_turn_id") else None),
         last_assistant_message_id=(str(raw["last_assistant_message_id"]) if raw.get("last_assistant_message_id") else None),
@@ -1860,6 +1912,7 @@ async def inspect_chatgpt_wait_probe(
         response_activity_tail=str(raw.get("response_activity_tail") or ""),
         response_activity_turn_id=(str(raw["response_activity_turn_id"]) if raw.get("response_activity_turn_id") else None),
         retry_visible=bool(raw.get("retry_visible")),
+        connection_interrupted_visible=bool(raw.get("connection_interrupted_visible")),
         last_user_text=str(raw.get("last_user_text") or ""),
         assistant_text=str(raw.get("assistant_text") or ""),
         response_activity_text=str(raw.get("response_activity_text") or ""),
@@ -1914,6 +1967,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
           const stop = firstVisible('button[data-testid="stop-button"], button[aria-label*="Stop"]');
           const login = firstVisible('[data-testid="login-button"]');
           const retry = (__CDPA_RETRY_RESOLVER__);
+          __CDPA_CONNECTION_INTERRUPTION__
           const errorTexts = [...document.querySelectorAll('[role="alert"]')]
             .filter(visible)
             .map(text)
@@ -2177,6 +2231,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             }
           }
 
+          __CDPA_MCP_PERMISSION_SURFACE__
           return {
             url: location.href,
             page_role: pageRole,
@@ -2201,14 +2256,14 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             attachment_markers: attachmentMarkers,
             choice_prompt_labels: [...new Set(choicePromptLabels)],
             error_present: Boolean(authCallbackError || alertError),
-            mcp_permission_node_count: [...document.querySelectorAll('button')]
-              .filter(b => /^Allow\b.*\bconversation\b/i.test(text(b) || (b.getAttribute('aria-label') || '').trim())).length +
-              document.querySelectorAll('[data-codex-approval-surface="true"]').length,
-            mcp_permission_allow_count: [...document.querySelectorAll('button')]
-              .filter(b => visible(b) && !b.disabled && b.getAttribute('aria-disabled') !== 'true' &&
-                (text(b) === 'Allow' || /^Allow\b.*\bconversation\b/i.test(text(b) || (b.getAttribute('aria-label') || '').trim()))).length +
-              [...document.querySelectorAll('[data-codex-approval-surface="true"]')].filter(visible).length,
+            mcp_permission_node_count: cdpaMcpNodeCount,
+            mcp_permission_surface_key: cdpaMcpSurfaceKey,
+            // Explicit provider risk UI can tighten a one-shot grant.
+            mcp_provider_risk: errorTexts.some((value) =>
+              /suspicious instruction|unsafe tool|prompt injection/i.test(value)),
+            mcp_permission_allow_count: cdpaMcpAllowCount,
             retry_visible: Boolean(retry),
+            connection_interrupted_visible: connectionInterruptedVisible,
             error_texts: errorTexts,
             response_activity_text: responseActivityText,
             response_activity_structure: responseActivityStructure,
@@ -2221,7 +2276,9 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
         }
         """.replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS)
           .replace('__CDPA_RESPONSE_PROJECTION__', RESPONSE_PROJECTION_JS)
-          .replace('__CDPA_RETRY_RESOLVER__', RETRY_RESOLVER_JS),
+          .replace('__CDPA_RETRY_RESOLVER__', RETRY_RESOLVER_JS)
+          .replace('__CDPA_MCP_PERMISSION_SURFACE__', _MCP_PERMISSION_SURFACE_JS)
+          .replace('__CDPA_CONNECTION_INTERRUPTION__', _CONNECTION_INTERRUPTION_JS),
         [
             ROLE_STORAGE_KEY,
             PAGE_ID_STORAGE_KEY,
@@ -2296,8 +2353,11 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             str(value) for value in raw.get("choice_prompt_labels") or []
         ),
         retry_visible=bool(raw.get("retry_visible")),
+        connection_interrupted_visible=bool(raw.get("connection_interrupted_visible")),
         mcp_permission_allow_count=max(0, int(raw.get("mcp_permission_allow_count") or 0)),
         mcp_permission_node_count=max(0, int(raw.get("mcp_permission_node_count") or 0)),
+        mcp_permission_surface_key=(str(raw["mcp_permission_surface_key"]) if raw.get("mcp_permission_surface_key") else None),
+        mcp_provider_risk=bool(raw.get("mcp_provider_risk")),
     )
 
 
@@ -2662,7 +2722,8 @@ class ChatGPTPage:
         if previous.stop_visible and not probe.stop_visible:
             return "stop_completed"
         if (
-            probe.error_texts != previous.error_texts
+            probe.connection_interrupted_visible != previous.connection_interrupted_visible
+            or probe.error_texts != previous.error_texts
             or probe.blocking_dialogs != previous.blocking_dialogs
         ):
             return "error_or_dialog"
@@ -2718,8 +2779,11 @@ class ChatGPTPage:
             composer_owner_source=probe.composer_owner_source,
             stop_visible=probe.stop_visible,
             retry_visible=probe.retry_visible,
+            connection_interrupted_visible=probe.connection_interrupted_visible,
             mcp_permission_allow_count=probe.mcp_permission_allow_count,
             mcp_permission_node_count=probe.mcp_permission_node_count,
+            mcp_permission_surface_key=probe.mcp_permission_surface_key,
+            mcp_provider_risk=probe.mcp_provider_risk,
             blocking_dialogs=probe.blocking_dialogs,
             attachment_markers=markers,
             error_texts=probe.error_texts,
@@ -2821,6 +2885,8 @@ class ChatGPTPage:
                     choice_prompt_labels=full.choice_prompt_labels,
                     mcp_permission_allow_count=full.mcp_permission_allow_count,
                     mcp_permission_node_count=full.mcp_permission_node_count,
+                    mcp_permission_surface_key=full.mcp_permission_surface_key,
+                    mcp_provider_risk=full.mcp_provider_risk,
                     retry_visible=full.retry_visible,
                     last_user_message_id=next((item.message_id for item in reversed(full.messages) if item.role == "user"), None),
                     last_user_turn_id=next((item.turn_id for item in reversed(full.messages) if item.role == "user"), None),
@@ -3029,35 +3095,31 @@ class ChatGPTPage:
         observer.info = dict(value)
         return dict(observer.info)
 
-    async def mcp_allow_visible(self) -> bool:
-        return bool(
-            await self.page.evaluate(
-                r"""() => {
-                  const visible = (e) => Boolean(e && getComputedStyle(e).visibility !== 'hidden' &&
-                    (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
-                  const norm = (v) => String(v || '').replace(/\s+/g, ' ').trim();
-                  return [...document.querySelectorAll('button')].some((button) =>
-                    visible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true' &&
-                    (norm(button.innerText || button.textContent) === 'Allow' ||
-                     /^Allow\b.*\bconversation\b/i.test(norm(button.innerText || button.textContent || button.getAttribute('aria-label'))))
-                  ) || [...document.querySelectorAll('[data-codex-approval-surface="true"]')].some((surface) =>
-                    visible(surface) && [...surface.querySelectorAll('button')].some((button) =>
-                      visible(button) && /^Allow once\b/i.test(norm(button.innerText || button.textContent))) &&
-                    [...surface.querySelectorAll('button')].some((button) =>
-                      visible(button) && norm(button.getAttribute('aria-label')) === 'Approval options'));
-                }"""
-            )
-        )
-
     async def auto_allow_mcp_permission(
         self,
         *,
         passive_action: Mapping[str, Any] | None = None,
+        expected_task_id: str | None = None,
+        expected_team: str | None = None,
+        expected_surface_key: str | None = None,
     ) -> dict[str, str] | None:
+        """Click one MCP/tool Allow only on the exact owned page with a clean composer."""
         async with self.mutation_guard():
+            owned = expected_task_id is not None or expected_team is not None
+            before = await self.assert_ownership(require_binding=owned)
+            if owned and (
+                before.page_task_id != str(expected_task_id or "").strip()
+                or before.page_team != str(expected_team or "").strip()
+            ):
+                raise TaskBindingError("exact task/team ownership does not match before Allow")
+            if before.composer_text.strip() or before.attachment_markers:
+                raise ComposerConflictError(
+                    "MCP Allow deferred by manual draft or attachments"
+                )
             result = await click_preferred_mcp_allow(
                 self.page,
                 passive_action=passive_action,
+                expected_surface_key=expected_surface_key,
             )
             if result is not None:
                 self.invalidate_wait_cache()
