@@ -133,6 +133,72 @@ def normalize_root_cause_key(value: str) -> str:
     return "root-" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
 
 
+def teamtask_trigger_idempotency_key(
+    trigger_kind: str,
+    subject_id: str,
+    occurrence_id: str,
+    *,
+    subject_kind: str | None = None,
+) -> str:
+    """Stable command-ledger key for one scheduler/recovery TeamTask occurrence."""
+    kind = str(trigger_kind or "").strip().lower()
+    subject = str(subject_id or "").strip()
+    occurrence = str(occurrence_id or "").strip()
+    owner_kind = str(subject_kind or "").strip().lower()
+    if kind not in {"cron", "heartbeat"} or not subject or not occurrence:
+        raise ValueError("TeamTask trigger identity is incomplete")
+    if kind == "heartbeat" and not owner_kind:
+        raise ValueError("heartbeat trigger requires subject_kind")
+    parts = [kind]
+    if owner_kind:
+        parts.append(owner_kind)
+    parts.extend((subject, occurrence))
+    return ":".join(parts)
+
+
+@dataclass(frozen=True)
+class ProviderRetryIntent:
+    """Deterministic command-ledger identity for one accepted-turn Retry click."""
+
+    command_id: str
+    idempotency_key: str
+    task_id: str
+    payload: dict[str, str]
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        state: Mapping[str, Any],
+        hop: Mapping[str, Any],
+        receipt: Any,
+        accepted_user_turn: str,
+    ) -> "ProviderRetryIntent":
+        task_id = str(state.get("task_id") or "").strip()
+        team = str(state.get("team") or "").strip()
+        request_id = str(hop.get("request_id") or "").strip()
+        accepted_turn = str(accepted_user_turn or "").strip()
+        if not task_id or not team or not request_id or not accepted_turn:
+            raise ValueError("provider Retry intent identity is incomplete")
+        receipt_value = receipt.to_dict() if hasattr(receipt, "to_dict") else receipt
+        if not isinstance(receipt_value, Mapping):
+            raise ValueError("provider Retry intent requires an accepted receipt")
+        payload = {
+            "accepted_user_turn": accepted_turn,
+            "request_id": request_id,
+            "receipt_sha256": _sha_json(receipt_value),
+            "team": team,
+        }
+        identity = {"kind": "provider_retry", "task_id": task_id, "payload": payload}
+        digest = _sha_json(identity)
+        return cls(
+            command_id=f"cmd-provider-retry-{digest[:24]}",
+            idempotency_key=f"provider-retry:{digest}",
+            task_id=task_id,
+            payload=payload,
+        )
+
+
 def command_snapshot(state: Mapping[str, Any], *, role: str | None = None) -> dict[str, Any]:
     logical_role = str(role or state.get("active_role") or "").strip().upper() or None
     hop = _active_hop(state)
@@ -681,6 +747,8 @@ def workflow_control_eligibility(
             "dependency_waiting",
         }:
             return no("Resume cannot bypass unfinished dependencies.")
+        if status == "WAITING" and str(state.get("waiting_code") or "") == "async_callback":
+            return no("Resume cannot bypass a registered async callback; the callback wakes the same role.")
         if status == "BLOCKED" and block_code == "ROUTE_BUDGET_EXHAUSTED":
             if route_budget_exhausted(state):
                 return no("Raise max_routes above the consumed route_seq before Resume.")

@@ -91,12 +91,19 @@ class PromptBuilder:
         physical_role: str,
         source_physical_role: str | None,
         closing_role: str | None = "PLAN",
+        allow_self_route: bool = False,
     ) -> str:
         normalized = validate_workflow_route_key(role)
         continuation = ""
         if source_physical_role and str(source_physical_role).strip() == str(physical_role).strip():
             continuation = " Continue from the handoff; do not restate prior work."
-        directive = "Work first." + continuation + " Write the report, then return exactly one valid route JSON object."
+        directive = (
+            "Complete substantive work before returning a route."
+            + continuation
+            + " If unfinished, stay in this same turn;"
+            + ("" if allow_self_route else " do not route to yourself;")
+            + " write the report and emit route JSON only for a real handoff or closure."
+        )
         if closing_role is not None:
             closer = validate_workflow_route_key(closing_role)
             if normalized == closer:
@@ -207,6 +214,7 @@ class PromptBuilder:
                 physical_role=str(physical_role).strip(),
                 source_physical_role=source_physical_role,
                 closing_role=normalized_closing_role,
+                allow_self_route=role in prompt_routes,
             )
         )
         return BuiltPrompt(
@@ -392,20 +400,14 @@ class PromptBuilder:
         error = self._sanitize_validation_error(validation_error)
         if not locked_route or not locked_handoff or not error:
             raise ValueError("report repair requires locked route, handoff, and validation error")
+        # A report repair fixes the artifact; it cannot revise the accepted route.
         route_context = (
-            "The prior route was PAUSE; report repair may repair the artifact only and must preserve PAUSE.\n"
-            if locked_route == "PAUSE"
-            else f"The prior route was {locked_route}; treat it as historical context, not a lock.\n"
+            f"The prior route was {locked_route}; the route is locked for this report-only repair.\n"
         )
-        route_instruction = (
-            "Preserve route PAUSE after repairing the artifact.\n"
-            if locked_route == "PAUSE"
-            else "Choose the route that is correct now from the completed evidence.\n"
-        )
+        route_instruction = f"Preserve route {locked_route} after repairing the artifact.\n"
         response_instruction = (
-            "After the file exists and is non-empty, respond with exactly one JSON object. Keep the handoff path exact and return route PAUSE.\n"
-            if locked_route == "PAUSE"
-            else "After the file exists and is non-empty, respond with exactly one JSON object. Keep the handoff path exact and set route to the role you actually intend next.\n"
+            "After the file exists and is non-empty, respond with exactly one JSON object. "
+            f"Keep the handoff path exact and return route {locked_route}.\n"
         )
         return (
             "CDPA_REPORT_REPAIR\n"

@@ -228,6 +228,8 @@ class ChatGPTSnapshot:
     retry_visible: bool = False
     mcp_permission_allow_count: int = 0
     mcp_permission_node_count: int = 0
+    mcp_permission_surface_key: str | None = None
+    mcp_provider_risk: bool = False
     page_task_id: str | None = None
     page_team: str | None = None
     response_activity_text: str = ""
@@ -239,6 +241,7 @@ class ChatGPTSnapshot:
     logical_turn_ids: tuple[str, ...] = ()
     response_segments: tuple[ResponseSegment, ...] = ()
     response_projection_active: bool = False
+    connection_interrupted_visible: bool = False
 
     @property
     def conversation_url(self) -> str | None:
@@ -296,8 +299,11 @@ class ChatGPTSnapshot:
             "choice_prompt_pending": self.choice_prompt_pending,
             "choice_prompt_labels": list(self.choice_prompt_labels),
             "retry_visible": self.retry_visible,
+            "connection_interrupted_visible": self.connection_interrupted_visible,
             "mcp_permission_allow_count": self.mcp_permission_allow_count,
             "mcp_permission_node_count": self.mcp_permission_node_count,
+            "mcp_permission_surface_key": self.mcp_permission_surface_key,
+            "mcp_provider_risk": self.mcp_provider_risk,
             "manual_input_pending": self.manual_input_pending,
             "image_count": self.image_count,
             "error_texts": list(self.error_texts),
@@ -341,6 +347,9 @@ class WaitProbe:
     composer_owner_source: str = ""
     response_segments: tuple[ResponseSegment, ...] = ()
     response_projection_active: bool = False
+    mcp_permission_surface_key: str | None = None
+    mcp_provider_risk: bool = False
+    connection_interrupted_visible: bool = False
 
     @property
     def composer_empty(self) -> bool:

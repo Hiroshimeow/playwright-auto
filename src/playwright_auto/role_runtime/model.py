@@ -14,6 +14,7 @@ class Action(str, Enum):
     ALLOW = "allow"
     REFRESH = "refresh"
     REPAIR = "repair"
+    RETRY = "retry"
     ACCEPT = "accept"
     BLOCK = "block"
     STATUS = "status"
@@ -36,6 +37,8 @@ class Policy:
     minimum_samples: int = 2
     timeout_seconds: float = 600.0
     reload_settle_seconds: float = 20.0
+    stuck_stop_grace_seconds: float = 60.0
+    connection_interruption_window_seconds: float = 600.0
 
 
 @dataclass

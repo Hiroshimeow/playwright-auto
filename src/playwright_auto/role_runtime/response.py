@@ -40,8 +40,8 @@ def current_assistant(messages: Sequence[Any], baseline: Any = None) -> Any | No
 
 
 def fingerprint(message: Any) -> str:
-    if message is None:
-        return ""
+    if message is None or not (str(message.text or "").strip() or getattr(message, "image_count", 0)):
+        return ""  # Empty assistant DOM shell is not a terminal candidate.
     return hashlib.sha256(str(message.text or "").encode("utf-8")).hexdigest()
 
 
@@ -172,7 +172,7 @@ def observe(
 
 def handle(ctx: Context) -> Decision | None:
     candidate = ctx.candidate
-    if candidate is None or not ctx.candidate_stable or ctx.validation_error is not None:
+    if candidate is None or not ctx.candidate_stable or ctx.validation_error is not None or ctx.transport_active:
         return None
     if not str(getattr(candidate, "text", "") or "").strip() and not getattr(candidate, "image_count", 0):
         return None
@@ -202,3 +202,85 @@ def handle(ctx: Context) -> Decision | None:
     ):
         return None
     return Decision(Action.ACCEPT, "valid_bound_result", candidate)
+
+
+def accepted_turn_key(receipt: Any) -> str:
+    """Exact accepted user-turn identity; empty when the receipt cannot prove it."""
+    if receipt is None:
+        return ""
+    return str(
+        getattr(receipt, "user_message_id", None)
+        or getattr(receipt, "user_turn_id", None)
+        or ""
+    ).strip()
+
+
+def _terminal_activity_settled(ctx: Context) -> bool:
+    """Accept a stuck Stop only with positive completion evidence, never from Stop absence."""
+    if not ctx.transport_active:
+        return True
+    if not bool(getattr(ctx.snapshot, "stop_visible", False)):
+        return False
+    if bool(getattr(ctx.snapshot, "response_projection_active", False)):
+        return False
+    turn = str(ctx.wait.get("bound_assistant_turn_id") or "")
+    if turn and str(getattr(ctx.snapshot, "response_activity_turn_id", "") or "") == turn:
+        return False
+    actions = tuple(getattr(ctx.candidate, "actions", ()) or ())
+    if not any(any(tag in str(action).lower() for tag in ("copy", "feedback", "regenerate")) for action in actions):
+        return False
+    first_seen = parse_time(ctx.wait.get("result_seen_at"))
+    return bool(first_seen and (ctx.now - first_seen).total_seconds() >= ctx.policy.stuck_stop_grace_seconds)
+
+
+def reconcile_terminal(
+    ctx: Context,
+    receipt: Any,
+    reconcile: Callable[[Any], dict[str, Any]] | None,
+) -> Decision | None:
+    """Accept a stable, contract-valid terminal route already bound to the accepted turn.
+
+    Runs before Retry/repair so a turn whose route JSON and exact report already
+    exist is committed instead of regenerated. Any missing provenance fails closed.
+    """
+    candidate = ctx.candidate
+    if (
+        reconcile is None
+        or candidate is None
+        or ctx.validation_error is not None
+        or not ctx.candidate_stable
+        or not _terminal_activity_settled(ctx)
+    ):
+        return None
+    turn_key = accepted_turn_key(receipt)
+    bound = {
+        str(ctx.wait.get("bound_assistant_message_id") or "").strip(),
+        str(ctx.wait.get("bound_assistant_turn_id") or "").strip(),
+    } - {""}
+    candidate_ids = {
+        str(getattr(candidate, "message_id", None) or "").strip(),
+        str(getattr(candidate, "turn_id", None) or "").strip(),
+    } - {""}
+    if not turn_key or not bound or not (bound & candidate_ids):
+        return None
+    record = {
+        "source": "dom_assistant_text",
+        "accepted_user_turn": turn_key,
+        "assistant_message_id": getattr(candidate, "message_id", None),
+        "assistant_turn_id": getattr(candidate, "turn_id", None),
+        "candidate_sha256": ctx.candidate_key,
+    }
+    try:
+        evidence = reconcile(candidate)
+    except (ValueError, OSError) as exc:
+        rejected = {**record, "result": "rejected", "error": str(exc)[:500]}
+        previous = dict(ctx.wait.get("terminal_reconciliation") or {})
+        previous.pop("checked_at", None)
+        if previous != rejected:
+            # Unchanged rejections are not rewritten every observation tick.
+            ctx.wait["terminal_reconciliation"] = {**rejected, "checked_at": ctx.now.isoformat()}
+        return None
+    ctx.wait["terminal_reconciliation"] = {
+        **record, **evidence, "result": "reconciled", "checked_at": ctx.now.isoformat(),
+    }
+    return Decision(Action.ACCEPT, "terminal_route_reconciled", candidate)

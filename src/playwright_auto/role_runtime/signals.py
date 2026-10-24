@@ -86,16 +86,14 @@ class RoleSignals:
         state_value = str(getattr(state, "value", state) or "").lower()
         return bool(
             getattr(self.snapshot, "stop_visible", False)
+            or getattr(self.snapshot, "response_projection_active", False)
             or state_value == "responding"
-            or str(self.network_status or "").upper()
-            in {"IS_STREAMING", "IS_STOP_REQUESTED"}
         )
 
     @property
     def permission_present(self) -> bool:
         return bool(
-            self.permission
-            or int(getattr(self.snapshot, "mcp_permission_node_count", 0) or 0)
+            int(getattr(self.snapshot, "mcp_permission_node_count", 0) or 0)
             or int(getattr(self.snapshot, "mcp_permission_allow_count", 0) or 0)
         )
 
@@ -164,6 +162,7 @@ class RoleSignals:
             ),
             "dom_stop_visible": bool(getattr(snapshot, "stop_visible", False)),
             "dom_retry_visible": bool(getattr(snapshot, "retry_visible", False)),
+            "dom_connection_interrupted_visible": bool(getattr(snapshot, "connection_interrupted_visible", False)),
             "dom_errors": list(errors),
             "dom_dialogs": list(dialogs),
             "dom_choices": list(choices),
@@ -218,6 +217,7 @@ def probe_values(probe: Any) -> dict[str, Any]:
         "attachment_count": int(getattr(probe, "attachment_count", 0) or 0),
         "stop_visible": bool(getattr(probe, "stop_visible", False)),
         "retry_visible": bool(getattr(probe, "retry_visible", False)),
+        "connection_interrupted_visible": bool(getattr(probe, "connection_interrupted_visible", False)),
         "transport_active": bool(getattr(probe, "transport_active", False)),
         "requires_login": bool(getattr(probe, "requires_login", False)),
         "error_count": len(tuple(getattr(probe, "error_texts", ()) or ())),

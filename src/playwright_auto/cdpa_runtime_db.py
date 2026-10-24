@@ -34,6 +34,9 @@ COMMAND_KINDS = frozenset(
         "independent_task_control",
         "resume_team",
         "task_control",
+        "provider_dispatch",
+        "async_continuation_register",
+        "async_continuation_complete",
         "browser_endpoint_add",
         "browser_endpoint_update",
         "browser_endpoint_remove",
@@ -43,6 +46,7 @@ COMMAND_KINDS = frozenset(
     }
 )
 COMMAND_STATUSES = frozenset({"queued", "running", "applied", "failed", "recovery_required"})
+_IRREVERSIBLE_ACTION_KINDS = frozenset({"provider_retry", "mcp_allow"})
 SCHEMA_VERSION = 1
 
 
@@ -513,6 +517,83 @@ class RuntimeDB:
                 "errors": public_errors,
             },
         }
+
+    def reserve_action_intent(
+        self,
+        *,
+        command_id: str,
+        idempotency_key: str,
+        kind: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically consume one irreversible browser action before mutation.
+
+        Action intents use the existing command ledger but are never queued for the
+        generic command loop. ``recovery_required`` is deliberate: a crash after
+        this durable boundary is ambiguous and must reconcile rather than replay.
+        """
+        self.ensure_schema()
+        if kind not in _IRREVERSIBLE_ACTION_KINDS:
+            raise ValueError(f"unsupported irreversible action kind {kind!r}")
+        if not idempotency_key.strip() or not task_id.strip():
+            raise ValueError("irreversible action identity is incomplete")
+        encoded = _json(payload)
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM command_queue WHERE idempotency_key=?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                same = (
+                    existing["kind"] == kind
+                    and existing["task_id"] == task_id
+                    and existing["expected_task_version"] is None
+                    and existing["payload_json"] == encoded
+                )
+                connection.commit()
+                if not same:
+                    raise IdempotencyConflict(
+                        "idempotency key was already used for a different action intent"
+                    )
+                return self._command_row(existing), False
+            connection.execute(
+                """
+                INSERT INTO command_queue(
+                    command_id, idempotency_key, kind, task_id, status,
+                    expected_task_version, created_at, payload_json
+                ) VALUES(?, ?, ?, ?, 'recovery_required', NULL, ?, ?)
+                """,
+                (command_id, idempotency_key, kind, task_id, _now(), encoded),
+            )
+            row = connection.execute(
+                "SELECT * FROM command_queue WHERE command_id=?", (command_id,)
+            ).fetchone()
+            connection.commit()
+        assert row is not None
+        return self._command_row(row), True
+
+    def finish_action_intent(
+        self,
+        command_id: str,
+        *,
+        result: Mapping[str, Any] | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        current = self.get_command(command_id)
+        if current is None:
+            raise KeyError(command_id)
+        if current["kind"] not in _IRREVERSIBLE_ACTION_KINDS:
+            raise ValueError("command is not an irreversible action intent")
+        if current["status"] in {"applied", "failed"}:
+            return current
+        if current["status"] != "recovery_required":
+            raise RuntimeDBError("irreversible action intent is not awaiting reconciliation")
+        self.finish_command(command_id, result=result, error=error)
+        completed = self.get_command(command_id)
+        assert completed is not None
+        return completed
 
     def enqueue_command(
         self,
