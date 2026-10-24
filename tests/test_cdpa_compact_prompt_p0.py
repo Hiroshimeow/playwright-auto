@@ -10,12 +10,12 @@ from test_cdpa_core import write_config
 from test_cdpa_worker import FakeActions, setup_task
 
 
-FINAL_DIRECTIVE = "Work first. Write the report, then return exactly one valid route JSON object."
+FINAL_DIRECTIVE = "DONE authority belongs to PLAN; semantic completion returns control to that closing role."
 ROOT = Path(__file__).resolve().parents[1]
 
 
 PLAN_CLOSURE_CUE = (
-    "If acceptance is satisfied after clean REVIEW, route DONE; otherwise route the smallest role with concrete remaining work."
+    "This is the closing role; DONE is available only when acceptance is satisfied."
 )
 
 
@@ -165,7 +165,7 @@ def test_later_normal_prompt_is_human_first_and_compact(tmp_path: Path):
         logical_role="DEV",
         physical_role="alpha-dev",
         turn=2,
-        allowed_routes=("PLAN", "DEV", "REVIEW", "DONE"),
+        allowed_routes=("PLAN", "REVIEW", "PAUSE"),
         workspace=str(tmp_path),
         source_physical_role="alpha-review",
         handoff=".plan/alpha/alpha-review_turn1_task-compact.md",
@@ -189,7 +189,8 @@ def test_later_normal_prompt_is_human_first_and_compact(tmp_path: Path):
     assert "Establish the root cause before changing or judging code" not in prompt
     assert "TURN_CONTEXT" not in prompt
     assert "allowed-routes" not in prompt
-    assert '"route":"PLAN|DEV|REVIEW"' in prompt
+    assert '"route":"PLAN|REVIEW|PAUSE"' in prompt
+    assert '"route":"PLAN|DEV"' not in prompt
     assert "Follow repository AGENTS/HCUW" not in prompt
     assert "PAUSE is exceptional:" not in prompt
     assert "use only tools authorized" not in prompt

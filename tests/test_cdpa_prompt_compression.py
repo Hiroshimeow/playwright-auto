@@ -77,7 +77,10 @@ def _setup(tmp_path: Path, *, bootstrap=None, roles=None):
         roles=roles,
         bootstrap=bootstrap,
     )
-    return store, state, CDPAWorker(config, store=store)
+    worker = CDPAWorker(config, store=store)
+    # Direct _pre_send tests must include scheduler endpoint admission.
+    assert worker._prepare_execution_endpoint(state, str(state["browser_endpoint_id"]))
+    return store, state, worker
 
 
 def test_fresh_builtin_first_turn_uses_compact_goal_route_report_contract(tmp_path: Path):
@@ -230,5 +233,8 @@ def test_production_prompt_split_keeps_common_context_out_of_role_files():
         assert "bounded backoff" not in text
         assert "LEARNING.md" not in text
 
-    assert '"route":"PLAN|DEV|TEST|REVIEW|AUDIT|PAUSE|DONE"' in guide
-    assert "Only PLAN may use `DONE`" in guide
+    # Shared response guide must not publish a competing, fixed route enum.
+    # Each turn's RouteContract supplies its own closed set and closing role.
+    assert '<closed enum from the current RouteContract>' in guide
+    assert "closing_role" in guide
+    assert '"route":"PLAN|DEV|TEST|REVIEW|AUDIT|PAUSE|DONE"' not in guide

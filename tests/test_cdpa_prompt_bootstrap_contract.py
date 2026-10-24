@@ -14,7 +14,11 @@ PACKAGED_PROMPTS = DEFAULT_CONFIG_PATH.parent / "prompts" / "cdpa"
 
 
 def _generation_zero_prompt(config, *, workspace: Path, role: str) -> str:
-    allowed_routes = tuple(dict.fromkeys(("PLAN", role, "PAUSE", "DONE")))
+    # This is an already-filtered RouteContract; an ordinary role cannot
+    # self-route, and only the configured closing role can use DONE.
+    allowed_routes = (
+        ("DEV", "PAUSE", "DONE") if role == "PLAN" else ("PLAN", "PAUSE")
+    )
     expected_report_path = (
         f".plan/prompt-contract/prompt-contract-{role.lower()}_turn1_task-prompt-contract.md"
     )
@@ -26,6 +30,7 @@ def _generation_zero_prompt(config, *, workspace: Path, role: str) -> str:
         physical_role=f"prompt-contract-{role.lower()}",
         turn=1,
         allowed_routes=allowed_routes,
+        closing_role="PLAN",
         workspace=str(workspace),
         source_physical_role=None,
         handoff="prompt contract handoff",
@@ -35,10 +40,7 @@ def _generation_zero_prompt(config, *, workspace: Path, role: str) -> str:
         conversation_generation=0,
     )
     assert built.constructor_included is False
-    prompt_routes = tuple(
-        item for item in allowed_routes if item != "PAUSE" and (item != "DONE" or role == "PLAN")
-    )
-    route_contract = "|".join(prompt_routes)
+    route_contract = "|".join(allowed_routes)
     assert f'"route":"{route_contract}"' in built.text
     assert f'"handoff":"{expected_report_path}"' in built.text
     assert f"Before replying, write a non-empty report to exactly: {expected_report_path}" in built.text
@@ -106,8 +108,10 @@ def test_runtime_prompt_assets_use_concise_role_specific_contracts(prompt_root: 
     assert "historical tool" in base.lower()
     assert "exact target" in base
     for text in prompts.values():
-        assert "relevant skills" in text
-    assert max(len(text.splitlines()) for text in prompts.values()) <= 7
+        assert "skills" in text.lower()
+        assert "RouteContract" in text
+    # Role-specific instructions are allowed to be descriptive, not truncated.
+    assert max(len(text.splitlines()) for text in prompts.values()) <= 14
     assert len(base.splitlines()) <= 14
 
 
@@ -123,11 +127,11 @@ def test_runtime_role_prompts_keep_only_identity_skill_and_route_contract(prompt
         for role in CDPA_ROLES
     }
 
-    assert "only PLAN may route `DONE`" in prompts["PLAN"]
-    assert "Route complete work to REVIEW" in prompts["DEV"]
-    assert "Route actionable defects to DEV" in prompts["REVIEW"]
-    assert "Route fixable failures to DEV" in prompts["TEST"]
-    assert "Route confirmed source defects to DEV" in prompts["AUDIT"]
-    assert all("relevant skills" in text for text in prompts.values())
+    assert "RouteContract declares this role as `closing_role`" in prompts["PLAN"]
+    assert "requiring independent correctness review to REVIEW" in prompts["DEV"]
+    assert "implementation defects to DEV" in prompts["REVIEW"]
+    assert "implementation failures to DEV" in prompts["TEST"]
+    assert "implementation defects to DEV" in prompts["AUDIT"]
+    assert all("skills" in text.lower() for text in prompts.values())
     assert all("LEARNING.md" not in text for text in prompts.values())
-    assert all(len(text.split()) <= 65 for text in prompts.values())
+    assert all(len(text.split()) <= 260 for text in prompts.values())
