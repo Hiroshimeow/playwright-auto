@@ -40,7 +40,7 @@ async def _with_page(body: str, callback):
             await browser.close()
 
 
-def test_auto_allow_uses_listen_action_without_dom_permission_button():
+def test_auto_allow_never_executes_network_react_action_without_visible_dom_permission():
     async def run(page):
         client = ChatGPTPage(page, timeout_ms=5_000)
         await page.evaluate(
@@ -80,17 +80,11 @@ def test_auto_allow_uses_listen_action_without_dom_permission_button():
         )
     )
 
-    assert result["method"] == "react_handler"
-    assert result["target_message_id"] == "call-1"
-    assert result["remember_answer"] == "true"
-    assert action == {
-        "type": "allow",
-        "target_message_id": "call-1",
-        "remember_answer": True,
-    }
+    assert result is None
+    assert action is None
 
 
-def test_auto_allow_opens_split_options_and_selects_conversation_scope():
+def test_auto_allow_prefers_one_shot_over_conversation_scope():
     async def run(page):
         client = ChatGPTPage(page, timeout_ms=5_000)
         result = await client.auto_allow_mcp_permission()
@@ -115,8 +109,9 @@ def test_auto_allow_opens_split_options_and_selects_conversation_scope():
         )
     )
 
-    assert result["method"] == "dom_click_conversation_menu"
-    assert clicks == {"once": 0, "conversation": 1}
+    assert result["method"] == "dom_click_once"
+    assert result["remember_answer"] == "false"
+    assert clicks == {"once": 1, "conversation": 0}
 
 
 def test_auto_allow_split_options_falls_back_to_allow_once_with_reason():
@@ -139,11 +134,52 @@ def test_auto_allow_split_options_falls_back_to_allow_once_with_reason():
         )
     )
 
-    assert result["method"] == "dom_click_once_fallback_missing"
+    assert result["method"] == "dom_click_once"
     assert clicks == 1
 
 
-def test_auto_allow_falls_back_to_plain_visible_allow_button():
+def test_auto_allow_once_without_approval_options_clicks_exact_once():
+    async def run(page):
+        client = ChatGPTPage(page, timeout_ms=5_000)
+        result = await client.auto_allow_mcp_permission()
+        return result, await page.evaluate("window.__once || 0")
+
+    result, clicks = asyncio.run(_with_page(
+        """
+        <main>
+          <div data-codex-approval-surface="true">
+            <button onclick="window.__once=(window.__once||0)+1">Allow once</button>
+          </div>
+          <div contenteditable="true" role="textbox"></div>
+        </main>
+        """,
+        run,
+    ))
+    assert result["method"] == "dom_click_once"
+    assert result["remember_answer"] == "false"
+    assert clicks == 1
+
+
+def test_ambiguous_allow_once_surface_never_clicks_any_button():
+    async def run(page):
+        client = ChatGPTPage(page, timeout_ms=5_000)
+        result = await client.auto_allow_mcp_permission()
+        return result, await page.evaluate("window.__once || 0")
+
+    result, clicks = asyncio.run(_with_page(
+        """
+        <main><div data-codex-approval-surface="true">
+          <button onclick="window.__once=(window.__once||0)+1">Allow once</button>
+          <button onclick="window.__once=(window.__once||0)+1">Allow once</button>
+        </div></main>
+        """,
+        run,
+    ))
+    assert result is None
+    assert clicks == 0
+
+
+def test_auto_allow_rejects_plain_unscoped_allow_button():
     async def run(page):
         client = ChatGPTPage(page, timeout_ms=5_000)
         result = await client.auto_allow_mcp_permission()
@@ -161,8 +197,8 @@ def test_auto_allow_falls_back_to_plain_visible_allow_button():
         )
     )
 
-    assert result["method"] == "dom_click"
-    assert clicks == 1
+    assert result is None
+    assert clicks == 0
 
 
 def test_sparse_probe_detects_valid_mcp_allow_group_even_with_composer_present():
@@ -315,7 +351,8 @@ def test_sparse_probe_distinguishes_hidden_permission_node_from_visible_offer():
     )
 
     assert probe.mcp_permission_allow_count == 0
-    assert probe.mcp_permission_node_count == 1
+    # A hidden node is diagnostic HTML, not an actionable browser permission.
+    assert probe.mcp_permission_node_count == 0
 
 
 def test_auto_allow_does_not_click_unrelated_allow_label():
@@ -341,7 +378,7 @@ def test_auto_allow_does_not_click_unrelated_allow_label():
     assert clicks == 0
 
 
-def test_preferred_allow_finds_generic_remembered_react_action_at_depth_six():
+def test_remembered_react_action_cannot_be_invoked_by_dom_click_handler():
     async def run(page):
         client = ChatGPTPage(page, timeout_ms=5_000)
         await page.evaluate(
@@ -380,12 +417,39 @@ def test_preferred_allow_finds_generic_remembered_react_action_at_depth_six():
         )
     )
 
-    assert result["method"] == "react_handler"
-    assert result["target_message_id"] == "depth-six-call"
-    assert result["remember_answer"] == "true"
-    assert action == {
-        "type": "allow",
-        "target_message_id": "depth-six-call",
-        "remember_answer": True,
-    }
+    assert result is None
+    assert action is None
     assert clicks == 0
+
+
+def test_split_allow_once_without_approval_options_is_one_identified_surface():
+    async def run(page):
+        full = await chatgpt_module.inspect_chatgpt_page(page)
+        probe = await inspect_chatgpt_wait_probe(page)
+        return full, probe
+
+    full, probe = asyncio.run(_with_page("""
+        <main><div data-codex-approval-surface="true">
+          <div>md wants to run a tool</div><button>Allow once</button>
+        </div><div contenteditable="true" role="textbox"></div></main>
+    """, run))
+    assert full.mcp_permission_allow_count == probe.mcp_permission_allow_count == 1
+    assert full.mcp_permission_surface_key and full.mcp_permission_surface_key == probe.mcp_permission_surface_key
+
+
+def test_distinct_simultaneous_approvals_are_ambiguous_and_warning_is_typed():
+    async def run(page):
+        full = await chatgpt_module.inspect_chatgpt_page(page)
+        probe = await inspect_chatgpt_wait_probe(page)
+        return full, probe
+
+    full, probe = asyncio.run(_with_page("""
+        <main><div role="alert">Suspicious Instruction</div>
+          <div data-codex-approval-surface="true"><button>Allow once</button></div>
+          <div data-codex-approval-surface="true"><button>Allow once</button></div>
+          <div contenteditable="true" role="textbox"></div>
+        </main>
+    """, run))
+    assert full.mcp_provider_risk and probe.mcp_provider_risk
+    assert full.mcp_permission_surface_key is None and probe.mcp_permission_surface_key is None
+    assert full.mcp_permission_allow_count == probe.mcp_permission_allow_count == 2
