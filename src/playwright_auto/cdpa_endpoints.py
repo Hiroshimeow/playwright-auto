@@ -214,13 +214,42 @@ class BrowserEndpointRegistry:
 
     def add(self, address: str, **settings: Any) -> dict[str, Any]:
         self.snapshot()
-        identity = settings.pop("endpoint_id", None) or str(uuid4())
+        normalized_address = normalize_cdp_endpoint(address)
+        requested_identity = settings.pop("endpoint_id", None)
         with exclusive_file_lock(self.lock_path):
             catalog = self._read_existing()
+            duplicate = next(
+                (
+                    item
+                    for item in catalog["entries"].values()
+                    if not item["removed"] and item["cdp_url"] == normalized_address
+                ),
+                None,
+            )
+            if duplicate is not None:
+                if requested_identity not in {None, duplicate["endpoint_id"]}:
+                    raise ValueError(
+                        "browser endpoint address is already registered with conflicting identity"
+                    )
+                candidate = normalize_endpoint_record(
+                    {**duplicate, **settings, "cdp_url": normalized_address},
+                    endpoint_id=duplicate["endpoint_id"],
+                )
+                if candidate == duplicate:
+                    return duplicate
+                raise ValueError(
+                    "browser endpoint address is already registered with different settings"
+                )
+            identity = requested_identity or str(uuid4())
             if identity in catalog["entries"]:
                 raise ValueError("browser endpoint_id is already registered")
-            settings.setdefault("is_default", not any(item["is_default"] for item in catalog["entries"].values()))
-            item = normalize_endpoint_record({**settings, "cdp_url": address}, endpoint_id=identity)
+            settings.setdefault(
+                "is_default",
+                not any(item["is_default"] for item in catalog["entries"].values()),
+            )
+            item = normalize_endpoint_record(
+                {**settings, "cdp_url": normalized_address}, endpoint_id=identity
+            )
             if item["is_default"]:
                 for other in catalog["entries"].values():
                     other["is_default"] = False

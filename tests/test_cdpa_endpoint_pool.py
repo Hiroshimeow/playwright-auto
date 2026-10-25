@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from playwright_auto.cdpa_config import load_cdpa_config
 from playwright_auto.cdpa_endpoints import BrowserEndpointRegistry
 from test_cdpa_core import write_config
@@ -251,21 +253,45 @@ def test_version_probe_uses_json_version_for_http_endpoint(monkeypatch):
     seen = []
 
     class Response:
+        status = 200
+
         def __enter__(self):
             return self
         def __exit__(self, *_args):
             return None
+        def geturl(self):
+            return "http://127.0.0.1:9222/json/version"
         def read(self, _limit):
-            return b'{"Browser":"Chromium/test","webSocketDebuggerUrl":"ws://browser/id"}'
+            return b'{"Browser":"Chromium/test","webSocketDebuggerUrl":"ws://evil.example/id"}'
 
-    def urlopen(request, timeout):
-        seen.append((request.full_url, timeout))
-        return Response()
+    class Opener:
+        def open(self, request, timeout):
+            seen.append((request.full_url, timeout))
+            return Response()
 
-    monkeypatch.setattr(module, "urlopen", urlopen)
+    monkeypatch.setattr(module, "build_opener", lambda *_args: Opener())
     result = asyncio.run(module.probe_cdp_version("http://127.0.0.1:9222/some-path"))
     assert seen[0][0] == "http://127.0.0.1:9222/json/version"
-    assert result["webSocketDebuggerUrl"] == "ws://browser/id"
+    assert result["webSocketDebuggerUrl"] == "ws://127.0.0.1:9222/id"
+
+
+def test_version_probe_rejects_http_redirect(monkeypatch):
+    import playwright_auto.cdpa_endpoint_pool as module
+    from urllib.error import HTTPError
+
+    class Opener:
+        def open(self, request, timeout):
+            raise HTTPError(
+                request.full_url,
+                302,
+                "redirect rejected",
+                {"Location": "http://evil.example/json/version"},
+                None,
+            )
+
+    monkeypatch.setattr(module, "build_opener", lambda *_args: Opener())
+    with pytest.raises(ValueError, match="redirect"):
+        asyncio.run(module.probe_cdp_version("http://127.0.0.1:9222"))
 
 
 def test_auth_probe_uses_existing_chatgpt_page_without_creating_one(monkeypatch):

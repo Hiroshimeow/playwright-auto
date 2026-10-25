@@ -7,8 +7,9 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Collection, Mapping, Sequence
+from urllib.error import HTTPError
 from urllib.parse import urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import UUID
 
 from .cdpa_endpoints import BrowserEndpointRegistry
@@ -16,22 +17,63 @@ from .chatgpt import ChatGPTPage
 from .connection import connect, normalize_cdp_endpoint
 
 
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 async def probe_cdp_version(address: str) -> Mapping[str, Any]:
-    parsed = urlsplit(address)
+    admitted = normalize_cdp_endpoint(address)
+    parsed = urlsplit(admitted)
     if parsed.scheme in {"ws", "wss"}:
-        return {"webSocketDebuggerUrl": address}
+        return {"webSocketDebuggerUrl": admitted}
     if parsed.scheme not in {"http", "https"}:
         raise ValueError("CDP version probe requires HTTP(S) or WebSocket endpoint")
     version_url = urlunsplit((parsed.scheme, parsed.netloc, "/json/version", "", ""))
 
     def fetch() -> Mapping[str, Any]:
         request = Request(version_url, headers={"Accept": "application/json"})
-        with urlopen(request, timeout=3.0) as response:
-            raw = response.read(65_536)
-        value = json.loads(raw.decode("utf-8"))
+        opener = build_opener(_NoRedirectHandler())
+        try:
+            with opener.open(request, timeout=3.0) as response:
+                final_url = str(response.geturl() or "")
+                if final_url != version_url:
+                    raise ValueError(
+                        "CDP /json/version redirect or cross-origin substitution is not allowed"
+                    )
+                status = int(getattr(response, "status", 200) or 200)
+                if status != 200:
+                    raise ValueError(f"CDP /json/version returned HTTP {status}")
+                raw = response.read(65_537)
+        except HTTPError as exc:
+            if 300 <= int(exc.code) < 400:
+                raise ValueError("CDP /json/version redirect is not allowed") from exc
+            raise ValueError(f"CDP /json/version returned HTTP {exc.code}") from exc
+        if len(raw) > 65_536:
+            raise ValueError("CDP /json/version response exceeds 65536 bytes")
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("CDP /json/version did not return valid JSON") from exc
         if not isinstance(value, Mapping):
             raise ValueError("CDP /json/version did not return an object")
-        return dict(value)
+        result = dict(value)
+        websocket = str(result.get("webSocketDebuggerUrl") or "").strip()
+        if websocket:
+            candidate = urlsplit(websocket)
+            if (
+                candidate.scheme not in {"ws", "wss"}
+                or candidate.username is not None
+                or candidate.password is not None
+                or candidate.fragment
+                or not candidate.path
+            ):
+                raise ValueError("CDP webSocketDebuggerUrl is invalid")
+            pinned_scheme = "wss" if parsed.scheme == "https" else "ws"
+            result["webSocketDebuggerUrl"] = urlunsplit(
+                (pinned_scheme, parsed.netloc, candidate.path, candidate.query, "")
+            )
+        return result
 
     return await asyncio.to_thread(fetch)
 

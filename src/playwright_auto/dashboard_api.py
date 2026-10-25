@@ -468,11 +468,11 @@ class DashboardAPI:
             normalized["workflow_mode"] = "solo"
             normalized["roles"] = [role]
             normalized["goal"] = str(raw.get("goal") or "").strip()
-        elif "role" in raw or "goal" in raw or "conversation_url" in raw:
+        elif "role" in raw or "goal" in raw:
             raise APIError(
                 400,
                 "invalid_request",
-                "role, goal, and conversation_url are valid only for Solo Task",
+                "role and goal are valid only for Solo Task",
             )
         elif "roles" in raw:
             normalized["roles"] = self._workflow_roles(raw.get("roles"))
@@ -485,6 +485,53 @@ class DashboardAPI:
                 raise APIError(
                     400, "invalid_request", "start_role must be one of the selected workflow roles"
                 )
+        if workflow_mode == "team" and "conversation_url" in raw:
+            conversation_url = raw.get("conversation_url")
+            if not isinstance(conversation_url, str) or not conversation_url.strip():
+                raise APIError(
+                    400,
+                    "invalid_request",
+                    "conversation_url must be an exact ChatGPT /c/... URL",
+                )
+            if "browser_endpoint_id" not in raw:
+                raise APIError(
+                    400,
+                    "invalid_request",
+                    "adopted TeamTask conversation_url requires browser_endpoint_id",
+                )
+            provider_id = str(
+                normalized.get("provider_id") or raw.get("provider_id") or "chatgpt_web"
+            )
+            try:
+                select_provider(
+                    explicit_provider_id=provider_id,
+                    required_capabilities=("browser", "adopted_url"),
+                    execution_mode="browser_dom",
+                )
+            except ProviderRuntimeError as exc:
+                raise APIError(
+                    400,
+                    "invalid_request",
+                    f"provider {provider_id!r} cannot adopt conversation_url",
+                ) from exc
+            parsed = urlsplit(conversation_url.strip())
+            parts = [part for part in parsed.path.split("/") if part]
+            if (
+                parsed.scheme != "https"
+                or (parsed.hostname or "").lower()
+                not in {"chatgpt.com", "www.chatgpt.com"}
+                or len(parts) != 2
+                or parts[0] != "c"
+                or not parts[1]
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise APIError(
+                    400,
+                    "invalid_request",
+                    "conversation_url must be an exact ChatGPT /c/... URL",
+                )
+            normalized["conversation_url"] = conversation_url.strip()
         if "temporary" in raw:
             if type(raw.get("temporary")) is not bool:
                 raise APIError(400, "invalid_request", "temporary must be a boolean")
