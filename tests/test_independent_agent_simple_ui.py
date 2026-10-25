@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 from datetime import datetime
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -63,7 +64,10 @@ def mark_responded(store: TaskStore, state: dict, *, trigger_type: str = "manual
 def test_new_triggered_agent_ignores_history_and_opens_only_for_a_new_event(
     tmp_path: Path,
 ):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    config = replace(
+        load_cdpa_config(write_config(tmp_path), repository_root=tmp_path),
+        independent_activation_enabled=True,
+    )
     store = TaskStore(config)
     old = store.create_task("Old done", requested_team="old", task_id="old-done")
     old = store.update(
