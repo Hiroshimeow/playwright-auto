@@ -4,6 +4,7 @@ import asyncio
 import signal
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,7 +24,10 @@ from test_cdpa_core import write_config
 
 
 def setup_worker(tmp_path: Path):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    config = replace(
+        load_cdpa_config(write_config(tmp_path), repository_root=tmp_path),
+        independent_activation_enabled=True,
+    )
     store = TaskStore(config)
     worker = CDPAWorker(config, store=store)
     worker.hydrate_runtime()
