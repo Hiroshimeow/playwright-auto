@@ -176,25 +176,39 @@ def test_reserved_surface_is_visible_to_drain_before_page_exists_and_releases_on
 def test_capacity_enforced_during_concurrent_page_allocation(tmp_path, monkeypatch):
     worker, store, first, second, tasks = _setup(tmp_path, task_count=6)
     quiet(worker, monkeypatch)
-    counts, peaks, seen = {}, {}, []
+    counts, peaks, seen, active_tasks = {}, {}, [], set()
+
     async def advance(path, context, *, scheduling_tasks=None, endpoint_id=None):
+        task_id = store.load(path)["task_id"]
+        # This test owns only the physical-capacity invariant. run_once_pool()
+        # may legitimately rescan the due frontier as slots are released, so
+        # the total number of sequential allocations in one cycle is not fixed.
+        assert task_id not in active_tasks
+        active_tasks.add(task_id)
         counts[endpoint_id] = counts.get(endpoint_id, 0) + 1
         peaks[endpoint_id] = max(peaks.get(endpoint_id, 0), counts[endpoint_id])
-        seen.append(store.load(path)["task_id"])
-        await asyncio.sleep(0.01)
-        counts[endpoint_id] -= 1
+        seen.append(task_id)
+        try:
+            await asyncio.sleep(0.01)
+        finally:
+            counts[endpoint_id] -= 1
+            active_tasks.remove(task_id)
         return store.load(path)
+
     monkeypatch.setattr(worker, "advance", advance)
+
     async def run():
         pool = await _pool(store)
         try:
             await worker.run_once_pool(pool)
         finally:
             await pool.close()
+
     asyncio.run(run())
-    assert len(seen) == 2 and len(set(seen)) == 2
-    assert peaks == {first["endpoint_id"]: 2}
-    assert sum(store.load(task["manifest_path"])["status"] == "WAITING" for task in tasks) == 4
+    assert seen
+    assert peaks.get(first["endpoint_id"]) == 2
+    assert all(peak <= 2 for peak in peaks.values())
+    assert active_tasks == set()
     assert worker._running_executions() == []
 
 

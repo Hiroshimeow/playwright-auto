@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -481,7 +482,10 @@ def test_interval_agent_stays_waiting_until_first_interval_is_due(tmp_path: Path
 
 
 def test_worker_activates_oldest_independent_event_and_persists_claim(tmp_path: Path):
-    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    config = replace(
+        load_cdpa_config(write_config(tmp_path), repository_root=tmp_path),
+        independent_activation_enabled=True,
+    )
     store = TaskStore(config)
     older = store.create_task("Older", requested_team="alpha", task_id="older")
     newer = store.create_task("Newer", requested_team="beta", task_id="newer")

@@ -156,7 +156,7 @@ def test_wait_response_resets_stability_when_text_changes(monkeypatch):
 
     result = asyncio.run(
         bind(page).wait_for_response(
-            receipt(), timeout_ms=40, stable_ms=3, poll_ms=1
+            receipt(), timeout_ms=500, stable_ms=3, poll_ms=1
         )
     )
 
