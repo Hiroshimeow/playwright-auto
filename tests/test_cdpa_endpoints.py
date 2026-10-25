@@ -59,8 +59,7 @@ def test_same_port_different_hosts_are_independent(tmp_path):
     assert one["endpoint_id"] != two["endpoint_id"]
     assert catalog.resolve("100.80.10.4:9222") == one
     assert catalog.resolve(two["endpoint_id"]) == two
-    with pytest.raises(ValueError, match="already registered"):
-        catalog.add("http://100.80.10.4:9222/")
+    assert catalog.add("http://100.80.10.4:9222/") == one
 
 
 def test_default_and_temporary_updates_are_atomic(tmp_path):

@@ -12214,6 +12214,17 @@ class CDPAWorker:
             for item in self._running_executions()
         ) or self._browser_endpoint_has_unresolved_execution(endpoint_id)
 
+    def _browser_endpoint_has_live_binding(self, endpoint_id: str) -> bool:
+        from .cdpa_conversations import ConversationWriterLease
+
+        return ConversationWriterLease(self.runtime_db).endpoint_in_use(endpoint_id)
+
+    def _browser_endpoint_is_in_use(self, endpoint_id: str) -> bool:
+        return (
+            self._browser_endpoint_has_running_execution(endpoint_id)
+            or self._browser_endpoint_has_live_binding(endpoint_id)
+        )
+
     def _browser_endpoint_has_unresolved_execution(self, endpoint_id: str) -> bool:
         """Protect draining endpoints from durable execution evidence, not UI cache state."""
         if self.registry is None:
@@ -12250,7 +12261,7 @@ class CDPAWorker:
             endpoint_id = str(endpoint.get("endpoint_id") or "")
             if not endpoint_id or endpoint.get("draining") is not True:
                 continue
-            if self._browser_endpoint_has_running_execution(endpoint_id):
+            if self._browser_endpoint_is_in_use(endpoint_id):
                 continue
             removed = self.store.endpoints.remove(
                 endpoint_id, has_nonterminal_tasks=False
@@ -12331,8 +12342,8 @@ class CDPAWorker:
             raise ValueError("browser endpoint update requires endpoint_id")
         changes = {key: value for key, value in payload.items() if key != "endpoint_id"}
         if "cdp_url" in changes and normalize_cdp_endpoint(changes["cdp_url"]) != self.store.endpoints.get(endpoint_id)["cdp_url"]:
-            if self._browser_endpoint_has_running_execution(endpoint_id):
-                raise ValueError("cannot retarget a running endpoint; drain its executions first")
+            if self._browser_endpoint_is_in_use(endpoint_id):
+                raise ValueError("cannot retarget an endpoint with running execution or live binding; drain it first")
         return self.store.endpoints.update(endpoint_id, **changes)
 
     def _apply_browser_endpoint_remove(self, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -12341,7 +12352,7 @@ class CDPAWorker:
             raise ValueError("browser endpoint removal requires endpoint_id")
         return self.store.endpoints.remove(
             endpoint_id,
-            has_nonterminal_tasks=self._browser_endpoint_has_running_execution(endpoint_id),
+            has_nonterminal_tasks=self._browser_endpoint_is_in_use(endpoint_id),
         )
 
     def _apply_next_command(

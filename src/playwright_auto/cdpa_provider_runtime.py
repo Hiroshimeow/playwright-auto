@@ -115,7 +115,7 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderRegistryEntry] = {
         provider_id="chatgpt_web",
         module_path="playwright_auto.role_runtime.controller:RoleController",
         execution_modes=("browser_dom",),
-        capabilities=frozenset({"browser", "material_api"}),
+        capabilities=frozenset({"browser", "material_api", "adopted_url", "direct_chat"}),
         default_timeout_seconds=7200,
     ),
     "codex": ProviderRegistryEntry(

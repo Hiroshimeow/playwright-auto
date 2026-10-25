@@ -144,3 +144,53 @@ def test_t075_recovery_target_mismatch_is_reconciliation_only(writers):
     with pytest.raises(ValueError, match="CONVERSATION_IDENTITY_MISMATCH"):
         writers.validate_binding("one", {**original, "page_target_identity": "replacement"})
     assert writers.get_binding("one")["binding_status"] == "blocked"
+
+
+def test_t074_duplicate_endpoint_add_reuses_identical_and_rejects_conflict(tmp_path):
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_endpoints import BrowserEndpointRegistry
+    from test_cdpa_core import write_config
+
+    registry = BrowserEndpointRegistry(
+        load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    )
+    first = registry.add("9202", label="Peer")
+    again = registry.add("http://127.0.0.1:9202/", label="Peer")
+    assert again["endpoint_id"] == first["endpoint_id"]
+    with pytest.raises(ValueError, match="different settings|conflicting"):
+        registry.add("127.0.0.1:9202", label="Different")
+
+
+def test_t074_endpoint_update_and_remove_respect_unsealed_binding(tmp_path):
+    from playwright_auto.cdpa_config import load_cdpa_config
+    from playwright_auto.cdpa_conversations import ConversationWriterLease
+    from playwright_auto.cdpa_store import TaskStore
+    from playwright_auto.cdpa_worker import CDPAWorker
+    from test_cdpa_core import write_config
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    worker = CDPAWorker(config, store=TaskStore(config))
+    worker.runtime_db.ensure_schema()
+    endpoint = worker.store.endpoints.resolve()
+    lease = ConversationWriterLease(worker.runtime_db)
+    lease.bind(
+        binding_id="bound-session",
+        provider_id="chatgpt_web",
+        endpoint_id=endpoint["endpoint_id"],
+        endpoint_cdp_url=endpoint["cdp_url"],
+        physical_browser_id="physical-1",
+        page_target_identity="target-1",
+        conversation_url="https://chatgpt.com/c/existing",
+        verified_new_chat=False,
+    )
+
+    with pytest.raises(ValueError, match="binding|drain|retarget"):
+        worker._apply_browser_endpoint_update({
+            "endpoint_id": endpoint["endpoint_id"],
+            "cdp_url": "http://127.0.0.1:9333",
+        })
+    draining = worker._apply_browser_endpoint_remove({"endpoint_id": endpoint["endpoint_id"]})
+    assert draining["draining"] is True and draining["removed"] is False
+    lease.close_binding("bound-session")
+    removed = worker._apply_browser_endpoint_remove({"endpoint_id": endpoint["endpoint_id"]})
+    assert removed["removed"] is True
