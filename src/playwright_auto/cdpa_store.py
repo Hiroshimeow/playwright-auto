@@ -56,6 +56,7 @@ from .cdpa_independent import (
     validate_independent_object,
     validate_trigger_settings,
 )
+from .cdpa_provider_runtime import ProviderRuntimeError, select_provider
 from .cdpa_role_policy import RolePolicyError, build_role_policy, normalize_role_list
 from .cdpa_routes import effective_report_mode, normalize_report_mode
 from .cdpa_safety import sanitize_text
@@ -150,7 +151,7 @@ def _optional_nonempty_string(value: Any, field: str) -> str | None:
     return value.strip()
 
 
-def _optional_solo_conversation_url(value: Any) -> str | None:
+def _optional_conversation_url(value: Any) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str) or not value.strip():
@@ -3216,10 +3217,16 @@ class TaskStore(IndependentAgentStoreMixin):
         if normalized_workflow_mode not in {"team", "solo"}:
             raise ValueError("workflow_mode must be team or solo")
         normalized_goal = str(goal or "").strip()
-        normalized_conversation_url = _optional_solo_conversation_url(conversation_url)
+        normalized_conversation_url = _optional_conversation_url(conversation_url)
         if normalized_workflow_mode == "team":
-            if goal is not None or normalized_conversation_url is not None:
-                raise ValueError("goal and conversation_url are valid only for solo workflow tasks")
+            if goal is not None:
+                raise ValueError("goal is valid only for solo workflow tasks")
+            if normalized_conversation_url is not None and (
+                browser_endpoint_id is None or not str(browser_endpoint_id).strip()
+            ):
+                raise ValueError(
+                    "adopted TeamTask conversation_url requires an explicit browser endpoint"
+                )
         elif browser_endpoint_id is None or not str(browser_endpoint_id).strip():
             raise ValueError("solo workflow task requires an explicit browser endpoint")
         text = str(task).strip()
@@ -3252,6 +3259,17 @@ class TaskStore(IndependentAgentStoreMixin):
         normalized_provider_id = str(provider_id or "").strip()
         if not normalized_provider_id:
             raise ValueError("provider_id must be a non-empty string")
+        if normalized_conversation_url is not None:
+            try:
+                select_provider(
+                    explicit_provider_id=normalized_provider_id,
+                    required_capabilities=("browser", "adopted_url"),
+                    execution_mode="browser_dom",
+                )
+            except ProviderRuntimeError as exc:
+                raise ValueError(
+                    f"{exc.code}: provider {normalized_provider_id!r} cannot adopt conversation_url"
+                ) from exc
         normalized_max_route_repairs = (
             self.config.route_repair_attempts
             if max_route_repairs is None
