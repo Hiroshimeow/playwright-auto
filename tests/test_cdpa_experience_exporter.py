@@ -538,5 +538,5 @@ def test_export_rejects_destination_inside_plan_and_symlink_escape(tmp_path: Pat
         link.symlink_to(outside, target_is_directory=True)
     except OSError:
         pytest.skip("symlink creation unavailable")
-    with pytest.raises(ValueError, match="symlink"):
+    with pytest.raises(ValueError, match="symlink|reparse|junction"):
         export_history(repo, link)

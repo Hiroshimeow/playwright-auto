@@ -131,6 +131,8 @@ def _setup(tmp_path: Path):
         task_id="task-rate-a",
     )
     worker = CDPAWorker(config, store=store)
+    # Unit tests enter provider logic without the normal scheduler lease.
+    assert worker._prepare_execution_endpoint(state, str(state["browser_endpoint_id"]))
     worker.runtime_db.ensure_schema()
     return config, store, state, worker
 

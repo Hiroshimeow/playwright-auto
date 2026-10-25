@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -563,6 +564,7 @@ def test_task_cli_roles_submit_team_subset_and_are_invalid_for_resume(tmp_path: 
     assert "--roles" in capsys.readouterr().err
     assert len(payloads) == 1
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only taskkill/PM2 supervisor semantics")
 def test_windows_worker_pm2_restart_reaps_old_lease_owner(tmp_path: Path, monkeypatch):
     calls: list[list[str]] = []
 

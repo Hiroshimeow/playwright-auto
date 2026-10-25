@@ -95,13 +95,18 @@ def _accepted_snapshot(receipt: SendReceipt, *, response: MessageSnapshot | None
     )
 
 
-def test_resume_pending_mcp_permission_hands_back_to_shared_controller(tmp_path: Path):
+@pytest.mark.parametrize("dom_permission", [False, True])
+def test_resume_pending_mcp_permission_hands_back_to_shared_controller(tmp_path: Path, dom_permission: bool):
     store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-resume-mcp-permission"
     )
     hop["conversation_url"] = "https://chatgpt.com/c/resume-mcp"
     state["roles"]["PLAN"]["page_url"] = hop["conversation_url"]
     snapshot = _accepted_snapshot(receipt)
+    if dom_permission:
+        snapshot.mcp_permission_node_count = 1
+        snapshot.mcp_permission_allow_count = 1
+        snapshot.mcp_permission_surface_key = "current-dom-surface"
     permission = {
         "type": "allow",
         "target_message_id": "resume-mcp-call",
@@ -120,9 +125,9 @@ def test_resume_pending_mcp_permission_hands_back_to_shared_controller(tmp_path:
         def page_observation(self):
             return {"permission_action": permission}
 
-        async def auto_allow_mcp_permission(self, *, passive_action=None):
-            calls.append(("allow", passive_action["target_message_id"]))
-            return {"method": "react_handler", "target_message_id": passive_action["target_message_id"]}
+        async def auto_allow_mcp_permission(self, *, passive_action=None, **_identity):
+            calls.append(("allow", _identity.get("expected_surface_key")))
+            return {"method": "dom_click_once", "target_message_id": "", "remember_answer": "false"}
 
         def clear_permission_action(self):
             calls.append(("clear",))
@@ -150,9 +155,11 @@ def test_resume_pending_mcp_permission_hands_back_to_shared_controller(tmp_path:
     }
     asyncio.run(worker._recover_resume_waiting(state, hop, control, Actions()))
 
-    assert calls == [("allow", "resume-mcp-call"), ("clear",)]
+    # A LISTEN-only approval is never executable. Only the exact current DOM
+    # surface may be approved, with one-shot semantics, after Resume.
+    assert calls == ([("allow", "current-dom-surface"), ("clear",)] if dom_permission else [])
     assert state["status"] == "RUNNING"
-    assert state["active_action"] == "wait_mcp_allow_continuation"
+    assert state["active_action"] == ("wait_mcp_allow_continuation" if dom_permission else "wait_response")
     assert state["block_code"] is None
     assert control["status"] == "applied"
     assert control["result"]["action"] == "resume_role_controller"
@@ -1789,6 +1796,7 @@ def test_reacquired_pristine_request_crosses_send_boundary_exactly_once(tmp_path
                 retry_visible=False,
                 blocking_dialogs=(),
                 messages=(),
+                logical_turn_ids=(),
                 session_id="presend-session",
                 conversation_url="https://chatgpt.com/c/WEB:presend-replacement",
                 url="https://chatgpt.com/c/WEB:presend-replacement",
@@ -3035,6 +3043,7 @@ def test_lost_sending_atomic_nonacceptance_rebinds_same_request_and_sends_once(
         attachment_markers=(),
         blocking_dialogs=(),
         messages=(),
+        logical_turn_ids=(),
         session_id="55555555-5555-4555-8555-555555555555",
         url="https://chatgpt.com/c/55555555-5555-4555-8555-555555555555",
         conversation_url="https://chatgpt.com/c/55555555-5555-4555-8555-555555555555",
@@ -3142,6 +3151,7 @@ def test_lost_sending_replacement_persists_admission_and_releases_gate_before_se
         attachment_markers=(),
         blocking_dialogs=(),
         messages=(),
+        logical_turn_ids=(),
         session_id="77777777-7777-4777-8777-777777777777",
         url=replacement_url,
         conversation_url=replacement_url,
@@ -3240,6 +3250,7 @@ def test_lost_sending_bounded_continuation_failure_is_not_replayed(
         attachment_markers=(),
         blocking_dialogs=(),
         messages=(),
+        logical_turn_ids=(),
         session_id="99999999-9999-4999-8999-999999999999",
         url="https://chatgpt.com/c/99999999-9999-4999-8999-999999999999",
         conversation_url="https://chatgpt.com/c/99999999-9999-4999-8999-999999999999",
@@ -3639,7 +3650,7 @@ def test_dashboard_distinguishes_continued_recovery_failed_queued_and_stale_work
 
 
 def _guard_blocked_state(tmp_path: Path, *, task_id: str):
-    _config, store, state, worker = setup_task(tmp_path, task_id=task_id)
+    _config, store, state, worker = setup_task(tmp_path, task_id=task_id, self_route_policy={"mode": "bounded", "max_self_routes": 32}, max_routes=32)
     from test_cdpa_worker import _accept_self_route_guard_decision
 
     source = None
@@ -3951,14 +3962,16 @@ def test_resume_accepted_root_canonicalizes_from_exact_owned_local_page_without_
     hop["conversation_url"] = "https://chatgpt.com/"
     state["roles"]["PLAN"]["page_url"] = "https://chatgpt.com/"
     snapshot = _accepted_snapshot(receipt)
-    snapshot.session_id = "local-canonical"
+    snapshot.session_id = "7db2aba2-cea8-43b1-9944-c683731c8f07"
+    snapshot.url = f"https://chatgpt.com/c/{snapshot.session_id}"
+    snapshot.conversation_url = snapshot.url
 
     class Client:
         async def assert_ownership(self):
             return snapshot
 
     acquired = AcquiredRole(
-        Client(), receipt.binding.page_id, "https://chatgpt.com/c/local-canonical", False, False
+        Client(), receipt.binding.page_id, "https://chatgpt.com/c/7db2aba2-cea8-43b1-9944-c683731c8f07", False, False
     )
     calls = {"search": 0, "graph": 0}
 
@@ -3977,10 +3990,10 @@ def test_resume_accepted_root_canonicalizes_from_exact_owned_local_page_without_
     )
 
     assert calls == {"search": 0, "graph": 0}
-    assert enriched.conversation_id == "local-canonical"
+    assert enriched.conversation_id == "7db2aba2-cea8-43b1-9944-c683731c8f07"
     durable = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
     assert durable is not None
-    assert durable.receipt["conversation_id"] == "local-canonical"
+    assert durable.receipt["conversation_id"] == "7db2aba2-cea8-43b1-9944-c683731c8f07"
     assert durable.attempts == 1
 
 
@@ -3992,14 +4005,16 @@ def test_resume_accepted_root_message_id_only_uses_same_local_identity_proof(tmp
     RequestLedger(hop["ledger_path"]).update(hop["request_id"], receipt=message_only.to_dict())
     hop["receipt"] = message_only.to_dict()
     snapshot = _accepted_snapshot(message_only)
-    snapshot.session_id = "message-only-canonical"
+    snapshot.session_id = "c190c46f-b2b1-402e-992a-8b03a2c71f30"
+    snapshot.url = f"https://chatgpt.com/c/{snapshot.session_id}"
+    snapshot.conversation_url = snapshot.url
 
     class Client:
         async def assert_ownership(self):
             return snapshot
 
     acquired = AcquiredRole(
-        Client(), message_only.binding.page_id, "https://chatgpt.com/c/message-only-canonical", False, False
+        Client(), message_only.binding.page_id, "https://chatgpt.com/c/c190c46f-b2b1-402e-992a-8b03a2c71f30", False, False
     )
 
     class Actions:
@@ -4013,7 +4028,7 @@ def test_resume_accepted_root_message_id_only_uses_same_local_identity_proof(tmp
     enriched = asyncio.run(
         worker._discover_accepted_conversation_identity(state, hop, Actions(), message_only)
     )
-    assert enriched.conversation_id == "message-only-canonical"
+    assert enriched.conversation_id == "c190c46f-b2b1-402e-992a-8b03a2c71f30"
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
 
 

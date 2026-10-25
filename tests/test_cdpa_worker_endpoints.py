@@ -1893,6 +1893,120 @@ def test_unpinned_team_first_placement_pins_endpoint_and_inherits_temporary_defa
     assert worker._prepare_execution_endpoint(state, first["endpoint_id"]) is False
 
 
+def test_v11_first_endpoint_pin_is_atomic_before_send_without_context_policy_mutation(tmp_path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    original = store.endpoints.resolve()
+    selected = store.endpoints.add("9202", temporary_default=True)
+    state = store.create_task("unpinned", task_id="v11-first-placement", requested_team="v11-first-placement")
+    path = Path(state["manifest_path"])
+    assert state["endpoint_pinned"] is False
+    assert state["context_policy"] == "fresh"
+
+    bound = store.pin_workflow_endpoint(path, selected["endpoint_id"], expected_updated_at=state["updated_at"])
+    assert bound["endpoint_pinned"] is True
+    assert bound["browser_endpoint_id"] == selected["endpoint_id"]
+    assert bound["conversation_mode"] == "temporary"
+    assert bound["context_policy"] == "fresh"
+    assert bound["roles"]["PLAN"]["browser_endpoint_id"] == selected["endpoint_id"]
+    assert store.load(path)["browser_endpoint_id"] == selected["endpoint_id"]
+    assert _active_hop(bound)["browser_endpoint_id"] == selected["endpoint_id"]
+    try:
+        store.pin_workflow_endpoint(path, original["endpoint_id"])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a pinned task cannot move to another endpoint")
+    assert store.load(path)["browser_endpoint_id"] == selected["endpoint_id"]
+
+
+def test_v11_first_endpoint_pin_rejects_page_and_durable_request(tmp_path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    selected = store.endpoints.add("9202")
+    state = store.create_task("pre-send", task_id="v11-pin-guard", requested_team="v11-pin-guard")
+    path = Path(state["manifest_path"])
+    state["roles"]["PLAN"]["page_id"] = "existing-page"
+    state = store.save(path, state)
+    try:
+        store.pin_workflow_endpoint(path, selected["endpoint_id"])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("page identity must prevent relocation")
+    assert store.load(path)["endpoint_pinned"] is False
+
+
+def test_v11_endpoint_pin_admits_only_unattempted_prepared_ledger(tmp_path):
+    from playwright_auto.durable import RequestLedger, RequestStatus
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    endpoint = store.endpoints.add("9202")
+    state = store.create_task("prepared before endpoint admission", task_id="pin-prepared", requested_team="pin-prepared")
+    path = Path(state["manifest_path"])
+    hop = _active_hop(state)
+    ledger = RequestLedger(hop["ledger_path"])
+    ledger.begin(role=hop["physical_role"], prompt="immutable prepared prompt", request_id=hop["request_id"])
+    ledger.update(hop["request_id"], status=RequestStatus.PROMPT_SET)
+    bound = store.pin_workflow_endpoint(path, endpoint["endpoint_id"])
+    assert bound["endpoint_pinned"] is True
+    assert bound["browser_endpoint_id"] == endpoint["endpoint_id"]
+    assert ledger.get(hop["request_id"]).attempts == 0
+    assert ledger.get(hop["request_id"]).status is RequestStatus.PROMPT_SET
+
+
+def test_v11_endpoint_pin_does_not_cross_durable_send_intent(tmp_path):
+    from playwright_auto.durable import RequestLedger
+
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    selected = store.endpoints.add("9202")
+    state = store.create_task("send once", task_id="v11-ledger-pin", requested_team="v11-ledger-pin")
+    path = Path(state["manifest_path"])
+    hop = _active_hop(state)
+    ledger = RequestLedger(hop["ledger_path"])
+    ledger.begin(role=hop["physical_role"], prompt="durable pre-send", request_id=hop["request_id"])
+    from playwright_auto.durable import RequestStatus
+    ledger.update(hop["request_id"], status=RequestStatus.SENDING, attempts=1)
+    try:
+        store.pin_workflow_endpoint(path, selected["endpoint_id"])
+    except ValueError as exc:
+        assert "Send intent" in str(exc)
+    else:
+        raise AssertionError("endpoint relocation must not cross durable Send identity")
+    reloaded = store.load(path)
+    assert reloaded["endpoint_pinned"] is False
+    assert reloaded["browser_endpoint_id"] == state["browser_endpoint_id"]
+    assert ledger.peek(hop["request_id"]) is not None
+
+
+def test_v11_scheduler_commits_unpinned_endpoint_before_browser_pre_send(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    selected = store.endpoints.add("9202")
+    state = store.create_task("work", task_id="v11-dispatch-atomic", requested_team="v11-dispatch-atomic")
+    worker = CDPAWorker(config, store=store)
+    path = Path(state["manifest_path"])
+    admitted = []
+
+    async def pre_send(task, hop, _actions):
+        persisted = store.load(path)
+        assert persisted["endpoint_pinned"] is True
+        assert persisted["browser_endpoint_id"] == selected["endpoint_id"]
+        assert persisted["context_policy"] == "fresh"
+        assert persisted["roles"]["PLAN"]["browser_endpoint_id"] == selected["endpoint_id"]
+        assert worker._execution_endpoint_id(task, "PLAN") == selected["endpoint_id"]
+        admitted.append(hop["request_id"])
+        task["active_action"] = "observed_pre_send"
+
+    monkeypatch.setattr(worker, "_pre_send", pre_send)
+    saved = asyncio.run(worker.advance(path, SimpleNamespace(pages=[]), endpoint_id=selected["endpoint_id"]))
+    assert admitted == ["v11-dispatch-atomic-hop1"]
+    assert saved["browser_endpoint_id"] == selected["endpoint_id"]
+    assert saved["active_action"] == "observed_pre_send"
+
+
 def test_pool_cycle_stale_registry_terminal_manifest_never_gets_capacity_lease(tmp_path, monkeypatch):
     worker, store, first, second, tasks = _setup(tmp_path)
     store.endpoints.remove(second["endpoint_id"], has_nonterminal_tasks=True)

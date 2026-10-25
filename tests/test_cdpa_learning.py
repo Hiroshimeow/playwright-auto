@@ -237,18 +237,17 @@ def test_oversized_lesson_is_rejected_without_mutation(tmp_path: Path) -> None:
     assert learning.read_text(encoding="utf-8") == before
 
 
-def test_final_plan_contract_requires_one_observable_guarded_learning_pass() -> None:
+def test_final_plan_contract_requires_current_acceptance_without_extra_learning_gate() -> None:
+    # The v11 PLAN prompt no longer adds a separate post-DONE model pass.
     prompt_paths = (
         Path("prompts/cdpa/PLAN.md"),
         Path("src/playwright_auto/cdpa_defaults/prompts/cdpa/PLAN.md"),
     )
-    for prompt_path in prompt_paths:
-        prompt = prompt_path.read_text(encoding="utf-8")
-        assert "newest relevant completion evidence" in prompt
-        assert "current `LEARNING.md`" in prompt
-        assert "`ADDED`, `REVISED`, or `NONE`" in prompt
-        assert "0-3" in prompt
-        assert "semantic duplicate" in prompt
-        assert "## Learning" in prompt
-        assert "read back" in prompt
-        assert "post-DONE model pass" in prompt
+    texts = [path.read_text(encoding="utf-8") for path in prompt_paths]
+    assert texts[0] == texts[1]
+    for prompt in texts:
+        assert "Route actionable implementation or fixable failure to DEV" in prompt
+        assert "all required acceptance is proven" in prompt
+        assert "no known in-scope failure remains" in prompt
+        assert "only when the per-turn RouteContract declares this role as `closing_role`" in prompt
+        assert "post-DONE model pass" not in prompt

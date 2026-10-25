@@ -453,7 +453,7 @@ def test_repair_release_rearms_stale_terminal_wait_and_consumes_materialized_bac
     assert state["status"] == "RUNNING"
     assert routed["state"] == "routed"
     assert routed["response"] == response_text
-    assert routed["wait"]["controller_reason"] == "valid_current_result"
+    assert routed["wait"]["controller_reason"] == "terminal_route_reconciled"
     assert hop["state"] == "pre_send"
     assert hop["target_role"] == "REVIEW"
     assert calls == {"status": 0, "graph": 0, "locate": 1, "send": 0, "retry": 0, "restart": 0, "new_chat": 0}
@@ -514,17 +514,14 @@ def test_repair_release_rearms_once_when_terminal_continuation_is_still_missing(
     actions = Actions()
     asyncio.run(worker._waiting(state, hop, actions, path))
     hop = _active_hop(state)
-
-    assert state["status"] == "RUNNING"
+    # Runtime-v2 never refreshes a page to discover missing terminal output.
+    # A released repair with no materialized response remains recoverable by
+    # an operator, but must preserve the exact accepted request and page.
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "response_terminal_missing"
     assert hop["state"] == "waiting"
-    assert hop["wait"]["controller_reason"] == "response_timeout_recheck"
-    assert hop["wait"]["timeout_refreshed"] is True
-    assert calls == {"status": 0, "graph": 0, "locate": 1, "refresh": 1, "send": 0, "retry": 0, "restart": 0, "new_chat": 0}
-
-    asyncio.run(worker._waiting(state, hop, actions, path))
-
-    assert hop["wait"]["controller_reason"] == "reload_settle"
-    assert calls == {"status": 0, "graph": 0, "locate": 2, "refresh": 1, "send": 0, "retry": 0, "restart": 0, "new_chat": 0}
+    assert hop["wait"]["controller_reason"] == "response_terminal_missing"
+    assert calls == {"status": 0, "graph": 0, "locate": 1, "refresh": 0, "send": 0, "retry": 0, "restart": 0, "new_chat": 0}
     record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
     assert record is not None and record.attempts == 1 and record.receipt == before_record.receipt
     assert not any(control["action"] == "resume" for control in state["controls"])

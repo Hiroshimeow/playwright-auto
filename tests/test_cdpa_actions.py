@@ -1541,7 +1541,7 @@ def test_locate_owned_metadata_never_falls_back_to_dom_snapshot(tmp_path, monkey
     assert context.lifecycle_calls == []
 
 
-def test_locate_owned_sets_active_lifecycle_on_only_the_selected_page(tmp_path, monkeypatch):
+def test_locate_owned_does_not_focus_or_emulate_page_activation(tmp_path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     other = FakePage(page_id="other", role="PLAN", team="other-team", task_id="task-1")
     owned = FakePage(page_id="owned", role="PLAN", team="new-team", task_id="task-1")
@@ -1555,29 +1555,24 @@ def test_locate_owned_sets_active_lifecycle_on_only_the_selected_page(tmp_path, 
     assert acquired.page_id == "owned"
     assert owned.front is False
     assert other.front is False
-    assert context.lifecycle_calls == [
-        (owned, "Page.setWebLifecycleState", {"state": "active"}, "task-1", "new-team"),
-        (owned, "Emulation.setFocusEmulationEnabled", {"enabled": True}, "task-1", "new-team"),
-    ]
-    assert context.detached_sessions == 1
+    assert context.lifecycle_calls == []
+    assert context.detached_sessions == 0
 
 
-def test_lifecycle_command_failure_is_soft_and_warns_once(tmp_path, monkeypatch):
+def test_normal_location_avoids_unsupported_lifecycle_calls(tmp_path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     owned = FakePage(page_id="owned", role="PLAN", team="new-team", task_id="task-1")
     monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
     context = FakeContext([owned], cdp_error=RuntimeError("unsupported command"))
     actions = CDPATabActions(context, config)
 
-    with pytest.warns(RuntimeWarning, match="lifecycle") as warnings:
-        first = asyncio.run(actions.locate_owned(manifest(page_id="owned"), "PLAN"))
-        second = asyncio.run(actions.locate_owned(manifest(page_id="owned"), "PLAN"))
+    first = asyncio.run(actions.locate_owned(manifest(page_id="owned"), "PLAN"))
+    second = asyncio.run(actions.locate_owned(manifest(page_id="owned"), "PLAN"))
 
     assert first is not None and second is not None
     assert first.page_id == second.page_id == "owned"
-    assert len(warnings) == 1
-    assert len(context.lifecycle_calls) == 2
-    assert context.detached_sessions == 2
+    assert context.lifecycle_calls == []
+    assert context.detached_sessions == 0
     assert owned.front is False
 
 
@@ -1606,11 +1601,8 @@ def test_terminal_team_reuse_rebinds_without_new_chat(tmp_path, monkeypatch):
     assert page.snapshot_value.page_task_id == "task-1"
     assert page.snapshot_value.page_team == "new-team"
     assert page.front is False
-    assert context.lifecycle_calls == [
-        (page, "Page.setWebLifecycleState", {"state": "active"}, "task-1", "new-team"),
-        (page, "Emulation.setFocusEmulationEnabled", {"enabled": True}, "task-1", "new-team"),
-    ]
-    assert context.detached_sessions == 1
+    assert context.lifecycle_calls == []
+    assert context.detached_sessions == 0
 
 
 
@@ -1666,22 +1658,10 @@ def test_recorded_offline_role_requires_controlled_reopen(tmp_path, monkeypatch)
     ]
     assert reopened.client.page.snapshot_value.page_task_id == "task-1"
     assert reopened.client.page.snapshot_value.page_team == "new-team"
-    assert reopened.client.page.front is True
-    assert actions.browser_context.lifecycle_calls == [
-        (
-            reopened.client.page,
-            "Page.setWebLifecycleState",
-            {"state": "active"},
-            "task-1",
-            "new-team",
-        ),
-        (
-            reopened.client.page,
-            "Emulation.setFocusEmulationEnabled",
-            {"enabled": True},
-            "task-1",
-            "new-team",
-        ),
+    assert reopened.client.page.front is False
+    # Prevent background freeze without stealing focus; never use focus emulation.
+    assert [entry[1:3] for entry in actions.browser_context.lifecycle_calls] == [
+        ("Page.setWebLifecycleState", {"state": "active"})
     ]
     assert actions.browser_context.detached_sessions == 1
 
@@ -1801,7 +1781,7 @@ def test_reopen_accepted_waiting_skips_clean_composer_requirement(tmp_path, monk
     assert reopened.client.clean_ready_calls == []
 
 
-def test_automatic_reopen_stays_background_until_explicit_wake(tmp_path, monkeypatch):
+def test_automatic_reopen_activates_lifecycle_without_focus(tmp_path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
     monkeypatch.setattr(
@@ -1826,22 +1806,6 @@ def test_automatic_reopen_stays_background_until_explicit_wake(tmp_path, monkeyp
     )
 
     assert reopened.client.page.front is False
-    assert actions.browser_context.lifecycle_calls == []
-
-    asyncio.run(actions.wake(reopened))
-    assert actions.browser_context.lifecycle_calls == [
-        (
-            reopened.client.page,
-            "Page.setWebLifecycleState",
-            {"state": "active"},
-            "task-1",
-            "new-team",
-        ),
-        (
-            reopened.client.page,
-            "Emulation.setFocusEmulationEnabled",
-            {"enabled": True},
-            "task-1",
-            "new-team",
-        ),
+    assert [call[1:3] for call in actions.browser_context.lifecycle_calls] == [
+        ("Page.setWebLifecycleState", {"state": "active"})
     ]

@@ -24,6 +24,10 @@ def _scenario(tmp_path: Path):
     role.update(page_id="owned-page", page_url="https://chatgpt.com/c/owned", online=False)
     original_request = hop["request_id"]
 
+    class OwnedPageClient:
+        async def assert_ownership(self, **_kwargs):
+            return None  # Simulated exact page ownership, not a live CDP target.
+
     class Actions(FakeActions):
         def __init__(self):
             super().__init__()
@@ -39,7 +43,7 @@ def _scenario(tmp_path: Path):
         async def locate_owned(self, *_args, **_kwargs):
             if not self.acquire_calls:
                 return AcquiredRole(
-                    client=SimpleNamespace(), page_id="owned-page",
+                    client=OwnedPageClient(), page_id="owned-page",
                     url="https://chatgpt.com/c/owned", created=False, new_chat=False,
                 )
             return None
@@ -47,7 +51,7 @@ def _scenario(tmp_path: Path):
         async def reopen(self, *_args, **kwargs):
             self.reopen_calls.append(kwargs)
             return AcquiredRole(
-                client=SimpleNamespace(), page_id=self.reopened_page,
+                client=OwnedPageClient(), page_id=self.reopened_page,
                 url=self.reopened_url, created=True, new_chat=False,
             )
 

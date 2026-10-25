@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -44,9 +45,12 @@ def test_incident_0001_reconstruction_and_controls_are_deterministic():
 
 
 def test_cli_help_and_gate_json_contract():
+    # pytest adds src to sys.path, but its child Python process does not inherit it.
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": str(root / "src") + os.pathsep + os.environ.get("PYTHONPATH", "")}
     help_result = subprocess.run(
         [sys.executable, "-m", "playwright_auto.cdpa_evolution_cli", "--help"],
-        text=True, capture_output=True, check=False,
+        text=True, capture_output=True, check=False, env=env,
     )
     assert help_result.returncode == 0
     for command in ("observe", "propose", "gate", "status", "promote", "rollback"):
@@ -60,7 +64,7 @@ def test_cli_help_and_gate_json_contract():
             "--oracle", str(FIXTURE / "oracle.json"),
             "--candidate", str(FIXTURE / "candidates" / "timeout_only.json"),
         ],
-        text=True, capture_output=True, check=False,
+        text=True, capture_output=True, check=False, env=env,
     )
     assert result.returncode != 0
     assert json.loads(result.stdout)["verdict"] == "REJECT"

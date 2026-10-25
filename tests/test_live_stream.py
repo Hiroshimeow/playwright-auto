@@ -186,3 +186,63 @@ def test_follower_rotation_resets_epoch_before_publishing_replacement(tmp_path: 
 
     assert recorder.resets == 1
     assert recorder.events[-1]["event_id"] == "new"
+
+
+def test_follower_cannot_publish_prior_activation_into_new_subscription(tmp_path: Path, monkeypatch):
+    """A deactivation/reactivation must fence an in-flight follower publish."""
+    import threading
+
+    path = tmp_path / "live.jsonl"
+    path.write_bytes(b"")
+    hub = LiveStreamHub(path, poll_seconds=0.002)
+    original, ready = hub.subscribe("task-1", "DEV")
+    old_epoch = ready["stream_epoch"]
+    prior_publish_entered = threading.Event()
+    let_prior_publish_finish = threading.Event()
+    resubscribed = threading.Event()
+    current = {}
+    errors = []
+    original_publish = hub.publish
+
+    def gated_publish(event):
+        if event.get("event_id") == "prior-generation":
+            prior_publish_entered.set()
+            assert let_prior_publish_finish.wait(2), "test timed out before release"
+        return original_publish(event)
+
+    monkeypatch.setattr(hub, "publish", gated_publish)
+    def switch_subscription():
+        try:
+            hub.unsubscribe(original)
+            new_subscription, control = hub.subscribe(
+                "task-1", "DEV", last_event_id=f"{old_epoch}:0",
+            )
+            current["subscription"] = new_subscription
+            current["control"] = control
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            resubscribed.set()
+
+    thread = None
+    try:
+        with path.open("ab") as handle:
+            handle.write(json.dumps(_event("prior-generation")).encode() + b"\n")
+        assert prior_publish_entered.wait(2), "follower never observed appended event"
+        thread = threading.Thread(target=switch_subscription, daemon=True)
+        thread.start()
+        # On the old implementation a stale in-flight publish can span the
+        # complete unsubscribe -> subscribe transition. This is not allowed.
+        resubscribed.wait(0.15)
+        let_prior_publish_finish.set()
+        thread.join(2)
+        assert not thread.is_alive()
+        assert not errors, errors
+        assert current["control"]["type"] == "stream.reset"
+        with __import__("pytest").raises(queue.Empty):
+            current["subscription"].get(timeout=0.02)
+    finally:
+        let_prior_publish_finish.set()
+        if thread is not None:
+            thread.join(2)
+        hub.close()

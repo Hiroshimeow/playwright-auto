@@ -139,13 +139,26 @@ def test_post_tasks_invalid_role_set_is_400_error_envelope(tmp_path: Path) -> No
     server = _server_with_runner(tmp_path)
     body = json.dumps({"task": "x", "roles": ["DEV", "REVIEW"], "start_role": "PLAN"}).encode("utf-8")
 
-    response = server.handle_post_path("/api/tasks", body)
+    response = server.handle_post_path("/api/tasks", body, idempotency_key="invalid-role-set")
     payload = response_json(response)
 
     assert response.status == 400
     assert payload["ok"] is False
     assert payload["error"]["code"] == "invalid_task_request"
     assert payload["error"]["message"] == "start_role must be included in roles"
+    assert server.state_store.list_task_records() == []
+
+
+def test_post_tasks_requires_idempotency_key(tmp_path: Path) -> None:
+    server = _server_with_runner(tmp_path)
+    body = json.dumps({"task": "x", "roles": ["REVIEW"]}).encode("utf-8")
+
+    response = server.handle_post_path("/api/tasks", body)
+    payload = response_json(response)
+
+    assert response.status == 400
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "idempotency_key_required"
     assert server.state_store.list_task_records() == []
 
 
@@ -194,6 +207,99 @@ def test_get_tasks_projects_latest_legacy_status_newest_first(tmp_path: Path) ->
 
     server.handle_get_path("/api/audit/snapshot")
     assert legacy.refreshed_with == frozenset({"cdpa-new", "cdpa-old"})
+
+
+class DiagnosticsLegacyAudit(FakeLegacyAudit):
+    def task_detail(self, task_id: str) -> dict:
+        return {
+            "task_id": task_id,
+            "dependency_diagnostics": {
+                "ready": False,
+                "waiting_on": ["parent-1"],
+            },
+            "async_continuations": [
+                {
+                    "continuation_id": "ac-1",
+                    "source_kind": "provider_job",
+                    "source_refs": ["pjob-1"],
+                    "status": "waiting",
+                }
+            ],
+            "provider_jobs": [{"provider_job_id": "pjob-1", "state": "RUNNING"}],
+        }
+
+    def runtime_state(self) -> dict:
+        return {
+            "worker_online": True,
+            "worker_stale": False,
+            "worker_heartbeat_at": "2026-10-15T00:00:00+00:00",
+        }
+
+
+def test_runtime_diagnostics_projects_scheduler_dependency_and_continuations_without_second_graph(
+    tmp_path: Path,
+) -> None:
+    legacy = DiagnosticsLegacyAudit({})
+    server = _server_with_runner(tmp_path, legacy)
+    records = [
+        {
+            "runtime_task_id": "rtask-cron",
+            "legacy_task_id": "task-cron",
+            "status": "submitted",
+            "created_at": "t1",
+            "idempotency_key": "cron:job-1:2026-10-15T00:00:00+00:00",
+            "trigger": {
+                "kind": "cron",
+                "cron_job_id": "job-1",
+                "scheduled_for": "2026-10-15T00:00:00+00:00",
+            },
+        },
+        {
+            "runtime_task_id": "rtask-heartbeat",
+            "legacy_task_id": "task-heartbeat",
+            "status": "submitted",
+            "created_at": "t2",
+            "idempotency_key": "heartbeat:worker:legacy-worker:episode-1",
+            "trigger": {
+                "kind": "stale_heartbeat",
+                "subject_kind": "worker",
+                "subject_id": "legacy-worker",
+                "stale_episode_started_at": "2026-10-15T00:00:00+00:00",
+            },
+        },
+    ]
+    for record in records:
+        server.state_store.save_task_record(record)
+
+    response = server.handle_get_path("/api/diagnostics")
+    payload = response_json(response)["data"]
+
+    assert response.status == 200
+    assert {item["runtime_task_id"] for item in payload["scheduler"]} == {
+        "rtask-cron", "rtask-heartbeat"
+    }
+    assert [item["runtime_task_id"] for item in payload["cron_jobs"]] == ["rtask-cron"]
+    assert [item["runtime_task_id"] for item in payload["heartbeat_recoveries"]] == [
+        "rtask-heartbeat"
+    ]
+    assert payload["heartbeats"] == [
+        {
+            "subject_type": "worker",
+            "subject_id": "legacy-worker",
+            "status": "healthy",
+            "heartbeat_at": "2026-10-15T00:00:00+00:00",
+            "source": "legacy_runtime_state",
+        }
+    ]
+    assert len(payload["tasks"]) == 2
+    assert payload["tasks"][0]["dependency"]["waiting_on"] == ["parent-1"]
+    assert payload["tasks"][0]["continuations"][0]["continuation_id"] == "ac-1"
+    assert payload["tasks"][0]["provider_jobs"][0]["provider_job_id"] == "pjob-1"
+    assert payload["dependency_graph"] == {
+        "stored_owner": "TeamTask.depends_on_task_ids",
+        "continuation_edges": "derived_only",
+    }
+    assert payload["independent_agent"]["activation_enabled"] is False
 
 
 def test_port_conflict_fails_without_fallback_to_legacy(tmp_path: Path) -> None:

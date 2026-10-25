@@ -801,7 +801,7 @@ def test_projection_summary_is_compact_and_deterministic(tmp_path: Path):
     assert first == second
     assert len(json.dumps(first.summary, separators=(",", ":")).encode()) <= 4096
     assert set(first.summary) <= {
-        "task_id", "team", "status", "column", "surface", "active_role",
+        "task_id", "team", "status", "v11_lifecycle", "column", "surface", "active_role",
         "active_hop_id", "active_action", "created_at", "started_at", "updated_at",
         "effective_activity_at", "active_role_started_at", "running_elapsed_seconds",
         "running_since", "active_role_running_elapsed_seconds", "active_role_running_since",
@@ -810,6 +810,7 @@ def test_projection_summary_is_compact_and_deterministic(tmp_path: Path):
         "stop_reason", "lifecycle_kind", "lifecycle_label",
         "queue_position", "queue_length", "queue_reason", "queue_since", "waiting_order", "roles", "requested_browser_endpoint_id", "required_browser_endpoint_id", "browser_endpoint_ids", "has_reports", "task_title",
         "submitted_roles", "initial_roles", "reachable_roles", "start_role", "closing_role", "route_seq", "max_routes", "max_route_repairs",
+        "browser_control", "async_continuation",
         "version", "projection_sha256",
     }
 

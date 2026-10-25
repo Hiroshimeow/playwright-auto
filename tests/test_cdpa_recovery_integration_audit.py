@@ -65,7 +65,10 @@ def test_pristine_new_ledger_request_can_relocate_without_changing_request(tmp_p
     state["roles"]["PLAN"]["browser_endpoint_id"] = store.endpoints.resolve()["endpoint_id"]
     endpoint = store.endpoints.add("9202")["endpoint_id"]
     request = hop["request_id"]
-    assert worker._prepare_execution_endpoint(state, endpoint)
+    # The workflow is already pinned to its original account. A pristine
+    # NEW/PROMPT_SET ledger is not permission for cross-endpoint migration.
+    assert state["endpoint_pinned"] is True
+    assert worker._prepare_execution_endpoint(state, endpoint) is False
     assert hop["request_id"] == request
     assert ledger.get(request).attempts == 0
     assert ledger.get(request).receipt is None
@@ -149,7 +152,10 @@ def test_pristine_prompt_set_ledger_request_can_relocate_without_replay(tmp_path
     endpoint = store.endpoints.add("9202")["endpoint_id"]
     request = hop["request_id"]
     ledger.update(request, status=RequestStatus.PROMPT_SET)
-    assert worker._prepare_execution_endpoint(state, endpoint)
+    # The workflow is already pinned to its original account. A pristine
+    # NEW/PROMPT_SET ledger is not permission for cross-endpoint migration.
+    assert state["endpoint_pinned"] is True
+    assert worker._prepare_execution_endpoint(state, endpoint) is False
     current = ledger.get(request)
     assert hop["request_id"] == request
     assert current.status is RequestStatus.PROMPT_SET

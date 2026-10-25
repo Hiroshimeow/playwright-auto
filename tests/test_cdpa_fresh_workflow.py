@@ -70,7 +70,11 @@ def _fresh_task(tmp_path: Path):
         task_id="task-fresh-workflow",
         context_policy="fresh",
     )
-    return state, CDPAWorker(config, store=store)
+    worker = CDPAWorker(config, store=store)
+    # These tests invoke _pre_send without run_once; the real scheduler first
+    # admits the exact registered endpoint and materializes role affinity.
+    assert worker._prepare_execution_endpoint(state, str(state["browser_endpoint_id"]))
+    return state, worker
 
 
 def test_explicit_fresh_first_send_opens_plain_new_chat_without_bootstrap(tmp_path: Path):
