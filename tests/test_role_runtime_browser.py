@@ -4,6 +4,8 @@ from tempfile import TemporaryDirectory
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from playwright_auto.cdpa_runtime_db import RuntimeDB
 from playwright_auto.chatgpt import (
     ChatGPTPage,
@@ -17,6 +19,18 @@ from playwright_auto.chatgpt import (
 from playwright_auto.role_runtime import Action, Decision, RoleController
 from test_chatgpt_mcp_permission import _with_page
 from test_operational_contract import snapshot
+
+
+_RUNTIME_RESOURCES = []
+
+
+@pytest.fixture(autouse=True)
+def close_runtime_resources():
+    yield
+    while _RUNTIME_RESOURCES:
+        runtime_db, db_dir = _RUNTIME_RESOURCES.pop()
+        runtime_db.close()
+        db_dir.cleanup()
 
 
 def request():
@@ -35,6 +49,7 @@ def environment(client):
     db_dir = TemporaryDirectory()
     runtime_db = RuntimeDB(__import__("pathlib").Path(db_dir.name) / "runtime.sqlite")
     runtime_db.ensure_schema()
+    _RUNTIME_RESOURCES.append((runtime_db, db_dir))
     worker = SimpleNamespace(
         runtime_db=runtime_db, _runtime_db_dir=db_dir,
         _validate_response_candidate=lambda *_: None,
