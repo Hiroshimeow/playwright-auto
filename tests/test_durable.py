@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -326,6 +327,7 @@ def test_ledger_peek_uses_replacement_safe_reader(tmp_path, monkeypatch):
     assert calls == [ledger_path.resolve()]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only sharing/replace semantics; verify on FJP")
 def test_ledger_replace_retries_transient_windows_permission_error(tmp_path, monkeypatch):
     ledger_path = tmp_path / "ledger.json"
     real_replace = durable_module.atomic_replace
@@ -347,6 +349,7 @@ def test_ledger_replace_retries_transient_windows_permission_error(tmp_path, mon
     assert not ledger_path.with_suffix(".json.tmp").exists()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only sharing/replace semantics; verify on FJP")
 def test_ledger_replace_contention_exhaustion_preserves_old_target_and_tmp(tmp_path, monkeypatch):
     ledger_path = tmp_path / "ledger.json"
     ledger = RequestLedger(ledger_path)

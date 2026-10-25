@@ -148,6 +148,7 @@ def test_worker_custom_hop_uses_snapshotted_prompt_and_dynamic_routes(tmp_path: 
     hop["physical_role"] = state["roles"][route_key]["physical_role"]
     state["active_role"] = route_key
     worker = CDPAWorker(store.config, store=store)
+    assert worker._prepare_execution_endpoint(state, str(state["browser_endpoint_id"]))
 
     asyncio.run(worker._pre_send(state, hop, FakeActions()))
 
@@ -185,6 +186,7 @@ def test_custom_agent_receives_real_hop_and_routes_onward(tmp_path: Path):
         roles=("PLAN", route_key, "REVIEW"),
     )
     worker = CDPAWorker(store.config, store=store)
+    assert worker._prepare_execution_endpoint(state, str(state["browser_endpoint_id"]))
     actions = FakeActions()
 
     plan_hop = _active_hop(state)

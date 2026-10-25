@@ -36,6 +36,27 @@ def test_new_generation_closes_only_exact_role_not_team_peers(tmp_path, monkeypa
     assert acquired.client.page not in [plan, dev, other]
 
 
+def test_history_controller_never_evaluates_non_chatgpt_pages(tmp_path):
+    _, _, _state, worker = setup_task(tmp_path)
+    evaluated = []
+
+    class Page:
+        url = ""
+
+        def is_closed(self):
+            return False
+
+        async def evaluate(self, _script):
+            evaluated.append(True)
+            return ""
+
+    asyncio.run(
+        worker._maintain_ambient_page_automation(SimpleNamespace(pages=[Page()]))
+    )
+
+    assert evaluated == []
+
+
 def test_history_controller_skips_terminal_owned_pages(tmp_path, monkeypatch):
     _, _, state, worker = setup_task(tmp_path)
     state.update(status="DONE", terminal_state="DONE", active_role=None, active_hop_id=None)

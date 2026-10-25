@@ -129,7 +129,9 @@ def test_missing_pause_report_repairs_artifact_without_changing_pause_route(tmp_
         "resume_condition=external_input_provided\n",
         encoding="utf-8",
     )
-    repair["response"] = json.dumps({"route": "PLAN", "handoff": handoff})
+    # A report repair must return the same frozen route, not silently change
+    # the original PAUSE decision while fixing only its missing artifact.
+    repair["response"] = json.dumps({"route": "PAUSE", "handoff": handoff})
     repair["state"] = "responded"
 
     worker._responded(state, repair)

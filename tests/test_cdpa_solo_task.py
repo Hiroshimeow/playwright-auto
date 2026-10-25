@@ -116,17 +116,20 @@ def test_solo_requires_exactly_one_role(
         )
 
 
-def test_solo_rejects_unknown_role(tmp_path: Path):
+def test_one_role_task_freezes_generic_valid_role_without_inventing_extra_roles(tmp_path: Path):
     _config, store = make_store(tmp_path)
-
-    with pytest.raises(ValueError, match="unknown workflow roles"):
-        store.create_task(
-            "Bad role",
-            task_id="solo-bad-role",
-            workflow_mode="solo",
-            roles=("UNKNOWN",),
-            browser_endpoint_id="9222",
-        )
+    # Spec003 permits arbitrary validated role keys. An unregistered role
+    # receives a frozen generic constructor rather than a dynamic lookup.
+    state = store.create_task(
+        "Generic role",
+        task_id="generic-one-role",
+        workflow_mode="solo",  # Legacy entry is mapped to one-role TeamTask.
+        roles=("UNKNOWN",),
+        browser_endpoint_id="9222",
+    )
+    assert list(state["roles"]) == ["UNKNOWN"]
+    assert state["workflow_agents"]["UNKNOWN"]["route_key"] == "UNKNOWN"
+    assert state["reachable_roles"] == ["UNKNOWN"]
 
 
 def test_solo_requires_explicit_browser_endpoint(tmp_path: Path):
@@ -384,8 +387,10 @@ def test_solo_repeated_invalid_repairs_are_bounded(tmp_path: Path):
             break
 
     assert state["status"] == "BLOCKED"
-    assert state["block_code"] == "route_validation_exhausted"
-    assert state["block_retryable"] is True
+    assert state["block_code"] == "ROUTE_VALIDATION_EXHAUSTED"
+    # The bounded automatic repair budget is exhausted; only an operator
+    # may explicitly resume/raise limits. A worker auto-retry is not safe.
+    assert state["block_retryable"] is False
     assert len(state["hops"]) == config.route_repair_attempts + 1
     assert active_hop(state)["repair_attempt"] == config.route_repair_attempts
 

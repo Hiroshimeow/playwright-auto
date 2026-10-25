@@ -50,6 +50,19 @@ def test_metadata_inventory_uses_one_minimal_evaluation():
     }
 
 
+def test_non_chatgpt_page_inventory_never_evaluates_page_script():
+    page = FakePage(page_id="ignored", url="")
+
+    result = asyncio.run(inspect_page_metadata(page))
+
+    assert page.scripts == []
+    assert result["url"] == ""
+    assert result["supported"] is False
+    assert result["online"] is True
+    assert result["page_id"] is None
+    assert result["task_id"] is None
+
+
 def test_browser_projection_is_stable_and_contains_no_chat_content():
     page = FakePage()
     context = SimpleNamespace(pages=[page])

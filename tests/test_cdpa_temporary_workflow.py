@@ -23,7 +23,10 @@ def _temporary_task(tmp_path: Path, *, task_id: str):
         task_id=task_id,
         temporary=True,
     )
-    return store, state, CDPAWorker(config, store=store)
+    worker = CDPAWorker(config, store=store)
+    # Direct _pre_send tests must include scheduler endpoint admission.
+    assert worker._prepare_execution_endpoint(state, str(state["browser_endpoint_id"]))
+    return store, state, worker
 
 
 class TemporaryWorkflowActions(FakeActions):

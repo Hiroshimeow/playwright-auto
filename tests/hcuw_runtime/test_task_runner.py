@@ -271,6 +271,63 @@ def test_ensure_legacy_runtime_never_spawns_duplicate_when_port_is_bound(
     assert runner.ensure_legacy_runtime()["status"] == "already_running"
 
 
+@pytest.mark.parametrize(
+    "health_payload",
+    [
+        {"ok": True},
+        {"ok": True, "independent_activation_enabled": True},
+    ],
+)
+def test_existing_legacy_runtime_must_prove_independent_activation_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, health_payload: dict
+) -> None:
+    runner = make_runner(tmp_path)
+    # Probe the actual health contract, not a mocked successful capability check.
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps(health_payload).encode()
+
+    monkeypatch.setattr("playwright_auto.hcuw_runtime.task_runner.urlopen", lambda *_a, **_k: Response())
+
+    with pytest.raises(RuntimeTaskRunnerError) as error:
+        runner.ensure_legacy_runtime()
+
+    assert error.value.reason == "legacy_runtime_incompatible"
+    assert "Independent Agent execution" in error.value.message
+
+
+def test_existing_legacy_runtime_is_adopted_after_team_only_capability_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = make_runner(tmp_path)
+    # Probe the actual health contract, not a mocked successful capability check.
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {"ok": True, "repository_root": str(tmp_path.resolve()),
+                 "independent_activation_enabled": False}
+            ).encode()
+
+    monkeypatch.setattr("playwright_auto.hcuw_runtime.task_runner.urlopen", lambda *_a, **_k: Response())
+
+    assert runner.ensure_legacy_runtime() == {
+        "status": "already_running",
+        "api": "http://127.0.0.1:9225",
+    }
+
+
 def test_legacy_bridge_config_allows_repository_and_disables_builtin_agents(tmp_path: Path) -> None:
     (tmp_path / "cdpa.yaml").write_text(
         json.dumps({"repositories": {"allowed_roots": ["C:/other"]}, "independent_agents": {"seed_builtins": True}}),
@@ -282,6 +339,7 @@ def test_legacy_bridge_config_allows_repository_and_disables_builtin_agents(tmp_
 
     assert bridge["repositories"]["allowed_roots"] == ["C:/other", str(runner.config.repository_root)]
     assert bridge["independent_agents"]["seed_builtins"] is False
+    assert bridge["independent_agents"]["activation_enabled"] is False
     assert json.loads((tmp_path / "cdpa.yaml").read_text(encoding="utf-8"))["independent_agents"]["seed_builtins"] is True
 
 

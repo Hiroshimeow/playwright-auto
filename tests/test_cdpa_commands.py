@@ -88,7 +88,7 @@ def test_workflow_control_matrix_projects_positive_and_negative_durable_admissio
     assert tuple(matrix) == (
         "pause", "resume", "retry", "restart_role", "new_chat",
         "open_tab", "route_plan", "release_required_browser_endpoint",
-        "stop", "clear_team", "archive_worktree",
+        "stop", "clear_team", "archive_worktree", "increase_route_limits",
     )
     assert matrix["pause"]["eligible"] is True
     assert matrix["resume"]["eligible"] is True

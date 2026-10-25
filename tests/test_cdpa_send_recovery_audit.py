@@ -44,20 +44,26 @@ def test_recovery_send_does_not_require_old_account_conversation_baseline(tmp_pa
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
 
 
-def test_fresh_pristine_relocation_reacquires_surface_with_same_request(tmp_path):
-    store, state, worker, _, hop, ledger, _ = _prepare_pristine_new_sending_record(tmp_path, task_id="pristine-surface")
+def test_pinned_fresh_pristine_resume_cannot_relocate_to_another_endpoint(tmp_path):
+    store, state, worker, _, hop, ledger, _ = _prepare_pristine_new_sending_record(
+        tmp_path, task_id="pristine-surface"
+    )
+    # Even a durable NEW request (attempts=0) does not authorize silently
+    # moving an already pinned workflow to another browser/account. The
+    # bootstrap/fresh policy must not override the endpoint ownership.
     state["bootstrap"] = None
     state["context_policy"] = "fresh"
-    state["roles"]["PLAN"].update(context_source="fresh", bootstrap_source_donor=None,
-                                      browser_endpoint_id=store.endpoints.resolve()["endpoint_id"])
-    endpoint = store.endpoints.add("9202")["endpoint_id"]
-    request = hop["request_id"]
-    prompt = hop["prompt"]
-    assert worker._prepare_execution_endpoint(state, endpoint)
-    actions = TemporaryWorkflowActions()
-    acquired = asyncio.run(worker._owned_or_block(state, "PLAN", actions))
-    assert acquired is not None
-    assert actions.fresh_urls == ["https://chatgpt.com/"]
+    role = state["roles"]["PLAN"]
+    first = store.endpoints.resolve()["endpoint_id"]
+    role.update(context_source="fresh", bootstrap_source_donor=None, browser_endpoint_id=first)
+    second = store.endpoints.add("9202")["endpoint_id"]
+    request, prompt = hop["request_id"], hop["prompt"]
+    prior_page = (role["page_id"], role["page_url"])
+
+    assert state["endpoint_pinned"] is True
+    assert worker._prepare_execution_endpoint(state, second) is False
+    assert state["browser_endpoint_id"] == first
+    assert (role["page_id"], role["page_url"]) == prior_page
     assert hop["request_id"] == request and hop["prompt"] == prompt
     assert ledger.get(request).attempts == 0
 
