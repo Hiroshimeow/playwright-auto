@@ -114,6 +114,9 @@ def _run_worker_lease_probe(repository: str, entered) -> None:
 
     _worker_module.CDPAWorker = _Worker
     _worker_module.EndpointPool = _EndpointPool
+    # This child tests process-exclusive scheduling, not the environment's
+    # optional installed Playwright JS-bundle patch.
+    _worker_module.ensure_playwright_dialog_autoclose_guard = lambda: False
     config = _SimpleNamespace(repository_root=_Path(repository), worker_poll_seconds=0.1)
     _asyncio.run(_worker_module._run(config))
 
@@ -268,6 +271,8 @@ def setup_task(
     roles=None,
     repository=None,
     bootstrap=None,
+    self_route_policy=None,
+    max_routes=None,
 ):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
@@ -279,8 +284,15 @@ def setup_task(
         roles=roles,
         repository=repository,
         bootstrap=bootstrap,
+        **({"self_route_policy": self_route_policy} if self_route_policy is not None else {}),
+        **({"max_routes": max_routes} if max_routes is not None else {}),
     )
-    return config, store, state, CDPAWorker(config, store=store)
+    worker = CDPAWorker(config, store=store)
+    # Unit tests invoke _pre_send directly, bypassing run_once's endpoint-pool
+    # admission. Reproduce that real admission before browser provider dispatch.
+    # Do not weaken ProviderDispatcher's registered-endpoint requirement.
+    assert worker._prepare_execution_endpoint(state, str(state["browser_endpoint_id"]))
+    return config, store, state, worker
 
 
 def _persist_removed_endpoint_cleanup(store, state):
@@ -731,7 +743,12 @@ def test_cleanup_identical_failure_caps_and_changed_evidence_resets_streak(
     assert capped["roles"]["PLAN"]["page_id"] == "legacy-page"
     assert actions.closed_teams == 0
 
-    capped["roles"]["PLAN"]["browser_endpoint_id"] = "legacy-2"
+    # A pinned task cannot migrate its role to legacy-2. Distinct cleanup
+    # evidence can still arrive from a subsequent verification attempt.
+    async def different_preflight_error(_state, _actions):
+        raise RoleOwnershipError("cleanup failed on a newly observed target")
+
+    monkeypatch.setattr(worker, "_cleanup_preflight", different_preflight_error)
     capped["cleanup"]["retry_suppressed"] = False
     capped["cleanup"]["next_retry_at"] = clock.isoformat()
     capped = store.save(capped["manifest_path"], capped)
@@ -740,7 +757,7 @@ def test_cleanup_identical_failure_caps_and_changed_evidence_resets_streak(
     changed = store.load(state["manifest_path"])
     assert changed["cleanup"]["same_failure_count"] == 1
     assert changed["cleanup"]["retry_suppressed"] is False
-    assert "legacy-2" in changed["cleanup"]["last_error"]
+    assert "newly observed target" in changed["cleanup"]["last_error"]
 
 
 def test_zero_progress_close_verification_failure_reaches_retry_cap(
@@ -1295,7 +1312,7 @@ def test_pause_requested_during_role_acquisition_survives_and_applies_before_sen
     actions = ConcurrentAcquireActions()
     monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
 
-    first = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+    first = asyncio.run(worker.advance(path, SimpleNamespace(pages=[]), endpoint_id=str(state["browser_endpoint_id"])))
 
     assert first == store.load(path)
     assert _active_hop(first)["state"] == "sending"
@@ -1327,7 +1344,7 @@ def test_pause_requested_after_accepted_send_survives_without_duplicate_send(
     path = Path(state["manifest_path"])
     worker = CDPAWorker(config, store=store)
     monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: FakeActions())
-    prepared = asyncio.run(worker.advance(path, SimpleNamespace(pages=[])))
+    prepared = asyncio.run(worker.advance(path, SimpleNamespace(pages=[]), endpoint_id=str(state["browser_endpoint_id"])))
     assert _active_hop(prepared)["state"] == "sending"
 
     class ConcurrentSendClient(RecordingCDPASendClient):
@@ -1875,7 +1892,7 @@ def test_missing_local_file_report_preserves_route_and_queues_report_repair(tmp_
     asyncio.run(worker._pre_send(state, repair, FakeActions()))
     assert "CDPA_REPORT_REPAIR" in repair["prompt"]
     assert "prior route was DEV" in repair["prompt"]
-    assert "historical context, not a lock" in repair["prompt"]
+    assert "route is locked for this report-only repair" in repair["prompt"]
     assert handoff in repair["prompt"]
     assert '"route":"DEV"' in repair["prompt"]
     assert len(repair["prompt"]) <= 2500
@@ -1888,14 +1905,43 @@ def test_missing_local_file_report_preserves_route_and_queues_report_repair(tmp_
         "# PLAN report\n\n## Evidence\n- Inspected `path=.plan/alpha/alpha-plan_turn1_task-missing-local-report.md`.\n- `send_attempts=1` -> recovered report artifact without replay.\n",
         encoding="utf-8",
     )
+    # This is an artifact-only repair: a new route would silently rewrite an
+    # accepted handoff. Keep the original route frozen through reconciliation.
+    repair["response"] = json.dumps({"route": "DEV", "handoff": handoff})
+    repair["state"] = "responded"
+    worker._responded(state, repair)
+
+    assert repair["route"] == "DEV"
+    assert _active_hop(state)["target_role"] == "DEV"
+    assert _active_hop(state)["kind"] == "handoff"
+
+
+
+def test_report_repair_cannot_change_prior_nonpause_route(tmp_path: Path):
+    _store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-report-repair-route-locked"
+    )
+    handoff = str(hop["expected_report_path"])
+    hop["response"] = json.dumps({"route": "DEV", "handoff": handoff})
+    hop["state"] = "responded"
+    worker._responded(state, hop)
+    repair = _active_hop(state)
+    assert repair["kind"] == "report_repair"
+    assert repair["locked_route"] == "DEV"
+
+    report = tmp_path / handoff
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("# Verified PLAN report\n\nEvidence exists.\n", encoding="utf-8")
     repair["response"] = json.dumps({"route": "REVIEW", "handoff": handoff})
     repair["state"] = "responded"
     worker._responded(state, repair)
 
-    assert repair["route"] == "REVIEW"
-    assert _active_hop(state)["target_role"] == "REVIEW"
-    assert _active_hop(state)["kind"] == "handoff"
-
+    assert not any(
+        entry.get("target_role") == "REVIEW" and entry.get("kind") == "handoff"
+        for entry in state["hops"]
+    )
+    assert _active_hop(state)["kind"] == "route_repair"
+    assert "locked route" in _active_hop(state)["validation_error"]
 
 def test_gate_a_report_repair_rejects_default_forbidden_self_route(tmp_path: Path):
     _store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
@@ -2251,6 +2297,10 @@ def test_open_tab_recovers_presend_role_offline_and_sends_original_once(
         tmp_path, task_id="task-open-tab-presend-recovery"
     )
     path = Path(state["manifest_path"])
+    # Scheduler would persist the one endpoint before opening the first page.
+    # This fixture injects a lost owned page, so establish that durable
+    # boundary first rather than accidentally testing a reassignment.
+    state = store.pin_workflow_endpoint(path, str(state["browser_endpoint_id"]))
     worker.runtime_db.ensure_schema()
     hop = _active_hop(state)
     original_hop_id = hop["hop_id"]
@@ -2307,6 +2357,10 @@ def test_open_tab_recovers_presend_role_offline_and_sends_original_once(
 
     class RecoveryClient:
         async def assert_ownership(self):
+            return current
+
+        async def wait_until_clean_ready(self, *, timeout_ms):
+            assert timeout_ms > 0
             return current
 
         async def wait_snapshot(self, _receipt, **_kwargs):
@@ -2390,7 +2444,7 @@ def test_open_tab_recovers_presend_role_offline_and_sends_original_once(
 
     recovered = asyncio.run(worker.advance(path, context))
     recovered_hop = _active_hop(recovered)
-    assert recovered["status"] == "RUNNING"
+    assert recovered["status"] == "RUNNING", (recovered.get("block_code"), recovered.get("block_reason"), recovered.get("active_action"), recovered["controls"][0].get("result"))
     assert recovered["kanban_column"] == "PLANNING"
     assert recovered["block_code"] is None
     assert recovered["block_reason"] is None
@@ -4128,6 +4182,9 @@ def test_cdpa_uploads_once_per_role_conversation_generation(tmp_path: Path, monk
         upload_paths=[attachment],
     )
     worker = CDPAWorker(config, store=store)
+    # This test calls the private browser workflow directly. Production admits
+    # the registered endpoint before entering _pre_send.
+    assert worker._prepare_execution_endpoint(state, str(state["browser_endpoint_id"]))
     captured_files: list[tuple[str, ...]] = []
 
     class Client:
@@ -4544,7 +4601,7 @@ def test_runtime_worker_consumes_new_requested_control_during_unrelated_slow_cyc
             reopen_calls += 1
             assert foreground is True
             return AcquiredRole(
-                client=SimpleNamespace(),
+                client=SimpleNamespace(wait_until_clean_ready=AsyncMock()),
                 page_id="target-plan-page",
                 url="https://chatgpt.com/c/target-plan",
                 created=False,
@@ -4774,6 +4831,8 @@ def test_run_heartbeat_ticks_while_startup_hydration_is_blocking(
 
     monkeypatch.setattr(worker_module, "CDPAWorker", _Worker)
     monkeypatch.setattr(worker_module, "EndpointPool", _EndpointPool)
+    # Worker heartbeat is independent of Playwright installation layout.
+    monkeypatch.setattr(worker_module, "ensure_playwright_dialog_autoclose_guard", lambda: False)
     timer = threading.Thread(target=observe_and_release)
     timer.start()
     config = SimpleNamespace(
@@ -5620,7 +5679,7 @@ def test_active_accepted_waiting_offline_reopens_without_resend_or_clean_compose
 
     assert result == acquired
     assert actions.reopen_calls == [(False, False)]
-    assert actions.wake_calls == [acquired]
+    assert actions.wake_calls == []  # observation must not steal foreground focus
     assert hop["state"] == "waiting"
     assert hop["request_id"] == original_request_id
     assert hop["receipt"] == receipt
@@ -5660,6 +5719,8 @@ def test_change_goal_keeps_current_prompt_and_updates_first_later_hop(tmp_path: 
         state["manifest_path"], "Replacement for later roles",
         external_command_id="cmd-goal-prompt",
     )
+    # Reloaded test state has not traversed scheduler endpoint admission.
+    assert worker._prepare_execution_endpoint(state, str(state["browser_endpoint_id"]))
     current = _active_hop(state)
     asyncio.run(worker._pre_send(state, current, FakeActions()))
     assert "Goal: Implement exact production behavior" in current["prompt"]
@@ -6484,7 +6545,7 @@ def test_rate_limit_defers_only_missing_tab_control(tmp_path: Path, action: str)
 
 
 @pytest.mark.parametrize("status", ["DONE", "STOPPED", "PAUSED", "BLOCKED"])
-def test_ambient_old_registered_tabs_keep_auto_allow(status: str, tmp_path: Path, monkeypatch):
+def test_ambient_history_tabs_never_auto_allow_without_running_controller(status: str, tmp_path: Path, monkeypatch):
     _config, _store, _state, worker = setup_task(
         tmp_path, task_id=f"task-ambient-history-{status.lower()}"
     )
@@ -6533,7 +6594,7 @@ def test_ambient_old_registered_tabs_keep_auto_allow(status: str, tmp_path: Path
                 "label": "Allow mcp-g8 for this conversation",
             }}
 
-        async def auto_allow_mcp_permission(self, *, passive_action=None):
+        async def auto_allow_mcp_permission(self, *, passive_action=None, **_identity):
             calls.append(("allow", passive_action["target_message_id"]))
             return {"method": "react_handler", "target_message_id": passive_action["target_message_id"]}
 
@@ -6550,8 +6611,8 @@ def test_ambient_old_registered_tabs_keep_auto_allow(status: str, tmp_path: Path
     if status in {"DONE", "STOPPED"}:
         assert calls == []
     else:
-        assert ("allow", "history-call") in calls
-        assert "clear" in calls
+        # Passive history may observe the tab but never clicks LISTEN actions.
+        assert calls == ["listen"]
 
 
 def test_worker_source_identity_detects_runtime_config_drift(tmp_path: Path):
@@ -6647,7 +6708,7 @@ def test_ambient_old_tab_visible_allow_is_clicked_without_passive_event(tmp_path
         def page_observation(self):
             return {}
 
-        async def auto_allow_mcp_permission(self, *, passive_action=None):
+        async def auto_allow_mcp_permission(self, *, passive_action=None, **_identity):
             assert self.binding == PageBinding("page-history-dom", "cdpa-history-dom-plan")
             calls.append(passive_action)
             return {"method": "dom_click", "target_message_id": "", "remember_answer": "false"}
