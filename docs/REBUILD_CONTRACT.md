@@ -1,6 +1,6 @@
 # CDPA Clean Rebuild Contract
 
-Date: 2026-10-24
+Date: 2026-10-25
 
 ## Authority
 
@@ -71,7 +71,14 @@ Do not re-import legacy duplicated gates, stale LISTEN arbitration, focus-based 
 
 - G6 path: `E:\git-project\cdpa`
 - Branch: `rebuild/runtime-v2-r11`
-- Python: CPython 3.12.x virtual environment built from `uv.lock`
-- Baseline compile: PASS
-- Spec003 Gate A focused baseline: 26 passed
+- Verified runtime/test tree: `6bac3efd1c35c4bbcf6e2f229cf3e720593103aa`
+- Python: CPython 3.12.12 virtual environment built from `uv.lock`
+- Baseline compile and `git diff --check`: PASS
+- Spec003 Gate B: 65 passed
+- Spec003 Phase 1.5: 26 passed
+- R11 critical runtime/attach set: 63 passed
+- Full regression clean-teardown run: 1927 passed, 45 skipped, stderr 0 bytes
+- FJP `runtime_v3` production parity: zero differences under `src/playwright_auto`
+- Gate B T059-T073: complete
+- Gate C T074+: open/deferred
 - CDPA server/dashboard/worker: intentionally OFF
