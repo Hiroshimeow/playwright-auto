@@ -89,21 +89,21 @@ Phase 1.5 closes the live-operation blockers found after Gate A: Business/Enterp
 
 ### Gate B implementation
 
-- [ ] T059 Update browser-provider audit/dashboard/worker decisions to use fresh DOM projection only; wake signals only trigger DOM reads. Carry forward the existing CDPA allow-button permission clicker for ChatGPT Web Business/Enterprise role turns, guarded by exact task/team/page ownership and composer safety, and record permission-click diagnostics before continuing the same wait_response turn.
-- [ ] T060 Implement ProviderDispatcher as single provider-selection owner.
-- [ ] T061 Implement durable ProviderJob owner and ProviderResult normalization.
-- [ ] T062 Add ChatGPT Web browser_dom provider wrapper that resolves explicit browser targets through BrowserEndpointRegistry/endpoint_id and does not establish a second raw-address/default-only transport path.
-- [ ] T063 Add Codex ACP/exec provider wrapper.
-- [ ] T064 Add Pi exec/long_timeout provider wrapper.
-- [ ] T065 Add custom/future provider fixture without route-logic change.
-- [ ] T066 Wire provider selection from explicit request, trigger policy, or capability policy; never legacy task mode names.
-- [ ] T067 Add full material API endpoints for handoff/prompt/skill/rule/report/task-context/log/artifact access under existing runtime bind/auth policy, including adopted-URL handoff context required by FR-041.
-- [ ] T068 Add CronJob -> TeamTask creation with deterministic idempotency.
-- [ ] T069 Add stale-heartbeat recovery -> TeamTask creation with deterministic idempotency.
-- [ ] T070 Gate/remove runtime-v2 Independent Agent activation and hide/deprecate its dashboard surfaces while preserving migration evidence.
-- [ ] T071 Implement TeamTask dependency DAG validation and readiness projection in the existing dependency/store owner; do not create ProviderJob dependency ids.
-- [ ] T072 Project CronJob, Heartbeat, and Dependency state in runtime-v2 API/dashboard as required by FR-020.
-- [ ] T073 Run Gate B focused tests.
+- [x] T059 Update browser-provider audit/dashboard/worker decisions to use fresh DOM projection only; wake signals only trigger DOM reads. Carry forward the existing CDPA allow-button permission clicker for ChatGPT Web Business/Enterprise role turns, guarded by exact task/team/page ownership and composer safety, and record permission-click diagnostics before continuing the same wait_response turn.
+- [x] T060 Implement ProviderDispatcher as single provider-selection owner.
+- [x] T061 Implement durable ProviderJob owner and ProviderResult normalization.
+- [x] T062 Add ChatGPT Web browser_dom provider wrapper that resolves explicit browser targets through BrowserEndpointRegistry/endpoint_id and does not establish a second raw-address/default-only transport path.
+- [x] T063 Add Codex ACP/exec provider wrapper.
+- [x] T064 Add Pi exec/long_timeout provider wrapper.
+- [x] T065 Add custom/future provider fixture without route-logic change.
+- [x] T066 Wire provider selection from explicit request, trigger policy, or capability policy; never legacy task mode names.
+- [x] T067 Add full material API endpoints for handoff/prompt/skill/rule/report/task-context/log/artifact access under existing runtime bind/auth policy, including adopted-URL handoff context required by FR-041.
+- [x] T068 Add CronJob -> TeamTask creation with deterministic idempotency.
+- [x] T069 Add stale-heartbeat recovery -> TeamTask creation with deterministic idempotency.
+- [x] T070 Gate/remove runtime-v2 Independent Agent activation and hide/deprecate its dashboard surfaces while preserving migration evidence.
+- [x] T071 Implement TeamTask dependency DAG validation and readiness projection in the existing dependency/store owner; do not create ProviderJob dependency ids.
+- [x] T072 Project CronJob, Heartbeat, and Dependency state in runtime-v2 API/dashboard as required by FR-020.
+- [x] T073 Run Gate B focused tests.
 
 ## Gate C: Adopted URL and Direct Chat Sessions (deferred)
 

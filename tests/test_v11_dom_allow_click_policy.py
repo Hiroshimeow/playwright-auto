@@ -151,12 +151,16 @@ def test_surface_changed_before_allow_dispatch_never_clicks_or_confirms_intent()
 
         client.auto_allow_mcp_permission = changed_after_snapshot
         state, hop, worker, acquired = environment(client)
-        result = await RoleController().run(worker, state, hop, acquired, None, wait_ms=0)
-        with worker.runtime_db.connection() as conn:
-            statuses = [row["status"] for row in conn.execute(
-                "SELECT status FROM command_queue WHERE kind='mcp_allow'"
-            ).fetchall()]
-        return result, statuses, await page.evaluate("window.__clicks || 0")
+        try:
+            result = await RoleController().run(worker, state, hop, acquired, None, wait_ms=0)
+            with worker.runtime_db.connection() as conn:
+                statuses = [row["status"] for row in conn.execute(
+                    "SELECT status FROM command_queue WHERE kind='mcp_allow'"
+                ).fetchall()]
+            return result, statuses, await page.evaluate("window.__clicks || 0")
+        finally:
+            worker.runtime_db.close()
+            worker._runtime_db_dir.cleanup()
 
     decision, statuses, clicks = asyncio.run(_with_page(
         '<main><div data-message-author-role="user" data-message-id="user-original">original task</div>'

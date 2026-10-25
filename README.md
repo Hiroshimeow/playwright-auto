@@ -245,7 +245,7 @@ uv tool update-shell
 From the control repository, the local wrapper uses the local source/runtime:
 
 ```powershell
-cd E:\git-project\playwright-auto-multicdp
+cd E:\git-project\cdpa
 cdpa "Repository/worktree: E:\git-project\target. Implement and verify the requested behavior."
 ```
 
