@@ -6759,11 +6759,21 @@ class CDPAWorker:
 
         writer = ConversationWriterLease(self.runtime_db)
         old_binding = writer.get_binding(old_binding_id)
-        if old_binding.get("canonical_conversation_id"):
-            raise ConversationLeaseError(
-                "CONVERSATION_IDENTITY_MISMATCH",
-                "canonical conversation binding cannot rotate during pristine recovery",
+        canonical_id = str(old_binding.get("canonical_conversation_id") or "").strip()
+        canonical_repair_rotation = False
+        if canonical_id:
+            observed_id = _recoverable_conversation_identity(acquired.url)
+            canonical_repair_rotation = bool(
+                hop.get("kind") in {"route_repair", "report_repair"}
+                and old_binding.get("reconciliation_only") is True
+                and str(old_binding.get("binding_status") or "") in {"blocked", "sealed"}
+                and observed_id == canonical_id
             )
+            if not canonical_repair_rotation:
+                raise ConversationLeaseError(
+                    "CONVERSATION_IDENTITY_MISMATCH",
+                    "canonical conversation binding cannot rotate outside a blocked pristine repair",
+                )
         endpoint_id = (
             str(hop.get("browser_endpoint_id") or "").strip()
             or self._execution_endpoint_id(state, role)
@@ -6779,7 +6789,10 @@ class CDPAWorker:
                 "CONVERSATION_IDENTITY_MISMATCH",
                 "endpoint or physical browser changed during pristine binding recovery",
             )
-        if str(old_binding.get("page_target_identity") or "") == str(acquired.page_id):
+        if (
+            str(old_binding.get("page_target_identity") or "") == str(acquired.page_id)
+            and not canonical_repair_rotation
+        ):
             return
 
         request_id = str(hop.get("request_id") or "").strip()
@@ -8319,6 +8332,15 @@ class CDPAWorker:
         decision: Any = None,
     ) -> None:
         self._complete_request_response(hop)
+        if hop.get("receipt") is not None:
+            # Route repair is a new browser turn. Once the accepted parent has
+            # terminal completion/validation evidence, release its writer lease
+            # before the repair child is allowed to prepare another Send.
+            self._gate_c_finish_role_turn(
+                state,
+                hop,
+                str(hop.get("target_role") or state.get("active_role") or ""),
+            )
         validation_error = sanitize_text(error, max_chars=2000)
         hop["validation_error"] = validation_error
         if decision is not None:

@@ -124,7 +124,19 @@ def test_t074_binding_drift_rejects_before_send(writers, field, value):
 def test_t078_adopted_identity_is_exact_and_unresolved_never_provisional(writers):
     from playwright_auto.cdpa_conversations import canonical_conversation
     assert canonical_conversation("https://chatgpt.com/c/abc?model=x") == "abc"
-    for url in ("https://evil.example/c/abc", "https://chatgpt.com/c/abc/extra", "https://chatgpt.com/"):
+    assert (
+        canonical_conversation(
+            "https://chatgpt.com/g/g-p-project-slug/c/abc?model=x"
+        )
+        == "abc"
+    )
+    for url in (
+        "https://evil.example/c/abc",
+        "https://chatgpt.com/c/abc/extra",
+        "https://chatgpt.com/",
+        "https://chatgpt.com/g/project/abc",
+        "https://chatgpt.com/g/project/x/abc",
+    ):
         with pytest.raises(ValueError, match="CONVERSATION_IDENTITY_MISMATCH"):
             canonical_conversation(url)
     original = bind(writers)

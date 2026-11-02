@@ -60,12 +60,24 @@ def canonical_conversation(url: str) -> str:
             "conversation URL is not an exact ChatGPT conversation",
         )
     pieces = [piece for piece in parsed.path.split("/") if piece]
-    if len(pieces) != 2 or pieces[0] != "c" or not pieces[1]:
+    if len(pieces) == 2 and pieces[0] == "c" and pieces[1]:
+        conversation_id = pieces[1]
+    elif (
+        len(pieces) == 4
+        and pieces[0] == "g"
+        and pieces[1]
+        and pieces[2] == "c"
+        and pieces[3]
+    ):
+        # ChatGPT Project conversations render under /g/<project>/c/<conversation>.
+        # The project segment is routing context; the canonical conversation
+        # identity remains the exact final /c/<id> segment.
+        conversation_id = pieces[3]
+    else:
         raise ConversationLeaseError(
             "CONVERSATION_IDENTITY_MISMATCH",
             "canonical conversation id is unavailable",
         )
-    conversation_id = pieces[1]
     if unquote(conversation_id).lower().startswith("local-chatgpt:"):
         raise ConversationLeaseError(
             "CONVERSATION_IDENTITY_MISMATCH",
