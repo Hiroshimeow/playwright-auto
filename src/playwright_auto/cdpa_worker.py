@@ -6694,6 +6694,145 @@ class CDPAWorker:
         raw = f"{state.get('task_id')}\n{role}\n{generation}"
         return "task-binding-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
+    def _gate_c_rotate_pristine_recovery_binding(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        role: str,
+        acquired: AcquiredRole,
+        durable: Any,
+        control: Mapping[str, Any],
+    ) -> None:
+        """Retire a stale page-scoped Gate-C binding after an explicit pristine Resume.
+
+        This is intentionally narrower than validate_binding(): it is allowed only
+        before the durable Send boundary, for the exact request/generation/page
+        reacquired by the active Resume control.
+        """
+        from .cdpa_conversations import ConversationLeaseError, ConversationWriterLease
+
+        if durable is None:
+            raise ConversationLeaseError(
+                "CONVERSATION_IDENTITY_MISMATCH",
+                "pristine binding rotation requires a durable request",
+            )
+        if (
+            durable.status not in {RequestStatus.NEW, RequestStatus.PROMPT_SET}
+            or int(durable.attempts or 0) != 0
+            or durable.receipt is not None
+            or durable.binding is not None
+        ):
+            raise ConversationLeaseError(
+                "CONVERSATION_IDENTITY_MISMATCH",
+                "binding rotation is forbidden after the durable Send boundary",
+            )
+        # Authorization is the _recover_pristine_preboundary_sending call-site
+        # itself. That path is entered only after either an explicit Resume or the
+        # worker's reserved pristine preboundary recovery has re-proven the exact
+        # durable request as attempts=0 with no receipt/binding evidence.
+
+        role_record = state["roles"][role]
+        old_binding_id = str(
+            role_record.get("conversation_binding_id")
+            or hop.get("conversation_binding_id")
+            or ""
+        ).strip()
+        if not old_binding_id:
+            return
+
+        generation = int(role_record.get("conversation_generation") or 0)
+        if int(hop.get("conversation_generation") or generation) != generation:
+            raise ConversationLeaseError(
+                "CONVERSATION_IDENTITY_MISMATCH",
+                "binding rotation generation changed during pristine recovery",
+            )
+
+        writer = ConversationWriterLease(self.runtime_db)
+        old_binding = writer.get_binding(old_binding_id)
+        if old_binding.get("canonical_conversation_id"):
+            raise ConversationLeaseError(
+                "CONVERSATION_IDENTITY_MISMATCH",
+                "canonical conversation binding cannot rotate during pristine recovery",
+            )
+        endpoint_id = (
+            str(hop.get("browser_endpoint_id") or "").strip()
+            or self._execution_endpoint_id(state, role)
+            or self.store.endpoint_id_for(state)
+        )
+        cdp_url, physical_id = self._gate_c_endpoint_evidence(endpoint_id)
+        if (
+            old_binding.get("endpoint_id") != endpoint_id
+            or old_binding.get("endpoint_cdp_url") != cdp_url
+            or old_binding.get("physical_browser_id") != physical_id
+        ):
+            raise ConversationLeaseError(
+                "CONVERSATION_IDENTITY_MISMATCH",
+                "endpoint or physical browser changed during pristine binding recovery",
+            )
+        if str(old_binding.get("page_target_identity") or "") == str(acquired.page_id):
+            return
+
+        attempt_id = str(hop.get("send_attempt_id") or "").strip()
+        if attempt_id:
+            command = self.runtime_db.get_command(attempt_id)
+            payload = command.get("payload") if isinstance(command, Mapping) else None
+            attempt = payload.get("send_attempt") if isinstance(payload, Mapping) else None
+            attempt_state = str((attempt or {}).get("state") or "")
+            if attempt_state == "intent_recorded":
+                writer.transition_attempt(
+                    attempt_id,
+                    "reconciled_absent",
+                    metadata={
+                        "reconciled_reason": "pristine_resume_page_reacquired",
+                        "reconciled_at": utc_now(),
+                    },
+                )
+            elif attempt_state not in {"", "reconciled_absent"}:
+                raise ConversationLeaseError(
+                    "CONVERSATION_IDENTITY_MISMATCH",
+                    "Gate-C send attempt crossed the pristine recovery boundary",
+                )
+
+        try:
+            writer.release_writer(old_binding_id)
+        except ConversationLeaseError as exc:
+            if exc.code != "WRITER_LEASE_LOST":
+                raise
+        writer.release_async_wait(old_binding_id, seal=True)
+
+        control_id = str(control.get("control_id") or "resume")
+        request_id = str(hop.get("request_id") or "")
+        raw = "\n".join(
+            (
+                str(state.get("task_id") or ""),
+                role,
+                str(generation),
+                request_id,
+                control_id,
+                str(acquired.page_id),
+            )
+        )
+        new_binding_id = "task-binding-" + hashlib.sha256(
+            raw.encode("utf-8")
+        ).hexdigest()[:24]
+        audit = {
+            "at": utc_now(),
+            "kind": "pristine_preboundary_binding_rotation",
+            "control_id": control.get("control_id"),
+            "request_id": request_id,
+            "generation": generation,
+            "old_binding_id": old_binding_id,
+            "new_binding_id": new_binding_id,
+            "old_page_id": old_binding.get("page_target_identity"),
+            "new_page_id": str(acquired.page_id),
+        }
+        hop["conversation_binding_id"] = new_binding_id
+        hop["binding_recovery"] = audit
+        hop.pop("writer_lease_epoch", None)
+        hop.pop("send_attempt_id", None)
+        role_record["conversation_binding_id"] = new_binding_id
+        state.setdefault("control_events", []).append(dict(audit))
+
     def _gate_c_endpoint_evidence(self, endpoint_id: str) -> tuple[str, str]:
         from .cdpa_conversations import ConversationLeaseError
 
@@ -6811,9 +6950,28 @@ class CDPAWorker:
         baseline_last_user_message_id = (
             user_messages[-1].message_id if user_messages else None
         )
+        attempt_key = f"browser-send:{hop['request_id']}"
+        existing_attempt_command = self.runtime_db.get_command_by_idempotency_key(
+            attempt_key
+        )
+        existing_attempt = None
+        if isinstance(existing_attempt_command, Mapping):
+            payload = existing_attempt_command.get("payload")
+            existing_attempt = (
+                payload.get("send_attempt")
+                if isinstance(payload, Mapping)
+                else None
+            )
+        if str((existing_attempt or {}).get("state") or "") == "reconciled_absent":
+            retry_index = 1
+            while self.runtime_db.get_command_by_idempotency_key(
+                f"{attempt_key}:retry:{retry_index}"
+            ) is not None:
+                retry_index += 1
+            attempt_key = f"{attempt_key}:retry:{retry_index}"
         attempt, _ = writer.record_send_intent(
             lease,
-            idempotency_key=f"browser-send:{hop['request_id']}",
+            idempotency_key=attempt_key,
             text=str(hop.get("prompt") or ""),
             baseline_last_user_message_id=baseline_last_user_message_id,
             baseline_user_turn_count=len(user_messages),
@@ -9706,6 +9864,16 @@ class CDPAWorker:
                     return
             action = "reacquire_preboundary_role"
             postcondition = "ownership_reacquired_before_send"
+        self._gate_c_rotate_pristine_recovery_binding(
+            state, hop, role, acquired, durable, control
+        )
+        if (acquired.created or acquired.new_chat) and (
+            explicit_fresh or temporary_recovery
+        ):
+            # The pristine replacement is now the origin page for this unchanged
+            # conversation generation. Persist that fact before _record_acquired
+            # deliberately normalizes the reusable role handle to new_chat=False.
+            hop["generation_started_here"] = True
         self._record_acquired(
             state,
             role,
