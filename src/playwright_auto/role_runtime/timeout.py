@@ -52,9 +52,20 @@ def handle(ctx: Context) -> Decision | None:
 
     backend_recovery_eligible = bool(
         ctx.wait.get("response_recovery_armed_for_sent_at")
-        and ctx.wait.get("live_listen_signature")
     )
     if backend_recovery_eligible:
+        current_status = str(ctx.network_status or "").strip().upper()
+        if current_status == "IS_STREAMING":
+            ctx.wait["controller_progress_at"] = ctx.now.isoformat()
+            ctx.wait.pop("timeout_status_checked_at", None)
+            return Decision(Action.WAIT, "response_still_active_backend")
+        if current_status == "COMPLETE":
+            # LISTEN/network status is completion evidence only; it never supplies
+            # the response body or route. Reconstruct from durable workspace/report.
+            return Decision(Action.REPAIR, "state_repair")
+        if current_status in {"FAILURE", "IS_STOP_REQUESTED"}:
+            return Decision(Action.REPAIR, "provider_stream_failure")
+
         checked_at = parse_time(ctx.wait.get("timeout_status_checked_at"))
         status_fresh = bool(
             checked_at

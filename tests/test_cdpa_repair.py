@@ -514,15 +514,15 @@ def test_repair_release_rearms_once_when_terminal_continuation_is_still_missing(
     actions = Actions()
     asyncio.run(worker._waiting(state, hop, actions, path))
     hop = _active_hop(state)
-    # Runtime-v2 never refreshes a page to discover missing terminal output.
-    # A released repair with no materialized response remains recoverable by
-    # an operator, but must preserve the exact accepted request and page.
-    assert state["status"] == "BLOCKED"
-    assert state["block_code"] == "response_terminal_missing"
-    assert hop["state"] == "waiting"
-    assert hop["wait"]["controller_reason"] == "response_terminal_missing"
-    assert calls == {"status": 0, "graph": 0, "locate": 1, "refresh": 0, "send": 0, "retry": 0, "restart": 0, "new_chat": 0}
-    record = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
+    # Backend COMPLETE is completion evidence only. The worker must not invent
+    # a response or replay the accepted Send; it queues same-role route repair
+    # from the existing durable workspace/report state.
+    assert state["status"] == "RUNNING"
+    assert state["active_action"] == "queued"
+    assert hop["kind"] == "route_repair"
+    assert hop["state"] == "pre_send"
+    assert calls == {"status": 1, "graph": 0, "locate": 1, "refresh": 0, "send": 0, "retry": 0, "restart": 0, "new_chat": 0}
+    record = RequestLedger(hop["ledger_path"]).get(before_record.request_id)
     assert record is not None and record.attempts == 1 and record.receipt == before_record.receipt
     assert not any(control["action"] == "resume" for control in state["controls"])
 

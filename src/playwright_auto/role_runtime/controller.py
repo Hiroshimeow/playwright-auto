@@ -465,7 +465,7 @@ class RoleController:
         if decision.action is Action.STATUS:
             wait["timeout_status_checked"] = True
             wait["timeout_status_checked_at"] = datetime.now(timezone.utc).isoformat()
-            wait["timeout_status"] = (
+            status = (
                 await worker._one_shot_stream_status(
                     actions,
                     receipt,
@@ -474,6 +474,37 @@ class RoleController:
                 if receipt
                 else None
             )
+            if not status:
+                try:
+                    listen = json.loads(str(wait.get("live_listen_signature") or "{}"))
+                except json.JSONDecodeError:
+                    listen = {}
+                status = str((listen or {}).get("status") or "").strip().upper() or None
+            wait["timeout_status"] = status
+            if status == "IS_STREAMING":
+                wait["controller_progress_at"] = datetime.now(timezone.utc).isoformat()
+                wait.pop("timeout_status_checked_at", None)
+                state["active_action"] = "wait_response"
+                return Decision(Action.WAIT, "response_still_active_backend")
+            if status == "COMPLETE":
+                worker._queue_format_repair(
+                    state,
+                    hop,
+                    None,
+                    RouteContractError(
+                        "accepted execution completed server-side without a bound DOM terminal; "
+                        "recover the route from existing workspace/report state without replaying the Send"
+                    ),
+                )
+                return Decision(Action.REPAIR, "state_repair")
+            if status in {"FAILURE", "IS_STOP_REQUESTED"}:
+                worker._block(
+                    state,
+                    "Provider stream failure requires operator recovery without replaying the accepted Send.",
+                    code="provider_stream_failure",
+                    retryable=True,
+                )
+                return Decision(Action.REPAIR, "provider_stream_failure")
             return decision
         if decision.action is Action.REPAIR and decision.reason != "malformed_result":
             if decision.reason == "state_repair":

@@ -709,6 +709,15 @@ def test_timeout_live_stream_evidence_checks_backend_before_terminal_missing():
     assert (complete.action, complete.reason) == (Action.REPAIR, "state_repair")
 
 
+def test_timeout_current_complete_network_status_repairs_without_dom_terminal():
+    wait = {
+        "controller_progress_at": (NOW - timedelta(seconds=605)).isoformat(),
+        "response_recovery_armed_for_sent_at": (NOW - timedelta(seconds=605)).isoformat(),
+    }
+    decision = step(snapshot(), wait, network_status="COMPLETE")
+    assert (decision.action, decision.reason) == (Action.REPAIR, "state_repair")
+
+
 def test_timeout_fresh_backend_streaming_rearms_bounded_wait():
     wait = {
         "controller_progress_at": (NOW - timedelta(seconds=605)).isoformat(),
