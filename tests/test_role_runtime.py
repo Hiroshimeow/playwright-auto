@@ -689,3 +689,53 @@ def test_stale_response_activity_turn_id_is_audit_evidence_not_presend_gate():
     )
     assert result.action is Action.WAIT
     assert result.reason == "ready"
+
+
+def test_timeout_live_stream_evidence_checks_backend_before_terminal_missing():
+    wait = {
+        "controller_progress_at": (NOW - timedelta(seconds=605)).isoformat(),
+        "response_recovery_armed_for_sent_at": (NOW - timedelta(seconds=605)).isoformat(),
+        "live_listen_signature": '{"status":"IS_STREAMING"}',
+    }
+    first = step(snapshot(), wait)
+    assert (first.action, first.reason) == (
+        Action.STATUS,
+        "response_timeout_status_check",
+    )
+
+    wait["timeout_status_checked_at"] = NOW.isoformat()
+    wait["timeout_status"] = "COMPLETE"
+    complete = step(snapshot(), wait)
+    assert (complete.action, complete.reason) == (Action.REPAIR, "state_repair")
+
+
+def test_timeout_fresh_backend_streaming_rearms_bounded_wait():
+    wait = {
+        "controller_progress_at": (NOW - timedelta(seconds=605)).isoformat(),
+        "response_recovery_armed_for_sent_at": (NOW - timedelta(seconds=605)).isoformat(),
+        "live_listen_signature": '{"status":"IS_STREAMING"}',
+        "timeout_status_checked_at": NOW.isoformat(),
+        "timeout_status": "IS_STREAMING",
+    }
+    decision = step(snapshot(), wait)
+    assert (decision.action, decision.reason) == (
+        Action.WAIT,
+        "response_still_active_backend",
+    )
+    assert wait["controller_progress_at"] == NOW.isoformat()
+    assert "timeout_status_checked_at" not in wait
+
+
+def test_timeout_fresh_backend_failure_requires_provider_recovery():
+    wait = {
+        "controller_progress_at": (NOW - timedelta(seconds=605)).isoformat(),
+        "response_recovery_armed_for_sent_at": (NOW - timedelta(seconds=605)).isoformat(),
+        "live_listen_signature": '{"status":"IS_STREAMING"}',
+        "timeout_status_checked_at": NOW.isoformat(),
+        "timeout_status": "FAILURE",
+    }
+    decision = step(snapshot(), wait)
+    assert (decision.action, decision.reason) == (
+        Action.REPAIR,
+        "provider_stream_failure",
+    )

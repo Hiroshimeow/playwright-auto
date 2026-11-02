@@ -49,6 +49,36 @@ def handle(ctx: Context) -> Decision | None:
             return Decision(Action.BLOCK, "response_stuck_active")
         ctx.wait["controller_progress_at"] = ctx.now.isoformat()
         return Decision(Action.WAIT, "response_still_active")
+
+    backend_recovery_eligible = bool(
+        ctx.wait.get("response_recovery_armed_for_sent_at")
+        and ctx.wait.get("live_listen_signature")
+    )
+    if backend_recovery_eligible:
+        checked_at = parse_time(ctx.wait.get("timeout_status_checked_at"))
+        status_fresh = bool(
+            checked_at
+            and (ctx.now - checked_at).total_seconds() <= 2 * ctx.policy.allow_stable_seconds
+        )
+        if not status_fresh:
+            return Decision(Action.STATUS, "response_timeout_status_check")
+
+        status = str(ctx.wait.get("timeout_status") or "").upper()
+        if status == "IS_STREAMING":
+            # A fresh backend status may extend the wait once, but it does not become
+            # a terminal response owner. Re-arm the bounded DOM wait and require a
+            # new one-shot check on the next timeout.
+            ctx.wait["controller_progress_at"] = ctx.now.isoformat()
+            ctx.wait.pop("timeout_status_checked_at", None)
+            return Decision(Action.WAIT, "response_still_active_backend")
+        if status == "COMPLETE":
+            # Server-side completion with no bound DOM terminal is recovery evidence,
+            # not a response body. Reconstruct the route from durable workspace/report
+            # state without replaying the accepted Send.
+            return Decision(Action.REPAIR, "state_repair")
+        if status in {"FAILURE", "IS_STOP_REQUESTED"}:
+            return Decision(Action.REPAIR, "provider_stream_failure")
+
     # Missing output is not malformed output. Never invent a repair candidate,
     # reload a Temporary document, or replay an accepted Send.
     return Decision(Action.BLOCK, "response_terminal_missing")

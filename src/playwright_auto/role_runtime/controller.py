@@ -464,7 +464,16 @@ class RoleController:
             return await self._provider_retry(worker, client, state, hop, receipt, snapshot)
         if decision.action is Action.STATUS:
             wait["timeout_status_checked"] = True
-            wait["timeout_status"] = await worker._one_shot_stream_status(actions, receipt) if receipt else None
+            wait["timeout_status_checked_at"] = datetime.now(timezone.utc).isoformat()
+            wait["timeout_status"] = (
+                await worker._one_shot_stream_status(
+                    actions,
+                    receipt,
+                    conversation_url=str(hop.get("conversation_url") or ""),
+                )
+                if receipt
+                else None
+            )
             return decision
         if decision.action is Action.REPAIR and decision.reason != "malformed_result":
             if decision.reason == "state_repair":
