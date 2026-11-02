@@ -33,6 +33,34 @@ def test_record_acquired_applies_runtime_model_gate_policy(tmp_path: Path):
     assert client.model_effort_gate_required is True
 
 
+def test_new_chat_generation_drops_previous_conversation_binding_pointer(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_task("generation binding reset", task_id="generation-binding-reset")
+    worker = CDPAWorker(config, store=store)
+    role = state["roles"]["PLAN"]
+    role["conversation_generation"] = 1
+    role["conversation_binding_id"] = "task-binding-generation-one"
+    role["page_id"] = "generation-one-page"
+    role["page_url"] = "https://chatgpt.com/c/generation-one"
+
+    worker._record_acquired(
+        state,
+        "PLAN",
+        AcquiredRole(
+            ready_client(state, "PLAN"),
+            "generation-two-page",
+            "https://chatgpt.com/",
+            True,
+            True,
+        ),
+    )
+
+    assert role["conversation_generation"] == 2
+    assert role.get("conversation_binding_id") is None
+    assert role["page_id"] == "generation-two-page"
+
+
 def test_canonical_branch_identity_survives_store_with_provisional_visible_url(tmp_path: Path):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)

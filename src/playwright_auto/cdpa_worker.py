@@ -2549,8 +2549,18 @@ class CDPAWorker:
             or not record.get("last_activity_at")
         )
         if acquired.new_chat:
+            previous_page_id = str(record.get("page_id") or "")
             record["conversation_generation"] = int(record.get("conversation_generation") or 0) + 1
             record.pop("branch_conversation_id", None)
+            # ConversationWriter bindings are generation-scoped, but some recovery
+            # adapters report new_chat=True while re-confirming the same physical
+            # page. Rotate the role pointer only when the page target actually
+            # changes. The old RuntimeDB binding remains historical evidence.
+            if (
+                record.get("conversation_binding_id")
+                and previous_page_id != str(acquired.page_id)
+            ):
+                record.pop("conversation_binding_id", None)
         if getattr(acquired, "conversation_id", None):
             record["branch_conversation_id"] = acquired.conversation_id
         generation = int(record.get("conversation_generation") or 0)
