@@ -10135,14 +10135,24 @@ class CDPAWorker:
                 state, hop, control, actions
             )
             return
-        if record is None or record.status is not RequestStatus.SENDING:
+        if record is None or record.status not in {RequestStatus.SENDING, RequestStatus.SENT}:
             self._require_resume_recovery(
                 state,
                 control,
                 action="none",
                 reason_code="durable_send_provenance_missing",
-                reason="Resume cannot reconcile the sending hop from an exact durable SENDING record.",
+                reason="Resume cannot reconcile the sending hop from an exact durable SENDING/SENT record.",
                 next_safe_action="Restore the durable request record; do not resend the prompt.",
+            )
+            return
+        if record.status is RequestStatus.SENT and record.receipt is None:
+            self._require_resume_recovery(
+                state,
+                control,
+                action="none",
+                reason_code="durable_send_provenance_missing",
+                reason="The durable SENT record has no accepted receipt and cannot prove the crossed Send boundary.",
+                next_safe_action="Restore the exact accepted receipt; do not inspect or resend the prompt.",
             )
             return
         source = record.source_context if isinstance(record.source_context, Mapping) else {}

@@ -2083,6 +2083,56 @@ def _prepare_sending_record(tmp_path: Path, *, task_id: str, bootstrap=None):
     return store, state, worker, path, hop, ledger, binding, baseline
 
 
+def test_resume_sending_hop_consumes_exact_durable_sent_receipt_without_page_or_resend(
+    tmp_path: Path,
+):
+    store, state, worker, _path, hop, ledger, binding, baseline = _prepare_sending_record(
+        tmp_path, task_id="task-resume-sent-receipt"
+    )
+    sending = ledger.get(hop["request_id"])
+    assert sending is not None
+    receipt = SendReceipt(
+        prompt=sending.rendered_prompt,
+        prompt_sha256=worker_module._sha(sending.rendered_prompt),
+        binding=binding,
+        baseline=baseline,
+        attempts=1,
+        accepted_via="exact_user_message",
+        session_id_before=sending.session_id_before,
+        user_message_id="sent-user-message",
+        user_turn_id="sent-user-turn",
+    )
+    ledger.update(
+        hop["request_id"],
+        status=RequestStatus.SENT,
+        accepted_at=1.0,
+        receipt=receipt.to_dict(),
+    )
+    state = _queue_blocked_resume(
+        store,
+        state,
+        code="durable_send_provenance_missing",
+        reason="accepted receipt exists while hop is still labeled sending",
+    )
+    hop = _active_hop(state)
+
+    class Actions:
+        async def locate_owned(self, *_args, **_kwargs):
+            raise AssertionError("exact durable SENT receipt must not inspect or resend the page")
+
+    control = state["controls"][-1]
+    asyncio.run(worker._recover_resume_sending(state, hop, control, Actions()))
+
+    current = ledger.get(hop["request_id"])
+    assert control["status"] == "applied"
+    assert control["result"]["action"] == "observe_progress"
+    assert current is not None
+    assert current.status is RequestStatus.SENT
+    assert current.attempts == 1
+    assert hop["state"] == "waiting"
+    assert state["active_action"] == "wait_response"
+
+
 def test_resume_raw_listen_streaming_does_not_promote_ambiguous_sending(tmp_path: Path):
     store, state, worker, path, hop, ledger, binding, _baseline = _prepare_sending_record(
         tmp_path, task_id="task-resume-ignore-listen-streaming"
