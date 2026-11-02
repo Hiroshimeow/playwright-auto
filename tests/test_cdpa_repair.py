@@ -514,14 +514,28 @@ def test_repair_release_rearms_once_when_terminal_continuation_is_still_missing(
     actions = Actions()
     asyncio.run(worker._waiting(state, hop, actions, path))
     hop = _active_hop(state)
-    # Backend COMPLETE is completion evidence only. The worker must not invent
-    # a response or replay the accepted Send; it queues same-role route repair
-    # from the existing durable workspace/report state.
+    # Backend COMPLETE is conversation-level evidence only. The first terminal
+    # uncertainty gets one bounded F5 on the exact accepted turn before repair.
+    assert state["status"] == "RUNNING"
+    assert state["active_action"] == "wait_response"
+    assert hop["kind"] != "route_repair"
+    assert calls == {"status": 1, "graph": 0, "locate": 1, "refresh": 1, "send": 0, "retry": 0, "restart": 0, "new_chat": 0}
+    assert hop["wait"]["terminal_reconcile"]["accepted_user_turn"]
+    hop["wait"].pop("refresh_ready_at", None)
+    hop["wait"]["controller_progress_at"] = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=worker.role_controller.policy.timeout_seconds + 5)
+    ).isoformat()
+
+    asyncio.run(worker._waiting(state, hop, actions, path))
+    hop = _active_hop(state)
+    # If the exact terminal still is not rendered after the bounded F5, the
+    # existing state-repair path may recover from durable workspace/report state.
     assert state["status"] == "RUNNING"
     assert state["active_action"] == "queued"
     assert hop["kind"] == "route_repair"
     assert hop["state"] == "pre_send"
-    assert calls == {"status": 1, "graph": 0, "locate": 1, "refresh": 0, "send": 0, "retry": 0, "restart": 0, "new_chat": 0}
+    assert calls == {"status": 2, "graph": 0, "locate": 2, "refresh": 1, "send": 0, "retry": 0, "restart": 0, "new_chat": 0}
     record = RequestLedger(hop["ledger_path"]).get(before_record.request_id)
     assert record is not None and record.attempts == 1 and record.receipt == before_record.receipt
     assert not any(control["action"] == "resume" for control in state["controls"])

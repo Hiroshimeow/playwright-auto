@@ -232,15 +232,21 @@ def test_malformed_result_queues_exact_parser_error_with_original_receipt_intact
     assert hop["receipt"] == request().to_dict()
 
 
-def test_missing_terminal_timeout_blocks_without_repair_or_replaying_send():
+def test_missing_terminal_timeout_refreshes_once_before_blocking_without_replay():
     class Client:
+        refreshes = 0
+
         async def install_page_observer(self):
             return None
 
         def page_observation(self):
             return {}
 
-    state, hop, worker, acquired = environment(Client())
+        async def refresh(self):
+            self.refreshes += 1
+
+    client = Client()
+    state, hop, worker, acquired = environment(client)
     queued = []
     worker._queue_format_repair = lambda *_args: queued.append(_args)
     worker._block = lambda _state, reason, **kwargs: _state.update(block_reason=reason, block_code=kwargs.get("code"))
@@ -253,7 +259,24 @@ def test_missing_terminal_timeout_blocks_without_repair_or_replaying_send():
     result = asyncio.run(RoleController().run(
         worker, state, hop, acquired, None, snapshot=snapshot(error_texts=("provider failed",)), wait_ms=0,
     ))
+    assert (result.action, result.reason) == (Action.WAIT, "terminal_reconcile_refresh")
+    assert client.refreshes == 1
+    assert queued == []
+    assert "block_code" not in state
+    assert hop["receipt"] == request().to_dict()
+
+    hop["wait"].pop("refresh_ready_at", None)
+    hop["wait"].update(
+        controller_progress_at=(datetime.now(timezone.utc) - timedelta(seconds=601)).isoformat(),
+        timeout_refreshed=True,
+        timeout_status_checked=True,
+        timeout_status="COMPLETE",
+    )
+    result = asyncio.run(RoleController().run(
+        worker, state, hop, acquired, None, snapshot=snapshot(error_texts=("provider failed",)), wait_ms=0,
+    ))
     assert (result.action, result.reason) == (Action.BLOCK, "response_terminal_missing")
+    assert client.refreshes == 1
     assert queued == []
     assert state["block_code"] == "response_terminal_missing"
     assert hop["receipt"] == request().to_dict()
@@ -263,11 +286,17 @@ def test_stable_retry_invokes_provider_retry_once_and_missing_terminal_blocks(tm
     class Client:
         retries = []
 
+        def __init__(self):
+            self.refreshes = 0
+
         async def install_page_observer(self):
             return None
 
         def page_observation(self):
             return {}
+
+        async def refresh(self):
+            self.refreshes += 1
 
         async def retry_generation(self, receipt, *, expected_task_id, expected_team):
             self.retries.append((receipt.user_message_id, expected_task_id, expected_team))
@@ -301,9 +330,24 @@ def test_stable_retry_invokes_provider_retry_once_and_missing_terminal_blocks(tm
     result = asyncio.run(RoleController().run(
         worker, state, hop, acquired, None, snapshot=snapshot(), wait_ms=0,
     ))
+    assert (result.action, result.reason) == (Action.WAIT, "terminal_reconcile_refresh")
+    assert acquired.client.refreshes == 1
+    assert "block_code" not in state
+    assert queued == []
+    assert hop["receipt"] == request().to_dict()
+
+    hop["wait"].pop("refresh_ready_at", None)
+    hop["wait"].update(
+        controller_progress_at=(datetime.now(timezone.utc) - timedelta(seconds=601)).isoformat(),
+        timeout_refreshed=True, timeout_status_checked=True, timeout_status="FAILURE",
+    )
+    result = asyncio.run(RoleController().run(
+        worker, state, hop, acquired, None, snapshot=snapshot(), wait_ms=0,
+    ))
     assert result.reason == "response_terminal_missing"
     assert state["block_code"] == "response_terminal_missing"
     assert state["retryable"] is True
+    assert acquired.client.refreshes == 1
     assert queued == []
     assert hop["receipt"] == request().to_dict()
 
@@ -358,10 +402,11 @@ def test_no_result_timeout_blocks_without_retry_click_or_replay(monkeypatch):
             block_reason=reason, block_code=kwargs.get("code")
         )
         result = await controller.run(worker, state, hop, acquired, None, wait_ms=0)
-        assert result.action is Action.BLOCK
-        assert state["block_code"] == "response_terminal_missing"
+        assert (result.action, result.reason) == (Action.WAIT, "terminal_reconcile_refresh")
+        assert "block_code" not in state
         assert "repair" not in state
         assert hop["receipt"] == request().to_dict()
+        assert hop["wait"]["terminal_reconcile"]["accepted_user_turn"]
         assert await page.evaluate("window.retryClicks || 0") == 0
         assert await page.evaluate("window.sentPrompts || []") == []
     asyncio.run(_with_page("""

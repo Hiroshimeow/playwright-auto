@@ -7885,11 +7885,11 @@ class CDPAWorker:
     ) -> str | None:
         conversation_id = str(receipt.conversation_id or "").strip()
         if not conversation_id:
-            conversation_id = (
+            identity = (
                 _recoverable_conversation_identity(conversation_url)
                 or _recoverable_conversation_identity(receipt.session_id_before)
-                or ""
             )
+            conversation_id = identity.rsplit("/", 1)[-1] if identity else ""
         reader = getattr(actions, "backend_stream_status", None)
         if not conversation_id or not callable(reader):
             return None

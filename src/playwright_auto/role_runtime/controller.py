@@ -20,6 +20,8 @@ from .signals import RoleSignals, SignalIdentity, record_cycle, record_signal_er
 _RATE_LIMIT_MARKERS = ("too many requests", "rate limit", "rate-limit", "request limit")
 _PROVIDER_CHALLENGE_MARKERS = ("cloudflare_challenge", "could not load chatgpt models")
 _TEMPORARY_SAVE_OFFER = "Want to keep this chat? You can now save it to your history."
+_TERMINAL_RECONCILE_REASONS = frozenset({"response_terminal_missing"})
+_TERMINAL_RECONCILE_REFRESH = "terminal_reconcile"
 
 
 class RoleController:
@@ -352,6 +354,42 @@ class RoleController:
         wait.pop("observation_error", None)
         return result
 
+    async def _reconcile_missing_terminal(
+        self,
+        client: Any,
+        snapshot: Any,
+        wait: dict[str, Any],
+        state: Mapping[str, Any],
+        receipt: Any,
+    ) -> Decision | None:
+        turn = response.accepted_turn_key(receipt) if receipt is not None else None
+        if not turn or state.get("conversation_mode") == "temporary":
+            return None
+        if (
+            str(getattr(snapshot, "composer_text", "") or "").strip()
+            or tuple(getattr(snapshot, "attachment_markers", ()) or ())
+        ):
+            return None
+        record = wait.get("terminal_reconcile")
+        if isinstance(record, Mapping) and record.get("accepted_user_turn") == turn:
+            return None
+        wait["terminal_reconcile"] = {
+            "accepted_user_turn": turn,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        for key in ("timeout_status_checked", "timeout_status_checked_at", "timeout_status"):
+            wait.pop(key, None)
+        await self.browser_action(
+            client,
+            snapshot,
+            wait,
+            None,
+            Decision(Action.REFRESH, _TERMINAL_RECONCILE_REFRESH),
+        )
+        wait["controller_decision"] = Action.WAIT.value
+        wait["controller_reason"] = "terminal_reconcile_refresh"
+        return Decision(Action.WAIT, "terminal_reconcile_refresh")
+
     async def _run(
         self, worker: Any, state: dict[str, Any], hop: dict[str, Any],
         acquired: Any, actions: Any, *, snapshot: Any = None,
@@ -438,6 +476,13 @@ class RoleController:
                 state["active_action"] = "wait_" + decision.reason
             return decision
         if decision.action is Action.BLOCK:
+            if phase == "waiting" and decision.reason in _TERMINAL_RECONCILE_REASONS:
+                reconciled = await self._reconcile_missing_terminal(
+                    client, snapshot, wait, state, receipt
+                )
+                if reconciled is not None:
+                    state["active_action"] = "wait_response"
+                    return reconciled
             worker._block(state, decision.reason, code=decision.reason, retryable=True)
             return decision
         if decision.action is Action.COOLDOWN:
@@ -487,6 +532,12 @@ class RoleController:
                 state["active_action"] = "wait_response"
                 return Decision(Action.WAIT, "response_still_active_backend")
             if status == "COMPLETE":
+                reconciled = await self._reconcile_missing_terminal(
+                    client, snapshot, wait, state, receipt
+                )
+                if reconciled is not None:
+                    state["active_action"] = "wait_response"
+                    return reconciled
                 worker._queue_format_repair(
                     state,
                     hop,
@@ -598,7 +649,7 @@ class RoleController:
             finish_refresh(wait)
             now = datetime.now(timezone.utc)
             wait["refresh_ready_at"] = (now + timedelta(seconds=self.policy.reload_settle_seconds)).isoformat()
-            if decision.reason != "response_timeout_recheck":
+            if decision.reason not in {"response_timeout_recheck", _TERMINAL_RECONCILE_REFRESH}:
                 wait["controller_progress_at"] = now.isoformat()
             wait["controller_last_refresh_at"] = now.isoformat()
             for key in ("mcp_allow_clicked_at", "mcp_allow_seen_at", "mcp_allow_retry_at"):

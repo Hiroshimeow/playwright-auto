@@ -5892,6 +5892,32 @@ def test_one_shot_stream_status_is_reserved_for_recovery_boundary(tmp_path: Path
     assert calls == [("status", canonical_id)]
 
 
+def test_one_shot_stream_status_normalizes_recoverable_conversation_path(tmp_path: Path):
+    from dataclasses import replace
+    _store, _state, worker, _path, _hop, receipt, _sent_at = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-stream-status-normalize"
+    )
+    calls = []
+
+    class Actions:
+        async def backend_stream_status(self, conversation_id):
+            calls.append(conversation_id)
+            return {"status": "COMPLETE"}
+
+    receipt = replace(receipt, conversation_id=None)
+    conversation_id = "6ae86b1d-4258-83ee-8271-971d1e4ea6bb"
+    status = asyncio.run(
+        worker._one_shot_stream_status(
+            Actions(),
+            receipt,
+            conversation_url=f"https://chatgpt.com/g/project/c/{conversation_id}",
+        )
+    )
+
+    assert status == "COMPLETE"
+    assert calls == [conversation_id]
+
+
 def test_record_response_reconciles_late_conversation_id_and_conflict_fails_closed(tmp_path: Path):
     from dataclasses import replace
     _store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
