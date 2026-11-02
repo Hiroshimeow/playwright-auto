@@ -6761,6 +6761,15 @@ class CDPAWorker:
                 "CONVERSATION_BINDING_INVALID",
                 "Temporary Chat has no verified document-scoped identity",
             )
+        verified_new_chat = bool(acquired.new_chat)
+        if not verified_new_chat and hop.get("generation_started_here") is True:
+            hop_generation = hop.get("conversation_generation")
+            verified_new_chat = (
+                hop_generation is not None
+                and int(hop_generation) == int(role_record.get("conversation_generation") or 0)
+                and str(role_record.get("page_id") or "") == str(acquired.page_id)
+                and str(role_record.get("page_url") or "") == str(acquired.url)
+            )
         observed = {
             "endpoint_id": endpoint_id,
             "endpoint_cdp_url": cdp_url,
@@ -6783,7 +6792,7 @@ class CDPAWorker:
                 physical_browser_id=physical_id,
                 page_target_identity=acquired.page_id,
                 conversation_url=acquired.url,
-                verified_new_chat=bool(acquired.new_chat),
+                verified_new_chat=verified_new_chat,
                 temporary_chat=temporary_chat,
                 temporary_document_id=temporary_document_id,
                 task_id=str(state.get("task_id") or ""),
