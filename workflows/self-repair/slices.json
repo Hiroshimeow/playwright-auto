@@ -1,0 +1,188 @@
+{
+  "campaign_id": "g6-cdpa-r11-gate-c-20261027",
+  "repository": "E:\\git-project\\cdpa",
+  "browser_endpoint_id": "4bc12276-da9c-4a7a-8ef9-ddcfcca6113f",
+  "browser_port": 9202,
+  "pi_model": "cliproxy-g8/gpt-5.6-luna",
+  "pi_thinking": "high",
+  "poll_seconds": 45,
+  "stall_seconds": 1200,
+  "max_recovery_attempts": 2,
+  "slices": [
+    {
+      "id": "01-inventory",
+      "title": "Map current Gate C gaps",
+      "task": "Read currently dirty Gate C code and tests. Do not modify product code. Produce one precise ordered set of remaining minimum fixes with source references and failing-first tests. This is an audit-only slice.",
+      "tests": [
+        "tests/test_spec003_gate_c_runtime.py",
+        "tests/test_gate_c_direct_chat_worker.py"
+      ]
+    },
+    {
+      "id": "01b-terminal-recovery",
+      "title": "Repair ChatGPT terminal DOM detection",
+      "task": "Fix ONE proven ChatGPT DOM terminal detection failure: Solo response is visibly final but CDPA BLOCKED with response_terminal_missing. Preserve existing source/dirty changes. Add failing-first test for current ChatGPT markup (without private data), fix existing DOM/RoleController owner only, prove terminal route is recovered without resending. No new generic DOM crawler.",
+      "tests": [
+        "tests/test_chatgpt.py",
+        "tests/test_spec003_gate_c_runtime.py"
+      ]
+    },
+    {
+      "id": "01c-terminal-fresh-retry",
+      "title": "Recover terminal DOM detection after Cloudflare restart",
+      "task": "The previous Solo task 01b was BLOCKED by a genuine Cloudflare challenge after an accepted Send; do NOT reuse or resend that accepted turn. This is a NEW conversation on G6 endpoint 9202. Read the BLOCKED 01b receipt and the 01-inventory evidence. Implement ONE failing-first regression for response_terminal_missing when assistant text and route JSON are visibly final, then fix the existing ChatGPT DOM/RoleController owner, not a parallel controller. Keep the R11 release gates. This is the only authorized fresh retry after the 9202 restart; if provider challenged again, report BLOCKED without further retry.",
+      "tests": [
+        "tests/test_role_runtime.py",
+        "tests/test_role_runtime_browser.py",
+        "tests/test_cdpa_repair.py",
+        "tests/test_spec003_gate_c_runtime.py"
+      ]
+    },
+    {
+      "id": "02-writer-lease",
+      "title": "Writer lease and exactly-once Send",
+      "task": "Repair ONE evidenced writer lease or SendAttempt fencing gap from inventory, with a failing-first regression. If no gap, prove that with tests and receipt.",
+      "tests": [
+        "tests/test_spec003_gate_c_runtime.py"
+      ]
+    },
+    {
+      "id": "03-adopted-url",
+      "title": "Adopted URL identity",
+      "task": "Repair ONE outstanding adopted URL binding/identity gate and demonstrate exact-page safety. No cross-account fallback.",
+      "tests": [
+        "tests/test_spec003_gate_c_runtime.py"
+      ]
+    },
+    {
+      "id": "04-direct-chat",
+      "title": "Direct Chat and DOM stream",
+      "task": "Finish ONE Direct Chat or DOM stream contract gap without adding a new controller or state store.",
+      "tests": [
+        "tests/test_gate_c_direct_chat_worker.py"
+      ]
+    },
+    {
+      "id": "05-endpoint-ui",
+      "title": "Endpoint registry and UI",
+      "task": "Finish one missing dynamic browser endpoint registration/probe/in-use guard or dashboard capability, with tests.",
+      "tests": [
+        "tests/test_spec003_gate_c_runtime.py"
+      ]
+    },
+    {
+      "id": "06-async-wait",
+      "title": "Async WAIT and wake back",
+      "task": "Finish one missing async continuation registration/callback/wake-back gate; never replay accepted Send.",
+      "tests": [
+        "tests/test_spec003_gate_c_runtime.py"
+      ]
+    },
+    {
+      "id": "07-regression",
+      "title": "Regression release gate",
+      "task": "Run gate-focused plus broad regression and fix ONE independently reproduced failure. If all green, produce clean teardown evidence.",
+      "tests": [
+        "tests/test_spec003_gate_c_runtime.py",
+        "tests/test_gate_c_direct_chat_worker.py"
+      ]
+    },
+    {
+      "id": "08-real-browser",
+      "title": "Real CDP release acceptance",
+      "task": "Using a NEW owned ChatGPT conversation on 9202 only, prove one Send/accepted reply, recovery, no unrelated tab interference, stable API/dashboard/worker, and document release PASS or NOT_ACCEPTED. No false claims.",
+      "tests": [
+        "tests/test_spec003_gate_c_runtime.py"
+      ]
+    },
+    {
+      "id": "09-postfix-real-cdp",
+      "title": "Verify live CDP after proven Resume control root-fix",
+      "task": "Perform ONE independent live browser acceptance check on a NEW owned ChatGPT conversation at 9202 after the TaskStore.resume_team nested-copy root-fix. Read prior 08 BLOCKED receipt and the accepted-Send ledger: old requests may NEVER be replayed. Verify exact new task model High/Extra High before composer fill and again before Send, require one accepted Send plus a stable valid terminal route; if a legitimate PAUSE requires operator Resume, reconcile the command exactly once without repeating the accepted hop. Capture unrelated-tab identities before/after without changing them; verify 9224/9225 health and 9202 readiness. Use the existing owners and narrow tests only. Write receipt 09-postfix-real-cdp.json with PASS only for proven live terminal, noninterference and exactly-once; otherwise BLOCKED/NOT_ACCEPTED, no false claims.",
+      "tests": [
+        "tests/test_cdpa_resume_control_store.py",
+        "tests/test_chatgpt_model_gate.py",
+        "tests/test_spec003_gate_c_runtime.py"
+      ]
+    },
+    {
+      "id": "10-release-review",
+      "title": "Independent R11 Gate C release evidence review",
+      "task": "Audit exact Gate C evidence after the postfix live-CDP task. Do NOT create, send or retry any browser message. Check receipts, exact task IDs, accepted-Send ledgers, model-gate events, stable terminal route, other-tab noninterference, accepted R11 contract and clean regression/worker teardown. Use read-only review and the smallest verification checks. Write receipt 10-release-review.json with release_verdict, full_regression, real_cdp fields PASS only if independent evidence proves every gate, else NOT_ACCEPTED/BLOCKED with one specific next root-cause fix. Do not alter unrelated work.",
+      "tests": [
+        "tests/test_spec003_gate_c_runtime.py",
+        "tests/test_cdpa_resume_control_store.py"
+      ]
+    },
+    {
+      "id": "11-final-real-cdp",
+      "title": "Final fresh 9202 release acceptance",
+      "task": "Perform ONE final live-browser acceptance on a NEW owned ChatGPT conversation at endpoint 9202 only. This is acceptance-only: do not inspect or modify product code and do not touch unrelated tabs. The coordinator captures authoritative 9202 tab identities before admission and after terminal completion. Require High/Extra High model verification before composer fill and before the one Send, exactly one accepted Send, no Retry/repair/reload/new-chat fallback, no PAUSE/Resume, and a stable terminal DONE route in the first hop. You may use read-only health/ledger checks and may write only workflows/self-repair/receipts/11-final-real-cdp.json. Mark PASS only for your own proven browser turn; overall release remains pending coordinator before/after comparison and full regression. If direct DONE cannot be proven, return PAUSE/BLOCKED without retry.",
+      "tests": [
+        "tests/test_chatgpt_model_gate.py",
+        "tests/test_spec003_gate_c_runtime.py",
+        "tests/test_cdpa_resume_control_store.py"
+      ]
+    },
+    {
+      "id": "12-final-release-review",
+      "title": "Final independent R11 release verdict",
+      "task": "Perform a final read-only release evidence review after slice 11. Do not create, send, retry, reload, focus, close, or otherwise mutate any application browser tab beyond this review task's own already-admitted prompt. Read receipts 07/10/11, .runtime/self-repair/11-final-tabs-compare.json, exact action/model-gate ledgers, worker health, and the post-rootfix full-regression result. Write workflows/self-repair/receipts/12-final-release-review.json. Set status PASS, release_verdict PASS, full_regression PASS, real_cdp PASS only if every accepted R11/Gate C gate is independently proven; otherwise BLOCKED/NOT_ACCEPTED with one exact missing gate. Return DONE only after writing the receipt.",
+      "tests": [
+        "tests/test_cdpa_selfrepair_supervisor.py",
+        "tests/test_cdpa_selfrepair_postfix.py",
+        "tests/test_spec003_gate_c_runtime.py"
+      ]
+    },
+    {
+      "id": "13-allow-reacceptance",
+      "title": "Recheck existing Gate C after auto-Allow root-fix",
+      "task": "This is a bounded RETEST of the existing live Gate C acceptance after fixing CDPA's unnecessary Suspicious Instruction label block; do not add any gate or control layer. Read receipts 11/12, the exact historical accepted-Send ledgers and the existing auto-Allow controller tests. Prior accepted requests MUST NEVER be replayed. On a NEW owned normal ChatGPT conversation at G6 endpoint 9202 only, verify exact High/Extra High model before composer fill and immediately before the ONE accepted Send. The existing MCP auto-Allow must click the single visible owned Allow once when needed, including if UI has a Suspicious Instruction label, with its existing idempotent ledger; do not click unrelated surfaces or duplicate approvals. Independently record other-tab identities before and after without reloading or focusing them. Require a stable valid terminal DONE, one accepted Send, accurate model evidence, healthy 9224/9225 worker and verified unrelated-tab noninterference for PASS; otherwise write BLOCKED/NOT_ACCEPTED with the one exact missing condition. Write workflows/self-repair/receipts/13-allow-reacceptance.json and stop. No new product feature, no broad rewrite, no old Send retry.",
+      "tests": [
+        "tests/test_v11_allow_ledger.py",
+        "tests/test_chatgpt_mcp_permission.py",
+        "tests/test_chatgpt_model_gate.py"
+      ]
+    },
+    {
+      "id": "14-release-recheck",
+      "title": "Independent recheck of existing R11 Gate C release",
+      "task": "Independent READ-ONLY review of existing G0-G9 Gate C acceptance after slice 13; not a new gate. Do not create, send, retry, reload, focus, close or otherwise mutate any application browser tab beyond this review task's own admitted prompt. Independently verify receipts 07/10/11/12/13, exact request and model-gate ledgers, one accepted Send, stable live terminal DONE, other-tab before/after evidence, 9224/9225 worker health, zero source drift, and post-rootfix current-code broad regression. Last full suite recorded 2055 PASS 1 FAILED (two-endpoint admission concurrency), so do not report full_regression PASS until a FINAL clean broad run is independently proven; six later targeted runs PASS but are not a substitute for broad regression. Write workflows/self-repair/receipts/14-release-recheck.json containing status, release_verdict, full_regression and real_cdp PASS only when all independently proven; otherwise BLOCKED / NOT_ACCEPTED and one precise next root fix. Never replay historical accepted Sends.",
+      "tests": [
+        "tests/test_cdpa_selfrepair_supervisor.py",
+        "tests/test_cdpa_selfrepair_continuation.py",
+        "tests/test_spec003_gate_c_runtime.py"
+      ]
+    },
+    {
+      "id": "15-real-terminal-reacceptance",
+      "title": "Fresh existing Gate C terminal proof after restored dashboard auth",
+      "task": "One bounded fresh G6 Gate C terminal acceptance, not a new gate or feature. Read previous BLOCKED receipt 14 and the exact historic accepted-Send ledger; NEVER replay any prior accepted Send. This task is already admitted by CDPA in one NEW owned normal ChatGPT conversation on G6 9202. Read previously captured unrelated-tab identity evidence if available; the external coordinator, not this assistant turn, records identities before admission and after terminal completion without focusing/reloading other tabs. Read and verify the exact task-bound High/Extra High model_gate events made by CDPA before composer fill and immediately before its one Send, plus accepted request attempts=1; do not fill or Send anything yourself. The existing CDPA controller owns the one-time MCP auto-Allow, including a Suspicious Instruction UI label; do not introduce any label-based gate or approval action. Do not attempt to observe or certify your own final response or Stop button: your terminal route can only be observed AFTER your turn ends. The EXISTING CDPA worker and slice 16 independent release reviewer, not this assistant, verify terminal DONE/PAUSE, assistant message/turn identity, text hash, completion actions, Stop state and unrelated-tab noninterference. Inspect available preterminal evidence and write workflows/self-repair/receipts/15-real-terminal-reacceptance.json with only independently verified facts, and BLOCKED/NOT_ACCEPTED for anything not proven; never assert real_cdp PASS before the external observer's evidence. Your FINAL reply must be exactly one JSON ROUTE object, no progress-summary prose. If unfinished use PAUSE with the exact blocker in handoff. Do not create/send/retry/repair an accepted browser request. No unrelated code editing, tab mutation or speculative approval policy.",
+      "tests": [
+        "tests/test_cdpa_overlay_observation.py",
+        "tests/test_role_runtime_browser.py",
+        "tests/test_v11_allow_ledger.py"
+      ]
+    },
+    {
+      "id": "15b-fresh-terminal-proof",
+      "title": "Existing Gate C single-Send terminal reacceptance after root fixes",
+      "task": "This is the next bounded retest of the EXISTING G6 R11 Gate C release, not a new gate or product feature. Earlier slice15 ended STOPPED/CLEARED after one accepted Send and MCP Allow but no usable terminal text; its receipt is BLOCKED/NOT_ACCEPTED. Never replay prior accepted Send or reuse its browser request. You are now already admitted by CDPA into ONE NEW owned normal ChatGPT conversation at G6 9202; CDPA separately owns model High/Extra High verification before composer fill and before Send, the one accepted Send ledger and MCP auto-Allow once. Read REPAIR_HISTORY.md and exact prior receipt before coding. Do only a bounded read-only smoke check of current response-controller tests and worker health; do not Stop/reload your own CDPA task, create another task, fill/Send in browser, modify unrelated tab, or attempt to observe your own unfinished reply. Write workflows/self-repair/receipts/15b-fresh-terminal-proof.json with exact task ID, source and tests, status PASS only for the bounded code/preterminal checks that you actually proved; explicitly set real_cdp=PENDING_EXTERNAL_OBSERVER and release_verdict=NOT_ACCEPTED. The existing CDPA worker and external coordinator independently observe your final assistant message and terminal status AFTER you finish, record before/after unrelated-tab identities and validate Send/Allow/model evidence. Your FINAL response MUST be one and only one valid route JSON object with route DONE and concise handoff if bounded work/receipt finished; if it cannot finish, route PAUSE with concrete blocker. Do not include any prose outside JSON. Do not certify your own final DOM, nor add an extra security/model/approval gate.",
+      "tests": [
+        "tests/test_role_runtime.py",
+        "tests/test_cdpa_overlay_observation.py",
+        "tests/test_cdpa_selfrepair_supervisor.py"
+      ]
+    },
+    {
+      "id": "16-final-release-evidence",
+      "title": "Independent final proof of existing Gate C release",
+      "task": "Read-only independent existing R11 Gate C release evidence review after slice 15b, without changing unrelated browser tabs or replaying old accepted requests. Verify 15 and 15b receipts, exact model/Send/MCP Allow ledgers from the NEW accepted turn and stable live DONE; independent other-tab noninterference, current 9224/9225 worker health and no source drift, and CURRENT-CODE clean broad pytest regression exit code. Prior 2026-10-28 09:50 broad suite had 2065 passed 45 skipped but subsequent code changes require final rerun. If ANY proof is missing, set status BLOCKED, release_verdict NOT_ACCEPTED and report exact missing root cause; do not invent new gate. If all accepted R11 G0-G9 evidence exists, mark status PASS, release_verdict PASS, full_regression PASS and real_cdp PASS in workflows/self-repair/receipts/16-final-release-evidence.json. Do not send historical prompts or perform browser reloads.",
+      "tests": [
+        "tests/test_spec003_gate_c_runtime.py",
+        "tests/test_cdpa_selfrepair_supervisor.py",
+        "tests/test_cdpa_selfrepair_release_review_retire.py"
+      ]
+    }
+  ]
+}
