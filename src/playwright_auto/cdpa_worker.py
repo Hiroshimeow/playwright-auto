@@ -6880,7 +6880,9 @@ class CDPAWorker:
                 )
             # Temporary Chat has no canonical conversation ID. Keep its
             # document-scoped writer identity; never call canonical rekey().
-        elif not binding.get("canonical_conversation_id"):
+        elif not binding.get("canonical_conversation_id") and not _provisional_conversation_url(
+            conversation_url
+        ):
             binding = writer.rekey(binding_id, conversation_url)
         state["roles"][role]["conversation_binding_id"] = binding_id
         hop["writer_identity_key"] = binding.get("writer_identity_key")

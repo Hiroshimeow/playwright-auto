@@ -64,3 +64,65 @@ def test_gate_c_preserves_fresh_chat_provenance_across_sending_reacquire(tmp_pat
         assert attempt["state"] == "intent_recorded"
     finally:
         db.close()
+
+
+def test_gate_c_accepted_local_placeholder_keeps_page_writer_until_canonicalized(tmp_path):
+    db = RuntimeDB(tmp_path / "fresh-accepted-local.sqlite3")
+    db.ensure_schema()
+    writer = ConversationWriterLease(db)
+
+    class Endpoints:
+        @staticmethod
+        def get(_endpoint_id):
+            return {"endpoint_id": "ep-fresh", "cdp_url": "http://127.0.0.1:9222"}
+
+    class Client:
+        @staticmethod
+        async def assert_ownership():
+            return SimpleNamespace(messages=[])
+
+    worker = object.__new__(CDPAWorker)
+    worker.runtime_db = db
+    worker.store = SimpleNamespace(endpoints=Endpoints())
+    worker._endpoint_pool = None
+
+    local_url = "https://chatgpt.com/c/local-chatgpt%3Ashared-placeholder"
+    state = {
+        "task_id": "fresh-accepted-task",
+        "conversation_mode": "persistent",
+        "roles": {
+            "PLAN": {
+                "conversation_generation": 1,
+                "page_id": "page-fresh-accepted",
+                "page_url": local_url,
+            }
+        },
+    }
+    hop = {
+        "browser_endpoint_id": "ep-fresh",
+        "request_id": "fresh-accepted-request",
+        "prompt": "research prompt",
+        "conversation_generation": 1,
+        "generation_started_here": True,
+    }
+    acquired = SimpleNamespace(
+        page_id="page-fresh-accepted",
+        url=local_url,
+        new_chat=False,
+        client=Client(),
+    )
+
+    try:
+        _writer, lease, attempt = asyncio.run(
+            worker._gate_c_prepare_browser_send(state, hop, "PLAN", acquired)
+        )
+        worker._gate_c_mark_send_accepted(state, hop, "PLAN", local_url)
+
+        binding = writer.get_binding(state["roles"]["PLAN"]["conversation_binding_id"])
+        command = db.get_command(attempt["attempt_id"])
+        assert binding["canonical_conversation_id"] is None
+        assert binding["writer_identity_key"] == lease["writer_identity_key"]
+        assert binding["provisional_writer_identity_key"] == lease["writer_identity_key"]
+        assert command["payload"]["send_attempt"]["state"] == "accepted"
+    finally:
+        db.close()
