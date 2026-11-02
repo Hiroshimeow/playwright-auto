@@ -1802,6 +1802,9 @@ def test_reacquired_pristine_request_crosses_send_boundary_exactly_once(tmp_path
                 url="https://chatgpt.com/c/WEB:presend-replacement",
             )
 
+        async def snapshot(self):
+            return self.current
+
         async def assert_ownership(self):
             return self.current
 

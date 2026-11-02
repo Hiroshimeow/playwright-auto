@@ -87,6 +87,24 @@ def _new_chat_url(url: str) -> bool:
     )
 
 
+def _temporary_chat_url(url: str) -> bool:
+    try:
+        parsed = urlparse(str(url or "").strip())
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.lower() == "https"
+        and parsed.hostname is not None
+        and parsed.hostname.lower() == "chatgpt.com"
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.port in {None, 443}
+        and parsed.path in {"", "/"}
+        and parsed.query == "temporary-chat=true"
+        and not parsed.fragment
+    )
+
+
 def _default_state() -> dict[str, Any]:
     return {
         "version": 1,
@@ -221,6 +239,8 @@ class ConversationWriterLease:
         page_target_identity: str,
         conversation_url: str,
         verified_new_chat: bool,
+        temporary_chat: bool = False,
+        temporary_document_id: str | None = None,
         task_id: str | None = None,
         role_key: str | None = None,
     ) -> dict[str, Any]:
@@ -237,13 +257,26 @@ class ConversationWriterLease:
                     "CONVERSATION_BINDING_INVALID", f"{label} is required"
                 )
 
-        try:
-            canonical_id: str | None = canonical_conversation(conversation_url)
-        except ConversationLeaseError:
-            if verified_new_chat and _new_chat_url(conversation_url):
-                canonical_id = None
-            else:
-                raise
+        if temporary_chat:
+            if not verified_new_chat or not _temporary_chat_url(conversation_url):
+                raise ConversationLeaseError(
+                    "CONVERSATION_IDENTITY_MISMATCH",
+                    "temporary chat requires an exact verified Temporary Chat URL",
+                )
+            if not str(temporary_document_id or "").strip():
+                raise ConversationLeaseError(
+                    "CONVERSATION_BINDING_INVALID",
+                    "temporary_document_id is required for Temporary Chat",
+                )
+            canonical_id: str | None = None
+        else:
+            try:
+                canonical_id = canonical_conversation(conversation_url)
+            except ConversationLeaseError:
+                if verified_new_chat and _new_chat_url(conversation_url):
+                    canonical_id = None
+                else:
+                    raise
 
         page_binding_id = _digest(
             "page", provider_id, physical_browser_id, page_target_identity
@@ -252,7 +285,9 @@ class ConversationWriterLease:
             provider_id, physical_browser_id, page_target_identity
         )
         writer_key = (
-            self._canonical_key(provider_id, canonical_id)
+            f"temporary:{provider_id}:{physical_browser_id}:{str(temporary_document_id).strip()}"
+            if temporary_chat
+            else self._canonical_key(provider_id, canonical_id)
             if canonical_id is not None
             else self._provisional_key(
                 provider_id, physical_browser_id, page_binding_id
@@ -272,6 +307,8 @@ class ConversationWriterLease:
                     "physical_browser_id": physical_browser_id,
                     "page_target_identity": page_target_identity,
                     "conversation_url": conversation_url,
+                    "temporary_chat": bool(temporary_chat),
+                    "temporary_document_id": str(temporary_document_id or "") or None,
                     "task_id": task_id,
                     "role_key": role_key,
                 }
@@ -311,6 +348,8 @@ class ConversationWriterLease:
                 "conversation_url": conversation_url,
                 "canonical_conversation_id": canonical_id,
                 "verified_new_chat": bool(verified_new_chat),
+                "temporary_chat": bool(temporary_chat),
+                "temporary_document_id": str(temporary_document_id or "") or None,
                 "writer_identity_key": writer_key,
                 "provisional_writer_identity_key": (
                     writer_key if canonical_id is None else None
@@ -335,6 +374,57 @@ class ConversationWriterLease:
             state, _ = self._load_state(connection)
         return self._binding_projection(self._binding_or_error(state, binding_id))
 
+    def list_bindings(self, *, include_sealed: bool = False) -> list[dict[str, Any]]:
+        with self.db.connection() as connection:
+            state, _ = self._load_state(connection)
+        result = [
+            self._binding_projection(binding)
+            for binding in state["bindings"].values()
+            if isinstance(binding, dict)
+            and (include_sealed or binding.get("binding_status") != "sealed")
+        ]
+        result.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("binding_id") or "")))
+        return result
+
+    def binding_for_task_role(
+        self, task_id: str, role_key: str
+    ) -> dict[str, Any] | None:
+        task = str(task_id or "").strip()
+        role = str(role_key or "").strip().upper()
+        matches = [
+            binding
+            for binding in self.list_bindings()
+            if str(binding.get("task_id") or "") == task
+            and str(binding.get("role_key") or "").upper() == role
+        ]
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise ConversationLeaseError(
+                "CONVERSATION_BINDING_AMBIGUOUS",
+                f"task/role has {len(matches)} live bindings",
+            )
+        return matches[0]
+
+    def update_dom_projection(
+        self, binding_id: str, projection: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        with self.db.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            state, version = self._load_state(connection)
+            binding = self._binding_or_error(state, binding_id)
+            binding["dom_projection"] = json.loads(
+                json.dumps(dict(projection), ensure_ascii=False)
+            )
+            binding["dom_projection_version"] = int(
+                binding.get("dom_projection_version") or 0
+            ) + 1
+            binding["dom_projection_updated_at"] = _utc_now()
+            binding["updated_at"] = _utc_now()
+            self._store_state(connection, state, version)
+            connection.commit()
+            return self._binding_projection(binding)
+
     def endpoint_in_use(self, endpoint_id: str) -> bool:
         with self.db.connection() as connection:
             state, _ = self._load_state(connection)
@@ -345,11 +435,20 @@ class ConversationWriterLease:
             for binding in state["bindings"].values()
         )
 
-    def acquire(self, binding_id: str) -> dict[str, Any]:
+    def acquire(
+        self, binding_id: str, *, require_idle: bool = False
+    ) -> dict[str, Any]:
         with self.db.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             state, version = self._load_state(connection)
             binding = self._binding_or_error(state, binding_id)
+            if require_idle and binding.get("binding_status") != "idle":
+                connection.rollback()
+                raise ConversationLeaseError(
+                    "WRITER_LEASE_BUSY",
+                    "binding is not idle for an operator-owned send",
+                    retryable=True,
+                )
             if binding.get("binding_status") in {"sealed", "blocked"}:
                 connection.rollback()
                 raise ConversationLeaseError(
@@ -369,6 +468,13 @@ class ConversationWriterLease:
                         "writer identity is owned by another binding",
                         retryable=True,
                     )
+                if str(lease.get("state") or "active") == "reserved_async_wait":
+                    connection.rollback()
+                    raise ConversationLeaseError(
+                        "WRITER_LEASE_RESERVED",
+                        "writer identity is reserved for this binding's async wake",
+                        retryable=True,
+                    )
             else:
                 epoch = int(state["lease_epochs"].get(key) or 0) + 1
                 state["lease_epochs"][key] = epoch
@@ -386,6 +492,92 @@ class ConversationWriterLease:
             self._store_state(connection, state, version)
             connection.commit()
             return self._lease_projection(binding, lease)
+
+    def reserve_async_wait(self, binding_id: str) -> dict[str, Any]:
+        with self.db.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            state, version = self._load_state(connection)
+            binding = self._binding_or_error(state, binding_id)
+            key = str(binding["writer_identity_key"])
+            lease = state["leases"].get(key)
+            if (
+                not isinstance(lease, dict)
+                or lease.get("owner_binding_id") != binding_id
+                or binding.get("binding_status") != "active"
+                or str(lease.get("state") or "active") != "active"
+            ):
+                connection.rollback()
+                raise ConversationLeaseError(
+                    "WRITER_LEASE_LOST",
+                    "async WAIT may reserve only the active writer lease owner",
+                )
+            lease["state"] = "reserved_async_wait"
+            lease["reserved_at"] = _utc_now()
+            binding["binding_status"] = "reserved_async_wait"
+            binding["updated_at"] = _utc_now()
+            self._store_state(connection, state, version)
+            connection.commit()
+            return self._lease_projection(binding, lease)
+
+    def resume_async_wait(self, binding_id: str) -> dict[str, Any]:
+        with self.db.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            state, version = self._load_state(connection)
+            binding = self._binding_or_error(state, binding_id)
+            key = str(binding["writer_identity_key"])
+            quarantine = state["quarantine"].get(key)
+            if isinstance(quarantine, dict):
+                connection.rollback()
+                raise self._quarantine_error(quarantine)
+            lease = state["leases"].get(key)
+            if (
+                not isinstance(lease, dict)
+                or lease.get("owner_binding_id") != binding_id
+                or binding.get("binding_status") != "reserved_async_wait"
+                or str(lease.get("state") or "") != "reserved_async_wait"
+            ):
+                connection.rollback()
+                raise ConversationLeaseError(
+                    "WRITER_LEASE_LOST",
+                    "async wake no longer owns its reserved writer lease",
+                )
+            lease["state"] = "active"
+            lease["resumed_at"] = _utc_now()
+            binding["binding_status"] = "active"
+            binding["updated_at"] = _utc_now()
+            self._store_state(connection, state, version)
+            connection.commit()
+            return self._lease_projection(binding, lease)
+
+    def release_async_wait(
+        self, binding_id: str, *, seal: bool = False
+    ) -> dict[str, Any]:
+        with self.db.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            state, version = self._load_state(connection)
+            binding = self._binding_or_error(state, binding_id)
+            key = str(binding["writer_identity_key"])
+            lease = state["leases"].get(key)
+            if isinstance(lease, dict) and lease.get("owner_binding_id") == binding_id:
+                if str(lease.get("state") or "") not in {
+                    "reserved_async_wait",
+                    "active",
+                }:
+                    connection.rollback()
+                    raise ConversationLeaseError(
+                        "WRITER_LEASE_LOST",
+                        "writer reservation is not releasable",
+                    )
+                state["leases"].pop(key, None)
+            if seal:
+                self._release_page_claim(state, binding)
+                binding["binding_status"] = "sealed"
+            else:
+                binding["binding_status"] = "idle"
+            binding["updated_at"] = _utc_now()
+            self._store_state(connection, state, version)
+            connection.commit()
+            return self._binding_projection(binding)
 
     @staticmethod
     def _attempt_from_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -533,9 +725,29 @@ class ConversationWriterLease:
         return row, payload, self._attempt_from_payload(payload)
 
     def transition_attempt(
-        self, attempt_id: str, desired_state: str
+        self,
+        attempt_id: str,
+        desired_state: str,
+        *,
+        metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         desired = str(desired_state)
+        updates = dict(metadata or {})
+        protected = {
+            "attempt_id",
+            "state",
+            "owner_binding_id",
+            "writer_identity_key",
+            "lease_epoch",
+            "baseline",
+            "text_hash",
+            "created_at",
+        }
+        if protected.intersection(updates):
+            raise ConversationLeaseError(
+                "SEND_ATTEMPT_INVALID",
+                "send attempt metadata cannot replace durable identity fields",
+            )
         with self.db.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             state, version = self._load_state(connection)
@@ -547,6 +759,9 @@ class ConversationWriterLease:
                     "SEND_ATTEMPT_TRANSITION",
                     f"invalid browser send transition {current!r} -> {desired!r}",
                 )
+            attempt.update(
+                json.loads(json.dumps(updates, ensure_ascii=False))
+            )
             attempt["state"] = desired
             attempt["updated_at"] = _utc_now()
             payload["send_attempt"] = attempt
@@ -604,6 +819,42 @@ class ConversationWriterLease:
         if current == desired:
             return attempt
         return self.transition_attempt(attempt_id, desired)
+
+
+    def release_writer(self, binding_id: str) -> dict[str, Any]:
+        """Release an idle/pre-send writer only after every SendAttempt is terminal."""
+        with self.db.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            state, version = self._load_state(connection)
+            binding = self._binding_or_error(state, binding_id)
+            unresolved = [
+                attempt
+                for attempt in self._attempts_for_binding(connection, binding_id)
+                if attempt.get("state") not in _TERMINAL_ATTEMPT_STATES
+            ]
+            if unresolved:
+                connection.rollback()
+                raise ConversationLeaseError(
+                    "WRITER_LEASE_BUSY",
+                    "writer has unresolved send evidence",
+                    retryable=True,
+                )
+            key = str(binding["writer_identity_key"])
+            lease = state["leases"].get(key)
+            if isinstance(lease, dict):
+                if lease.get("owner_binding_id") != binding_id:
+                    connection.rollback()
+                    raise ConversationLeaseError(
+                        "WRITER_LEASE_BUSY",
+                        "writer identity is owned by another binding",
+                        retryable=True,
+                    )
+                state["leases"].pop(key, None)
+            binding["binding_status"] = "idle"
+            binding["updated_at"] = _utc_now()
+            self._store_state(connection, state, version)
+            connection.commit()
+            return self._binding_projection(binding)
 
     def finish_turn(
         self,
@@ -737,6 +988,8 @@ class ConversationWriterLease:
                 "endpoint_cdp_url",
                 "physical_browser_id",
                 "page_target_identity",
+                "temporary_chat",
+                "temporary_document_id",
             ):
                 if observed.get(field) != binding.get(field):
                     mismatch = True
@@ -769,6 +1022,12 @@ class ConversationWriterLease:
         )
 
     def rekey(self, binding_id: str, conversation_url: str) -> dict[str, Any]:
+        current = self.get_binding(binding_id)
+        if current.get("temporary_chat") is True:
+            raise ConversationLeaseError(
+                "CONVERSATION_IDENTITY_MISMATCH",
+                "Temporary Chat uses a document-scoped writer identity and must not be canonicalized",
+            )
         canonical_id = canonical_conversation(conversation_url)
         with self.db.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")

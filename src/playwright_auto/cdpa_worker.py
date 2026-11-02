@@ -557,6 +557,7 @@ class CDPAWorker:
         self._endpoint_admission_holds: dict[asyncio.Task[Any], tuple[str, asyncio.Lock]] = {}
         self._endpoint_admission_loop: asyncio.AbstractEventLoop | None = None
         self._browser_command_tasks: set[asyncio.Task[Any]] = set()
+        self._command_event_loop: asyncio.AbstractEventLoop | None = None
         self._rate_limit_cooldown: dict[str, Any] | None = None
         self._rate_limit_cooldowns: dict[str, dict[str, Any]] = {}
         self._rate_limit_lock = asyncio.Lock()
@@ -679,14 +680,10 @@ class CDPAWorker:
 
     def _source_identity_paths(self) -> list[Path]:
         package = Path(__file__).resolve().parent
-        names = (
-            "cdpa_worker.py", "cdpa_actions.py", "cdpa_commands.py", "cdpa_config.py",
-            "cdpa_endpoint_pool.py", "cdpa_endpoints.py", "cdpa_managed_browser.py",
-            "cdpa_projection.py", "cdpa_prompts.py", "cdpa_routes.py", "cdpa_runtime_db.py",
-            "cdpa_runtime_registry.py", "cdpa_store.py", "durable.py", "file_lock.py",
-            "observability.py", "role_runtime.py", "dashboard_api.py", "dashboard.html",
-        )
-        paths = [package / name for name in names]
+        # Watch imported Python owners without hand-maintaining a partial list.
+        # Adding a module must not leave the running worker blind to its edits.
+        paths = sorted(path for path in package.rglob("*.py") if path.is_file())
+        paths.append(package / "dashboard.html")
         dashboard_assets = package / "dashboard_assets"
         if dashboard_assets.is_dir():
             paths.extend(
@@ -2539,6 +2536,7 @@ class CDPAWorker:
         acquired: AcquiredRole,
     ) -> None:
         record = state["roles"][logical_role]
+        acquired.client.model_effort_gate_required = bool(self.config.model_effort_gate_required)
         changed = (
             acquired.created
             or acquired.new_chat
@@ -5836,6 +5834,34 @@ class CDPAWorker:
         if error is not None:
             self._block_async_wake(state, continuation, error, code="ASYNC_WAKE_IDENTITY_MISMATCH")
             return None
+        target_ref = (
+            continuation.get("target_ref")
+            if isinstance(continuation.get("target_ref"), Mapping)
+            else {}
+        )
+        binding_id = str(target_ref.get("binding_id") or "").strip()
+        if binding_id:
+            from .cdpa_conversations import ConversationLeaseError, ConversationWriterLease
+
+            try:
+                lease = ConversationWriterLease(self.runtime_db).resume_async_wait(
+                    binding_id
+                )
+            except ConversationLeaseError as exc:
+                self._block_async_wake(
+                    state,
+                    continuation,
+                    str(exc),
+                    code=exc.code,
+                )
+                return None
+            continuation["writer_reservation"] = {
+                **dict(continuation.get("writer_reservation") or {}),
+                "binding_id": binding_id,
+                "lease_epoch": int(lease["lease_epoch"]),
+                "state": "active",
+                "resumed_at": utc_now(),
+            }
         continuation["state"] = "waking"
         if (continuation.get("wake") or {}).get("status") != "verified":
             continuation["wake"] = {
@@ -5891,16 +5917,27 @@ class CDPAWorker:
                     route_repair_snapshot
                 )
         independent = state.get("independent") if is_independent_task(state) else None
-        solo_existing_url = (
+        adopted_start_url = (
             not isinstance(independent, Mapping)
-            and str(state.get("workflow_mode") or "team").strip().lower() == "solo"
             and str(hop.get("kind") or "") == "task"
+            and hop.get("source_role") is None
             and bool(str(hop.get("conversation_url") or "").strip())
+            and not (
+                str(state.get("conversation_mode") or "persistent") == "temporary"
+                and (
+                    str(hop.get("conversation_url") or "").strip().rstrip("/")
+                    in {"https://chatgpt.com", "https://chatgpt.com/?temporary-chat=true"}
+                )
+            )
             and not bool(state["roles"][role].get("page_id"))
+        )
+        solo_existing_url = (
+            adopted_start_url
+            and str(state.get("workflow_mode") or "team").strip().lower() == "solo"
         )
         if route_repair_stale_error_ready:
             acquired = route_repair_owned
-        elif solo_existing_url:
+        elif adopted_start_url:
             candidate_url = str(hop["conversation_url"])
             owner = self._foreign_durable_conversation_owner(
                 state,
@@ -5922,7 +5959,6 @@ class CDPAWorker:
                 role,
                 url=candidate_url,
             )
-            hop["conversation_url"] = acquired.url
             await self._dismiss_known_rate_limit_on_existing(acquired)
         elif hop.get("kind") == "async_wake":
             acquired = await self._acquire_async_wake_page(state, hop, role, actions)
@@ -6108,6 +6144,32 @@ class CDPAWorker:
                 )
                 return
             if acquired is None:
+                return
+        if adopted_start_url:
+            from .cdpa_conversations import ConversationLeaseError, canonical_conversation
+
+            try:
+                expected = canonical_conversation(str(hop["conversation_url"]))
+                observed = canonical_conversation(str(acquired.url))
+            except ConversationLeaseError:
+                observed = None
+                expected = None
+            page_binding = getattr(acquired.client, "binding", None)
+            if (
+                expected is None
+                or observed != expected
+                or acquired.new_chat
+                or (
+                    page_binding is not None
+                    and str(page_binding.page_id) != str(acquired.page_id)
+                )
+            ):
+                self._block(
+                    state,
+                    "Adopted conversation URL or exact page identity changed before Send.",
+                    code="CONVERSATION_IDENTITY_MISMATCH",
+                    retryable=False,
+                )
                 return
         self._record_acquired(state, role, acquired)
         generation = int(state["roles"][role].get("conversation_generation") or 0)
@@ -6623,6 +6685,218 @@ class CDPAWorker:
             state["active_action"] = "retry_preboundary"
         return True
 
+    @staticmethod
+    def _gate_c_task_binding_id(
+        state: Mapping[str, Any], role: str
+    ) -> str:
+        role_record = (state.get("roles") or {}).get(role) or {}
+        generation = int(role_record.get("conversation_generation") or 0)
+        raw = f"{state.get('task_id')}\n{role}\n{generation}"
+        return "task-binding-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+    def _gate_c_endpoint_evidence(self, endpoint_id: str) -> tuple[str, str]:
+        from .cdpa_conversations import ConversationLeaseError
+
+        endpoint = self.store.endpoints.get(endpoint_id)
+        cdp_url = str(endpoint.get("cdp_url") or "").strip()
+        physical_id: str | None = None
+        if self._endpoint_pool is not None:
+            snapshot = self._endpoint_pool.snapshot(
+                running_executions=self._running_executions()
+            )
+            runtime = next(
+                (
+                    item
+                    for item in snapshot.get("endpoints", ())
+                    if str(item.get("endpoint_id") or "") == endpoint_id
+                ),
+                None,
+            )
+            if isinstance(runtime, Mapping):
+                if str(runtime.get("health") or "") == "conflict":
+                    raise ConversationLeaseError(
+                        "WRITER_LEASE_BUSY",
+                        "endpoint resolves to a physical-browser conflict",
+                        retryable=True,
+                    )
+                physical_id = str(runtime.get("physical_browser_id") or "").strip() or None
+                if str(runtime.get("health") or "") == "online" and physical_id is None:
+                    raise ConversationLeaseError(
+                        "CONVERSATION_IDENTITY_MISMATCH",
+                        "online endpoint has no physical browser identity",
+                    )
+        if physical_id is None:
+            # Compatibility for direct unit/single-context execution. Production
+            # pooled execution supplies the real devtools browser identity above.
+            physical_id = f"endpoint:{endpoint_id}:{cdp_url}"
+        return cdp_url, physical_id
+
+    async def _gate_c_prepare_browser_send(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        role: str,
+        acquired: AcquiredRole,
+    ) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+        from .cdpa_conversations import ConversationLeaseError, ConversationWriterLease
+
+        endpoint_id = (
+            str(hop.get("browser_endpoint_id") or "").strip()
+            or self._execution_endpoint_id(state, role)
+            or self.store.endpoint_id_for(state)
+        )
+        cdp_url, physical_id = self._gate_c_endpoint_evidence(endpoint_id)
+        writer = ConversationWriterLease(self.runtime_db)
+        role_record = state["roles"][role]
+        binding_id = (
+            str(role_record.get("conversation_binding_id") or "").strip()
+            or self._gate_c_task_binding_id(state, role)
+        )
+        temporary_chat = str(state.get("conversation_mode") or "persistent") == "temporary"
+        temporary_document_id = (
+            str(role_record.get("temporary_document_id") or "").strip() or None
+        )
+        if temporary_chat and not temporary_document_id:
+            raise ConversationLeaseError(
+                "CONVERSATION_BINDING_INVALID",
+                "Temporary Chat has no verified document-scoped identity",
+            )
+        observed = {
+            "endpoint_id": endpoint_id,
+            "endpoint_cdp_url": cdp_url,
+            "physical_browser_id": physical_id,
+            "page_target_identity": acquired.page_id,
+            "conversation_url": acquired.url,
+            "temporary_chat": temporary_chat,
+            "temporary_document_id": temporary_document_id,
+        }
+        try:
+            writer.get_binding(binding_id)
+        except ConversationLeaseError as exc:
+            if exc.code != "CONVERSATION_BINDING_NOT_FOUND":
+                raise
+            writer.bind(
+                binding_id=binding_id,
+                provider_id="chatgpt_web",
+                endpoint_id=endpoint_id,
+                endpoint_cdp_url=cdp_url,
+                physical_browser_id=physical_id,
+                page_target_identity=acquired.page_id,
+                conversation_url=acquired.url,
+                verified_new_chat=bool(acquired.new_chat),
+                temporary_chat=temporary_chat,
+                temporary_document_id=temporary_document_id,
+                task_id=str(state.get("task_id") or ""),
+                role_key=role,
+            )
+        else:
+            writer.validate_binding(binding_id, observed)
+
+        lease = writer.acquire(binding_id)
+        # Read the baseline through the same ownership-checked path used by Send.
+        # A generic snapshot is not required by every supported role adapter.
+        snapshot = await acquired.client.assert_ownership()
+        user_messages = [
+            message for message in snapshot.messages if str(message.role) == "user"
+        ]
+        baseline_last_user_message_id = (
+            user_messages[-1].message_id if user_messages else None
+        )
+        attempt, _ = writer.record_send_intent(
+            lease,
+            idempotency_key=f"browser-send:{hop['request_id']}",
+            text=str(hop.get("prompt") or ""),
+            baseline_last_user_message_id=baseline_last_user_message_id,
+            baseline_user_turn_count=len(user_messages),
+        )
+        hop["conversation_binding_id"] = binding_id
+        hop["writer_lease_epoch"] = int(lease["lease_epoch"])
+        hop["send_attempt_id"] = attempt["attempt_id"]
+        role_record["conversation_binding_id"] = binding_id
+        return writer, lease, attempt
+
+    def _gate_c_mark_send_unconfirmed(self, hop: Mapping[str, Any]) -> None:
+        attempt_id = str(hop.get("send_attempt_id") or "").strip()
+        if not attempt_id:
+            return
+        from .cdpa_conversations import ConversationLeaseError, ConversationWriterLease
+
+        writer = ConversationWriterLease(self.runtime_db)
+        try:
+            command = self.runtime_db.get_command(attempt_id)
+            payload = (command or {}).get("payload") if isinstance(command, Mapping) else None
+            attempt = (
+                payload.get("send_attempt")
+                if isinstance(payload, Mapping)
+                else None
+            )
+            current = str((attempt or {}).get("state") or "")
+            if current == "submitted":
+                writer.transition_attempt(attempt_id, "unconfirmed")
+        except (ConversationLeaseError, ValueError):
+            return
+
+    def _gate_c_mark_send_accepted(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        role: str,
+        conversation_url: str,
+    ) -> None:
+        attempt_id = str(hop.get("send_attempt_id") or "").strip()
+        binding_id = str(hop.get("conversation_binding_id") or "").strip()
+        if not attempt_id or not binding_id:
+            return
+        from .cdpa_conversations import ConversationWriterLease
+
+        writer = ConversationWriterLease(self.runtime_db)
+        command = self.runtime_db.get_command(attempt_id)
+        payload = (command or {}).get("payload") if isinstance(command, Mapping) else None
+        attempt = payload.get("send_attempt") if isinstance(payload, Mapping) else None
+        current = str((attempt or {}).get("state") or "")
+        if current in {"intent_recorded", "submitted", "unconfirmed"}:
+            writer.transition_attempt(attempt_id, "accepted")
+        binding = writer.get_binding(binding_id)
+        if binding.get("temporary_chat") is True:
+            expected_document_id = str(
+                state["roles"][role].get("temporary_document_id") or ""
+            ).strip()
+            if (
+                not expected_document_id
+                or expected_document_id != str(binding.get("temporary_document_id") or "")
+            ):
+                raise ConversationLeaseError(
+                    "CONVERSATION_IDENTITY_MISMATCH",
+                    "Temporary Chat document identity changed at the accepted Send boundary",
+                )
+            # Temporary Chat has no canonical conversation ID. Keep its
+            # document-scoped writer identity; never call canonical rekey().
+        elif not binding.get("canonical_conversation_id"):
+            binding = writer.rekey(binding_id, conversation_url)
+        state["roles"][role]["conversation_binding_id"] = binding_id
+        hop["writer_identity_key"] = binding.get("writer_identity_key")
+
+    def _gate_c_finish_role_turn(
+        self,
+        state: Mapping[str, Any],
+        hop: Mapping[str, Any],
+        role: str,
+    ) -> None:
+        binding_id = str(hop.get("conversation_binding_id") or "").strip()
+        if not binding_id:
+            return
+        from .cdpa_conversations import ConversationLeaseError, ConversationWriterLease
+
+        try:
+            ConversationWriterLease(self.runtime_db).finish_turn(
+                binding_id,
+                assistant_terminal=True,
+                turn_committed=True,
+            )
+        except ConversationLeaseError as exc:
+            if exc.code != "CONVERSATION_BINDING_NOT_FOUND":
+                raise
+
     async def _sending(
         self,
         state: dict[str, Any],
@@ -6704,6 +6978,30 @@ class CDPAWorker:
             for item in state.get("hops") or []
         )
         self._arm_passive_request_observer(state, hop, acquired.client)
+        gate_c_after_send_click: Callable[[], None] | None = None
+        if (
+            not is_independent_task(state)
+            and str(state.get("workflow_mode") or "team").strip().lower() == "team"
+        ):
+            from .cdpa_conversations import ConversationLeaseError
+
+            try:
+                gate_c_writer, _, gate_c_attempt = await self._gate_c_prepare_browser_send(
+                    state, hop, role, acquired
+                )
+            except ConversationLeaseError as exc:
+                self._block(
+                    state,
+                    str(exc),
+                    code=exc.code,
+                    retryable=exc.retryable,
+                )
+                return
+
+            def gate_c_after_send_click() -> None:
+                gate_c_writer.transition_attempt(
+                    str(gate_c_attempt["attempt_id"]), "submitted"
+                )
         block = DurableSendBlock(
             str(hop["prompt"]),
             ledger_path=hop["ledger_path"],
@@ -6725,10 +7023,16 @@ class CDPAWorker:
             # create an ambiguous second send. Reload is never safe for CDPA normal workflow.
             max_attempts=1,
             recovery_reload=False,
+            after_send_click=gate_c_after_send_click,
         )
         try:
             async def perform_send() -> Any:
-                return await block.run(WorkflowContext(acquired.client))
+                try:
+                    return await block.run(WorkflowContext(acquired.client))
+                except Exception:
+                    if not is_independent_task(state):
+                        self._gate_c_mark_send_unconfirmed(hop)
+                    raise
 
             output = await self._run_automated_send(perform_send)
         except ConversationTranscriptNotReadyError as exc:
@@ -6825,6 +7129,24 @@ class CDPAWorker:
         if isinstance(hop.get("preboundary_recovery"), dict):
             hop["preboundary_recovery"]["phase"] = "complete"
         self._canonicalize_receipt_conversation_url(state, hop)
+        if str(hop.get("send_attempt_id") or "").strip():
+            from .cdpa_conversations import ConversationLeaseError
+
+            try:
+                self._gate_c_mark_send_accepted(
+                    state,
+                    hop,
+                    role,
+                    str(hop.get("conversation_url") or ""),
+                )
+            except ConversationLeaseError as exc:
+                self._block(
+                    state,
+                    str(exc),
+                    code=exc.code,
+                    retryable=exc.retryable,
+                )
+                return
         try:
             observer_receipt = SendReceipt.from_dict(hop["receipt"])
         except (KeyError, TypeError, ValueError):
@@ -7862,6 +8184,35 @@ class CDPAWorker:
         role = str(hop["target_role"])
         continuation_id = str(continuation["continuation_id"])
         now = utc_now()
+        binding_id = str(hop.get("conversation_binding_id") or "").strip()
+        if binding_id:
+            from .cdpa_conversations import ConversationLeaseError, ConversationWriterLease
+
+            try:
+                reservation = ConversationWriterLease(
+                    self.runtime_db
+                ).reserve_async_wait(binding_id)
+            except ConversationLeaseError as exc:
+                self._block(
+                    state,
+                    str(exc),
+                    code=exc.code,
+                    retryable=exc.retryable,
+                )
+                return
+            continuation["target_ref"] = {
+                **dict(continuation.get("target_ref") or {}),
+                "binding_id": binding_id,
+                "ownership": "managed",
+                "task_id": str(state.get("task_id") or ""),
+                "role_key": role,
+            }
+            continuation["writer_reservation"] = {
+                "binding_id": binding_id,
+                "lease_epoch": int(reservation["lease_epoch"]),
+                "state": "reserved_async_wait",
+                "reserved_at": now,
+            }
         self._complete_request_response(hop)
         hop.update(route=async_continuation.WAIT_ROUTE, state="routed", async_continuation_id=continuation_id)
         hop["timestamps"]["routed_at"] = now
@@ -7941,9 +8292,47 @@ class CDPAWorker:
         continuation["state"] = "wake_scheduled"
         continuation["wake"] = {"status": "scheduled", "hop_id": wake["hop_id"], "at": utc_now()}
 
+
+    def _gate_c_release_continuation_writer(
+        self,
+        continuation: Mapping[str, Any],
+        *,
+        seal: bool = False,
+    ) -> None:
+        target_ref = (
+            continuation.get("target_ref")
+            if isinstance(continuation.get("target_ref"), Mapping)
+            else {}
+        )
+        binding_id = str(target_ref.get("binding_id") or "").strip()
+        if not binding_id:
+            return
+        from .cdpa_conversations import ConversationLeaseError, ConversationWriterLease
+
+        writer = ConversationWriterLease(self.runtime_db)
+        try:
+            binding = writer.get_binding(binding_id)
+            if binding.get("binding_status") in {"idle", "sealed"}:
+                return
+            writer.release_async_wait(binding_id, seal=seal)
+        except ConversationLeaseError:
+            return
+        if isinstance(continuation, dict):
+            continuation["writer_reservation"] = {
+                **dict(continuation.get("writer_reservation") or {}),
+                "binding_id": binding_id,
+                "state": "sealed" if seal else "released",
+                "released_at": utc_now(),
+            }
+
     def _block_async_wake(
         self, state: dict[str, Any], continuation: dict[str, Any], reason: str, *, code: str
     ) -> None:
+        seal = code in {
+            "ASYNC_WAKE_IDENTITY_MISMATCH",
+            "CONVERSATION_IDENTITY_MISMATCH",
+        }
+        self._gate_c_release_continuation_writer(continuation, seal=seal)
         continuation["wake"] = {"status": "blocked", "code": code, "reason": reason, "at": utc_now()}
         state.update(waiting=None, waiting_code=None, waiting_reason=None)
         self._block(state, f"{code}: {reason}; no new chat or task was opened", code=code, retryable=False)
@@ -7954,6 +8343,7 @@ class CDPAWorker:
         waiting = state.get("waiting") if isinstance(state.get("waiting"), Mapping) else {}
         now = utc_now()
         if status in TERMINAL:
+            self._gate_c_release_continuation_writer(continuation)
             continuation["state"] = "completed"
             continuation["wake"] = {"status": "not_woken", "reason": "parent task is terminal", "at": now}
         elif (
@@ -7971,6 +8361,7 @@ class CDPAWorker:
             # consume it; blocking is not a semantic route away from this turn.
             continuation["wake"] = {"status": "pending_wait", "at": now}
         else:
+            self._gate_c_release_continuation_writer(continuation)
             continuation["state"] = "superseded"
             continuation["wake"] = {
                 "status": "not_scheduled",
@@ -8408,6 +8799,7 @@ class CDPAWorker:
                 "report_path": report_path,
             }
         )
+        self._gate_c_finish_role_turn(state, hop, role)
         state["roles"][role]["status"] = "idle"
         state["block_code"] = None
         state["block_retryable"] = False
@@ -12208,6 +12600,643 @@ class CDPAWorker:
                 raise RuntimeError("control command provenance has different confirmation")
         return state
 
+
+    def _schedule_async_browser_command(
+        self,
+        command_id: str,
+        factory: Callable[[], Any],
+    ) -> dict[str, Any]:
+        loop = self._command_event_loop
+        if loop is None or not loop.is_running():
+            return asyncio.run(factory())
+
+        def start() -> None:
+            task = loop.create_task(factory())
+            self._browser_command_tasks.add(task)
+            task.add_done_callback(self._browser_command_tasks.discard)
+
+        loop.call_soon_threadsafe(start)
+        return self.runtime_db.get_command(command_id)
+
+    @staticmethod
+    def _direct_chat_binding_id(
+        provider_id: str, endpoint_id: str, conversation_id: str
+    ) -> str:
+        raw = f"{provider_id}\n{endpoint_id}\n{conversation_id}"
+        return "direct-chat-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+    async def _direct_chat_page(
+        self, endpoint_id: str, conversation_url: str
+    ) -> tuple[Any, Any, dict[str, Any]]:
+        from .cdpa_conversations import (
+            ConversationLeaseError,
+            canonical_conversation,
+        )
+        from .chatgpt import ChatGPTPage
+        from .chatgpt_models import PageBinding
+
+        if self._endpoint_pool is None:
+            raise ConversationLeaseError(
+                "BROWSER_ENDPOINT_UNAVAILABLE",
+                "browser endpoint pool is not ready",
+                retryable=True,
+            )
+        context = self._endpoint_pool.contexts.get(endpoint_id)
+        if context is None:
+            raise ConversationLeaseError(
+                "BROWSER_ENDPOINT_UNAVAILABLE",
+                "selected browser endpoint is not connected",
+                retryable=True,
+            )
+        expected_id = canonical_conversation(conversation_url)
+        matches: list[Any] = []
+        for page in tuple(getattr(context, "pages", ())):
+            try:
+                if canonical_conversation(str(page.url)) == expected_id:
+                    matches.append(page)
+            except (ConversationLeaseError, ValueError):
+                continue
+        if len(matches) != 1:
+            raise ConversationLeaseError(
+                "CONVERSATION_IDENTITY_MISMATCH",
+                (
+                    "exact conversation page is unavailable"
+                    if not matches
+                    else "conversation is open in multiple page targets"
+                ),
+                retryable=not matches,
+            )
+        client = ChatGPTPage(matches[0])
+        snapshot = await client.snapshot()
+        if canonical_conversation(str(snapshot.url)) != expected_id:
+            raise ConversationLeaseError(
+                "CONVERSATION_IDENTITY_MISMATCH",
+                "page identity changed during Direct Chat admission",
+            )
+        if snapshot.page_id and snapshot.page_role:
+            client.binding = PageBinding(
+                page_id=str(snapshot.page_id),
+                role=str(snapshot.page_role),
+            )
+            snapshot = await client.assert_ownership()
+        else:
+            if snapshot.page_task_id or snapshot.page_team:
+                raise ConversationLeaseError(
+                    "CONVERSATION_IDENTITY_MISMATCH",
+                    "task-owned page is missing exact role/page binding evidence",
+                )
+            await client.set_role("DIRECT_CHAT")
+            snapshot = await client.assert_ownership()
+        if not snapshot.page_id:
+            raise ConversationLeaseError(
+                "CONVERSATION_IDENTITY_MISMATCH",
+                "Direct Chat page has no stable page target identity",
+            )
+        cdp_url, physical_id = self._gate_c_endpoint_evidence(endpoint_id)
+        observed = {
+            "endpoint_id": endpoint_id,
+            "endpoint_cdp_url": cdp_url,
+            "physical_browser_id": physical_id,
+            "page_target_identity": str(snapshot.page_id),
+            "conversation_url": str(snapshot.url),
+        }
+        return client, snapshot, observed
+
+    @staticmethod
+    def _direct_chat_busy_snapshot(snapshot: Any) -> bool:
+        return bool(
+            getattr(snapshot, "stop_visible", False)
+            or getattr(snapshot, "transport_active", False)
+            or getattr(snapshot, "response_projection_active", False)
+            or str(getattr(snapshot, "composer_text", "") or "").strip()
+            or tuple(getattr(snapshot, "attachment_markers", ()) or ())
+            or tuple(getattr(snapshot, "blocking_dialogs", ()) or ())
+            or int(getattr(snapshot, "mcp_permission_node_count", 0) or 0) > 0
+            or int(getattr(snapshot, "mcp_permission_allow_count", 0) or 0) > 0
+        )
+
+    def _direct_chat_prompt(self, payload: Mapping[str, Any]) -> str:
+        text = str(payload.get("text") or "")
+        refs = tuple(str(item) for item in payload.get("material_refs") or ())
+        if not refs:
+            return text
+        task_id = str(payload.get("task_id") or "").strip()
+        private = self.runtime_db.get_task_private(task_id) if task_id else None
+        materials = (
+            private.get("materials")
+            if isinstance(private, Mapping)
+            and isinstance(private.get("materials"), Mapping)
+            else {}
+        )
+        lines = []
+        for material_id in refs:
+            locator = materials.get(material_id)
+            if not isinstance(locator, Mapping):
+                raise ValueError(f"registered MaterialRef is unavailable: {material_id}")
+            version = str(locator.get("version") or "v1")
+            material_type = str(locator.get("material_type") or "artifact")
+            lines.append(
+                f"- material://{task_id}/{material_id} "
+                f"(type={material_type}; version={version})"
+            )
+        return text + "\n\nRegistered MaterialRefs:\n" + "\n".join(lines)
+
+    def _defer_direct_chat_command(
+        self,
+        command_id: str,
+        *,
+        code: str,
+        reason: str,
+        binding_id: str | None = None,
+        attempt_id: str | None = None,
+    ) -> dict[str, Any]:
+        result = {
+            "status": "deferred",
+            "code": code,
+            "binding_id": binding_id,
+            "attempt_id": attempt_id,
+            "retryable": True,
+        }
+        self.runtime_db.require_command_recovery(
+            command_id,
+            error=sanitize_text(f"{code}: {reason}", max_chars=2000),
+            result=result,
+        )
+        return self.runtime_db.get_command(command_id)
+
+    async def _complete_direct_chat_bind(
+        self, command_id: str, payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        from .cdpa_conversations import (
+            ConversationLeaseError,
+            ConversationWriterLease,
+            canonical_conversation,
+        )
+        from .cdpa_dom_stream import project_dom_snapshot
+
+        try:
+            endpoint_id = str(payload.get("endpoint_id") or "").strip()
+            conversation_url = str(payload.get("conversation_url") or "").strip()
+            client, snapshot, observed = await self._direct_chat_page(
+                endpoint_id, conversation_url
+            )
+            requested_task = str(payload.get("task_id") or "").strip() or None
+            requested_role = str(payload.get("role_key") or "").strip().upper() or None
+            observed_task = str(snapshot.page_task_id or "").strip() or None
+            observed_role = str(snapshot.page_role or "").strip().upper() or None
+            if observed_task is not None:
+                if requested_task != observed_task or requested_role != observed_role:
+                    raise ConversationLeaseError(
+                        "CONVERSATION_IDENTITY_MISMATCH",
+                        "task-owned Direct Chat page requires exact task/role evidence",
+                    )
+            elif requested_task is not None:
+                raise ConversationLeaseError(
+                    "CONVERSATION_IDENTITY_MISMATCH",
+                    "standalone page cannot be claimed as task-owned Direct Chat",
+                )
+
+            writer = ConversationWriterLease(self.runtime_db)
+            existing = [
+                item
+                for item in writer.list_bindings()
+                if item.get("endpoint_id") == endpoint_id
+                and item.get("physical_browser_id") == observed["physical_browser_id"]
+                and item.get("page_target_identity") == observed["page_target_identity"]
+            ]
+            if len(existing) > 1:
+                raise ConversationLeaseError(
+                    "CONVERSATION_BINDING_AMBIGUOUS",
+                    "physical page target has multiple live bindings",
+                )
+            if existing:
+                binding = writer.validate_binding(
+                    str(existing[0]["binding_id"]), observed
+                )
+                if (binding.get("task_id") or None) != requested_task or (
+                    str(binding.get("role_key") or "").upper() or None
+                ) != requested_role:
+                    raise ConversationLeaseError(
+                        "CONVERSATION_IDENTITY_MISMATCH",
+                        "existing page binding belongs to different task/role evidence",
+                    )
+            else:
+                conversation_id = canonical_conversation(conversation_url)
+                binding = writer.bind(
+                    binding_id=self._direct_chat_binding_id(
+                        str(payload.get("provider_id") or "chatgpt_web"),
+                        endpoint_id,
+                        conversation_id,
+                    ),
+                    provider_id=str(payload.get("provider_id") or "chatgpt_web"),
+                    endpoint_id=endpoint_id,
+                    endpoint_cdp_url=str(observed["endpoint_cdp_url"]),
+                    physical_browser_id=str(observed["physical_browser_id"]),
+                    page_target_identity=str(observed["page_target_identity"]),
+                    conversation_url=str(snapshot.url),
+                    task_id=requested_task,
+                    role_key=requested_role,
+                )
+            binding = writer.update_dom_projection(
+                str(binding["binding_id"]), project_dom_snapshot(snapshot)
+            )
+            self.runtime_db.finish_command(
+                command_id,
+                result={
+                    "status": "bound",
+                    "binding_id": binding["binding_id"],
+                    "session": binding,
+                },
+            )
+        except Exception as exc:
+            self.runtime_db.finish_command(
+                command_id,
+                error=sanitize_text(f"{type(exc).__name__}: {exc}", max_chars=2000),
+            )
+        return self.runtime_db.get_command(command_id)
+
+    async def _complete_direct_chat_message(
+        self, command_id: str, payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        from .cdpa_conversations import ConversationLeaseError, ConversationWriterLease
+        from .cdpa_dom_stream import project_dom_snapshot
+        from .chatgpt_errors import (
+            ComposerConflictError,
+            PageOwnershipError,
+            UnsafePageStateError,
+        )
+        from .chatgpt_models import SendReceipt
+
+        writer = ConversationWriterLease(self.runtime_db)
+        binding_id = str(payload.get("binding_id") or "").strip()
+        attempt: dict[str, Any] | None = None
+        try:
+            binding = writer.get_binding(binding_id)
+            client, snapshot, observed = await self._direct_chat_page(
+                str(binding["endpoint_id"]), str(binding["conversation_url"])
+            )
+            binding = writer.validate_binding(binding_id, observed)
+            writer.update_dom_projection(binding_id, project_dom_snapshot(snapshot))
+            attempt_key = f"direct-chat-send:{command_id}"
+            existing_attempt_command = self.runtime_db.get_command_by_idempotency_key(
+                attempt_key
+            )
+            existing_attempt = None
+            if isinstance(existing_attempt_command, Mapping):
+                existing_payload = existing_attempt_command.get("payload")
+                if (
+                    existing_attempt_command.get("kind") == "browser_send"
+                    and isinstance(existing_payload, Mapping)
+                    and isinstance(existing_payload.get("send_attempt"), Mapping)
+                ):
+                    existing_attempt = dict(existing_payload["send_attempt"])
+            if self._direct_chat_busy_snapshot(snapshot) and not (
+                existing_attempt is not None
+                and existing_attempt.get("state") in {"accepted", "reconciled_accepted"}
+            ):
+                return self._defer_direct_chat_command(
+                    command_id,
+                    code="DIRECT_CHAT_TARGET_BUSY",
+                    reason="target has active response, manual draft, attachment, or blocking UI",
+                    binding_id=binding_id,
+                )
+            prompt = self._direct_chat_prompt(payload)
+            users = [
+                message
+                for message in snapshot.messages
+                if str(message.role) == "user"
+            ]
+            baseline = {
+                "last_user_message_id": (
+                    users[-1].message_id if users else None
+                ),
+                "user_turn_count": len(users),
+            }
+            try:
+                lease = writer.acquire(
+                    binding_id,
+                    require_idle=existing_attempt is None,
+                )
+            except ConversationLeaseError as exc:
+                if exc.retryable or exc.code in {
+                    "WRITER_LEASE_BUSY",
+                    "WRITER_LEASE_RESERVED",
+                }:
+                    return self._defer_direct_chat_command(
+                        command_id,
+                        code=exc.code,
+                        reason=str(exc),
+                        binding_id=binding_id,
+                    )
+                raise
+
+            if existing_attempt is not None:
+                if existing_attempt.get("owner_binding_id") != binding_id:
+                    raise ConversationLeaseError(
+                        "SEND_ATTEMPT_INVALID",
+                        "Direct Chat send attempt belongs to another binding",
+                    )
+                expected_text_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+                if existing_attempt.get("text_hash") != expected_text_hash:
+                    raise ConversationLeaseError(
+                        "SEND_ATTEMPT_INVALID",
+                        "Direct Chat replay text does not match durable send identity",
+                    )
+                attempt = existing_attempt
+                created = False
+            else:
+                attempt, created = writer.record_send_intent(
+                    lease,
+                    idempotency_key=attempt_key,
+                    text=prompt,
+                    baseline_last_user_message_id=baseline["last_user_message_id"],
+                    baseline_user_turn_count=baseline["user_turn_count"],
+                )
+            if not created:
+                state_name = str(attempt.get("state") or "")
+                if state_name in {"intent_recorded", "submitted", "unconfirmed"}:
+                    attempt = writer.reconcile_attempt(
+                        str(attempt["attempt_id"]),
+                        {
+                            "last_user_message_id": (
+                                users[-1].message_id if users else None
+                            ),
+                            "user_turn_count": len(users),
+                        },
+                    )
+                    state_name = str(attempt.get("state") or "")
+                if state_name == "reconciled_accepted" and not attempt.get("receipt"):
+                    return self._defer_direct_chat_command(
+                        command_id,
+                        code="DIRECT_CHAT_RECONCILED_ACCEPTED",
+                        reason="send acceptance is proven but exact response receipt is unavailable; refusing replay",
+                        binding_id=binding_id,
+                        attempt_id=str(attempt["attempt_id"]),
+                    )
+                if state_name in {"intent_recorded", "submitted", "unconfirmed"}:
+                    return self._defer_direct_chat_command(
+                        command_id,
+                        code="DIRECT_CHAT_SEND_UNCONFIRMED",
+                        reason="send attempt remains ambiguous and must reconcile before retry",
+                        binding_id=binding_id,
+                        attempt_id=str(attempt["attempt_id"]),
+                    )
+                if state_name == "reconciled_absent":
+                    retry_index = 1
+                    while self.runtime_db.get_command_by_idempotency_key(
+                        f"{attempt_key}:retry:{retry_index}"
+                    ) is not None:
+                        retry_index += 1
+                    attempt, created = writer.record_send_intent(
+                        lease,
+                        idempotency_key=f"{attempt_key}:retry:{retry_index}",
+                        text=prompt,
+                        baseline_last_user_message_id=baseline["last_user_message_id"],
+                        baseline_user_turn_count=baseline["user_turn_count"],
+                    )
+                elif state_name in {"accepted", "reconciled_accepted"}:
+                    receipt_data = attempt.get("receipt")
+                    if not isinstance(receipt_data, Mapping):
+                        return self._defer_direct_chat_command(
+                            command_id,
+                            code="DIRECT_CHAT_RECEIPT_UNAVAILABLE",
+                            reason="accepted send has no durable response receipt; refusing replay",
+                            binding_id=binding_id,
+                            attempt_id=str(attempt["attempt_id"]),
+                        )
+                    receipt = SendReceipt.from_dict(receipt_data)
+                    response = await client.wait_for_response(
+                        receipt,
+                        timeout_ms=600_000,
+                        stable_ms=1_000,
+                        poll_ms=100,
+                        active_reload_after_ms=None,
+                    )
+                    final_snapshot = await client.snapshot()
+                    writer.update_dom_projection(
+                        binding_id, project_dom_snapshot(final_snapshot)
+                    )
+                    writer.finish_turn(
+                        binding_id,
+                        assistant_terminal=True,
+                        turn_committed=True,
+                    )
+                    self.runtime_db.finish_command(
+                        command_id,
+                        result={
+                            "status": "completed",
+                            "binding_id": binding_id,
+                            "attempt_id": attempt["attempt_id"],
+                            "response": response.to_dict(),
+                            "reconciled": True,
+                        },
+                    )
+                    return self.runtime_db.get_command(command_id)
+
+            click_dispatched = False
+
+            def after_send_click() -> None:
+                nonlocal click_dispatched, attempt
+                click_dispatched = True
+                attempt = writer.transition_attempt(
+                    str(attempt["attempt_id"]), "submitted"
+                )
+
+            try:
+                receipt = await client.send(
+                    prompt,
+                    wait_for_stop=False,
+                    max_attempts=1,
+                    recovery_reload=False,
+                    expected_task_id=(
+                        str(snapshot.page_task_id)
+                        if snapshot.page_task_id and snapshot.page_team
+                        else None
+                    ),
+                    expected_team=(
+                        str(snapshot.page_team)
+                        if snapshot.page_task_id and snapshot.page_team
+                        else None
+                    ),
+                    require_existing_conversation_baseline=True,
+                    after_send_click=after_send_click,
+                )
+            except (ComposerConflictError, PageOwnershipError, UnsafePageStateError) as exc:
+                current = self.runtime_db.get_command(str(attempt["attempt_id"]))
+                current_attempt = (
+                    ((current or {}).get("payload") or {}).get("send_attempt")
+                    if isinstance((current or {}).get("payload"), Mapping)
+                    else {}
+                )
+                if not click_dispatched and str(
+                    (current_attempt or {}).get("state") or ""
+                ) == "intent_recorded":
+                    writer.transition_attempt(
+                        str(attempt["attempt_id"]), "reconciled_absent"
+                    )
+                    writer.release_writer(binding_id)
+                    return self._defer_direct_chat_command(
+                        command_id,
+                        code="DIRECT_CHAT_INPUT_RACE",
+                        reason=str(exc),
+                        binding_id=binding_id,
+                        attempt_id=str(attempt["attempt_id"]),
+                    )
+                if str((current_attempt or {}).get("state") or "") in {
+                    "intent_recorded",
+                    "submitted",
+                }:
+                    writer.transition_attempt(
+                        str(attempt["attempt_id"]), "unconfirmed"
+                    )
+                return self._defer_direct_chat_command(
+                    command_id,
+                    code="DIRECT_CHAT_SEND_UNCONFIRMED",
+                    reason=str(exc),
+                    binding_id=binding_id,
+                    attempt_id=str(attempt["attempt_id"]),
+                )
+            except Exception as exc:
+                current = self.runtime_db.get_command(str(attempt["attempt_id"]))
+                current_attempt = (
+                    ((current or {}).get("payload") or {}).get("send_attempt")
+                    if isinstance((current or {}).get("payload"), Mapping)
+                    else {}
+                )
+                if str((current_attempt or {}).get("state") or "") in {
+                    "intent_recorded",
+                    "submitted",
+                }:
+                    writer.transition_attempt(
+                        str(attempt["attempt_id"]), "unconfirmed"
+                    )
+                return self._defer_direct_chat_command(
+                    command_id,
+                    code="DIRECT_CHAT_SEND_UNCONFIRMED",
+                    reason=f"{type(exc).__name__}: {exc}",
+                    binding_id=binding_id,
+                    attempt_id=str(attempt["attempt_id"]),
+                )
+
+            attempt = writer.transition_attempt(
+                str(attempt["attempt_id"]),
+                "accepted",
+                metadata={"receipt": receipt.to_dict(), "accepted_at": utc_now()},
+            )
+            writer.update_dom_projection(
+                binding_id, project_dom_snapshot(await client.snapshot())
+            )
+            try:
+                response = await client.wait_for_response(
+                    receipt,
+                    timeout_ms=600_000,
+                    stable_ms=1_000,
+                    poll_ms=100,
+                    active_reload_after_ms=None,
+                )
+            except Exception as exc:
+                return self._defer_direct_chat_command(
+                    command_id,
+                    code="DIRECT_CHAT_RESPONSE_PENDING",
+                    reason=f"{type(exc).__name__}: {exc}",
+                    binding_id=binding_id,
+                    attempt_id=str(attempt["attempt_id"]),
+                )
+            final_snapshot = await client.snapshot()
+            writer.update_dom_projection(
+                binding_id, project_dom_snapshot(final_snapshot)
+            )
+            writer.finish_turn(
+                binding_id,
+                assistant_terminal=True,
+                turn_committed=True,
+            )
+            self.runtime_db.finish_command(
+                command_id,
+                result={
+                    "status": "completed",
+                    "binding_id": binding_id,
+                    "attempt_id": attempt["attempt_id"],
+                    "response": response.to_dict(),
+                },
+            )
+        except ConversationLeaseError as exc:
+            if exc.retryable or exc.code in {
+                "WRITER_LEASE_BUSY",
+                "WRITER_LEASE_RESERVED",
+                "BROWSER_ENDPOINT_UNAVAILABLE",
+            }:
+                return self._defer_direct_chat_command(
+                    command_id,
+                    code=exc.code,
+                    reason=str(exc),
+                    binding_id=binding_id or None,
+                    attempt_id=(
+                        str(attempt.get("attempt_id"))
+                        if isinstance(attempt, Mapping)
+                        else None
+                    ),
+                )
+            self.runtime_db.finish_command(
+                command_id,
+                error=sanitize_text(str(exc), max_chars=2000),
+            )
+        except Exception as exc:
+            self.runtime_db.finish_command(
+                command_id,
+                error=sanitize_text(f"{type(exc).__name__}: {exc}", max_chars=2000),
+            )
+        return self.runtime_db.get_command(command_id)
+
+    def _complete_direct_chat_close(
+        self, command_id: str, payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        from .cdpa_conversations import ConversationLeaseError, ConversationWriterLease
+
+        try:
+            binding_id = str(payload.get("binding_id") or "").strip()
+            writer = ConversationWriterLease(self.runtime_db)
+            binding = writer.get_binding(binding_id)
+            if binding.get("task_id"):
+                raise ConversationLeaseError(
+                    "DIRECT_CHAT_CLOSE_FORBIDDEN",
+                    "task-bound role bindings stay live until task terminal/stop",
+                )
+            if binding.get("binding_status") != "idle":
+                return self._defer_direct_chat_command(
+                    command_id,
+                    code="DIRECT_CHAT_TARGET_BUSY",
+                    reason="standalone Direct Chat binding is not idle",
+                    binding_id=binding_id,
+                )
+            closed = writer.close_binding(binding_id)
+            self.runtime_db.finish_command(
+                command_id,
+                result={
+                    "status": "closed",
+                    "binding_id": binding_id,
+                    "session": closed,
+                },
+            )
+        except ConversationLeaseError as exc:
+            if exc.retryable:
+                return self._defer_direct_chat_command(
+                    command_id,
+                    code=exc.code,
+                    reason=str(exc),
+                    binding_id=str(payload.get("binding_id") or "") or None,
+                )
+            self.runtime_db.finish_command(
+                command_id,
+                error=sanitize_text(str(exc), max_chars=2000),
+            )
+        except Exception as exc:
+            self.runtime_db.finish_command(
+                command_id,
+                error=sanitize_text(f"{type(exc).__name__}: {exc}", max_chars=2000),
+            )
+        return self.runtime_db.get_command(command_id)
+
     def _browser_endpoint_has_running_execution(self, endpoint_id: str) -> bool:
         return any(
             str(item.get("endpoint_id") or "") == endpoint_id
@@ -12336,6 +13365,25 @@ class CDPAWorker:
             self.managed_browsers.start(endpoint)
         return endpoint
 
+    async def _complete_browser_endpoint_update(self, command_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        try:
+            endpoint_id = str(payload.get("endpoint_id") or "").strip()
+            existing = self.store.endpoints.get(endpoint_id)
+            address = normalize_cdp_endpoint(payload["cdp_url"]) if "cdp_url" in payload else existing["cdp_url"]
+            if address != existing["cdp_url"]:
+                if self._browser_endpoint_is_in_use(endpoint_id):
+                    raise ValueError("cannot retarget an endpoint with running execution or live binding; drain it first")
+                probe = await self._probe_browser_endpoint(address)
+                if probe.get("health") != "online":
+                    raise ConnectionError(probe.get("error") or "CDP endpoint is unavailable")
+            endpoint = self._apply_browser_endpoint_update(payload)
+            self.runtime_db.finish_command(command_id, result={"endpoint_id": endpoint_id, "endpoint": endpoint})
+        except Exception as exc:
+            self.runtime_db.finish_command(
+                command_id, error=sanitize_text(f"{type(exc).__name__}: {exc}", max_chars=2000)
+            )
+        return self.runtime_db.get_command(command_id)
+
     def _apply_browser_endpoint_update(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         endpoint_id = str(payload.get("endpoint_id") or "").strip()
         if not endpoint_id:
@@ -12408,6 +13456,18 @@ class CDPAWorker:
                         f"{len(catalog.get('errors') or [])} discovery errors"
                     )
                 result = {"catalog": catalog}
+            elif kind == "direct_chat_bind":
+                return self._schedule_async_browser_command(
+                    command_id,
+                    lambda: self._complete_direct_chat_bind(command_id, payload),
+                )
+            elif kind == "direct_chat_message":
+                return self._schedule_async_browser_command(
+                    command_id,
+                    lambda: self._complete_direct_chat_message(command_id, payload),
+                )
+            elif kind == "direct_chat_close":
+                return self._complete_direct_chat_close(command_id, payload)
             elif kind == "browser_endpoint_add":
                 try:
                     loop = asyncio.get_running_loop()
@@ -12418,8 +13478,10 @@ class CDPAWorker:
                 task.add_done_callback(self._browser_command_tasks.discard)
                 return self.runtime_db.get_command(command_id)
             elif kind == "browser_endpoint_update":
-                endpoint = self._apply_browser_endpoint_update(payload)
-                result = {"endpoint_id": endpoint["endpoint_id"], "endpoint": endpoint}
+                return self._schedule_async_browser_command(
+                    command_id,
+                    lambda: self._complete_browser_endpoint_update(command_id, payload),
+                )
             elif kind == "browser_endpoint_remove":
                 endpoint = self._apply_browser_endpoint_remove(payload)
                 result = {
@@ -12981,6 +14043,7 @@ class CDPAWorker:
 
     async def run_command_loop(self) -> None:
         self._command_loop_ready = True
+        self._command_event_loop = asyncio.get_running_loop()
         self._publish_heartbeat(force=True)
         try:
             while True:
@@ -12990,6 +14053,7 @@ class CDPAWorker:
                 else:
                     await asyncio.sleep(0)
         finally:
+            self._command_event_loop = None
             self._command_loop_ready = False
             self._publish_heartbeat(force=True)
 

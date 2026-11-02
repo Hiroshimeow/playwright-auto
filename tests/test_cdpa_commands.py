@@ -118,6 +118,17 @@ def test_workflow_control_matrix_projects_positive_and_negative_durable_admissio
     assert workflow_control_matrix(current)["archive_worktree"]["eligible"] is True
 
 
+def test_stopped_solo_projects_its_actual_sole_role_for_clear_team():
+    current = state()
+    current["status"] = "STOPPED"
+    current["active_role"] = None
+    current["active_hop_id"] = None
+    current["workflow_mode"] = "solo"
+    eligibility = workflow_control_matrix(current)["clear_team"]
+    assert eligibility["eligible"] is True
+    assert eligibility["role"] == "DEV"
+
+
 def test_legacy_no_progress_block_can_be_explicitly_resumed_for_budget_migration():
     current = state()
     current["status"] = "BLOCKED"

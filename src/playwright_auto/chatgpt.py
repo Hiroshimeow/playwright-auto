@@ -53,7 +53,7 @@ from .chatgpt_graph import (
     rendered_user_text_matches,
     visible_text_matches,
 )
-from .chatgpt_response_projection import RESPONSE_PROJECTION_JS, RETRY_RESOLVER_JS
+from .chatgpt_response_projection import ACTIVE_CHAT_ROOT_JS, RESPONSE_PROJECTION_JS, RETRY_RESOLVER_JS
 from .chatgpt_models import (
     ChatGPTSnapshot,
     ChatGPTState,
@@ -1595,6 +1595,7 @@ _CONNECTION_INTERRUPTION_JS = r"""
 _WAIT_PROBE_READ_SCRIPT = "() => window.__PLAYWRIGHT_AUTO_WAIT_PROBE__?.() || null"
 _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windowNamePrefix]) => {
           window.__PLAYWRIGHT_AUTO_WAIT_PROBE__ = () => {
+          const chatRoot = (__CDPA_ACTIVE_CHAT_ROOT__);
           const visible = (element) => Boolean(
             element && window.getComputedStyle(element).visibility !== 'hidden' &&
             (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
@@ -1605,7 +1606,7 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             return value.length <= limit ? value : value.slice(0, limit);
           };
           const firstVisible = (selector) => [...document.querySelectorAll(selector)].find(visible) || null;
-          const latest = (selector) => [...document.querySelectorAll(selector)].filter(visible).at(-1) || null;
+          const latest = (selector) => [...chatRoot.querySelectorAll(selector)].filter(visible).at(-1) || null;
           const logicalTurnId = (element, role) => {
             const turnId = element?.closest('[data-turn-id]')?.getAttribute('data-turn-id');
             if (turnId) return turnId;
@@ -1640,13 +1641,22 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
           const semanticTurns = () => {
             const counts = {user: 0, assistant: 0};
             const turns = [];
-            for (const heading of document.querySelectorAll('main h4')) {
-              const label = (heading.textContent || '').replace(/\s+/g, ' ').trim();
-              const role = label === 'You said:' ? 'user' : label === 'ChatGPT said:' ? 'assistant' : null;
+            for (const heading of chatRoot.querySelectorAll('h3,h4')) {
+              // Rendered Markdown headings are message content, not turn headers.
+              if (heading.closest('.markdown,[data-message-author-role]')) continue;
+              const headingText = (heading.textContent || '').replace(/\s+/g, ' ').trim();
+              const declaredRole = heading.getAttribute('data-conversation-role');
+              const role = declaredRole === 'user' || declaredRole === 'assistant'
+                ? declaredRole
+                : headingText === 'You said:' ? 'user' : headingText === 'ChatGPT said:' ? 'assistant' : null;
               if (!role || !heading.parentElement) continue;
+              // The accessible heading can contain duplicate hidden role text.
+              const label = role === 'user' ? 'You said:' : 'ChatGPT said:';
               const element = heading.parentElement;
               const raw = (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
-              const body = raw.startsWith(label) ? raw.slice(label.length).trim() : raw;
+              const headingVisible = (heading.innerText || '').replace(/\s+/g, ' ').trim();
+              const prefix = [headingVisible, headingText, label].find(p => p && raw.startsWith(p)) || label;
+              const body = raw.startsWith(prefix) ? raw.slice(prefix.length).trim() : raw;
               const ordinal = counts[role]++;
               turns.push({
                 role,
@@ -1662,7 +1672,7 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
           const composerOwner = (__CDPA_COMPOSER_RESOLVER__)();
           const composer = composerOwner.element;
           const composerRoot = composer?.closest('form') || composer?.closest('[data-testid="composer"]') || null;
-          const stop = firstVisible('button[data-testid="stop-button"], button[aria-label*="Stop"]');
+          const stop = [...chatRoot.querySelectorAll('button[data-testid="stop-button"], button[aria-label*="Stop"]')].find(visible) || null;
           const retry = (__CDPA_RETRY_RESOLVER__);
           const activeResponse = latest('[data-streaming-response-status]');
           const projection = (__CDPA_RESPONSE_PROJECTION__);
@@ -1670,7 +1680,7 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
           const semanticUser = semantic.filter((turn) => turn.role === 'user').at(-1) || null;
           const semanticAssistant = semantic.filter((turn) => turn.role === 'assistant').at(-1) || null;
           const lastUser = latest('[data-message-author-role="user"][data-message-id]');
-          const assistantNodes = [...document.querySelectorAll('[data-message-author-role="assistant"][data-message-id]')]
+          const assistantNodes = [...chatRoot.querySelectorAll('[data-message-author-role="assistant"][data-message-id]')]
             .filter(visible);
           const lastAssistant = assistantNodes.filter((element) => textShape(element).length > 0).at(-1)
             || assistantNodes.at(-1) || null;
@@ -1824,7 +1834,8 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
           };
           return true;
         }""".replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS).replace(
-            '__CDPA_RESPONSE_PROJECTION__', RESPONSE_PROJECTION_JS
+            '__CDPA_ACTIVE_CHAT_ROOT__', ACTIVE_CHAT_ROOT_JS
+        ).replace('__CDPA_RESPONSE_PROJECTION__', RESPONSE_PROJECTION_JS
         ).replace('__CDPA_RETRY_RESOLVER__', RETRY_RESOLVER_JS).replace(
             '__CDPA_MCP_PERMISSION_SURFACE__', _MCP_PERMISSION_SURFACE_JS
         ).replace('__CDPA_CONNECTION_INTERRUPTION__', _CONNECTION_INTERRUPTION_JS)
@@ -1942,6 +1953,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             );
           };
           const text = (element) => (element?.innerText || "").replace(/\s+/g, " ").trim();
+          const chatRoot = (__CDPA_ACTIVE_CHAT_ROOT__);
           const firstVisible = (selector) => [...document.querySelectorAll(selector)].find(visible) || null;
 
           const composerOwner = (__CDPA_COMPOSER_RESOLVER__)();
@@ -1964,7 +1976,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
           }).filter((item) => visible(item.button) && item.score >= 4)
             .sort((a, b) => b.score - a.score);
           const send = sendCandidates[0]?.button || null;
-          const stop = firstVisible('button[data-testid="stop-button"], button[aria-label*="Stop"]');
+          const stop = [...chatRoot.querySelectorAll('button[data-testid="stop-button"], button[aria-label*="Stop"]')].find(visible) || null;
           const login = firstVisible('[data-testid="login-button"]');
           const retry = (__CDPA_RETRY_RESOLVER__);
           __CDPA_CONNECTION_INTERRUPTION__
@@ -2088,7 +2100,6 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             .filter(Boolean)
             .slice(0, 12);
 
-          const chatRoot = document.querySelector('main') || document.body;
           const logicalTurnId = (element, role) => {
             const turnId = element?.closest('[data-turn-id]')?.getAttribute('data-turn-id');
             if (turnId) return turnId;
@@ -2163,13 +2174,21 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             });
           const semanticCounts = {user: 0, assistant: 0};
           const semanticMessages = [];
-          for (const heading of chatRoot.querySelectorAll('h4')) {
-            const label = (heading.textContent || '').replace(/\s+/g, ' ').trim();
-            const role = label === 'You said:' ? 'user' : label === 'ChatGPT said:' ? 'assistant' : null;
+          for (const heading of chatRoot.querySelectorAll('h3,h4')) {
+              // Rendered Markdown headings are message content, not turn headers.
+              if (heading.closest('.markdown,[data-message-author-role]')) continue;
+            const headingText = (heading.textContent || '').replace(/\s+/g, ' ').trim();
+            const declaredRole = heading.getAttribute('data-conversation-role');
+            const role = declaredRole === 'user' || declaredRole === 'assistant'
+              ? declaredRole
+              : headingText === 'You said:' ? 'user' : headingText === 'ChatGPT said:' ? 'assistant' : null;
             if (!role || !heading.parentElement) continue;
+            const label = role === 'user' ? 'You said:' : 'ChatGPT said:';
             const element = heading.parentElement;
             const rawText = text(element);
-            const body = rawText.startsWith(label) ? rawText.slice(label.length).trim() : rawText;
+            const headingVisible = (heading.innerText || '').replace(/\s+/g, ' ').trim();
+            const prefix = [headingVisible, headingText, label].find(p => p && rawText.startsWith(p)) || label;
+            const body = rawText.startsWith(prefix) ? rawText.slice(prefix.length).trim() : rawText;
             const actionScope = role === 'assistant'
               ? (element.closest('[data-turn-key],[data-turn-id],[data-turn-id-container]') || element)
               : element;
@@ -2275,6 +2294,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
           };
         }
         """.replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS)
+          .replace('__CDPA_ACTIVE_CHAT_ROOT__', ACTIVE_CHAT_ROOT_JS)
           .replace('__CDPA_RESPONSE_PROJECTION__', RESPONSE_PROJECTION_JS)
           .replace('__CDPA_RETRY_RESOLVER__', RETRY_RESOLVER_JS)
           .replace('__CDPA_MCP_PERMISSION_SURFACE__', _MCP_PERMISSION_SURFACE_JS)
@@ -2374,6 +2394,7 @@ class ChatGPTPage:
         self.page = page
         self.timeout_ms = timeout_ms
         self.binding: PageBinding | None = None
+        self.model_effort_gate_required = False
         self._owned_composer_text: str | None = None
         self._frontend_identity_task: asyncio.Future[dict[str, str] | None] | None = None
         self._frontend_identity_listener: Callable[[Any], None] | None = None
@@ -3743,6 +3764,80 @@ class ChatGPTPage:
         )
         return snapshot
 
+    async def _ensure_selfrepair_model_effort_locked(
+        self, snapshot: ChatGPTSnapshot, *, allow_change: bool = True
+    ) -> str | None:
+        """Verify High/Extra High on this exact G6 Solo page before editing/Send.
+
+        Fail closed when the model picker is missing or ambiguous. No model
+        change after a composer draft or an accepted Send.
+        """
+        if not self.model_effort_gate_required:
+            return None
+
+        async def read_effort() -> str | None:
+            try:
+                picker = self.page.get_by_role("button", name="Select ChatGPT model")
+                if await picker.count() != 1 or not await picker.is_visible():
+                    return None
+                text = " ".join((await picker.inner_text()).split())
+            except Exception:
+                return None
+            if not text.startswith("Thinking effort "):
+                return None
+            if text.endswith("Extra High"):
+                return "Extra High"
+            if text.endswith("High"):
+                return "High"
+            if text.endswith(("Medium", "Low")):
+                return "below_high"
+            return None
+
+        effort = await read_effort()
+        if effort in {"High", "Extra High"}:
+            await record_page_action(self.page, "model_gate", "verified", detail=effort)
+            return effort
+        if effort != "below_high" or not allow_change:
+            raise UnsafePageStateError(
+                "model_verification_blocked: exact task tab does not show High/Extra High"
+            )
+        if str(getattr(snapshot, "composer_text", "") or "").strip() or getattr(
+            snapshot, "attachment_markers", ()
+        ):
+            raise UnsafePageStateError(
+                "model_verification_blocked: cannot switch model with a composer draft"
+            )
+
+        # The supported G6 UI has a visible Power menu and a five-position
+        # effort slider. Only the owned page may be changed; reverify after it.
+        try:
+            picker = self.page.get_by_role("button", name="Select ChatGPT model")
+            await picker.click()
+            power = self.page.locator('[role="menuitem"][aria-label="Power"]')
+            if await power.count() != 1:
+                raise ValueError("Power menu unavailable")
+            slider = power.locator('[role="slider"]')
+            if await slider.count() != 1:
+                raise ValueError("Effort slider unavailable")
+            for _ in range(3):
+                await power.press("ArrowRight")
+                await asyncio.sleep(0.25)
+                effort = await read_effort()
+                if effort in {"High", "Extra High"}:
+                    break
+            else:
+                raise ValueError("High selection not observable")
+            after = await self.assert_ownership()
+            for name in ("page_id", "page_role", "page_team", "page_task_id"):
+                if getattr(after, name, None) != getattr(snapshot, name, None):
+                    raise ValueError("owned page identity changed during model selection")
+        except Exception as exc:
+            raise UnsafePageStateError(
+                "model_verification_blocked: unable to select and verify High"
+            ) from exc
+        await record_page_action(self.page, "model_gate", "verified", detail=effort)
+        return effort
+
     async def set_text(
         self,
         text: str,
@@ -3762,6 +3857,7 @@ class ChatGPTPage:
         timeout = timeout_ms or self.timeout_ms
         async with self.mutation_guard():
             snapshot = await self._interaction_snapshot(timeout_ms=timeout)
+            await self._ensure_selfrepair_model_effort_locked(snapshot)
             existing = snapshot.composer_text.strip()
             if existing and not visible_text_matches(existing, expected):
                 permitted = overwrite or (
@@ -4177,6 +4273,7 @@ class ChatGPTPage:
         expected_attachment_count: int = 0,
         expected_attachment_names: Sequence[str] | None = None,
         require_existing_conversation_baseline: bool = False,
+        after_send_click: Callable[[], None] | None = None,
     ) -> SendReceipt:
         prompt = text.strip()
         if not prompt:
@@ -4227,6 +4324,7 @@ class ChatGPTPage:
             self._assert_interaction_safe(
                 before, allow_attachments=expected_count > 0
             )
+            await self._ensure_selfrepair_model_effort_locked(before)
             if (before.page_task_id is None) != (before.page_team is None):
                 raise TaskBindingError(
                     "task/team ownership evidence is incomplete before send"
@@ -4255,6 +4353,11 @@ class ChatGPTPage:
                         expected_attachment_names=expected_names,
                     )
                     pre_send = await self.assert_ownership()
+                    # Model may have changed while preparing the composer.
+                    # Verify again immediately before the single accepted Send.
+                    await self._ensure_selfrepair_model_effort_locked(
+                        pre_send, allow_change=False
+                    )
                     baseline = capture_message_baseline(
                         pre_send.messages, pre_send.logical_turn_ids
                     )
@@ -4284,6 +4387,8 @@ class ChatGPTPage:
                     except Exception:
                         click_outcome_ambiguous = True
                         raise
+                    if after_send_click is not None:
+                        after_send_click()
                     dispatched_clicks += 1
                     self._owned_composer_text = None
                     acceptance_timeout_ms = 60_000

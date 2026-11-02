@@ -88,6 +88,21 @@ def test_workflow_temporary_first_send_opens_exact_temporary_url(tmp_path: Path)
     assert hop["state"] == "sending"
 
 
+def test_temporary_task_start_url_is_not_treated_as_adopted_conversation(tmp_path: Path):
+    _store, state, worker = _temporary_task(tmp_path, task_id="task-temp-start-url")
+    hop = _active_hop(state)
+    # Temporary tasks may carry the generic ChatGPT start URL in their initial
+    # hop. It is not an adopted durable conversation and has no canonical ID.
+    hop["conversation_url"] = "https://chatgpt.com/"
+    actions = TemporaryWorkflowActions()
+
+    asyncio.run(worker._pre_send(state, hop, actions))
+
+    assert actions.fresh_urls == [TEMPORARY_CHAT_URL]
+    assert state["roles"]["PLAN"]["page_url"] == TEMPORARY_CHAT_URL
+    assert hop["state"] == "sending"
+
+
 def test_workflow_temporary_same_generation_reuses_owned_tab(tmp_path: Path):
     _store, state, worker = _temporary_task(tmp_path, task_id="task-temp-owned")
     role = state["roles"]["PLAN"]

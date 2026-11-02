@@ -712,8 +712,9 @@ def workflow_control_eligibility(
 
     status = str(state.get("status") or "").upper()
     active_role = str(state.get("active_role") or "").upper() or None
-    selected_role = str(role or active_role or "PLAN").upper()
     roles = state.get("roles") if isinstance(state.get("roles"), Mapping) else {}
+    fallback_role = next(iter(roles)) if len(roles) == 1 else "PLAN"
+    selected_role = str(role or active_role or fallback_role).upper()
     role_exists = selected_role in roles
     hop: Mapping[str, Any] | None = None
     active_hop_id = state.get("active_hop_id")

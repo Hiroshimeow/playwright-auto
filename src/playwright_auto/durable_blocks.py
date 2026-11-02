@@ -140,6 +140,7 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
         max_attempts: int = 2,
         recovery_reload: bool = True,
         require_existing_conversation_baseline: bool = False,
+        after_send_click: Callable[[], None] | None = None,
         response_timeout_ms: int | None = None,
         stable_ms: int = 1_000,
         poll_ms: int = 100,
@@ -170,6 +171,7 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
         self.require_existing_conversation_baseline = bool(
             require_existing_conversation_baseline
         )
+        self.after_send_click = after_send_click
         self.response_timeout_ms = response_timeout_ms
         self.stable_ms = stable_ms
         self.poll_ms = poll_ms
@@ -666,6 +668,7 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
                 recovery_reload=self.recovery_reload,
                 expected_attachment_count=len(identities),
                 expected_attachment_names=expected_markers,
+                after_send_click=self.after_send_click,
                 **send_ownership,
             )
         except Exception as exc:

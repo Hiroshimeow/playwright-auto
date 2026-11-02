@@ -190,10 +190,12 @@ def register_source(
         or str(state.get("active_role") or "").upper() != role
         or hop is None
         or str(hop.get("target_role") or "").upper() != role
+        or str(hop.get("state") or "") not in {"sent", "waiting"}
+        or not isinstance(hop.get("receipt"), Mapping)
     ):
         raise AsyncContinuationError(
             "ASYNC_SPAWN_REJECTED",
-            "continuation source may register only for the active TeamTask role turn",
+            "continuation source may register only for the active accepted TeamTask role turn",
         )
     if kind == "teamtask":
         tasks = list(all_tasks)

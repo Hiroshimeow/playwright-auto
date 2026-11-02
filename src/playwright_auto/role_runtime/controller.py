@@ -101,10 +101,6 @@ class RoleController:
             # No accepted-turn owner is available to approve this old surface.
             # Explicitly pause instead of waiting forever or clicking blindly.
             return self._remember(ctx, Decision(Action.BLOCK, "pre_send_permission_unowned"))
-        # Provider risk UI can only tighten an otherwise eligible approval.
-        # File/tool content never supplies a route or permission decision.
-        if ctx.permission_present and bool(getattr(snapshot, "mcp_provider_risk", False)):
-            return self._remember(ctx, Decision(Action.BLOCK, "permission_review"))
         if ctx.permission_present and (
             int(getattr(snapshot, "mcp_permission_allow_count", 0) or 0) > 1
             or int(getattr(snapshot, "mcp_permission_node_count", 0) or 0) > 1

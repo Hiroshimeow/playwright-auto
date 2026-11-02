@@ -315,3 +315,22 @@ def test_browser_manager_poll_does_not_replace_focused_form():
         text=True,
     )
     assert result.stdout.strip() == "ok"
+
+def test_endpoint_retarget_probes_before_registry_mutation(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    worker = CDPAWorker(config, store=TaskStore(config))
+    worker.runtime_db.ensure_schema()
+    endpoint = worker.store.endpoints.add('9304')
+    before = worker.store.endpoints.get(endpoint['endpoint_id']).copy()
+    probe = AsyncMock(side_effect=ConnectionError('target unavailable'))
+    monkeypatch.setattr(worker, '_probe_browser_endpoint', probe)
+    worker.runtime_db.enqueue_command(
+        command_id='retarget-probe', idempotency_key='retarget-probe',
+        kind='browser_endpoint_update', task_id=None, expected_task_version=None,
+        payload={'endpoint_id': endpoint['endpoint_id'], 'cdp_url': '9305'},
+    )
+    result = worker._apply_next_command()
+    assert result['status'] == 'failed'
+    assert worker.store.endpoints.get(endpoint['endpoint_id']) == before
+    probe.assert_awaited_once_with('http://127.0.0.1:9305')

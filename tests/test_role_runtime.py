@@ -216,6 +216,17 @@ def test_explicit_cloudflare_challenge_blocks_without_retry_or_reload():
     assert (decision.action, decision.reason) == (Action.BLOCK, "provider_challenge")
 
 
+def test_empty_bound_assistant_placeholder_reaches_existing_terminal_timeout():
+    """Accepted blank assistant shell must not WAIT/result_stability indefinitely."""
+    current = current_result("")
+    wait = {}
+    initial = step(current, wait)
+    assert initial.action is Action.WAIT
+    decision = step(current, wait, 605)
+    assert (decision.action, decision.reason) == (Action.BLOCK, "response_terminal_missing")
+    assert "timeout_refreshed" not in wait
+
+
 def test_no_terminal_result_ui_error_is_not_format_repair():
     current = snapshot(error_texts=("Something went wrong",))
     wait = {}

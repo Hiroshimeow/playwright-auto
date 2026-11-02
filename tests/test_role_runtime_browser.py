@@ -124,6 +124,20 @@ def test_modern_semantic_dom_preserves_exact_identity_completion_actions_and_spa
     asyncio.run(_with_page(modern_semantic_dom(), run))
 
 
+def test_semantic_heading_h3_terminalizes_bound_final_route():
+    async def run(page):
+        current = await inspect_chatgpt_page(page)
+        assert len(current.messages) == 2
+        assert current.messages[-1].text == '{"route":"DONE","handoff":"complete"}'
+        wait = {}
+        controller = RoleController()
+        controller.decide(current, wait, receipt=semantic_request(), now=datetime(2026, 9, 28, tzinfo=timezone.utc))
+        result = controller.decide(current, wait, receipt=semantic_request(), now=datetime(2026, 9, 28, 0, 0, 5, tzinfo=timezone.utc))
+        assert (result.action, result.reason) == (Action.ACCEPT, "valid_bound_result")
+
+    asyncio.run(_with_page(modern_semantic_dom().replace('<h4>', '<h3>').replace('</h4>', '</h3>'), run))
+
+
 def test_modern_semantic_bound_dom_terminalizes_despite_stale_listen_streaming():
     async def run(page):
         current = await inspect_chatgpt_page(page)
@@ -613,3 +627,30 @@ def test_text_only_retry_is_scoped_to_current_response():
           <div contenteditable="true" role="textbox"></div>
         </main>
     """, run))
+
+def test_duplicate_main_uses_active_conversation_for_full_and_wait_projection():
+    hidden = '''
+      <main data-app-shell-main-surface="browser" style="position:absolute;width:0;height:0;overflow:hidden">
+        <section data-turn-key="old-stale-turn"><article><h4>You said:</h4>stale old user</article>
+          <article><h4>ChatGPT said:</h4>{"route":"DONE","handoff":"stale old"}</article>
+        </section>
+        <div id="old-composer" contenteditable="true" role="textbox"></div>
+        <button data-testid="stop-button">Stop</button>
+      </main>
+    '''
+    async def run(page):
+        full = await inspect_chatgpt_page(page)
+        assert [(m.role,m.message_id) for m in full.messages] == [
+            ('user',_MODERN_TURN_KEY),('assistant',_MODERN_ASSISTANT_ID)]
+        assert full.stop_visible is False
+        assert full.messages[-1].text == '{"route":"DONE","handoff":"complete"}'
+        probe = await inspect_chatgpt_wait_probe(page)
+        assert probe.last_user_message_id == _MODERN_TURN_KEY
+        assert probe.last_assistant_message_id == _MODERN_ASSISTANT_ID
+        assert probe.stop_visible is False
+        wait = {}
+        controller = RoleController()
+        controller.decide(full, wait, receipt=semantic_request(), now=datetime(2026,9,28,tzinfo=timezone.utc))
+        terminal=controller.decide(full,wait,receipt=semantic_request(),now=datetime(2026,9,28,0,0,5,tzinfo=timezone.utc))
+        assert (terminal.action,terminal.reason) == (Action.ACCEPT,'valid_bound_result')
+    asyncio.run(_with_page(hidden + modern_semantic_dom(), run))
