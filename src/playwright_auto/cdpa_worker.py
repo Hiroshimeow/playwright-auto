@@ -9732,6 +9732,37 @@ class CDPAWorker:
         acquired = await actions.locate_owned(state, role)
         action = "confirm_preboundary_role"
         postcondition = "ownership_confirmed_before_send"
+        if acquired is None and hop.get("kind") in {"route_repair", "report_repair"}:
+            reopen = getattr(actions, "reopen", None)
+            if not callable(reopen):
+                self._require_resume_recovery(
+                    state,
+                    control,
+                    action="none",
+                    reason_code="canonical_repair_reopen_unavailable",
+                    reason="Canonical repair recovery cannot reopen the saved conversation.",
+                    next_safe_action="Restore the exact saved conversation; do not fall back to a Fresh chat.",
+                )
+                return
+            try:
+                acquired = await reopen(
+                    state,
+                    role,
+                    require_clean_ready=True,
+                    foreground=False,
+                )
+                action = "reopen_repair_conversation"
+                postcondition = "canonical_repair_conversation_reopened"
+            except Exception as exc:
+                self._require_resume_recovery(
+                    state,
+                    control,
+                    action="none",
+                    reason_code="canonical_repair_reopen_failed",
+                    reason=sanitize_exception(exc),
+                    next_safe_action="Restore the exact saved canonical conversation; do not open a Fresh replacement.",
+                )
+                return
         explicit_fresh = state.get("context_policy") == "fresh"
         temporary_recovery = state.get("conversation_mode") == "temporary"
         refresh_stale_recovery_prompt = (

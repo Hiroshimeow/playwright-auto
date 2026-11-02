@@ -770,12 +770,13 @@ class CDPATabActions:
             raise RoleOwnershipError(
                 f"recorded role URL is not a ChatGPT conversation: {page_url!r}"
             )
+        conversation_identity = _reopenable_conversation_identity(page_url)
         conversation_id = parsed_url.path.rstrip("/").rsplit("/", 1)[-1]
         if conversation_id.startswith("WEB:"):
             raise RoleOwnershipError(
                 "temporary WEB conversation cannot be reopened exactly; use Restart role or Stop"
             )
-        if not parsed_url.path.startswith("/c/"):
+        if conversation_identity is None:
             raise RoleOwnershipError(
                 f"recorded role URL is not an exact conversation URL: {page_url!r}"
             )
