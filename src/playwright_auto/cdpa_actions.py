@@ -56,16 +56,24 @@ def _reopenable_conversation_identity(value: Any) -> str | None:
         parsed = urlparse(str(value or ""))
     except ValueError:
         return None
-    path = parsed.path.rstrip("/")
-    conversation_id = path.rsplit("/", 1)[-1]
-    if (
-        (parsed.hostname or "").lower() not in _CHATGPT_HOSTS
-        or not path.startswith("/c/")
-        or len(path) <= 3
-        or conversation_id.startswith("WEB:")
-    ):
+    if (parsed.hostname or "").lower() not in _CHATGPT_HOSTS:
         return None
-    return path
+    pieces = [piece for piece in parsed.path.split("/") if piece]
+    if len(pieces) == 2 and pieces[0] == "c" and pieces[1]:
+        conversation_id = pieces[1]
+    elif (
+        len(pieces) == 4
+        and pieces[0] == "g"
+        and pieces[1]
+        and pieces[2] == "c"
+        and pieces[3]
+    ):
+        conversation_id = pieces[3]
+    else:
+        return None
+    if conversation_id.startswith("WEB:"):
+        return None
+    return f"/c/{conversation_id}"
 
 
 class BranchBootstrapError(RuntimeError):
