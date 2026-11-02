@@ -1252,13 +1252,16 @@ class CDPATabActions:
             page_id = str(metadata.get("page_id") or "")
             if not page_id:
                 continue
-            if expected_binding_id and metadata.get("binding_id") == expected_binding_id:
-                pass
-            elif recorded_page_id and page_id == recorded_page_id:
+            if recorded_page_id:
+                # Durable page identity is authoritative once materialized. A stale
+                # recovery page may still carry the same binding token, but it must
+                # not compete with the recorded owner.
+                if page_id != recorded_page_id:
+                    continue
+            elif expected_binding_id and metadata.get("binding_id") == expected_binding_id:
                 pass
             elif (
-                not recorded_page_id
-                and metadata.get("role") == physical
+                metadata.get("role") == physical
                 and metadata.get("team") == team
                 and metadata.get("task_id") == task_id
             ):
