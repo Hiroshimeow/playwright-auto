@@ -132,6 +132,45 @@ def test_t078_adopted_identity_is_exact_and_unresolved_never_provisional(writers
         writers.validate_binding("one", {**original, "conversation_url": "https://chatgpt.com/c/abcd"})
 
 
+def test_t078_local_chatgpt_url_stays_provisional_per_page(writers):
+    from playwright_auto.cdpa_conversations import canonical_conversation
+
+    url = "https://chatgpt.com/c/local-chatgpt%3Ashared-placeholder"
+    with pytest.raises(ValueError, match="CONVERSATION_IDENTITY_MISMATCH"):
+        canonical_conversation(url)
+
+    first = writers.bind(
+        binding_id="fresh-local-one",
+        provider_id="chatgpt_web",
+        endpoint_id="ep-1",
+        endpoint_cdp_url="http://127.0.0.1:9222",
+        physical_browser_id="browser-9222",
+        page_target_identity="page-one",
+        conversation_url=url,
+        verified_new_chat=True,
+        task_id="task-one",
+        role_key="PLAN",
+    )
+    second = writers.bind(
+        binding_id="fresh-local-two",
+        provider_id="chatgpt_web",
+        endpoint_id="ep-1",
+        endpoint_cdp_url="http://127.0.0.1:9222",
+        physical_browser_id="browser-9222",
+        page_target_identity="page-two",
+        conversation_url=url,
+        verified_new_chat=True,
+        task_id="task-two",
+        role_key="PLAN",
+    )
+
+    assert first["canonical_conversation_id"] is None
+    assert second["canonical_conversation_id"] is None
+    assert first["writer_identity_key"] != second["writer_identity_key"]
+    assert first["provisional_writer_identity_key"] == first["writer_identity_key"]
+    assert second["provisional_writer_identity_key"] == second["writer_identity_key"]
+
+
 def test_t078_temporary_chat_url_is_a_valid_provisional_new_chat(writers):
     url = "https://chatgpt.com/?temporary-chat=true"
     binding = writers.bind(

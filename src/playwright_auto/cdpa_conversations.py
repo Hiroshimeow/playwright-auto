@@ -4,7 +4,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from typing import Any, Mapping
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from .cdpa_runtime_db import IdempotencyConflict, RuntimeDB
 
@@ -65,7 +65,33 @@ def canonical_conversation(url: str) -> str:
             "CONVERSATION_IDENTITY_MISMATCH",
             "canonical conversation id is unavailable",
         )
-    return pieces[1]
+    conversation_id = pieces[1]
+    if unquote(conversation_id).lower().startswith("local-chatgpt:"):
+        raise ConversationLeaseError(
+            "CONVERSATION_IDENTITY_MISMATCH",
+            "local ChatGPT placeholder is provisional, not a canonical conversation id",
+        )
+    return conversation_id
+
+
+def _local_chatgpt_url(url: str) -> bool:
+    try:
+        parsed = urlparse(str(url or "").strip())
+    except ValueError:
+        return False
+    pieces = [piece for piece in parsed.path.split("/") if piece]
+    return (
+        parsed.scheme.lower() == "https"
+        and parsed.hostname is not None
+        and parsed.hostname.lower() == "chatgpt.com"
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.port in {None, 443}
+        and not parsed.fragment
+        and len(pieces) == 2
+        and pieces[0] == "c"
+        and unquote(pieces[1]).lower().startswith("local-chatgpt:")
+    )
 
 
 def _new_chat_url(url: str) -> bool:
@@ -273,7 +299,9 @@ class ConversationWriterLease:
             try:
                 canonical_id = canonical_conversation(conversation_url)
             except ConversationLeaseError:
-                if verified_new_chat and _new_chat_url(conversation_url):
+                if verified_new_chat and (
+                    _new_chat_url(conversation_url) or _local_chatgpt_url(conversation_url)
+                ):
                     canonical_id = None
                 else:
                     raise
