@@ -12884,6 +12884,9 @@ class CDPAWorker:
             client, snapshot, observed = await self._direct_chat_page(
                 str(binding["endpoint_id"]), str(binding["conversation_url"])
             )
+            observed = dict(observed)
+            observed.setdefault("temporary_chat", False)
+            observed.setdefault("temporary_document_id", None)
             binding = writer.validate_binding(binding_id, observed)
             writer.update_dom_projection(binding_id, project_dom_snapshot(snapshot))
             attempt_key = f"direct-chat-send:{command_id}"

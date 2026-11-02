@@ -14,6 +14,17 @@ from test_operator_resume_recovery import _prepare_pristine_new_sending_record
 TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true"
 
 
+class _TemporaryPage:
+    async def evaluate(self, *_args):
+        return "temporary-document-test-token"
+
+
+def _temporary_ready_client(state, role):
+    client = ready_client(state, role)
+    client.page = _TemporaryPage()
+    return client
+
+
 def _temporary_task(tmp_path: Path, *, task_id: str):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
@@ -40,7 +51,7 @@ class TemporaryWorkflowActions(FakeActions):
         assert clean_for_send is True
         record = state["roles"][role]
         return AcquiredRole(
-            client=ready_client(state, role),
+            client=_temporary_ready_client(state, role),
             page_id=str(record["page_id"]),
             url=str(record["page_url"]),
             created=False,
@@ -55,7 +66,7 @@ class TemporaryWorkflowActions(FakeActions):
             return None
         record = state["roles"][role]
         return AcquiredRole(
-            client=ready_client(state, role),
+            client=_temporary_ready_client(state, role),
             page_id=str(record["page_id"]),
             url=str(record["page_url"]),
             created=False,
@@ -67,7 +78,7 @@ class TemporaryWorkflowActions(FakeActions):
         self.fresh_urls.append(url)
         record = state["roles"][role]
         return AcquiredRole(
-            client=ready_client(state, role),
+            client=_temporary_ready_client(state, role),
             page_id=f"temporary-{record['physical_role']}",
             url=url,
             created=True,
@@ -200,7 +211,19 @@ def test_temporary_normal_send_uses_no_recovery_reload(tmp_path: Path):
 
     # Now run _sending with a recording client and verify max_attempts=1, recovery_reload=False
     client = RecordingCDPASendClient(task_id=state["task_id"], team=state["team"])
-    asyncio.run(worker._sending(state, hop, RecordingCDPASendActions(client)))
+
+    class TemporarySendActions(RecordingCDPASendActions):
+        async def locate_owned(self, current, role):
+            record = current["roles"][role]
+            return AcquiredRole(
+                client=self.client,
+                page_id=str(record["page_id"]),
+                url=str(record["page_url"]),
+                created=False,
+                new_chat=False,
+            )
+
+    asyncio.run(worker._sending(state, hop, TemporarySendActions(client)))
 
     assert len(client.send_calls) == 1
     assert client.send_max_attempts == [1], (

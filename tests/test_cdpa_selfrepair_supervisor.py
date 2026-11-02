@@ -499,6 +499,8 @@ def test_no_stale_stop_for_active_or_ambiguous_send(monkeypatch,tmp_path,changes
 
 def test_source_drift_allows_reconciliation_but_blocks_new_slice(monkeypatch, tmp_path):
     config, state = setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(mod.socket, "gethostname", lambda: mod.HOST)
+    monkeypatch.setattr(mod, "ROOT", Path(config["repository"]))
     health={'ok':True,'worker_online':True,'worker_ready':True,
             'worker_runtime_ready':True,'worker_command_loop_ready':True,
             'worker_source_drift':{'drifted':True}}
