@@ -693,7 +693,7 @@ class CDPATabActions:
                     timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
                 )
             await client.bind_task_identity(task_id, team)
-            new_chat = False
+            new_chat = True
         else:
             client, snapshot = matches[0]
             await client.assert_ownership()

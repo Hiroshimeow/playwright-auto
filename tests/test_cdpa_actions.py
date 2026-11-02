@@ -1576,6 +1576,27 @@ def test_normal_location_avoids_unsupported_lifecycle_calls(tmp_path, monkeypatc
     assert owned.front is False
 
 
+def test_acquire_new_role_marks_fresh_chat_for_provisional_identity(tmp_path, monkeypatch):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    monkeypatch.setattr(actions_module, "ChatGPTWorkspace", FakeWorkspace)
+    monkeypatch.setattr(
+        actions_module,
+        "random_delay",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+    context = FakeContext()
+    actions = CDPATabActions(context, config)
+
+    acquired = asyncio.run(
+        actions.acquire(manifest(page_id=None, page_url=None), "PLAN")
+    )
+
+    assert acquired.created is True
+    assert acquired.url == "https://chatgpt.com/"
+    assert acquired.new_chat is True
+    assert acquired.client.bind_calls == [("task-1", "new-team")]
+
+
 def test_terminal_team_reuse_rebinds_without_new_chat(tmp_path, monkeypatch):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     page = FakePage(
