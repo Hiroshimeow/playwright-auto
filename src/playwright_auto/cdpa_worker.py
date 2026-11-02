@@ -6772,8 +6772,33 @@ class CDPAWorker:
         if str(old_binding.get("page_target_identity") or "") == str(acquired.page_id):
             return
 
-        attempt_id = str(hop.get("send_attempt_id") or "").strip()
-        if attempt_id:
+        request_id = str(hop.get("request_id") or "").strip()
+        attempt_ids: list[str] = []
+        transient_attempt_id = str(hop.get("send_attempt_id") or "").strip()
+        if transient_attempt_id:
+            attempt_ids.append(transient_attempt_id)
+        base_key = f"browser-send:{request_id}"
+        retry_index = 0
+        while True:
+            key = base_key if retry_index == 0 else f"{base_key}:retry:{retry_index}"
+            command = self.runtime_db.get_command_by_idempotency_key(key)
+            if command is None:
+                if retry_index == 0:
+                    retry_index += 1
+                    continue
+                break
+            payload = command.get("payload") if isinstance(command, Mapping) else None
+            attempt = payload.get("send_attempt") if isinstance(payload, Mapping) else None
+            if (
+                isinstance(attempt, Mapping)
+                and str(attempt.get("owner_binding_id") or "") == old_binding_id
+            ):
+                candidate_id = str(attempt.get("attempt_id") or "").strip()
+                if candidate_id and candidate_id not in attempt_ids:
+                    attempt_ids.append(candidate_id)
+            retry_index += 1
+
+        for attempt_id in attempt_ids:
             command = self.runtime_db.get_command(attempt_id)
             payload = command.get("payload") if isinstance(command, Mapping) else None
             attempt = payload.get("send_attempt") if isinstance(payload, Mapping) else None
