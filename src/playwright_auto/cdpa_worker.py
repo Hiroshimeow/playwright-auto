@@ -6719,7 +6719,11 @@ class CDPAWorker:
         before the durable Send boundary, for the exact request/generation/page
         reacquired by the active Resume control.
         """
-        from .cdpa_conversations import ConversationLeaseError, ConversationWriterLease
+        from .cdpa_conversations import (
+            ConversationLeaseError,
+            ConversationWriterLease,
+            canonical_conversation,
+        )
 
         if durable is None:
             raise ConversationLeaseError(
@@ -6762,7 +6766,10 @@ class CDPAWorker:
         canonical_id = str(old_binding.get("canonical_conversation_id") or "").strip()
         canonical_repair_rotation = False
         if canonical_id:
-            observed_id = _recoverable_conversation_identity(acquired.url)
+            try:
+                observed_id = canonical_conversation(acquired.url)
+            except ConversationLeaseError:
+                observed_id = None
             canonical_repair_rotation = bool(
                 hop.get("kind") in {"route_repair", "report_repair"}
                 and old_binding.get("reconciliation_only") is True
