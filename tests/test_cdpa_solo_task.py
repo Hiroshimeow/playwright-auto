@@ -277,15 +277,33 @@ def test_solo_done_registers_report_file_referenced_in_handoff(tmp_path: Path):
 
     data = report.read_bytes()
     assert state["status"] == "DONE"
-    assert hop["report_path"] == "workflows/self-evolution/review-solo.md"
+    canonical = (
+        tmp_path
+        / ".plan"
+        / state["team"]
+        / f"{hop['physical_role']}_turn{hop['turn']}_{state['task_id']}.md"
+    )
+    assert hop["report_path"] == str(canonical)
+    assert canonical.read_bytes() == data
     assert hop["report_sha256"] == hashlib.sha256(data).hexdigest()
     assert hop["report_size"] == len(data)
     assert len(state["reports"]) == 1
     entry = state["reports"][0]
-    assert entry["path"] == "workflows/self-evolution/review-solo.md"
+    assert entry["path"] == str(canonical)
     assert entry["role"] == "REVIEW"
     assert entry["sha256"] == hop["report_sha256"]
     assert entry["size"] == len(data)
+
+    from playwright_auto.cdpa_projection import _hydrate_file_report_evidence
+
+    hydrated = _hydrate_file_report_evidence(
+        state,
+        entry["path"],
+        repository=str(tmp_path),
+        declared_hash=entry["sha256"],
+        declared_size=entry["size"],
+    )
+    assert hydrated is not None
 
 
 def test_solo_done_registers_relative_report_reference(tmp_path: Path):
@@ -310,7 +328,14 @@ def test_solo_done_registers_relative_report_reference(tmp_path: Path):
     worker._responded(state, hop)
 
     assert state["status"] == "DONE"
-    assert hop["report_path"] == "docs/result.md"
+    canonical = (
+        tmp_path
+        / ".plan"
+        / state["team"]
+        / f"{hop['physical_role']}_turn{hop['turn']}_{state['task_id']}.md"
+    )
+    assert hop["report_path"] == str(canonical)
+    assert canonical.read_bytes() == report.read_bytes()
     assert len(state["reports"]) == 1
 
 
@@ -435,8 +460,123 @@ def test_solo_done_registers_fresh_report_next_to_cited_spec(tmp_path: Path):
     worker._responded(state, hop)
 
     assert state["status"] == "DONE"
-    assert hop["report_path"] == "docs/review.md"
+    canonical = (
+        tmp_path
+        / ".plan"
+        / state["team"]
+        / f"{hop['physical_role']}_turn{hop['turn']}_{state['task_id']}.md"
+    )
+    assert hop["report_path"] == str(canonical)
+    assert canonical.read_bytes() == report.read_bytes()
     assert len(state["reports"]) == 1
+
+
+def test_solo_done_falls_back_when_canonical_path_holds_other_content(tmp_path: Path):
+    config, store = make_store(tmp_path)
+    state = store.create_task(
+        "Solo REVIEW fallback",
+        task_id="solo-done-materialize-fallback",
+        workflow_mode="solo",
+        roles=("REVIEW",),
+        browser_endpoint_id="9222",
+    )
+    report = tmp_path / "docs" / "result.md"
+    report.parent.mkdir(parents=True)
+    report.write_text("# Result\n\nAgent version.\n", encoding="utf-8")
+    worker = CDPAWorker(config, store=store)
+    hop = active_hop(state)
+    canonical = (
+        tmp_path
+        / ".plan"
+        / state["team"]
+        / f"{hop['physical_role']}_turn{hop['turn']}_{state['task_id']}.md"
+    )
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    canonical.write_text("# Different content\n", encoding="utf-8")
+    hop["state"] = "responded"
+    hop["response"] = json.dumps(
+        {"route": "DONE", "handoff": f"Full result written to {report}."}
+    )
+
+    worker._responded(state, hop)
+
+    assert state["status"] == "DONE"
+    assert hop["report_path"] == "docs/result.md"
+    assert hop["report_materialization_error"].startswith("RouteContractError")
+    assert len(state["reports"]) == 1
+    assert state["reports"][0]["path"] == "docs/result.md"
+
+
+def test_solo_done_materializes_cited_report_byte_for_byte(tmp_path: Path):
+    import hashlib
+
+    config, store = make_store(tmp_path)
+    state = store.create_task(
+        "Solo REVIEW byte fidelity",
+        task_id="solo-done-byte-fidelity",
+        workflow_mode="solo",
+        roles=("REVIEW",),
+        browser_endpoint_id="9222",
+    )
+    payload = b"\xef\xbb\xbf# Title\r\n\r\nBody without trailing newline"
+    report = tmp_path / "docs" / "bytes.md"
+    report.parent.mkdir(parents=True)
+    report.write_bytes(payload)
+    worker = CDPAWorker(config, store=store)
+    hop = active_hop(state)
+    hop["state"] = "responded"
+    hop["response"] = json.dumps(
+        {"route": "DONE", "handoff": f"Report saved at {report} - done."}
+    )
+
+    worker._responded(state, hop)
+
+    canonical = (
+        tmp_path
+        / ".plan"
+        / state["team"]
+        / f"{hop['physical_role']}_turn{hop['turn']}_{state['task_id']}.md"
+    )
+    assert hop["report_path"] == str(canonical)
+    assert canonical.read_bytes() == payload
+    assert hop["report_sha256"] == hashlib.sha256(payload).hexdigest()
+    assert "report_materialization_error" not in hop
+
+
+def test_solo_done_replay_registers_single_report(tmp_path: Path):
+    config, store = make_store(tmp_path)
+    state = store.create_task(
+        "Solo REVIEW replay",
+        task_id="solo-done-replay",
+        workflow_mode="solo",
+        roles=("REVIEW",),
+        browser_endpoint_id="9222",
+    )
+    report = tmp_path / "docs" / "replay.md"
+    report.parent.mkdir(parents=True)
+    report.write_text("# Replay\n\nStable.\n", encoding="utf-8")
+    worker = CDPAWorker(config, store=store)
+    hop = active_hop(state)
+    hop["state"] = "responded"
+    hop["response"] = json.dumps(
+        {"route": "DONE", "handoff": f"Report saved at {report} - done."}
+    )
+
+    worker._responded(state, hop)
+    assert len(state["reports"]) == 1
+
+    hop["state"] = "responded"
+    worker._responded(state, hop)
+
+    assert state["status"] == "DONE"
+    assert len(state["reports"]) == 1
+    canonical = (
+        tmp_path
+        / ".plan"
+        / state["team"]
+        / f"{hop['physical_role']}_turn{hop['turn']}_{state['task_id']}.md"
+    )
+    assert state["reports"][0]["path"] == str(canonical)
 
 
 def test_solo_done_does_not_register_mdx_lookalike(tmp_path: Path):

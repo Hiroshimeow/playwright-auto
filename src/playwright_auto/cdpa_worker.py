@@ -105,6 +105,7 @@ from .cdpa_route_contract import (
 )
 from .cdpa_routes import (
     InlineReportMaterializationError,
+    ReportEvidence,
     RouteContractError,
     RouteDecision,
     expected_report_relative,
@@ -8569,6 +8570,52 @@ class CDPAWorker:
             **outcome,
         }
 
+    def _materialize_solo_report(
+        self,
+        state: Mapping[str, Any],
+        hop: Mapping[str, Any],
+        evidence: ReportEvidence,
+    ) -> ReportEvidence:
+        """Copy a Solo handoff report file to the canonical report location.
+
+        The dashboard only serves report files stored under the task's team
+        plan root, so a report the agent wrote elsewhere in the repository
+        is materialized at the hop's expected report path, mirroring how
+        inline reports are materialized. Returns the evidence unchanged
+        when the file already sits at the canonical path.
+        """
+        report_repository, report_plans_root = _workflow_report_roots(self.config, state)
+        expected_relative = expected_report_relative(
+            plans_root=report_plans_root,
+            repository_root=report_repository,
+            team=str(state["team"]),
+            physical_role=str(hop["physical_role"]),
+            turn=int(hop["turn"]),
+            task_id=str(state["task_id"]),
+        )
+        source = Path(evidence.path)
+        if not source.is_absolute():
+            source = report_repository / source
+        expected_target = report_repository / expected_relative
+        if source.resolve() == expected_target.resolve():
+            return ReportEvidence(str(expected_target), evidence.sha256, evidence.size)
+        raw = source.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != evidence.sha256:
+            raise ValueError("cited report changed after validation")
+        result = materialize_inline_report(
+            raw.decode("utf-8"),
+            expected_report_path=expected_relative,
+            repository_root=report_repository,
+            plans_root=report_plans_root,
+            team=str(state["team"]),
+            physical_role=str(hop["physical_role"]),
+            turn=int(hop["turn"]),
+            task_id=str(state["task_id"]),
+        )
+        if result.sha256 != evidence.sha256:
+            raise ValueError("materialized report differs from cited bytes")
+        return result
+
     def _responded(self, state: dict[str, Any], hop: dict[str, Any]) -> None:
         if is_independent_task(state):
             if not str(hop.get("response") or "").strip():
@@ -8627,30 +8674,50 @@ class CDPAWorker:
                 except Exception:
                     solo_evidence = None
                 if solo_evidence is not None:
+                    try:
+                        registered = self._materialize_solo_report(state, hop, solo_evidence)
+                    except Exception as exc:
+                        registered = solo_evidence
+                        hop_update["report_materialization_error"] = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
                     hop_update.update(
                         {
-                            "report_path": solo_evidence.path,
-                            "report_sha256": solo_evidence.sha256,
-                            "report_size": solo_evidence.size,
+                            "report_path": registered.path,
+                            "report_sha256": registered.sha256,
+                            "report_size": registered.size,
                         }
                     )
-                    if not any(
-                        item.get("path") == solo_evidence.path
-                        and item.get("role") == role
-                        and item.get("physical_role") == hop["physical_role"]
-                        and item.get("turn") == hop["turn"]
-                        for item in state.get("reports") or []
-                        if isinstance(item, Mapping)
-                    ):
+                    existing = next(
+                        (
+                            item
+                            for item in state.get("reports") or []
+                            if isinstance(item, dict)
+                            and item.get("role") == role
+                            and item.get("physical_role") == hop["physical_role"]
+                            and item.get("turn") == hop["turn"]
+                        ),
+                        None,
+                    )
+                    if existing is None:
                         state.setdefault("reports", []).append(
                             {
                                 "report_id": len(state.get("reports") or []) + 1,
                                 "role": role,
                                 "physical_role": hop["physical_role"],
                                 "turn": hop["turn"],
-                                "path": solo_evidence.path,
-                                "sha256": solo_evidence.sha256,
-                                "size": solo_evidence.size,
+                                "path": registered.path,
+                                "sha256": registered.sha256,
+                                "size": registered.size,
+                                "created_at": utc_now(),
+                            }
+                        )
+                    elif existing.get("path") != registered.path:
+                        existing.update(
+                            {
+                                "path": registered.path,
+                                "sha256": registered.sha256,
+                                "size": registered.size,
                                 "created_at": utc_now(),
                             }
                         )
