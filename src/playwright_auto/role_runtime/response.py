@@ -154,7 +154,9 @@ def _bound_assistant(ctx: Context, receipt: Any) -> Any | None:
         ) + 1
     ctx.wait["bound_assistant_message_id"] = getattr(candidate, "message_id", None)
     ctx.wait["bound_assistant_turn_id"] = getattr(candidate, "turn_id", None)
-    return candidate
+    # Keep the accepted-turn identity, but an empty DOM shell is not a
+    # response candidate: let the existing missing-response timeout execute.
+    return candidate if fingerprint(candidate) else None
 
 
 def observe(

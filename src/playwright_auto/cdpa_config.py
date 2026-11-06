@@ -136,6 +136,7 @@ class CDPAConfig:
     repository_allowed_roots: tuple[Path, ...]
     cdp_url: str
     workspace_timeout_seconds: float
+    model_effort_gate_required: bool
     route_repair_attempts: int
     response_timeout_seconds: float
     response_refresh_after_seconds: float
@@ -313,6 +314,7 @@ def load_cdpa_config(
         cdp_url=normalize_cdp_endpoint(str(browser.get("cdp_url", "http://127.0.0.1:9222"))),
         browser_endpoints=endpoint_config_seeds(browser),
         workspace_timeout_seconds=float(_positive(browser.get("workspace_timeout_seconds", 15), "browser.workspace_timeout_seconds")),
+        model_effort_gate_required=bool(browser.get("model_effort_gate_required", False)),
         route_repair_attempts=int(_positive(repair.get("max_attempts", 3), "route_repair.max_attempts", integer=True)),
         response_timeout_seconds=float(_positive(response.get("timeout_seconds", 7200), "response.timeout_seconds")),
         response_refresh_after_seconds=float(_positive(response.get("refresh_after_seconds", 600), "response.refresh_after_seconds")),

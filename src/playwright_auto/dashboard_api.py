@@ -25,6 +25,7 @@ from .cdpa_bootstraps import (
 )
 from .cdpa_commands import RepairRequest
 from .cdpa_config import CDPAConfig, declared_repository_from_task, load_cdpa_config
+from .cdpa_conversations import ConversationLeaseError, ConversationWriterLease, canonical_conversation
 from .cdpa_endpoints import BrowserEndpointRegistry
 from .cdpa_identity import generate_idempotent_task_id, validate_task_id
 from .cdpa_materials import (
@@ -101,6 +102,9 @@ class DashboardAPI:
         self.live_stream_hub = LiveStreamHub(self.live_event_log)
         self.db = db or RuntimeDB(config.runtime_database)
         self.db.ensure_schema()
+        self.conversations = ConversationWriterLease(self.db)
+        self._session_stream_lock = threading.RLock()
+        self._session_streams: dict[str, dict[str, Any]] = {}
         self._system_lock = threading.Lock()
         self._previous_cpu = self._read_cpu()
 
@@ -1274,6 +1278,115 @@ class DashboardAPI:
         except IdempotencyConflict as exc:
             raise APIError(409, "idempotency_conflict", str(exc)) from exc
 
+    def session_catalog(self) -> dict[str, Any]:
+        return {"items": self.conversations.list_bindings()}
+
+    def normalize_direct_chat_bind(self, raw: Mapping[str, Any]) -> dict[str, Any]:
+        allowed = {"endpoint_id", "conversation_url", "provider_id", "task_id", "role_key"}
+        unknown = set(raw) - allowed
+        if unknown:
+            raise APIError(400, "invalid_request", f"unknown fields: {sorted(unknown)!r}")
+        endpoint_id = self._resolved_browser_endpoint_id(raw.get("endpoint_id"))
+        conversation_url = str(raw.get("conversation_url") or "").strip()
+        if not conversation_url:
+            raise APIError(400, "invalid_request", "conversation_url is required")
+        try:
+            canonical_conversation(conversation_url)
+        except ConversationLeaseError as exc:
+            raise APIError(400, exc.code.lower(), str(exc)) from exc
+        provider_id = str(raw.get("provider_id") or "chatgpt_web").strip()
+        try:
+            select_provider(
+                explicit_provider_id=provider_id,
+                required_capabilities=("browser", "adopted_url", "direct_chat"),
+                execution_mode="browser_dom",
+            )
+        except ProviderRuntimeError as exc:
+            raise APIError(400, "invalid_request", str(exc)) from exc
+        task_id = str(raw.get("task_id") or "").strip() or None
+        role_key = str(raw.get("role_key") or "").strip().upper() or None
+        if role_key is not None and task_id is None:
+            raise APIError(400, "invalid_request", "role_key requires task_id")
+        if task_id is not None and self.db.get_task_private(validate_task_id(task_id)) is None:
+            raise APIError(404, "task_not_found", "task does not exist")
+        return {
+            "endpoint_id": endpoint_id,
+            "conversation_url": conversation_url,
+            "provider_id": provider_id,
+            "task_id": task_id,
+            "role_key": role_key,
+        }
+
+    def normalize_direct_chat_message(
+        self, binding_id: str, raw: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        allowed = {"text", "task_id", "material_refs"}
+        unknown = set(raw) - allowed
+        if unknown:
+            raise APIError(400, "invalid_request", f"unknown fields: {sorted(unknown)!r}")
+        try:
+            binding = self.conversations.get_binding(binding_id)
+        except ConversationLeaseError as exc:
+            raise APIError(404, "session_not_found", str(exc)) from exc
+        text = str(raw.get("text") or "")
+        if not text.strip():
+            raise APIError(400, "invalid_request", "text must not be empty")
+        task_id = str(raw.get("task_id") or binding.get("task_id") or "").strip() or None
+        refs = raw.get("material_refs") or []
+        if isinstance(refs, (str, bytes)) or not isinstance(refs, list):
+            raise APIError(400, "invalid_request", "material_refs must be a list")
+        material_refs: list[str] = []
+        if refs:
+            if task_id is None:
+                raise APIError(400, "invalid_request", "material_refs require task_id")
+            private = self.db.get_task_private(validate_task_id(task_id))
+            if private is None:
+                raise APIError(404, "task_not_found", "task does not exist")
+            materials = private.get("materials")
+            if not isinstance(materials, Mapping):
+                raise APIError(400, "material_not_found", "task has no registered materials")
+            for item in refs:
+                identifier = str(item or "").strip()
+                if not identifier or identifier not in materials:
+                    raise APIError(400, "material_not_found", f"unknown material_ref: {identifier!r}")
+                material_refs.append(identifier)
+        return {
+            "binding_id": binding_id,
+            "text": text,
+            "task_id": task_id,
+            "material_refs": material_refs,
+        }
+
+    def session_dom_state(self, binding_id: str) -> dict[str, Any]:
+        try:
+            binding = self.conversations.get_binding(binding_id)
+        except ConversationLeaseError as exc:
+            raise APIError(404, "session_not_found", str(exc)) from exc
+        source_version = int(binding.get("dom_projection_version") or 0)
+        projection = binding.get("dom_projection")
+        if not isinstance(projection, Mapping):
+            projection = {}
+        with self._session_stream_lock:
+            state = self._session_streams.get(binding_id)
+            if state is None:
+                state = {
+                    "stream_epoch": uuid.uuid4().hex,
+                    "seq": 0,
+                    "source_version": -1,
+                    "projection": {},
+                }
+                self._session_streams[binding_id] = state
+            if source_version != int(state["source_version"]):
+                state["seq"] = int(state["seq"]) + 1
+                state["source_version"] = source_version
+                state["projection"] = dict(projection)
+            return {
+                "stream_epoch": str(state["stream_epoch"]),
+                "seq": int(state["seq"]),
+                "source_version": int(state["source_version"]),
+                "projection": dict(state["projection"]),
+            }
+
     def material_catalog(self, task_id: str) -> dict[str, Any]:
         """List only registered/projected materials for one task; never enumerate paths."""
         validated_task_id = validate_task_id(task_id)
@@ -1611,6 +1724,71 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
         finally:
             hub.unsubscribe(subscription)
 
+    def _stream_session_dom(self, binding_id: str) -> None:
+        last_event_id = str(self.headers.get("Last-Event-ID") or "").strip()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            state = self.application.session_dom_state(binding_id)
+            current_id = f"{state['stream_epoch']}:{state['seq']}"
+            if last_event_id != current_id:
+                self._write_sse(
+                    "stream.reset",
+                    {
+                        "type": "stream.reset",
+                        "stream_epoch": state["stream_epoch"],
+                        "seq": state["seq"],
+                    },
+                    event_id=f"{state['stream_epoch']}:0",
+                )
+                if state["projection"]:
+                    self._write_sse(
+                        "dom.full",
+                        {
+                            "type": "dom.full",
+                            "binding_id": binding_id,
+                            "projection": state["projection"],
+                        },
+                        event_id=current_id,
+                    )
+            last_seq = int(state["seq"])
+            last_epoch = str(state["stream_epoch"])
+            last_heartbeat = time.monotonic()
+            while True:
+                time.sleep(0.2)
+                state = self.application.session_dom_state(binding_id)
+                epoch = str(state["stream_epoch"])
+                seq = int(state["seq"])
+                if epoch != last_epoch:
+                    self._write_sse(
+                        "stream.reset",
+                        {"type": "stream.reset", "stream_epoch": epoch, "seq": seq},
+                        event_id=f"{epoch}:0",
+                    )
+                    last_epoch = epoch
+                    last_seq = 0
+                if seq > last_seq:
+                    self._write_sse(
+                        "dom.full",
+                        {
+                            "type": "dom.full",
+                            "binding_id": binding_id,
+                            "projection": state["projection"],
+                        },
+                        event_id=f"{epoch}:{seq}",
+                    )
+                    last_seq = seq
+                if time.monotonic() - last_heartbeat >= 20.0:
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+                    last_heartbeat = time.monotonic()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+
     def do_GET(self) -> None:
         try:
             self._get()
@@ -1640,6 +1818,26 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                     **health,
                 },
             )
+            return
+        if path == "/api/browser-endpoints":
+            browser = db.get_snapshot("browser")
+            health_items = {
+                str(item.get("endpoint_id") or ""): dict(item)
+                for item in ((browser or {}).get("payload") or {}).get("endpoints", [])
+                if isinstance(item, Mapping)
+            }
+            items = []
+            for endpoint in BrowserEndpointRegistry(app.config).list(include_removed=True):
+                items.append(
+                    {
+                        **endpoint,
+                        "runtime": health_items.get(str(endpoint.get("endpoint_id") or ""), {}),
+                    }
+                )
+            self._json(200, {"items": items}, headers={"Cache-Control": "no-store"})
+            return
+        if path == "/api/sessions":
+            self._json(200, app.session_catalog(), headers={"Cache-Control": "no-store"})
             return
         if path == "/api/dashboard-actions":
             snapshot = db.get_snapshot("dashboard_actions")
@@ -1743,6 +1941,20 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
             self._json(200, app.system_status(), headers={"Cache-Control": "no-store"})
             return
         parts = [unquote(part) for part in path.strip("/").split("/") if part]
+        if len(parts) == 3 and parts[:2] == ["api", "sessions"]:
+            try:
+                binding = app.conversations.get_binding(parts[2])
+            except ConversationLeaseError as exc:
+                raise APIError(404, "session_not_found", str(exc)) from exc
+            self._json(200, binding, headers={"Cache-Control": "no-store"})
+            return
+        if (
+            len(parts) == 4
+            and parts[:2] == ["api", "sessions"]
+            and parts[3] == "dom-stream"
+        ):
+            self._stream_session_dom(parts[2])
+            return
         if len(parts) == 3 and parts[:2] == ["api", "commands"]:
             command = db.get_command(parts[2])
             if command is None:
@@ -1862,6 +2074,14 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                 task_id=None,
                 payload=payload,
             )
+        elif path == "/api/sessions":
+            payload = app.normalize_direct_chat_bind(raw)
+            command = app.enqueue(
+                idempotency_key=key,
+                kind="direct_chat_bind",
+                task_id=payload.get("task_id"),
+                payload=payload,
+            )
         elif path == "/api/browser-endpoints":
             payload = app.normalize_browser_endpoint_add(raw)
             command = app.enqueue(
@@ -1907,7 +2127,41 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
             )
         else:
             parts = [unquote(part) for part in path.strip("/").split("/") if part]
-            if len(parts) == 4 and parts[:2] == ["api", "browser-endpoints"]:
+            if (
+                len(parts) == 4
+                and parts[:2] == ["api", "sessions"]
+                and parts[3] == "messages"
+            ):
+                binding_id = parts[2]
+                payload = app.normalize_direct_chat_message(binding_id, raw)
+                command = app.enqueue(
+                    idempotency_key=key,
+                    kind="direct_chat_message",
+                    task_id=payload.get("task_id"),
+                    payload=payload,
+                )
+            elif (
+                len(parts) == 4
+                and parts[:2] == ["api", "sessions"]
+                and parts[3] == "close"
+            ):
+                binding_id = parts[2]
+                try:
+                    binding = app.conversations.get_binding(binding_id)
+                except ConversationLeaseError as exc:
+                    raise APIError(404, "session_not_found", str(exc)) from exc
+                payload = {
+                    **app.normalize_empty(raw),
+                    "binding_id": binding_id,
+                    "task_id": binding.get("task_id"),
+                }
+                command = app.enqueue(
+                    idempotency_key=key,
+                    kind="direct_chat_close",
+                    task_id=payload.get("task_id"),
+                    payload=payload,
+                )
+            elif len(parts) == 4 and parts[:2] == ["api", "browser-endpoints"]:
                 endpoint_id = app._browser_endpoint_id(parts[2])
                 operation = parts[3]
                 if operation == "settings":

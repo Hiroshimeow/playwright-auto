@@ -1,5 +1,21 @@
 from __future__ import annotations
 
+# ChatGPT may retain an offscreen zero-size <main> during history navigation.
+# Both the sparse wait probe and full DOM projection must read the same live main.
+ACTIVE_CHAT_ROOT_JS = r"""
+(() => {
+  const mains = [...document.querySelectorAll('main')];
+  const live = mains.filter((main) => {
+    const rect = main.getBoundingClientRect();
+    const style = window.getComputedStyle(main);
+    return main.isConnected && !main.closest('[inert],[aria-hidden="true"]') &&
+      style.display !== 'none' && style.visibility !== 'hidden' &&
+      style.visibility !== 'collapse' && rect.width > 0 && rect.height > 0;
+  });
+  return live.at(-1) || (mains.length ? document.createElement('main') : document.body);
+})()
+"""
+
 RESPONSE_PROJECTION_JS = r"""
 (() => {
   const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
@@ -14,11 +30,11 @@ RESPONSE_PROJECTION_JS = r"""
     if (keyed?.getAttribute('data-turn-key')) return `group:assistant:${keyed.getAttribute('data-turn-key')}`;
     return element?.closest('[data-turn-id-container]')?.getAttribute('data-turn-id-container') || null;
   };
-  const latestUser = [...document.querySelectorAll(
+  const latestUser = [...chatRoot.querySelectorAll(
     '[data-message-author-role="user"], [data-chatgpt-search-unit-key$=":user"]'
   )].filter(isVisible).at(-1) || null;
   const userTurn = latestUser?.closest('[data-turn-id],[data-turn-key],[data-turn-id-container]') || latestUser;
-  const roots = [...document.querySelectorAll('[data-turn-id],[data-turn-key],[data-turn-id-container]')]
+  const roots = [...chatRoot.querySelectorAll('[data-turn-id],[data-turn-key],[data-turn-id-container]')]
     .filter(isVisible)
     .filter((root) => !userTurn || root === userTurn ||
       Boolean(userTurn.compareDocumentPosition(root) & Node.DOCUMENT_POSITION_FOLLOWING));
@@ -88,11 +104,11 @@ RETRY_RESOLVER_JS = r"""
     element && window.getComputedStyle(element).visibility !== 'hidden' &&
     (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
   );
-  const latestUser = [...document.querySelectorAll(
+  const latestUser = [...chatRoot.querySelectorAll(
     '[data-message-author-role="user"], [data-chatgpt-search-unit-key$=":user"]'
   )].filter(visible).at(-1) || null;
   const userTurn = latestUser?.closest('[data-turn-id],[data-turn-key],[data-turn-id-container]') || latestUser;
-  const exact = [...document.querySelectorAll('[data-testid="regenerate-thread-error-button"]')]
+  const exact = [...chatRoot.querySelectorAll('[data-testid="regenerate-thread-error-button"]')]
     .find((element) => {
       if (!visible(element) || element.disabled || element.getAttribute('aria-disabled') === 'true') return false;
       const root = element.closest('[data-turn-id],[data-turn-key],[data-turn-id-container]');
@@ -103,7 +119,7 @@ RETRY_RESOLVER_JS = r"""
         Boolean(userTurn.compareDocumentPosition(root) & Node.DOCUMENT_POSITION_FOLLOWING);
     });
   if (exact) return exact;
-  const matches = [...document.querySelectorAll('button,[role="button"]')].filter((element) => {
+  const matches = [...chatRoot.querySelectorAll('button,[role="button"]')].filter((element) => {
     if (!visible(element) || element.disabled || element.getAttribute('aria-disabled') === 'true') return false;
     if (String(element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim() !== 'Retry') return false;
     const root = element.closest('[data-turn-id],[data-turn-key],[data-turn-id-container]');

@@ -42,6 +42,9 @@ COMMAND_KINDS = frozenset(
         "browser_endpoint_remove",
         "browser_endpoint_start",
         "browser_endpoint_stop",
+        "direct_chat_bind",
+        "direct_chat_message",
+        "direct_chat_close",
         "reload_catalog",
     }
 )

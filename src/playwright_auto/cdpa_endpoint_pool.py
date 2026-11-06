@@ -353,6 +353,7 @@ class EndpointPool:
                 chatgpt_ready=runtime.chatgpt_ready if runtime else False,
                 error=runtime.error if runtime else None,
                 observed_at=runtime.observed_at if runtime else None,
+                physical_browser_id=runtime.physical_id if runtime else None,
                 active_count=active_count,
                 capacity=capacity,
                 available_slots=max(0, capacity - active_count),

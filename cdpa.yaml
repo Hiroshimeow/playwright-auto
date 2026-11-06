@@ -20,7 +20,8 @@
   ],
   "browser": {
     "cdp_url": "http://127.0.0.1:9222",
-    "workspace_timeout_seconds": 15
+    "workspace_timeout_seconds": 15,
+    "model_effort_gate_required": true
   },
   "dashboard": {
     "url": "http://127.0.0.1:9224",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import os
@@ -6071,7 +6072,10 @@ class TaskStore(IndependentAgentStoreMixin):
                 self._assert_manifest_mutable_unlocked(target, current)
                 if str(current.get("status") or "").upper() in TERMINAL:
                     raise ValueError(f"exact team {team!r} became terminal while resuming")
-                queued = dict(current)
+                # A shallow copy aliases controls/applied_command_ids with the
+                # loaded baseline. That makes the lifecycle persistence owner
+                # treat Resume as a no-op and lose the queued control on disk.
+                queued = copy.deepcopy(current)
                 if releasing_queue or releasing_dependency:
                     if str(queued.get("status") or "").upper() != "WAITING":
                         raise ValueError(
