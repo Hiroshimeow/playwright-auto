@@ -3949,6 +3949,29 @@ class CDPAWorker:
             return "crossed"
         return "preboundary"
 
+    @staticmethod
+    def _mark_control_generation_start(
+        state: dict[str, Any],
+        role: str,
+        hop: dict[str, Any],
+        acquired: AcquiredRole,
+    ) -> None:
+        """Record Gate C verified-new-chat evidence for a control acquisition.
+
+        A restart/new-chat control that acquired a brand-new chat began the
+        role's current conversation generation for this hop, so the hop's
+        first Send is that generation's first turn.  Pages that already carry
+        a canonical conversation id never need (and must not get) the flag.
+        """
+        if not acquired.new_chat:
+            return
+        if _recoverable_conversation_identity(acquired.url) is not None:
+            return
+        hop["conversation_generation"] = int(
+            state["roles"][role].get("conversation_generation") or 0
+        )
+        hop["generation_started_here"] = True
+
     async def _apply_control(
         self,
         state: dict[str, Any],
@@ -4488,6 +4511,13 @@ class CDPAWorker:
                         )
                     self._record_acquired(state, role, acquired)
                     state["roles"][role]["constructor_sent_generation"] = None
+                    if (
+                        not blocked_restart
+                        and hop is not None
+                        and str(hop.get("target_role") or "") == role
+                        and str(hop.get("state") or "") == "pre_send"
+                    ):
+                        self._mark_control_generation_start(state, role, hop, acquired)
                     if blocked_restart:
                         assert hop is not None
                         old_hop_id = int(hop["hop_id"])
@@ -4524,6 +4554,7 @@ class CDPAWorker:
                             handoff=restart_handoff,
                             kind="role_restart",
                         )
+                        self._mark_control_generation_start(state, role, new_hop, acquired)
                         state["block_code"] = None
                         state["block_retryable"] = False
                         state["block_reason"] = None
@@ -4578,6 +4609,12 @@ class CDPAWorker:
                     await self._dismiss_known_rate_limit_on_existing(acquired)
                     self._record_acquired(state, role, acquired)
                     state["roles"][role]["constructor_sent_generation"] = None
+                    if (
+                        hop is not None
+                        and str(hop.get("target_role") or "") == role
+                        and str(hop.get("state") or "") == "pre_send"
+                    ):
+                        self._mark_control_generation_start(state, role, hop, acquired)
                     result = {"page_id": acquired.page_id, "new_chat": True}
             elif action == "open_tab":
                 blocked_role_recovery = _is_verified_role_offline_block(state, role)
@@ -9625,14 +9662,14 @@ class CDPAWorker:
         if role_record.get("branch_conversation_id"):
             return False
         for entry in state.get("route_timeline") or []:
-            # Agent route decisions carry the handoff text; operator control
-            # entries (role_restart, new_chat) do not and are not progress.
-            if (
-                isinstance(entry, Mapping)
-                and entry.get("hop_id") != hop.get("hop_id")
-                and entry.get("handoff")
-            ):
+            # Operator role restarts are not workflow progress; every other
+            # timeline entry records an agent route decision or a post-Send
+            # reconciliation, and unknown shapes fail closed.
+            if not isinstance(entry, Mapping):
                 return False
+            if entry.get("kind") in {"role_restart", "resume_role_restart"}:
+                continue
+            return False
         for other in state.get("hops") or []:
             if not isinstance(other, Mapping) or other is hop:
                 continue

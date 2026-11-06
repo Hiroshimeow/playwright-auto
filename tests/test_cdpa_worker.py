@@ -2916,6 +2916,117 @@ def test_advance_persists_ineffective_open_tab_before_later_requested_control(
     assert worker.runtime_db.get_command("cmd-btm-like-restart")["status"] == "failed"
 
 
+def test_restart_role_blocked_marks_new_hop_generation_started_here(tmp_path: Path):
+    _, store, state, worker = setup_task(tmp_path, task_id="task-restart-generation-flag")
+    hop = _active_hop(state)
+    hop["state"] = "pre_send"
+    worker._block(
+        state,
+        "acquisition failed before any binding",
+        code="preboundary_acquisition_recovery_required",
+        retryable=False,
+    )
+    state["controls"] = [
+        {
+            "control_id": 1,
+            "action": "restart_role",
+            "role": "PLAN",
+            "reason": "operator restart",
+            "status": "requested",
+        }
+    ]
+    actions = FakeActions()
+
+    assert asyncio.run(worker._apply_control(state, actions)) is True
+
+    new_hop = _active_hop(state)
+    assert hop["state"] == "abandoned"
+    assert new_hop["hop_id"] != hop["hop_id"]
+    assert new_hop["generation_started_here"] is True
+    assert new_hop["conversation_generation"] == state["roles"]["PLAN"]["conversation_generation"]
+
+
+def test_new_chat_control_marks_active_hop_generation_started_here(tmp_path: Path):
+    _, store, state, worker = setup_task(tmp_path, task_id="task-new-chat-generation-flag")
+    hop = _active_hop(state)
+    state["controls"] = [
+        {
+            "control_id": 1,
+            "action": "new_chat",
+            "role": "PLAN",
+            "reason": "operator new chat",
+            "status": "requested",
+        }
+    ]
+
+    class NewChatActions(FakeActions):
+        async def new_chat(self, state, role):
+            record = state["roles"][role]
+            return AcquiredRole(
+                client=ready_client(state, role),
+                page_id=f"fresh-{record['physical_role']}",
+                url="https://chatgpt.com/",
+                created=True,
+                new_chat=True,
+            )
+
+    assert asyncio.run(worker._apply_control(state, NewChatActions())) is True
+
+    assert hop["generation_started_here"] is True
+    assert hop["conversation_generation"] == state["roles"]["PLAN"]["conversation_generation"]
+
+
+def test_restart_role_running_marks_active_hop_generation_started_here(tmp_path: Path):
+    _, store, state, worker = setup_task(tmp_path, task_id="task-restart-running-generation-flag")
+    hop = _active_hop(state)
+    hop["state"] = "pre_send"
+    state["controls"] = [
+        {
+            "control_id": 1,
+            "action": "restart_role",
+            "role": "PLAN",
+            "reason": "operator restart",
+            "status": "requested",
+        }
+    ]
+
+    assert asyncio.run(worker._apply_control(state, FakeActions())) is True
+
+    assert _active_hop(state)["hop_id"] == hop["hop_id"]
+    assert hop["generation_started_here"] is True
+    assert hop["conversation_generation"] == state["roles"]["PLAN"]["conversation_generation"]
+
+
+def test_new_chat_control_with_canonical_url_does_not_mark_generation(tmp_path: Path):
+    _, store, state, worker = setup_task(tmp_path, task_id="task-new-chat-canonical-no-flag")
+    hop = _active_hop(state)
+    hop["state"] = "pre_send"
+    state["controls"] = [
+        {
+            "control_id": 1,
+            "action": "new_chat",
+            "role": "PLAN",
+            "reason": "operator new chat",
+            "status": "requested",
+        }
+    ]
+
+    class CanonicalActions(FakeActions):
+        async def new_chat(self, state, role):
+            record = state["roles"][role]
+            return AcquiredRole(
+                client=ready_client(state, role),
+                page_id=f"existing-{record['physical_role']}",
+                url="https://chatgpt.com/c/12345678-1234-1234-1234-123456789012",
+                created=True,
+                new_chat=True,
+            )
+
+    assert asyncio.run(worker._apply_control(state, CanonicalActions())) is True
+
+    assert not hop.get("generation_started_here")
+
+
 def test_restart_role_from_report_repair_preserves_substantive_handoff(tmp_path: Path):
     _, store, state, worker = setup_task(tmp_path, task_id="task-restart-report-repair-handoff")
     path = Path(state["manifest_path"])
