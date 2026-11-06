@@ -369,6 +369,133 @@ def test_solo_done_ignores_report_reference_outside_repository(tmp_path: Path):
     assert state["reports"] == []
 
 
+def test_solo_done_ignores_preexisting_cited_markdown(tmp_path: Path):
+    import os
+    from datetime import datetime, timezone
+
+    config, store = make_store(tmp_path)
+    state = store.create_task(
+        "Solo REVIEW cited spec",
+        task_id="solo-done-cited-old",
+        workflow_mode="solo",
+        roles=("REVIEW",),
+        browser_endpoint_id="9222",
+    )
+    spec = tmp_path / "docs" / "spec.md"
+    spec.parent.mkdir(parents=True)
+    spec.write_text("# Spec\n", encoding="utf-8")
+    old = time.time() - 7200
+    os.utime(spec, (old, old))
+    worker = CDPAWorker(config, store=store)
+    hop = active_hop(state)
+    hop["state"] = "responded"
+    hop["timestamps"]["sending_at"] = datetime.now(timezone.utc).isoformat()
+    hop["response"] = json.dumps(
+        {"route": "DONE", "handoff": f"Reviewed against the spec at {spec}."}
+    )
+
+    worker._responded(state, hop)
+
+    assert state["status"] == "DONE"
+    assert hop["report_path"] is None
+    assert state["reports"] == []
+
+
+def test_solo_done_registers_fresh_report_next_to_cited_spec(tmp_path: Path):
+    import os
+    from datetime import datetime, timezone
+
+    config, store = make_store(tmp_path)
+    state = store.create_task(
+        "Solo REVIEW fresh report",
+        task_id="solo-done-fresh-next-to-spec",
+        workflow_mode="solo",
+        roles=("REVIEW",),
+        browser_endpoint_id="9222",
+    )
+    docs = tmp_path / "docs"
+    docs.mkdir(parents=True)
+    spec = docs / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+    old = time.time() - 7200
+    os.utime(spec, (old, old))
+    report = docs / "review.md"
+    report.write_text("# Review\n\nFresh.\n", encoding="utf-8")
+    worker = CDPAWorker(config, store=store)
+    hop = active_hop(state)
+    hop["state"] = "responded"
+    hop["timestamps"]["sending_at"] = datetime.now(timezone.utc).isoformat()
+    hop["response"] = json.dumps(
+        {
+            "route": "DONE",
+            "handoff": f"Reviewed {spec}; full report written to {report}.",
+        }
+    )
+
+    worker._responded(state, hop)
+
+    assert state["status"] == "DONE"
+    assert hop["report_path"] == "docs/review.md"
+    assert len(state["reports"]) == 1
+
+
+def test_solo_done_does_not_register_mdx_lookalike(tmp_path: Path):
+    config, store = make_store(tmp_path)
+    state = store.create_task(
+        "Solo DEV mdx lookalike",
+        task_id="solo-done-mdx",
+        workflow_mode="solo",
+        roles=("DEV",),
+        browser_endpoint_id="9222",
+    )
+    notes = tmp_path / "docs" / "notes.md"
+    notes.parent.mkdir(parents=True)
+    notes.write_text("# Notes\n", encoding="utf-8")
+    worker = CDPAWorker(config, store=store)
+    hop = active_hop(state)
+    hop["state"] = "responded"
+    hop["response"] = json.dumps(
+        {"route": "DONE", "handoff": "Summary published in docs/notes.mdx today."}
+    )
+
+    worker._responded(state, hop)
+
+    assert state["status"] == "DONE"
+    assert hop["report_path"] is None
+    assert state["reports"] == []
+
+
+def test_solo_done_ignores_symlink_escaping_repository(tmp_path: Path):
+    config, store = make_store(tmp_path)
+    state = store.create_task(
+        "Solo DEV symlink escape",
+        task_id="solo-done-symlink",
+        workflow_mode="solo",
+        roles=("DEV",),
+        browser_endpoint_id="9222",
+    )
+    outside = tmp_path.parent / "outside-symlink-target.md"
+    outside.write_text("# Outside\n", encoding="utf-8")
+    link = tmp_path / "docs" / "linked.md"
+    link.parent.mkdir(parents=True)
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is not permitted on this host")
+    worker = CDPAWorker(config, store=store)
+    hop = active_hop(state)
+    hop["state"] = "responded"
+    hop["response"] = json.dumps(
+        {"route": "DONE", "handoff": f"Report available at {link}."}
+    )
+
+    worker._responded(state, hop)
+
+    assert state["status"] == "DONE"
+    assert hop["report_path"] is None
+    assert state["reports"] == []
+
+
 def test_solo_done_accepts_inline_literal_as_concise_handoff(tmp_path: Path):
     config, store = make_store(tmp_path)
     state = store.create_task(

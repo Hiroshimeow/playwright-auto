@@ -351,10 +351,14 @@ def validate_file_report(
 
 
 _HANDOFF_ABSOLUTE_MD = re.compile(
-    r"[A-Za-z]:[\\/](?:[^\s\"'<>|\\/]+[\\/])*[^\s\"'<>|\\/]+\.md", re.IGNORECASE
+    r"[A-Za-z]:[\\/](?:[^\s\"'<>|\\/]+[\\/])*[^\s\"'<>|\\/]+\.md(?!\w)(?!\.\w)",
+    re.IGNORECASE,
+)
+_HANDOFF_POSIX_MD = re.compile(
+    r"(?<![\w:/.-])((?:/[^\s\"'<>|/]+)+\.md)(?!\w)(?!\.\w)", re.IGNORECASE
 )
 _HANDOFF_RELATIVE_MD = re.compile(
-    r"(?<![\w.\\/-])((?:[\w.-]+[\\/])+[\w.-]+\.md)", re.IGNORECASE
+    r"(?<![\w.\\/-])((?:[\w.-]+[\\/])+[\w.-]+\.md)(?!\w)(?!\.\w)", re.IGNORECASE
 )
 
 
@@ -362,19 +366,28 @@ def handoff_report_evidence(
     handoff: str,
     *,
     repository_root: str | Path,
+    modified_after: float | None = None,
 ) -> ReportEvidence | None:
     """Fingerprint the single report file a free-form handoff references.
 
     Solo tasks keep a minimal route contract: on DONE the agent names its
     result in the handoff, which may point at the report file it wrote.
     Register that file only when exactly one candidate validates as a
-    regular, non-empty Markdown file inside the repository.
+    regular, non-empty Markdown file inside the repository. When
+    ``modified_after`` (epoch seconds) is given, only files modified at
+    or after it qualify, so a merely cited pre-existing file is not
+    mistaken for this hop's report.
     """
     root = Path(repository_root).expanduser().resolve()
     candidates: list[Path] = []
     seen: set[str] = set()
     for match in _HANDOFF_ABSOLUTE_MD.finditer(str(handoff or "")):
         raw = match.group(0)
+        if raw.lower() not in seen:
+            seen.add(raw.lower())
+            candidates.append(Path(raw))
+    for match in _HANDOFF_POSIX_MD.finditer(str(handoff or "")):
+        raw = match.group(1)
         if raw.lower() not in seen:
             seen.add(raw.lower())
             candidates.append(Path(raw))
@@ -388,15 +401,20 @@ def handoff_report_evidence(
         try:
             target = candidate.resolve()
             target.relative_to(root)
-        except (OSError, ValueError):
-            continue
-        if target.is_symlink() or not target.is_file():
-            continue
-        try:
+            if target.is_symlink() or not target.is_file():
+                continue
+            info = target.stat()
+            if info.st_size <= 0 or info.st_size > 10_000_000:
+                continue
+            if (
+                modified_after is not None
+                and info.st_mtime < modified_after - 2.0
+            ):
+                continue
             data = target.read_bytes()
-        except OSError:
+        except (OSError, RuntimeError, ValueError):
             continue
-        if not data or len(data) > 10_000_000:
+        if not data:
             continue
         display = _display_path(target, root)
         validated[display] = ReportEvidence(

@@ -8603,10 +8603,26 @@ class CDPAWorker:
                 "state": "routed",
             }
             if decision.route == "DONE":
-                solo_evidence = handoff_report_evidence(
-                    decision.handoff,
-                    repository_root=str(state["repository"]),
+                sent_at = (
+                    (hop.get("timestamps") or {}).get("sending_at")
+                    or state.get("started_at")
                 )
+                modified_after: float | None = None
+                if isinstance(sent_at, str) and sent_at.strip():
+                    try:
+                        modified_after = datetime.fromisoformat(
+                            sent_at.replace("Z", "+00:00")
+                        ).timestamp()
+                    except ValueError:
+                        modified_after = None
+                try:
+                    solo_evidence = handoff_report_evidence(
+                        decision.handoff,
+                        repository_root=str(state["repository"]),
+                        modified_after=modified_after,
+                    )
+                except Exception:
+                    solo_evidence = None
                 if solo_evidence is not None:
                     hop_update.update(
                         {
