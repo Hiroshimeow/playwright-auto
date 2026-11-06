@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,25 @@ from playwright_auto.cdpa_worker import CDPAWorker
 
 from test_cdpa_core import write_config
 from test_cdpa_worker import FakeActions, bootstrap_record, ready_client
+
+
+def test_record_acquired_applies_runtime_model_gate_policy(tmp_path: Path):
+    path = write_config(tmp_path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["browser"]["model_effort_gate_required"] = True
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    config = load_cdpa_config(path, repository_root=tmp_path)
+    store = TaskStore(config)
+    state = store.create_task("model gate policy", task_id="model-gate-policy")
+    worker = CDPAWorker(config, store=store)
+    client = ready_client(state, "PLAN")
+    assert getattr(client, "model_effort_gate_required", False) is False
+    worker._record_acquired(
+        state,
+        "PLAN",
+        AcquiredRole(client, "gate-page", "https://chatgpt.com/", True, True),
+    )
+    assert client.model_effort_gate_required is True
 
 
 def test_canonical_branch_identity_survives_store_with_provisional_visible_url(tmp_path: Path):

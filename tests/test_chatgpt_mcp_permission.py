@@ -453,3 +453,31 @@ def test_distinct_simultaneous_approvals_are_ambiguous_and_warning_is_typed():
     assert full.mcp_provider_risk and probe.mcp_provider_risk
     assert full.mcp_permission_surface_key is None and probe.mcp_permission_surface_key is None
     assert full.mcp_permission_allow_count == probe.mcp_permission_allow_count == 2
+
+
+def test_provider_warning_keeps_existing_one_shot_allow_click_available():
+    async def run(page):
+        probe = await inspect_chatgpt_wait_probe(page)
+        client = ChatGPTPage(page, timeout_ms=5_000)
+        result = await client.auto_allow_mcp_permission(
+            expected_surface_key=probe.mcp_permission_surface_key
+        )
+        clicks = await page.evaluate("window.__allowClicks || 0")
+        return probe, result, clicks
+
+    probe, result, clicks = asyncio.run(_with_page("""
+        <main>
+          <div role="alert">Suspicious Instruction</div>
+          <div data-codex-approval-surface="true">
+            <div>md wants to run a tool</div>
+            <button onclick="window.__allowClicks = (window.__allowClicks || 0) + 1">
+              Allow once
+            </button>
+          </div>
+        </main>
+    """, run))
+    assert probe.mcp_provider_risk
+    assert probe.mcp_permission_allow_count == 1
+    assert probe.mcp_permission_surface_key
+    assert result["method"] == "dom_click_once"
+    assert clicks == 1

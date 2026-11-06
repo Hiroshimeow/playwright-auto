@@ -1186,6 +1186,9 @@ class RecordingCDPASendClient:
     async def assert_ownership(self):
         return self.current
 
+    async def snapshot(self):
+        return self.current
+
     async def set_text(self, text):
         self.set_calls.append(text)
         self.current = send_snapshot(
@@ -1209,8 +1212,11 @@ class RecordingCDPASendClient:
         expected_attachment_count=0,
         expected_attachment_names=None,
         timeout_ms=None,
+        after_send_click=None,
     ):
         self.send_calls.append(text)
+        if after_send_click is not None:
+            after_send_click()
         self.send_timeout_ms.append(timeout_ms)
         self.send_max_attempts.append(max_attempts)
         self.send_recovery_reload.append(recovery_reload)
@@ -2378,6 +2384,9 @@ def test_open_tab_recovers_presend_role_offline_and_sends_original_once(
 
     class RecoveryClient:
         async def assert_ownership(self):
+            return current
+
+        async def snapshot(self):
             return current
 
         async def wait_until_clean_ready(self, *, timeout_ms):
@@ -4209,22 +4218,28 @@ def test_cdpa_uploads_once_per_role_conversation_generation(tmp_path: Path, monk
     captured_files: list[tuple[str, ...]] = []
 
     class Client:
-        binding = PageBinding("page-alpha-plan", "alpha-plan")
+        def __init__(self, role):
+            physical_role = f"alpha-{role.lower()}"
+            self.page_id = f"page-{physical_role}"
+            self.url = f"https://chatgpt.com/c/upload-{role.lower()}"
+            self.binding = PageBinding(self.page_id, physical_role)
+
+        async def snapshot(self):
+            return SimpleNamespace(messages=())
 
         async def assert_ownership(self):
-            return SimpleNamespace(
-                conversation_url="https://chatgpt.com/c/upload",
-                url="https://chatgpt.com/c/upload",
-            )
+            return SimpleNamespace(conversation_url=self.url, url=self.url, messages=())
 
-    client = Client()
+    client = Client("PLAN")
+    dev_client = Client("DEV")
 
     class Actions(FakeActions):
         async def locate_owned(self, _state, _role):
+            selected = client if _role == "PLAN" else dev_client
             return AcquiredRole(
-                client=client,
-                page_id="page-alpha-plan",
-                url="https://chatgpt.com/c/upload",
+                client=selected,
+                page_id=selected.page_id,
+                url=selected.url,
                 created=False,
                 new_chat=False,
             )

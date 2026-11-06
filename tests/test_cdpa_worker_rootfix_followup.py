@@ -39,7 +39,7 @@ class ExactSendActions(FakeActions):
             page_id=record.get("page_id") or f"page-{record['physical_role']}",
             url=record.get("page_url") or "https://chatgpt.com/",
             created=False,
-            new_chat=False,
+            new_chat=True,
         )
 
 

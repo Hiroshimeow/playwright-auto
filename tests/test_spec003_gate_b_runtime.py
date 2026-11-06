@@ -888,6 +888,11 @@ class _WakeSchedulerSpy:
     def __init__(self):
         self.calls = []
 
+    @staticmethod
+    def _gate_c_release_continuation_writer(_continuation):
+        # The spy has no real Gate C binding to release.
+        return None
+
     def _schedule_async_wake(self, state, continuation):
         assert state["status"] == "WAITING"
         assert state["waiting_code"] == "async_callback"

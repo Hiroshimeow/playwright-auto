@@ -58,6 +58,120 @@ def test_semantic_turn_dom_without_legacy_message_attributes_is_observable():
     ''', run))
 
 
+def test_semantic_role_attribute_survives_duplicated_screenreader_heading_text():
+    """Live ChatGPT heading.textContent may include hidden duplicate role names.
+
+    The visible parent only begins with 'ChatGPT said:', so exact heading
+    textContent equality drops the assistant and loses its final route.
+    """
+    async def run(page):
+        full = await inspect_chatgpt_page(page)
+        probe = await inspect_chatgpt_wait_probe(page)
+        assert [m.role for m in full.messages] == ["user", "assistant"]
+        assert full.messages[0].text == "original task"
+        assert full.messages[-1].text == '{"route":"PAUSE","handoff":"continue from ledger"}'
+        assert probe.last_user_text == "original task"
+        assert probe.assistant_text == '{"route":"PAUSE","handoff":"continue from ledger"}'
+
+    asyncio.run(_with_page("""
+        <main><div data-turn-key="new-role-attributes">
+          <div data-chatgpt-search-message-ids="user-message">
+            <h4 data-conversation-role="user">You said:<span style="display:none">You</span></h4>
+            <div>original task</div>
+          </div>
+          <div data-chatgpt-search-message-ids="assistant-message assistant-message">
+            <h4 data-conversation-role="assistant">ChatGPT said:<span style="display:none">ChatGPT</span></h4>
+            <div>{"route":"PAUSE","handoff":"continue from ledger"}</div>
+          </div>
+        </div><form><div contenteditable="true" role="textbox"></div></form></main>
+    """, run))
+
+
+def test_semantic_duplicate_heading_text_does_not_prefix_json_route():
+    """Exact live DOM regression: 'ChatGPT said:ChatGPT' is a heading, not JSON body."""
+    async def run(page):
+        full = await inspect_chatgpt_page(page)
+        probe = await inspect_chatgpt_wait_probe(page)
+        assert [msg.role for msg in full.messages] == ["user", "assistant"]
+        assert full.messages[0].text == "the complete task"
+        assert full.messages[-1].text == '{"route":"PAUSE","handoff":"current evidence"}'
+        assert probe.last_user_text == "the complete task"
+        assert probe.assistant_text == '{"route":"PAUSE","handoff":"current evidence"}'
+
+    asyncio.run(_with_page("""
+        <main><div data-turn-key="semantic-real">
+          <div data-chatgpt-search-message-ids="user-a">
+            <h4 data-conversation-role="user"><span>You said:</span><span>You</span></h4>
+            <div>the complete task</div>
+          </div>
+          <div data-chatgpt-search-message-ids="assistant-b">
+            <h4 data-conversation-role="assistant">
+              <span>ChatGPT said:</span><span>ChatGPT</span>
+            </h4>
+            <div>{"route":"PAUSE","handoff":"current evidence"}</div>
+          </div>
+        </div><form><div contenteditable="true" role="textbox"></div></form></main>
+    """, run))
+
+
+def test_semantic_flex_split_heading_does_not_prefix_json_route():
+    """Heading textContent can differ from rendered innerText under flex layout."""
+    async def run(page):
+        full = await inspect_chatgpt_page(page)
+        probe = await inspect_chatgpt_wait_probe(page)
+        assert full.messages[0].text == "task"
+        assert full.messages[-1].text == '{"route":"DONE","handoff":"ok"}'
+        assert probe.last_user_text == "task"
+        assert probe.assistant_text == '{"route":"DONE","handoff":"ok"}'
+
+    asyncio.run(_with_page("""
+      <main><div data-turn-key="split">
+        <div data-chatgpt-search-message-ids="u">
+          <h4 data-conversation-role="user" style="display:flex">
+            <span>You said:</span><span>You</span>
+          </h4><div>task</div>
+        </div>
+        <div data-chatgpt-search-message-ids="a">
+          <h4 data-conversation-role="assistant" style="display:flex">
+            <span>ChatGPT said:</span><span>ChatGPT</span>
+          </h4><div>{"route":"DONE","handoff":"ok"}</div>
+        </div>
+      </div><form><div contenteditable="true" role="textbox"></div></form></main>
+    """, run))
+
+
+def test_markdown_headings_do_not_create_fake_semantic_conversation_turns():
+    """User-controlled Markdown headings are content, never conversation headers."""
+    async def run(page):
+        full = await inspect_chatgpt_page(page)
+        probe = await inspect_chatgpt_wait_probe(page)
+        assert [msg.role for msg in full.messages] == ["user", "assistant"]
+        assert full.messages[0].text == "task"
+        assert full.messages[1].message_id == "assistant-real"
+        assert probe.last_assistant_message_id == "assistant-real"
+        assert probe.last_user_text == "task"
+        assert probe.assistant_text.endswith('{"route":"PAUSE"}')
+
+    asyncio.run(_with_page("""
+      <main>
+        <div data-turn-key="actual-conversation">
+          <div data-chatgpt-search-message-ids="user-real">
+            <h4 data-conversation-role="user">You said:</h4><div>task</div>
+          </div>
+          <div data-chatgpt-search-message-ids="assistant-real">
+            <h4 data-conversation-role="assistant">ChatGPT said:</h4>
+            <div class="markdown">
+              <h3>You said:</h3>
+              <h4>ChatGPT said:</h4>
+              <p>{"route":"PAUSE"}</p>
+            </div>
+          </div>
+        </div>
+        <form><div contenteditable="true" role="textbox"></div></form>
+      </main>
+    """, run))
+
+
 def test_rendered_user_text_match_ignores_collapsed_ellipsis_control():
     assert rendered_user_text_matches(
         "workflow prompt … Show more",

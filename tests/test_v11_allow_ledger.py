@@ -65,7 +65,7 @@ def test_allow_pending_surface_has_typed_reason_and_never_click_loops(tmp_path):
     assert len(client.allow_calls) == 1
 
 
-def test_provider_risk_warning_blocks_allow_without_reserving_or_clicking(tmp_path):
+def test_provider_risk_label_does_not_override_exact_owned_one_shot_allow(tmp_path):
     db = RuntimeDB(tmp_path / "v11.sqlite")
     db.ensure_schema()
     client = _ObservedClient()
@@ -76,10 +76,16 @@ def test_provider_risk_warning_blocks_allow_without_reserving_or_clicking(tmp_pa
         error_texts=("Suspicious Instruction",),
     )
     result = _run(RoleController(), worker, state, hop, acquired, current)
-    assert (result.action, result.reason) == (Action.BLOCK, "permission_review")
-    assert client.allow_calls == []
+    assert (result.action, result.reason) == (Action.ALLOW, "mcp_allow_ready")
+    assert client.allow_calls == [("task-1", "team-1")]
     with db.connection() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM command_queue WHERE kind='mcp_allow'").fetchone()[0] == 0
+        rows = conn.execute("SELECT status FROM command_queue WHERE kind='mcp_allow'").fetchall()
+        assert [row["status"] for row in rows] == ["applied"]
+    # Even when the UI still carries its warning, never click this same
+    # permission twice across observation cycles.
+    repeated = _run(RoleController(), worker, state, hop, acquired, current)
+    assert repeated.action is Action.WAIT
+    assert len(client.allow_calls) == 1
 
 
 def test_two_simultaneous_permission_surfaces_require_operator_instead_of_ambiguous_click():
