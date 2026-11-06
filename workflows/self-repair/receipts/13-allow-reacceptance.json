@@ -1,0 +1,30 @@
+{
+  "slice_id": "13-allow-reacceptance",
+  "task_id": "cdpa-idem-701b4b536d59352a0ccc9071",
+  "status": "BLOCKED",
+  "release_verdict": "NOT_ACCEPTED",
+  "real_cdp": "NOT_ACCEPTED",
+  "git_before": "rebuild/runtime-v2-r11 (pre-existing dirty worktree)",
+  "git_after": "rebuild/runtime-v2-r11 (no product-source changes by this slice)",
+  "changed_files": [
+    "workflows/self-repair/receipts/13-allow-reacceptance.json"
+  ],
+  "tests": [
+    {
+      "command": "G6 .venv\\Scripts\\python.exe -m pytest -q tests/test_v11_allow_ledger.py tests/test_chatgpt_mcp_permission.py tests/test_chatgpt_model_gate.py --tb=short",
+      "result": "35 passed in 22.28s; exit 0"
+    }
+  ],
+  "evidence": [
+    "G6 DESKTOP-B5E4IUE, endpoint 9202, exact team g6-selfrepair-15-13-allow-reacceptance, owned new normal conversation https://chatgpt.com/c/6ae13b8e-da78-83ee-b65b-4a50b30008ae.",
+    "Exact task-specific .runtime/action-events.jsonl model_gate High verified at 2026-10-28T00:02:20.961874Z before composer_fill and 00:02:28.639424Z immediately before send:click 00:02:31.873994Z; send complete 00:02:32.854908Z.",
+    "Exact .plan/g6-selfrepair-15-13-allow-reacceptance/cdpa-idem-701b4b536d59352a0ccc9071/requests.json: hop1 status sent, attempts=1. Historical accepted requests from slices 11 and 12 were not retried or resumed by this slice.",
+    "Owned MCP auto-Allow logged exactly one task-associated mcp_allow complete at 2026-10-28T00:05:32.286053Z; exact task API browser_control.permission_click_count=1. No proof of duplicate Allow on this task.",
+    "G6 frontend 9224 and API/worker 9225 /health healthy, worker_source_drift=false, worker command loop ready at checks.",
+    "Independent before-acceptance unrelated-tab identity inventory for this slice was not found in .runtime/self-repair; a post-Send read-only tab list alone cannot prove unrelated-tab noninterference.",
+    "At evidence cutoff exact task API RUNNING/wait_response, active_hop.route=null, browser_control.permission_click_count=1; no stable terminal DONE evidenced yet.",
+    "Current-code broad regression exit 1: 2055 passed, 1 failed (tests/test_cdpa_worker_endpoints.py::test_different_endpoints_admit_concurrently), 45 skipped; separate release gate pending."
+  ],
+  "missing_condition": "Stable contract-valid terminal DONE for exact hop1 was not independently observable at receipt time; also no pre-acceptance unrelated-tab snapshot exists, so PASS cannot be asserted.",
+  "next_action": "Coordinator must reconcile this already-accepted hop without replay/Retry; independently establish terminal result and tab noninterference before any release PASS. Do not spawn successor from this Solo."
+}

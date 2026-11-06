@@ -1,0 +1,50 @@
+{
+  "slice_id": "16-final-release-evidence",
+  "task_id": "cdpa-idem-6c99192811d4fba96fd90a70",
+  "team": "g6-selfrepair-19-16-final-release-evidence",
+  "status": "BLOCKED",
+  "release_verdict": "NOT_ACCEPTED",
+  "real_cdp": "BLOCKED",
+  "full_regression": "PENDING_CURRENT_RUN",
+  "git_before": "5c4690f0e6256c2217283719d0fc1784e01d004f; existing dirty/untracked files preserved",
+  "git_after": "5c4690f0e6256c2217283719d0fc1784e01d004f; source unchanged",
+  "changed_files": [
+    "workflows/self-repair/receipts/16-final-release-evidence.json"
+  ],
+  "tests": [
+    {
+      "command": "hcuw fingerprint .",
+      "exit_code": 0,
+      "result": "sha256:b55af76f7c107843707a096f835f5a8c3ca29da6455e5319da3e2bdeaf0f3cb4 matches project policy"
+    },
+    {
+      "command": "Read-only G6 /health 9224 and 9225",
+      "exit_code": 0,
+      "result": "Frontend ok; worker HEALTHY/ready/online; worker_stale=false; worker_source_drift.drifted=false; worker_reload_required=false at 2026-10-28T04:47:46Z"
+    },
+    {
+      "command": "uv run pytest -q",
+      "exit_code": null,
+      "result": "CURRENT independent full suite started on G6 with retained process session remote-c38e503d-8aa9-4fdd-9453-be9c213dbf8e; output reached 20%, terminal exit not yet available; cannot claim PASS"
+    },
+    {
+      "command": "Read existing post-opus full suite .runtime/self-repair/post-opus-full-20261028.{log,exit}",
+      "exit_code": 0,
+      "result": "Historical current-source candidate 2089 passed, 45 skipped, 649.74s; independent rerun still pending"
+    }
+  ],
+  "evidence": {
+    "host": "DESKTOP-B5E4IUE",
+    "branch": "rebuild/runtime-v2-r11",
+    "prior_15": "receipt BLOCKED/NOT_ACCEPTED; exact accepted Send once, MCP Allow once, terminal missing",
+    "prior_15b": "receipt PASS only BOUNDED_CODE_AND_PRETERMINAL_CHECKS_ONLY, release NOT_ACCEPTED; subsequently worker BLOCKED/response_terminal_missing and STOPPED/CLEARED; no verified live terminal DONE",
+    "prior_15b_request": "cdpa-idem-b204835a8e7ffe939d4366ec-hop1 accepted_via=exact_user_message attempts=1; task-bound High model_gate x3 before composer fill/send, one send:click, no task-bound mcp_allow event (not proof approval required)",
+    "current_task_request": "cdpa-idem-6c99192811d4fba96fd90a70-hop1 accepted_via=exact_user_message attempts=1; task-bound High model_gate x3 and one send:click before this read-only review; do not replay",
+    "tabs_before": ".runtime/self-repair/16-final-tabs-before.json exists (18 pages, before admission)",
+    "tabs_after": "No independently verified after-terminal comparison available at receipt time; current task not terminal",
+    "worker_health": "9224 frontend pid 52868; 9225 HEALTHY, worker source fingerprint e265a702b664bd28967c46a7b0a953176c067703a9a91e1ce6e948919ea27d49, source_drift=false",
+    "source_unchanged": "Git HEAD 5c4690f0e6256c2217283719d0fc1784e01d004f; preexisting dirty work preserved"
+  },
+  "blocker": "Exact latest 15b accepted task failed BLOCKED/response_terminal_missing: independent observer found assistant body empty, not a stable contract-valid DONE. Thus G4 real terminal acceptance is absent, and authoritative before/after noninterference proof for that accepted turn is absent (G6). Current independent full pytest rerun also lacks exit code. Underlying reason for empty provider assistant body is NOT established; do not attribute it to DOM parser without evidence.",
+  "next_action": "Leave release NOT_ACCEPTED. Existing G6 Pi coordinator must resolve evidence-backed cause of empty provider assistant output and arrange a NEW owned terminal acceptance with authoritative before/after tab comparison, without replaying accepted requests. Independently capture full current-code pytest terminal exit and teardown. No successor created and no browser mutation by this review."
+}

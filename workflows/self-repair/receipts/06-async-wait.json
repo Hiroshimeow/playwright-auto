@@ -1,0 +1,29 @@
+{
+  "slice_id": "06-async-wait",
+  "task_id": "cdpa-idem-bdaa8331af55fe1c962c5d9e",
+  "status": "BLOCKED",
+  "git_before": "dirty worktree preserved; prior coordinator state was not reset",
+  "git_after": "dirty worktree preserved; no coordinator source edit",
+  "changed_files": [
+    "src/playwright_auto/cdpa_async_continuation.py",
+    "tests/test_spec003_gate_c_runtime.py"
+  ],
+  "tests": [
+    {
+      "command": ".venv/Scripts/python.exe -m pytest -q tests/test_spec003_gate_c_runtime.py tests/test_gate_c_direct_chat_worker.py tests/test_cdpa_browser_management.py tests/test_cdpa_browser_admission.py",
+      "result": "PASS: 46 passed in 8.69s"
+    },
+    {
+      "command": "git diff --check -- src tests workflows/self-repair",
+      "result": "PASS; existing LF/CRLF warnings only"
+    }
+  ],
+  "evidence": [
+    "The accepted Send ledger for the task has attempts=1 and one sent request; no resend was issued.",
+    "Authoritative API state before recovery was BLOCKED with block_code=permission_review and active_action=blocked; the task was stopped once through idempotent command cmd-7a2afdf6-6c9b-4270-8218-5f1543205a78, which is now APPLIED.",
+    "The task is terminal STOPPED with stop_reason preserving the accepted Send; no terminal route or receipt was produced by the browser turn.",
+    "The source change shown in the existing dirty diff adds the async registration guard requiring an active sent/waiting hop and a receipt mapping; this is code-only evidence, not real-browser acceptance.",
+    "Release remains NOT_ACCEPTED."
+  ],
+  "next_action": "Do not resume, retry, or replay this accepted Send. After CDPA reload health/source checks and model-gate evidence, dispatch one fresh subsequent 07-regression Solo TeamTask."
+}

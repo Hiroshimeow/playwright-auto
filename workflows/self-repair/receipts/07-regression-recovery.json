@@ -1,0 +1,41 @@
+{
+  "slice_id": "07-regression",
+  "task_id": "cdpa-idem-5e0a1861289d6b53b457b8d2",
+  "status": "BLOCKED",
+  "git_before": "5c4690f; pre-existing dirty worktree",
+  "git_after": "5c4690f; existing dirty worktree preserved",
+  "changed_files": [
+    "tests/test_operator_resume_recovery.py"
+  ],
+  "tests": [
+    {
+      "command": "pytest -q [10 focused suites]",
+      "result": "340 passed, 11 skipped"
+    },
+    {
+      "command": "pytest -q (full initial)",
+      "result": "2002 passed, 45 skipped, 1 failed: missing mock Client.snapshot"
+    },
+    {
+      "command": "pytest -q tests/test_operator_resume_recovery.py::test_reacquired_pristine_request_crosses_send_boundary_exactly_once",
+      "result": "1 passed after 3-line test-double update"
+    },
+    {
+      "command": "pytest -q (full rerun)",
+      "result": "2002 passed, 45 skipped, 1 failed: test_cdpa_worker.py::test_cdpa_uploads_once_per_role_conversation_generation; SimpleNamespace missing messages in assert_ownership snapshot"
+    },
+    {
+      "command": "python -m compileall -q src/playwright_auto; git diff --check",
+      "result": "PASS"
+    }
+  ],
+  "evidence": [
+    "Original full-suite failure reproduced independently before change.",
+    "One bounded test-double fix only; no further fixes authorized in this slice.",
+    "Second full-suite run failed; clean teardown release gate not proven; stderr 0 bytes.",
+    "Runtime 9225 health reports worker_ready true, worker_stale false, source_drift false at last observation.",
+    "Accepted Send ledger for this task attempts=1; task is STOPPED. No replay or browser mutation.",
+    "A separate coordinator has since started subsequent tasks; this task must not spawn or interfere."
+  ],
+  "next_action": "Pi coordinator must reconcile newer task/receipt state, independently investigate remaining full-suite failure, then re-run full regression and real CDP gates. Release NOT_ACCEPTED for this slice."
+}

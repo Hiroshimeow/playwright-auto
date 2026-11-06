@@ -1,0 +1,37 @@
+[Reading 35 lines from start (total: 35 lines, 0 remaining)]
+
+{
+  "slice_id": "08-real-browser",
+  "task_id": "cdpa-idem-d0fb10d01544ca5949dbcfe6",
+  "status": "BLOCKED",
+  "git_before": "5c4690f dirty",
+  "git_after": "5c4690f dirty; product unchanged",
+  "release": "NOT_ACCEPTED",
+  "changed_files": [
+    "workflows/self-repair/receipts/08-real-browser.json"
+  ],
+  "tests": [
+    {
+      "command": "uv run pytest -q tests/test_chatgpt_model_gate.py tests/test_spec003_gate_c_runtime.py",
+      "result": "37 passed in 6.80s, exit 0"
+    },
+    {
+      "command": "uv run python -m compileall -q src/playwright_auto",
+      "result": "exit 0"
+    },
+    {
+      "command": "git diff --check -- src tests specs/003-team-only-dom-runtime",
+      "result": "exit 0 (line-ending warnings)"
+    }
+  ],
+  "evidence": [
+    "G6 DESKTOP-B5E4IUE, branch rebuild/runtime-v2-r11, HEAD 5c4690f. Existing tracked/untracked changes preserved.",
+    "Exact current task/team: cdpa-idem-d0fb10d01544ca5949dbcfe6 / g6-selfrepair-10-08-real-browser-retry1; owned page_id 8e4b1fcf-8574-4b83-8b61-4f4e6d659ab3 on endpoint 9202.",
+    "Raw .runtime/action-events.jsonl: model_gate verified Extra High at 2026-10-27T14:51:51.745633Z BEFORE composer_fill start at 14:51:53.101341Z; reverified Extra High at 14:51:53.928543Z and 14:51:59.059124Z BEFORE unique send:click at 14:52:02.973712Z and send:complete at 14:52:03.595251Z.",
+    "One MCP Allow click documented for exact task at 2026-10-27T14:54:36.617149Z; accepted Send not replayed by this DEV.",
+    "At 2026-10-27T14:56:00Z exact task status RUNNING/wait_response, route_seq=0, stop_visible=true, retry_visible=false, controller_reason=malformed_result_stability; cannot prove terminal assistant route or accepted reply completion.",
+    "9224 /health HTTP 200, 9225 /health HTTP 200 worker_status=HEALTHY, worker_stale=false, worker_reload_required=false, source_drift=false, CDP 9202 /json/version HTTP 200.",
+    "No observed source drift/deadlock/stale worker to authorize runtime reload; absence of terminal proof and independent unrelated-tab before/after snapshot means full real-CDP release gate unverified."
+  ],
+  "next_action": "Pi coordinator: preserve accepted Send and exact binding; observe live owned 9202 page until stable terminal, reconcile route without a second Send. Independently compare unrelated tab state and verify recovery / stable worker; if terminal cannot complete, stop affected task and reload only CDPA runtime per policy, never replay accepted Send. Release remains NOT_ACCEPTED."
+}

@@ -1,0 +1,63 @@
+{
+  "slice_id": "15-real-terminal-reacceptance",
+  "task_id": "cdpa-idem-7ae318d1c89d6eea19244a44",
+  "team": "g6-selfrepair-17-15-real-terminal-reaccep-retry2",
+  "status": "BLOCKED",
+  "release_verdict": "NOT_ACCEPTED",
+  "real_cdp": "NOT_ACCEPTED",
+  "full_regression": "NOT_CLAIMED_CURRENT_CODE",
+  "git_before": "5c4690f0e6256c2217283719d0fc1784e01d004f; pre-existing dirty files preserved",
+  "git_after": "5c4690f0e6256c2217283719d0fc1784e01d004f; no source edits",
+  "changed_files": [
+    "workflows/self-repair/receipts/15-real-terminal-reacceptance.json"
+  ],
+  "tests": [
+    {
+      "command": ".venv\\Scripts\\python.exe -m pytest -q tests/test_cdpa_overlay_observation.py tests/test_role_runtime_browser.py tests/test_v11_allow_ledger.py --tb=short",
+      "exit_code": 0,
+      "result": "32 passed in 24.23s; retained process exit 0"
+    },
+    {
+      "command": "G6 PowerShell read-only task-bound ledger/order/identity check",
+      "exit_code": 0,
+      "result": "exact request count=1, attempts=1, accepted via exact_user_message, three High model_gate events before one send click; same page_id throughout"
+    },
+    {
+      "command": "GET /health on 9224/9225 and /json/version 9202",
+      "exit_code": 0,
+      "result": "9224/9225 healthy; worker HEALTHY, stale=false, source_drift=false; 9202 CDP reachable"
+    }
+  ],
+  "evidence": {
+    "host": "DESKTOP-B5E4IUE",
+    "branch": "rebuild/runtime-v2-r11",
+    "previous_receipt14": "BLOCKED/NOT_ACCEPTED; prior accepted request cdpa-idem-3f8329cef8fd05ba58d45abd-hop1 attempts=1, never replayed",
+    "request_id": "cdpa-idem-7ae318d1c89d6eea19244a44-hop1",
+    "accepted_at_epoch": 1793159874.1049278,
+    "accepted_via": "exact_user_message",
+    "attempts": 1,
+    "request_status": "sent",
+    "accepted_user_message_id": "799d7f0e-19ee-4f30-b503-3f1fea1c20a0",
+    "owned_page_id": "88d80eb0-bded-482f-94de-58d2e61299e7",
+    "role": "g6-selfrepair-17-15-real-terminal-reaccep-retry2-dev",
+    "model_gate_verified_high_utc": [
+      "2026-10-28T03:57:40.167202Z (before fill)",
+      "2026-10-28T03:57:42.164289Z (after fill)",
+      "2026-10-28T03:57:47.293239Z (before send)"
+    ],
+    "composer_fill_start_utc": "2026-10-28T03:57:41.355110Z",
+    "send_click_utc": "2026-10-28T03:57:51.341119Z",
+    "send_click_count": 1,
+    "mcp_allow": "one task-bound mcp_allow event found; this assistant performed no approval action; verify controller ownership/outcome independently",
+    "tab_identity_evidence": "Only historical slice 11 before/after comparison available; none captured for current slice 15",
+    "terminal_route": "PENDING_EXTERNAL_WORKER_OBSERVATION_AFTER_THIS_TURN",
+    "assistant_message_turn_id": "PENDING_EXTERNAL_OBSERVER",
+    "final_text_hash": "PENDING_EXTERNAL_OBSERVER",
+    "completion_actions": "PENDING_EXTERNAL_OBSERVER",
+    "stop_state": "PENDING_EXTERNAL_OBSERVER",
+    "unrelated_tab_noninterference": "PENDING_EXTERNAL_COORDINATOR",
+    "runtime_health": "9224 frontend ok, 9225 worker healthy source_drift=false, 9202 CDP reachable at 2026-10-28T03:58:41Z"
+  },
+  "blocker": "The current assistant cannot independently observe its own terminal response or Stop state before finishing. Exact current-task unrelated-tab before/after evidence is absent; release and real-CDP PASS require independent postterminal checks plus final broad current-code regression.",
+  "next_action": "Existing CDPA worker observes this exact final route and validates terminal message identity/hash, completion actions and Stop without replay; Pi coordinator compares unrelated-tab before/after; independent slice 16 reviewer checks release proof and final current-code broad regression. Do not spawn successor here."
+}

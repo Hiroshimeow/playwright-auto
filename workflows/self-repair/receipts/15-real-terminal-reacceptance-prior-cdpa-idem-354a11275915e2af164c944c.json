@@ -1,0 +1,55 @@
+{
+  "slice_id": "15-real-terminal-reacceptance",
+  "task_id": "cdpa-idem-354a11275915e2af164c944c",
+  "status": "BLOCKED",
+  "real_cdp": "NOT_ACCEPTED",
+  "release_verdict": "NOT_ACCEPTED",
+  "git_before": "5c4690f0e6256c2217283719d0fc1784e01d004f; pre-existing dirty tree",
+  "git_after": "same HEAD; no source edits",
+  "changed_files": [
+    "workflows/self-repair/receipts/15-real-terminal-reacceptance.json"
+  ],
+  "tests": [
+    {
+      "command": "G6 .venv/Scripts/python.exe -m pytest -q tests/test_cdpa_overlay_observation.py tests/test_role_runtime_browser.py tests/test_v11_allow_ledger.py --tb=short",
+      "result": "exit 0; output contained passing dots (count unavailable)"
+    },
+    {
+      "command": "G6 read-only owned DOM probe_current_selfrepair.py",
+      "result": "exit 0; matched 9202, responding, Stop visible; assistant message IDs 7b5d3ffb-7c0d-446f-b82d-b92e889ac59f and a50ef10c-7ad0-47c6-a04f-3049b69b705d"
+    }
+  ],
+  "evidence": {
+    "host": "DESKTOP-B5E4IUE",
+    "team": "g6-selfrepair-17-15-real-terminal-reacceptance",
+    "browser_endpoint": 9202,
+    "page_id": "0cc4e7d0-458e-465c-bef0-5d1671d1af82",
+    "conversation_url": "https://chatgpt.com/c/6ae16cde-1394-83ec-b94d-bde6ac670d68",
+    "request_id": "cdpa-idem-354a11275915e2af164c944c-hop1",
+    "request_status": "sent",
+    "accepted_via": "exact_user_message",
+    "accepted_at_epoch": 1793158380.0979018,
+    "attempts": 1,
+    "user_message_id": "6c4a1f55-797a-43a2-ac94-24fbfb87c0b0",
+    "model_gate_high_verified_utc": [
+      "03:32:44.614776 before fill",
+      "03:32:46.803936 after fill",
+      "03:32:51.981943 immediately before Send"
+    ],
+    "send_click_utc": "03:32:56.050025",
+    "mcp_allow_utc": "03:34:27.525868",
+    "permission_click_count": 1,
+    "health": "9224 and 9225 HTTP 200; worker HEALTHY, source drift false",
+    "stop_visible": true,
+    "dom_state": "responding",
+    "terminal_done_proven": false,
+    "terminal_source_route": null,
+    "final_text_hash": null,
+    "copy_completion_actions": null,
+    "other_tabs_before": "MISSING exact slice 15 before-admission tab inventory",
+    "other_tabs_after": "Cannot prove noninterference without before inventory",
+    "wait_probe_full_snapshot_discrepancy": "Not established: final terminal not yet observed"
+  },
+  "root_diagnosis": "Evidence gap: owned DOM still streaming with Stop visible at observation and exact before-admission unrelated-tab baseline for slice 15 absent; cannot independently certify terminal DONE or noninterference. This does not prove a product bug.",
+  "next_action": "Pi coordinator reconcile same accepted hop without replay, Retry or Stop; no successor spawned; retain NOT_ACCEPTED until stable terminal and independent noninterference evidence."
+}

@@ -1,0 +1,65 @@
+{
+  "slice_id": "01-inventory",
+  "task_id": "cdpa-idem-4b2948e5cf17388b7d78d2d3",
+  "status": "BLOCKED",
+  "git_before": "5c4690f dirty",
+  "git_after": "5c4690f dirty; product unchanged",
+  "tests": [
+    {
+      "command": "uv run pytest -q tests/test_spec003_gate_c_runtime.py tests/test_gate_c_direct_chat_worker.py",
+      "result": "PASS 22 passed in 4.14s"
+    },
+    {
+      "command": "git diff --check -- src tests",
+      "result": "FAIL tests/test_spec003_gate_c_runtime.py:348 new blank line at EOF"
+    }
+  ],
+  "changed_files": [
+    "workflows/self-repair/receipts/01-inventory.json"
+  ],
+  "evidence": {
+    "host": "DESKTOP-B5E4IUE",
+    "branch": "rebuild/runtime-v2-r11",
+    "release": "NOT_ACCEPTED",
+    "fingerprint_drift": "current sha256:b55af76f... vs policy sha256:2959575f...",
+    "ordered_minimum_fixes": [
+      {
+        "order": 1,
+        "slice": "02-writer-lease",
+        "source": "cdpa_conversations.py:399-666; tests/test_spec003_gate_c_runtime.py:36-148; T075-T077",
+        "failing_first": "stale epoch before composer click; lost-ack submitted recovery; route-back competing writer, no duplicate Send"
+      },
+      {
+        "order": 2,
+        "slice": "03-adopted-url",
+        "source": "cdpa_worker.py:8927,9180,9653; tests/test_spec003_gate_c_runtime.py:116-126; T078-T079",
+        "failing_first": "two-role adopted start-route-away-route-back; mismatch blocks before Send; no new tab fallback"
+      },
+      {
+        "order": 3,
+        "slice": "04-direct-chat",
+        "source": "cdpa_worker.py:12656-12680,12796-12825; dashboard_api.py:1320-1358; tests/test_gate_c_direct_chat_worker.py:166-227; T080,T087",
+        "failing_first": "MaterialRef registered attachment/reference delivery and route-looking standalone reply must not mutate TeamTask route"
+      },
+      {
+        "order": 4,
+        "slice": "05-endpoint-ui",
+        "source": "dashboard_api.py:668-740; tests/test_spec003_gate_c_runtime.py:182-231; T074,T089,T091-T092",
+        "failing_first": "cross-origin redirect and websocket authority mismatch reject; dynamic endpoint visible without restart"
+      },
+      {
+        "order": 5,
+        "slice": "06-async-wait",
+        "source": "cdpa_worker.py:8155-8472; dashboard_api.py:1087-1194; tests/test_spec003_gate_c_runtime.py:232-250; T093-T099",
+        "failing_first": "confirmed spawn WAIT duplicate/conflicting callback, same-role same-binding wake once; no resend"
+      },
+      {
+        "order": 6,
+        "slice": "07-regression,08-real-browser",
+        "source": "tests/test_spec003_gate_c_runtime.py:348; REBUILD_CONTRACT.md; T100-T105",
+        "failing_first": "fix EOF blank line then diff check; compile/full regression; new owned 9202 CDP smoke"
+      }
+    ]
+  },
+  "next_action": "Pi coordinator: blocked by diff-check failing. Small scoped fix for test EOF blank line, rerun checks; then continue planned slices. No worker auto-spawn."
+}

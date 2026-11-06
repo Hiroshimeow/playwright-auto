@@ -1,0 +1,38 @@
+{
+  "slice_id": "08-real-browser",
+  "task_id": "cdpa-idem-b73d4b4fee4b73731c7c4ab0",
+  "status": "BLOCKED",
+  "release": "NOT_ACCEPTED",
+  "git_before": "5c4690f with existing Gate C changes",
+  "git_after": "5c4690f with tested local root-fix changes (not committed)",
+  "changed_files": [
+    "src/playwright_auto/cdpa_store.py",
+    "workflows/self-repair/supervisor.py",
+    "tests/test_cdpa_resume_control_store.py",
+    "tests/test_cdpa_selfrepair_watchdog.py",
+    "workflows/self-repair/receipts/08-real-browser.json"
+  ],
+  "tests": [
+    {
+      "command": "G6 coordinator: pytest -q tests/test_operator_resume_recovery.py tests/test_cdpa_worker.py -k \"resume or control\" --tb=short",
+      "result": "100 passed, 111 deselected in 82.10s, exit 0 (after source fix)"
+    },
+    {
+      "command": "G6 coordinator: pytest -q tests/test_cdpa_resume_control_store.py tests/test_cdpa_selfrepair_watchdog.py tests/test_cdpa_selfrepair_recovery.py tests/test_cdpa_selfrepair_supervisor.py tests/test_chatgpt_model_gate.py --tb=short",
+      "result": "75 passed, exit 0 (after source fix)"
+    },
+    {
+      "command": "G6 coordinator: pytest -q tests/test_cdpa_resume_control_store.py -x --tb=short",
+      "result": "Failing-first reproduced shared nested controls in TaskStore.resume_team; after fix 1 passed, exit 0"
+    }
+  ],
+  "evidence": [
+    "G6 task g6-selfrepair-10-08-real-browser-retry2 STOPPED with exact official Stop APPLIED (reason 'G6 self-repair runtime reload: operator priority; preserve prior Send ledger') and cleanup CLEARED, verified_empty_at 2026-10-27T15:18:14.920174Z. No resume/replay of this task.",
+    "Exact accepted request cdpa-idem-b73d4b4fee4b73731c7c4ab0-hop1 had ledger status sent, attempts=1, accepted_via=exact_user_message, response absent. Do not claim the assistant turn completed.",
+    "Raw G6 action-events.jsonl for this task: Extra High model gate verified before composer fill and twice before unique send:click 2026-10-27T15:12:34.569324Z.",
+    "Runtime API 9225 and dashboard 9224 healthy after reload; Chrome CDP 9202/9212 remained online; no browser restart by coordinator.",
+    "Resume control root cause independently reproduced: TaskStore.resume_team used shallow dict(current); controls and applied_command_ids aliased original, so persistence could treat queued control as no-op. Fixed via independent nested copy and failing-first regression; integration 100 passed.",
+    "Real-browser acceptance gate still unproven: stopped prior Send before terminal route; no independent unrelated-tab before/after snapshot for this attempt. Release is NOT_ACCEPTED."
+  ],
+  "next_action": "After verifying STOPPED/CLEARED and this BLOCKED receipt, archive this bounded 08 attempt and advance only to a NEW isolated postfix real-CDP slice. Require fresh High/Extra High model proof before next Send, never replay prior accepted Send. Maintain NOT_ACCEPTED until actual terminal CDP and non-interference evidence passes."
+}

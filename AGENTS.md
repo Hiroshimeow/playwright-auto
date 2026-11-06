@@ -1,5 +1,9 @@
 # CDPA Agent Guide
 
+## Mandatory self-evolution goal propagation
+
+For every Pi/CDPA agent participating in CDPA self-evolution, first read `workflows/self-evolution/GOAL_AND_RULES.md` in full. Every spawned CDPA task at any generation MUST use `workflows/self-evolution/spawn_cdpa.py`, which embeds the entire current campaign goal, all operational rules, and the task-spawning command into the actual `--task` argument; never forward a shortened summary or only a path. Pi is the sole coordinator/dispatcher. CDPA agents own source changes, tests, and reviews; Pi operates task lifecycle and recovery. Preserve exactly-once Send, task identity and unrelated browser profiles.
+
 CDPA is the durable control plane for browser-backed multi-agent workflows. Repository source plus durable runtime state are authoritative. Preserve unrelated dirty and untracked work.
 
 ## Start here

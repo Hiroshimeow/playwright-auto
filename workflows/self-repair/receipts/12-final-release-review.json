@@ -1,0 +1,44 @@
+{
+  "slice_id": "12-final-release-review",
+  "task_id": "cdpa-idem-ff7d1b2118ef54820d9cbdcc",
+  "status": "BLOCKED",
+  "release": "NOT_ACCEPTED",
+  "release_verdict": "NOT_ACCEPTED",
+  "full_regression": "CURRENT_SOURCE_FULL_RERUN_REQUIRED",
+  "real_cdp": "BLOCKED",
+  "changed_files": [
+    "workflows/self-repair/supervisor.py",
+    "tests/test_cdpa_selfrepair_final_review_close.py",
+    "workflows/self-repair/receipts/12-final-release-review.json"
+  ],
+  "tests": [
+    {
+      "command": "G6 .venv\\Scripts\\python.exe -m pytest -q tests/test_cdpa_selfrepair_final_review_close.py tests/test_cdpa_selfrepair_final_acceptance.py tests/test_cdpa_selfrepair_watchdog.py tests/test_cdpa_selfrepair_recovery.py tests/test_cdpa_selfrepair_postfix.py tests/test_cdpa_selfrepair_supervisor.py --tb=short",
+      "result": "79 passed, exit 0; failing-first reproduced missing STOPPED review retirement"
+    },
+    {
+      "command": "G6 .venv\\Scripts\\python.exe -m pytest -q tests/test_chatgpt_model_gate.py tests/test_cdpa_resume_control_store.py tests/test_spec003_gate_c_runtime.py tests/test_gate_c_direct_chat_worker.py --tb=short",
+      "result": "41 passed in 6.69s, exit 0"
+    },
+    {
+      "command": "G6 git diff --check -- workflows/self-repair/supervisor.py",
+      "result": "exit 0"
+    },
+    {
+      "command": "G6 full suite recorded in earlier receipts/10-release-review.json",
+      "result": "2045 passed, 45 skipped at earlier source revision; current supervisor changes made later, so cannot yet claim current full regression PASS"
+    }
+  ],
+  "evidence": [
+    "Authoritative task g6-selfrepair-14-12-final-release-review / cdpa-idem-ff7d1b2118ef54820d9cbdcc was BLOCKED permission_review, not terminal DONE; final review prompt was already accepted once. It is retired without Retry, Resume or duplicate Send.",
+    "Exact requests.json request cdpa-idem-ff7d1b2118ef54820d9cbdcc-hop1 status sent, attempts=1, accepted_via=user_message_identity; response not recorded.",
+    "Exact .runtime/action-events.jsonl task-specific model_gate High verified at 2026-10-27T22:38:15.038326Z, 22:38:17.036149Z, 22:38:22.197139Z; one send click 22:38:25.473670Z, completed 22:38:26.260632Z.",
+    "RoleController emits permission_review when a permission surface is present with provider-risk UI. Task's owned 9202 tab had already disappeared at independent read-only probe; the exact warning contents cannot be reconstructed from live DOM. No risk warning was automatically approved or bypassed.",
+    "Exact official Stop command cmd-d728b33a-bbcb-4c13-ad5b-8438ecbd398c status applied; exact Clear Team cmd-277da64c-d51a-4b8a-95a9-afb3573608c9 applied. Task STOPPED/cleared, cleanup CLEARED, verified_empty_at 2026-10-27T22:45:43.529144Z.",
+    "Slice 11 receipt 11-final-real-cdp.json remains BLOCKED: model High before Send, one accepted Send, but permission_review and no direct stable terminal DONE. The before/after 9202 snapshot IDs/URLs matched (12 vs 12), though that alone cannot prove every focus/noninterference action.",
+    "API 9225, dashboard 9224, worker HEALTHY/source drift=false; 9202 and 9212 listening, G6 local Pi supervisor and health watchdog Ready, 1-minute cadence at last check.",
+    "Falling-first regression added for Stop/CLEARED of final read-only reviewer: baseline failed with phase NEEDS_PI; after the exact supervisor owner fix 79 focused tests passed and separate Gate C focused suite 41 passed."
+  ],
+  "root_cause": "Final ChatGPT-backed read-only review unnecessarily requested MCP file access, triggering provider permission-risk approval. CDPA correctly blocked automatic approval, but supervisor had no exact STOPPED/CLEARED retirement path for slice 12; fixed without bypassing provider safety.",
+  "next_action": "Release remains NOT_ACCEPTED. Re-run broad regression on current supervisor code, then prove a fresh, permitted High/Extra High model-gated 9202 direct terminal DONE with exactly one accepted Send, before/after other-tab noninterference, and run an independent updated release review. Do not retry or resume accepted hops from slices 11/12. Do not disable hourly ChatGPT automation until G0-G9 PASS."
+}

@@ -1,0 +1,47 @@
+{
+  "slice_id": "14-release-recheck",
+  "task_id": "cdpa-idem-68555676d0c16a3a98b68359",
+  "team": "g6-selfrepair-16-14-release-recheck-retry1",
+  "status": "BLOCKED",
+  "release": "NOT_ACCEPTED",
+  "release_verdict": "NOT_ACCEPTED",
+  "full_regression": "PASS",
+  "real_cdp": "BLOCKED",
+  "git_before": "DESKTOP-B5E4IUE rebuild/runtime-v2-r11 HEAD 5c4690f0e6256c2217283719d0fc1784e01d004f; pre-existing dirty worktree",
+  "git_after": "Same HEAD/branch; pre-existing dirty worktree preserved, no product-code edits",
+  "changed_files": [
+    "workflows/self-repair/receipts/14-release-recheck.json"
+  ],
+  "prior_slice14_attempt": {
+    "task_id": "cdpa-idem-96f6bb4a33615070e0264690",
+    "result": "BLOCKED/NOT_ACCEPTED; historical receipt superseded for retry1; its accepted Send is not replayed"
+  },
+  "tests": [
+    {
+      "command": "G6 existing retained broad run: .venv\\Scripts\\python.exe -m pytest -q; .runtime/self-repair/gate-c-full-20261028-0937.{started,log,exit}",
+      "result": "2065 passed, 45 skipped in 612.16s, exit 0; started 2026-10-28T00:39:51.5978375Z, finished 2026-10-28 09:50:05 JST; no src/tests/workflows .py/.json mtime newer than the run start at check"
+    },
+    {
+      "command": ".venv\\Scripts\\python.exe -m pytest -q tests/test_cdpa_selfrepair_supervisor.py tests/test_cdpa_selfrepair_continuation.py tests/test_spec003_gate_c_runtime.py --tb=short",
+      "result": "67 passed in 4.99s, retained G6 process exit 0"
+    },
+    {
+      "command": "hcuw fingerprint .; git diff --check",
+      "result": "baseline 0.5 evidence fingerprint sha256:b55af76f7c107843707a096f835f5a8c3ca29da6455e5319da3e2bdeaf0f3cb4 matches .agents/rules/project.md; diff check exit 0 (only line-ending warnings)"
+    },
+    {
+      "command": "Read-only 9225/health, 9224/health, 9202/9212 /json/version; Get-ScheduledTaskInfo",
+      "result": "9225 HEALTHY worker_ready=true worker_stale=false worker_command_loop_ready=true source_drift=false reload_required=false; 9224 ok; browser ports HTTP 200; Pi supervisor and health watchdog Ready, last task results 0"
+    }
+  ],
+  "evidence": [
+    "Independent receipt review: 07-regression was PASS for older broad source (2020/45), 10-release-review was NOT_ACCEPTED for missing live DONE despite older broad PASS (2045/45), and 11-final-real-cdp/12-final-release-review/13-allow-reacceptance remain BLOCKED/NOT_ACCEPTED. The earlier 2055 passed/1 failed/45 skipped full run is superseded by a later completed clean broad run, NOT by its six isolated targeted passes.",
+    "Exact requests.json for slice11 cdpa-idem-ecd3f44725efdd226035dc60-hop1 and slice12 cdpa-idem-ff7d1b2118ef54820d9cbdcc-hop1 each status=sent, attempts=1, response=null. Independent raw action-events.jsonl for each shows task-bound High model_gate verifications before the one send:click; neither has a verified stable terminal DONE.",
+    "Slice13 exact request cdpa-idem-701b4b536d59352a0ccc9071-hop1 in .plan/g6-selfrepair-15-13-allow-reacceptance has status=sent, attempts=1, response=null. Raw action-events verify High at 00:02:20.961874Z before fill and at 00:02:28.639424Z before single send:click 00:02:31.873994Z; exactly one task-associated mcp_allow complete at 00:05:32.286053Z. Slice13 receipt records RUNNING/wait_response without terminal route at cutoff and subsequent campaign state records STOPPED/BLOCKED; no observed terminal DONE.",
+    "Current retry1 review request cdpa-idem-68555676d0c16a3a98b68359-hop1 bound to owned page 707bc91b-7a08-4349-9215-7101d9f038b8, status=sent, attempts=1, accepted_via=exact_user_message, response=null at review; raw action events verify High at 00:46:18.818465Z BEFORE composer_fill, High at 00:46:25.904554Z BEFORE the one send:click 00:46:29.366493Z. Campaign state RUNNING/wait_response; this review task's accepted Send is not a replacement for a distinct live acceptance.",
+    "Read-only .runtime/self-repair/11-final-tabs-compare.json compared 12 before/after 9202 IDs and found no changes in IDs or URLs, but explicitly cannot independently establish no focus/reload during the interval. Slice13 lacks authoritative unrelated-tab snapshot BEFORE its Send; 9202/9212 noninterference is therefore NOT PROVEN. This review did not navigate, focus, reload, close, send, approve, or retry any application tab.",
+    "G0 code regression is checked in GOAL_CHECKLIST.md; G1-G9 remain unchecked. 9225 latest /health at 2026-10-28T00:52:48Z reports healthy command loop and zero source drift. Current full broad result is clean on unchanged source; live G4 and G6 evidence is still insufficient."
+  ],
+  "missing_gate": "No independently proven stable contract-valid terminal DONE for the fresh slice13 9202 acceptance after one Send/Allow, and no authoritative slice13 pre-Send unrelated-tab identities to establish noninterference; real_cdp and release cannot PASS.",
+  "next_action": "Pi coordinator: investigate the existing owned-page response-admission/wait_response path after the verified one-time MCP Allow on slice13, and repair only an independently reproduced terminal-consumption defect with a failing-first test. Then perform ONE NEW model-gated 9202 live acceptance with authoritative unrelated-tab snapshots before/after and stable DONE. Never replay any previously accepted Send; no new control/gate layer and no Solo spawn from this review."
+}

@@ -1,0 +1,40 @@
+{
+  "slice_id": "04-direct-chat",
+  "task_id": "cdpa-idem-309371a09f2ed7bf205c5530",
+  "status": "PASS",
+  "git_before": "5c4690f0e6256c2217283719d0fc1784e01d004f (dirty working tree preserved)",
+  "git_after": "5c4690f0e6256c2217283719d0fc1784e01d004f (uncommitted bounded change)",
+  "changed_files": [
+    "src/playwright_auto/cdpa_worker.py",
+    "tests/test_gate_c_direct_chat_worker.py"
+  ],
+  "tests": [
+    {
+      "command": "uv run pytest -q tests/test_gate_c_direct_chat_worker.py -k accepted_active_response_resumes_wait_without_resend",
+      "result": "RED: failed 1; resumed status recovery_required rather than applied"
+    },
+    {
+      "command": "uv run pytest -q tests/test_gate_c_direct_chat_worker.py tests/test_spec003_gate_c_runtime.py",
+      "result": "PASS: 27 passed, 0 failed (fresh verification)"
+    },
+    {
+      "command": "uv run python -m compileall -q src/playwright_auto/cdpa_worker.py src/playwright_auto/cdpa_dom_stream.py",
+      "result": "PASS exit 0"
+    },
+    {
+      "command": "git diff --check",
+      "result": "PASS exit 0"
+    },
+    {
+      "command": "uv run pytest -q tests/test_cdpa_worker.py tests/test_gate_c_direct_chat_worker.py tests/test_spec003_gate_c_runtime.py tests/test_role_runtime_browser.py",
+      "result": "INCOMPLETE: one-shot 28s timeout; no failure assertion and no full suite claim"
+    }
+  ],
+  "evidence": [
+    "Before fix, _complete_direct_chat_message checked busy snapshot before reading existing accepted SendAttempt; active response was rejected as DIRECT_CHAT_TARGET_BUSY and could not resume.",
+    "Moved existing ledger SendAttempt lookup ahead of busy predicate; accepted or reconciled_accepted attempt resumes owned wait while new attempts retain busy guard.",
+    "Regression exercises stop_visible and response_projection_active, requires completion after one accepted Send without duplicate click, verifies writer becomes idle.",
+    "No browser Send, page refresh, endpoint mutation, or runtime restart performed."
+  ],
+  "next_action": "Pi coordinator independently verify receipt/diff and run broader regression in dedicated 07-regression slice; subsequent real CDP acceptance remains unverified. Release NOT_ACCEPTED."
+}

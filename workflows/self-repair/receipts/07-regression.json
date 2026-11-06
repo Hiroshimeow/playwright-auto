@@ -1,0 +1,39 @@
+{
+  "slice_id": "07-regression",
+  "task_id": "cdpa-idem-34eb8412fb5997ec937f51a0",
+  "status": "PASS",
+  "git_before": "5c4690f0 dirty",
+  "git_after": "5c4690f0 dirty; no product changes",
+  "changed_files": [
+    "workflows/self-repair/receipts/07-regression.json"
+  ],
+  "tests": [
+    {
+      "command": "uv run pytest -q tests/test_cdpa_worker.py::test_cdpa_uploads_once_per_role_conversation_generation",
+      "result": "1 passed in 31.12s exit 0"
+    },
+    {
+      "command": "uv run pytest -q tests/test_spec003_gate_c_runtime.py tests/test_gate_c_direct_chat_worker.py tests/test_cdpa_selfrepair_recovery.py tests/test_cdpa_selfrepair_supervisor.py tests/test_role_runtime_browser.py",
+      "result": "93 passed in 23.51s exit 0"
+    },
+    {
+      "command": "uv run pytest -q",
+      "result": "2020 passed, 45 skipped in 594.22s exit 0; clean teardown"
+    },
+    {
+      "command": "uv run python -m compileall -q src/playwright_auto",
+      "result": "exit 0"
+    },
+    {
+      "command": "git diff --check -- src tests specs/003-team-only-dom-runtime",
+      "result": "exit 0"
+    }
+  ],
+  "evidence": [
+    "G6 host DESKTOP-B5E4IUE branch rebuild/runtime-v2-r11; previous failing test rerun PASS, no independent failure observed.",
+    "9225 HEALTHY, worker_stale=false, source_drift=false, reload_required=false; 9224 health HTTP 200.",
+    "Current task RUNNING wait_response at final check. No browser Send, model UI verification, or F5; release NOT_ACCEPTED until real CDP gate.",
+    "Git tracked and untracked preexisting work untouched; no product change. Clean pytest process exit."
+  ],
+  "next_action": "Pi coordinator reconcile current task and accepted Send ledger; proceed to 08-real-browser only after actual High/Extra High UI verification before composer fill; no resend of accepted Send."
+}

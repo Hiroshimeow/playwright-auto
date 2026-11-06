@@ -1,0 +1,26 @@
+﻿{
+    "slice_id":  "01b-terminal-recovery",
+    "task_id":  "cdpa-idem-86b069e80cbb1060363c3a93",
+    "status":  "BLOCKED",
+    "issuer":  "G6 supervisor reconciliation",
+    "git_before":  "5c4690f dirty",
+    "git_after":  "5c4690f dirty",
+    "changed_files":  [
+
+                      ],
+    "tests":  [
+
+              ],
+    "evidence":  {
+                     "block_code":  "provider_challenge",
+                     "accepted_send_observed":  true,
+                     "send_provenance":  "exact_user_message",
+                     "challenge_marker":  "cloudflare_challenge Retry",
+                     "owned_tab_closed":  true,
+                     "restart":  "Browser.close 9202; Desktop 9202_PLUSHCU.bat; restored original tabs",
+                     "chatgpt_composer_ready":  true,
+                     "safety":  "Prior accepted Send was never retried",
+                     "release":  "NOT_ACCEPTED"
+                 },
+    "next_action":  "Create ONE new fresh Solo 01c-terminal-fresh-retry; leave old task BLOCKED"
+}

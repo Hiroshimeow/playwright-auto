@@ -1,0 +1,33 @@
+﻿{
+    "slice_id":  "10-release-review",
+    "task_id":  "cdpa-idem-fa676a6c918ea3ac150789be",
+    "status":  "BLOCKED",
+    "release":  "NOT_ACCEPTED",
+    "release_verdict":  "NOT_ACCEPTED",
+    "full_regression":  "PASS",
+    "real_cdp":  "BLOCKED",
+    "changed_files":  [
+                          "workflows/self-repair/receipts/10-release-review.json"
+                      ],
+    "tests":  [
+                  {
+                      "command":  "pytest -q tests/test_cdpa_selfrepair_supervisor.py tests/test_cdpa_selfrepair_postfix.py tests/test_cdpa_selfrepair_watchdog.py --tb=short",
+                      "result":  "50 passed, exit 0"
+                  },
+                  {
+                      "command":  "pytest -q",
+                      "result":  "2045 passed, 45 skipped in 599.20s, exit 0; clean process completion"
+                  }
+              ],
+    "evidence":  [
+                     "Slice 09 task cdpa-idem-49e239a7cd6e3da737154a35 used endpoint 9202 and one owned page e30d36c4-22cb-4b99-9517-a874b69a8285.",
+                     "Slice 09 hop1 and hop2 each had High model-gate verification before composer fill/Send and exactly one accepted Send click; hop2 was created only by one applied official Resume after a valid PAUSE.",
+                     "Slice 09 final hop returned PAUSE again rather than terminal DONE; coordinator then used one official Stop and one Clear Team. Cleanup reached CLEARED, closed_tabs=1, target_tabs=1, verified_empty_at=2026-10-27T15:52:11.283070+00:00.",
+                     "All 26 slice-09 action events used the same owned page_id; no focus, reload, new_chat, retry or repair action was recorded on another page. However an authoritative unrelated-tab identity snapshot captured immediately BEFORE slice 09 was not available, so the explicit before/after noninterference release gate is not independently proven.",
+                     "Slice 10 review task itself was model-gated High and sent its task prompt exactly once, but it did not create the required receipt/route. Its generated review text independently identified the same release blockers: final live task ended STOPPED after PAUSE rather than stable DONE, and full regression post-rootfix was not yet proven.",
+                     "Slice 10 review task was officially Stopped before any repair/retry, then Clear Team reached CLEARED and closed only its one owned review tab.",
+                     "API/dashboard/worker were healthy with source_drift=false during review.",
+                     "Post-rootfix full regression rerun on G6 completed: 2045 passed, 45 skipped in 599.20s, exit 0."
+                 ],
+    "next_action":  "Run one final fresh 9202 acceptance with authoritative tab inventory captured before/after, require direct terminal DONE without Resume/retry, then run final read-only release review."
+}

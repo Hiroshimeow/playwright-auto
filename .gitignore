@@ -46,3 +46,9 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# Local operator scratch
+.tmp/
+gate_c_verify_tmp/
+.gate-c-*
+NUL

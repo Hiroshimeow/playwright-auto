@@ -1,0 +1,27 @@
+{
+  "slice_id": "16-post-regression-independent-check",
+  "task_id": "cdpa-idem-6c99192811d4fba96fd90a70",
+  "checked_at": "2026-10-28T15:37:00+09:00",
+  "host": "DESKTOP-B5E4IUE",
+  "branch": "rebuild/runtime-v2-r11",
+  "status": "BLOCKED",
+  "release_verdict": "NOT_ACCEPTED",
+  "full_regression": "PASS_TEST_ONLY_FINAL_CODE_FREEZE_NOT_PROVEN",
+  "real_cdp": "BLOCKED",
+  "tests": [
+    {
+      "command": ".runtime/self-repair/run_post_opus_full.ps1: .venv/Scripts/python.exe -m pytest -q --disable-warnings",
+      "result": "2089 passed,45 skipped,0 failed in 649.74 seconds; post-opus-full-20261028.exit=0"
+    }
+  ],
+  "evidence": [
+    "Fresh API GET /health: HEALTHY, stale=false, source drift=false at 2026-10-28T06:37Z.",
+    "Exact independent review task cdpa-idem-6c99192811d4fba96fd90a70: API DONE, active_action cleared, cleanup CLEARED, version 13.",
+    "Existing 16-final-release-evidence.json BLOCKED/NOT_ACCEPTED. Independent accepted 15b task had empty assistant body, no valid terminal DONE, missing authoritative BEFORE unrelated-tab identity snapshot.",
+    "This receipt upgrades regression evidence only. No new Send, browser mutation or scheduler changes."
+  ],
+  "changed_files": [
+    "workflows/self-repair/receipts/16-post-regression-independent-check.json"
+  ],
+  "next_action": "G6 existing Pi supervisor reconcile NEEDS_PI with API DONE/CLEARED and receipt 16 BLOCKED, independently investigate empty assistant response before another fresh acceptance; capture unrelated-tab before/after and stable terminal DONE; run independent final review after code freeze. Preserve schedule and accepted Send ledger."
+}

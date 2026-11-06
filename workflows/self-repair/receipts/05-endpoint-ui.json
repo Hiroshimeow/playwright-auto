@@ -1,0 +1,32 @@
+﻿{
+    "slice_id":  "05-endpoint-ui",
+    "changed_files":  [
+                          "src/playwright_auto/cdpa_worker.py",
+                          "tests/test_cdpa_browser_management.py"
+                      ],
+    "evidence":  [
+                     "Previously browser_endpoint_update changed cdp_url without probe. New async command runs admission probe before applying; rejected offline target retains previous registry address.",
+                     "Existing active execution/unsealed binding retarget guard remains in use both before probe and at apply.",
+                     "No browser Send, no F5, no Chrome restart, no live endpoint mutation.",
+                     "G6 health before change: worker HEALTHY, SOURCE_DRIFT false, 9202 connected; release remains NOT_ACCEPTED."
+                 ],
+    "next_action":  "Pi coordinator independently validate bounded receipt and reload worker due to source drift, then advance to 06-async-wait. Run full regression and real CDP verification in later slices. Do not replay accepted Send.",
+    "git_before":  "5c4690f0e6256c2217283719d0fc1784e01d004f (dirty worktree preserved)",
+    "tests":  [
+                  {
+                      "result":  "RED: 1 failed, endpoint retarget accepted without probe",
+                      "command":  "uv run pytest -q tests/test_cdpa_browser_management.py -k endpoint_retarget_probes_before_registry_mutation"
+                  },
+                  {
+                      "result":  "PASS: 40 passed in 9.69s",
+                      "command":  "uv run pytest -q tests/test_cdpa_browser_management.py tests/test_cdpa_browser_admission.py tests/test_spec003_gate_c_runtime.py"
+                  },
+                  {
+                      "result":  "PASS exit 0",
+                      "command":  "git diff --check; uv run python -m compileall -q src/playwright_auto/cdpa_worker.py"
+                  }
+              ],
+    "git_after":  "5c4690f0e6256c2217283719d0fc1784e01d004f (bounded uncommitted change)",
+    "task_id":  "cdpa-idem-7eac4821e97342c12379a562",
+    "status":  "PASS"
+}

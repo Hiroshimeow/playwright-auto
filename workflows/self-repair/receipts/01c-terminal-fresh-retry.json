@@ -1,0 +1,37 @@
+{
+  "slice_id": "01c-terminal-fresh-retry",
+  "task_id": "cdpa-idem-ba7a0091c4a42870bc74c695",
+  "status": "PASS",
+  "git_before": "5c4690f dirty; preserved existing changes",
+  "git_after": "5c4690f dirty; no commit; unrelated changes preserved",
+  "changed_files": [
+    "src/playwright_auto/chatgpt.py",
+    "tests/test_role_runtime_browser.py",
+    "workflows/self-repair/receipts/01c-terminal-fresh-retry.json"
+  ],
+  "tests": [
+    {
+      "command": "uv run pytest -q tests/test_role_runtime_browser.py -k semantic_heading_h3_terminalizes_bound_final_route (before fix)",
+      "result": "FAIL expected: 0 DOM messages vs 2"
+    },
+    {
+      "command": "uv run pytest -q tests/test_role_runtime.py tests/test_role_runtime_browser.py tests/test_cdpa_repair.py tests/test_spec003_gate_c_runtime.py",
+      "result": "PASS 96 passed in 26.04s"
+    },
+    {
+      "command": "git diff --check -- src/playwright_auto/chatgpt.py tests/test_role_runtime_browser.py",
+      "result": "PASS"
+    }
+  ],
+  "evidence": {
+    "host": "DESKTOP-B5E4IUE",
+    "branch": "rebuild/runtime-v2-r11",
+    "existing_owner": "chatgpt.py inspect_chatgpt_page semanticMessages",
+    "fix": "Recognize role-label headings h3 and h4; preserve bound accepted user and assistant identities, completion-action gating and RoleController acceptance.",
+    "failing_first": "h3 role-label headings produce zero messages despite visually final route JSON",
+    "accepted_prior_send": "01b accepted send not retried; no browser Send, F5 or tab mutations in this slice",
+    "release": "NOT_ACCEPTED",
+    "limitation": "Synthetic DOM regression verified; exact real browser release acceptance remains a later slice; fingerprint drift pre-existing."
+  },
+  "next_action": "Pi coordinator validate receipt and continue next small Gate C slice. Maintain separate real CDP release gate; do not mark full release accepted."
+}

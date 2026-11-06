@@ -1,0 +1,98 @@
+{
+  "slice_id": "15b-fresh-terminal-proof",
+  "task_id": "cdpa-idem-b204835a8e7ffe939d4366ec",
+  "team": "g6-selfrepair-18-15b-fresh-terminal-proof-retry1",
+  "status": "PASS",
+  "pass_scope": "BOUNDED_CODE_AND_PRETERMINAL_CHECKS_ONLY",
+  "real_cdp": "PENDING_EXTERNAL_OBSERVER",
+  "release_verdict": "NOT_ACCEPTED",
+  "full_regression": "NOT_CLAIMED_CURRENT_CODE",
+  "host": "DESKTOP-B5E4IUE",
+  "repo": "E:\\git-project\\cdpa",
+  "branch": "rebuild/runtime-v2-r11",
+  "git_before": "5c4690f0e6256c2217283719d0fc1784e01d004f; pre-existing modified/untracked files preserved",
+  "git_after": "5c4690f0e6256c2217283719d0fc1784e01d004f; no product/source changes",
+  "changed_files": [
+    "workflows/self-repair/receipts/15b-fresh-terminal-proof.json"
+  ],
+  "source_inspected": [
+    ".agents/skills/cdpa-self-repair/SKILL.md",
+    "AGENTS.md",
+    ".agents/skills/hcu-work/SKILL.md",
+    ".agents/rules/project.md",
+    "docs/REBUILD_CONTRACT.md",
+    "docs/CURRENT_VERIFIED_STATE.md",
+    "specs/003-team-only-dom-runtime/tasks.md",
+    "workflows/self-repair/{MISSION.md,PROGRESS.md,slices.json,GOAL_CHECKLIST.md,REPAIR_HISTORY.md}",
+    "workflows/self-repair/receipts/15-real-terminal-reacceptance.json",
+    "workflows/self-repair/receipts/15b-fresh-terminal-proof.json (prior attempt)",
+    "src/playwright_auto/role_runtime/response.py:42,112,159",
+    "tests/test_role_runtime.py:219",
+    "tests/test_cdpa_overlay_observation.py:117",
+    ".runtime/action-events.jsonl (exact task-filtered)",
+    ".plan/g6-selfrepair-18-15b-fresh-terminal-proof-retry1/cdpa-idem-b204835a8e7ffe939d4366ec/requests.json (exact record)",
+    ".runtime/self-repair/state.json",
+    "GET /api/tasks, GET 9224/health, GET 9225/health, GET 9202/json/version"
+  ],
+  "tests": [
+    {
+      "command": ".venv\\Scripts\\python.exe -m pytest -q tests/test_role_runtime.py tests/test_cdpa_overlay_observation.py tests/test_cdpa_selfrepair_supervisor.py --tb=short",
+      "exit_code": 0,
+      "result": "104 passed in 9.90s; retained process completed exit 0 (12.47s runtime)"
+    },
+    {
+      "command": "hcuw fingerprint .",
+      "exit_code": 0,
+      "result": "sha256:b55af76f7c107843707a096f835f5a8c3ca29da6455e5319da3e2bdeaf0f3cb4 matches .agents/rules/project.md"
+    },
+    {
+      "command": "read-only GET /health on 9224 and 9225; GET /json/version on 9202",
+      "exit_code": 0,
+      "result": "frontend ok; worker HEALTHY/ready/online, worker_stale=false, source_drift=false, reload_required=false; 9202 Chrome CDP reachable"
+    },
+    {
+      "command": "read-only GET /api/tasks exact task_id",
+      "exit_code": 0,
+      "result": "exact owned DEV task RUNNING / wait_response at sample; not a terminal observation"
+    },
+    {
+      "command": "exact-task action-event and accepted request ledger read",
+      "exit_code": 0,
+      "result": "Three task-bound High model_gate verified events, before composer fill and Send; one send:click, exact request sent accepted_via=exact_user_message attempts=1; same page_id"
+    }
+  ],
+  "evidence": {
+    "prior_slice_15": "BLOCKED/NOT_ACCEPTED; STOPPED/CLEARED after one accepted Send/MCP Allow without usable terminal text; historical request never replayed",
+    "previous_15b_attempt": "cdpa-idem-a72f22f3186257d4710f68e0 STOPPED/CLEARED with BLOCKED receipt, distinct from this task; no request reused",
+    "current_request_id": "cdpa-idem-b204835a8e7ffe939d4366ec-hop1",
+    "current_request_status": "sent",
+    "accepted_via": "exact_user_message",
+    "attempts": 1,
+    "accepted_user_message_id": "7920f6da-5cf7-4ef9-a401-c0ec37e8699e",
+    "current_owned_page_id": "b2376c4c-3784-42d1-9d89-540061092c32",
+    "current_role": "g6-selfrepair-18-15b-fresh-terminal-proof-retry1-dev",
+    "current_model_gate_verified_high_utc": [
+      "2026-10-28T04:31:20.179652Z (before composer fill)",
+      "2026-10-28T04:31:22.563146Z (after composer fill)",
+      "2026-10-28T04:31:27.701505Z (before Send)"
+    ],
+    "current_composer_fill_start_utc": "2026-10-28T04:31:21.387920Z",
+    "current_send_click_utc": "2026-10-28T04:31:32.209542Z",
+    "current_send_click_count": 1,
+    "current_send_request_attempts": 1,
+    "model_page_binding_consistent": true,
+    "current_mcp_allow": "PENDING_EXTERNAL_OBSERVER; no approval action performed by this assistant",
+    "current_final_assistant_text": "PENDING_EXTERNAL_OBSERVER_AFTER_THIS_TURN",
+    "current_terminal_route": "PENDING_EXTERNAL_OBSERVER_AFTER_THIS_TURN",
+    "current_stop_state": "PENDING_EXTERNAL_OBSERVER_AFTER_THIS_TURN",
+    "unrelated_tab_before_after": "PENDING_EXTERNAL_COORDINATOR",
+    "health_at_sample_utc": "2026-10-28T04:32:58Z",
+    "worker_status": "HEALTHY",
+    "worker_stale": false,
+    "worker_source_drift": false,
+    "worker_reload_required": false,
+    "source_head": "5c4690f0e6256c2217283719d0fc1784e01d004f",
+    "worker_source_fingerprint": "e265a702b664bd28967c46a7b0a953176c067703a9a91e1ce6e948919ea27d49"
+  },
+  "next_action": "Existing CDPA worker independently observes this final one-object DONE route, assistant message/turn identity, text hash, Stop/completion and any owned MCP auto-Allow after turn end; existing G6 Pi coordinator verifies unrelated-tab before/after and ledger consistency. Dedicated later independent reviewer runs CURRENT-CODE full broad regression and judges Gate C. Do not spawn successor or replay Send here."
+}

@@ -1,0 +1,41 @@
+{
+  "slice_id": "03-adopted-url",
+  "task_id": "cdpa-idem-c7d0c78e67947f154faeec4f",
+  "status": "PASS",
+  "git_before": "5c4690f dirty; preserved pre-existing uncommitted and untracked work",
+  "git_after": "5c4690f dirty; scoped changes only; no commit",
+  "changed_files": [
+    "src/playwright_auto/cdpa_worker.py",
+    "tests/test_spec003_gate_c_runtime.py",
+    "workflows/self-repair/receipts/03-adopted-url.json"
+  ],
+  "tests": [
+    {
+      "command": "uv run pytest -q tests/test_spec003_gate_c_runtime.py -k team_adopted_start_role_keeps_exact_page_before_send (before fix)",
+      "result": "RED: 3 failed; team adopted URL ignored and no adopt_conversation called"
+    },
+    {
+      "command": "uv run pytest -q tests/test_spec003_gate_c_runtime.py tests/test_gate_c_direct_chat_worker.py",
+      "result": "PASS: 26 passed in 5.87s (fresh final run)"
+    },
+    {
+      "command": "uv run python -m compileall -q src/playwright_auto",
+      "result": "PASS exit 0"
+    },
+    {
+      "command": "git diff --check -- src/playwright_auto/cdpa_worker.py tests/test_spec003_gate_c_runtime.py",
+      "result": "PASS exit 0"
+    }
+  ],
+  "evidence": {
+    "host": "DESKTOP-B5E4IUE",
+    "branch": "rebuild/runtime-v2-r11",
+    "root_cause": "TeamTask initial adopted conversation_url only handled for Solo; initial TeamTask opened Fresh chat. Acquired URL overwrote requested URL before identity verification.",
+    "fix": "Use existing adopt_conversation for initial adopted TeamTask; preserve immutable requested URL and validate canonical conversation and page binding before pre-send state or ledger intent. Mismatch blocks CONVERSATION_IDENTITY_MISMATCH without New Chat or Send.",
+    "offline_cases": "valid adopted URL retains exact PLAN page and leaves DEV unallocated; wrong URL and wrong page binding block before request ledger insertion, no fallback",
+    "runtime": "/health healthy and 9202 CDP responsive before change; no browser mutation or real Send exercised",
+    "release": "NOT_ACCEPTED",
+    "limitations": "Broad test command started but shell RPC timed out without retained session handle; process still running when checked, so no broad-suite result claimed. Real CDP acceptance and Gate C release remain outstanding. Parallel pre-existing dirty code preserved."
+  },
+  "next_action": "Pi coordinator validates receipt and regression; continue isolated next Gate C slice; obtain broad-suite/real-browser Gate C acceptance in later release slices; never replay accepted Send or move endpoints."
+}

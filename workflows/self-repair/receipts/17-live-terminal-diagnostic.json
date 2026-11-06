@@ -1,0 +1,91 @@
+{
+  "slice_id": "17-live-terminal-diagnostic",
+  "task_id": "cdpa-idem-1be26964f73f16408386ee25",
+  "team": "g6-selfrepair-20-17-live-terminal-diagnostic",
+  "status": "PASS",
+  "pass_scope": "BOUNDED_PRETERMINAL_DIAGNOSTIC_AND_FOCUSED_REGRESSION_ONLY",
+  "real_cdp": "PENDING_EXTERNAL_OBSERVER",
+  "release_verdict": "NOT_ACCEPTED",
+  "git_before": "5c4690f0e6256c2217283719d0fc1784e01d004f; existing dirty/untracked files preserved",
+  "git_after": "5c4690f0e6256c2217283719d0fc1784e01d004f; source unchanged",
+  "changed_files": [
+    "workflows/self-repair/receipts/17-live-terminal-diagnostic.json"
+  ],
+  "tests": [
+    {
+      "command": "hcuw fingerprint .",
+      "exit_code": 0,
+      "result": "sha256:b55af76f7c107843707a096f835f5a8c3ca29da6455e5319da3e2bdeaf0f3cb4 matches project policy"
+    },
+    {
+      "command": "uv run pytest -q tests/test_cdpa_overlay_observation.py tests/test_role_runtime.py tests/test_chatgpt_model_gate.py",
+      "exit_code": 0,
+      "result": "72 passed in 8.39s; retained process complete exit 0"
+    },
+    {
+      "command": "uv run python .runtime/self-repair/diagnose_live_owned_response.py",
+      "exit_code": 0,
+      "result": "Exact owned task sessionStorage matched exactly one 9202 tab; first sample at 07:31:16Z 0 assistant headings, Stop visible; second sample at 07:31:51Z 1 assistant heading with 268 chars intermediate body in child DIV, Stop visible; not terminal evidence"
+    },
+    {
+      "command": "git diff --check",
+      "exit_code": 0,
+      "result": "No whitespace errors; two existing LF/CRLF warnings; no source changes"
+    },
+    {
+      "command": "read-only GET 9224/health and 9225/health",
+      "exit_code": 0,
+      "result": "HTTP 200 both; worker HEALTHY ready true stale false source_drift false reload_required false"
+    }
+  ],
+  "evidence": {
+    "host": "DESKTOP-B5E4IUE",
+    "branch": "rebuild/runtime-v2-r11",
+    "request_id": "cdpa-idem-1be26964f73f16408386ee25-hop1",
+    "accepted_via": "exact_user_message",
+    "accepted_send_attempts": 1,
+    "request_status_at_inspection": "sent",
+    "user_message_id": "67e9aefa-b006-45e6-9463-6c0f90c1218d",
+    "owned_page_id": "39dc0c6c-df81-42a7-b9d9-358077531283",
+    "owned_role": "g6-selfrepair-20-17-live-terminal-diagnostic-dev",
+    "owned_url": "https://chatgpt.com/c/6aec3055-5a0c-83ee-af37-b5812c3eaa7b",
+    "browser_endpoint_id": "4bc12276-da9c-4a7a-8ef9-ddcfcca6113f",
+    "model_gate_verified_extra_high_utc": [
+      "2026-11-05T07:29:24.030431Z",
+      "2026-11-05T07:29:25.855871Z",
+      "2026-11-05T07:29:31.013269Z"
+    ],
+    "composer_fill_start_utc": "2026-11-05T07:29:25.447793Z",
+    "send_click_utc": "2026-11-05T07:29:34.559465Z",
+    "send_complete_utc": "2026-11-05T07:29:35.089385Z",
+    "exact_task_send_click_count": 1,
+    "manifest_at_last_inspection": "2026-11-05T07:32:12.396105Z RUNNING/wait_mcp_allow_continuation; hop waiting, response=null; browser_control.stop_visible=true; controller_reason=mcp_allow_ready",
+    "live_dom_at_first_sample": "2026-11-05T07:31:16.651Z; owned_tab_count=1; assistant h4 count=0, .markdown count=0, Stop visible=true",
+    "live_dom_at_second_sample": "2026-11-05T07:31:51.769Z; owned_tab_count=1; assistant h4 count=1, h4 data-conversation-role=assistant, h4.innerText length=13, parent children H4+DIV, child DIV innerText length=268, Stop visible=true; intermediate commentary, not terminal JSON",
+    "diagnostic": {
+      "provider_output_absent": "NOT_ESTABLISHED for current task; assistant visible intermediate body exists as of second sample, whereas historical 15b had empty body after Stop false",
+      "dom_extraction": "NOT_ESTABLISHED as root cause for historical blank final: historical 15b had h4+empty DIV, no markdown; current visible assistant body proves some provider content was rendered in owned DOM",
+      "task_ownership": "SUPPORTED by exact sessionStorage task match, manifest role/page/endpoint and ledger page identity; not a post-terminal ownership attestation",
+      "identity": "Task_id, role, page_id and user message are consistent in manifest and ledger; conversation URL recorded but not independently compared after completion",
+      "final_response": "NOT_OBSERVABLE_YET; worker alone must verify assistant terminal route/Stop after this final turn"
+    },
+    "historical_requests": [
+      {
+        "request_id": "cdpa-idem-b204835a8e7ffe939d4366ec-hop1",
+        "attempts": 1,
+        "status": "sent",
+        "accepted_via": "exact_user_message",
+        "replayed": false
+      },
+      {
+        "request_id": "cdpa-idem-6c99192811d4fba96fd90a70-hop1",
+        "attempts": 1,
+        "status": "completed",
+        "accepted_via": "exact_user_message",
+        "replayed": false
+      }
+    ],
+    "release_gaps": "Current valid stable terminal route and independent noninterference before/after not observed; historical provider blank-body root cause not established."
+  },
+  "next_action": "Existing G6 CDPA worker must observe final assistant route and ownership, reconcile one accepted Send and any owned MCP Allow, and external Pi reviewer must capture unrelated-tab before/after and Gate C acceptance; no assistant-side browser Send/reload/Stop, no historical request replay, no spawned successor."
+}

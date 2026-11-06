@@ -1,0 +1,32 @@
+{
+  "slice_id": "09-postfix-real-cdp",
+  "task_id": "cdpa-idem-49e239a7cd6e3da737154a35",
+  "status": "BLOCKED",
+  "release": "NOT_ACCEPTED",
+  "git_before": "5c4690f0e6256c2217283719d0fc1784e01d004f (dirty worktree)",
+  "git_after": "5c4690f0e6256c2217283719d0fc1784e01d004f (no product changes)",
+  "changed_files": [
+    "workflows/self-repair/receipts/09-postfix-real-cdp.json"
+  ],
+  "tests": [
+    {
+      "command": "uv run pytest -q tests/test_cdpa_resume_control_store.py tests/test_chatgpt_model_gate.py --tb=short",
+      "result": "11 passed, exit 0"
+    },
+    {
+      "command": "python -m pytest -q tests/test_cdpa_resume_control_store.py tests/test_chatgpt_model_gate.py --tb=short",
+      "result": "not run: python launcher unavailable, exit 1"
+    }
+  ],
+  "evidence": [
+    "Prior 08 BLOCKED receipt read; accepted request cdpa-idem-b73d4b4fee4b73731c7c4ab0-hop1 never replayed.",
+    "Exact 09 task action events prove model_gate High verified at 2026-10-27T15:36:24Z before composer_fill and again at 15:36:29Z and 15:36:35Z before unique send:click at 15:36:39Z; send completed 15:36:42Z.",
+    "9224 frontend healthy, 9225 worker healthy with source_drift=false, CDP 9202 /json/version available.",
+    "At last independent observation 09 task RUNNING/wait_response; stop_visible=true retry_visible=false, terminal_reconciliation=null. A stable valid terminal route is not proven.",
+    "One after-only snapshot of 9202 tabs observed; a before/after noninterference comparison was not available. No unrelated browser tabs touched by this worker.",
+    "No Resume was issued because no legitimate PAUSE was observed. No old accepted Send was replayed.",
+    "Continuation observation: exact task progressed to active_hop_id=2, RUNNING/wait_response, version=20 after a new (not replayed) second hop Send click 2026-10-27T15:43:35Z. For hop 2 High verified at 15:43:22Z before composer fill, and 15:43:25Z plus 15:43:30Z before Send. This is a distinct hop; exactly-once must be assessed per request/hop, not as one Send for whole task.",
+    "Latest observed hop 2 stop_visible=true, retry_visible=false, terminal_reconciliation=null. Supervisor state snapshot reported PAUSED/NEEDS_PI with Pi recovery timeout while authoritative API reports RUNNING; do not act on stale projection."
+  ],
+  "next_action": "Preserve both accepted hops and inspect exact durable command ledger; allow the running hop 2 to finish via existing worker without new Send/Resume; once terminal, verify stable route plus tab before/after snapshots, otherwise keep release NOT_ACCEPTED. Pi supervisor state needs reconciliation with authoritative API; no successor spawned."
+}

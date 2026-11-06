@@ -1,0 +1,27 @@
+{
+  "slice_id": "14-release-recheck",
+  "task_id": "cdpa-idem-3f8329cef8fd05ba58d45abd",
+  "status": "BLOCKED",
+  "release_verdict": "NOT_ACCEPTED",
+  "full_regression": "NOT_RETESTED",
+  "real_cdp": "BLOCKED",
+  "tests": [
+    {
+      "command": ".venv/Scripts/python.exe -m pytest -q tests/test_cdpa_selfrepair_release_review_retire.py tests/test_cdpa_selfrepair_allow_reconciliation.py tests/test_cdpa_selfrepair_supervisor.py tests/test_cdpa_selfrepair_opus_review.py --tb=short",
+      "result": "46 passed in 0.86s, 2026-10-28"
+    }
+  ],
+  "evidence": [
+    "Exact task-bound requests.json: cdpa-idem-3f8329cef8fd05ba58d45abd-hop1 accepted_via known; status=sent, attempts=1, accepted=true. No second Send.",
+    "Task-bound action-events.jsonl: High model gate verified three times before one send:click 2026-10-28T01:10:32.092465Z. One MCP Allow click at 01:12:55Z with dom_click_once.",
+    "After BLOCKED/response_terminal_missing, exact official Resume cmd-d29141a8-a7a0-4b45-80b2-cd9662a306ac reached applied, then same task BLOCKED/response_terminal_missing. No old Send replay.",
+    "No owned ChatGPT page remained in G6 CDP tabs; read-only visit to previously recorded conversation yielded zero messages. Stable terminal DONE never independently observed.",
+    "Existing prior release review receipt archived as 14-release-recheck-prior-cdpa-idem-68555676d0c16a3a98b68359.json; its prior broad regression PASS does not cure current missing live DONE.",
+    "Independent 46 focused supervisor/recovery tests PASS and git diff --check PASS on current source. Current-code full broad suite not rerun for this receipt."
+  ],
+  "changed_files": [
+    "workflows/self-repair/supervisor.py",
+    "tests/test_cdpa_selfrepair_release_review_retire.py"
+  ],
+  "next_action": "Retire this accepted review via exact Stop and CLEARED cleanup; leave release NOT_ACCEPTED. Repair only a reproduced terminal-response loss in the existing reader/worker before any NEW model-gated acceptance. Never replay this Send, never invent approval gates."
+}

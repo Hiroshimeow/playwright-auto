@@ -1,0 +1,39 @@
+{
+  "slice_id": "02-writer-lease",
+  "task_id": "cdpa-idem-6edb1fca84409f0f6f617b40",
+  "status": "PASS",
+  "git_before": "5c4690f dirty",
+  "git_after": "5c4690f dirty; no product-code change",
+  "changed_files": [
+    "tests/test_spec003_gate_c_runtime.py (one focused regression; preexisting dirty edits preserved)",
+    "workflows/self-repair/receipts/02-writer-lease.json"
+  ],
+  "tests": [
+    {
+      "command": "uv run pytest -q tests/test_spec003_gate_c_runtime.py -k reserved_async_wait_cannot_record_new_send_intent",
+      "result": "Initial assertion for reserved-specific error failed because existing active-binding guard already rejects before command insert (WRITER_LEASE_LOST); test corrected to actual contract."
+    },
+    {
+      "command": "uv run pytest -q tests/test_spec003_gate_c_runtime.py tests/test_gate_c_direct_chat_worker.py",
+      "result": "PASS 23 passed in 5.00s"
+    },
+    {
+      "command": "uv run python -m compileall -q src/playwright_auto",
+      "result": "PASS"
+    },
+    {
+      "command": "git diff --check -- src tests",
+      "result": "PASS"
+    }
+  ],
+  "evidence": {
+    "host": "DESKTOP-B5E4IUE",
+    "branch": "rebuild/runtime-v2-r11",
+    "owner": "cdpa_conversations.py::record_send_intent",
+    "finding": "An apparently available gap (new intent under reserved_async_wait) is already prevented by binding_status != active guard at lines 576-580; reserved wait transitions binding to non-active, and regression proves no command_queue insertion.",
+    "scope": "Offline writer lease/SendAttempt guard only. No browser mutation, no Send/retry, no Temporary Chat reload.",
+    "release": "NOT_ACCEPTED",
+    "limitations": "Other writer-lease scenarios from inventory, live CDP acceptance, broad release gates not proven."
+  },
+  "next_action": "Pi coordinator validates receipt and chooses next isolated slice; do not infer full Gate C acceptance."
+}

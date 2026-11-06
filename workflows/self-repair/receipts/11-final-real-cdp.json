@@ -1,0 +1,35 @@
+{
+  "slice_id": "11-final-real-cdp",
+  "task_id": "cdpa-idem-ecd3f44725efdd226035dc60",
+  "status": "BLOCKED",
+  "release": "NOT_ACCEPTED",
+  "release_verdict": "NOT_ACCEPTED",
+  "real_cdp": "BLOCKED",
+  "terminal_route": "UNPROVEN",
+  "git_before": "rebuild/runtime-v2-r11, existing dirty worktree preserved",
+  "git_after": "rebuild/runtime-v2-r11, existing dirty worktree preserved; no product code changed by this acceptance check",
+  "changed_files": [
+    "workflows/self-repair/receipts/11-final-real-cdp.json",
+    ".runtime/self-repair/11-final-tabs-after.json",
+    ".runtime/self-repair/11-final-tabs-compare.json"
+  ],
+  "tests": [
+    {
+      "command": "G6 .venv\\Scripts\\python.exe -m pytest -q tests/test_chatgpt_model_gate.py tests/test_cdpa_resume_control_store.py --tb=short",
+      "result": "11 passed in 1.42s, exit 0, 2026-10-28 JST"
+    },
+    {
+      "command": "G6 git diff --check -- src/playwright_auto workflows/self-repair",
+      "result": "exit 0 (existing CRLF warning)"
+    }
+  ],
+  "evidence": [
+    "Exact task/team g6-selfrepair-13-11-final-real-cdp / cdpa-idem-ecd3f44725efdd226035dc60 at endpoint 9202; one request cdpa-idem-ecd3f44725efdd226035dc60-hop1 in requests.json has status sent, attempts=1, accepted_via=exact_user_message, and NO completed response.",
+    "Task-specific .runtime/action-events.jsonl recorded model_gate verified High before composer_fill at 2026-10-27T16:10:40.484560Z; again High at 16:10:43.013134Z and 16:10:48.160985Z before unique send:click at 16:10:52.473492Z; send completed 16:10:53.049746Z.",
+    "Authoritative 9225 API task became BLOCKED/permission_review at 2026-10-27T16:13:29.802735Z (one permission prompt observed; no confirmed terminal route, no Retry, no response). Direct first-hop DONE not proven; user-authorized read-only acceptance may not Resume or Retry.",
+    "Coordinator exact official Stop cmd-8d709f35-d5ff-4969-b8e3-1b4421d8c29d reached applied; exact Clear Team cmd-3f52af22-08d5-4f91-91e2-a0ca7618980f reached applied. Task STOPPED/cleared, cleanup CLEARED with verified_empty_at=2026-10-27T22:34:57.071663Z; no old Send replay.",
+    "Read-only 9202 CDP inventory before at 2026-10-27T16:10:08.2858493Z (12 page IDs) and after at 2026-10-27T22:35:23.2594352Z (12) was compared in .runtime/self-repair/11-final-tabs-compare.json: no missing/new page IDs and no URL changes. This is a snapshot comparison, not independent proof of every focus event or reload.",
+    "G6 9225 API/worker HEALTHY with worker_source_drift=false after Stop/cleanup; 11 focused tests PASS. Independent read-only final release review still required."
+  ],
+  "next_action": "Accept this exact BLOCKED receipt for slice 11 without replaying the accepted Send, independently review the final gate and record 12-final-release-review.json. Maintain NOT_ACCEPTED unless an actual fresh stable terminal DONE plus remaining gates can be independently demonstrated."
+}
