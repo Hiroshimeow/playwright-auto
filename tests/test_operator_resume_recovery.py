@@ -2028,8 +2028,10 @@ def test_manifest_pristine_pre_send_classifier(tmp_path: Path):
     assert worker._manifest_proves_pristine_pre_send(state, hop, role) is False
     hop["state"] = "sending"
 
-    state["route_timeline"] = [{"route": "PLAN"}]
+    state["route_timeline"] = [{"hop_id": 99, "route": "DEV", "handoff": "prior work"}]
     assert worker._manifest_proves_pristine_pre_send(state, hop, role) is False
+    state["route_timeline"] = [{"hop_id": 99, "route": "PLAN", "kind": "role_restart"}]
+    assert worker._manifest_proves_pristine_pre_send(state, hop, role) is True
     state["route_timeline"] = []
 
     prior = dict(hop)

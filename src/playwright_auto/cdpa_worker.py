@@ -9624,8 +9624,15 @@ class CDPAWorker:
             return False  # A real conversation already exists for this role.
         if role_record.get("branch_conversation_id"):
             return False
-        if state.get("route_timeline"):
-            return False
+        for entry in state.get("route_timeline") or []:
+            # Agent route decisions carry the handoff text; operator control
+            # entries (role_restart, new_chat) do not and are not progress.
+            if (
+                isinstance(entry, Mapping)
+                and entry.get("hop_id") != hop.get("hop_id")
+                and entry.get("handoff")
+            ):
+                return False
         for other in state.get("hops") or []:
             if not isinstance(other, Mapping) or other is hop:
                 continue
