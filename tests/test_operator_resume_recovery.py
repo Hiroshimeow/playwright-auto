@@ -1936,6 +1936,176 @@ def test_pristine_preboundary_recovery_survives_worker_restart(tmp_path: Path, m
     assert record.attempts == 0
 
 
+def test_pristine_preboundary_recovery_without_any_ledger_record(tmp_path: Path, monkeypatch):
+    store, state, worker, path, hop, ledger, donor = _prepare_pristine_new_sending_record(
+        tmp_path, task_id="task-resume-pristine-no-ledger"
+    )
+    original_request_id = hop["request_id"]
+    original_generation = state["roles"]["PLAN"]["conversation_generation"]
+    Path(hop["ledger_path"]).unlink()
+    assert ledger.get(original_request_id) is None
+    state["block_code"] = "CONVERSATION_IDENTITY_MISMATCH"
+    hop["errors"] = [
+        "CONVERSATION_IDENTITY_MISMATCH: canonical conversation id is unavailable"
+    ]
+    state = store.save(path, state)
+    hop = _active_hop(state)
+
+    class Actions:
+        def __init__(self):
+            self.branch_calls = []
+
+        async def locate_owned(self, _state, _role):
+            return None
+
+        async def branch_from_anchor(
+            self, _state, role, *, source_conversation_id, assistant_message_id
+        ):
+            self.branch_calls.append((role, source_conversation_id, assistant_message_id))
+            return AcquiredRole(
+                SimpleNamespace(),
+                "WEB:no-ledger-replacement",
+                "https://chatgpt.com/c/WEB:no-ledger-replacement",
+                True,
+                True,
+            )
+
+    actions = Actions()
+    fresh_worker = worker_module.CDPAWorker(worker.config, store=store)
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    recovered = asyncio.run(fresh_worker.advance(path, SimpleNamespace(pages=[])))
+
+    recovered_hop = _active_hop(recovered)
+    assert actions.branch_calls == [
+        ("PLAN", donor["conversation_id"], donor["assistant_message_id"])
+    ]
+    assert recovered["controls"][-1]["status"] == "applied"
+    assert recovered["controls"][-1]["result"]["postcondition"] == "ownership_reacquired_before_send"
+    assert recovered_hop["request_id"] == original_request_id
+    assert recovered_hop["state"] == "sending"
+    assert recovered["roles"]["PLAN"]["conversation_generation"] == original_generation
+
+
+def test_pristine_preboundary_without_ledger_stays_closed_with_receipt(tmp_path: Path, monkeypatch):
+    store, state, worker, path, hop, ledger, donor = _prepare_pristine_new_sending_record(
+        tmp_path, task_id="task-resume-no-ledger-with-receipt"
+    )
+    Path(hop["ledger_path"]).unlink()
+    hop["receipt"] = {"user_message_id": "u-hidden", "user_turn_id": "t-hidden"}
+    state = store.save(path, state)
+
+    class Actions:
+        async def locate_owned(self, _state, _role):
+            raise AssertionError("fail-closed recovery must not touch pages")
+
+    actions = Actions()
+    fresh_worker = worker_module.CDPAWorker(worker.config, store=store)
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: actions)
+
+    recovered = asyncio.run(fresh_worker.advance(path, SimpleNamespace(pages=[])))
+
+    assert recovered["status"] == "BLOCKED"
+    assert recovered["controls"][-1]["status"] == "recovery_required"
+    assert recovered["controls"][-1]["result"]["reason_code"] == "durable_send_provenance_missing"
+
+
+def test_manifest_pristine_pre_send_classifier(tmp_path: Path):
+    _config, _store, state, worker = setup_task(
+        tmp_path, task_id="task-manifest-pristine-classifier"
+    )
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    assert hop["state"] == "sending"
+    role = state["roles"]["PLAN"]
+
+    # No recorded pre-Send failure class yet: absence of evidence is not proof.
+    assert worker._manifest_proves_pristine_pre_send(state, hop, role) is False
+    state["block_code"] = "CONVERSATION_IDENTITY_MISMATCH"
+    assert worker._manifest_proves_pristine_pre_send(state, hop, role) is True
+
+    hop["state"] = "sent"
+    assert worker._manifest_proves_pristine_pre_send(state, hop, role) is False
+    hop["state"] = "sending"
+
+    state["route_timeline"] = [{"route": "PLAN"}]
+    assert worker._manifest_proves_pristine_pre_send(state, hop, role) is False
+    state["route_timeline"] = []
+
+    prior = dict(hop)
+    prior["hop_id"] = 99
+    prior["receipt"] = {"user_message_id": "u-prior"}
+    state["hops"].append(prior)
+    assert worker._manifest_proves_pristine_pre_send(state, hop, role) is False
+    state["hops"].pop()
+    assert worker._manifest_proves_pristine_pre_send(state, hop, role) is True
+
+    hop["receipt"] = {"user_message_id": "u-1"}
+    assert worker._manifest_proves_pristine_pre_send(state, hop, role) is False
+    hop["receipt"] = None
+
+    hop["message_identity"] = {"user_message_id": "u-1"}
+    assert worker._manifest_proves_pristine_pre_send(state, hop, role) is False
+    hop["message_identity"] = None
+
+    original_hash = hop["prompt_sha256"]
+    hop["prompt_sha256"] = "0" * 64
+    assert worker._manifest_proves_pristine_pre_send(state, hop, role) is False
+    hop["prompt_sha256"] = original_hash
+
+    role["page_url"] = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111"
+    assert worker._manifest_proves_pristine_pre_send(state, hop, role) is False
+    role["page_url"] = "https://chatgpt.com/"
+    assert worker._manifest_proves_pristine_pre_send(state, hop, role) is True
+
+
+def test_resume_missing_ledger_with_reissued_hop_record_fails_closed(tmp_path: Path):
+    _config, store, state, worker = setup_task(
+        tmp_path, task_id="task-resume-reissued-hop-record"
+    )
+    path = Path(state["manifest_path"])
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    assert hop["state"] == "sending"
+    constructor = worker_module.task_workflow_definitions(state, worker.config)["PLAN"][
+        "system_prompt"
+    ]
+    ledger = RequestLedger(hop["ledger_path"])
+    ledger.begin(
+        role=hop["physical_role"],
+        prompt=hop["prompt"],
+        source_context={
+            "task_id": state["task_id"],
+            "team": state["team"],
+            "hop_id": hop["hop_id"],
+            "manifest": state["manifest_path"],
+        },
+        role_prompt_hash=worker_module._sha(str(constructor)),
+        request_id="reissued-request-id",
+        render_request_marker=False,
+    )
+    assert ledger.get(hop["request_id"]) is None
+    assert worker._ledger_records_exist_for_hop(hop["ledger_path"], hop) is True
+
+    state = store.save(path, state)
+    state = _queue_blocked_resume(
+        store,
+        state,
+        code="CONVERSATION_IDENTITY_MISMATCH",
+        reason="identity verification failed before durable send",
+    )
+    applied = asyncio.run(worker._apply_control(state, FakeActions(), path))
+    assert applied is True
+    control = state["controls"][-1]
+    actions = FakeActions()
+    asyncio.run(worker._recover_resume_control(state, control, actions))
+
+    assert state["status"] == "BLOCKED"
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "durable_send_provenance_missing"
+    assert actions.located_roles == []
+
+
 def test_preboundary_classifier_rejects_nonpristine_and_crossed_records(tmp_path: Path):
     _store, state, worker, _path, hop, ledger, _donor = _prepare_pristine_new_sending_record(
         tmp_path, task_id="task-resume-preboundary-negative"

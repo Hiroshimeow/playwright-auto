@@ -193,6 +193,9 @@ from .workspace import ChatGPTWorkspace
 
 TERMINAL = frozenset({"DONE", "STOPPED"})
 IN_FLIGHT = frozenset({"sending", "sent", "waiting"})
+_PRE_SEND_FAILURE_BLOCK_CODES = frozenset(
+    {"CONVERSATION_IDENTITY_MISMATCH", "CONVERSATION_BINDING_INVALID"}
+)
 _STREAM_STATUS_RECOVERY_SECONDS = 30.0
 _LEGACY_CONSECUTIVE_SELF_ROUTE_BLOCK_CODE = "consecutive_self_route_limit"
 _LEGACY_NO_PROGRESS_ROUTE_CYCLE_BLOCK_CODE = "no_progress_route_cycle"
@@ -9502,12 +9505,120 @@ class CDPAWorker:
             postcondition="child_hop_appended",
         )
 
+    def _manifest_proves_pristine_pre_send(
+        self,
+        state: Mapping[str, Any],
+        hop: Mapping[str, Any],
+        role_record: Mapping[str, Any],
+    ) -> bool:
+        """Prove from the manifest alone that a hop never crossed Send.
+
+        The durable send block creates its ledger record before any browser
+        Send attempt, so a missing record is ambiguous only when other
+        evidence suggests progress. When the hop carries no receipt, no
+        message identity and no response, its prompt still matches its
+        persisted hash, no attachments were uploaded in this generation,
+        and the role has no started (canonical) conversation, the Send
+        boundary provably was never crossed.
+        """
+        if is_independent_task(state):
+            return False
+        if str(hop.get("state") or "") != "sending":
+            return False
+        if any(
+            hop.get(field) is not None
+            for field in ("receipt", "message_identity", "response")
+        ):
+            return False
+        prompt = str(hop.get("prompt") or "")
+        if not prompt or str(hop.get("prompt_sha256") or "") != _sha(prompt):
+            return False
+        uploaded_generation = role_record.get("attachments_uploaded_generation")
+        if (
+            uploaded_generation is not None
+            and uploaded_generation == role_record.get("conversation_generation")
+        ):
+            return False
+        from .cdpa_conversations import canonical_conversation
+
+        for url in (
+            hop.get("conversation_url"),
+            role_record.get("conversation_url"),
+            role_record.get("page_url"),
+        ):
+            text = str(url or "").strip()
+            if not text:
+                continue
+            try:
+                conversation_id = canonical_conversation(text)
+                UUID(conversation_id)
+            except Exception:
+                continue  # Root/new-chat/temporary/provisional URLs only.
+            return False  # A real conversation already exists for this role.
+        if role_record.get("branch_conversation_id"):
+            return False
+        if state.get("route_timeline"):
+            return False
+        for other in state.get("hops") or []:
+            if not isinstance(other, Mapping) or other is hop:
+                continue
+            if any(
+                other.get(field) is not None
+                for field in ("receipt", "message_identity", "response", "route")
+            ):
+                return False
+        manifest_path = str(state.get("manifest_path") or "").strip()
+        hop_ledger_path = str(hop.get("ledger_path") or "").strip()
+        if not manifest_path or not hop_ledger_path:
+            return False
+        if Path(hop_ledger_path).parent.resolve() != Path(manifest_path).parent.resolve():
+            return False
+        # Positive provenance: the recorded failure for this hop must be a
+        # pre-durable-send failure class (identity/binding verification
+        # happens before the durable send block begins its request).
+        block_code = str(state.get("block_code") or "").strip()
+        error_codes = {
+            str(error).split(":", 1)[0].strip()
+            for error in hop.get("errors") or []
+            if isinstance(error, str)
+        }
+        if (
+            block_code not in _PRE_SEND_FAILURE_BLOCK_CODES
+            and not error_codes.intersection(_PRE_SEND_FAILURE_BLOCK_CODES)
+        ):
+            return False
+        return True
+
+    def _ledger_records_exist_for_hop(
+        self, ledger_path: str, hop: Mapping[str, Any]
+    ) -> bool:
+        try:
+            raw = json.loads(Path(ledger_path).read_bytes().decode("utf-8"))
+        except Exception:
+            return False
+        if not isinstance(raw, Mapping):
+            return False
+        records = raw.get("records")
+        if not isinstance(records, Mapping):
+            return False
+        for record in records.values():
+            if not isinstance(record, Mapping):
+                continue
+            source_context = record.get("source_context")
+            if isinstance(source_context, Mapping) and source_context.get(
+                "hop_id"
+            ) == hop.get("hop_id"):
+                return True
+        return False
+
     async def _recover_pristine_preboundary_sending(
         self,
         state: dict[str, Any],
         hop: dict[str, Any],
         control: dict[str, Any],
         actions: CDPATabActions,
+        *,
+        allow_missing_ledger: bool = False,
     ) -> None:
         role = str(hop["target_role"])
         role_record = state["roles"][role]
@@ -9529,16 +9640,27 @@ class CDPAWorker:
         except Exception:
             durable = None
         if durable is None:
-            self._require_resume_recovery(
-                state,
-                control,
-                action="none",
-                reason_code="durable_send_provenance_missing",
-                reason="Resume cannot prove pristine pre-Send ownership because the durable request record is missing.",
-                next_safe_action="Restore the durable request record; do not relocate or resend the prompt.",
-            )
-            return
-        if durable.status not in {RequestStatus.NEW, RequestStatus.PROMPT_SET} or int(durable.attempts or 0) != 0:
+            if (
+                not allow_missing_ledger
+                or not self._manifest_proves_pristine_pre_send(state, hop, role_record)
+                or self._ledger_records_exist_for_hop(ledger_path, hop)
+            ):
+                self._require_resume_recovery(
+                    state,
+                    control,
+                    action="none",
+                    reason_code="durable_send_provenance_missing",
+                    reason="Resume cannot prove pristine pre-Send ownership because the durable request record is missing.",
+                    next_safe_action="Restore the durable request record; do not relocate or resend the prompt.",
+                )
+                return
+            # No ledger record exists for this hop, but the manifest proves
+            # it is pristine pre-Send (see _manifest_proves_pristine_pre_send):
+            # the failure happened before the durable send block began its
+            # request, so fall through to the same ownership/fresh recovery
+            # used for a pristine NEW record.
+            hop["preboundary_recovery_evidence"] = "manifest_pristine_no_ledger"
+        elif durable.status not in {RequestStatus.NEW, RequestStatus.PROMPT_SET} or int(durable.attempts or 0) != 0:
             self._require_resume_recovery(
                 state,
                 control,
@@ -10167,7 +10289,7 @@ class CDPAWorker:
         record = ledger.get(str(hop.get("request_id") or "")) if ledger_exists else None
         if record is None:
             await self._recover_pristine_preboundary_sending(
-                state, hop, control, actions
+                state, hop, control, actions, allow_missing_ledger=True
             )
             return
         if await self._recover_failed_upload_before_ready(
