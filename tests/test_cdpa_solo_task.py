@@ -249,6 +249,126 @@ def test_solo_done_accepts_concise_handoff_without_report_file(tmp_path: Path):
     assert state["reports"] == []
 
 
+def test_solo_done_registers_report_file_referenced_in_handoff(tmp_path: Path):
+    config, store = make_store(tmp_path)
+    state = store.create_task(
+        "Solo REVIEW report registration",
+        task_id="solo-done-report-ref",
+        workflow_mode="solo",
+        roles=("REVIEW",),
+        browser_endpoint_id="9222",
+    )
+    report = tmp_path / "workflows" / "self-evolution" / "review-solo.md"
+    report.parent.mkdir(parents=True)
+    report.write_text("# Solo review\n\nVerdict: verified.\n", encoding="utf-8")
+    worker = CDPAWorker(config, store=store)
+    hop = active_hop(state)
+    hop["state"] = "responded"
+    hop["response"] = json.dumps(
+        {
+            "route": "DONE",
+            "handoff": f"Review completed. Report verified at {report}. Tests: 3 passed.",
+        }
+    )
+
+    worker._responded(state, hop)
+
+    import hashlib
+
+    data = report.read_bytes()
+    assert state["status"] == "DONE"
+    assert hop["report_path"] == "workflows/self-evolution/review-solo.md"
+    assert hop["report_sha256"] == hashlib.sha256(data).hexdigest()
+    assert hop["report_size"] == len(data)
+    assert len(state["reports"]) == 1
+    entry = state["reports"][0]
+    assert entry["path"] == "workflows/self-evolution/review-solo.md"
+    assert entry["role"] == "REVIEW"
+    assert entry["sha256"] == hop["report_sha256"]
+    assert entry["size"] == len(data)
+
+
+def test_solo_done_registers_relative_report_reference(tmp_path: Path):
+    config, store = make_store(tmp_path)
+    state = store.create_task(
+        "Solo DEV relative report",
+        task_id="solo-done-report-relative",
+        workflow_mode="solo",
+        roles=("DEV",),
+        browser_endpoint_id="9222",
+    )
+    report = tmp_path / "docs" / "result.md"
+    report.parent.mkdir(parents=True)
+    report.write_text("# Result\n\nDone.\n", encoding="utf-8")
+    worker = CDPAWorker(config, store=store)
+    hop = active_hop(state)
+    hop["state"] = "responded"
+    hop["response"] = json.dumps(
+        {"route": "DONE", "handoff": "Full result written to docs/result.md for review."}
+    )
+
+    worker._responded(state, hop)
+
+    assert state["status"] == "DONE"
+    assert hop["report_path"] == "docs/result.md"
+    assert len(state["reports"]) == 1
+
+
+def test_solo_done_ignores_ambiguous_report_references(tmp_path: Path):
+    config, store = make_store(tmp_path)
+    state = store.create_task(
+        "Solo DEV ambiguous",
+        task_id="solo-done-ambiguous",
+        workflow_mode="solo",
+        roles=("DEV",),
+        browser_endpoint_id="9222",
+    )
+    docs = tmp_path / "docs"
+    docs.mkdir(parents=True)
+    (docs / "one.md").write_text("# One\n", encoding="utf-8")
+    (docs / "two.md").write_text("# Two\n", encoding="utf-8")
+    worker = CDPAWorker(config, store=store)
+    hop = active_hop(state)
+    hop["state"] = "responded"
+    hop["response"] = json.dumps(
+        {
+            "route": "DONE",
+            "handoff": f"See {docs / 'one.md'} and {docs / 'two.md'} for details.",
+        }
+    )
+
+    worker._responded(state, hop)
+
+    assert state["status"] == "DONE"
+    assert hop["report_path"] is None
+    assert state["reports"] == []
+
+
+def test_solo_done_ignores_report_reference_outside_repository(tmp_path: Path):
+    config, store = make_store(tmp_path)
+    state = store.create_task(
+        "Solo DEV outside reference",
+        task_id="solo-done-outside",
+        workflow_mode="solo",
+        roles=("DEV",),
+        browser_endpoint_id="9222",
+    )
+    outside = tmp_path.parent / "outside-solo-report.md"
+    outside.write_text("# Outside\n", encoding="utf-8")
+    worker = CDPAWorker(config, store=store)
+    hop = active_hop(state)
+    hop["state"] = "responded"
+    hop["response"] = json.dumps(
+        {"route": "DONE", "handoff": f"Report stored at {outside}."}
+    )
+
+    worker._responded(state, hop)
+
+    assert state["status"] == "DONE"
+    assert hop["report_path"] is None
+    assert state["reports"] == []
+
+
 def test_solo_done_accepts_inline_literal_as_concise_handoff(tmp_path: Path):
     config, store = make_store(tmp_path)
     state = store.create_task(

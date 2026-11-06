@@ -350,6 +350,65 @@ def validate_file_report(
     )
 
 
+_HANDOFF_ABSOLUTE_MD = re.compile(
+    r"[A-Za-z]:[\\/](?:[^\s\"'<>|\\/]+[\\/])*[^\s\"'<>|\\/]+\.md", re.IGNORECASE
+)
+_HANDOFF_RELATIVE_MD = re.compile(
+    r"(?<![\w.\\/-])((?:[\w.-]+[\\/])+[\w.-]+\.md)", re.IGNORECASE
+)
+
+
+def handoff_report_evidence(
+    handoff: str,
+    *,
+    repository_root: str | Path,
+) -> ReportEvidence | None:
+    """Fingerprint the single report file a free-form handoff references.
+
+    Solo tasks keep a minimal route contract: on DONE the agent names its
+    result in the handoff, which may point at the report file it wrote.
+    Register that file only when exactly one candidate validates as a
+    regular, non-empty Markdown file inside the repository.
+    """
+    root = Path(repository_root).expanduser().resolve()
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    for match in _HANDOFF_ABSOLUTE_MD.finditer(str(handoff or "")):
+        raw = match.group(0)
+        if raw.lower() not in seen:
+            seen.add(raw.lower())
+            candidates.append(Path(raw))
+    for match in _HANDOFF_RELATIVE_MD.finditer(str(handoff or "")):
+        raw = match.group(1)
+        if raw.lower() not in seen:
+            seen.add(raw.lower())
+            candidates.append(root / raw)
+    validated: dict[str, ReportEvidence] = {}
+    for candidate in candidates:
+        try:
+            target = candidate.resolve()
+            target.relative_to(root)
+        except (OSError, ValueError):
+            continue
+        if target.is_symlink() or not target.is_file():
+            continue
+        try:
+            data = target.read_bytes()
+        except OSError:
+            continue
+        if not data or len(data) > 10_000_000:
+            continue
+        display = _display_path(target, root)
+        validated[display] = ReportEvidence(
+            display,
+            hashlib.sha256(data).hexdigest(),
+            len(data),
+        )
+    if len(validated) != 1:
+        return None
+    return next(iter(validated.values()))
+
+
 def materialize_inline_report(
     report: str,
     *,

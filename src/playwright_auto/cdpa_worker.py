@@ -108,6 +108,7 @@ from .cdpa_routes import (
     RouteContractError,
     RouteDecision,
     expected_report_relative,
+    handoff_report_evidence,
     materialize_inline_report,
     parse_role_response,
     parse_route_response,
@@ -8596,13 +8597,45 @@ class CDPAWorker:
                 self._repair_route(state, hop, exc)
                 return
             self._complete_request_response(hop)
-            hop.update(
-                {
-                    "route": decision.route,
-                    "routed_handoff": decision.handoff,
-                    "state": "routed",
-                }
-            )
+            hop_update: dict[str, Any] = {
+                "route": decision.route,
+                "routed_handoff": decision.handoff,
+                "state": "routed",
+            }
+            if decision.route == "DONE":
+                solo_evidence = handoff_report_evidence(
+                    decision.handoff,
+                    repository_root=str(state["repository"]),
+                )
+                if solo_evidence is not None:
+                    hop_update.update(
+                        {
+                            "report_path": solo_evidence.path,
+                            "report_sha256": solo_evidence.sha256,
+                            "report_size": solo_evidence.size,
+                        }
+                    )
+                    if not any(
+                        item.get("path") == solo_evidence.path
+                        and item.get("role") == role
+                        and item.get("physical_role") == hop["physical_role"]
+                        and item.get("turn") == hop["turn"]
+                        for item in state.get("reports") or []
+                        if isinstance(item, Mapping)
+                    ):
+                        state.setdefault("reports", []).append(
+                            {
+                                "report_id": len(state.get("reports") or []) + 1,
+                                "role": role,
+                                "physical_role": hop["physical_role"],
+                                "turn": hop["turn"],
+                                "path": solo_evidence.path,
+                                "sha256": solo_evidence.sha256,
+                                "size": solo_evidence.size,
+                                "created_at": utc_now(),
+                            }
+                        )
+            hop.update(hop_update)
             hop["timestamps"]["routed_at"] = utc_now()
             state.setdefault("route_timeline", []).append(
                 {
