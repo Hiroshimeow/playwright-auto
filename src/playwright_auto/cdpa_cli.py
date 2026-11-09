@@ -118,6 +118,7 @@ def submit_task(
     upload_paths: Sequence[str | Path] = (),
     bootstrap_id: str | None | object = _BOOTSTRAP_UNSET,
     idempotency_key: str | None = None,
+    parent_task_id: str | None = None,
     workflow_mode: str = "team",
     solo_role: str | None = None,
     goal: str | None = None,
@@ -140,6 +141,8 @@ def submit_task(
             payload["task"] = str(task).strip()
         if team:
             payload["requested_team"] = team
+        if parent_task_id:
+            payload["parent_task_id"] = parent_task_id
         if conversation_url:
             payload["conversation_url"] = str(conversation_url).strip()
         if repository is not None:
@@ -736,6 +739,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="create a Solo Task using exactly this existing workflow role",
     )
     parser.add_argument("--goal", default=None, help="optional Solo Task goal")
+    parser.add_argument("--parent-task-id", default=None, help="Solo Task lineage; does not schedule a dependency")
+    parser.add_argument("--idempotency-key", default=None, help="durable task creation command identity")
     parser.add_argument(
         "--conversation-url",
         default=None,
@@ -830,6 +835,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         dependencies = parse_dependency_ids(args.depends_on)
         existing_solo = bool(args.solo and args.conversation_url)
         if task or existing_solo:
+            if args.parent_task_id and not args.solo:
+                raise ValueError("--parent-task-id requires --solo ROLE")
             if args.solo and (
                 new_roles
                 or team_roles
@@ -863,11 +870,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 workflow_mode="solo" if args.solo else "team",
                 solo_role=args.solo,
                 goal=args.goal,
+                parent_task_id=args.parent_task_id,
+                idempotency_key=args.idempotency_key,
                 conversation_url=args.conversation_url,
                 roles=team_roles,
             )
             mode = "created"
         else:
+            if args.idempotency_key is not None or args.parent_task_id is not None:
+                raise ValueError("--idempotency-key and --parent-task-id are create-only")
             if not args.team:
                 raise ValueError("taskless resume requires --team <exact-existing-team>")
             if (

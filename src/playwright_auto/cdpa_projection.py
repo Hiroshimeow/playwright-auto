@@ -1484,6 +1484,7 @@ def build_task_projection(
         "browser_control": _browser_control(raw),
         "async_continuation": (async_continuations[0] if async_continuations else None),
         "task_title": title,
+        "parent_task_id": str(raw.get("parent_task_id") or "") or None,
         "version": 0,
     }
     if status == "WAITING" and independent is None:

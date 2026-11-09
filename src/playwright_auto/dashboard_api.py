@@ -340,6 +340,7 @@ class DashboardAPI:
             "role",
             "goal",
             "conversation_url",
+            "parent_task_id",
             "start_role",
         }
         unknown = set(raw) - allowed
@@ -472,11 +473,17 @@ class DashboardAPI:
             normalized["workflow_mode"] = "solo"
             normalized["roles"] = [role]
             normalized["goal"] = str(raw.get("goal") or "").strip()
-        elif "role" in raw or "goal" in raw:
+            if "parent_task_id" in raw:
+                from .cdpa_identity import validate_task_id
+                try:
+                    normalized["parent_task_id"] = validate_task_id(raw["parent_task_id"])
+                except (TypeError, ValueError) as exc:
+                    raise APIError(400, "invalid_request", "invalid parent_task_id") from exc
+        elif "role" in raw or "goal" in raw or "parent_task_id" in raw:
             raise APIError(
                 400,
                 "invalid_request",
-                "role and goal are valid only for Solo Task",
+                "role, goal and parent_task_id are valid only for Solo Task",
             )
         elif "roles" in raw:
             normalized["roles"] = self._workflow_roles(raw.get("roles"))
@@ -1954,6 +1961,38 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
             and parts[3] == "dom-stream"
         ):
             self._stream_session_dom(parts[2])
+            return
+        if len(parts) == 4 and parts[:3] == ["api", "commands", "by-idempotency"]:
+            # Existing durable command ledger is the reconciliation authority.
+            # Return only identity/provenance, never the full task goal.
+            key = parts[3]
+            if not key or len(key) > 200:
+                raise APIError(400, "invalid_idempotency_key", "invalid command key")
+            command = db.get_command_by_idempotency_key(key)
+            if command is None:
+                raise APIError(404, "command_not_found", "command does not exist")
+            payload = command["payload"]
+            roles = payload.get("roles")
+            role = payload.get("role") or (
+                roles[0] if isinstance(roles, list) and roles else None
+            )
+            goal_text = str(payload.get("goal") or "")
+            goal_sha256 = (
+                hashlib.sha256(goal_text.encode("utf-8")).hexdigest()
+                if goal_text
+                else None
+            )
+            self._json(200, {
+                "command_id": command["command_id"],
+                "idempotency_key": command["idempotency_key"],
+                "kind": command["kind"],
+                "task_id": command["task_id"],
+                "status": command["status"],
+                "parent_task_id": payload.get("parent_task_id"),
+                "team": payload.get("requested_team"),
+                "role": role,
+                "goal_sha256": goal_sha256,
+            }, headers={"Cache-Control": "no-store"})
             return
         if len(parts) == 3 and parts[:2] == ["api", "commands"]:
             command = db.get_command(parts[2])

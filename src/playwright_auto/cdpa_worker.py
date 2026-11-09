@@ -13853,6 +13853,7 @@ class CDPAWorker:
                         context_policy=payload.get("context_policy") or None,
                         workflow_mode=str(payload.get("workflow_mode") or "team"),
                         goal=payload.get("goal"),
+                        parent_task_id=payload.get("parent_task_id") or None,
                         conversation_url=payload.get("conversation_url") or None,
                         start_role=payload.get("start_role") or None,
                         external_command_id=command_id,

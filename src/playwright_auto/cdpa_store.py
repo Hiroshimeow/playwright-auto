@@ -2824,6 +2824,7 @@ class TaskStore(IndependentAgentStoreMixin):
         context_policy: str | None = None,
         workflow_mode: str = "team",
         goal: str = "",
+        parent_task_id: str | None = None,
         conversation_url: str | None = None,
         initial_role: str | None = None,
     ) -> dict[str, Any]:
@@ -2844,6 +2845,8 @@ class TaskStore(IndependentAgentStoreMixin):
             raise ValueError("bootstrap context policy requires a bootstrap snapshot")
         if mode == "temporary" and normalized_bootstrap is not None:
             raise ValueError("temporary workflows do not support bootstrap context")
+        if parent_task_id is not None and workflow_mode != "solo":
+            raise ValueError("parent_task_id is supported only for Solo tasks")
         initial_role = initial_role or workflow_roles[0]
         roles = {}
         role_slots = {}
@@ -2979,6 +2982,7 @@ class TaskStore(IndependentAgentStoreMixin):
             "task_title": text.splitlines()[0],
             "task_text": text,
             **({"goal": goal} if workflow_mode == "solo" else {}),
+            **({"parent_task_id": parent_task_id} if parent_task_id else {}),
             "task_slug": slugify(text),
             "repository": str(repository_path),
             "requested_team": requested_team,
@@ -3204,6 +3208,7 @@ class TaskStore(IndependentAgentStoreMixin):
         context_policy: str | None = None,
         workflow_mode: str = "team",
         goal: str | None = None,
+        parent_task_id: str | None = None,
         conversation_url: str | None = None,
         start_role: str | None = None,
         external_command_id: str | None = None,
@@ -3218,6 +3223,9 @@ class TaskStore(IndependentAgentStoreMixin):
         if normalized_workflow_mode not in {"team", "solo"}:
             raise ValueError("workflow_mode must be team or solo")
         normalized_goal = str(goal or "").strip()
+        normalized_parent = _validate_task_id(parent_task_id) if parent_task_id is not None else None
+        if normalized_parent and normalized_workflow_mode != "solo":
+            raise ValueError("parent_task_id is supported only for Solo tasks")
         normalized_conversation_url = _optional_conversation_url(conversation_url)
         if normalized_workflow_mode == "team":
             if goal is not None:
@@ -3358,6 +3366,10 @@ class TaskStore(IndependentAgentStoreMixin):
                 else []
             )
             manifests, _discovery_errors = self._discover_with_catalog_unlocked(catalog)
+            if normalized_parent and normalized_parent not in {
+                str(item.get("task_id") or "") for item in manifests
+            }:
+                raise ValueError("parent_task_id must identify an existing task")
             if task_id in {
                 str(item.get("task_id") or "") for item in manifests
             }:
@@ -3605,6 +3617,7 @@ class TaskStore(IndependentAgentStoreMixin):
                 context_policy=context_policy,
                 workflow_mode=normalized_workflow_mode,
                 goal=normalized_goal,
+                parent_task_id=normalized_parent,
                 conversation_url=normalized_conversation_url,
             )
             state["endpoint_pinned"] = bool(
