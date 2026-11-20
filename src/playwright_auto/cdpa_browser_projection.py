@@ -21,7 +21,12 @@ _STORAGE_SCRIPT = """() => {
 
 
 def _safe_url(value: object) -> str:
-    parsed = urlsplit(str(value or ""))
+    url = str(value or "")
+    # Owned-tab lookup uses this metadata; the exact fresh Temporary Chat
+    # URL is identity evidence, not a query to redact.
+    if url == "https://chatgpt.com/?temporary-chat=true":
+        return url
+    parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"}:
         return ""
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))

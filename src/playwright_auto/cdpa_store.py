@@ -96,7 +96,7 @@ SCHEMA_VERSION = 1
 CATALOG_VERSION = 1
 _TASK_STATUSES = frozenset({"INBOX", "WAITING", "RUNNING", "PAUSED", "BLOCKED", "DONE", "STOPPED"})
 _HOP_STATES = frozenset({"waiting_trigger", "pre_send", "sending", "sent", "waiting", "responded", "routed", "abandoned"})
-_CLEANUP_STATES = frozenset({"ACTIVE", "CLEARING", "CLEARED"})
+_CLEANUP_STATES = frozenset({"ACTIVE", "CLEARING", "CLEARED", "STOP_RELEASED"})
 _MAINTENANCE_STATES = frozenset({"OPEN", "RUNNING", "SUSPENDED", "RESOLVED", "ESCALATED"})
 _BOOTSTRAP_CONTEXT_SOURCES = frozenset(
     {"bootstrap_donor", "bootstrap_native", "bootstrap_ui", "fresh_fallback"}
@@ -1122,6 +1122,8 @@ class TaskStore(IndependentAgentStoreMixin):
         cleanup_phase = cleanup.get("phase")
         if cleanup_phase not in {
             None,
+            "writer_stop_pending",
+            "writer_released",
             "stop_pending",
             "close_pending",
             "closing",
@@ -1133,6 +1135,7 @@ class TaskStore(IndependentAgentStoreMixin):
             return "active cleanup must not have an in-progress phase"
         if cleanup_state == "CLEARING" and cleanup_phase not in {
             None,
+            "writer_stop_pending",
             "stop_pending",
             "close_pending",
             "closing",
@@ -1141,6 +1144,8 @@ class TaskStore(IndependentAgentStoreMixin):
             return "clearing cleanup must have a resumable phase"
         if cleanup_state == "CLEARED" and cleanup_phase not in {None, "cleared"}:
             return "cleared cleanup has an inconsistent phase"
+        if cleanup_state == "STOP_RELEASED" and cleanup_phase != "writer_released":
+            return "released Stop cleanup has an inconsistent phase"
 
         if catalog_key is not None and catalog_key != relative.as_posix():
             return "catalog key does not match the primary manifest path"
@@ -3306,7 +3311,7 @@ class TaskStore(IndependentAgentStoreMixin):
             if normalized_bootstrap is not None:
                 raise ValueError("solo workflow task does not support bootstrap context")
             context_policy = "fresh"
-            conversation_mode = "persistent"
+            # Solo inherits the selected endpoint Temporary default unless explicit.
         if context_policy == "fresh" and normalized_bootstrap is not None:
             raise ValueError("fresh context policy must not include a bootstrap snapshot")
         if context_policy == "bootstrap" and normalized_bootstrap is None:
@@ -6160,6 +6165,11 @@ class TaskStore(IndependentAgentStoreMixin):
                 )
                 if not eligibility["eligible"]:
                     raise ValueError(str(eligibility["reason"] or f"{action} is not eligible."))
+        if action == "reconcile_presend_acquisition" and any(
+            isinstance(item, Mapping) and item.get("action") == action
+            for item in state.get("controls") or ()
+        ):
+            raise ValueError("historical acquisition reconciliation is one-shot")
         command_reason = normalized_reason or f"{action} requested"
         command = WorkerCommand.create(
             origin=normalized_origin,
@@ -6214,6 +6224,22 @@ class TaskStore(IndependentAgentStoreMixin):
             if external_command_id
             else None,
         }
+        if action == "reconcile_presend_acquisition":
+            active_role = str(state.get("active_role") or "").upper()
+            active_hop = next(
+                item for item in state.get("hops") or ()
+                if item.get("hop_id") == state.get("active_hop_id")
+            )
+            record = state["roles"][active_role]
+            control["acquisition_identity"] = {
+                "browser_endpoint_id": state.get("browser_endpoint_id"),
+                "active_role": active_role,
+                "physical_role": record.get("physical_role"),
+                "conversation_generation": record.get("conversation_generation"),
+                "request_id": active_hop.get("request_id"),
+                "preboundary_recovery": copy.deepcopy(active_hop.get("preboundary_recovery")),
+                "updated_at": state.get("updated_at"),
+            }
         if source_task is not None:
             control["source_task_id"] = source_task
             control["source_event_key"] = source_event
@@ -6361,7 +6387,7 @@ class TaskStore(IndependentAgentStoreMixin):
         max_route_repairs: int | None = None,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
-        allowed = {"pause", "resume", "retry", "stop", "reset", "restart_role", "open_tab", "close_tab", "new_chat", "route_plan", "release_required_browser_endpoint", "clear_team", "archive_worktree", "increase_route_limits"}
+        allowed = {"pause", "resume", "retry", "stop", "reset", "restart_role", "open_tab", "reconcile_presend_acquisition", "close_tab", "new_chat", "route_plan", "release_required_browser_endpoint", "clear_team", "archive_worktree", "increase_route_limits"}
         action = str(action).strip().lower()
         if action not in allowed:
             raise ValueError(f"unsupported control action {action!r}")

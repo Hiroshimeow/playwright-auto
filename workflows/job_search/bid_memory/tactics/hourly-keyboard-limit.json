@@ -1,0 +1,13 @@
+{
+  "title": "Verify actual hourly form values",
+  "rule": "The hourly form did not register programmatic fill. For an authorized manual entry, select all and replace values using keyboard input, then verify the rate and weekly limit; a draft can retain 40.",
+  "classes": [],
+  "evidence": {
+    "reported-hourly-form": {
+      "kind": "support",
+      "note": "Programmatic fill failed to register and weekly limit retained stale draft 40.",
+      "source": ".runtime/job-search/pi-jobs/bid-memory-brief-20261119.md"
+    }
+  },
+  "last_updated": "2026-11-19"
+}

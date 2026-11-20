@@ -240,3 +240,61 @@ def test_pi_operator_must_act_or_record_exact_safety_hold(tmp_path, monkeypatch)
     assert "safety hold" in prompt.lower()
     assert "not an operational checkpoint" in prompt
     assert "9202" in prompt and "9212" in prompt and "FJP" in prompt
+
+def test_campaign_task_inventory_reads_existing_cdpa_api_only(monkeypatch):
+    import io
+    import json
+
+    payload = {"items": [
+        {"task_id": "cdpa-old", "task_title": "CDPA Self-Evolution DEV: old", "status": "DONE"},
+        {"task_id": "cdpa-new", "task_title": "CDPA Self-Evolution TEST: new", "status": "RUNNING"},
+        {"task_id": "unrelated", "task_title": "Not the campaign", "status": "RUNNING"},
+    ]}
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            self.close()
+
+    monkeypatch.setattr(runner, "urlopen", lambda *args, **kwargs:
+                        Response(json.dumps(payload).encode("utf-8")))
+    assert runner.campaign_tasks() == {
+        "cdpa-old": {"status": "DONE", "team": None, "parent_task_id": None},
+        "cdpa-new": {"status": "RUNNING", "team": None, "parent_task_id": None},
+    }
+
+
+def test_pi_cycle_ignores_checkpoint_and_unverified_dispatch_claim():
+    before = {"cdpa-old": {"status": "DONE"}}
+    assert runner.classify_cycle(before, before, "", 0)[0] == "NO_PROGRESS"
+    assert runner.classify_cycle(before, before, "PI_ACTION: DISPATCH cdpa-new", 0)[0] == "NO_PROGRESS"
+    assert runner.classify_cycle(before, before, "PI_ACTION: WAIT cdpa-old", 0)[0] == "NO_PROGRESS"
+
+
+def test_pi_cycle_requires_exact_new_task_and_reconciles_failed_child():
+    before = {"cdpa-old": {"status": "DONE"}}
+    after = {**before, "cdpa-new": {"status": "RUNNING"}}
+    assert runner.classify_cycle(before, after, "PI_ACTION: DISPATCH cdpa-new", 0)[0] == "SAFETY_HOLD"
+    assert runner.classify_cycle(before, after, "PI_ACTION: DISPATCH cdpa-new", 1)[0] == "RECOVERY_PENDING"
+    assert runner.classify_cycle(before, after, "PI_ACTION: DISPATCH cdpa-other", 0)[0] == "SAFETY_HOLD"
+    assert runner.classify_cycle(before, {**after, "cdpa-third": {"status": "RUNNING"}}, "", 0)[0] == "SAFETY_HOLD"
+
+
+def test_pi_cycle_does_not_count_unverified_hold_as_progress():
+    before = {"cdpa-old": {"status": "DONE"}}
+    assert runner.classify_cycle(before, before, "PI_ACTION: SAFETY_HOLD no evidence", 0)[0] == "NO_PROGRESS"
+    assert runner.classify_cycle(before, before, "PI_ACTION: SAFETY_HOLD task cdpa-old blocked", 0)[0] == "NO_PROGRESS"
+    assert runner.classify_cycle(None, before, "PI_ACTION: DISPATCH cdpa-new", 0)[0] == "SAFETY_HOLD"
+
+
+def test_two_failed_cycles_are_included_in_next_pi_prompt(tmp_path, monkeypatch):
+    import json
+
+    state = tmp_path / "pi-runner.json"
+    monkeypatch.setattr(runner, "STATE", state)
+    state.write_text(json.dumps({"status": "NO_PROGRESS", "no_progress_cycles": 2,
+                                 "reason": "No verified CDPA operation"}), encoding="utf-8")
+    prompt = runner.coordinator_prompt()
+    assert "2 consecutive NO_PROGRESS cycles" in prompt
+    assert "No verified CDPA operation" in prompt

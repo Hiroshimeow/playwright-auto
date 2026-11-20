@@ -1,0 +1,13 @@
+{
+  "title": "Detect profile skills wizard",
+  "rule": "If a skills wizard hides the bid form, Select All then Next clears it and adds those skills to the profile. Do not do this without authorization to change the profile; stop if skills would be inaccurate.",
+  "classes": [],
+  "evidence": {
+    "reported-wizard": {
+      "kind": "support",
+      "note": "Reported wizard path exposes form but changes profile skills.",
+      "source": ".runtime/job-search/pi-jobs/bid-memory-brief-20261119.md"
+    }
+  },
+  "last_updated": "2026-11-19"
+}

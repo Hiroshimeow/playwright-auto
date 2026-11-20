@@ -5,6 +5,7 @@ It embeds the complete current GOAL_AND_RULES.md into the CLI request.
 """
 from __future__ import annotations
 import argparse
+import uuid
 import subprocess
 import sys
 from pathlib import Path
@@ -39,6 +40,11 @@ def command(role: str, team: str, instruction: str, parent: str = "", depends_on
            "--config", str(ROOT / "cdpa.yaml")]
     if depends_on:
         cmd.extend(["--depends-on", depends_on])
+    if parent:
+        # Same parent transition always returns the same CDPA command; a changed
+        # payload conflicts instead of creating a second child after lost ack.
+        key = str(uuid.uuid5(uuid.NAMESPACE_URL, "cdpa:self-evolution:successor:" + parent))
+        cmd.extend(["--parent-task-id", parent, "--idempotency-key", key])
     if len(subprocess.list2cmdline(cmd)) >= 30000:
         raise ValueError("Windows command-line length exceeds safe budget")
     return cmd
@@ -57,6 +63,15 @@ def main():
         print("READY: role=" + args.role + " team=" + args.team
               + " embedded_contract_bytes=" + str(len(cmd[cmd.index("--goal") + 1].encode("utf-8"))))
         return
+    if args.parent:
+        # This is the Pi-owned dispatch path; persist the exact transition
+        # before the first irreversible task-create API call.
+        from run_pi import record_transition_intent
+        record_transition_intent(
+            parent=args.parent, team=args.team, role=args.role,
+            goal=cmd[cmd.index("--goal") + 1],
+            idempotency_key=cmd[cmd.index("--idempotency-key") + 1],
+        )
     result = subprocess.run(cmd, cwd=str(ROOT), check=False)
     raise SystemExit(result.returncode)
 

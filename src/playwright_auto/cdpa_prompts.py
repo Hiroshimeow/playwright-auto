@@ -231,6 +231,8 @@ class PromptBuilder:
         continuation: bool = False,
         repair_error: str | None = None,
         repair_candidate: str | None = None,
+        temporary_context: bool = False,
+        recovery_handoff: str = "",
     ) -> BuiltPrompt:
         role = validate_workflow_route_key(logical_role)
         name = str(task_name).strip()
@@ -241,6 +243,16 @@ class PromptBuilder:
         normalized_repair_candidate = str(repair_candidate or "")
         if continuation:
             sections = ["Continue from the current state."]
+            if temporary_context:
+                sections.append(
+                    f"ROLE: {role}\nTASK: {name}\nWORKSPACE: {workspace}\n"
+                    f"GOAL: {normalized_goal}\n"
+                    "TEMPORARY CHAT: Do not assume an earlier turn is visible. "
+                    "Inspect durable workspace state before acting; never replay accepted "
+                    "Sends or completed external side effects."
+                )
+                if recovery_handoff.strip():
+                    sections.append("DURABLE RECOVERY HANDOFF\n" + recovery_handoff.strip())
             if normalized_repair_error:
                 sections.append(
                     "FORMAT REPAIR\n"
@@ -259,6 +271,11 @@ class PromptBuilder:
             )
         else:
             sections = [f"You are {role} for the solo task {name}."]
+            if temporary_context:
+                sections.append(
+                    f"WORKSPACE: {workspace}\nTEMPORARY CHAT: This prompt is self-contained. "
+                    "Read durable workspace evidence and do not assume hidden chat history."
+                )
             if normalized_goal:
                 sections.append(f"Goal: {normalized_goal}")
             sections.extend(

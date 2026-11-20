@@ -101,16 +101,43 @@ def test_t075_accepted_send_holds_lease_through_terminal_and_route_commit(writer
     assert not writers.endpoint_in_use("ep-1")
 
 
-def test_t075_unresolved_stop_seals_and_permanently_quarantines(writers):
+@pytest.mark.parametrize("abandon", [False, True])
+@pytest.mark.parametrize("attempt_state", ["intent_recorded", "submitted", "unconfirmed"])
+def test_t075_unresolved_stop_retains_writer_and_evidence(writers, abandon, attempt_state):
     current = writers.acquire(bind(writers)["binding_id"])
-    intent(writers, current)
-    writers.close_binding("one", abandon=True)
-    assert writers.get_binding("one")["binding_status"] == "sealed"
-    assert not writers.endpoint_in_use("ep-1")
-    bind(writers, "two", physical="other", target="other")
-    with pytest.raises(ValueError, match="WRITER_LEASE_QUARANTINED") as error:
-        writers.acquire("two")
-    assert not error.value.retryable
+    attempt, _ = intent(writers, current)
+    if attempt_state != "intent_recorded":
+        writers.transition_attempt(attempt["attempt_id"], attempt_state)
+    before = writers.db.get_command(attempt["attempt_id"])
+    with pytest.raises(ValueError, match="WRITER_LEASE_BUSY"):
+        writers.close_binding("one", abandon=abandon)
+    assert writers.get_binding("one")["binding_status"] == "active"
+    assert writers.endpoint_in_use("ep-1")
+    assert writers.db.get_command(attempt["attempt_id"]) == before
+    with writers.db.connection() as connection:
+        durable, _ = writers._load_state(connection)
+    assert not durable["quarantine"]
+    assert "one" in durable["page_claims"].values()
+
+
+def test_t075_sealed_release_is_idempotent_and_preserves_flags(writers):
+    writers.acquire(bind(writers)["binding_id"])
+    sealed = writers.close_binding("one")
+    assert writers.close_binding("one") == sealed
+    assert writers.release_writer("one") == sealed
+
+
+def test_t075_release_writer_releases_provisional_without_touching_foreign_lease(writers):
+    first = bind(writers, conversation=None)
+    writers.acquire("one")
+    writers.rekey("one", "https://chatgpt.com/c/promoted")
+    writers.acquire(bind(writers, "two", conversation="other", target="other")["binding_id"])
+    writers.release_writer("one")
+    with writers.db.connection() as connection:
+        durable, _ = writers._load_state(connection)
+    assert first["writer_identity_key"] not in durable["leases"]
+    assert all(lease["owner_binding_id"] != "one" for lease in durable["leases"].values())
+    assert any(lease["owner_binding_id"] == "two" for lease in durable["leases"].values())
 
 
 @pytest.mark.parametrize("field,value", [("endpoint_id", "ep-2"), ("endpoint_cdp_url", "http://127.0.0.1:9998"),

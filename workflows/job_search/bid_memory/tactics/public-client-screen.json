@@ -1,0 +1,13 @@
+{
+  "title": "Screen from About the Client",
+  "rule": "Use the public project page About the Client block. A null API owner_id is not a negative client signal; keep missing flags unknown.",
+  "classes": [],
+  "evidence": {
+    "owner-id-null": {
+      "kind": "support",
+      "note": "Project API returned owner_id null, so the public block is needed for screening.",
+      "source": ".runtime/job-search/pi-jobs/bid-memory-brief-20261119.md"
+    }
+  },
+  "last_updated": "2026-11-19"
+}

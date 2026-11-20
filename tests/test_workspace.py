@@ -310,3 +310,64 @@ def test_open_role_classifies_cloudflare_challenge_as_retryable_rate_limit():
         asyncio.run(ChatGPTWorkspace().open_role(context, "PLAN"))
 
     assert context.page.closed is True
+
+
+@pytest.mark.parametrize("evidence", [True, False, "diagnostic_error", "diagnostic_timeout"])
+def test_open_role_unchanged_url_challenge_evidence(monkeypatch, evidence):
+    class RootPage(ChallengePage):
+        async def goto(self, url, **_options):
+            self.url = url
+
+        async def evaluate(self, script):
+            assert "_cf_chl_opt" in script
+            assert "challenge-platform" in script
+            if evidence == "diagnostic_error":
+                raise RuntimeError("renderer unavailable")
+            if evidence == "diagnostic_timeout":
+                await asyncio.sleep(10)
+            return evidence
+
+    context = ChallengeContext()
+    context.page = RootPage()
+    ws = ChatGPTWorkspace()
+    if evidence == "diagnostic_timeout":
+        original_wait_for = asyncio.wait_for
+
+        async def bounded_wait_for(awaitable, timeout):
+            assert timeout <= 2
+            return await original_wait_for(awaitable, timeout=0.001)
+
+        monkeypatch.setattr(asyncio, "wait_for", bounded_wait_for)
+    expected = RateLimitBlockedError if evidence is True else TimeoutError
+    with pytest.raises(expected, match="Cloudflare challenge" if evidence is True else "composer absent"):
+        asyncio.run(ws.open_role(context, "PLAN"))
+    assert context.page.closed is True
+    assert ws.active_roles == ()
+
+
+def test_open_role_binding_failure_is_not_reclassified_as_cloudflare(monkeypatch):
+    class ReadyLocator:
+        @property
+        def first(self):
+            return self
+
+        async def wait_for(self, **_options):
+            pass
+
+    class ReadyPage(ChallengePage):
+        def locator(self, _selector):
+            return ReadyLocator()
+
+        async def evaluate(self, _script):
+            pytest.fail("diagnostics must not override a binding failure")
+
+    async def fail_binding(*_args, **_kwargs):
+        raise WorkspaceBindingError("ownership conflict")
+
+    ws = ChatGPTWorkspace()
+    monkeypatch.setattr(ws, "bind", fail_binding)
+    context = ChallengeContext()
+    context.page = ReadyPage()
+    with pytest.raises(WorkspaceBindingError, match="ownership conflict"):
+        asyncio.run(ws.open_role(context, "PLAN"))
+    assert context.page.closed is True

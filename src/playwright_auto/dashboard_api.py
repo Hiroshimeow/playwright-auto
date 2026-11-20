@@ -455,7 +455,6 @@ class DashboardAPI:
                 "new_all",
                 "bootstrap_id",
                 "bootstrap_definition",
-                "temporary",
                 "required_browser_endpoint_id",
                 "start_role",
             } & set(raw)
@@ -544,6 +543,8 @@ class DashboardAPI:
                 )
             normalized["conversation_url"] = conversation_url.strip()
         if "temporary" in raw:
+            if workflow_mode == "solo" and raw.get("conversation_url") is not None and raw.get("temporary") is True:
+                raise APIError(400, "invalid_request", "Temporary Solo cannot adopt a persistent conversation URL")
             if type(raw.get("temporary")) is not bool:
                 raise APIError(400, "invalid_request", "temporary must be a boolean")
             if raw.get("temporary") is True:

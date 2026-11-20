@@ -1,0 +1,13 @@
+{
+  "title": "Validate fixed-price milestone",
+  "rule": "Provide a meaningful milestone description of at least 10 characters and use a milestone near 65% of the total bid when compatible with the agreed terms. Verify before submit.",
+  "classes": [],
+  "evidence": {
+    "reported-validation": {
+      "kind": "support",
+      "note": "Validation failed without the minimum description and near-65% amount; exact number of failures and tolerance not recorded.",
+      "source": ".runtime/job-search/pi-jobs/bid-memory-brief-20261119.md"
+    }
+  },
+  "last_updated": "2026-11-19"
+}

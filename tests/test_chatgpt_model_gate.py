@@ -59,11 +59,11 @@ def probe(page, snapshot=None, *, gate_required=True):
 
 @pytest.mark.parametrize("value", [
     "Thinking effort High", "Thinking effort 5.6 Extra High",
-    "Thinking effort Extra High",
+    "Thinking effort Extra High", "Thinking effort Pro",
 ])
 def test_high_or_extra_high_is_accepted_without_click(value):
     result, page = probe(Page(value))
-    assert result in {"High", "Extra High"}
+    assert result in {"High", "Extra High", "Pro"}
     assert page.clicks == page.arrows == 0
 
 

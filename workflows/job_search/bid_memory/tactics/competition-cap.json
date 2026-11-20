@@ -1,0 +1,13 @@
+{
+  "title": "Screen bid count",
+  "rule": "Avoid projects with over 25 competing bids unless exceptionally well matched; document any exception.",
+  "classes": [],
+  "evidence": {
+    "playbook": {
+      "kind": "guidance",
+      "note": "Bid-count rule, not a measured conversion advantage.",
+      "source": "Muse bid-playbook.md as summarized in .runtime/job-search/pi-jobs/bid-memory-brief-20261119.md; workspace file not inspected"
+    }
+  },
+  "last_updated": "2026-11-19"
+}

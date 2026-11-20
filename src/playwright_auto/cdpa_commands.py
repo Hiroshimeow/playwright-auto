@@ -681,6 +681,7 @@ _WORKFLOW_CONTROL_ACTIONS = (
     "restart_role",
     "new_chat",
     "open_tab",
+    "reconcile_presend_acquisition",
     "route_plan",
     "release_required_browser_endpoint",
     "stop",
@@ -787,6 +788,27 @@ def workflow_control_eligibility(
             return no("Restart role cannot bypass an execution-renewal boundary; Resume is required.")
         if hop_state in _WORKFLOW_IN_FLIGHT:
             return no("This control cannot cross an in-flight or accepted Send boundary; use Resume.")
+        return yes()
+    if normalized_action == "reconcile_presend_acquisition":
+        marker = (hop or {}).get("preboundary_recovery") if isinstance(hop, Mapping) else None
+        record = roles.get(selected_role) if isinstance(roles, Mapping) else None
+        if (
+            status != "BLOCKED"
+            or block_code not in {"preboundary_acquisition_recovery_required", "resume_progress_unverified"}
+            or not role_exists
+            or active_role != selected_role
+            or len(state.get("hops") or ()) != 1
+            or hop_state != "pre_send"
+            or not isinstance(marker, Mapping)
+            or marker.get("phase") != "recovery_required"
+            or marker.get("stage") != "acquisition"
+            or not str((hop or {}).get("request_id") or "").strip()
+            or marker.get("request_id") != (hop or {}).get("request_id")
+            or not isinstance(record, Mapping)
+            or record.get("page_id")
+            or record.get("page_url")
+        ):
+            return no("Historical acquisition reconciliation requires one unbound BLOCKED pre_send acquisition marker on the exact active role.")
         return yes()
     if normalized_action == "open_tab":
         if status in _WORKFLOW_TERMINAL:

@@ -1,0 +1,7 @@
+{
+  "title": "Discovery readiness failures are not bid attempts",
+  "lesson": "The detail label was present with leading DOM whitespace; the anchored label wait missed it. A later search sometimes stayed on a shell before a result/empty state; underlying hydration cause unproven. HOLD is not an empty result and does not authorize bypass or count as a bid.",
+  "source": "workflows/job_search/FREELANCER_DETAIL_FIX_REPORT.md and .runtime/job-search/pi-jobs/freelancer-readiness-report-20261119.md",
+  "general": false,
+  "classes": []
+}

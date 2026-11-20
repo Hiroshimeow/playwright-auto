@@ -1,0 +1,7 @@
+{
+  "title": "Milestone validation blocked submission",
+  "lesson": "Reported cause: missing or too-short description, or milestone not near 65% of the quote. Check both fields. Project IDs, count and exact amount tolerance were not supplied.",
+  "source": ".runtime/job-search/pi-jobs/bid-memory-brief-20261119.md",
+  "general": true,
+  "classes": []
+}

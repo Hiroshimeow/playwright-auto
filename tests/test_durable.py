@@ -395,6 +395,41 @@ def test_ledger_replace_does_not_retry_non_permission_error(tmp_path, monkeypatc
     assert ledger_path.with_suffix(".json.tmp").exists()
 
 
+@pytest.mark.parametrize("status", [RequestStatus.NEW, RequestStatus.PROMPT_SET])
+@pytest.mark.parametrize("receipt_kind", ["empty", "none", "absent", "populated"])
+def test_ledger_receipt_roundtrip_preserves_pristine_distinction(tmp_path, status, receipt_kind):
+    ledger_path = tmp_path / "ledger.json"
+    ledger = RequestLedger(ledger_path)
+    record = ledger.begin(role="DEV", prompt="prepared only", request_id="receipt-roundtrip")
+    assert record.receipt is None
+    assert record.pristine_before_dispatch()
+    receipt = {"accepted": True} if receipt_kind == "populated" else (
+        {} if receipt_kind == "empty" else None
+    )
+    record = ledger.update(record.request_id, status=status, receipt=receipt)
+    expected_pristine = receipt_kind in {"none", "absent"}
+    assert record.receipt == receipt
+    assert record.pristine_before_dispatch() is expected_pristine
+    raw = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert raw["records"][record.request_id]["receipt"] == receipt
+    if receipt_kind == "absent":
+        # Legacy records may omit the optional receipt field entirely.
+        raw["records"][record.request_id].pop("receipt")
+        ledger_path.write_text(json.dumps(raw), encoding="utf-8")
+    before_bytes = ledger_path.read_bytes()
+    before_mtime = ledger_path.stat().st_mtime_ns
+
+    observed = RequestLedger(ledger_path).peek(record.request_id)
+
+    assert ledger_path.read_bytes() == before_bytes
+    assert ledger_path.stat().st_mtime_ns == before_mtime
+    assert observed is not None
+    assert observed.receipt == receipt
+    assert observed.status is status
+    assert observed.attempts == 0
+    assert observed.pristine_before_dispatch() is expected_pristine
+
+
 def test_ledger_begin_is_stable_for_same_normalized_request(tmp_path):
     ledger = RequestLedger(tmp_path / "ledger.json")
 

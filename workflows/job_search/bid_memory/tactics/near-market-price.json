@@ -1,0 +1,13 @@
+{
+  "title": "Quote near the current average",
+  "rule": "Use the bid-time average only in the same currency and basis. Check scope, effort and current authorized floor; skip if they do not support a viable quote.",
+  "classes": [],
+  "evidence": {
+    "playbook": {
+      "kind": "guidance",
+      "note": "No bid-time averages recovered; historical quotes are not market rates.",
+      "source": "Muse bid-playbook.md as summarized in .runtime/job-search/pi-jobs/bid-memory-brief-20261119.md; workspace file not inspected"
+    }
+  },
+  "last_updated": "2026-11-19"
+}

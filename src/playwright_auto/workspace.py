@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import Awaitable, Callable, Iterable
@@ -115,11 +116,15 @@ class ChatGPTWorkspace:
         if role in self._clients:
             raise WorkspaceBindingError(f"role {role!r} is already open")
         page = await browser_context.new_page()
+        readiness_complete = False
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            # ChatGPT initial hydration can exceed the default 15-second workspace timeout.
+            # This is readiness-only: no ownership or Send boundary is bypassed.
             await page.locator(
                 '[contenteditable="true"][role="textbox"]'
-            ).first.wait_for(state="visible", timeout=timeout_ms)
+            ).first.wait_for(state="visible", timeout=max(timeout_ms, 45_000))
+            readiness_complete = True
             return await self.bind(
                 role,
                 page,
@@ -127,7 +132,27 @@ class ChatGPTWorkspace:
                 force_new_page_id=force_new_page_id,
             )
         except Exception as exc:
-            cloudflare_challenge = "__cf_chl_rt_tk=" in str(getattr(page, "url", ""))
+            cloudflare_challenge = False
+            if not readiness_complete:
+                cloudflare_challenge = "__cf_chl_rt_tk=" in str(getattr(page, "url", ""))
+                if not cloudflare_challenge:
+                    try:
+                        # Inspect only this new, unbound page. Return a boolean, never
+                        # challenge tokens, scripts or private page content. A generic
+                        # "Just a moment" title or blank page is not positive evidence.
+                        cloudflare_challenge = (await asyncio.wait_for(
+                            page.evaluate("""() => Boolean(
+                                window._cf_chl_opt ||
+                                document.querySelector('script[src*="/cdn-cgi/challenge-platform/"]') ||
+                                (document.querySelector('#challenge-running, #challenge-stage') &&
+                                 /verifying you are human|checking your browser|performing security verification/i
+                                     .test(document.body?.innerText || ''))
+                            )"""),
+                            timeout=2,
+                        )) is True
+                    except Exception:
+                        # Diagnostic failure must preserve the original readiness error.
+                        pass
             await page.close()
             if cloudflare_challenge:
                 raise RateLimitBlockedError(

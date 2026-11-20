@@ -1,13 +1,23 @@
 import asyncio
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
-from playwright_auto.cdpa_actions import AcquiredRole
+import pytest
+
+import playwright_auto.cdpa_actions as actions_module
+from playwright_auto.cdpa_actions import AcquiredRole, CDPATabActions
 from playwright_auto.cdpa_config import load_cdpa_config
+from playwright_auto.cdpa_conversations import ConversationWriterLease
 from playwright_auto.cdpa_store import TaskStore
 from playwright_auto.cdpa_worker import CDPAWorker, _active_hop
+from playwright_auto.durable import RequestLedger, RequestStatus
 
+from test_cdpa_actions import FakeContext, FakePage
 from test_cdpa_core import write_config
-from test_cdpa_worker import FakeActions, _prepare_sent_waiting_task, ready_client
+from test_cdpa_worker import (
+    FakeActions, RecordingCDPASendClient, _prepare_sent_waiting_task, ready_client,
+)
 from test_operator_resume_recovery import _prepare_pristine_new_sending_record
 
 
@@ -114,6 +124,53 @@ def test_temporary_task_start_url_is_not_treated_as_adopted_conversation(tmp_pat
     assert hop["state"] == "sending"
 
 
+@pytest.mark.parametrize(
+    "page_url, composer_text, can_replace",
+    [
+        (TEMPORARY_CHAT_URL, "", True),
+        (TEMPORARY_CHAT_URL, "operator draft", False),
+        ("https://chatgpt.com/c/foreign?temporary-chat=true", "", False),
+    ],
+)
+def test_temporary_first_send_with_owned_but_unproven_page(
+    tmp_path: Path, page_url, composer_text, can_replace
+):
+    _store, state, worker = _temporary_task(tmp_path, task_id="task-temp-unproven")
+    hop = _active_hop(state)
+    role = state["roles"]["PLAN"]
+    # Exact owner on the 9202 landing URL, but no recorded fresh acquisition.
+    role.update(page_id="unproven-plan-page", page_url=page_url, online=True)
+    client = RecordingCDPASendClient(task_id=state["task_id"], team=state["team"])
+    client.current = replace(client.current, url=page_url, composer_text=composer_text)
+
+    class Actions(TemporaryWorkflowActions):
+        async def locate_owned(self, state, logical_role):
+            acquired = await super().locate_owned(state, logical_role)
+            return replace(acquired, client=client) if acquired else None
+
+        async def preflight_team(self, *_args, **_kwargs):
+            pytest.fail("unsafe owned page must not be selected for blocked-tab cleanup")
+
+    actions = Actions(owned=True)
+    asyncio.run(worker._pre_send(state, hop, actions))
+
+    if can_replace:
+        assert actions.fresh_urls == [TEMPORARY_CHAT_URL]
+        assert hop["state"] == "sending"
+        assert hop["generation_started_here"] is True
+        assert hop["conversation_generation"] == 1
+        assert role["page_id"] != "unproven-plan-page"
+        assert role["page_url"] == TEMPORARY_CHAT_URL
+    else:
+        assert state["status"] == "BLOCKED"
+        assert hop["state"] == "pre_send"
+        assert not actions.fresh_urls
+        assert role["page_id"] == "unproven-plan-page"
+        asyncio.run(worker._release_blocked_workflow_tabs(state, actions))
+    assert not client.set_calls
+    assert not client.send_calls
+
+
 def test_workflow_temporary_same_generation_reuses_owned_tab(tmp_path: Path):
     _store, state, worker = _temporary_task(tmp_path, task_id="task-temp-owned")
     role = state["roles"]["PLAN"]
@@ -194,44 +251,240 @@ def test_same_endpoint_pristine_temporary_resume_starts_new_temporary_generation
     assert current.receipt is None
 
 
-def test_temporary_normal_send_uses_no_recovery_reload(tmp_path: Path):
-    """Fix B: Normal _pre_send for temporary workflow must configure max_attempts=1, recovery_reload=False.
-
-    This ensures temporary workflows cannot auto-reload from Send recovery via the normal send path.
-    Reload destroys temporary document identity (see AGENTS.md and Fix 5 in the RCA).
-    """
-    from test_cdpa_worker import RecordingCDPASendActions, RecordingCDPASendClient
-
-    _store, state, worker = _temporary_task(tmp_path, task_id="task-temp-send-config")
-    hop = _active_hop(state)
-    # First, run _pre_send to open the temporary page
+@pytest.mark.parametrize("page_still_open", [False, True])
+def test_temporary_resume_9202_pristine_block_restores_fresh_proof(tmp_path: Path, page_still_open):
+    _store, state, worker = _temporary_task(tmp_path, task_id="task-temp-9202-resume")
     actions = TemporaryWorkflowActions()
+    hop = _active_hop(state)
     asyncio.run(worker._pre_send(state, hop, actions))
     assert hop["state"] == "sending"
+    role = state["roles"]["PLAN"]
+    # Reproduce the persisted 9202 values and the Gate C failure, not a URL variant.
+    hop.update(conversation_generation=0, generation_started_here=False)
+    role.update(conversation_generation=0, constructor_sent_generation=0)
+    original_identity = (hop["hop_id"], hop["turn"], hop["request_id"], hop["prompt_sha256"])
+    live = TemporaryWorkflowActions(owned=True)
+    asyncio.run(worker._sending(state, hop, live))
+    assert state["status"] == "BLOCKED"
+    assert state["block_reason"] == (
+        "CONVERSATION_IDENTITY_MISMATCH: temporary chat requires an exact verified Temporary Chat URL"
+    )
+    assert role["page_url"] == TEMPORARY_CHAT_URL
+    assert not Path(hop["ledger_path"]).exists()
+    assert worker.runtime_db.get_command_by_idempotency_key(f"browser-send:{hop['request_id']}") is None
 
-    # Now run _sending with a recording client and verify max_attempts=1, recovery_reload=False
     client = RecordingCDPASendClient(task_id=state["task_id"], team=state["team"])
+    client.current = replace(client.current, url=TEMPORARY_CHAT_URL, session_id=None)
 
-    class TemporarySendActions(RecordingCDPASendActions):
-        async def locate_owned(self, current, role):
-            record = current["roles"][role]
-            return AcquiredRole(
-                client=self.client,
-                page_id=str(record["page_id"]),
-                url=str(record["page_url"]),
-                created=False,
-                new_chat=False,
-            )
+    class Actions(TemporaryWorkflowActions):
+        async def locate_owned(self, state, logical_role):
+            acquired = await super().locate_owned(state, logical_role)
+            return replace(acquired, client=client) if acquired else None
 
-    asyncio.run(worker._sending(state, hop, TemporarySendActions(client)))
+    replacement = Actions(owned=page_still_open)
+    control = {"action": "resume", "status": "recovering"}
 
-    assert len(client.send_calls) == 1
-    assert client.send_max_attempts == [1], (
-        f"Temporary send must use max_attempts=1 to prevent reload, got {client.send_max_attempts}"
+    async def resume():
+        try:
+            await worker._recover_resume_sending(state, hop, control, replacement)
+        finally:
+            worker._release_endpoint_admission()
+
+    asyncio.run(resume())
+    assert control["status"] == "applied"
+    assert replacement.fresh_urls == [TEMPORARY_CHAT_URL]
+    assert hop["generation_started_here"] is True
+    assert (hop["hop_id"], hop["turn"], hop["request_id"], hop["prompt_sha256"]) == original_identity
+    assert not Path(hop["ledger_path"]).exists()
+
+    # The next worker tick finds the replacement by ownership; lookup does not
+    # label the page new again. The persisted proof must reach the writer gate.
+    acquired = asyncio.run(live.locate_owned(state, "PLAN"))
+    assert acquired.new_chat is False
+    _writer, binding, attempt = asyncio.run(
+        worker._gate_c_prepare_browser_send(state, hop, "PLAN", acquired)
     )
-    assert client.send_recovery_reload == [False], (
-        f"Temporary send must use recovery_reload=False, got {client.send_recovery_reload}"
+    assert binding["conversation_url"] == TEMPORARY_CHAT_URL
+    assert binding["verified_new_chat"] is True
+    assert attempt["state"] == "intent_recorded"
+
+
+@pytest.mark.parametrize(
+    "page_url, can_send",
+    [
+        (TEMPORARY_CHAT_URL, True),
+        ("https://chatgpt.com/", False),
+        ("https://chatgpt.com/?temporary-chat=false", False),
+        (TEMPORARY_CHAT_URL + "&temporary-chat=false", False),
+        ("https://chatgpt.com/c/foreign?temporary-chat=true", False),
+    ],
+)
+def test_temporary_send_verifies_url_after_owned_tab_lookup(
+    tmp_path: Path, monkeypatch, page_url, can_send
+):
+    _store, state, worker = _temporary_task(tmp_path, task_id="task-temp-send")
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, TemporaryWorkflowActions()))
+    assert hop["state"] == "sending"
+    role = state["roles"]["PLAN"]
+    assert role["page_url"] == TEMPORARY_CHAT_URL
+
+    class Page(FakePage):
+        async def evaluate(self, script, *args):
+            if args:
+                return role["temporary_document_id"]
+            return await super().evaluate(script)
+
+    page = Page(
+        page_id=role["page_id"], role=role["physical_role"],
+        team=state["team"], task_id=state["task_id"],
     )
+    page.url = page_url
+    client = RecordingCDPASendClient(task_id=state["task_id"], team=state["team"])
+    client.page = page
+    monkeypatch.setattr(actions_module, "ChatGPTPage", lambda *_a, **_kw: client)
+    actions = CDPATabActions(FakeContext([page]), worker.config)
+
+    asyncio.run(worker._sending(state, hop, actions))
+
+    if can_send:
+        assert state.get("block_code") is None
+        assert hop["state"] == "sent"
+        assert len(client.send_calls) == 1
+        assert client.send_max_attempts == [1]
+        assert client.send_recovery_reload == [False]
+    else:
+        assert state["status"] == "BLOCKED"
+        assert state["block_code"] == "CONVERSATION_IDENTITY_MISMATCH"
+        assert not client.set_calls
+        assert not client.send_calls
+        assert worker.runtime_db.get_command_by_idempotency_key(
+            f"browser-send:{hop['request_id']}"
+        ) is None
+
+
+
+@pytest.mark.parametrize(
+    "loss", ["tab_closed", "document_reloaded", "already_blocked", "child_intent_exists"],
+)
+def test_temporary_dev_generation_loss_uses_new_writer_without_replaying(tmp_path, loss):
+    store, state, worker = _temporary_task(tmp_path, task_id="task-temp-dev-recovery")
+
+    class Actions(TemporaryWorkflowActions):
+        current = None
+        document = None
+
+        async def locate_owned(self, state, role):
+            if self.current is not None:
+                return replace(self.current, new_chat=False, created=False)
+            return None
+
+        async def fresh_chat(self, state, role, *, url, clean_for_send=False):
+            assert url == TEMPORARY_CHAT_URL and clean_for_send
+            self.fresh_urls.append(url)
+            page_id = f"dev-page-{len(self.fresh_urls)}"
+            self.document = f"document-{len(self.fresh_urls)}"
+            client = RecordingCDPASendClient(task_id=state["task_id"], team=state["team"])
+            client.current = replace(client.current, url=url, session_id=None)
+
+            async def evaluate(*_args):
+                return self.document
+
+            client.page = SimpleNamespace(evaluate=evaluate)
+            client.binding = replace(client.binding, page_id=page_id, role=state["roles"][role]["physical_role"])
+            self.current = AcquiredRole(client=client, page_id=page_id, url=url, created=True, new_chat=True)
+            return self.current
+
+    async def run():
+        actions = Actions()
+        # Reproduce the live shape: earlier workflow progress, an accepted DEV
+        # repair on generation 1, and its own DEV turn 2 continuation request.
+        plan = _active_hop(state)
+        plan.update(state="routed", route="DEV")
+        dev = worker._append_hop(state, source_role="PLAN", target_role="DEV", handoff="do work")
+        dev.update(state="routed", route="PLAN")
+        parent = worker._append_hop(
+            state, source_role="DEV", target_role="DEV", handoff="route repair",
+            kind="route_repair", turn=1,
+        )
+        role = state["roles"]["DEV"]
+        await worker._pre_send(state, parent, actions)
+        await worker._sending(state, parent, actions)
+        assert parent["state"] == "sent"
+        original = actions.current
+        parent["state"] = "waiting"
+        ledger = RequestLedger(parent["ledger_path"])
+        accepted = ledger.peek(parent["request_id"])
+        assert accepted.status is RequestStatus.SENT and accepted.attempts == 1
+        assert accepted.receipt["conversation_id"] is None
+        old_binding = parent["conversation_binding_id"]
+        original_document = role["temporary_document_id"]
+        if loss == "document_reloaded":
+            actions.document = "reloaded-document"
+        else:
+            actions.current = None
+        await worker._waiting(state, parent, actions, Path(state["manifest_path"]))
+        child = _active_hop(state)
+        assert parent["state"] == "abandoned"
+        assert child["recovery_of_request_id"] == parent["request_id"]
+        assert (child["hop_id"], child["turn"], child["state"]) == (4, 2, "pre_send")
+        # Keep the test on the actual Send implementation, but use the same
+        # fresh-worker boundary as guarded reload (no preceding local Send).
+        sender = CDPAWorker(worker.config, store=store)
+        await sender._pre_send(state, child, actions)
+        assert child["generation_started_here"] and child["conversation_generation"] == 2
+        assert role["temporary_document_id"] != original_document
+        if loss in {"already_blocked", "child_intent_exists"}:
+            # Emulate the snapshot left by the old code, including the stale
+            # binding, but with no irreversible evidence for the child itself.
+            role["conversation_binding_id"] = old_binding
+            prepared_page = await actions.locate_owned(state, "DEV")
+            await sender._sending(state, child, actions)
+            assert state["block_code"] == "CONVERSATION_IDENTITY_MISMATCH"
+            assert ledger.peek(child["request_id"]) is None
+            actions.current = None  # existing blocked-tab cleanup closed it
+            if loss == "child_intent_exists":
+                # Simulate a writer-ledger save gap. The child must stay blocked
+                # even with no requests.json entry and no attempt in its manifest.
+                role.pop("conversation_binding_id")
+                replacement = await sender._gate_c_prepare_browser_send(
+                    state, child, "DEV", prepared_page,
+                )
+                assert replacement[2]["state"] == "intent_recorded"
+                for key in ("send_attempt_id", "conversation_binding_id", "writer_lease_epoch"):
+                    child.pop(key)
+                role["conversation_binding_id"] = old_binding
+            control = {"action": "resume", "status": "recovering"}
+            try:
+                await sender._recover_resume_sending(state, child, control, actions)
+            finally:
+                sender._release_endpoint_admission()
+            assert ledger.peek(child["request_id"]) is None
+            if loss == "child_intent_exists":
+                assert control["status"] == "recovery_required"
+                assert state["block_code"] == "durable_send_provenance_missing"
+                assert actions.fresh_urls == [TEMPORARY_CHAT_URL] * 2
+                assert not prepared_page.client.set_calls and not prepared_page.client.send_calls
+                assert ledger.peek(parent["request_id"]) == accepted
+                return
+            assert control["status"] == "applied"
+        await sender._sending(state, child, actions)
+        assert state["block_code"] is None, state["block_reason"]
+        assert child["state"] == "sent"
+        assert actions.fresh_urls == [TEMPORARY_CHAT_URL] * (3 if loss == "already_blocked" else 2)
+        new_binding = ConversationWriterLease(sender.runtime_db).get_binding(child["conversation_binding_id"])
+        assert new_binding["binding_id"] != old_binding
+        assert new_binding["verified_new_chat"] is True
+        assert new_binding["page_target_identity"] == actions.current.page_id
+        assert new_binding["temporary_document_id"] == role["temporary_document_id"]
+        assert ledger.peek(parent["request_id"]) == accepted
+        sent = ledger.peek(child["request_id"])
+        assert sent.status is RequestStatus.SENT and sent.attempts == 1
+        assert len(original.client.send_calls) == len(actions.current.client.send_calls) == 1
+        assert actions.current.client.send_max_attempts == [1]
+        assert actions.current.client.send_recovery_reload == [False]
+
+    asyncio.run(run())
 
 
 def test_temporary_fresh_chat_goto_timeout_is_pre_send_not_blocked(tmp_path: Path):

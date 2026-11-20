@@ -197,6 +197,52 @@ def test_solo_prompt_initial_and_continuation_are_minimal(tmp_path: Path):
     )
 
 
+def test_cdpa_quick_cli_defaults_to_solo_dev_9202_and_preserves_full_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    captured: list[dict] = []
+    config = SimpleNamespace(
+        repository_root=tmp_path.resolve(),
+        dashboard_api_host="127.0.0.1",
+        dashboard_api_port=9225,
+        dashboard_url="http://127.0.0.1:9224",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cli_module, "load_cdpa_config",
+        lambda _path, *, repository_root: config,
+    )
+    monkeypatch.setattr(
+        cli_module, "submit_task",
+        lambda _config, **kwargs: captured.append(kwargs) or {"status": "INBOX"},
+    )
+    prompt = "Find paid remote freelance tasks today; check receipts before bids."
+    assert cli_module.main(["-p", prompt]) == 0
+    assert captured[0]["workflow_mode"] == "solo"
+    assert captured[0]["solo_role"] == "DEV"
+    assert captured[0]["browser_endpoint_id"] == "9202"
+    assert captured[0]["goal"] == prompt
+    assert captured[0]["task"].startswith("Solo request:")
+    assert cli_module.main(["-e", "9212", "-m", "solo", "-p", "Inspect G6"]) == 0
+    assert captured[1]["browser_endpoint_id"] == "9212"
+    assert captured[1]["goal"] == "Inspect G6"
+    assert cli_module.main(["-m", "team", "-p", "Team task"]) == 0
+    assert captured[2]["workflow_mode"] == "team"
+    assert captured[2]["browser_endpoint_id"] == "9202"
+    assert captured[2]["task"] == "Team task"
+
+
+def test_cdpa_quick_cli_rejects_conflicting_inputs_and_preserves_legacy():
+    p = cli_module.build_parser()
+    assert p.parse_args(["--solo", "REVIEW", "--browser", "9212", "--task", "Review"]).solo == "REVIEW"
+    assert p.parse_args(["-p", "x"]).quick_prompt == "x"
+    assert p.parse_args(["-e", "9222"]).browser == "9222"
+    assert cli_module.main(["-p", ""]) == 2
+    assert cli_module.main(["-p", "x", "--goal", "other"]) == 2
+    assert cli_module.main(["-p", "x", "--conversation-url", "https://chatgpt.com/c/abc"]) == 2
+    assert cli_module.main(["-m", "solo"]) == 2
+
+
 @pytest.mark.parametrize("handoff", ["Implemented and verified focused tests.", "INLINE"])
 def test_solo_live_candidate_accepts_done_before_responded_transition(
     tmp_path: Path,

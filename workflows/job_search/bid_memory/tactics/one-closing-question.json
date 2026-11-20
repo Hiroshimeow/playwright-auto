@@ -1,0 +1,13 @@
+{
+  "title": "Close with one question",
+  "rule": "End the proposal with exactly one question that resolves the most important scope uncertainty.",
+  "classes": [],
+  "evidence": {
+    "playbook": {
+      "kind": "guidance",
+      "note": "Proposal rule, not proven reply lift.",
+      "source": "Muse bid-playbook.md as summarized in .runtime/job-search/pi-jobs/bid-memory-brief-20261119.md; workspace file not inspected"
+    }
+  },
+  "last_updated": "2026-11-19"
+}

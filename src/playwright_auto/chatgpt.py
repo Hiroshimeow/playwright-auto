@@ -2395,6 +2395,7 @@ class ChatGPTPage:
         self.timeout_ms = timeout_ms
         self.binding: PageBinding | None = None
         self.model_effort_gate_required = False
+        self.temporary_chat = False
         self._owned_composer_text: str | None = None
         self._frontend_identity_task: asyncio.Future[dict[str, str] | None] | None = None
         self._frontend_identity_listener: Callable[[Any], None] | None = None
@@ -3260,6 +3261,11 @@ class ChatGPTPage:
                     return await self.health()
             return initial
 
+        if self.temporary_chat:
+            raise UnsafePageStateError(
+                "Temporary Chat document cannot be refreshed; reconcile the exact owned "
+                "tab or create a new self-contained recovery turn."
+            )
         try:
             await self.refresh(timeout_ms=timeout)
             await asyncio.sleep(0.25)
@@ -3767,7 +3773,7 @@ class ChatGPTPage:
     async def _ensure_selfrepair_model_effort_locked(
         self, snapshot: ChatGPTSnapshot, *, allow_change: bool = True
     ) -> str | None:
-        """Verify High/Extra High on this exact G6 Solo page before editing/Send.
+        """Verify High/Extra High or Pro on this exact G6 Solo page before editing/Send.
 
         Fail closed when the model picker is missing or ambiguous. No model
         change after a composer draft or an accepted Send.
@@ -3789,17 +3795,19 @@ class ChatGPTPage:
                 return "Extra High"
             if text.endswith("High"):
                 return "High"
+            if text.endswith("Pro"):
+                return "Pro"
             if text.endswith(("Medium", "Low")):
                 return "below_high"
             return None
 
         effort = await read_effort()
-        if effort in {"High", "Extra High"}:
+        if effort in {"High", "Extra High", "Pro"}:
             await record_page_action(self.page, "model_gate", "verified", detail=effort)
             return effort
         if effort != "below_high" or not allow_change:
             raise UnsafePageStateError(
-                "model_verification_blocked: exact task tab does not show High/Extra High"
+                "model_verification_blocked: exact task tab does not show High/Extra High/Pro"
             )
         if str(getattr(snapshot, "composer_text", "") or "").strip() or getattr(
             snapshot, "attachment_markers", ()
@@ -3823,7 +3831,7 @@ class ChatGPTPage:
                 await power.press("ArrowRight")
                 await asyncio.sleep(0.25)
                 effort = await read_effort()
-                if effort in {"High", "Extra High"}:
+                if effort in {"High", "Extra High", "Pro"}:
                     break
             else:
                 raise ValueError("High selection not observable")
@@ -4059,6 +4067,10 @@ class ChatGPTPage:
     ) -> None:
         from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+        if self.temporary_chat:
+            raise UnsafePageStateError(
+                "Temporary Chat cannot be refreshed: reload discards its context."
+            )
         timeout = timeout_ms or self.timeout_ms
         async with self.mutation_guard():
             before = await self.assert_ownership(require_binding=self.binding is not None)
@@ -4431,7 +4443,7 @@ class ChatGPTPage:
                     raise
                 except Exception as exc:
                     last_error = exc
-                    if attempt >= max_attempts or not recovery_reload:
+                    if attempt >= max_attempts or not recovery_reload or self.temporary_chat:
                         break
                     from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 

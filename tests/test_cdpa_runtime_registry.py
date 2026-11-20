@@ -265,3 +265,30 @@ def test_new_replacement_unschedules_existing_parent_immediately():
     assert "old" in affected
     assert registry.immutable_task_ids == {"old"}
     assert "old" not in registry.due_task_ids(1001.0)
+
+
+def test_stop_released_has_no_deadline_after_restart_but_explicit_clear_is_due():
+    stopped = task('stopped', status='STOPPED', updated_at='1970-01-01T00:00:00+00:00')
+    stopped['cleanup'] = {'state': 'STOP_RELEASED', 'phase': 'writer_released'}
+    registry = CDPARuntimeRegistry.hydrate([stopped], now=1000, cleanup_idle_seconds=300)
+    assert registry.next_due_at() is None
+    restarted = CDPARuntimeRegistry.hydrate(list(registry.tasks_by_id.values()), now=2000)
+    assert restarted.next_due_at() is None
+    stopped['controls'] = [{'control_id': 2, 'action': 'clear_team', 'status': 'requested'}]
+    restarted.update_task(stopped, now=2001)
+    assert restarted.due_task_ids(2001.5) == ('stopped',)
+
+
+def test_pending_stop_writer_cleanup_and_attached_clear_keep_retry_deadline():
+    for clear_requested in (False, True):
+        stopped = task('stopped', status='STOPPED')
+        stopped['cleanup'] = {
+            'state': 'CLEARING', 'phase': 'writer_stop_pending',
+            'next_retry_at': '1970-01-01T00:17:00+00:00',
+            'control_id': 2 if clear_requested else None,
+        }
+        if clear_requested:
+            stopped['controls'] = [{'control_id': 2, 'action': 'clear_team', 'status': 'cleanup_pending'}]
+        registry = CDPARuntimeRegistry.hydrate([stopped], now=1000)
+        assert registry.next_due_at() == 1020
+        assert registry.due_task_ids(1020) == ('stopped',)

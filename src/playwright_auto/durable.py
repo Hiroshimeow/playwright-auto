@@ -294,7 +294,7 @@ class DurableRequestRecord:
                 if value.get("session_id_before") is not None
                 else None
             ),
-            receipt=(dict(value["receipt"]) if value.get("receipt") else None),
+            receipt=(dict(value["receipt"]) if value.get("receipt") is not None else None),
             upload_receipt=(
                 dict(value["upload_receipt"])
                 if value.get("upload_receipt")

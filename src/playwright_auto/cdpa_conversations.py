@@ -867,17 +867,10 @@ class ConversationWriterLease:
                     "writer has unresolved send evidence",
                     retryable=True,
                 )
-            key = str(binding["writer_identity_key"])
-            lease = state["leases"].get(key)
-            if isinstance(lease, dict):
-                if lease.get("owner_binding_id") != binding_id:
-                    connection.rollback()
-                    raise ConversationLeaseError(
-                        "WRITER_LEASE_BUSY",
-                        "writer identity is owned by another binding",
-                        retryable=True,
-                    )
-                state["leases"].pop(key, None)
+            if binding.get("binding_status") == "sealed":
+                connection.commit()
+                return self._binding_projection(binding)
+            self._release_binding_leases(state, binding)
             binding["binding_status"] = "idle"
             binding["updated_at"] = _utc_now()
             self._store_state(connection, state, version)
@@ -985,19 +978,19 @@ class ConversationWriterLease:
                 for attempt in self._attempts_for_binding(connection, binding_id)
                 if attempt.get("state") not in _TERMINAL_ATTEMPT_STATES
             ]
-            key = str(binding["writer_identity_key"])
-            if abandon and unresolved:
-                state["quarantine"][key] = {
-                    "permanent": True,
-                    "winner_binding_id": None,
-                    "loser_binding_ids": [binding_id],
-                    "reason": "unresolved_abandon",
-                    "updated_at": _utc_now(),
-                }
+            if unresolved:
+                connection.rollback()
+                raise ConversationLeaseError(
+                    "WRITER_LEASE_BUSY",
+                    "writer has unresolved send evidence",
+                    retryable=True,
+                )
+            if binding.get("binding_status") == "sealed":
+                connection.commit()
+                return self._binding_projection(binding)
             self._release_binding_leases(state, binding)
             self._release_page_claim(state, binding)
             binding["binding_status"] = "sealed"
-            binding["reconciliation_only"] = bool(unresolved)
             binding["updated_at"] = _utc_now()
             self._store_state(connection, state, version)
             connection.commit()

@@ -136,7 +136,7 @@ class CDPARuntimeRegistry:
             return now + MINIMUM_DEADLINE_SECONDS
         status = str(state.get("status") or "INBOX").upper()
         if status in TERMINAL:
-            if cleanup_state == "CLEARED":
+            if cleanup_state in {"CLEARED", "STOP_RELEASED"}:
                 return None
             base = _timestamp(
                 state.get("completed_at")

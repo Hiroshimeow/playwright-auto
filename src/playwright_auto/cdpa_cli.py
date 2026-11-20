@@ -137,6 +137,8 @@ def submit_task(
             "goal": str(goal or "").strip(),
             "browser_endpoint_id": browser_endpoint_id,
         }
+        if temporary:
+            payload["temporary"] = True
         if str(task).strip():
             payload["task"] = str(task).strip()
         if team:
@@ -739,6 +741,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="create a Solo Task using exactly this existing workflow role",
     )
     parser.add_argument("--goal", default=None, help="optional Solo Task goal")
+    parser.add_argument("-p", dest="quick_prompt", default=None, help="short form: full prompt for new task; defaults to Solo DEV on endpoint 9202")
+    parser.add_argument("-m", dest="quick_mode", choices=("solo", "team"), default=None, help="short form task mode (default: solo when using -p)")
     parser.add_argument("--parent-task-id", default=None, help="Solo Task lineage; does not schedule a dependency")
     parser.add_argument("--idempotency-key", default=None, help="durable task creation command identity")
     parser.add_argument(
@@ -753,7 +757,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="force Temporary Chat with Fresh context for this workflow task",
     )
     parser.add_argument(
-        "--browser",
+        "-e", "--browser",
         default=None,
         help="pin the whole workflow team to this browser endpoint ID, port, host:port, or CDP URL",
     )
@@ -816,6 +820,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_independent_cli(raw[1:])
 
         args = build_parser().parse_args(raw)
+        if args.quick_prompt is not None:
+            prompt = args.quick_prompt.strip()
+            if not prompt:
+                raise ValueError("-p requires a non-empty prompt")
+            if args.task or args.task_option:
+                raise ValueError("-p cannot be combined with positional task or --task")
+            if args.goal is not None or args.solo is not None or args.roles is not None:
+                raise ValueError("-p cannot be combined with --goal, --solo or --roles")
+            if args.conversation_url is not None:
+                raise ValueError("-p does not attach to existing conversations; use --solo and --conversation-url explicitly")
+            if args.quick_mode in (None, "solo"):
+                args.solo = "DEV"
+                args.goal = prompt
+                args.task_option = "Solo request: " + prompt[:100]
+                args.browser = args.browser or "9202"
+            else:
+                args.task_option = prompt
+                args.browser = args.browser or "9202"
+        elif args.quick_mode is not None:
+            raise ValueError("-m requires -p; use --solo ROLE or --roles for advanced tasks")
         repository = (
             Path(args.repository).expanduser().resolve()
             if args.repository is not None
@@ -841,14 +865,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 new_roles
                 or team_roles
                 or args.new_all
-                or args.temp
                 or dependencies
                 or args.upload
                 or args.bootstrap_id is not _BOOTSTRAP_UNSET
             ):
                 raise ValueError(
                     "Solo Task accepts --team, --solo, --goal, --browser, "
-                    "--conversation-url, and --repository only"
+                    "--conversation-url, --temp, and --repository only"
                 )
             if not args.solo and (
                 args.goal is not None or args.conversation_url is not None

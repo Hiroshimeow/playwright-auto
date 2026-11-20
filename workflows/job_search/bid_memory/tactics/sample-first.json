@@ -1,0 +1,18 @@
+{
+  "title": "Offer a small sample",
+  "rule": "Offer an existing, synthetic, or small non-production sample. Start production only after the agreed milestone is funded.",
+  "classes": [],
+  "evidence": {
+    "playbook": {
+      "kind": "guidance",
+      "note": "Sample-first proposal rule.",
+      "source": "Muse bid-playbook.md as summarized in .runtime/job-search/pi-jobs/bid-memory-brief-20261119.md; workspace file not inspected"
+    },
+    "sample-budget": {
+      "kind": "guidance",
+      "note": "Strategy suggests at most ten minutes for a fresh non-production sample.",
+      "source": ".runtime/job-search/pi-jobs/strategy-plan-pi-20261119.md"
+    }
+  },
+  "last_updated": "2026-11-19"
+}

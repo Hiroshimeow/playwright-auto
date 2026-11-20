@@ -1,0 +1,13 @@
+{
+  "title": "Lead with one concrete detail",
+  "rule": "Write 120–200 words. Open with one line specific to this brief, then explain your approach and fit in plain language.",
+  "classes": [],
+  "evidence": {
+    "playbook": {
+      "kind": "guidance",
+      "note": "No reply-linked historical opening recovered.",
+      "source": "Muse bid-playbook.md as summarized in .runtime/job-search/pi-jobs/bid-memory-brief-20261119.md; workspace file not inspected"
+    }
+  },
+  "last_updated": "2026-11-19"
+}

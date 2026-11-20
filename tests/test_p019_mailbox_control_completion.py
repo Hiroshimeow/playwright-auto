@@ -10,6 +10,7 @@ from playwright_auto.cdpa_store import TaskStore
 from playwright_auto.cdpa_worker import CDPAWorker
 
 from test_cdpa_core import write_config
+from test_cdpa_worker import FakeActions
 
 
 class GuardActions:
@@ -17,9 +18,10 @@ class GuardActions:
         self.calls = calls
         calls["constructed"] += 1
 
-    async def locate_owned(self, _state, _role):
+    async def locate_owned(self, state, role):
         self.calls["locate"] += 1
-        return SimpleNamespace()
+        # Exercise Stop ownership verification with a real ChatGPTSnapshot/client.
+        return await FakeActions().locate_owned(state, role)
 
     async def stop_if_active(self, _acquired):
         self.calls["stop"] += 1
@@ -131,7 +133,8 @@ def test_waiting_stop_mailbox_tracks_durable_control_and_restart_replay(
     assert command["status"] == "applied"
     assert command["result"]["stopped_response"] is False
     assert len(stopped["controls"]) == 1
-    assert calls == {"constructed": 1, "locate": 1, "stop": 1, "transport": 0}
+    assert stopped["cleanup"]["state"] == "STOP_RELEASED"
+    assert calls == {"constructed": 1, "locate": 0, "stop": 0, "transport": 0}
 
     with restarted.runtime_db.connection() as connection:
         connection.execute(
@@ -142,7 +145,7 @@ def test_waiting_stop_mailbox_tracks_durable_control_and_restart_replay(
     terminal_replay = restarted.dispatch_command_once()
     assert terminal_replay["status"] == "applied"
     assert len(store.load(path)["controls"]) == 1
-    assert calls == {"constructed": 1, "locate": 1, "stop": 1, "transport": 0}
+    assert calls == {"constructed": 1, "locate": 0, "stop": 0, "transport": 0}
 
 
 def test_stop_supersedes_stale_requested_controls_without_reawakening_work(
@@ -267,6 +270,7 @@ def test_stop_supersedes_stale_requested_controls_without_reawakening_work(
     assert restart_command["status"] == "failed"
     assert restart_command["result"]["reason_code"] == "superseded_by_stop"
     assert stop_command["status"] == "applied"
+    assert stopped["cleanup"]["state"] == "STOP_RELEASED"
     assert calls == {
         "constructed": 1,
         "locate": 1,

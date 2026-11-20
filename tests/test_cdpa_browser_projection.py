@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from playwright_auto.cdpa_browser_projection import build_browser_projection, inspect_page_metadata
 
 
@@ -48,6 +50,20 @@ def test_metadata_inventory_uses_one_minimal_evaluation():
         "online": True,
         "supported": True,
     }
+
+
+@pytest.mark.parametrize(
+    "observed_url, expected_url",
+    [
+        ("https://chatgpt.com/?temporary-chat=true", "https://chatgpt.com/?temporary-chat=true"),
+        ("https://chatgpt.com/?temporary-chat=true&token=secret", "https://chatgpt.com/"),
+        ("https://chatgpt.com/?temporary-chat=true#secret", "https://chatgpt.com/"),
+        ("https://example.com/?temporary-chat=true", "https://example.com/"),
+    ],
+)
+def test_metadata_preserves_only_exact_temporary_chat_marker(observed_url, expected_url):
+    page = FakePage(url=observed_url)
+    assert asyncio.run(inspect_page_metadata(page))["url"] == expected_url
 
 
 def test_non_chatgpt_page_inventory_never_evaluates_page_script():

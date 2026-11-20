@@ -1091,6 +1091,10 @@ class CDPATabActions:
         skip_precheck: bool = False,
     ) -> AcquiredRole:
         timeout = max(float(self.config.workspace_timeout_seconds), 0.001)
+        if (manifest is not None and manifest.get("conversation_mode") == "temporary") or getattr(
+            acquired.client, "temporary_chat", False
+        ):
+            raise UnsafePageStateError("Temporary Chat may not be refreshed or reloaded")
         if skip_precheck and not recover:
             raise RoleOwnershipError("precheck bypass is only valid for recovery refresh")
         async with asyncio.timeout(timeout):

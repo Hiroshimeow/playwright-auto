@@ -82,7 +82,7 @@ from .cdpa_projection import (
 from .cdpa_runtime_db import RuntimeDB
 from .cdpa_runtime_registry import CDPARuntimeRegistry, MINIMUM_DEADLINE_SECONDS
 from .cdpa_prompts import PromptBuilder
-from .file_lock import exclusive_file_lock
+from .file_lock import exclusive_file_lock, read_shared_bytes
 from .role_runtime import Action, Policy, RoleController
 from .playwright_driver_patch import ensure_playwright_dialog_autoclose_guard
 from .cdpa_response import (
@@ -907,6 +907,105 @@ class CDPAWorker:
             isinstance(page, Mapping) and str(page.get("page_id") or "").strip() == page_id
             for page in endpoint.get("pages") or ()
         )
+
+    @staticmethod
+    def _classify_presend_acquisition(state: Mapping[str, Any]) -> dict[str, Any]:
+        """Read-only candidate classification, never authority to create a tab or Send."""
+        def hold(code: str) -> dict[str, Any]:
+            return {
+                "classification": "safe_hold",
+                "reason_code": code,
+                "send_authorized": False,
+                "next_safe_action": "reconcile_exact_historical_send_and_browser_provenance",
+            }
+
+        role = str(state.get("active_role") or "").upper()
+        hops = state.get("hops")
+        roles = state.get("roles")
+        if (
+            not isinstance(hops, list) or len(hops) != 1
+            or not isinstance(hops[0], Mapping)
+            or not isinstance(roles, Mapping)
+            or role not in roles
+        ):
+            return hold("historical_identity_incomplete")
+        hop = hops[0]
+        record = roles[role]
+        marker = hop.get("preboundary_recovery")
+        if (
+            not isinstance(record, Mapping)
+            or str(state.get("status") or "").upper() != "BLOCKED"
+            or state.get("block_code") not in {
+                "preboundary_acquisition_recovery_required", "resume_progress_unverified"
+            }
+            or state.get("active_hop_id") != hop.get("hop_id")
+            or hop.get("hop_id") != 1
+            or str(hop.get("target_role") or "").upper() != role
+            or hop.get("state") != "pre_send"
+            or not isinstance(marker, Mapping)
+            or marker.get("phase") != "recovery_required"
+            or marker.get("stage") != "acquisition"
+            or marker.get("attempts") != 0
+            or marker.get("request_id") != hop.get("request_id")
+            or not str(hop.get("request_id") or "").strip()
+            or not str(state.get("browser_endpoint_id") or "").strip()
+            or state.get("endpoint_pinned") is not True
+            or str(record.get("browser_endpoint_id") or "") != str(state.get("browser_endpoint_id") or "")
+            or str(hop.get("browser_endpoint_id") or "") != str(state.get("browser_endpoint_id") or "")
+            or str(hop.get("physical_role") or "") != str(record.get("physical_role") or "")
+            or record.get("page_id") or record.get("page_url")
+            or hop.get("conversation_url") or hop.get("receipt")
+            or hop.get("message_identity") or hop.get("response")
+            or hop.get("route") or hop.get("report_path")
+            or hop.get("prompt") or hop.get("prompt_sha256")
+            or int(record.get("conversation_generation") or 0) != 0
+            or record.get("attachments_uploaded_generation") is not None
+            or any(hop.get("timestamps", {}).get(k) for k in ("sending_at", "sent_at", "waiting_at", "accepted_at"))
+            or any(hop.get(k) for k in ("sent_at", "sending_at", "user_message_id", "user_turn_id"))
+        ):
+            return hold("historical_send_or_identity_ambiguous")
+        if state.get("block_code") == "resume_progress_unverified":
+            prior = [
+                c for c in state.get("controls") or ()
+                if isinstance(c, Mapping) and c.get("action") == "resume"
+            ]
+            if len(prior) != 1 or prior[0].get("status") not in {
+                "applied", "recovery_required", "ineffective", "failed"
+            }:
+                return hold("resume_control_provenance_unverified")
+        ledger_path = str(hop.get("ledger_path") or "")
+        expected = Path(str(state.get("manifest_path") or "")).resolve().parent / "requests.json"
+        if not ledger_path or Path(ledger_path).resolve() != expected:
+            return hold("ledger_path_identity_mismatch")
+        try:
+            raw = json.loads(expected.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raw = None
+        except (OSError, UnicodeError, ValueError):
+            return hold("request_ledger_unreadable")
+        if raw is not None:
+            if not isinstance(raw, Mapping) or raw.get("version") != 1 or not isinstance(raw.get("records"), dict):
+                return hold("request_ledger_invalid")
+            from .durable import DurableRequestRecord
+            for request_id, data in raw["records"].items():
+                if request_id != hop["request_id"]:
+                    return hold("alternate_request_ledger_unreconciled")
+                try:
+                    durable = DurableRequestRecord.from_dict(data)
+                except (ValueError, TypeError, KeyError):
+                    return hold("request_ledger_invalid")
+                if (
+                    durable.request_id != request_id
+                    or durable.role != str(record.get("physical_role") or "")
+                    or not durable.pristine_before_dispatch()
+                ):
+                    return hold("request_ledger_send_ambiguous")
+        return {
+            "classification": "pristine_candidate",
+            "reason_code": "external_send_absence_unproven",
+            "send_authorized": False,
+            "next_safe_action": "reconcile_exact_historical_send_and_browser_provenance",
+        }
 
     def _execution_is_pristine_pre_send(
         self,
@@ -2542,6 +2641,7 @@ class CDPAWorker:
     ) -> None:
         record = state["roles"][logical_role]
         acquired.client.model_effort_gate_required = bool(self.config.model_effort_gate_required)
+        acquired.client.temporary_chat = state.get("conversation_mode") == "temporary"
         changed = (
             acquired.created
             or acquired.new_chat
@@ -2556,6 +2656,9 @@ class CDPAWorker:
         if acquired.new_chat:
             record["conversation_generation"] = int(record.get("conversation_generation") or 0) + 1
             record.pop("branch_conversation_id", None)
+            if acquired.client.temporary_chat:
+                # Writer bindings belong to a document, not to the role across generations.
+                record.pop("conversation_binding_id", None)
         if getattr(acquired, "conversation_id", None):
             record["branch_conversation_id"] = acquired.conversation_id
         generation = int(record.get("conversation_generation") or 0)
@@ -2662,6 +2765,16 @@ class CDPAWorker:
         )
         return str(value) if value else None
 
+    @staticmethod
+    async def _can_replace_unproven_temporary_page(acquired: AcquiredRole) -> bool:
+        snapshot = await acquired.client.assert_ownership()
+        return (
+            snapshot.url == "https://chatgpt.com/?temporary-chat=true"
+            and not snapshot.messages
+            and not snapshot.stop_visible
+            and not snapshot.manual_input_pending
+        )
+
     async def _owned_or_block(
         self,
         state: dict[str, Any],
@@ -2733,7 +2846,10 @@ class CDPAWorker:
                     # A truly pristine request can reacquire a surface without being replayed.
                     ledger = RequestLedger(str(hop["ledger_path"]))
                     durable = ledger.peek(str(hop["request_id"]))
-                    if self._is_pristine_preboundary_sending_record(state, hop, durable):
+                    if (
+                        self._is_pristine_preboundary_sending_record(state, hop, durable)
+                        and not self._gate_c_has_send_intent(hop)
+                    ):
                         await self._acquire_endpoint_admission(state, role)
                         if admitted is not None:
                             admitted.append(True)
@@ -2745,6 +2861,9 @@ class CDPAWorker:
                         )
                         state["roles"][role]["temporary_document_id"] = await self._temporary_document_token(acquired.client, create=True)
                         self._record_acquired(state, role, acquired)
+                        if acquired.new_chat:
+                            hop["conversation_generation"] = state["roles"][role]["conversation_generation"]
+                            hop["generation_started_here"] = True
                         return acquired
                 # Temporary URLs are generation evidence, never saved-conversation reopen targets.
                 expected_conversation = None
@@ -3099,6 +3218,201 @@ class CDPAWorker:
             pages.extend(await CDPATabActions(context, self.config).preflight_team(state))
         return pages
 
+    @staticmethod
+    def _stop_role_needs_owned_page(state: Mapping[str, Any], role: str) -> bool:
+        """Exclude queued intent only with role-specific no-execution proof."""
+        from .durable import RequestLedger
+
+        record = state["roles"][role]
+        if any(record.get(key) for key in (
+            "page_id", "page_url", "online", "conversation_generation", "turn",
+            "last_activity_at", "conversation_binding_id",
+            "temporary_document_id", "context_source", "branch_conversation_id",
+            "send_attempt_id", "writer_lease_epoch", "writer_reservation",
+        )) or any(record.get(key) is not None for key in (
+            "constructor_sent_generation", "attachments_uploaded_generation",
+            "reset_applied_generation",
+        )):
+            return True
+        hops = [
+            hop for hop in state.get("hops") or []
+            if str(hop.get("target_role") or "").upper() == role
+        ]
+        if not hops:
+            # A remembered active role without its hop has no pristine proof.
+            return role == str((state.get("cleanup") or {}).get("active_role") or "PLAN").upper()
+        for hop in hops:
+            if hop.get("state") != "pre_send":
+                return True
+            if any(hop.get(key) is not None for key in (
+                "receipt", "message_identity", "conversation_url", "response", "route",
+                "prompt", "prompt_sha256", "rendered_prompt_sha256", "report_path",
+                "response_sha256", "report_sha256", "report_size", "branch_conversation_id",
+                "conversation_generation", "conversation_binding_id", "send_attempt_id",
+                "writer_lease_epoch", "writer_reservation", "context_recovery_snapshot",
+            )) or set(hop.get("timestamps") or {}) - {"created_at"}:
+                return True
+            if any((hop.get("wait") or {}).values()) or hop.get("errors"):
+                return True
+            request_id = str(hop.get("request_id") or "").strip()
+            ledger_path = str(hop.get("ledger_path") or "").strip()
+            if not request_id or not ledger_path:
+                return True
+            # Request IDs are queued intent. peek is read-only; attempts/receipts
+            # in the durable owner outrank a pre_send hop even after a save gap.
+            prepared = RequestLedger(ledger_path).peek(request_id)
+            if prepared is not None and (
+                prepared.role != record["physical_role"]
+                or not prepared.pristine_before_dispatch()
+            ):
+                return True
+        return False
+
+    async def _continue_stop_writer_cleanup(
+        self,
+        state: dict[str, Any],
+        actions: CDPATabActions,
+        manifest_path: Path,
+        *,
+        force_retry: bool = False,
+    ) -> bool:
+        """Non-destructive Stop maintenance; never infer Send or turn completion."""
+        from .cdpa_conversations import ConversationWriterLease, canonical_conversation
+
+        cleanup = state["cleanup"]
+        if not force_retry and not self._cleanup_retry_due(cleanup):
+            return False
+        errors: list[str] = []
+        released: list[str] = []
+        stopped_response = False
+        try:
+            writer = ConversationWriterLease(self.runtime_db)
+            # RuntimeDB task ownership survives loss of active role/hop and task-save gaps.
+            bindings = [
+                binding for binding in writer.list_bindings(include_sealed=True)
+                if binding.get("task_id") == state.get("task_id")
+            ]
+            targets = [
+                (str(binding["role_key"]).upper(), binding)
+                for binding in bindings if binding.get("binding_status") != "sealed"
+            ]
+            # Partial Gate C coverage must not hide legacy role execution.
+            # All bindings, including sealed save-gap proof, remain authoritative.
+            covered_roles = {str(binding["role_key"]).upper() for binding in bindings}
+            for role in state.get("roles", {}):
+                if role not in covered_roles and self._stop_role_needs_owned_page(state, role):
+                    targets.append((role, None))
+            for role, binding in targets:
+                endpoint = str((binding or {}).get("endpoint_id") or self._execution_endpoint_id(state, role) or self.store.endpoint_id_for(state))
+                already_held = asyncio.current_task() in self._endpoint_admission_holds
+                try:
+                    await self._acquire_endpoint_admission(state, role, endpoint_id=endpoint)
+                    selected_actions = actions
+                    if self._endpoint_pool is not None:
+                        context = self._endpoint_pool.contexts.get(endpoint)
+                        if context is None:
+                            raise RoleOwnershipError(f"Stop cannot verify unavailable browser {endpoint}")
+                        selected_actions = CDPATabActions(context, self.config)
+                    exact_state = copy.deepcopy(state)
+                    if binding is not None:
+                        record = exact_state["roles"][role]
+                        record["page_id"] = binding["page_target_identity"]
+                        cdp, physical = self._gate_c_endpoint_evidence(endpoint)
+                        if cdp != binding["endpoint_cdp_url"] or physical != binding["physical_browser_id"]:
+                            raise RoleOwnershipError("Stop endpoint identity changed")
+                    acquired = await selected_actions.locate_owned(exact_state, role)
+                    if acquired is None:
+                        raise RoleOwnershipError("Stop has no exact owned page evidence")
+
+                    async def verify_page() -> Any:
+                        current = await acquired.client.assert_ownership()
+                        record = exact_state["roles"][role]
+                        if (
+                            current.page_id != acquired.page_id
+                            or current.page_task_id != state["task_id"]
+                            or current.page_team != state["team"]
+                            or current.page_role != record["physical_role"]
+                        ):
+                            raise RoleOwnershipError("Stop page ownership changed")
+                        if binding is not None:
+                            if acquired.page_id != binding["page_target_identity"]:
+                                raise RoleOwnershipError("Stop page identity changed")
+                            canonical = binding.get("canonical_conversation_id")
+                            if canonical and canonical_conversation(str(current.url)) != canonical:
+                                raise RoleOwnershipError("Stop conversation identity changed")
+                            if binding.get("temporary_chat") and await self._temporary_document_token(acquired.client, create=False) != binding.get("temporary_document_id"):
+                                raise RoleOwnershipError("Stop temporary document identity changed")
+                        return current
+
+                    await verify_page()
+                    stopped_response = await selected_actions.stop_if_active(acquired) or stopped_response
+                    current = await verify_page()
+                    if (
+                        current.stop_visible is not False
+                        or current.response_activity_turn_id
+                        or current.response_projection_active is not False
+                    ):
+                        raise RoleOwnershipError("Stop page is still responding")
+                    if binding is not None:
+                        writer.close_binding(str(binding["binding_id"]))
+                        released.append(str(binding["binding_id"]))
+                except Exception as exc:
+                    errors.append(sanitize_exception(exc))
+                finally:
+                    if not already_held:
+                        self._release_endpoint_admission()
+        except Exception as exc:
+            errors.append(sanitize_exception(exc))
+
+        def record_result(current: dict[str, Any]) -> dict[str, Any]:
+            current_cleanup = current["cleanup"]
+            current_cleanup["released_bindings"] = sorted(set(current_cleanup.get("released_bindings") or []) | set(released))
+            if errors:
+                self._record_cleanup_failure(current, RuntimeError("; ".join(errors)))
+                # Stop remains applied. Existing bounded retry delays, without permanent suppression.
+                if current_cleanup.get("retry_suppressed"):
+                    current_cleanup["retry_suppressed"] = False
+                    current_cleanup["next_retry_at"] = (datetime.now(timezone.utc) + timedelta(seconds=_CLEANUP_RETRY_DELAYS_SECONDS[-1])).isoformat()
+            else:
+                self._reset_cleanup_retry_gate(current_cleanup)
+                clear_control = self._cleanup_control(current, current_cleanup)
+                if (
+                    clear_control is not None
+                    and clear_control.get("action") == "clear_team"
+                    and clear_control.get("status") in {"requested", "cleanup_pending"}
+                ):
+                    # Persist the handoff with the exact Clear identity, never a
+                    # STOP_RELEASED gap that could strand a cleanup_pending control.
+                    current_cleanup.update(
+                        state="CLEARING", phase="stop_pending",
+                        clear_requested_at=current_cleanup.get("clear_requested_at") or utc_now(),
+                        cleared_at=None, verified_empty_at=None,
+                        status_before=str(current.get("status") or "").upper(),
+                        terminal_state_before=current.get("terminal_state"),
+                        target_tabs=int(current_cleanup.get("target_tabs") or 0),
+                        closed_tabs=int(current_cleanup.get("closed_tabs") or 0),
+                        retry_count=0, last_error=None, last_error_at=None,
+                    )
+                    current["active_action"] = "cleanup_stop_pending"
+                else:
+                    current_cleanup.update(state="STOP_RELEASED", phase="writer_released", last_error=None)
+                    current["active_action"] = "stopped"
+            control = next((item for item in current.get("controls") or [] if item.get("control_id") == current_cleanup.get("stop_control_id")), None)
+            if control is not None:
+                previous_result = control.get("result") or {}
+                control["result"] = {
+                    "stopped_response": bool(previous_result.get("stopped_response")) or stopped_response,
+                    "writer_cleanup_pending": bool(errors),
+                    "released_bindings": current_cleanup["released_bindings"],
+                    "browser_stop_error": "; ".join(errors) or None,
+                }
+            return current
+
+        saved = self.store.update(manifest_path, record_result)
+        state.clear()
+        state.update(saved)
+        return not errors
+
     async def _continue_cleanup(
         self,
         state: dict[str, Any],
@@ -3117,6 +3431,14 @@ class CDPAWorker:
             return state
 
         cleanup = state.setdefault("cleanup", {})
+        if cleanup.get("phase") == "writer_stop_pending":
+            if not await self._continue_stop_writer_cleanup(
+                state, actions, manifest_path, force_retry=force_retry
+            ):
+                return False
+            cleanup = state["cleanup"]
+            if cleanup.get("state") == "STOP_RELEASED":
+                return True
         if cleanup.get("state") == "CLEARED":
             return True
         if cleanup.get("state") != "CLEARING":
@@ -3895,6 +4217,8 @@ class CDPAWorker:
     ) -> None:
         if is_independent_task(state) or str(state.get("status") or "").upper() != "BLOCKED":
             return
+        if state.get("block_code") == "temporary_fresh_context_unverified":
+            return  # Preserve the exact page that was unsafe to replace.
         try:
             hop = _active_hop(state)
         except Exception:
@@ -3972,6 +4296,105 @@ class CDPAWorker:
         )
         hop["generation_started_here"] = True
 
+    async def _inspect_presend_acquisition_orphans(
+        self, actions: CDPATabActions, state: Mapping[str, Any], role: str,
+    ) -> dict[str, Any]:
+        """Read-only live inventory; negative live inventory is not historical proof."""
+        from .cdpa_browser_projection import inspect_page_metadata
+
+        context = getattr(actions, "browser_context", None)
+        pages = getattr(context, "pages", None)
+        if pages is None:
+            return {"reason_code": "browser_inventory_unavailable", "possible_orphans": None}
+        possible = 0
+        try:
+            for page in list(pages):
+                if page.is_closed():
+                    continue
+                url = str(getattr(page, "url", "") or "")
+                if not url.startswith(("https://chatgpt.com", "https://www.chatgpt.com")):
+                    continue
+                metadata = await inspect_page_metadata(page)
+                # Unknown ownership is a possible orphan, never a reusable tab.
+                if not metadata.get("page_id") or not all(
+                    metadata.get(key) for key in ("task_id", "team", "role")
+                ):
+                    possible += 1
+                    continue
+                if (
+                    metadata.get("task_id") == state.get("task_id")
+                    or metadata.get("team") == state.get("team")
+                    or metadata.get("role") == state["roles"][role]["physical_role"]
+                ):
+                    possible += 1
+        except Exception:
+            return {"reason_code": "browser_inventory_incomplete", "possible_orphans": None}
+        return {
+            "reason_code": (
+                "possible_orphan_or_anonymous_tab"
+                if possible else "historical_external_send_absence_unproven"
+            ),
+            "possible_orphans": possible,
+        }
+
+    async def _reconcile_presend_acquisition_hold(
+        self,
+        state: dict[str, Any],
+        control: Mapping[str, Any],
+        actions: CDPATabActions,
+    ) -> dict[str, Any]:
+        """Classify one exact historical acquisition; no browser mutation is authorized."""
+        role = str(state.get("active_role") or "").upper()
+        identity = control.get("acquisition_identity")
+        hop = _active_hop(state)
+        record = state.get("roles", {}).get(role, {})
+        if not isinstance(identity, Mapping) or any(
+            identity.get(key) != actual for key, actual in (
+                ("browser_endpoint_id", state.get("browser_endpoint_id")),
+                ("active_role", role),
+                ("physical_role", record.get("physical_role")),
+                ("conversation_generation", record.get("conversation_generation")),
+                ("request_id", hop.get("request_id")),
+                ("preboundary_recovery", hop.get("preboundary_recovery")),
+            )
+        ):
+            raise IneffectiveControlError("historical acquisition command snapshot changed")
+        command = control.get("command")
+        snapshot = command.get("snapshot") if isinstance(command, Mapping) else None
+        if not isinstance(snapshot, Mapping):
+            raise IneffectiveControlError("historical acquisition command identity missing")
+        current = command_snapshot(state, role=role)
+        for field in (
+            "active_hop_id", "active_request_id", "active_role", "hop_state",
+            "hop_turn", "physical_role", "page_id", "conversation_id",
+            "conversation_generation", "receipt_sha256", "block_code", "status",
+        ):
+            if snapshot.get(field) != current.get(field):
+                raise IneffectiveControlError(f"historical acquisition command {field} stale")
+        verdict = self._classify_presend_acquisition(state)
+        if verdict["classification"] == "pristine_candidate":
+            browser = await self._inspect_presend_acquisition_orphans(actions, state, role)
+            reason_code = str(browser["reason_code"])
+        else:
+            browser = {"possible_orphans": None}
+            reason_code = str(verdict["reason_code"])
+        return {
+            "outcome": "safe_hold",
+            "action": "reconcile_presend_acquisition",
+            "reason_code": reason_code,
+            "reason": (
+                "Historical external Send and original unbound-tab provenance "
+                "cannot be conclusively excluded; keep the exact request blocked."
+            ),
+            "classification": verdict["classification"],
+            "send_authorized": False,
+            "next_safe_action": verdict["next_safe_action"],
+            "postcondition": "blocked_pre_send_identity_preserved",
+            "possible_orphans": browser["possible_orphans"],
+            "request_id": hop["request_id"],
+            "browser_endpoint_id": state["browser_endpoint_id"],
+        }
+
     async def _apply_control(
         self,
         state: dict[str, Any],
@@ -4036,6 +4459,10 @@ class CDPAWorker:
                         role=role,
                         hop=hop,
                     )
+            elif action == "reconcile_presend_acquisition":
+                if manifest_path is None:
+                    raise RuntimeError("historical acquisition reconciliation requires durable manifest")
+                result = await self._reconcile_presend_acquisition_hold(state, control, actions)
             elif action == "release_required_browser_endpoint":
                 if not self._execution_is_pristine_pre_send(
                     state, allow_prepared_ledger=True
@@ -4421,17 +4848,21 @@ class CDPAWorker:
                     raise RuntimeError("Stop is invalid for a terminal task")
                 self._terminalize_controls_superseded_by_stop(state, control)
                 stop_role = str(state.get("active_role") or role).upper()
-                stopped_response = False
-                browser_stop_error = None
-                try:
-                    acquired = await actions.locate_owned(state, stop_role)
-                    if acquired is not None:
-                        stopped_response = await actions.stop_if_active(acquired)
-                except Exception as exc:
-                    browser_stop_error = sanitize_exception(exc)
-                result = {"stopped_response": stopped_response}
-                if browser_stop_error:
-                    result["browser_stop_error"] = browser_stop_error
+                # Persist the requested action and maintenance phase before browser/DB
+                # side effects. Retry discovers bindings by durable task ownership.
+                cleanup = state.setdefault("cleanup", {})
+                cleanup.update(
+                    state="CLEARING",
+                    phase="writer_stop_pending",
+                    active_role=stop_role,
+                    active_hop_id=state.get("active_hop_id"),
+                    stop_control_id=control_id,
+                    control_id=None,
+                    released_bindings=[],
+                    last_error=None,
+                )
+                self._reset_cleanup_retry_gate(cleanup)
+                result = {"stopped_response": False, "writer_cleanup_pending": True}
                 state["status"] = "STOPPED"
                 state["terminal_state"] = "STOPPED"
                 state["kanban_column"] = "DONE_STOPPED"
@@ -5130,6 +5561,8 @@ class CDPAWorker:
             state.update(saved)
             if persisted_result is not None:
                 persisted_result.append(True)
+            if action == "stop" and state.get("cleanup", {}).get("phase") == "writer_stop_pending":
+                await self._continue_cleanup(state, actions, manifest_path, force_retry=True)
         return True
 
     @staticmethod
@@ -6035,7 +6468,18 @@ class CDPAWorker:
             await self._dismiss_known_rate_limit_on_existing(acquired)
         elif not isinstance(independent, Mapping) and state.get("conversation_mode") == "temporary":
             acquired = await actions.locate_owned(state, role)
-            token = state["roles"][role].get("temporary_document_id")
+            role_record = state["roles"][role]
+            token = role_record.get("temporary_document_id")
+            # A returned ownership match is not proof of a fresh acquisition.
+            if acquired is not None and not role_record.get("conversation_generation"):
+                if not await self._can_replace_unproven_temporary_page(acquired):
+                    self._block(
+                        state,
+                        "Owned page has no fresh Temporary Chat generation and is not safe to replace.",
+                        code="temporary_fresh_context_unverified",
+                    )
+                    return
+                acquired = None
             if acquired is not None and token and await self._temporary_document_token(acquired.client) != token:
                 acquired = None
             if acquired is None:
@@ -6325,6 +6769,13 @@ class CDPAWorker:
                 continuation=continuation,
                 repair_error=repair_error,
                 repair_candidate=repair_candidate,
+                temporary_context=state.get("conversation_mode") == "temporary",
+                recovery_handoff=(
+                    str(hop.get("handoff") or "")
+                    if state.get("conversation_mode") == "temporary"
+                    and str(hop.get("kind") or "") == "execution_recovery"
+                    else ""
+                ),
             )
             prompt = built.text
             hop["prompt"] = prompt
@@ -6772,6 +7223,14 @@ class CDPAWorker:
             # pooled execution supplies the real devtools browser identity above.
             physical_id = f"endpoint:{endpoint_id}:{cdp_url}"
         return cdp_url, physical_id
+
+    def _gate_c_has_send_intent(self, hop: Mapping[str, Any]) -> bool:
+        if hop.get("send_attempt_id") is not None:
+            return True
+        self.runtime_db.ensure_schema()
+        return self.runtime_db.get_command_by_idempotency_key(
+            f"browser-send:{hop['request_id']}"
+        ) is not None
 
     async def _gate_c_prepare_browser_send(
         self,
@@ -8396,7 +8855,9 @@ class CDPAWorker:
         waiting = state.get("waiting") if isinstance(state.get("waiting"), Mapping) else {}
         now = utc_now()
         if status in TERMINAL:
-            self._gate_c_release_continuation_writer(continuation)
+            # Pending Stop owns release after attempt and exact-page proof.
+            if (state.get("cleanup") or {}).get("phase") != "writer_stop_pending":
+                self._gate_c_release_continuation_writer(continuation)
             continuation["state"] = "completed"
             continuation["wake"] = {"status": "not_woken", "reason": "parent task is terminal", "at": now}
         elif (
@@ -9622,8 +10083,9 @@ class CDPAWorker:
         evidence suggests progress. When the hop carries no receipt, no
         message identity and no response, its prompt still matches its
         persisted hash, no attachments were uploaded in this generation,
-        and the role has no started (canonical) conversation, the Send
-        boundary provably was never crossed.
+        and the role has no started (canonical) conversation, a known
+        pre-intent failure can prove the hop never crossed Send. Prior
+        progress is only allowed for a separately identified recovery child.
         """
         if is_independent_task(state):
             return False
@@ -9631,7 +10093,8 @@ class CDPAWorker:
             return False
         if any(
             hop.get(field) is not None
-            for field in ("receipt", "message_identity", "response")
+            for field in ("receipt", "message_identity", "response", "send_attempt_id",
+                          "conversation_binding_id", "writer_lease_epoch")
         ):
             return False
         prompt = str(hop.get("prompt") or "")
@@ -9661,6 +10124,14 @@ class CDPAWorker:
             return False  # A real conversation already exists for this role.
         if role_record.get("branch_conversation_id"):
             return False
+        manifest_path = str(state.get("manifest_path") or "").strip()
+        hop_ledger_path = str(hop.get("ledger_path") or "").strip()
+        if not manifest_path or not hop_ledger_path:
+            return False
+        if Path(hop_ledger_path).resolve() != Path(manifest_path).resolve().with_name("requests.json"):
+            return False
+        if self._is_stale_temporary_recovery_writer(state, hop, role_record):
+            return True
         for entry in state.get("route_timeline") or []:
             # Operator role restarts are not workflow progress; every other
             # timeline entry records an agent route decision or a post-Send
@@ -9678,12 +10149,6 @@ class CDPAWorker:
                 for field in ("receipt", "message_identity", "response", "route")
             ):
                 return False
-        manifest_path = str(state.get("manifest_path") or "").strip()
-        hop_ledger_path = str(hop.get("ledger_path") or "").strip()
-        if not manifest_path or not hop_ledger_path:
-            return False
-        if Path(hop_ledger_path).parent.resolve() != Path(manifest_path).parent.resolve():
-            return False
         # Positive provenance: the recorded failure for this hop must be a
         # pre-durable-send failure class (identity/binding verification
         # happens before the durable send block begins its request).
@@ -9700,21 +10165,61 @@ class CDPAWorker:
             return False
         return True
 
+    @staticmethod
+    def _is_stale_temporary_recovery_writer(
+        state: Mapping[str, Any],
+        hop: Mapping[str, Any],
+        role_record: Mapping[str, Any],
+    ) -> bool:
+        """Recognize the old writer reference on an already-prepared recovery child."""
+        if (
+            state.get("conversation_mode") != "temporary"
+            or hop.get("kind") != "execution_recovery"
+            or hop.get("generation_started_here") is not True
+            or not isinstance(hop.get("conversation_generation"), int)
+            or hop.get("conversation_generation") != role_record.get("conversation_generation")
+            or not role_record.get("temporary_document_id")
+            or not role_record.get("conversation_binding_id")
+            or "CONVERSATION_IDENTITY_MISMATCH: binding evidence changed before browser send"
+            not in (hop.get("errors") or ())
+        ):
+            return False
+        parent = next(
+            (item for item in state["hops"] if item["hop_id"] == hop.get("parent_hop_id")), None,
+        )
+        receipt = (parent or {}).get("receipt") or {}
+        parent_page_id = (receipt.get("binding") or {}).get("page_id")
+        return bool(
+            parent
+            and parent["state"] == "abandoned"
+            and parent["request_id"] == hop.get("recovery_of_request_id")
+            and parent["target_role"] == hop["target_role"]
+            and parent["physical_role"] == hop["physical_role"]
+            and parent["ledger_path"] == hop["ledger_path"]
+            and parent.get("conversation_binding_id") == role_record["conversation_binding_id"]
+            and parent_page_id and role_record.get("page_id") and parent_page_id != role_record["page_id"]
+            and int(parent.get("conversation_generation") or 0) < hop["conversation_generation"]
+            and (parent.get("execution_recovery") or {}).get("target_endpoint_id")
+            == hop.get("browser_endpoint_id") == state.get("browser_endpoint_id")
+        )
+
     def _ledger_records_exist_for_hop(
         self, ledger_path: str, hop: Mapping[str, Any]
     ) -> bool:
         try:
-            raw = json.loads(Path(ledger_path).read_bytes().decode("utf-8"))
-        except Exception:
+            raw = json.loads(read_shared_bytes(ledger_path))
+        except FileNotFoundError:
             return False
-        if not isinstance(raw, Mapping):
-            return False
+        except (OSError, ValueError):
+            return True  # Cannot prove absence in an unreadable ledger.
+        if not isinstance(raw, Mapping) or raw.get("version") != RequestLedger.VERSION:
+            return True
         records = raw.get("records")
-        if not isinstance(records, Mapping):
-            return False
+        if not isinstance(records, Mapping) or hop.get("request_id") in records:
+            return True
         for record in records.values():
             if not isinstance(record, Mapping):
-                continue
+                return True
             source_context = record.get("source_context")
             if isinstance(source_context, Mapping) and source_context.get(
                 "hop_id"
@@ -9750,11 +10255,13 @@ class CDPAWorker:
             durable = RequestLedger(ledger_path).peek(request_id)
         except Exception:
             durable = None
+        stale_temporary_writer = False
         if durable is None:
             if (
                 not allow_missing_ledger
                 or not self._manifest_proves_pristine_pre_send(state, hop, role_record)
                 or self._ledger_records_exist_for_hop(ledger_path, hop)
+                or self._gate_c_has_send_intent(hop)
             ):
                 self._require_resume_recovery(
                     state,
@@ -9765,6 +10272,7 @@ class CDPAWorker:
                     next_safe_action="Restore the durable request record; do not relocate or resend the prompt.",
                 )
                 return
+            stale_temporary_writer = self._is_stale_temporary_recovery_writer(state, hop, role_record)
             # No ledger record exists for this hop, but the manifest proves
             # it is pristine pre-Send (see _manifest_proves_pristine_pre_send):
             # the failure happened before the durable send block began its
@@ -9796,6 +10304,37 @@ class CDPAWorker:
             and hop.get("rebuild_prompt_after_relocation") is True
             and not role_record.get("temporary_document_id")
         ):
+            acquired = None
+        if (
+            stale_temporary_writer
+            and acquired is not None
+            and await self._temporary_document_token(acquired.client) != role_record["temporary_document_id"]
+        ):
+            self._require_resume_recovery(
+                state,
+                control,
+                action="confirm_preboundary_role",
+                reason_code="temporary_document_changed",
+                reason="The owned Temporary Chat document no longer matches the prepared recovery hop.",
+                next_safe_action="Reconcile the exact owned page before Resume.",
+            )
+            return
+        if (
+            temporary_recovery
+            and acquired is not None
+            and generation == 0
+            and hop.get("generation_started_here") is not True
+        ):
+            if not await self._can_replace_unproven_temporary_page(acquired):
+                self._require_resume_recovery(
+                    state,
+                    control,
+                    action="reacquire_preboundary_role",
+                    reason_code="temporary_fresh_context_unverified",
+                    reason="Owned page has no fresh Temporary Chat generation and is not safe to replace.",
+                    next_safe_action="Inspect the owned page without sending or discarding any draft.",
+                )
+                return
             acquired = None
         proven_operator_fresh = False
         if acquired is None:
@@ -10001,10 +10540,17 @@ class CDPAWorker:
         )
         if int(role_record.get("conversation_generation") or 0) != generation:
             raise RuntimeError("pre-boundary role replacement changed conversation generation")
-        if temporary_recovery and (acquired.created or acquired.new_chat):
+        if temporary_recovery and acquired.new_chat:
             role_record["temporary_document_id"] = await self._temporary_document_token(
                 acquired.client, create=True
             )
+            # Pristine Resume keeps the logical generation, but the new document
+            # needs its own fresh-acquisition proof at the next owned lookup.
+            hop["conversation_generation"] = generation
+            hop["generation_started_here"] = True
+        if stale_temporary_writer:
+            # Do not carry the parent's binding onto the child's fresh document.
+            role_record.pop("conversation_binding_id", None)
         hop["conversation_url"] = acquired.url
         state["status"] = "RUNNING"
         state["kanban_column"] = _column_for(role)
@@ -11501,7 +12047,7 @@ class CDPAWorker:
                     else None
                 )
                 persisted_control: list[bool] = []
-                if pending_action in {"open_tab", "restart_role", "new_chat"}:
+                if pending_action in {"open_tab", "restart_role", "new_chat", "reconcile_presend_acquisition"}:
                     control_role = str(
                         (pending_control or {}).get("role")
                         or state.get("active_role")
@@ -11550,7 +12096,10 @@ class CDPAWorker:
                 if state.get("status") == "WAITING":
                     return state
                 if state.get("status") in TERMINAL:
-                    if is_independent_task(state):
+                    if (
+                        is_independent_task(state)
+                        or state.get("cleanup", {}).get("state") == "STOP_RELEASED"
+                    ):
                         return state
                     if scheduling_tasks is None:
                         raise RuntimeError("terminal cleanup requires runtime registry tasks")
@@ -14853,6 +15402,7 @@ class CDPAWorker:
                             "open_tab",
                             "restart_role",
                             "new_chat",
+                            "reconcile_presend_acquisition",
                         }:
                             control_role = str(
                                 pending_control.get("role")

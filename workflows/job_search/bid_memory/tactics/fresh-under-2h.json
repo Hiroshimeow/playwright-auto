@@ -1,0 +1,13 @@
+{
+  "title": "Bid while the listing is fresh",
+  "rule": "Prefer projects under 2 hours old; capture listing age at the actual bid boundary.",
+  "classes": [],
+  "evidence": {
+    "playbook": {
+      "kind": "guidance",
+      "note": "Freshness rule; no bid-time ages recovered in the seed.",
+      "source": "Muse bid-playbook.md as summarized in .runtime/job-search/pi-jobs/bid-memory-brief-20261119.md; workspace file not inspected"
+    }
+  },
+  "last_updated": "2026-11-19"
+}
