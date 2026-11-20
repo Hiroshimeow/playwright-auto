@@ -3781,25 +3781,25 @@ class ChatGPTPage:
         if not self.model_effort_gate_required:
             return None
 
+        picker = self.page.get_by_role("button", name="Select ChatGPT model")
+
         async def read_effort() -> str | None:
             try:
-                picker = self.page.get_by_role("button", name="Select ChatGPT model")
                 if await picker.count() != 1 or not await picker.is_visible():
                     return None
                 text = " ".join((await picker.inner_text()).split())
             except Exception:
                 return None
-            if not text.startswith("Thinking effort "):
+            # The compact picker drops the legacy "Thinking effort" prefix.
+            # Match the whole label so an unknown option ending in "High" cannot pass.
+            match = re.fullmatch(
+                r"(?:Thinking effort (?:[0-9]+(?:\.[0-9]+)* )?)?(Extra High|High|Pro|Medium|Low)",
+                text,
+            )
+            if match is None:
                 return None
-            if text.endswith("Extra High"):
-                return "Extra High"
-            if text.endswith("High"):
-                return "High"
-            if text.endswith("Pro"):
-                return "Pro"
-            if text.endswith(("Medium", "Low")):
-                return "below_high"
-            return None
+            effort = match[1]
+            return "below_high" if effort in {"Medium", "Low"} else effort
 
         effort = await read_effort()
         if effort in {"High", "Extra High", "Pro"}:
@@ -3819,7 +3819,6 @@ class ChatGPTPage:
         # The supported G6 UI has a visible Power menu and a five-position
         # effort slider. Only the owned page may be changed; reverify after it.
         try:
-            picker = self.page.get_by_role("button", name="Select ChatGPT model")
             await picker.click()
             power = self.page.locator('[role="menuitem"][aria-label="Power"]')
             if await power.count() != 1:

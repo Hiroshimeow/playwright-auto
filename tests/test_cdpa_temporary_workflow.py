@@ -11,6 +11,7 @@ from playwright_auto.cdpa_config import load_cdpa_config
 from playwright_auto.cdpa_conversations import ConversationWriterLease
 from playwright_auto.cdpa_store import TaskStore
 from playwright_auto.cdpa_worker import CDPAWorker, _active_hop
+from playwright_auto.chatgpt_errors import UnsafePageStateError
 from playwright_auto.durable import RequestLedger, RequestStatus
 
 from test_cdpa_actions import FakeContext, FakePage
@@ -483,6 +484,91 @@ def test_temporary_dev_generation_loss_uses_new_writer_without_replaying(tmp_pat
         assert len(original.client.send_calls) == len(actions.current.client.send_calls) == 1
         assert actions.current.client.send_max_attempts == [1]
         assert actions.current.client.send_recovery_reload == [False]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("intent_state", ["intent_recorded", "submitted", "accepted"])
+def test_temporary_model_gate_resume_preserves_exact_request(tmp_path, intent_state):
+    store, state, worker = _temporary_task(tmp_path, task_id="task-temp-model-gate")
+    hop = _active_hop(state)
+    request_id = hop["request_id"]
+    key = f"browser-send:{request_id}"
+
+    class Actions(TemporaryWorkflowActions):
+        current = None
+
+        async def locate_owned(self, _state, _role):
+            if self.current:
+                return replace(self.current, created=False, new_chat=False)
+            return None
+
+        async def fresh_chat(self, state, role, *, url, clean_for_send=False):
+            assert url == TEMPORARY_CHAT_URL and clean_for_send
+            self.fresh_urls.append(url)
+            index = len(self.fresh_urls)
+            client = RecordingCDPASendClient(task_id=state["task_id"], team=state["team"])
+            client.current = replace(client.current, url=url, session_id=None)
+            client.binding = replace(client.binding, page_id=f"model-tab-{index}", role=hop["physical_role"])
+
+            async def evaluate(*_args):
+                return f"model-doc-{index}"
+
+            client.page = SimpleNamespace(evaluate=evaluate)
+            if index == 1:
+                async def block_set_text(_text):
+                    raise UnsafePageStateError("model_verification_blocked: exact task tab does not show High/Extra High/Pro")
+                client.set_text = block_set_text
+            self.current = AcquiredRole(client, client.binding.page_id, url, True, True)
+            return self.current
+
+    async def run():
+        actions = Actions()
+        await worker._pre_send(state, hop, actions)
+        # Save gap: the old durable writer intent exists, but the manifest's
+        # attempt and binding fields were rolled back when the gate raised.
+        before = dict(hop)
+        with pytest.raises(UnsafePageStateError, match="model_verification_blocked") as error:
+            await worker._sending(state, hop, actions)
+        original = actions.current.client
+        hop.clear()
+        hop.update(before)
+        state["roles"]["PLAN"].pop("conversation_binding_id", None)
+        worker._block(state, error.value, code="unexpected_error", retryable=False)
+        actions.current = None  # the worker closed the blocked pristine tab
+        row = worker.runtime_db.get_command_by_idempotency_key(key)
+        writers = ConversationWriterLease(worker.runtime_db)
+        if intent_state != "intent_recorded":
+            # Contradictory writer evidence must not be erased by a NEW ledger.
+            writers.transition_attempt(row["command_id"], intent_state)
+        ledger = RequestLedger(hop["ledger_path"])
+        assert ledger.peek(request_id).status is RequestStatus.NEW
+        resumed_worker = CDPAWorker(worker.config, store=store)
+        control = {"action": "resume", "status": "recovering"}
+        try:
+            await resumed_worker._recover_resume_sending(state, hop, control, actions)
+        finally:
+            resumed_worker._release_endpoint_admission()
+        old = worker.runtime_db.get_command(row["command_id"])["payload"]["send_attempt"]
+        assert not original.send_calls
+        if intent_state != "intent_recorded":
+            assert control["status"] == "recovery_required"
+            assert len(actions.fresh_urls) == 1
+            assert old["state"] == intent_state
+            assert ledger.peek(request_id).attempts == 0
+            return
+        assert control["status"] == "applied"
+        assert len(actions.fresh_urls) == 2
+        assert old["state"] == "reconciled_absent"
+        assert writers.get_binding(old["owner_binding_id"])["binding_status"] == "sealed"
+        await resumed_worker._sending(state, hop, actions)
+        assert state["block_code"] is None, state["block_reason"]
+        assert (hop["hop_id"], hop["request_id"], hop["state"]) == (1, request_id, "sent")
+        record = ledger.peek(request_id)
+        assert record.status is RequestStatus.SENT and record.attempts == 1 and record.receipt
+        assert len(actions.current.client.send_calls) == 1
+        new = worker.runtime_db.get_command(hop["send_attempt_id"])["payload"]["send_attempt"]
+        assert new["state"] == "accepted" and new["owner_binding_id"] != old["owner_binding_id"]
 
     asyncio.run(run())
 

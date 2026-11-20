@@ -7224,6 +7224,20 @@ class CDPAWorker:
             physical_id = f"endpoint:{endpoint_id}:{cdp_url}"
         return cdp_url, physical_id
 
+    def _gate_c_send_slot(
+        self, hop: Mapping[str, Any]
+    ) -> tuple[str, dict[str, Any] | None]:
+        base_key = key = f"browser-send:{hop['request_id']}"
+        previous = None
+        while (command := self.runtime_db.get_command_by_idempotency_key(key)) is not None:
+            attempt = command["payload"].get("send_attempt")
+            if not isinstance(attempt, Mapping) or attempt.get("state") != "reconciled_absent":
+                return key, command
+            # Keep reconciled attempts immutable; a replacement writer needs its own intent.
+            previous = command
+            key = f"{base_key}:after:{command['command_id']}"
+        return key, previous
+
     def _gate_c_has_send_intent(self, hop: Mapping[str, Any]) -> bool:
         if hop.get("send_attempt_id") is not None:
             return True
@@ -7249,10 +7263,6 @@ class CDPAWorker:
         cdp_url, physical_id = self._gate_c_endpoint_evidence(endpoint_id)
         writer = ConversationWriterLease(self.runtime_db)
         role_record = state["roles"][role]
-        binding_id = (
-            str(role_record.get("conversation_binding_id") or "").strip()
-            or self._gate_c_task_binding_id(state, role)
-        )
         temporary_chat = str(state.get("conversation_mode") or "persistent") == "temporary"
         temporary_document_id = (
             str(role_record.get("temporary_document_id") or "").strip() or None
@@ -7262,6 +7272,14 @@ class CDPAWorker:
                 "CONVERSATION_BINDING_INVALID",
                 "Temporary Chat has no verified document-scoped identity",
             )
+        send_key, _ = self._gate_c_send_slot(hop)
+        binding_id = str(role_record.get("conversation_binding_id") or "").strip()
+        if not binding_id:
+            binding_id = self._gate_c_task_binding_id(state, role)
+            if temporary_chat and send_key != f"browser-send:{hop['request_id']}":
+                # Resume preserves the logical generation, but the old binding
+                # is sealed and belongs to the prior Temporary document.
+                binding_id += "-" + _sha(str(temporary_document_id))[:24]
         verified_new_chat = bool(acquired.new_chat)
         if not verified_new_chat and hop.get("generation_started_here") is True:
             hop_generation = hop.get("conversation_generation")
@@ -7314,7 +7332,7 @@ class CDPAWorker:
         )
         attempt, _ = writer.record_send_intent(
             lease,
-            idempotency_key=f"browser-send:{hop['request_id']}",
+            idempotency_key=send_key,
             text=str(hop.get("prompt") or ""),
             baseline_last_user_message_id=baseline_last_user_message_id,
             baseline_user_turn_count=len(user_messages),
@@ -10227,6 +10245,45 @@ class CDPAWorker:
                 return True
         return False
 
+    def _reconcile_temporary_presend_writer(
+        self, state: Mapping[str, Any], hop: Mapping[str, Any], *, page_missing: bool
+    ) -> None:
+        from .cdpa_conversations import ConversationLeaseError, ConversationWriterLease
+
+        self.runtime_db.ensure_schema()
+        _, command = self._gate_c_send_slot(hop)
+        if command is None:
+            if hop.get("send_attempt_id") is not None:
+                raise ConversationLeaseError("SEND_ATTEMPT_NOT_FOUND", "Missing exact Send intent")
+            return
+        attempt = command["payload"].get("send_attempt")
+        if (
+            command["kind"] != "browser_send"
+            or command["task_id"] != state["task_id"]
+            or not isinstance(attempt, Mapping)
+            or attempt.get("attempt_id") != command["command_id"]
+            or attempt.get("text_hash") != hop["prompt_sha256"]
+            or attempt.get("state") not in {"intent_recorded", "reconciled_absent"}
+        ):
+            raise ConversationLeaseError("SEND_ATTEMPT_INVALID", "Writer evidence does not prove pre-Send")
+        if not page_missing:
+            return
+        writer = ConversationWriterLease(self.runtime_db)
+        binding = writer.get_binding(str(attempt.get("owner_binding_id") or ""))
+        if (
+            binding.get("task_id") != state["task_id"]
+            or binding.get("role_key") != hop["target_role"]
+            or binding.get("endpoint_id") != hop.get("browser_endpoint_id")
+            or binding.get("temporary_chat") is not True
+            or binding.get("writer_identity_key") != attempt.get("writer_identity_key")
+        ):
+            raise ConversationLeaseError("CONVERSATION_BINDING_INVALID", "Send intent does not own the exact Temporary role")
+        if attempt["state"] == "intent_recorded":
+            # The exact request ledger is pristine. DurableSendBlock records
+            # SENDING before the browser click, so this intent never dispatched.
+            writer.transition_attempt(command["command_id"], "reconciled_absent")
+        writer.close_binding(binding["binding_id"])
+
     async def _recover_pristine_preboundary_sending(
         self,
         state: dict[str, Any],
@@ -10294,6 +10351,32 @@ class CDPAWorker:
         postcondition = "ownership_confirmed_before_send"
         explicit_fresh = state.get("context_policy") == "fresh"
         temporary_recovery = state.get("conversation_mode") == "temporary"
+        if temporary_recovery and durable is not None:
+            # Recheck the exact ledger before interpreting a non-dispatched writer intent.
+            if not self._is_pristine_preboundary_sending_record(state, hop, durable):
+                self._require_resume_recovery(
+                    state, control, action="none",
+                    reason_code="durable_send_provenance_missing",
+                    reason="The exact Temporary request is no longer provably pre-Send.",
+                    next_safe_action="Reconcile the exact request ledger; do not resend.",
+                )
+                return
+            from .cdpa_conversations import ConversationLeaseError
+
+            try:
+                self._reconcile_temporary_presend_writer(
+                    state, hop, page_missing=acquired is None
+                )
+            except ConversationLeaseError as exc:
+                self._require_resume_recovery(
+                    state,
+                    control,
+                    action="none",
+                    reason_code=exc.code,
+                    reason=str(exc),
+                    next_safe_action="Reconcile the exact writer and request ledger; do not resend.",
+                )
+                return
         refresh_stale_recovery_prompt = (
             hop.get("kind") == "execution_recovery"
             and hop.get("rebuild_prompt_after_relocation") is True
@@ -10541,6 +10624,7 @@ class CDPAWorker:
         if int(role_record.get("conversation_generation") or 0) != generation:
             raise RuntimeError("pre-boundary role replacement changed conversation generation")
         if temporary_recovery and acquired.new_chat:
+            role_record.pop("conversation_binding_id", None)
             role_record["temporary_document_id"] = await self._temporary_document_token(
                 acquired.client, create=True
             )

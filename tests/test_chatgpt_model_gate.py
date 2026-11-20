@@ -33,12 +33,13 @@ class Power:
     async def press(self, key):
         assert key == "ArrowRight"
         self.page.arrows += 1
-        self.page.model = "Thinking effort High"
+        self.page.model = self.page.after_arrow
 
 
 class Page:
-    def __init__(self, model, *, count=1, power_count=1):
+    def __init__(self, model, *, count=1, power_count=1, after_arrow="Thinking effort High"):
         self.model, self.count, self.power_count = model, count, power_count
+        self.after_arrow = after_arrow
         self.clicks = self.arrows = 0
     def get_by_role(self, role, *, name):
         assert (role, name) == ("button", "Select ChatGPT model")
@@ -48,13 +49,16 @@ class Page:
         return Power(self)
 
 
-def probe(page, snapshot=None, *, gate_required=True):
+def probe(page, snapshot=None, *, gate_required=True, allow_change=True):
     client = ChatGPTPage(page)
     client.model_effort_gate_required = gate_required
     current = snapshot or owned()
     async def ownership(): return current
     client.assert_ownership = ownership
-    return asyncio.run(client._ensure_selfrepair_model_effort_locked(current)), page
+    result = asyncio.run(
+        client._ensure_selfrepair_model_effort_locked(current, allow_change=allow_change)
+    )
+    return result, page
 
 
 @pytest.mark.parametrize("value", [
@@ -67,8 +71,16 @@ def test_high_or_extra_high_is_accepted_without_click(value):
     assert page.clicks == page.arrows == 0
 
 
-def test_medium_switches_to_high_before_any_composer_fill():
-    result, page = probe(Page("Thinking effort Medium"))
+@pytest.mark.parametrize("effort", ["High", "Extra High", "Pro"])
+def test_compact_picker_verifies_without_changing_model_at_send(effort):
+    result, page = probe(Page(effort), owned(text="prepared prompt"), allow_change=False)
+    assert result == effort
+    assert page.clicks == page.arrows == 0
+
+
+@pytest.mark.parametrize("prefix", ["Thinking effort ", ""])
+def test_medium_switches_to_high_before_any_composer_fill(prefix):
+    result, page = probe(Page(prefix + "Medium", after_arrow=prefix + "High"))
     assert result == "High"
     assert page.clicks == page.arrows == 1
 
@@ -78,10 +90,19 @@ def test_medium_switches_to_high_before_any_composer_fill():
     ("Thinking effort Medium", 2),
     ("Thinking effort Auto", 1),
     ("Unknown UI", 1),
+    ("Not Extra High", 1),
+    ("Thinking effort Not High", 1),
 ])
 def test_model_unobservable_or_unknown_blocks_send(value,count):
     with pytest.raises(UnsafePageStateError, match="model_verification_blocked"):
         probe(Page(value, count=count))
+
+
+def test_compact_below_high_fails_closed_at_send():
+    page = Page("Medium", after_arrow="High")
+    with pytest.raises(UnsafePageStateError, match="model_verification_blocked"):
+        probe(page, allow_change=False)
+    assert page.clicks == page.arrows == 0
 
 
 def test_model_change_refused_with_unowned_draft():
