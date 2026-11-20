@@ -305,9 +305,11 @@ def test_temporary_blank_terminal_recovers_only_route_on_same_turn(
     assert ledger.peek(hop["request_id"]) == accepted
 
 
-@pytest.mark.parametrize("guard", [None, "conflicting_route", "unselected_route", "terminal_route",
-                                     "missing_report", "receipt_mismatch", "route_budget", "malformed_reply"])
-def test_taskless_resume_recovers_exhausted_blank_route_from_exact_report(tmp_path, guard):
+@pytest.mark.parametrize("route_label", ["Route", "Route verdict"])
+@pytest.mark.parametrize("guard", [None, "conflicting_route", "nonfinal_route", "unselected_route",
+                                     "terminal_route", "missing_report", "receipt_mismatch",
+                                     "route_budget", "malformed_reply"])
+def test_taskless_resume_recovers_exhausted_blank_route_from_exact_report(tmp_path, guard, route_label):
     store, state, worker = _temporary_task(tmp_path, task_id="temp-exhausted-report-route")
     path = Path(state["manifest_path"])
     hop = _active_hop(state)
@@ -336,11 +338,15 @@ def test_taskless_resume_recovers_exhausted_blank_route_from_exact_report(tmp_pa
     report = tmp_path / hop["expected_report_path"]
     report.parent.mkdir(parents=True, exist_ok=True)
     route = {"unselected_route": "UNKNOWN", "terminal_route": "DONE"}.get(guard, "DEV")
-    body = "# Completed report\n\n"
+    body = f"# Completed report\n**Role:** PLAN | **Route:** {route} (independent checks).\n\n"
     if guard == "conflicting_route":
         body += "Route: REVIEW\n\n"
     if guard != "missing_report":
-        report.write_text(body + f"**Route:** **{route}**. Ready for independent checks.\n", encoding="utf-8")
+        target = route if route_label == "Route verdict" else f"**{route}**"
+        body += f"**{route_label}:** {target}. Ready for independent checks.\n"
+        if guard == "nonfinal_route":
+            body += "\nMore notes follow.\n"
+        report.write_text(body, encoding="utf-8")
     if guard == "receipt_mismatch":
         ledger.update(hop["request_id"], receipt=None)
     if guard == "route_budget":

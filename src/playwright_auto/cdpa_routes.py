@@ -145,10 +145,11 @@ def parse_route_response(
 def parse_report_route(text: str) -> str:
     """Read one explicit final Route declaration, never infer a route from prose."""
     lines = text.rstrip().splitlines()
-    declarations = [line for line in lines if re.match(r"^(?:Route:|\*\*Route:\*\*)", line)]
+    label = r"(?:Route(?: verdict)?:|\*\*Route(?: verdict)?:\*\*)"
+    declarations = [line for line in lines if re.match(label, line)]
     if len(declarations) == 1 and lines[-1] == declarations[0]:
         match = re.fullmatch(
-            r"(?:Route:|\*\*Route:\*\*)[ \t]+([A-Z][A-Z0-9_]{0,31}|\*\*[A-Z][A-Z0-9_]{0,31}\*\*)(?:\. [^\r\n]+|\.)?",
+            label + r"[ \t]+([A-Z][A-Z0-9_]{0,31}|\*\*[A-Z][A-Z0-9_]{0,31}\*\*)(?:\. [^\r\n]+|\.)?",
             declarations[0],
         )
         if match:
