@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ from playwright_auto.cdpa_conversations import ConversationWriterLease
 from playwright_auto.cdpa_store import TaskStore
 from playwright_auto.cdpa_worker import CDPAWorker, _active_hop
 from playwright_auto.chatgpt_errors import UnsafePageStateError
+from playwright_auto.chatgpt_models import MessageSnapshot
 from playwright_auto.durable import RequestLedger, RequestStatus
 
 from test_cdpa_actions import FakeContext, FakePage
@@ -190,6 +192,103 @@ def test_workflow_temporary_same_generation_reuses_owned_tab(tmp_path: Path):
     assert role["page_id"] == "temporary-plan-page"
     assert role["page_url"] == "https://chatgpt.com/c/current-temporary-generation"
     assert hop["state"] == "sending"
+
+
+@pytest.mark.parametrize("tab_lost,parent_kind,guard", [
+    (False, "handoff", None), (True, "handoff", None),
+    (False, "route_repair", None), (True, "route_repair", None),
+    (False, "handoff", "report_missing"), (False, "handoff", "draft"),
+    (False, "handoff", "receipt_mismatch"), (False, "route_repair", "budget_exhausted"),
+])
+def test_temporary_blank_terminal_recovers_only_route_on_same_turn(
+    tmp_path: Path, tab_lost, parent_kind, guard,
+):
+    _store, state, worker, path, hop, receipt, _ = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-temp-terminal-missing",
+    )
+    state["conversation_mode"] = "temporary"
+    state["context_policy"] = "fresh"
+    if parent_kind == "route_repair":
+        state["route_repair_count"] = 1
+        hop.update(kind=parent_kind, repair_attempt=1)
+    else:
+        hop["kind"] = parent_kind
+    report = tmp_path / hop["expected_report_path"]
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("# Completed report\n\nRoute requested: DEV\n", encoding="utf-8")
+    hop["timestamps"]["sent_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=worker.role_controller.policy.timeout_seconds + 1)
+    ).isoformat()
+    worker._start_wait_budget_from_sent(hop)
+    hop["wait"]["controller_progress_at"] = hop["timestamps"]["sent_at"]
+    ledger = RequestLedger(hop["ledger_path"])
+    if guard == "report_missing":
+        report.unlink()
+    if guard == "receipt_mismatch":
+        ledger.update(hop["request_id"], receipt=None)
+    if guard == "budget_exhausted":
+        state["route_repair_count"] = state["max_route_repairs"]
+    accepted = ledger.peek(hop["request_id"])
+    role = state["roles"]["PLAN"]
+    role.update(
+        conversation_generation=1,
+        temporary_document_id="temporary-document-test-token",
+        page_url="https://chatgpt.com/c/exact?temporary-chat=true",
+    )
+    snapshot = ready_client(state, "PLAN").assert_ownership.return_value
+    snapshot = replace(snapshot, url=role["page_url"], composer_text="my draft" if guard == "draft" else "", messages=(
+        MessageSnapshot("user", receipt.user_message_id, receipt.user_turn_id, receipt.prompt, ()),
+        MessageSnapshot("assistant", "empty", "exact-assistant", "", ()),
+    ))
+
+    class Actions(TemporaryWorkflowActions):
+        async def locate_owned(self, state, logical_role):
+            acquired = await super().locate_owned(state, logical_role)
+            if acquired is not None:
+                async def wait_snapshot(_receipt, **_kwargs):
+                    assert _receipt == receipt
+                    return snapshot
+                acquired.client.wait_snapshot = wait_snapshot
+            return acquired
+
+    actions = Actions(owned=not tab_lost)
+    if tab_lost:
+        # Resume admission clears block_code; the waiting hop retains its diagnosis.
+        hop["wait"]["controller_reason"] = "response_terminal_missing"
+        control = {"role": "PLAN", "status": "recovering", "result": {"before": {
+            "block_code": "response_terminal_missing",
+        }}}
+        asyncio.run(worker._recover_resume_waiting(state, hop, control, actions))
+        assert control["status"] == "applied"
+    else:
+        asyncio.run(worker._waiting(state, hop, actions, path))
+
+    repair = _active_hop(state)
+    assert ledger.peek(hop["request_id"]) == accepted
+    if guard:
+        assert repair is hop
+        assert state["status"] == "BLOCKED"
+        assert state["block_code"] == (
+            "ROUTE_VALIDATION_EXHAUSTED" if guard == "budget_exhausted" else "response_terminal_missing"
+        )
+        assert not actions.fresh_urls
+        return
+    assert state["status"] == "RUNNING" and state["block_code"] is None
+    assert repair["kind"] == "route_repair"
+    assert repair["parent_hop_id"] == hop["hop_id"]
+    assert repair["turn"] == hop["turn"]
+    assert repair["repair_attempt"] == (2 if parent_kind == "route_repair" else 1)
+    assert repair["request_id"] != hop["request_id"]
+    assert hop.get("response") is None
+    assert not actions.fresh_urls  # Queuing a repair does not itself touch Send or a tab.
+
+    asyncio.run(worker._pre_send(state, repair, actions))
+    assert actions.fresh_urls == ([TEMPORARY_CHAT_URL] if tab_lost else [])
+    assert repair["expected_report_path"] == hop["expected_report_path"]
+    assert str(report) in repair["prompt"]
+    assert "terminal result" in repair["prompt"]
+    assert state["task_text"] not in repair["prompt"]
+    assert ledger.peek(hop["request_id"]) == accepted
 
 
 def test_cross_endpoint_accepted_temporary_recovery_waits_for_same_team_endpoint(tmp_path: Path):

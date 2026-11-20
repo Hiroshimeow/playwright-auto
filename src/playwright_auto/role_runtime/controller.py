@@ -401,6 +401,26 @@ class RoleController:
                 else None
             ),
         )
+        if (
+            state.get("conversation_mode") == "temporary"
+            and decision.reason == "response_terminal_missing"
+            and any(
+                message.role == "assistant"
+                and message.message_id == wait.get("bound_assistant_message_id")
+                and not response.fingerprint(message)
+                for message in getattr(snapshot, "messages", ())
+            )
+            and not wait.get("result_seen_key")
+            and signals.composer_ready
+            and not signals.draft_present
+            and not getattr(snapshot, "retry_visible", False)
+            and not getattr(snapshot, "error_texts", ())
+            and worker._recover_missing_terminal_route(state, hop)
+        ):
+            # No text to admit. The worker queued a distinct request (or hit its
+            # existing repair limit) without modifying the accepted receipt.
+            decision = Decision(Action.REPAIR, "missing_terminal_route_repair")
+            wait.update(controller_decision=decision.action.value, controller_reason=decision.reason)
         identity = SignalIdentity.from_snapshot(
             snapshot,
             request_id=str(hop.get("request_id") or "") or None,
@@ -417,6 +437,8 @@ class RoleController:
             previous_decision=previous,
             decision=decision,
         )
+        if decision.reason == "missing_terminal_route_repair":
+            return decision
         state["active_action"] = "wait_response" if phase == "waiting" else "queued"
         if decision.action is Action.REFRESH and state.get("conversation_mode") == "temporary":
             # Temporary Chat documents are ephemeral. Reload can destroy the live

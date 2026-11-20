@@ -2064,6 +2064,13 @@ class CDPAWorker:
         role_record = state.get("roles", {}).get(role)
         if not isinstance(role_record, dict):
             return False
+        if (
+            state.get("conversation_mode") == "temporary"
+            and (hop.get("wait") or {}).get("controller_reason") == "response_terminal_missing"
+            and self._recover_missing_terminal_route(state, hop)
+        ):
+            # Keep the existing turn and repair budget when only the route is missing.
+            return True
         if not force_new_generation and self._execution_can_relocate(state, endpoint_id):
             return self._prepare_execution_endpoint(state, endpoint_id)
         snapshot = self._build_execution_recovery_snapshot(
@@ -6907,7 +6914,6 @@ class CDPAWorker:
                 else contract_context
             )
         if hop.get("kind") == "route_repair":
-            bounded_context = ""  # Format repair never reintroduces the original goal or handoff.
             repair_prompt = self.prompts.repair(
                 task_id=str(state["task_id"]),
                 team=str(state["team"]),
@@ -6918,7 +6924,10 @@ class CDPAWorker:
                 report_mode=_report_mode(state),
                 allowed_routes=allowed_routes,
             )
-            prompt = (bounded_context + "\n\n" if bounded_context else "") + repair_prompt
+            prompt = (
+                self.prompts.filesystem_scope(str(state["repository"]), expected)
+                + "\n\n" + repair_prompt
+            )
             included = False
         elif hop.get("kind") == "report_repair":
             locked_route = str(hop.get("locked_route") or "").strip().upper()
@@ -8199,6 +8208,55 @@ class CDPAWorker:
             return None
         status = str(payload.get("status") or "").strip().upper()
         return status or None
+
+    def _recover_missing_terminal_route(
+        self, state: dict[str, Any], hop: dict[str, Any],
+    ) -> bool:
+        """Continue only the route when a Temporary Team turn already wrote its report."""
+        if (
+            state.get("conversation_mode") != "temporary"
+            or is_independent_task(state)
+            or str(state.get("workflow_mode") or "team").lower() != "team"
+            or _report_mode(state) != "file"
+            or hop.get("kind") == "report_repair"  # Its accepted route is locked.
+            or not isinstance(hop.get("receipt"), Mapping)
+            or not hop.get("ledger_path")
+            or not hop.get("request_id")
+            or not hop.get("expected_report_path")
+        ):
+            return False
+        try:
+            receipt = SendReceipt.from_dict(hop["receipt"])
+            record = RequestLedger(hop["ledger_path"]).peek(hop["request_id"])
+        except (ValueError, OSError, DurableRequestError):
+            return False
+        if (
+            not (receipt.user_message_id or receipt.user_turn_id)
+            or record is None
+            or record.status is not RequestStatus.SENT
+            or record.attempts < 1
+            or record.accepted_at is None
+            or record.role != hop["physical_role"]
+            or record.receipt != hop["receipt"]
+            or (record.source_context is not None and record.source_context != {
+                "task_id": state["task_id"], "team": state["team"],
+                "hop_id": hop["hop_id"], "manifest": state["manifest_path"],
+            })
+        ):
+            return False
+        try:
+            self._validated_report_evidence(state, hop, hop["expected_report_path"])
+        except (ValueError, OSError):
+            return False
+        self._queue_format_repair(
+            state, hop, None,
+            RouteContractError(
+                f"Accepted request {hop['request_id']} produced no terminal result. "
+                "Read the existing report to choose the next route. "
+                "Leave the report unchanged and do not replay the Send."
+            ),
+        )
+        return True
 
     def _queue_format_repair(
         self,
@@ -9772,7 +9830,11 @@ class CDPAWorker:
         self._finish_resume_control(
             state, control, outcome="continued", action="resume_role_controller",
             reason_code=None, reason="The saved conversation is handled by the shared role controller.",
-            postcondition="response_consumed" if decision.action is Action.ACCEPT else "observation_rearmed",
+            postcondition=(
+                "response_consumed" if decision.action is Action.ACCEPT
+                else "route_repair_queued" if decision.action is Action.REPAIR
+                else "observation_rearmed"
+            ),
         )
 
     def _is_pristine_preboundary_sending_record(
