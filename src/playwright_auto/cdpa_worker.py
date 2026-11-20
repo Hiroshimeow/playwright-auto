@@ -45,6 +45,7 @@ from .cdpa_commands import (
     WorkerCommand,
     command_snapshot,
     conversation_identity,
+    exhausted_blank_route_recovery,
     validate_worker_command,
     workflow_control_eligibility,
 )
@@ -98,6 +99,7 @@ from .cdpa_response import (
 )
 from .cdpa_safety import sanitize_exception, sanitize_text, sanitize_value
 from .cdpa_route_contract import (
+    RouteContract,
     RoutePolicyError,
     apply_valid_route_transition,
     build_route_contract,
@@ -111,6 +113,7 @@ from .cdpa_routes import (
     expected_report_relative,
     handoff_report_evidence,
     materialize_inline_report,
+    parse_report_route,
     parse_role_response,
     parse_route_response,
     validate_file_report,
@@ -321,7 +324,7 @@ def _control_can_run_endpointless(
     except RuntimeError:
         return False
     hop_state = str(hop.get("state") or "").strip().lower()
-    if hop_state == "responded":
+    if hop_state == "responded" or exhausted_blank_route_recovery(state, hop):
         return True
     return hop_state == "routed" and str(hop.get("route") or "").strip().upper() == "PAUSE"
 
@@ -4729,6 +4732,7 @@ class CDPAWorker:
                     }
                     resume_completed = True
                 else:
+                    recover_report_route = hop is not None and exhausted_blank_route_recovery(state, hop)
                     if status == "PAUSED":
                         state["kanban_column"] = state.pop(
                             "resume_column", _column_for(str(state.get("active_role") or "PLAN"))
@@ -4781,6 +4785,22 @@ class CDPAWorker:
                             "before": command_snapshot(baseline, role=role),
                             "after": command_snapshot(state, role=role),
                         }
+                    elif recover_report_route:
+                        origin = control.get("origin") or (command.origin if command else "operator")
+                        if origin != "operator":
+                            raise IneffectiveControlError(
+                                "Report route recovery requires explicit operator Resume."
+                            )
+                        self._recover_exhausted_report_route(state, hop)
+                        result.update(
+                            outcome="continued",
+                            action="recover_report_route",
+                            reason_code=None,
+                            reason="Resumed from the verified report without replaying an accepted Send.",
+                            postcondition="report_route_recovered",
+                            after=command_snapshot(state, role=role),
+                        )
+                        resume_completed = True
             elif action == "safe_restore":
                 source_task_id = str(control.get("source_task_id") or "").strip()
                 source_event_key = str(control.get("source_event_key") or "").strip()
@@ -8237,28 +8257,34 @@ class CDPAWorker:
                 "response_terminal_missing", "missing_terminal_route_repair",
             }
             or parent.get("expected_report_path") != expected
-            or remote_repository_from_task(str(state.get("task_text") or "")) is not None
         ):
             return None
-        repository, _ = _workflow_report_roots(self.config, state)
-        path = repository / expected
         try:
-            if path.stat().st_size > 1024 * 1024:
-                return None
-            _, digest, _ = self._validated_report_evidence(state, hop, expected)
-            with path.open("rb") as handle:
-                data = handle.read(1024 * 1024 + 1)
+            text, _ = self._read_verified_route_report(state, hop, expected)
         except (OSError, ValueError):
             return None
-        if len(data) > 1024 * 1024 or hashlib.sha256(data).hexdigest() != digest:
-            return None
-        text = data.decode("utf-8", errors="replace").strip()
+        text = text.strip()
         return text if len(text) <= 3600 else text[:600] + "\n[... omitted ...]\n" + text[-3000:]
 
-    def _recover_missing_terminal_route(
-        self, state: dict[str, Any], hop: dict[str, Any],
-    ) -> bool:
-        """Continue only the route when a Temporary Team turn already wrote its report."""
+    def _read_verified_route_report(
+        self, state: Mapping[str, Any], hop: Mapping[str, Any], expected: str,
+    ) -> tuple[str, ReportEvidence]:
+        if remote_repository_from_task(str(state.get("task_text") or "")) is not None:
+            raise ValueError("report route recovery requires a local report")
+        repository, _ = _workflow_report_roots(self.config, state)
+        path = repository / expected
+        limit = 1024 * 1024
+        if path.stat().st_size > limit:
+            raise ValueError("report is too large for route recovery")
+        report_path, digest, size = self._validated_report_evidence(state, hop, expected)
+        with path.open("rb") as handle:
+            data = handle.read(limit + 1)
+        if len(data) > limit or hashlib.sha256(data).hexdigest() != digest:
+            raise ValueError("report changed during route recovery")
+        return data.decode("utf-8", errors="replace"), ReportEvidence(report_path, digest, size)
+
+    @staticmethod
+    def _accepted_blank_route_request(state: Mapping[str, Any], hop: Mapping[str, Any]) -> bool:
         if (
             state.get("conversation_mode") != "temporary"
             or is_independent_task(state)
@@ -8274,21 +8300,52 @@ class CDPAWorker:
         try:
             receipt = SendReceipt.from_dict(hop["receipt"])
             record = RequestLedger(hop["ledger_path"]).peek(hop["request_id"])
-        except (ValueError, OSError, DurableRequestError):
+        except (KeyError, TypeError, ValueError, OSError, DurableRequestError):
             return False
-        if (
-            not (receipt.user_message_id or receipt.user_turn_id)
-            or record is None
-            or record.status is not RequestStatus.SENT
-            or record.attempts < 1
-            or record.accepted_at is None
-            or record.role != hop["physical_role"]
-            or record.receipt != hop["receipt"]
-            or (record.source_context is not None and record.source_context != {
+        return (
+            bool(receipt.user_message_id or receipt.user_turn_id)
+            and record is not None
+            and record.status is RequestStatus.SENT
+            and record.attempts == receipt.attempts
+            and record.accepted_at is not None
+            and record.role == hop["physical_role"]
+            and record.receipt == hop["receipt"]
+            and record.response is None
+            and (record.source_context is None or record.source_context == {
                 "task_id": state["task_id"], "team": state["team"],
                 "hop_id": hop["hop_id"], "manifest": state["manifest_path"],
             })
+        )
+
+    def _recover_exhausted_report_route(self, state: dict[str, Any], hop: dict[str, Any]) -> None:
+        if (
+            hop.get("response") or hop.get("response_record")
+            or (hop.get("wait") or {}).get("result_seen_key")
+            or not self._accepted_blank_route_request(state, hop)
         ):
+            raise IneffectiveControlError("Cannot verify the exact accepted request with a missing route.")
+        try:
+            role = str(hop["target_role"])
+            contract = self._frozen_route_contract(state, role)
+            if contract is None or self._execution_budget_exhausted(state):
+                raise ValueError("a valid route contract and remaining execution budget are required")
+            expected = str(hop["expected_report_path"])
+            text, evidence = self._read_verified_route_report(state, hop, expected)
+            route = parse_report_route(text)
+            if route not in contract.allowed_routes or route not in state["roles"] or route == role:
+                raise RouteContractError("report must declare an allowed handoff to another selected role")
+        except (OSError, ValueError) as exc:
+            raise IneffectiveControlError(f"Cannot recover a valid route from the exact report: {exc}") from exc
+        self._commit_team_route(
+            state, hop, RouteDecision(route, expected), evidence,
+            route_contract=contract, recovered_from_report=True,
+        )
+
+    def _recover_missing_terminal_route(
+        self, state: dict[str, Any], hop: dict[str, Any],
+    ) -> bool:
+        """Continue only the route when a Temporary Team turn already wrote its report."""
+        if not self._accepted_blank_route_request(state, hop):
             return False
         try:
             self._validated_report_evidence(state, hop, hop["expected_report_path"])
@@ -9495,7 +9552,26 @@ class CDPAWorker:
             if not isinstance(options, dict):
                 raise ValueError("task options must be mutable during legacy report migration")
             options["report_mode"] = "file"
-        self._complete_request_response(hop)
+        self._commit_team_route(
+            state, hop, RouteDecision(decision.route, routed_handoff),
+            ReportEvidence(report_path, report_sha256, report_size), route_contract=route_contract,
+        )
+
+    def _commit_team_route(
+        self,
+        state: dict[str, Any],
+        hop: dict[str, Any],
+        decision: RouteDecision,
+        evidence: ReportEvidence,
+        *,
+        route_contract: RouteContract | None,
+        recovered_from_report: bool = False,
+    ) -> None:
+        role = str(hop["target_role"])
+        report_path, report_sha256, report_size = evidence.path, evidence.sha256, evidence.size
+        # A report handoff does not supply a provider response for the accepted request.
+        if not recovered_from_report:
+            self._complete_request_response(hop)
         hop.update(
             {
                 "report_path": report_path,
@@ -9508,11 +9584,11 @@ class CDPAWorker:
         hop["timestamps"]["routed_at"] = utc_now()
         register_material(
             state,
-            source_kind="route_json",
+            source_kind="file" if recovered_from_report else "route_json",
             material_type="handoff",
             version=str(state.get("route_contract_id") or f"hop-{hop['hop_id']}"),
             content=json.dumps(
-                {"route": decision.route, "handoff": routed_handoff},
+                {"route": decision.route, "handoff": decision.handoff},
                 ensure_ascii=False,
                 sort_keys=True,
             ),
@@ -9547,9 +9623,13 @@ class CDPAWorker:
                 "source_role": role,
                 "route": decision.route,
                 "report_path": report_path,
+                **({"kind": "report_route_recovered"} if recovered_from_report else {}),
             }
         )
-        self._gate_c_finish_role_turn(state, hop, role)
+        # With an exhausted blank response, keep the existing Send evidence
+        # and writer binding untouched; no assistant terminal result was verified.
+        if not recovered_from_report:
+            self._gate_c_finish_role_turn(state, hop, role)
         state["roles"][role]["status"] = "idle"
         state["block_code"] = None
         state["block_retryable"] = False
@@ -9605,7 +9685,7 @@ class CDPAWorker:
             state,
             source_role=role,
             target_role=decision.route,
-            handoff=routed_handoff,
+            handoff=decision.handoff,
         )
 
     @staticmethod
@@ -12161,6 +12241,10 @@ class CDPAWorker:
                 if (
                     initial_hop is not None
                     and str(initial_hop.get("state") or "") == "waiting"
+                    # Report-backed Resume also writes reports, materials and route policy.
+                    and not (
+                        requested_control and exhausted_blank_route_recovery(state, initial_hop)
+                    )
                 ):
                     state = _waiting_working_copy(state)
                 else:

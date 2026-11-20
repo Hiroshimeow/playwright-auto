@@ -142,6 +142,20 @@ def parse_route_response(
     return RouteDecision(route, handoff)
 
 
+def parse_report_route(text: str) -> str:
+    """Read one explicit final Route declaration, never infer a route from prose."""
+    lines = text.rstrip().splitlines()
+    declarations = [line for line in lines if re.match(r"^(?:Route:|\*\*Route:\*\*)", line)]
+    if len(declarations) == 1 and lines[-1] == declarations[0]:
+        match = re.fullmatch(
+            r"(?:Route:|\*\*Route:\*\*)[ \t]+([A-Z][A-Z0-9_]{0,31}|\*\*[A-Z][A-Z0-9_]{0,31}\*\*)(?:\. [^\r\n]+|\.)?",
+            declarations[0],
+        )
+        if match:
+            return match[1].strip("*")
+    raise RouteContractError("report needs one unambiguous final Route declaration")
+
+
 def _contains_route_object(text: str) -> bool:
     decoder = json.JSONDecoder()
     for index, character in enumerate(text):

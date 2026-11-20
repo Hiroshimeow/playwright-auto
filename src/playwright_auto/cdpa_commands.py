@@ -693,6 +693,20 @@ _WORKFLOW_TERMINAL = frozenset({"DONE", "STOPPED"})
 _WORKFLOW_IN_FLIGHT = frozenset({"sending", "sent", "waiting"})
 
 
+def exhausted_blank_route_recovery(state: Mapping[str, Any], hop: Mapping[str, Any]) -> bool:
+    """Identify an exhausted blank-response block eligible for report reconciliation."""
+    return (
+        state.get("status") == "BLOCKED"
+        and state.get("block_code") == "ROUTE_VALIDATION_EXHAUSTED"
+        and state.get("conversation_mode") == "temporary"
+        and state.get("workflow_mode") == "team"
+        and not isinstance(state.get("independent"), Mapping)
+        and hop.get("state") == "waiting"
+        and hop.get("kind") == "route_repair"
+        and (hop.get("wait") or {}).get("controller_reason") == "missing_terminal_route_repair"
+    )
+
+
 def workflow_control_eligibility(
     state: Mapping[str, Any],
     action: str,
@@ -755,7 +769,9 @@ def workflow_control_eligibility(
             if route_budget_exhausted(state):
                 return no("Raise max_routes above the consumed route_seq before Resume.")
         if status == "BLOCKED" and block_code == "ROUTE_VALIDATION_EXHAUSTED":
-            if route_repair_budget_exhausted(state):
+            if route_repair_budget_exhausted(state) and not exhausted_blank_route_recovery(
+                state, hop or {},
+            ):
                 return no(
                     "Raise max_route_repairs above the consumed repair count before Resume."
                 )

@@ -8,12 +8,15 @@ import pytest
 
 import playwright_auto.cdpa_actions as actions_module
 from playwright_auto.cdpa_actions import AcquiredRole, CDPATabActions
+from playwright_auto.cdpa_commands import workflow_control_eligibility
 from playwright_auto.cdpa_config import load_cdpa_config
 from playwright_auto.cdpa_conversations import ConversationWriterLease
 from playwright_auto.cdpa_store import TaskStore
 from playwright_auto.cdpa_worker import CDPAWorker, _active_hop
 from playwright_auto.chatgpt_errors import UnsafePageStateError
-from playwright_auto.chatgpt_models import MessageSnapshot
+from playwright_auto.chatgpt_models import (
+    MessageBaseline, MessageSnapshot, PageBinding, SendReceipt, prompt_digest,
+)
 from playwright_auto.durable import RequestLedger, RequestStatus
 
 from test_cdpa_actions import FakeContext, FakePage
@@ -300,6 +303,82 @@ def test_temporary_blank_terminal_recovers_only_route_on_same_turn(
     assert len(repair["prompt"]) < 6000
     assert state["task_text"] not in repair["prompt"]
     assert ledger.peek(hop["request_id"]) == accepted
+
+
+@pytest.mark.parametrize("guard", [None, "conflicting_route", "unselected_route", "terminal_route",
+                                     "missing_report", "receipt_mismatch", "route_budget", "malformed_reply"])
+def test_taskless_resume_recovers_exhausted_blank_route_from_exact_report(tmp_path, guard):
+    store, state, worker = _temporary_task(tmp_path, task_id="temp-exhausted-report-route")
+    path = Path(state["manifest_path"])
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, TemporaryWorkflowActions()))
+    ledger = RequestLedger(hop["ledger_path"])
+    receipt = SendReceipt(
+        hop["prompt"], prompt_digest(hop["prompt"]),
+        PageBinding("temporary-alpha-plan", hop["physical_role"]),
+        MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset()),
+        1, "user_message_identity", None, "accepted-user", "accepted-turn",
+    )
+    ledger.begin(role=hop["physical_role"], prompt=hop["prompt"], request_id=hop["request_id"],
+                 render_request_marker=False)
+    ledger.update(hop["request_id"], status=RequestStatus.SENDING, attempts=1,
+                  binding=receipt.binding, baseline=receipt.baseline)
+    ledger.update(hop["request_id"], status=RequestStatus.SENT, accepted_at=1.0,
+                  receipt=receipt.to_dict())
+    hop.update(state="waiting", receipt=receipt.to_dict())
+    state.update(status="BLOCKED", kanban_column="BLOCKED", active_action="blocked",
+                 block_code="ROUTE_VALIDATION_EXHAUSTED", block_retryable=False,
+                 route_repair_count=state["max_route_repairs"])
+    hop.update(kind="route_repair", repair_attempt=state["max_route_repairs"])
+    hop["wait"]["controller_reason"] = (
+        "malformed_result" if guard == "malformed_reply" else "missing_terminal_route_repair"
+    )
+    report = tmp_path / hop["expected_report_path"]
+    report.parent.mkdir(parents=True, exist_ok=True)
+    route = {"unselected_route": "UNKNOWN", "terminal_route": "DONE"}.get(guard, "DEV")
+    body = "# Completed report\n\n"
+    if guard == "conflicting_route":
+        body += "Route: REVIEW\n\n"
+    if guard != "missing_report":
+        report.write_text(body + f"**Route:** **{route}**. Ready for independent checks.\n", encoding="utf-8")
+    if guard == "receipt_mismatch":
+        ledger.update(hop["request_id"], receipt=None)
+    if guard == "route_budget":
+        state["route_seq"] = state["max_routes"]
+    accepted = ledger.peek(hop["request_id"])
+    state = store.save(path, state)
+    if guard == "malformed_reply":
+        assert not workflow_control_eligibility(state, "resume")["eligible"]
+        return
+    queued = store.resume_team(state["team"])
+    control = queued["controls"][-1]
+    saved = asyncio.run(worker.advance(
+        path, None, scheduling_tasks=[queued],
+        expected_endpointless_control=(control["control_id"], "resume"),
+    ))
+    assert ledger.peek(hop["request_id"]) == accepted
+    assert saved["max_route_repairs"] == state["max_route_repairs"]
+    assert saved["task_id"] == state["task_id"]
+    if guard:
+        assert saved["active_hop_id"] == hop["hop_id"]
+        assert saved["status"] == "BLOCKED"
+        assert saved["block_code"] == "ROUTE_VALIDATION_EXHAUSTED"
+        assert saved["controls"][-1]["status"] == "ineffective"
+        assert saved["route_repair_count"] == state["max_route_repairs"]
+        return
+    completed = saved["hops"][0]
+    child = _active_hop(saved)
+    assert saved["status"] == "RUNNING" and saved["block_code"] is None
+    assert saved["controls"][-1]["result"]["postcondition"] == "report_route_recovered"
+    assert saved["route_repair_count"] == 0 and saved["route_seq"] == state["route_seq"] + 1
+    assert completed["state"] == "routed" and completed["route"] == "DEV"
+    assert completed["response"] is None and completed.get("response_record") is None
+    assert completed["report_sha256"] == saved["reports"][-1]["sha256"]
+    assert saved["route_timeline"][-1]["kind"] == "report_route_recovered"
+    assert child["parent_hop_id"] == hop["hop_id"]
+    assert child["target_role"] == "DEV" and child["state"] == "pre_send"
+    assert child["handoff"] == hop["expected_report_path"]
+    assert ledger.peek(child["request_id"]) is None
 
 
 def test_cross_endpoint_accepted_temporary_recovery_waits_for_same_team_endpoint(tmp_path: Path):
