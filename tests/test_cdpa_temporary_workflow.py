@@ -215,7 +215,10 @@ def test_temporary_blank_terminal_recovers_only_route_on_same_turn(
         hop["kind"] = parent_kind
     report = tmp_path / hop["expected_report_path"]
     report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text("# Completed report\n\nRoute requested: DEV\n", encoding="utf-8")
+    report.write_text(
+        "# Completed report\n\n" + "Intermediate evidence. " * 650 + "\nRoute requested: DEV\n",
+        encoding="utf-8",
+    )
     hop["timestamps"]["sent_at"] = (
         datetime.now(timezone.utc) - timedelta(seconds=worker.role_controller.policy.timeout_seconds + 1)
     ).isoformat()
@@ -254,7 +257,10 @@ def test_temporary_blank_terminal_recovers_only_route_on_same_turn(
     actions = Actions(owned=not tab_lost)
     if tab_lost:
         # Resume admission clears block_code; the waiting hop retains its diagnosis.
-        hop["wait"]["controller_reason"] = "response_terminal_missing"
+        hop["wait"]["controller_reason"] = (
+            "missing_terminal_route_repair" if parent_kind == "route_repair"
+            else "response_terminal_missing"
+        )
         control = {"role": "PLAN", "status": "recovering", "result": {"before": {
             "block_code": "response_terminal_missing",
         }}}
@@ -285,8 +291,13 @@ def test_temporary_blank_terminal_recovers_only_route_on_same_turn(
     asyncio.run(worker._pre_send(state, repair, actions))
     assert actions.fresh_urls == ([TEMPORARY_CHAT_URL] if tab_lost else [])
     assert repair["expected_report_path"] == hop["expected_report_path"]
-    assert str(report) in repair["prompt"]
+    assert hop["expected_report_path"] in repair["prompt"]
     assert "terminal result" in repair["prompt"]
+    assert "Route requested: DEV" in repair["prompt"]
+    assert "Read-only excerpt" in repair["prompt"]
+    assert "Do not call tools" in repair["prompt"]
+    assert "Ensure the report exists" not in repair["prompt"]
+    assert len(repair["prompt"]) < 6000
     assert state["task_text"] not in repair["prompt"]
     assert ledger.peek(hop["request_id"]) == accepted
 

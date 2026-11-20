@@ -368,6 +368,7 @@ class PromptBuilder:
         expected_report_path: str,
         report_mode: str = "file",
         allowed_routes: Sequence[str] | None = None,
+        report_verified: bool = False,
     ) -> str:
         if not str(validation_error).strip():
             raise ValueError("repair requires a validation error")
@@ -390,9 +391,13 @@ class PromptBuilder:
             f"Turn: {int(turn)}\n"
             f"Validation error: {error}\n"
             f"Expected report path: {exact_report}\n\n"
-            "Continue from the existing workspace/report state. Do not redo completed "
-            "substantive work or irreversible actions. Ensure the report exists and is "
-            "non-empty at the exact expected path, then return the corrected route only.\n\n"
+            + (
+                "The worker verified the report at the exact path. Return the corrected route only.\n\n"
+                if report_verified else
+                "Continue from the existing workspace/report state. Do not redo completed "
+                "substantive work or irreversible actions. Ensure the report exists and is "
+                "non-empty at the exact expected path, then return the corrected route only.\n\n"
+            )
             + guide
             + "\nRules:\n"
             "- Output exactly one JSON object and nothing else.\n"
