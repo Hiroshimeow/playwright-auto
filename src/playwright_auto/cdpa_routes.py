@@ -143,18 +143,33 @@ def parse_route_response(
 
 
 def parse_report_route(text: str) -> str:
-    """Read one explicit final Route declaration, never infer a route from prose."""
-    lines = text.rstrip().splitlines()
+    """Read an explicit footer route or a PAUSE in the opening metadata block."""
+    lines = [line.rstrip() for line in text.rstrip().splitlines()]
     label = r"(?:Route(?: verdict)?:|\*\*Route(?: verdict)?:\*\*)"
     declarations = [line for line in lines if re.match(label, line)]
-    if len(declarations) == 1 and lines[-1] == declarations[0]:
+    if len(declarations) == 1:
+        declaration = declarations[0]
+        token = r"[A-Z][A-Z0-9_]{0,31}"
         match = re.fullmatch(
-            label + r"[ \t]+([A-Z][A-Z0-9_]{0,31}|\*\*[A-Z][A-Z0-9_]{0,31}\*\*)(?:\. [^\r\n]+|\.)?",
-            declarations[0],
+            label + rf"[ \t]+({token}|\*\*{token}\*\*|`{token}`)(?:[.;](?: [^\r\n]+)?)?",
+            declaration,
         )
         if match:
-            return match[1].strip("*")
-    raise RouteContractError("report needs one unambiguous final Route declaration")
+            route = match[1].strip("*`")
+            if lines[-1] == declaration:
+                return route
+            if route == "PAUSE":
+                # A report can declare a hold before describing its prerequisite.
+                # Only admit it in the opening metadata, never in body prose/examples.
+                body = lines[1:] if lines[0].startswith("# ") else lines
+                header = "\n".join(body).lstrip("\n").partition("\n\n")[0].splitlines()
+                if declaration in header and all(
+                    re.match(r"\*\*[^*]+:\*\*[ \t]+|" + label, line) for line in header
+                ):
+                    return route
+    raise RouteContractError(
+        "report needs one unambiguous final Route declaration or an explicit PAUSE in its opening metadata"
+    )
 
 
 def _contains_route_object(text: str) -> bool:

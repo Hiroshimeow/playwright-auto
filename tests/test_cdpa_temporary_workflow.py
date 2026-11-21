@@ -308,7 +308,8 @@ def test_temporary_blank_terminal_recovers_only_route_on_same_turn(
 @pytest.mark.parametrize("route_label", ["Route", "Route verdict"])
 @pytest.mark.parametrize("guard", [None, "conflicting_route", "nonfinal_route", "unselected_route",
                                      "terminal_route", "missing_report", "receipt_mismatch",
-                                     "route_budget", "malformed_reply"])
+                                     "route_budget", "malformed_reply", "pause_final",
+                                     "pause_header", "pause_conflict", "pause_in_body"])
 def test_taskless_resume_recovers_exhausted_blank_route_from_exact_report(tmp_path, guard, route_label):
     store, state, worker = _temporary_task(tmp_path, task_id="temp-exhausted-report-route")
     path = Path(state["manifest_path"])
@@ -337,21 +338,28 @@ def test_taskless_resume_recovers_exhausted_blank_route_from_exact_report(tmp_pa
     )
     report = tmp_path / hop["expected_report_path"]
     report.parent.mkdir(parents=True, exist_ok=True)
-    route = {"unselected_route": "UNKNOWN", "terminal_route": "DONE"}.get(guard, "DEV")
-    body = f"# Completed report\n**Role:** PLAN | **Route:** {route} (independent checks).\n\n"
-    if guard == "conflicting_route":
-        body += "Route: REVIEW\n\n"
+    route = {
+        "unselected_route": "UNKNOWN", "terminal_route": "DONE", "pause_final": "PAUSE",
+    }.get(guard, "DEV")
+    title = "# Completed report\n\n"
+    pause_line = f"**{route_label}:** `PAUSE`; waiting for external evidence.\n"
+    prerequisite = "\n**block_code:** `SOURCE_UNAVAILABLE`\n\n**resume_condition:** Authorized access restored.\n"
+    target = route if route_label == "Route verdict" else f"**{route}**"
+    final_route = f"**{route_label}:** {target}. Ready for independent checks.\n"
+    body = title + {
+        "pause_header": "**Role:** PLAN\n" + pause_line + prerequisite,
+        "pause_conflict": pause_line + prerequisite + "\nRoute: DEV\n",
+        "pause_in_body": "## Examples\n\n```md\n" + pause_line + "```\n" + prerequisite,
+        "conflicting_route": "Route: REVIEW\n\n" + final_route,
+        "nonfinal_route": final_route + "\nMore notes follow.\n",
+    }.get(guard, f"**Role:** PLAN | **Route:** {route} (independent checks).\n\n" + final_route)
     if guard != "missing_report":
-        target = route if route_label == "Route verdict" else f"**{route}**"
-        body += f"**{route_label}:** {target}. Ready for independent checks.\n"
-        if guard == "nonfinal_route":
-            body += "\nMore notes follow.\n"
         report.write_text(body, encoding="utf-8")
     if guard == "receipt_mismatch":
         ledger.update(hop["request_id"], receipt=None)
     if guard == "route_budget":
         state["route_seq"] = state["max_routes"]
-    accepted = ledger.peek(hop["request_id"])
+    ledger_before = Path(hop["ledger_path"]).read_bytes()
     state = store.save(path, state)
     if guard == "malformed_reply":
         assert not workflow_control_eligibility(state, "resume")["eligible"]
@@ -362,10 +370,10 @@ def test_taskless_resume_recovers_exhausted_blank_route_from_exact_report(tmp_pa
         path, None, scheduling_tasks=[queued],
         expected_endpointless_control=(control["control_id"], "resume"),
     ))
-    assert ledger.peek(hop["request_id"]) == accepted
+    assert Path(hop["ledger_path"]).read_bytes() == ledger_before
     assert saved["max_route_repairs"] == state["max_route_repairs"]
     assert saved["task_id"] == state["task_id"]
-    if guard:
+    if guard not in {None, "pause_header", "pause_final"}:
         assert saved["active_hop_id"] == hop["hop_id"]
         assert saved["status"] == "BLOCKED"
         assert saved["block_code"] == "ROUTE_VALIDATION_EXHAUSTED"
@@ -373,14 +381,24 @@ def test_taskless_resume_recovers_exhausted_blank_route_from_exact_report(tmp_pa
         assert saved["route_repair_count"] == state["max_route_repairs"]
         return
     completed = saved["hops"][0]
-    child = _active_hop(saved)
-    assert saved["status"] == "RUNNING" and saved["block_code"] is None
+    assert saved["block_code"] is None
     assert saved["controls"][-1]["result"]["postcondition"] == "report_route_recovered"
-    assert saved["route_repair_count"] == 0 and saved["route_seq"] == state["route_seq"] + 1
-    assert completed["state"] == "routed" and completed["route"] == "DEV"
+    assert completed["state"] == "routed"
     assert completed["response"] is None and completed.get("response_record") is None
     assert completed["report_sha256"] == saved["reports"][-1]["sha256"]
     assert saved["route_timeline"][-1]["kind"] == "report_route_recovered"
+    if guard in {"pause_header", "pause_final"}:
+        assert completed["route"] == "PAUSE"
+        assert saved["status"] == "PAUSED"
+        assert saved["active_hop_id"] == hop["hop_id"]
+        assert len(saved["hops"]) == 1  # PAUSE must not schedule another Send.
+        assert saved["route_seq"] == state["route_seq"]
+        assert saved["route_repair_count"] == state["route_repair_count"]
+        return
+    assert saved["status"] == "RUNNING"
+    assert completed["route"] == "DEV"
+    assert saved["route_repair_count"] == 0 and saved["route_seq"] == state["route_seq"] + 1
+    child = _active_hop(saved)
     assert child["parent_hop_id"] == hop["hop_id"]
     assert child["target_role"] == "DEV" and child["state"] == "pre_send"
     assert child["handoff"] == hop["expected_report_path"]

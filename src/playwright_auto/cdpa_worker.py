@@ -8332,8 +8332,12 @@ class CDPAWorker:
             expected = str(hop["expected_report_path"])
             text, evidence = self._read_verified_route_report(state, hop, expected)
             route = parse_report_route(text)
-            if route not in contract.allowed_routes or route not in state["roles"] or route == role:
-                raise RouteContractError("report must declare an allowed handoff to another selected role")
+            if route not in contract.allowed_routes or (
+                route != "PAUSE" and (route not in state["roles"] or route == role)
+            ):
+                raise RouteContractError(
+                    "report must declare an allowed PAUSE or handoff to another selected role"
+                )
         except (OSError, ValueError) as exc:
             raise IneffectiveControlError(f"Cannot recover a valid route from the exact report: {exc}") from exc
         self._commit_team_route(
