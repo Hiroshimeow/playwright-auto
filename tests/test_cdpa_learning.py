@@ -246,8 +246,8 @@ def test_final_plan_contract_requires_current_acceptance_without_extra_learning_
     texts = [path.read_text(encoding="utf-8") for path in prompt_paths]
     assert texts[0] == texts[1]
     for prompt in texts:
-        assert "Route actionable implementation or fixable failure to DEV" in prompt
-        assert "all required acceptance is proven" in prompt
-        assert "no known in-scope failure remains" in prompt
-        assert "only when the per-turn RouteContract declares this role as `closing_role`" in prompt
+        assert "Route implementation or repair to DEV" in prompt
+        assert "all required acceptance, and artifacts are verified" in prompt
+        assert "no known in-scope failure remaining" in prompt
+        assert "Use DONE only as the authorized closing_role" in prompt
         assert "post-DONE model pass" not in prompt

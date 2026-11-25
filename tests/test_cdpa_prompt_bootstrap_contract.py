@@ -99,7 +99,7 @@ def test_runtime_prompt_assets_use_concise_role_specific_contracts(prompt_root: 
     }
     base = (prompt_root / "BASE_CONTEXT.md").read_text(encoding="utf-8")
 
-    assert "scope and workflow decision owner" in prompts["PLAN"]
+    assert "team leader and decision owner" in prompts["PLAN"]
     assert "implementation owner" in prompts["DEV"]
     assert "independent correctness reviewer" in prompts["REVIEW"]
     assert "independent verification owner" in prompts["TEST"]
@@ -111,7 +111,7 @@ def test_runtime_prompt_assets_use_concise_role_specific_contracts(prompt_root: 
         assert "skills" in text.lower()
         assert "RouteContract" in text
     # Role-specific instructions are allowed to be descriptive, not truncated.
-    assert max(len(text.splitlines()) for text in prompts.values()) <= 14
+    assert max(len(text.splitlines()) for text in prompts.values()) <= 16
     assert len(base.splitlines()) <= 14
 
 
@@ -127,11 +127,84 @@ def test_runtime_role_prompts_keep_only_identity_skill_and_route_contract(prompt
         for role in CDPA_ROLES
     }
 
-    assert "RouteContract declares this role as `closing_role`" in prompts["PLAN"]
-    assert "requiring independent correctness review to REVIEW" in prompts["DEV"]
-    assert "implementation defects to DEV" in prompts["REVIEW"]
+    assert "Use DONE only as the authorized closing_role" in prompts["PLAN"]
+    assert "Route completed work to REVIEW" in prompts["DEV"]
+    assert "blocking defects to DEV" in prompts["REVIEW"]
     assert "implementation failures to DEV" in prompts["TEST"]
     assert "implementation defects to DEV" in prompts["AUDIT"]
     assert all("skills" in text.lower() for text in prompts.values())
     assert all("LEARNING.md" not in text for text in prompts.values())
-    assert all(len(text.split()) <= 260 for text in prompts.values())
+    assert all(len(text.split()) <= 280 for text in prompts.values())
+
+@pytest.mark.parametrize("mode", ("local", "packaged"))
+def test_effective_workflow_role_contract_and_frozen_snapshot(tmp_path: Path, mode: str):
+    from dataclasses import replace
+    from playwright_auto.cdpa_workflow_agents import (
+        WorkflowAgentCatalog, semantic_routes_from_workflow_definitions,
+        task_workflow_definitions, workflow_snapshot,
+    )
+
+    workspace = ROOT if mode == "local" else tmp_path
+    config = load_cdpa_config(None, repository_root=workspace)
+    config = replace(config, plans_root=tmp_path / "isolated-plans")
+    catalog = WorkflowAgentCatalog(config)
+    definitions = catalog.resolve_for_task(config.roles)
+    snapshot = workflow_snapshot(list(definitions.values()))
+    state = {"roles": dict.fromkeys(snapshot), "workflow_agents": snapshot}
+    resolved = task_workflow_definitions(state, config)
+    assert resolved == snapshot
+    expected_routes = {
+        "PLAN": {"DEV", "TEST", "REVIEW", "AUDIT"},
+        "DEV": {"REVIEW", "TEST", "PLAN"},
+        "TEST": {"DEV", "PLAN"},
+        "REVIEW": {"DEV", "TEST", "PLAN"},
+        "AUDIT": {"DEV", "TEST", "PLAN"},
+    }
+    routes = semantic_routes_from_workflow_definitions(resolved)
+    assert {role: set(edges.values()) for role, edges in routes.items()} == expected_routes
+    for role, definition in resolved.items():
+        prompt = definition["system_prompt"]
+        assert prompt == config.constructor_paths[role].read_text(encoding="utf-8").strip()
+        assert "specific external or manual prerequisite" in prompt
+        assert "checked alternatives" in prompt
+        assert "resume condition" in prompt
+        assert "task/workspace identity, all required acceptance, and artifacts are verified" in prompt
+        assert "no known in-scope failure remaining" in prompt
+        assert "new evidence, a changed approach, or a concrete corrective action" in prompt
+        assert "COMPLETE/FIX" not in prompt
+        assert "PRESERVE" not in prompt
+        if role != "PLAN":
+            assert "to PLAN when allowed" in prompt
+            assert "otherwise route to an authorized role" in prompt
+            assert "no meaningful authorized action or handoff remains" in prompt
+        built = PromptBuilder(config).build(
+            task_title="contract", task_id="task-contract", team="contract",
+            logical_role=role, physical_role=role.lower(), turn=1,
+            allowed_routes=tuple(expected_routes[role]) + ("PAUSE",) + (("DONE",) if role == "PLAN" else ()),
+            closing_role="PLAN", workspace=str(workspace),
+            source_physical_role=None, handoff="Inspect the assigned boundary.",
+            goal="Verify the role contract.", constructor_text=prompt,
+            expected_report_path=".plan/contract/report.md",
+        )
+        assert prompt in built.text
+        assert built.constructor_included
+
+    catalog.update("PLAN", display_name="PLAN", system_prompt="New catalog prompt")
+    assert catalog.get("PLAN")["system_prompt"] == "New catalog prompt"
+    assert task_workflow_definitions(state, config)["PLAN"]["system_prompt"] == snapshot["PLAN"]["system_prompt"]
+
+
+def test_workflow_without_plan_keeps_review_as_closer(tmp_path: Path):
+    from dataclasses import replace
+    from playwright_auto.cdpa_workflow_agents import (
+        WorkflowAgentCatalog, semantic_routes_from_workflow_definitions,
+        workflow_closing_role,
+    )
+
+    config = replace(load_cdpa_config(None, repository_root=ROOT), plans_root=tmp_path)
+    definitions = WorkflowAgentCatalog(config).resolve_for_task(("DEV", "REVIEW"))
+    assert workflow_closing_role(definitions) == "REVIEW"
+    routes = semantic_routes_from_workflow_definitions(definitions)
+    assert set(routes["DEV"].values()) == {"REVIEW"}
+    assert set(routes["REVIEW"].values()) == {"DEV"}
+    assert "otherwise route to an authorized role" in definitions["REVIEW"]["system_prompt"]
