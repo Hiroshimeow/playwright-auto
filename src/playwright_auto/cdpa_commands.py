@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, fields
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 
-from .cdpa_route_contract import route_budget_exhausted, route_repair_budget_exhausted
+from .cdpa_route_contract import route_repair_budget_exhausted
 
 COMMAND_ORIGINS = frozenset({"operator", "independent_agent", "worker", "repair_task"})
 COMMAND_STATES = frozenset(
@@ -173,6 +173,8 @@ class ProviderRetryIntent:
         hop: Mapping[str, Any],
         receipt: Any,
         accepted_user_turn: str,
+        failed_generation: str | None = None,
+        action: str = "retry",
     ) -> "ProviderRetryIntent":
         task_id = str(state.get("task_id") or "").strip()
         team = str(state.get("team") or "").strip()
@@ -189,6 +191,8 @@ class ProviderRetryIntent:
             "receipt_sha256": _sha_json(receipt_value),
             "team": team,
         }
+        if failed_generation is not None:
+            payload.update(failed_generation=failed_generation, recovery_action=action)
         identity = {"kind": "provider_retry", "task_id": task_id, "payload": payload}
         digest = _sha_json(identity)
         return cls(
@@ -679,12 +683,15 @@ _WORKFLOW_CONTROL_ACTIONS = (
     "resume",
     "retry",
     "restart_role",
+    "restart_team",
     "new_chat",
     "open_tab",
+    "change_role_url",
     "reconcile_presend_acquisition",
     "route_plan",
     "release_required_browser_endpoint",
     "stop",
+    "stop_at_boundary",
     "clear_team",
     "archive_worktree",
     "increase_route_limits",
@@ -751,6 +758,20 @@ def workflow_control_eligibility(
     def no(reason: str) -> dict[str, Any]:
         return {"eligible": False, "reason": reason, "role": selected_role}
 
+    if normalized_action == "restart_team":
+        if str(state.get("workflow_mode") or "team") != "team":
+            return no("Restart team applies to Team Tasks.")
+        return yes() if status in {"BLOCKED", "PAUSED", "STOPPED"} else no(
+            "Restart team requires a blocked, paused, or stopped team."
+        )
+
+    if normalized_action == "change_role_url":
+        if status not in {"BLOCKED", "PAUSED", "INBOX"} or not role_exists:
+            return no("Change URL requires an existing role on a blocked, paused, or queued team.")
+        if state.get("conversation_mode") == "temporary":
+            return no("Temporary chats require the original live document.")
+        return yes()
+
     if normalized_action == "pause":
         return yes() if status in {"INBOX", "RUNNING", "BLOCKED"} else no(
             "Pause is available only for INBOX or RUNNING work, or BLOCKED work."
@@ -765,10 +786,7 @@ def workflow_control_eligibility(
             return no("Resume cannot bypass unfinished dependencies.")
         if status == "WAITING" and str(state.get("waiting_code") or "") == "async_callback":
             return no("Resume cannot bypass a registered async callback; the callback wakes the same role.")
-        if status == "BLOCKED" and block_code == "ROUTE_BUDGET_EXHAUSTED":
-            if route_budget_exhausted(state):
-                return no("Raise max_routes above the consumed route_seq before Resume.")
-        if status == "BLOCKED" and block_code == "ROUTE_VALIDATION_EXHAUSTED":
+        if status in {"BLOCKED", "PAUSED"} and block_code == "ROUTE_VALIDATION_EXHAUSTED":
             if route_repair_budget_exhausted(state) and not exhausted_blank_route_recovery(
                 state, hop or {},
             ):
@@ -780,12 +798,9 @@ def workflow_control_eligibility(
         return yes()
 
     if normalized_action == "increase_route_limits":
-        if status != "BLOCKED" or block_code not in {
-            "ROUTE_BUDGET_EXHAUSTED",
-            "ROUTE_VALIDATION_EXHAUSTED",
-        }:
+        if status not in {"BLOCKED", "PAUSED"} or block_code != "ROUTE_VALIDATION_EXHAUSTED":
             return no(
-                "Route limits may be increased only for a route-budget or route-validation exhaustion block."
+                "The route-repair limit may be increased only for a route-validation exhaustion block."
             )
         return yes()
 
@@ -867,6 +882,19 @@ def workflow_control_eligibility(
         return yes()
     if normalized_action == "stop":
         return no("Stop is invalid for terminal work.") if status in _WORKFLOW_TERMINAL else yes()
+    if normalized_action == "stop_at_boundary":
+        if status in _WORKFLOW_TERMINAL:
+            return no("Stop is invalid for terminal work.")
+        recovery = (hop or {}).get("preboundary_recovery") or {}
+        if block_code == "preboundary_acquisition_recovery_required" or (
+            recovery.get("phase") == "recovery_required" and recovery.get("stage") == "acquisition"
+        ):
+            return no("Stop refused: task is in pre-Send SAFE HOLD; preserve it for reconciliation.")
+        if status == "BLOCKED" or block_code:
+            return no(f"Stop refused: {block_code or 'BLOCKED'}; reconcile the block first.")
+        if hop_state not in {"pre_send", "sending", "sent", "waiting", "responded", "routed"}:
+            return no("Stop requires a known durable hop state.")
+        return yes()
     if normalized_action == "clear_team":
         # The actual control still requires confirmation before destructive
         # nonterminal cleanup and exact-owner browser preflight.

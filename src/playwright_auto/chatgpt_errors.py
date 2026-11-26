@@ -23,8 +23,16 @@ class UnsafePageStateError(ChatGPTAutomationError):
     pass
 
 
+class ModelVerificationError(UnsafePageStateError):
+    pass
+
+
 class ConversationTranscriptNotReadyError(UnsafePageStateError):
     pass
+
+
+class ProviderChallengeError(ChatGPTAutomationError):
+    """Fresh navigation was blocked by a provider verification page, not a request limit."""
 
 
 class RateLimitBlockedError(UnsafePageStateError):

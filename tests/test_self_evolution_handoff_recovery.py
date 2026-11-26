@@ -239,6 +239,29 @@ def test_canonical_constructor_persists_intent_before_any_subprocess(monkeypatch
     assert events[0][1]["idempotency_key"] == argv_field(events[1][1], "--idempotency-key")
 
 
+def test_canonical_constructor_explains_owner_refusal_without_invoking_cli(monkeypatch, tmp_path, capsys):
+    import run_pi
+
+    state = tmp_path / "pi-runner.json"
+    state.write_text(json.dumps({"status": "SAFETY_HOLD", "dispatch_allowed": False}), encoding="utf-8")
+    monkeypatch.setattr(run_pi, "STATE", state)
+    monkeypatch.setattr(run_pi, "STATE_LOCK", tmp_path / "pi-state.lock")
+    monkeypatch.setattr(sys, "argv", [
+        "spawn_cdpa.py", "--role", "REVIEW", "--team", "review-probe",
+        "--instruction", "Review a repository", "--parent", "codex-thread-id",
+    ])
+    monkeypatch.setattr(spawn.subprocess, "run", lambda *args, **kwargs: pytest.fail("CDPA CLI was invoked"))
+
+    with pytest.raises(SystemExit) as refused:
+        spawn.main()
+
+    assert refused.value.code == 2
+    err = capsys.readouterr().err
+    assert "Pi is not the active dispatch owner" in err and "SAFETY_HOLD" in err
+    assert "No CDPA task was submitted" in err and "--solo REVIEW" in err
+    assert json.loads(state.read_text(encoding="utf-8"))["status"] == "SAFETY_HOLD"
+
+
 def test_pi_restart_reconciles_committed_child_without_spawning(tmp_path, monkeypatch):
     from contextlib import nullcontext
 

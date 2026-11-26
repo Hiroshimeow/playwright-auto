@@ -638,6 +638,11 @@ a.role-url-action { display: inline-flex; align-items: center; }
 .notify-report-head { display: flex; align-items: center; gap: .7rem; flex-wrap: wrap; margin-bottom: .75rem; }
 .notify-report-head strong { min-width: 0; overflow-wrap: anywhere; }
 .notify-report a { display: block; margin-top: .4rem; color: var(--accent); font-size: .65rem; overflow-wrap: anywhere; }
+.notify-report .report-body { max-height: none; }
+.notify-reason { display: grid; gap: .5rem; margin-bottom: .75rem; overflow-wrap: anywhere; }
+.notify-reason p { margin: 0; white-space: pre-wrap; }
+.notify-reason code { width: fit-content; color: var(--muted-strong); }
+.notify-prior-report .report-reader { margin: .55rem; }
 .metric-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .7rem; }
 .metric { display: grid; gap: .28rem; min-width: 0; padding: 1rem; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
 .metric strong { overflow-wrap: anywhere; font-size: 1.12rem; }

@@ -16,6 +16,7 @@ from .file_lock import exclusive_file_lock, fsync_parent_directory
 ROUTES = frozenset({"PLAN", "DEV", "REVIEW", "TEST", "AUDIT", "PAUSE", "DONE"})
 _REPORT_MODES = frozenset({"file", "inline"})
 _KEYS = frozenset({"route", "handoff"})
+REPORT_RESULT_LABEL = "CDPA-RESULT"
 _FENCE = re.compile(r"^```json\s*(\{.*\})\s*```$", re.DOTALL | re.IGNORECASE)
 
 
@@ -142,14 +143,36 @@ def parse_route_response(
     return RouteDecision(route, handoff)
 
 
+def parse_report_result(
+    text: str,
+    *,
+    result_key: str,
+    expected_report_path: str,
+    source_role: str,
+    closing_role: str,
+    allowed_routes: Sequence[str],
+) -> RouteDecision:
+    body, _, footer = text.rstrip().rpartition("\n")
+    prefix = f"{REPORT_RESULT_LABEL} {result_key}: "
+    if not result_key or not body.strip() or not footer.startswith(prefix):
+        raise RouteContractError("report needs a final result for the exact request")
+    decision = parse_route_response(
+        footer[len(prefix):], source_role=source_role,
+        closing_role=closing_role, allowed_routes=allowed_routes,
+    )
+    if decision.handoff != expected_report_path:
+        raise RouteContractError("report result handoff does not match the expected report")
+    return decision
+
+
 def parse_report_route(text: str) -> str:
-    """Read an explicit footer route or a PAUSE in the opening metadata block."""
+    """Read the explicit route in a legacy report used during operator Resume."""
     lines = [line.rstrip() for line in text.rstrip().splitlines()]
     label = r"(?:Route(?: verdict)?:|\*\*Route(?: verdict)?:\*\*)"
+    token = r"[A-Z][A-Z0-9_]{0,31}"
     declarations = [line for line in lines if re.match(label, line)]
     if len(declarations) == 1:
         declaration = declarations[0]
-        token = r"[A-Z][A-Z0-9_]{0,31}"
         match = re.fullmatch(
             label + rf"[ \t]+({token}|\*\*{token}\*\*|`{token}`)(?:[.;](?: [^\r\n]+)?)?",
             declaration,
@@ -167,8 +190,21 @@ def parse_report_route(text: str) -> str:
                     re.match(r"\*\*[^*]+:\*\*[ \t]+|" + label, line) for line in header
                 ):
                     return route
+    if not declarations and lines:
+        body = lines[1:] if lines[0].startswith("# ") else lines
+        opening = next((line for line in body if line.strip()), "")
+        legacy_routes = {
+            match[1]
+            for match in (
+                re.fullmatch(rf"\*\*Decision: ({token})\.\*\*(?: .*)?", opening),
+                re.fullmatch(rf"\*\*Next role: ({token})\.\*\*(?: .*)?", lines[-1]),
+            )
+            if match is not None
+        }
+        if len(legacy_routes) == 1:
+            return legacy_routes.pop()
     raise RouteContractError(
-        "report needs one unambiguous final Route declaration or an explicit PAUSE in its opening metadata"
+        "report needs one unambiguous route declaration in its opening or footer"
     )
 
 
@@ -332,6 +368,32 @@ def validate_file_report(
     task_id: str,
 ) -> ReportEvidence:
     """Validate and fingerprint one exact local workflow report artifact."""
+    _, evidence = read_file_report(
+        handoff,
+        repository_root=repository_root,
+        plans_root=plans_root,
+        team=team,
+        physical_role=physical_role,
+        turn=turn,
+        task_id=task_id,
+    )
+    if evidence.size == 0:
+        raise RouteContractError("report file is empty")
+    return evidence
+
+
+def read_file_report(
+    handoff: str,
+    *,
+    repository_root: str | Path,
+    plans_root: str | Path,
+    team: str,
+    physical_role: str,
+    turn: int,
+    task_id: str,
+    max_bytes: int | None = None,
+) -> tuple[bytes, ReportEvidence]:
+    """Read and fingerprint the exact report, including an empty file."""
     root, team_root, target = _validated_report_location(
         handoff,
         repository_root=repository_root,
@@ -358,13 +420,15 @@ def validate_file_report(
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
             raise RouteContractError("report path must be a regular file")
+        if max_bytes is not None and before.st_size > max_bytes:
+            raise RouteContractError("report is too large for route recovery")
         with os.fdopen(descriptor, "rb", closefd=False) as handle:
-            data = handle.read()
+            data = handle.read() if max_bytes is None else handle.read(max_bytes + 1)
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
-    if not data:
-        raise RouteContractError("report file is empty")
+    if max_bytes is not None and len(data) > max_bytes:
+        raise RouteContractError("report is too large for route recovery")
     if (
         before.st_dev != after.st_dev
         or before.st_ino != after.st_ino
@@ -373,7 +437,7 @@ def validate_file_report(
         or len(data) != after.st_size
     ):
         raise RouteContractError("report file changed during validation")
-    return ReportEvidence(
+    return data, ReportEvidence(
         _display_path(target, root),
         hashlib.sha256(data).hexdigest(),
         len(data),

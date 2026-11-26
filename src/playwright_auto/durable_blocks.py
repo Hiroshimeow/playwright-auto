@@ -16,6 +16,7 @@ from .chatgpt import (
     visible_text_matches,
     wait_for_existing_conversation_messages,
 )
+from .chatgpt_errors import ManualInputPendingError
 from .durable import (
     DurableRecoveryState,
     DurableRequestError,
@@ -139,6 +140,7 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
         wait_for_stop: bool = True,
         max_attempts: int = 2,
         recovery_reload: bool = True,
+        preserve_manual_input: bool = False,
         require_existing_conversation_baseline: bool = False,
         after_send_click: Callable[[], None] | None = None,
         response_timeout_ms: int | None = None,
@@ -168,6 +170,7 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
         self.wait_for_stop = wait_for_stop
         self.max_attempts = max_attempts
         self.recovery_reload = recovery_reload
+        self.preserve_manual_input = preserve_manual_input
         self.require_existing_conversation_baseline = bool(
             require_existing_conversation_baseline
         )
@@ -422,7 +425,8 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
             )
 
         snapshot = await context.client.assert_ownership()
-        snapshot = await self._clear_pristine_composer(context, record, snapshot)
+        if not self.preserve_manual_input:
+            snapshot = await self._clear_pristine_composer(context, record, snapshot)
         recovery = classify_recovery_state(record, snapshot)
         context.variables[self.recovery_key] = recovery
 
@@ -490,11 +494,14 @@ class DurableSendBlock(WorkflowBlock[ChatGPTPage]):
             and record.session_id_before is None
         )
         if recovery in {
-            DurableRecoveryState.SENT_MARKER_MISSING,
             DurableRecoveryState.COMPOSER_ATTACHMENTS_WITHOUT_MARKER,
             DurableRecoveryState.MANUAL_COMPOSER_DIRTY,
             DurableRecoveryState.COMPOSER_PROMPT_AND_ATTACHMENTS_PENDING,
         }:
+            if self.preserve_manual_input and record.status in {RequestStatus.NEW, RequestStatus.PROMPT_SET}:
+                raise ManualInputPendingError("manual composer input is pending before Send")
+            self._raise_ambiguous(record, recovery)
+        if recovery is DurableRecoveryState.SENT_MARKER_MISSING:
             self._raise_ambiguous(record, recovery)
         if (
             record.status is RequestStatus.UPLOADING

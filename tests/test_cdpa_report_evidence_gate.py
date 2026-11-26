@@ -68,7 +68,7 @@ def test_report_content_is_not_semantically_policed(tmp_path):
     )
 
 
-def test_budget_exhaustion_preserves_valid_report_and_decision_without_next_execution(tmp_path):
+def test_execution_count_does_not_block_a_valid_team_report_and_route(tmp_path):
     _, _, state, worker = setup_task(
         tmp_path,
         task_id="task-budget-exhaustion",
@@ -88,15 +88,31 @@ def test_budget_exhaustion_preserves_valid_report_and_decision_without_next_exec
 
     worker._responded(state, hop)
 
-    assert state["status"] == "BLOCKED"
-    assert state["block_code"] == "autonomous_execution_budget_exhausted"
-    assert state["active_hop_id"] == hop["hop_id"]
+    assert state["status"] == "RUNNING"
+    assert state["block_code"] is None
     assert hop["state"] == "routed"
     assert hop["route"] == "REVIEW"
     assert hop["report_path"] == expected
     assert hop["report_sha256"]
-    assert len(state["hops"]) == 1
-    assert RequestLedger(hop["ledger_path"]).peek(f"{state['task_id']}-hop2") is None
+    child = _active_hop(state)
+    assert child["target_role"] == "REVIEW"
+    assert RequestLedger(child["ledger_path"]).peek(child["request_id"]) is None
+
+
+def _restore_historical_budget_frontier(state, hop):
+    # The former Team cap recorded the route or repair but allocated no child.
+    child = state["hops"].pop()
+    assert child["parent_hop_id"] == hop["hop_id"]
+    state.update(
+        active_hop_id=hop["hop_id"],
+        active_role=hop["target_role"],
+        status="BLOCKED",
+        kanban_column="BLOCKED",
+        active_action="blocked",
+        block_code="autonomous_execution_budget_exhausted",
+        block_retryable=False,
+    )
+    return child
 
 
 def test_budget_resume_preserves_pending_report_repair_instead_of_downstream_handoff(tmp_path):
@@ -117,17 +133,18 @@ def test_budget_resume_preserves_pending_report_repair_instead_of_downstream_han
 
     worker._responded(state, hop)
 
-    assert state["status"] == "BLOCKED"
-    assert state["block_code"] == "autonomous_execution_budget_exhausted"
+    assert state["status"] == "RUNNING"
+    assert _active_hop(state)["kind"] == "report_repair"
+    repair = _restore_historical_budget_frontier(state, hop)
     assert hop["route"] == "DEV"
     assert hop["report_path"] is None
-    assert hop["budget_continuation"] == {
+    hop["budget_continuation"] = {
         "kind": "report_repair",
         "source_role": "PLAN",
         "target_role": "PLAN",
         "handoff": "report repair",
         "turn": hop["turn"],
-        "repair_attempt": 1,
+        "repair_attempt": repair["repair_attempt"],
         "validation_error": hop["validation_error"],
         "locked_route": "DEV",
         "locked_handoff": expected,
@@ -182,11 +199,11 @@ def test_budget_resume_recovers_legacy_pending_route_repair_context(tmp_path):
 
     worker._responded(state, hop)
 
-    assert state["status"] == "BLOCKED"
-    assert state["block_code"] == "autonomous_execution_budget_exhausted"
+    assert state["status"] == "RUNNING"
+    assert _active_hop(state)["kind"] == "route_repair"
+    _restore_historical_budget_frontier(state, hop)
     assert hop["route"] == "PLAN"
-    assert hop["budget_continuation"]["kind"] == "route_repair"
-    hop.pop("budget_continuation")  # simulate a repair-blocked manifest from before this fix
+    # Older manifests carried the repair context in the route timeline alone.
     path = Path(state["manifest_path"])
     store.save(path, state)
 
@@ -226,6 +243,7 @@ def test_operator_resume_renews_exhausted_budget_and_allocates_exact_decided_rou
     }
     expected = _prepare_report(state, hop, route="REVIEW")
     worker._responded(state, hop)
+    _restore_historical_budget_frontier(state, hop)
     path = Path(state["manifest_path"])
     store.save(path, state)
 

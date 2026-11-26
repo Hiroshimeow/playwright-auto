@@ -227,6 +227,18 @@ def test_empty_bound_assistant_placeholder_reaches_existing_terminal_timeout():
     assert "timeout_refreshed" not in wait
 
 
+def test_completed_blank_temporary_turn_enters_recovery_after_stability():
+    current = snapshot(url="https://chatgpt.com/c/owned?temporary-chat=true", messages=(
+        MessageSnapshot("user", "original-user", "original-turn", "original task", ()),
+        MessageSnapshot("assistant", "answer", "answer-turn", "", ("copy", "retry-menu")),
+    ))
+    wait = {}
+    assert step(current, wait).reason == "empty_terminal_observing"
+    assert step(current, wait, 4).action is Action.WAIT
+    decision = step(current, wait, 5)
+    assert (decision.action, decision.reason) == (Action.BLOCK, "empty_terminal_response")
+
+
 def test_no_terminal_result_ui_error_is_not_format_repair():
     current = snapshot(error_texts=("Something went wrong",))
     wait = {}

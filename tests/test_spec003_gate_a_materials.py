@@ -222,3 +222,26 @@ def test_t021_projection_and_dashboard_use_material_backed_nonblank_handoff(tmp_
     assert "function reportSelectionKey(report)" in detail
     assert "report?.url || report?.material_url || null" in detail
     assert "if (loaded?.status === \"ready\") return loaded.body;" in detail
+
+
+def test_projected_handoff_links_to_exact_report_path(tmp_path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    state = TaskStore(config).create_task("Read exact report", requested_team="alpha", task_id="notify-exact")
+    report_path = ".plan/alpha/plan-turn1.md"
+    state["reports"] = [
+        {"report_id": 17, "path": report_path, "role": "PLAN", "turn": 1},
+        {"report_id": 22, "path": ".plan/alpha/plan-turn2.md", "role": "PLAN", "turn": 2},
+    ]
+    state.update(status="PAUSED", pause_reason="Waiting for a decision on the draft.")
+    for material_id, handoff in [("handoff-hop-1", report_path), ("handoff-hop-2", ".plan/other/plan-turn1.md")]:
+        register_material(
+            state, source_kind="route_json", material_type="handoff", version="v1",
+            content=json.dumps({"route": "DEV", "handoff": handoff}),
+            role_key="PLAN", material_id=material_id,
+        )
+
+    detail = build_task_projection(state, tasks=[state]).detail
+    rows = {report["report_id"]: report for report in detail["reports"]}
+    assert rows["handoff-hop-1"]["linked_report_id"] == "17"
+    assert rows["handoff-hop-2"].get("linked_report_id") is None
+    assert detail["pause_reason"] == "Waiting for a decision on the draft."

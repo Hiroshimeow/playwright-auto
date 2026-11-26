@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,12 +10,49 @@ import pytest
 from playwright_auto.cdpa_team import is_active_team_owner
 from playwright_auto.cdpa_worker import _active_hop
 from test_cdpa_worker_endpoints import _setup, _pool, _noop, _execution
+from test_cdpa_worker import _prepare_sent_waiting_task
 
 
 def quiet(worker, monkeypatch):
     monkeypatch.setattr(worker, "_maintain_ambient_page_automation", _noop)
     monkeypatch.setattr(worker, "_refresh_rate_limit_cooldown", _noop)
     monkeypatch.setattr(worker, "_close_idle_independent_tabs", _noop)
+
+
+@pytest.mark.parametrize("already_waiting_for_browser", [False, True])
+def test_offline_pool_recognizes_the_accepted_turns_report(tmp_path, monkeypatch, already_waiting_for_browser):
+    store, state, worker, path, hop, _, _ = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-report-without-browser",
+    )
+    quiet(worker, monkeypatch)
+    if already_waiting_for_browser:
+        state = worker._set_pool_wait(state, waiting=True)
+    expected = hop["expected_report_path"]
+    key = hop["report_result"]["key"]
+    result = json.dumps({"route": "DEV", "handoff": expected})
+    (tmp_path / expected).write_text(f"# Ready\n\nCDPA-RESULT {key}: {result}\n", encoding="utf-8")
+    ledger = Path(hop["ledger_path"])
+    original = ledger.read_bytes()
+
+    async def run_offline():
+        pool = await _pool(store)
+        try:
+            for endpoint_id in tuple(pool.contexts):
+                await pool.mark_unavailable(endpoint_id, "test partition")
+            assert not pool.contexts
+            await worker.run_once_pool(pool)
+        finally:
+            await pool.close()
+
+    asyncio.run(run_offline())
+    saved = store.load(path)
+    assert saved["hops"][0]["state"] == "routed"
+    assert saved["route_timeline"][-1]["kind"] == "report_route_recovered"
+    assert _active_hop(saved)["target_role"] == "DEV"
+    assert _active_hop(saved)["state"] == "pre_send"
+    assert _active_hop(saved)["receipt"] is None
+    assert saved["browser_endpoint_id"] == state["browser_endpoint_id"]
+    assert ledger.read_bytes() == original
 
 
 def test_direct_create_without_independent_agents_claims_idle_pool_capacity(tmp_path, monkeypatch):

@@ -6,11 +6,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from uuid import UUID
 
 from .cdpa_browser_projection import inspect_page_metadata
 from .cdpa_config import CDPAConfig
+from .cdpa_conversations import canonical_conversation
 from .cdpa_independent import is_independent_task
 from .chatgpt import (
     ChatGPTPage,
@@ -52,20 +53,17 @@ def is_transient_page_lifecycle_error(exc: BaseException) -> bool:
 
 
 def _reopenable_conversation_identity(value: Any) -> str | None:
+    url = str(value or "")
     try:
-        parsed = urlparse(str(value or ""))
+        conversation_id = canonical_conversation(url)
     except ValueError:
         return None
-    path = parsed.path.rstrip("/")
-    conversation_id = path.rsplit("/", 1)[-1]
     if (
-        (parsed.hostname or "").lower() not in _CHATGPT_HOSTS
-        or not path.startswith("/c/")
-        or len(path) <= 3
-        or conversation_id.startswith("WEB:")
+        conversation_id.startswith("WEB:")
+        or "true" in parse_qs(urlparse(url).query).get("temporary-chat", ())
     ):
         return None
-    return path
+    return conversation_id
 
 
 class BranchBootstrapError(RuntimeError):
@@ -696,10 +694,15 @@ class CDPATabActions:
             new_chat = True
         else:
             client, snapshot = matches[0]
-            await client.assert_ownership()
+            snapshot = await client.assert_ownership()
             if clean_for_send:
-                await self._clean_target_composer(
-                    client,
+                if snapshot.stop_visible:
+                    raise UnsafePageStateError("page is already responding")
+                if snapshot.manual_input_pending:
+                    raise ManualInputPendingError(
+                        "The owned tab contains a draft or attachments. Resolve them before Resume."
+                    )
+                await client.wait_until_clean_ready(
                     timeout_ms=round(self.config.workspace_timeout_seconds * 1000),
                 )
             force_new = bool(
@@ -761,24 +764,13 @@ class CDPATabActions:
         )
         page_url = next(
             (value for value in candidate_urls if _reopenable_conversation_identity(value) is not None),
-            next((value for value in candidate_urls if value), ""),
+            "",
         )
-        if not page_id or not page_url:
+        if not page_id:
             raise RoleOwnershipError("role has no recorded page identity to reopen")
-        parsed_url = urlparse(page_url)
-        if (parsed_url.hostname or "").lower() not in _CHATGPT_HOSTS:
-            raise RoleOwnershipError(
-                f"recorded role URL is not a ChatGPT conversation: {page_url!r}"
-            )
-        conversation_id = parsed_url.path.rstrip("/").rsplit("/", 1)[-1]
-        if conversation_id.startswith("WEB:"):
-            raise RoleOwnershipError(
-                "temporary WEB conversation cannot be reopened exactly; use Restart role or Stop"
-            )
-        if not parsed_url.path.startswith("/c/"):
-            raise RoleOwnershipError(
-                f"recorded role URL is not an exact conversation URL: {page_url!r}"
-            )
+        expected = _reopenable_conversation_identity(page_url)
+        if expected is None:
+            raise RoleOwnershipError("role has no recorded persistent ChatGPT conversation to reopen")
 
         existing = await self.locate_owned(manifest, logical_role)
         created = existing is None
@@ -794,25 +786,14 @@ class CDPATabActions:
             page = client.page
         timeout = round(self.config.workspace_timeout_seconds * 1000)
         try:
-            actual_url = urlparse(str(page.url))
-            exact_url = (
-                actual_url.scheme == parsed_url.scheme
-                and actual_url.netloc == parsed_url.netloc
-                and actual_url.path.rstrip("/") == parsed_url.path.rstrip("/")
-            )
-            if not exact_url:
+            if _reopenable_conversation_identity(page.url) != expected:
                 await page.goto(
                     page_url, wait_until="domcontentloaded", timeout=timeout
                 )
                 await page.locator("body").wait_for(
                     state="visible", timeout=timeout
                 )
-                actual_url = urlparse(str(page.url))
-                if (
-                    actual_url.scheme != parsed_url.scheme
-                    or actual_url.netloc != parsed_url.netloc
-                    or actual_url.path.rstrip("/") != parsed_url.path.rstrip("/")
-                ):
+                if _reopenable_conversation_identity(page.url) != expected:
                     raise RoleOwnershipError(
                         "conversation reopen redirected away from the recorded URL: "
                         f"{page.url!r}"
@@ -842,6 +823,8 @@ class CDPATabActions:
             if require_clean_ready:
                 await client.wait_until_clean_ready(timeout_ms=timeout)
             snapshot = await client.assert_ownership()
+            if _reopenable_conversation_identity(snapshot.url) != expected:
+                raise RoleOwnershipError("conversation identity changed while reopening the recorded role")
             if (
                 str(snapshot.page_id or "") != page_id
                 or str(snapshot.page_role or "") != physical

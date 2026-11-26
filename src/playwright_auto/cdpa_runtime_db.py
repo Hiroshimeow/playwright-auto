@@ -598,6 +598,15 @@ class RuntimeDB:
         assert completed is not None
         return completed
 
+    def provider_retry_intents(self, task_id: str, request_id: str) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM command_queue WHERE task_id=? AND kind='provider_retry' "
+                "AND json_extract(payload_json, '$.request_id')=? ORDER BY rowid",
+                (task_id, request_id),
+            ).fetchall()
+        return [self._command_row(row) for row in rows]
+
     def enqueue_command(
         self,
         *,

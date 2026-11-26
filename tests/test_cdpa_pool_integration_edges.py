@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -8,6 +9,7 @@ import pytest
 
 from playwright_auto.cdpa_worker import _active_hop
 from playwright_auto.chatgpt import MessageSnapshot
+from playwright_auto.chatgpt_models import bound_assistant_for_receipt
 from playwright_auto.cdpa_actions import AcquiredRole
 from playwright_auto.durable import RequestLedger
 from test_cdpa_worker import _prepare_sent_waiting_task
@@ -84,6 +86,56 @@ def test_accepted_provisional_url_canonicalizes_only_on_same_owned_page(tmp_path
     assert hop["conversation_url"] == canonical
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).receipt["conversation_id"] == snapshot.session_id
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
+    actions.reopen.assert_not_awaited()
+
+
+@pytest.mark.parametrize("user_evidence", ["remounted", "different_prompt", "duplicate_prompt", "stable_receipt"])
+def test_canonicalize_original_page_after_synthetic_user_id_is_replaced(tmp_path, user_evidence):
+    _store, state, worker, _path, hop, receipt, _sent = _prepare_sent_waiting_task(
+        tmp_path, task_id="provisional-remounted-user",
+    )
+    if user_evidence != "stable_receipt":
+        receipt = replace(receipt, user_message_id="DOM:user:0", user_turn_id=None)
+        hop["receipt"] = receipt.to_dict()
+        RequestLedger(hop["ledger_path"]).update(hop["request_id"], receipt=hop["receipt"])
+    provisional = "https://chatgpt.com/c/local-chatgpt%3Atemporary"
+    canonical_id = "11111111-1111-4111-8111-111111111111"
+    canonical = f"https://chatgpt.com/c/{canonical_id}"
+    hop["conversation_url"] = state["roles"]["PLAN"]["page_url"] = provisional
+    user = MessageSnapshot(
+        role="user", message_id="saved-user", turn_id="group:user:saved-user",
+        text="Different prompt" if user_evidence == "different_prompt" else receipt.prompt, actions=(),
+    )
+    assistant = MessageSnapshot(
+        role="assistant", message_id="saved-answer", turn_id="group:assistant:saved-user",
+        text="Accepted answer", actions=(),
+    )
+    messages = (user, assistant)
+    if user_evidence == "duplicate_prompt":
+        messages += (replace(user, message_id="another-user", turn_id="group:user:another-user"),)
+    snapshot = SimpleNamespace(
+        page_id=receipt.binding.page_id, session_id=canonical_id, url=canonical, messages=messages,
+    )
+    acquired = AcquiredRole(
+        client=SimpleNamespace(assert_ownership=AsyncMock(return_value=snapshot)),
+        page_id=receipt.binding.page_id, url=canonical, created=False, new_chat=False,
+    )
+    actions = SimpleNamespace(locate_owned=AsyncMock(return_value=acquired), reopen=AsyncMock())
+
+    result = asyncio.run(worker._owned_or_block(state, "PLAN", actions))
+
+    saved = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
+    if user_evidence == "remounted":
+        assert result is acquired
+        assert hop["conversation_url"] == canonical
+        assert saved.receipt["conversation_id"] == canonical_id
+        assert bound_assistant_for_receipt(messages, receipt) == (assistant, None)
+    else:
+        assert result is None
+        assert state["block_code"] == "accepted_conversation_identity_unresolved"
+        assert saved.receipt["conversation_id"] is None
+    assert saved.receipt["user_message_id"] == receipt.user_message_id
+    assert saved.attempts == 1
     actions.reopen.assert_not_awaited()
 
 

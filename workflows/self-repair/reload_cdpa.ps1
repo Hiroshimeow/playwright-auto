@@ -32,7 +32,13 @@ if ($port) {
   for ($i = 0; $i -lt 8 -and $pidCandidate -gt 0; $i++) {
     $proc = $processes | Where-Object { $_.ProcessId -eq $pidCandidate } | Select-Object -First 1
     if (-not $proc) { break }
-    if ($proc.CommandLine -match 'playwright_auto\.cdpa_cli\s+start' -and
+    $entrypoint = Join-Path $root '.venv\Scripts\cdpa.exe'
+    $processPrefix = '^\s*"?' + [regex]::Escape([string]$proc.ExecutablePath) + '"?\s+'
+    $isPython = $proc.Name -in @('python.exe', 'pythonw.exe')
+    $moduleLauncher = $isPython -and $proc.CommandLine -match ($processPrefix + '-m\s+playwright_auto\.cdpa_cli\s+start(?:\s|$)')
+    $entrypointLauncher = ($proc.ExecutablePath -ieq $entrypoint -and $proc.CommandLine -match ($processPrefix + 'start(?:\s|$)')) -or
+      ($isPython -and $proc.CommandLine -match ($processPrefix + '"?' + [regex]::Escape($entrypoint) + '"?\s+start(?:\s|$)'))
+    if (($moduleLauncher -or $entrypointLauncher) -and
         $proc.CommandLine -like '*E:\git-project\cdpa*') { $rootPid = $proc.ProcessId }
     $pidCandidate = [int]$proc.ParentProcessId
   }

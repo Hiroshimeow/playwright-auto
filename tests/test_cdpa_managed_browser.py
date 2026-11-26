@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import threading
@@ -39,6 +40,14 @@ def test_managed_local_profile_can_be_created_or_cloned_only_while_source_offlin
             clone_from=source,
             source_running=True,
         )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process query")
+def test_windows_profile_usage_does_not_require_powershell_on_path(tmp_path: Path, monkeypatch):
+    import playwright_auto.cdpa_managed_browser as managed
+
+    monkeypatch.setenv("PATH", "")
+    assert not managed._profile_in_use(tmp_path)
 
 
 @pytest.mark.parametrize("argv", [

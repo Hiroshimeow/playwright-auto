@@ -29,7 +29,7 @@ from playwright_auto.durable import (
 from playwright_auto.durable_blocks import DurableSendBlock
 from playwright_auto.file_lock import open_shared_read
 from playwright_auto.upload import UploadReceipt, collect_file_identities
-from playwright_auto.workflow import Workflow, WorkflowExecutionError
+from playwright_auto.workflow import Workflow, WorkflowContext, WorkflowExecutionError
 
 
 def snapshot(
@@ -631,6 +631,37 @@ def test_pristine_new_dirty_composer_clears_once_then_sends_exactly_once(tmp_pat
     assert len(client.send_calls) == 1
     assert record.status is RequestStatus.SENT
     assert record.attempts == 1
+
+
+@pytest.mark.parametrize("text,attachments", [("operator draft", ()), ("", ("operator.pdf",))])
+def test_preserve_manual_input_holds_a_pristine_send_until_the_composer_is_clear(
+    tmp_path, text, attachments,
+):
+    from playwright_auto.chatgpt_errors import ManualInputPendingError
+
+    ledger_path = tmp_path / "ledger.json"
+    client = FakeDurableClient(snapshot(text=text, attachments=attachments, state=ChatGPTState.DRAFT))
+    block = DurableSendBlock(
+        "repair the report",
+        ledger_path=ledger_path,
+        request_id="repair",
+        wait_for_response=False,
+        preserve_manual_input=True,
+    )
+
+    with pytest.raises(ManualInputPendingError):
+        asyncio.run(block.run(WorkflowContext(client)))
+
+    ledger = RequestLedger(ledger_path)
+    assert ledger.get("repair").attempts == 0
+    assert client.clear_calls == 0
+    assert client.set_calls == client.send_calls == []
+
+    client.current = snapshot()
+    run_block(block, client)
+    assert ledger.get("repair").status is RequestStatus.SENT
+    assert ledger.get("repair").attempts == 1
+    assert len(client.send_calls) == 1
 
 
 def test_pristine_new_dirty_composer_rehydrate_blocks_without_send(tmp_path):

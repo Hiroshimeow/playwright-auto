@@ -38,8 +38,38 @@ COMPOSER_RESOLVER_JS = r"""() => {
 }"""
 
 
+COMPOSER_TEXT_JS = r"""element => {
+  // Read editor content, not CSS layout: generated URL icons can make innerText
+  // insert line breaks inside an otherwise unchanged prompt.
+  const blocks = new Set(['P', 'DIV']);
+  const read = node => {
+    if (node.nodeType === Node.TEXT_NODE) return node.nodeValue || '';
+    if (node.nodeType !== Node.ELEMENT_NODE) return '';
+    if (node.matches('[data-inline-url-icon][aria-hidden="true"][contenteditable="false"]')) {
+      return '';
+    }
+    if (node.tagName === 'BR') return '\n';
+    const children = [...node.childNodes];
+    // An empty editor paragraph uses BR as its caret placeholder.
+    if (blocks.has(node.tagName) && children.length === 1 && children[0].nodeName === 'BR') {
+      return '';
+    }
+    let text = '', previousBlock = false;
+    for (const [index, child] of children.entries()) {
+      const block = child.nodeType === Node.ELEMENT_NODE && blocks.has(child.tagName);
+      if (index && (block || previousBlock)) text += '\n';
+      text += read(child);
+      previousBlock = block;
+    }
+    return text;
+  };
+  return element ? read(element) : '';
+}"""
+
+
 COMPOSER_REPLACE_TEXT_JS = r"""targetText => {
   const resolve = __CDPA_COMPOSER_RESOLVER__;
+  const readText = __CDPA_COMPOSER_TEXT__;
   const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
   const result = (owner, status, text = null) => ({
     status,
@@ -51,7 +81,7 @@ COMPOSER_REPLACE_TEXT_JS = r"""targetText => {
   if (owner.ambiguous) return result(owner, 'ambiguous');
   const element = owner.element;
   if (!element) return result(owner, 'missing');
-  const before = normalize(element.innerText);
+  const before = normalize(readText(element));
   element.focus();
   const afterFocus = resolve();
   if (!element.isConnected || afterFocus.element !== element) {
@@ -60,8 +90,8 @@ COMPOSER_REPLACE_TEXT_JS = r"""targetText => {
   if (document.activeElement !== element && !element.contains(document.activeElement)) {
     return result(afterFocus, 'focus_stolen', before);
   }
-  if (normalize(element.innerText) !== before) {
-    return result(afterFocus, 'content_changed', normalize(element.innerText));
+  if (normalize(readText(element)) !== before) {
+    return result(afterFocus, 'content_changed', normalize(readText(element)));
   }
   const expected = normalize(targetText);
   if (before === expected) return result(afterFocus, 'unchanged', before);
@@ -73,8 +103,10 @@ COMPOSER_REPLACE_TEXT_JS = r"""targetText => {
   // mutation and readback stay in one callback, so no later keyboard event can
   // be redirected to another editable node.
   const edited = document.execCommand(targetText ? 'insertText' : 'delete', false, targetText);
-  return result(afterFocus, edited ? 'edited' : 'unsupported', normalize(element.innerText));
-}""".replace('__CDPA_COMPOSER_RESOLVER__', COMPOSER_RESOLVER_JS)
+  return result(afterFocus, edited ? 'edited' : 'unsupported', normalize(readText(element)));
+}""".replace('__CDPA_COMPOSER_RESOLVER__', COMPOSER_RESOLVER_JS).replace(
+    '__CDPA_COMPOSER_TEXT__', COMPOSER_TEXT_JS
+)
 
 
 async def replace_owned_composer_text(

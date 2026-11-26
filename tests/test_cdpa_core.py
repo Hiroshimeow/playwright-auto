@@ -13,7 +13,7 @@ from playwright_auto.cdpa_bootstraps import normalize_bootstrap_record
 from playwright_auto.cdpa_config import CDPAConfigError, load_cdpa_config
 from playwright_auto.cdpa_projection import build_dashboard_actions
 from playwright_auto.cdpa_prompts import PromptBuilder
-from playwright_auto.cdpa_routes import RouteContractError, parse_route_response
+from playwright_auto.cdpa_routes import RouteContractError, parse_report_result, parse_report_route, parse_route_response
 from playwright_auto.cdpa_store import TaskStore, effective_task_goal, task_goal_for_hop, utc_now
 from playwright_auto.cdpa_worker import CDPAWorker
 from playwright_auto.file_lock import open_shared_read
@@ -489,6 +489,7 @@ def test_normal_prompt_is_compact_and_constructor_assets_are_not_injected(tmp_pa
             logical_role="DEV",
             physical_role="alpha-dev",
             source_physical_role="alpha-plan",
+            allowed_routes=("PLAN", "TEST", "REVIEW", "AUDIT", "PAUSE"),
             handoff=".plan/alpha/alpha-plan_turn1_task-a.md",
             constructor_sent_generation=0,
         )
@@ -553,6 +554,53 @@ def test_normal_prompt_is_compact_and_constructor_assets_are_not_injected(tmp_pa
     assert "Output exactly one JSON object and nothing else." in repair
     assert "full task" not in repair
     assert "Constructor for PLAN" not in repair
+
+
+def test_repeated_team_turn_prompt_requires_an_actionable_handoff(tmp_path: Path):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    prompt = PromptBuilder(config).build(**_prompt_kwargs(
+        config,
+        tmp_path,
+        logical_role="REVIEW",
+        physical_role="alpha-review",
+        source_physical_role="alpha-dev",
+        turn=3,
+        allowed_routes=("PLAN", "DEV", "TEST", "PAUSE"),
+        handoff=".plan/alpha/alpha-dev_turn3_task-a.md",
+    )).text
+
+    assert "the next role's exact action and how to verify it" in prompt
+    assert "If the same issue returns" in prompt
+    assert "what changed or what action or decision could move it forward" in prompt
+    assert "Handoff: .plan/alpha/alpha-dev_turn3_task-a.md" in prompt
+    assert "PAUSE requires an external/manual prerequisite" in prompt
+    assert "`block_code` and `resume_condition` in the report" in prompt
+    assert "Goal: full task" not in prompt
+
+
+@pytest.mark.parametrize(
+    ("role", "turn", "required_guidance"),
+    [
+        ("PLAN", 1, "an implementable scope and explicit acceptance checks"),
+        ("DEV", 2, "what passed and what still needs verification"),
+        ("TEST", 2, "an unresolved acceptance blocker"),
+        ("REVIEW", 2, "an unresolved acceptance blocker"),
+        ("AUDIT", 2, "an unresolved acceptance blocker"),
+    ],
+)
+def test_team_prompt_sets_role_specific_handoff_criteria(tmp_path, role, turn, required_guidance):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    prompt = PromptBuilder(config).build(**_prompt_kwargs(
+        config,
+        tmp_path,
+        logical_role=role,
+        physical_role=f"alpha-{role.lower()}",
+        turn=turn,
+        closing_role="PLAN",
+        allowed_routes=("DEV", "TEST", "REVIEW", "PAUSE", "DONE") if role == "PLAN" else ("PLAN", "PAUSE"),
+    )).text
+
+    assert required_guidance in prompt
 
 
 def test_same_role_continuation_prompt_rejects_report_only_turn(tmp_path: Path):
@@ -786,6 +834,35 @@ def test_manifest_replace_does_not_retry_non_permission_error(tmp_path: Path, mo
         store.request_resume(manifest, external_command_id="cmd-resume-invalid")
 
     assert attempts == 1
+
+
+def test_report_result_requires_the_current_request_and_exact_handoff():
+    path = ".plan/alpha/alpha-plan_turn1_task-a.md"
+    result = json.dumps({"route": "DEV", "handoff": path})
+    report = f"# Finished work\n\nCDPA-RESULT task-a-hop1: {result}\n"
+    assert parse_report_result(
+        report, result_key="task-a-hop1", expected_report_path=path,
+        source_role="PLAN", closing_role="PLAN", allowed_routes=("DEV", "PAUSE", "DONE"),
+    ).route == "DEV"
+    for invalid, request, expected in (
+        (report, "task-a-hop2", path),
+        (report, "task-a-hop1", ".plan/alpha/another.md"),
+        (report + "Draft notes\n", "task-a-hop1", path),
+        (f"CDPA-RESULT task-a-hop1: {result}\n", "task-a-hop1", path),
+    ):
+        with pytest.raises(RouteContractError):
+            parse_report_result(
+                invalid, result_key=request, expected_report_path=expected,
+                source_role="PLAN", closing_role="PLAN", allowed_routes=("DEV", "PAUSE", "DONE"),
+            )
+
+
+@pytest.mark.parametrize("report", [
+    "# Plan\n\n**Decision: DEV.** Implementation remains.\n\nEvidence and handoff.\n",
+    "# Plan\n\nEvidence and handoff.\n\n**Next role: DEV.** Implementation remains.\n",
+])
+def test_legacy_report_route_accepts_an_explicit_disposition(report):
+    assert parse_report_route(report) == "DEV"
 
 
 def test_route_contract_validates_only_worker_owned_fields():

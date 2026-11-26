@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
-from playwright_auto.cdpa_runtime_registry import CDPARuntimeRegistry
+from playwright_auto.cdpa_runtime_registry import CDPARuntimeRegistry, held_report_check
 
 
 def task(
@@ -41,6 +42,22 @@ def test_due_tasks_follow_durable_fifo_instead_of_task_id_order():
     )
 
     assert registry.due_task_ids(1000.5) == ("zzz-old", "aaa-new")
+
+
+def test_held_reports_keep_three_deadlines_across_worker_restart():
+    blocked = task("blocked", status="BLOCKED")
+    blocked["blocked_at"] = datetime.fromtimestamp(1000, timezone.utc).isoformat()
+    observation = {"key": "verified-result-key"}
+    blocked["hops"][0].update(report_result=observation, receipt={"user_message_id": "accepted"})
+    for deadline in (1180, 1600, 2740):
+        registry = CDPARuntimeRegistry.hydrate([blocked], now=deadline - 10)
+        assert registry.next_due_at() == deadline
+        assert held_report_check(blocked, deadline) == (1, deadline)
+        observation["checked_at"] = datetime.fromtimestamp(deadline, timezone.utc).isoformat()
+    assert held_report_check(blocked, 2741) is None
+    observation.pop("checked_at")
+    assert held_report_check(blocked, 1800) == (1, 1600)
+    assert held_report_check(blocked, 2801) is None
 
 
 def test_due_tasks_do_not_starve_old_normal_work_behind_new_urgent_repairs():
@@ -98,6 +115,23 @@ def test_due_set_excludes_idle_terminal_paused_blocked_and_dependency_waiters():
 
     assert registry.due_task_ids(1000.0) == ()
     assert registry.due_task_ids(1000.5) == ("active", "parent")
+
+
+def test_recovering_resume_is_due_for_held_tasks_without_waking_idle_tasks():
+    states = [task(task_id, status=status, controls=[control] if control else None)
+              for task_id, status, control in (
+                  ("blocked", "BLOCKED", {"status": "recovering", "action": "resume"}),
+                  ("paused", "PAUSED", {"status": "recovering", "action": "resume"}),
+                  ("idle", "BLOCKED", None),
+                  ("other", "BLOCKED", {"status": "recovering", "action": "new_chat"}),
+                  ("finished", "BLOCKED", {"status": "applied", "action": "resume"}),
+                  ("done", "DONE", {"status": "recovering", "action": "resume"}),
+              )]
+    states[-1]["cleanup"] = {"state": "CLEARED"}
+    registry = CDPARuntimeRegistry.hydrate(states, now=1000.0)
+
+    assert registry.due_task_ids(1000.0) == ()
+    assert registry.due_task_ids(1000.5) == ("blocked", "paused")
 
 
 def test_controls_cleanup_and_ready_waiters_are_due():

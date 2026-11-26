@@ -543,8 +543,8 @@ def test_board_uses_operator_labels_run_task_and_restored_settings():
     assert 'body: {trigger_type: "manual", instruction}' in app
     assert '/api/independent-agents/${encodeURIComponent(taskId)}/reset' in app
     assert '.filter(item => !item.agent?.deleted_at)' in app
-    assert 'app.js?v=20260925-live-sse-v1' in html
-    assert 'dashboard.css?v=20260925-live-sse-v1' in html
+    assert 'app.js?v=cdpa-accepted-report-v1' in html
+    assert 'dashboard.css?v=cdpa-recovery-controls-v2' in html
     assert 'function addEditedBrowserEndpoint(body, select, values)' in app
     assert 'if (selected !== initial) body.browser_endpoint_id = selected || null;' in app
     assert "new_chat_next_job" not in html[html.index('id="agent-settings-dialog"') :]

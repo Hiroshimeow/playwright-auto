@@ -50,7 +50,10 @@ def command(role: str, team: str, instruction: str, parent: str = "", depends_on
     return cmd
 
 def main():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(
+        description="Submit a CDPA self-evolution task through the campaign constructor.",
+        epilog="For ordinary repository reviews, use the CDPA CLI with --solo REVIEW.",
+    )
     p.add_argument("--role", required=True)
     p.add_argument("--team", required=True)
     p.add_argument("--instruction", required=True)
@@ -66,12 +69,17 @@ def main():
     if args.parent:
         # This is the Pi-owned dispatch path; persist the exact transition
         # before the first irreversible task-create API call.
-        from run_pi import record_transition_intent
-        record_transition_intent(
-            parent=args.parent, team=args.team, role=args.role,
-            goal=cmd[cmd.index("--goal") + 1],
-            idempotency_key=cmd[cmd.index("--idempotency-key") + 1],
-        )
+        from run_pi import PiDispatchOwnerUnavailable, record_transition_intent
+        try:
+            record_transition_intent(
+                parent=args.parent, team=args.team, role=args.role,
+                goal=cmd[cmd.index("--goal") + 1],
+                idempotency_key=cmd[cmd.index("--idempotency-key") + 1],
+            )
+        except PiDispatchOwnerUnavailable as error:
+            p.exit(2, f"{error}. No CDPA task was submitted by this invocation. "
+                   "For campaign successors, reconcile the Pi checkpoint. "
+                   "For ordinary repository reviews, use cdpa --solo REVIEW.\n")
     result = subprocess.run(cmd, cwd=str(ROOT), check=False)
     raise SystemExit(result.returncode)
 

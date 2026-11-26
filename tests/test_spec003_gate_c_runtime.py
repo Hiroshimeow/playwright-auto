@@ -151,10 +151,14 @@ def test_t074_binding_drift_rejects_before_send(writers, field, value):
 def test_t078_adopted_identity_is_exact_and_unresolved_never_provisional(writers):
     from playwright_auto.cdpa_conversations import canonical_conversation
     assert canonical_conversation("https://chatgpt.com/c/abc?model=x") == "abc"
-    for url in ("https://evil.example/c/abc", "https://chatgpt.com/c/abc/extra", "https://chatgpt.com/"):
+    project_url = "https://chatgpt.com/g/g-p-test-project/c/abc"
+    assert canonical_conversation(project_url) == "abc"
+    for url in ("https://evil.example/c/abc", "https://chatgpt.com/c/abc/extra", "https://chatgpt.com/",
+                "https://chatgpt.com/g/g-custom-gpt/c/abc"):
         with pytest.raises(ValueError, match="CONVERSATION_IDENTITY_MISMATCH"):
             canonical_conversation(url)
     original = bind(writers)
+    assert writers.validate_binding("one", {**original, "conversation_url": project_url}) == original
     with pytest.raises(ValueError, match="CONVERSATION_IDENTITY_MISMATCH"):
         writers.validate_binding("one", {**original, "conversation_url": "https://chatgpt.com/c/abcd"})
 

@@ -230,6 +230,32 @@ def test_terminal_advance_retries_stop_before_terminal_clear_and_survives_save_g
     assert actions.closed_teams == 0
 
 
+def test_empty_page_inventory_cannot_release_a_registered_idle_writer(tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from playwright_auto.cdpa_actions import CDPATabActions
+
+    config, store, state, worker = setup_task(tmp_path)
+    writers, _ = owned_binding(worker, state, 'PLAN')
+    writers.release_writer('PLAN')
+    owned_binding(worker, state, 'PLAN', identity='foreign', task='another-task')
+    before = snapshot(writers)
+    actions = CDPATabActions(SimpleNamespace(pages=[]), config)
+    actions.stop_if_active = AsyncMock()
+    actions.close_team = AsyncMock()
+
+    stopped = stop(store, state, worker, actions)
+    assert stopped['status'] == 'STOPPED'
+    assert stopped['active_hop_id'] is None
+    assert stopped['cleanup']['phase'] == 'writer_stop_pending'
+    assert 'no exact owned page evidence' in stopped['cleanup']['last_error']
+    assert not stopped['cleanup']['released_bindings']
+    assert snapshot(writers) == before
+    actions.stop_if_active.assert_not_awaited()
+    actions.close_team.assert_not_awaited()
+
+
 @pytest.mark.parametrize(('activity', 'value'), [
     ('response_activity_turn_id', 'active-turn'),
     ('response_projection_active', True),
@@ -297,6 +323,63 @@ def test_pristine_stop_needs_no_browser_and_survives_reload_and_replacement_retr
         rewire_children=True, incident_id='pristine-stop-replacement',
     )
     assert first['replacement']['task_id'] == second['replacement']['task_id']
+
+
+def test_restart_team_stops_first_and_replays_to_the_same_fresh_team(tmp_path):
+    from test_cdpa_temporary_workflow import _temporary_task
+
+    store, state, worker = _temporary_task(tmp_path, task_id="restart-exact-team")
+    path = Path(state["manifest_path"])
+    state.update(status="BLOCKED", kanban_column="BLOCKED", block_code="test")
+    state = store.save(path, state)
+    other_parent = store.create_task("Unrelated observer dependency", task_id="observer-other-parent")
+    child = store.create_task(
+        "Observe both campaign results",
+        task_id="restart-team-dependent",
+        depends_on_task_ids=(other_parent["task_id"], state["task_id"]),
+    )
+    worker.hydrate_runtime()
+
+    def enqueue(key, version=None):
+        return worker.runtime_db.enqueue_command(
+            command_id=key, idempotency_key=key, kind="task_control", task_id=state["task_id"],
+            payload={"action": "restart_team", "confirmed": True}, expected_task_version=version,
+        )
+
+    first = enqueue("restart-first")
+    applied = worker.dispatch_command_once()
+    requested = store.load(path)
+    assert requested["status"] == "BLOCKED"
+    assert requested["controls"] and requested["controls"][-1]["action"] == "stop", applied
+    assert not any(item.get("replaces_task_id") == state["task_id"] for item in store.discover())
+    worker.runtime_db.requeue_running_commands()
+    result = worker.dispatch_command_once()
+    assert result["status"] == "running", result
+    asyncio.run(worker._apply_control(requested, StopActions(missing=True), path))
+    stopped = store.load(path)
+    assert stopped["status"] == "STOPPED"
+    worker._sync_control_commands(stopped)
+    result = worker.runtime_db.get_command(first["command_id"])
+    assert result["status"] == "applied", result
+    successor = store.load_task_id(result["result"]["task_id"])
+    assert successor["team"] != state["team"]
+    for field in ("task_text", "repository", "browser_endpoint_id", "conversation_mode", "initial_roles"):
+        assert successor[field] == state[field]
+    assert successor["context_policy"] == "fresh" and successor["reports"] == []
+    assert successor["hops"][0]["receipt"] is None
+    assert state["task_id"] in successor["hops"][0]["handoff"]
+    expected_parents = [other_parent["task_id"], successor["task_id"]]
+    assert store.load(child["manifest_path"])["depends_on_task_ids"] == expected_parents
+    assert worker.registry.dependency_children[successor["task_id"]] == {child["task_id"]}
+    assert child["task_id"] not in worker.registry.dependency_children.get(state["task_id"], set())
+    published = worker.runtime_db.get_task_detail(child["task_id"])
+    assert published["depends_on_task_ids"] == expected_parents
+    second = enqueue("restart-second", version=-1)
+    worker.dispatch_command_once()
+    assert worker.runtime_db.get_command(second["command_id"])["result"]["task_id"] == successor["task_id"]
+    reloaded_child = store.load(child["manifest_path"])
+    assert reloaded_child["depends_on_task_ids"] == expected_parents
+    assert sum(event["status"] == "REWIRED" for event in reloaded_child["dependency_events"]) == 1
 
 
 @pytest.fixture

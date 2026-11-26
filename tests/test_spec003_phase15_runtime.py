@@ -35,6 +35,7 @@ from playwright_auto.dashboard_api import DashboardAPI
 from playwright_auto.hcuw_runtime.api_server import RuntimeApiServer
 from playwright_auto.hcuw_runtime.legacy_audit import LegacyObservationAudit
 from playwright_auto.role_runtime import Action, RoleController
+from role_runtime_test_support import RoleRuntimeTestWorker
 from test_cdpa_core import write_config
 from test_operational_contract import snapshot
 
@@ -117,7 +118,7 @@ def _fake_environment(client, *, runtime_db=None):
         tempdir = TemporaryDirectory()
         runtime_db = RuntimeDB(Path(tempdir.name) / "runtime.sqlite3")
         runtime_db.ensure_schema()
-    worker = SimpleNamespace(
+    worker = RoleRuntimeTestWorker(
         runtime_db=runtime_db,
         _runtime_db_tempdir=tempdir,
         _validate_response_candidate=lambda *_: None,
@@ -548,17 +549,29 @@ def test_t043_wait_is_admitted_only_after_confirmed_spawn_and_sets_async_waiting
     assert is_active_team_owner(waiting) is True
 
 
-def test_t043_callback_wakes_same_task_role_and_parent_conversation_exactly_once(tmp_path):
+@pytest.mark.parametrize("budget_exhausted", [False, True])
+def test_t043_callback_wakes_same_task_role_and_parent_conversation_exactly_once(tmp_path, budget_exhausted):
     store, worker, state = _waiting_dev_turn(tmp_path)
     _command, payload = _register(worker, state, wake_prompt="Summarize the benchmark result.")
     continuation_id = payload["continuation_id"]
     waiting = _commit_wait(store, worker, store.load(state["manifest_path"]), continuation_id)
     hop_count = len(waiting["hops"])
     task_count = len(store.discover())
+    if budget_exhausted:
+        budget = worker._execution_budget(waiting)
+        budget["limit"] = len(budget["charged_hop_ids"])
+        waiting = store.save(waiting["manifest_path"], waiting)
 
     done = _callback(worker, waiting, continuation_id, key="callback-1", stdout="x" * 9000 + "tail-marker", stderr="warn")
     assert done["status"] == "applied", done
     woken = store.load(state["manifest_path"])
+    if budget_exhausted:
+        assert woken["status"] == "BLOCKED"
+        assert woken["block_code"] == "ASYNC_WAKE_BUDGET_EXHAUSTED"
+        assert woken["async_continuations"][continuation_id]["wake"]["status"] == "blocked"
+        assert len(woken["hops"]) == hop_count
+        assert len(store.discover()) == task_count
+        return
     assert woken["status"] == "RUNNING"
     assert woken.get("waiting_code") is None
     assert len(woken["hops"]) == hop_count + 1

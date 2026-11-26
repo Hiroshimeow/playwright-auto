@@ -34,6 +34,10 @@ PI = Path(os.environ.get("APPDATA", "")) / "npm" / "node_modules" / "@earendil-w
 _JOB_HANDLE = None
 
 
+class PiDispatchOwnerUnavailable(RuntimeError):
+    pass
+
+
 def read_state():
     try:
         return json.loads(STATE.read_text(encoding="utf-8"))
@@ -109,7 +113,8 @@ def record_transition_intent(*, parent, team, role, goal, idempotency_key):
     with state_guard():
         state = read_state()
         if state.get("status") not in {"RUNNING", "INTENT_PENDING"} or state.get("dispatch_allowed") is not False:
-            raise RuntimeError("Pi is not the active dispatch owner")
+            checkpoint_status = state.get("status") or "missing"
+            raise PiDispatchOwnerUnavailable(f"Pi is not the active dispatch owner (checkpoint: {checkpoint_status})")
         old = state.get("transition")
         if old and old != transition:
             raise RuntimeError("parent transition conflict: reconcile previous command first")

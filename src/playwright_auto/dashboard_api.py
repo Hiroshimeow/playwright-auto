@@ -2373,6 +2373,13 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                         "reason": raw.get("reason"),
                         "confirmed": bool(raw.get("confirmed")),
                     }
+                    if action == "restart_team" and (raw.get("confirmed") is not True or expected is None):
+                        raise APIError(400, "invalid_request", "Restart team requires confirmation and the expected task version")
+                    if action == "change_role_url":
+                        url = raw.get("conversation_url")
+                        if expected is None or not isinstance(url, str) or not 1 <= len(url.strip()) <= 2048:
+                            raise APIError(400, "invalid_request", "Change URL requires a conversation URL and the expected task version")
+                        control_payload["conversation_url"] = url.strip()
                     if action == "increase_route_limits":
                         allowed_fields = {
                             "action",

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 
-from .chatgpt_graph import normalize_visible_text
+from .chatgpt_graph import normalize_visible_text, rendered_user_text_matches
 
 _ROLE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 
@@ -475,11 +475,12 @@ def unique_new_user_message(
     return candidates[0] if len(candidates) == 1 else None
 
 
-def _receipt_user_index(
+def _receipt_user_matches(
     messages: Sequence[MessageSnapshot], receipt: SendReceipt
-) -> int | None:
+) -> list[int]:
     message_id = str(receipt.user_message_id or "").strip()
     turn_id = str(receipt.user_turn_id or "").strip()
+    provisional_user = not turn_id and message_id.startswith("DOM:user:")
     expected = normalize_visible_text(receipt.prompt)
     marker = request_marker_from_prompt(receipt.prompt)
     matches: list[int] = []
@@ -494,7 +495,13 @@ def _receipt_user_index(
             )
         ):
             continue
-        if message_id or turn_id:
+        if provisional_user:
+            # The ordinal DOM ID can disappear when ChatGPT saves the same user turn.
+            matched = (
+                (message.message_id == message_id or message.turn_id == f"group:user:{message.message_id}")
+                and rendered_user_text_matches(message.text, receipt.prompt)
+            )
+        elif message_id or turn_id:
             matched = (
                 (bool(message_id) and message.message_id == message_id)
                 or (bool(turn_id) and message.turn_id == turn_id)
@@ -504,6 +511,13 @@ def _receipt_user_index(
             matched = visible == expected or bool(marker and marker in message.text)
         if matched:
             matches.append(index)
+    return matches
+
+
+def _receipt_user_index(
+    messages: Sequence[MessageSnapshot], receipt: SendReceipt
+) -> int | None:
+    matches = _receipt_user_matches(messages, receipt)
     return matches[0] if len(matches) == 1 else None
 
 
@@ -511,6 +525,25 @@ def receipt_user_message_seen(
     messages: Sequence[MessageSnapshot], receipt: SendReceipt
 ) -> bool:
     return _receipt_user_index(messages, receipt) is not None
+
+
+def current_repair_receipt(
+    messages: Sequence[MessageSnapshot], receipt: SendReceipt,
+) -> SendReceipt | None:
+    """Use an observation-only receipt when ChatGPT remounts the same repair prompt."""
+    user = next((message for message in reversed(messages) if message.role == "user"), None)
+    if user is None:
+        return None
+    index = _receipt_user_index(messages, receipt)
+    if index is not None:
+        return receipt if messages[index] == user else None
+    if (
+        not user.turn_id or user.message_id in receipt.baseline.user_message_ids
+        or user.turn_id in receipt.baseline.logical_turn_ids
+        or not rendered_user_text_matches(user.text, receipt.prompt)
+    ):
+        return None
+    return replace(receipt, user_message_id=user.message_id, user_turn_id=user.turn_id)
 
 
 def bound_assistant_for_receipt(
@@ -531,18 +564,10 @@ def bound_assistant_for_receipt(
     bound_turn_id = str(assistant_turn_id or "").strip()
 
     if allow_user_steering:
-        exact_receipt_users = [
-            index
-            for index, message in enumerate(messages)
-            if message.role == "user"
-            and (
-                (user_message_id and message.message_id == user_message_id)
-                or (user_turn_id and message.turn_id == user_turn_id)
-            )
-        ]
-        if len(exact_receipt_users) > 1:
+        user_matches = _receipt_user_matches(messages, receipt)
+        if len(user_matches) > 1:
             return None, "duplicate_receipt_user_identity"
-        anchor_index = _receipt_user_index(messages, receipt)
+        anchor_index = user_matches[0] if user_matches else None
         if anchor_index is None:
             # The accepted user can be virtualized out after a rerender. A user
             # that is not part of the pre-Send baseline is then an operator
@@ -637,15 +662,7 @@ def bound_assistant_for_receipt(
         return (matches[0], None) if matches else (None, None)
 
     # Initial binding still requires the exact accepted user to be rendered.
-    user_matches = [
-        index
-        for index, message in enumerate(messages)
-        if message.role == "user"
-        and (
-            (user_message_id and message.message_id == user_message_id)
-            or (user_turn_id and message.turn_id == user_turn_id)
-        )
-    ]
+    user_matches = _receipt_user_matches(messages, receipt)
     if len(user_matches) > 1:
         return None, "duplicate_receipt_user_identity"
     if not user_matches:

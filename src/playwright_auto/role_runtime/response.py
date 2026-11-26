@@ -5,7 +5,7 @@ import hashlib
 from typing import Any, Callable, Sequence
 
 from ..cdpa_response import parse_time
-from ..chatgpt_models import bound_assistant_for_receipt
+from ..chatgpt_models import bound_assistant_for_receipt, receipt_user_message_seen
 from .model import Action, Context, Decision
 
 
@@ -109,7 +109,7 @@ def observe_candidate(
     ctx.candidate_stable = stable_for >= ctx.policy.response_stable_seconds
 
 
-def _bound_assistant(ctx: Context, receipt: Any) -> Any | None:
+def _bound_assistant(ctx: Context, receipt: Any, *, exact_turn: bool) -> Any | None:
     messages = tuple(getattr(ctx.snapshot, "messages", ()) or ())
     if receipt is None:
         return current_assistant(messages)
@@ -119,9 +119,9 @@ def _bound_assistant(ctx: Context, receipt: Any) -> Any | None:
     candidate, error = bound_assistant_for_receipt(
         messages,
         receipt,
-        assistant_message_id=ctx.wait.get("bound_assistant_message_id"),
-        assistant_turn_id=ctx.wait.get("bound_assistant_turn_id"),
-        allow_user_steering=True,
+        assistant_message_id=None if exact_turn else ctx.wait.get("bound_assistant_message_id"),
+        assistant_turn_id=None if exact_turn else ctx.wait.get("bound_assistant_turn_id"),
+        allow_user_steering=not exact_turn,
     )
     if error is not None:
         ctx.wait["response_binding_error"] = error
@@ -163,13 +163,51 @@ def observe(
     ctx: Context,
     receipt: Any,
     validate: Callable[[Any], None] | None,
+    *,
+    exact_turn: bool = False,
 ) -> None:
     observe_candidate(
         ctx,
-        _bound_assistant(ctx, receipt),
+        _bound_assistant(ctx, receipt, exact_turn=exact_turn),
         validate,
         source="dom",
     )
+
+
+def completed_empty_assistant(
+    snapshot: Any, receipt: Any, *, bound_message_id: str | None = None,
+    bound_turn_id: str | None = None,
+) -> Any | None:
+    """Use visible completion controls on the exact latest accepted user/assistant pair."""
+    messages = tuple(getattr(snapshot, "messages", ()) or ())
+    if receipt is None or not accepted_turn_key(receipt):
+        return None
+    user = next((message for message in reversed(messages) if message.role == "user"), None)
+    if user is None:
+        return None
+    if receipt_user_message_seen(messages, receipt) and (
+        user.message_id == receipt.user_message_id or user.turn_id and user.turn_id == receipt.user_turn_id
+    ):
+        assistant, error = bound_assistant_for_receipt(messages, receipt)
+    elif (
+        not receipt.user_turn_id and str(receipt.user_message_id or "").startswith("DOM:user:")
+        and str(user.turn_id or "").startswith("group:user:")
+        and bound_turn_id == user.turn_id.replace("group:user:", "group:assistant:", 1)
+        and bound_message_id
+        and sum(message.role == "user" and message.message_id not in receipt.baseline.user_message_ids
+                for message in messages) == 1
+    ):
+        assistant, error = bound_assistant_for_receipt(
+            messages, receipt, assistant_message_id=bound_message_id, assistant_turn_id=bound_turn_id,
+        )
+        if assistant is None or assistant.message_id != bound_message_id:
+            return None
+    else:
+        return None
+    if error or assistant is None or fingerprint(assistant):
+        return None
+    actions = getattr(assistant, "actions", ())
+    return assistant if "copy" in actions or "feedback" in actions else None
 
 
 def handle(ctx: Context) -> Decision | None:

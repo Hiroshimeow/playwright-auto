@@ -16,9 +16,10 @@ def _scenario(tmp_path: Path):
     parent = _active_hop(state)
     parent["state"] = "routed"
     parent["receipt"] = {"user_message_id": "previously-accepted-user"}
+    # Exercise the normal clean-ready acquisition path. Repairs reuse the
+    # observed tab without composer cleanup.
     hop = worker._append_hop(
-        state, source_role="PLAN", target_role="PLAN",
-        handoff="repair route format", kind="route_repair",
+        state, source_role="PLAN", target_role="PLAN", handoff="continue",
     )
     role = state["roles"]["PLAN"]
     role.update(page_id="owned-page", page_url="https://chatgpt.com/c/owned", online=False)

@@ -4,18 +4,107 @@ import asyncio
 import json
 import re
 from collections.abc import Awaitable, Callable, Iterable
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
-from .chatgpt import ChatGPTPage, PageBinding, RateLimitBlockedError, validate_page_role
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+from .chatgpt import ChatGPTPage, PageBinding, validate_page_role
+from .chatgpt_errors import ProviderChallengeError
+
+CLOUDFLARE_CHALLENGE_DOM = """() => Boolean(
+    window._cf_chl_opt ||
+    (document.querySelector('#challenge-form, #challenge-running, #challenge-stage') &&
+     /verifying you are human|checking your browser|performing security verification/i
+         .test(document.body?.innerText || ''))
+)"""
+
+
+def has_cloudflare_challenge_url(url: str) -> bool:
+    try:
+        query = urlsplit(url).query
+    except ValueError:
+        return False
+    return any(parse_qs(query).get("__cf_chl_rt_tk", ()))
 
 
 class WorkspaceBindingError(RuntimeError):
     pass
 
 
+class FreshPageReadinessTimeout(TimeoutError):
+    """A new page timed out before binding and was confirmed closed."""
+
+
 class RouteValidationError(ValueError):
     pass
+
+
+async def _open_direct_in_default_profile(context: Any, url: str, timeout_ms: int) -> Any | None:
+    """Open at the destination and take only the Playwright page for our CDP target."""
+    browser = getattr(context, "browser", None)
+    if browser is None or browser.browser_type.name != "chromium":
+        return None
+    timeout = timeout_ms / 1000
+    session = await asyncio.wait_for(browser.new_browser_cdp_session(), timeout)
+    try:
+        contexts = await asyncio.wait_for(session.send("Target.getBrowserContexts"), timeout)
+        if contexts["browserContextIds"]:
+            # A Playwright-managed isolated context must not open in the account's default profile.
+            return None
+
+        # On shared attached Chromium, the second navigation from about:blank can
+        # stall before commit. Start navigation at creation, without borrowing a tab.
+        pages: asyncio.Queue[Any] = asyncio.Queue()
+        on_page = pages.put_nowait
+        context.on("page", on_page)
+        try:
+            target = await asyncio.wait_for(
+                session.send("Target.createTarget", {"url": url, "background": True}),
+                timeout,
+            )
+            target_id = target["targetId"]
+            try:
+                async with asyncio.timeout(timeout):
+                    while True:
+                        page = await pages.get()
+                        try:
+                            child = await context.new_cdp_session(page)
+                            try:
+                                info = await child.send("Target.getTargetInfo")
+                            finally:
+                                await child.detach()
+                        except PlaywrightError:
+                            if page.is_closed():
+                                continue
+                            raise
+                        if info["targetInfo"]["targetId"] == target_id:
+                            return page
+            except (Exception, asyncio.CancelledError) as exc:
+                # Only a confirmed close permits the worker's bounded pre-Send retry.
+                async with asyncio.timeout(timeout):
+                    await session.send("Target.closeTarget", {"targetId": target_id})
+                    while True:
+                        try:
+                            await session.send("Target.getTargetInfo", {"targetId": target_id})
+                        except PlaywrightError as error:
+                            if "No target with given id found" not in str(error):
+                                raise
+                            break
+                        await asyncio.sleep(0.05)
+                if isinstance(exc, (TimeoutError, PlaywrightTimeoutError)):
+                    raise FreshPageReadinessTimeout(
+                        "Fresh Chromium target did not attach to Playwright before the deadline"
+                    ) from exc
+                raise
+        finally:
+            context.remove_listener("page", on_page)
+    finally:
+        with suppress(PlaywrightError, TimeoutError):
+            await asyncio.wait_for(session.detach(), timeout)
 
 
 @dataclass(frozen=True)
@@ -115,10 +204,19 @@ class ChatGPTWorkspace:
     ) -> ChatGPTPage:
         if role in self._clients:
             raise WorkspaceBindingError(f"role {role!r} is already open")
-        page = await browser_context.new_page()
+        page = await _open_direct_in_default_profile(browser_context, url, timeout_ms)
+        needs_navigation = page is None
+        if needs_navigation:
+            page = await browser_context.new_page()
         readiness_complete = False
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            if needs_navigation:
+                try:
+                    await page.goto(url, wait_until="commit", timeout=timeout_ms)
+                except PlaywrightError as exc:
+                    if "net::ERR_ABORTED" not in str(exc) or page.url not in {"about:blank", url}:
+                        raise
+                    await page.wait_for_url(url, wait_until="commit", timeout=timeout_ms)
             # ChatGPT initial hydration can exceed the default 15-second workspace timeout.
             # This is readiness-only: no ownership or Send boundary is bypassed.
             await page.locator(
@@ -134,20 +232,14 @@ class ChatGPTWorkspace:
         except Exception as exc:
             cloudflare_challenge = False
             if not readiness_complete:
-                cloudflare_challenge = "__cf_chl_rt_tk=" in str(getattr(page, "url", ""))
+                cloudflare_challenge = has_cloudflare_challenge_url(str(getattr(page, "url", "")))
                 if not cloudflare_challenge:
                     try:
                         # Inspect only this new, unbound page. Return a boolean, never
                         # challenge tokens, scripts or private page content. A generic
                         # "Just a moment" title or blank page is not positive evidence.
                         cloudflare_challenge = (await asyncio.wait_for(
-                            page.evaluate("""() => Boolean(
-                                window._cf_chl_opt ||
-                                document.querySelector('script[src*="/cdn-cgi/challenge-platform/"]') ||
-                                (document.querySelector('#challenge-running, #challenge-stage') &&
-                                 /verifying you are human|checking your browser|performing security verification/i
-                                     .test(document.body?.innerText || ''))
-                            )"""),
+                            page.evaluate(CLOUDFLARE_CHALLENGE_DOM),
                             timeout=2,
                         )) is True
                     except Exception:
@@ -155,9 +247,11 @@ class ChatGPTWorkspace:
                         pass
             await page.close()
             if cloudflare_challenge:
-                raise RateLimitBlockedError(
+                raise ProviderChallengeError(
                     "Cloudflare challenge blocked fresh ChatGPT page readiness"
                 ) from exc
+            if not readiness_complete and isinstance(exc, (TimeoutError, PlaywrightTimeoutError)):
+                raise FreshPageReadinessTimeout(str(exc)) from exc
             raise
 
     async def attach_existing(

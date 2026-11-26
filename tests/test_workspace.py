@@ -8,10 +8,10 @@ from playwright_auto.chatgpt import (
     MessageBaseline,
     MessageSnapshot,
     PageBinding,
-    RateLimitBlockedError,
     SendReceipt,
 )
 from playwright_auto.workflow import Workflow
+from playwright_auto.chatgpt_errors import ProviderChallengeError
 from playwright_auto.workspace import (
     ChatGPTWorkspace,
     RouteValidationError,
@@ -303,13 +303,101 @@ class ChallengeContext:
         return self.page
 
 
-def test_open_role_classifies_cloudflare_challenge_as_retryable_rate_limit():
+def test_open_role_classifies_cloudflare_verification_as_provider_challenge():
     context = ChallengeContext()
 
-    with pytest.raises(RateLimitBlockedError, match="Cloudflare challenge"):
+    with pytest.raises(ProviderChallengeError, match="Cloudflare challenge"):
         asyncio.run(ChatGPTWorkspace().open_role(context, "PLAN"))
 
     assert context.page.closed is True
+
+
+def test_cloudflare_detection_requires_a_challenge_page():
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.set_content(
+                '<script type="application/json" src="/cdn-cgi/challenge-platform/cdn.js"></script>'
+                '<main><p>How to tell if a site says verifying you are human</p>'
+                '<div contenteditable="true" role="textbox"></div></main>'
+            )
+            assert page.evaluate(workspace_module.CLOUDFLARE_CHALLENGE_DOM) is False
+            page.set_content('<main id="challenge-stage">Verifying you are human</main>')
+            assert page.evaluate(workspace_module.CLOUDFLARE_CHALLENGE_DOM) is True
+        finally:
+            browser.close()
+
+
+def test_open_role_waits_for_composer_after_navigation_commits(monkeypatch):
+    context = ChallengeContext()
+    steps = []
+
+    async def goto(url, *, wait_until, timeout):
+        if wait_until != "commit":
+            raise TimeoutError("document committed but DOMContentLoaded is delayed")
+        context.page.url = url
+        steps.append("commit")
+
+    async def ready(self, **_options):
+        steps.append("composer")
+
+    async def bind(self, role, page, **_options):
+        assert page is context.page and role == "PLAN"
+        steps.append("bind")
+        return page
+
+    monkeypatch.setattr(context.page, "goto", goto)
+    monkeypatch.setattr(ChallengeLocator, "wait_for", ready)
+    monkeypatch.setattr(ChatGPTWorkspace, "bind", bind)
+    assert asyncio.run(ChatGPTWorkspace().open_role(context, "PLAN")) is context.page
+    assert steps == ["commit", "composer", "bind"]
+
+
+@pytest.mark.parametrize("commits", [True, False])
+def test_open_role_observes_expected_document_after_aborted_navigation(monkeypatch, commits):
+    from playwright.async_api import Error
+
+    expected = "https://chatgpt.com/?temporary-chat=true"
+    steps = []
+
+    class AbortedPage(ChallengePage):
+        async def goto(self, url, *, wait_until, timeout):
+            assert url == expected and wait_until == "commit"
+            steps.append("goto")
+            raise Error("Page.goto: net::ERR_ABORTED")
+
+        async def wait_for_url(self, url, *, wait_until, timeout):
+            assert url == expected and wait_until == "commit"
+            steps.append("observe")
+            if not commits:
+                raise TimeoutError("expected document never committed")
+            self.url = url
+
+    async def ready(self, **_options):
+        steps.append("composer")
+
+    async def bind(self, role, page, **_options):
+        assert page is context.page and role == "PLAN"
+        steps.append("bind")
+        return page
+
+    context = ChallengeContext()
+    context.page = AbortedPage()
+    monkeypatch.setattr(ChallengeLocator, "wait_for", ready)
+    monkeypatch.setattr(ChatGPTWorkspace, "bind", bind)
+    operation = ChatGPTWorkspace().open_role(context, "PLAN", url=expected)
+    if commits:
+        assert asyncio.run(operation) is context.page
+        assert steps == ["goto", "observe", "composer", "bind"]
+        assert not context.page.closed
+    else:
+        with pytest.raises(workspace_module.FreshPageReadinessTimeout):
+            asyncio.run(operation)
+        assert steps == ["goto", "observe"]
+        assert context.page.closed
 
 
 @pytest.mark.parametrize("evidence", [True, False, "diagnostic_error", "diagnostic_timeout"])
@@ -320,7 +408,6 @@ def test_open_role_unchanged_url_challenge_evidence(monkeypatch, evidence):
 
         async def evaluate(self, script):
             assert "_cf_chl_opt" in script
-            assert "challenge-platform" in script
             if evidence == "diagnostic_error":
                 raise RuntimeError("renderer unavailable")
             if evidence == "diagnostic_timeout":
@@ -338,11 +425,13 @@ def test_open_role_unchanged_url_challenge_evidence(monkeypatch, evidence):
             return await original_wait_for(awaitable, timeout=0.001)
 
         monkeypatch.setattr(asyncio, "wait_for", bounded_wait_for)
-    expected = RateLimitBlockedError if evidence is True else TimeoutError
-    with pytest.raises(expected, match="Cloudflare challenge" if evidence is True else "composer absent"):
+    expected = ProviderChallengeError if evidence is True else TimeoutError
+    with pytest.raises(expected, match="Cloudflare challenge" if evidence is True else "composer absent") as failure:
         asyncio.run(ws.open_role(context, "PLAN"))
     assert context.page.closed is True
     assert ws.active_roles == ()
+    if evidence is not True:
+        assert type(failure.value).__name__ == "FreshPageReadinessTimeout"
 
 
 def test_open_role_binding_failure_is_not_reclassified_as_cloudflare(monkeypatch):
@@ -371,3 +460,75 @@ def test_open_role_binding_failure_is_not_reclassified_as_cloudflare(monkeypatch
     with pytest.raises(WorkspaceBindingError, match="ownership conflict"):
         asyncio.run(ws.open_role(context, "PLAN"))
     assert context.page.closed is True
+
+
+@pytest.mark.parametrize("close_verified", [True, False])
+def test_direct_open_only_retries_after_the_exact_unattached_target_is_gone(close_verified):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from playwright.async_api import Error
+
+    calls = []
+
+    async def send(method, params=None):
+        calls.append((method, params))
+        if method == "Target.getBrowserContexts":
+            return {"browserContextIds": []}
+        if method == "Target.createTarget":
+            return {"targetId": "created-here"}
+        assert params == {"targetId": "created-here"}
+        if method == "Target.closeTarget":
+            return {"success": True}
+        assert method == "Target.getTargetInfo"
+        if close_verified:
+            raise Error("No target with given id found")
+        return {"targetInfo": {"targetId": "created-here"}}
+
+    session = SimpleNamespace(send=send, detach=AsyncMock())
+    browser = SimpleNamespace(
+        browser_type=SimpleNamespace(name="chromium"),
+        new_browser_cdp_session=AsyncMock(return_value=session),
+    )
+    context = SimpleNamespace(browser=browser, on=Mock(), remove_listener=Mock(), new_page=AsyncMock())
+    with pytest.raises(TimeoutError) as exc:
+        asyncio.run(ChatGPTWorkspace().open_role(context, "PLAN", timeout_ms=25))
+    assert isinstance(exc.value, workspace_module.FreshPageReadinessTimeout) == close_verified
+    assert [method for method, _ in calls] == [
+        "Target.getBrowserContexts", "Target.createTarget", "Target.closeTarget", "Target.getTargetInfo"
+    ]
+    assert context.remove_listener.call_args == context.on.call_args
+    context.new_page.assert_not_awaited()
+    session.detach.assert_awaited_once()
+
+
+def test_open_role_creates_the_destination_directly_and_matches_exact_target(tmp_path, monkeypatch):
+    from playwright.async_api import Page, async_playwright
+
+    async def refuse_goto(*_args, **_kwargs):
+        raise TimeoutError("blank-tab navigation deferred")
+
+    async def bind(self, _role, page, **_options):
+        return page
+
+    monkeypatch.setattr(Page, "goto", refuse_goto)
+    monkeypatch.setattr(ChatGPTWorkspace, "bind", bind)
+
+    async def run():
+        async with async_playwright() as playwright:
+            context = await playwright.chromium.launch_persistent_context(str(tmp_path / "chromium"))
+            try:
+                existing = context.pages[0]
+                url = 'data:text/html,<div contenteditable="true" role="textbox">ready</div>'
+                workspace = ChatGPTWorkspace()
+                plan, dev = await asyncio.gather(
+                    workspace.open_role(context, "PLAN", url=url, timeout_ms=3000),
+                    workspace.open_role(context, "DEV", url=url, timeout_ms=3000),
+                )
+                assert len({plan, dev, existing}) == 3
+                assert existing.url == "about:blank"
+                assert await plan.locator('[role="textbox"]').inner_text() == "ready"
+                assert await dev.locator('[role="textbox"]').inner_text() == "ready"
+            finally:
+                await context.close()
+
+    asyncio.run(run())

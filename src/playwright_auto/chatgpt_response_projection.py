@@ -132,3 +132,83 @@ RETRY_RESOLVER_JS = r"""
   return matches.length === 1 ? matches[0] : null;
 })()
 """
+
+
+BLANK_TURN_RETRY_MENU_JS = r"""
+([storage, owner, url, userId, userTurnId, assistantId, assistantTurnId, triggerId, editPrompt]) => {
+  if (location.href !== url || storage.some((key, i) => sessionStorage.getItem(key) !== owner[i])) {
+    return {reason: 'ownership_changed'};
+  }
+  const visible = element => Boolean(element?.getClientRects().length &&
+    getComputedStyle(element).visibility !== 'hidden');
+  const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
+  const hasId = (element, id) => id && normalize(element.getAttribute('data-chatgpt-search-message-ids'))
+    .split(' ').includes(id);
+  const composer = (__CDPA_COMPOSER_RESOLVER__)().element;
+  const composerHost = composer?.closest('form') || composer?.parentElement;
+  if (!composer || normalize(composer.innerText) || [...composerHost.querySelectorAll(
+    '[data-filename], [data-file-name], [data-testid*=attachment], [data-testid*=file]'
+  )].some(visible)) return {reason: 'composer_conflict'};
+  if ([...document.querySelectorAll(
+    'button[data-testid="stop-button"], main button[aria-label*="Stop"], ' +
+    '[role="dialog"]:not(#playwright-auto-role-control-v1), [data-testid^="modal-"]'
+  )].some(visible)) return {reason: 'page_busy'};
+
+  if (editPrompt !== null && triggerId) {
+    const group = [...document.querySelectorAll('main [data-turn-key]')].at(-1);
+    if (group?.getAttribute('data-turn-key') !== triggerId) return {reason: 'edit_turn_changed'};
+    const editors = [...group.querySelectorAll('textarea,[contenteditable="true"]')].filter(visible);
+    const editor = editors[0];
+    if (editors.length !== 1 || normalize(editor.value ?? editor.innerText) !== normalize(editPrompt)) {
+      return {reason: 'repair_editor_content_changed'};
+    }
+    const send = [...group.querySelectorAll('button')].filter(e =>
+      visible(e) && !e.disabled && e.getAttribute('aria-disabled') !== 'true' &&
+      [normalize(e.innerText), normalize(e.getAttribute('aria-label'))].includes('Send'));
+    if (send.length !== 1) return {reason: 'repair_editor_send_unavailable'};
+    send[0].click();
+    return {clicked: true};
+  }
+
+  const user = [...document.querySelectorAll('main [data-chatgpt-search-unit-key$=":user"]')]
+    .filter(visible).at(-1);
+  const group = user?.closest('[data-turn-key]');
+  const key = group?.getAttribute('data-turn-key');
+  if (!key || assistantTurnId !== `group:assistant:${key}` ||
+      (userId ? !hasId(user, userId) : userTurnId !== `group:user:${key}`)) {
+    return {reason: 'accepted_turn_changed'};
+  }
+  const assistants = [...group.querySelectorAll('[data-chatgpt-search-unit-key$=":assistant"]')]
+    .filter(visible).filter(element => hasId(element, assistantId));
+  if (assistants.length !== 1 || !['', 'ChatGPT said:'].includes(normalize(assistants[0].innerText)) ||
+      [...assistants[0].querySelectorAll('img, video, canvas')].some(visible)) {
+    return {reason: 'assistant_changed'};
+  }
+  if (editPrompt !== null) {
+    const edits = [...group.querySelectorAll('button[aria-label="Edit message"]')]
+      .filter(e => visible(e) && !e.disabled && e.getAttribute('aria-disabled') !== 'true');
+    if (edits.length !== 1) return {reason: 'repair_edit_unavailable'};
+    edits[0].click();
+    return {edit_group: key};
+  }
+  const triggers = [...group.querySelectorAll('button[aria-label="More actions"][aria-haspopup="menu"]')]
+    .filter(element => visible(element) && !element.disabled && element.getAttribute('aria-disabled') !== 'true');
+  if (triggers.length !== 1 || !triggers[0].id) return {reason: 'retry_menu_unavailable'};
+  const trigger = triggers[0];
+  if (!triggerId) {
+    if (trigger.getAttribute('aria-expanded') !== 'false') return {reason: 'retry_menu_already_open'};
+    return {trigger_id: trigger.id};
+  }
+  if (trigger.id !== triggerId || trigger.getAttribute('aria-expanded') !== 'true') {
+    return {reason: 'retry_menu_changed'};
+  }
+  const menu = document.getElementById(trigger.getAttribute('aria-controls'));
+  if (!menu?.matches('[role="menu"]') || !visible(menu)) return {reason: 'retry_menu_changed'};
+  const items = [...menu.querySelectorAll('[role="menuitem"]')].filter(element =>
+    visible(element) && normalize(element.innerText) === 'Retry' &&
+    element.getAttribute('aria-disabled') !== 'true' && !element.hasAttribute('data-disabled'));
+  if (items.length !== 1) return {reason: 'retry_unavailable'};
+  items[0].click();
+  return {clicked: true};
+}
+"""

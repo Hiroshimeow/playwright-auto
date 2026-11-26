@@ -17,6 +17,7 @@ from playwright_auto.chatgpt import (
     prompt_digest,
 )
 from playwright_auto.role_runtime import Action, Decision, RoleController
+from role_runtime_test_support import RoleRuntimeTestWorker
 from test_chatgpt_mcp_permission import _with_page
 from test_operational_contract import snapshot
 
@@ -50,7 +51,7 @@ def environment(client):
     runtime_db = RuntimeDB(__import__("pathlib").Path(db_dir.name) / "runtime.sqlite")
     runtime_db.ensure_schema()
     _RUNTIME_RESOURCES.append((runtime_db, db_dir))
-    worker = SimpleNamespace(
+    worker = RoleRuntimeTestWorker(
         runtime_db=runtime_db, _runtime_db_dir=db_dir,
         _validate_response_candidate=lambda *_: None,
         _terminal_route_evidence=lambda *_: (_ for _ in ()).throw(ValueError("no exact report evidence")),

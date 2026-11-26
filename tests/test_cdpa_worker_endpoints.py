@@ -5,6 +5,8 @@ import copy
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import playwright_auto.cdpa_worker as worker_module
 from playwright_auto.cdpa_actions import AcquiredRole
 from playwright_auto.cdpa_bootstraps import BootstrapCatalog
@@ -1012,6 +1014,7 @@ def test_different_endpoints_admit_concurrently(tmp_path, monkeypatch):
     global_peak = 0
     endpoint_active = {first["endpoint_id"]: 0, second["endpoint_id"]: 0}
     endpoint_peak = {first["endpoint_id"]: 0, second["endpoint_id"]: 0}
+    both_admitted = asyncio.Event()
 
     async def fake_pre_send(state, hop, _actions):
         nonlocal global_active, global_peak
@@ -1023,8 +1026,10 @@ def test_different_endpoints_admit_concurrently(tmp_path, monkeypatch):
         endpoint_peak[endpoint_id] = max(
             endpoint_peak[endpoint_id], endpoint_active[endpoint_id]
         )
+        if global_active == 2:
+            both_admitted.set()
         try:
-            await asyncio.sleep(0.05)
+            await asyncio.wait_for(both_admitted.wait(), timeout=5)
             state["roles"][role].update(
                 page_id=f"{state['task_id']}-page",
                 page_url=f"https://chatgpt.com/c/{state['task_id']}",
@@ -1040,6 +1045,8 @@ def test_different_endpoints_admit_concurrently(tmp_path, monkeypatch):
     async def scenario():
         pool = await _pool(store)
         monkeypatch.setattr(worker, "_pre_send", fake_pre_send)
+        # A slow cycle can reach the next Send deadline before returning.
+        monkeypatch.setattr(worker, "_sending", _noop)
         monkeypatch.setattr(worker, "_maintain_ambient_page_automation", _noop)
         monkeypatch.setattr(worker, "_refresh_rate_limit_cooldown", _noop)
         monkeypatch.setattr(worker, "_close_idle_independent_tabs", _noop)
@@ -1848,6 +1855,44 @@ def test_pool_forever_refreshes_one_shared_pool_instead_of_reconnecting_one_url(
     assert calls[0] == ("refresh", True)
     assert ("cycle", False) in calls  # Offline pools still publish resource waiting.
     assert ("cycle", True) in calls
+
+
+def test_pool_forever_advances_healthy_endpoint_during_slow_peer_refresh(tmp_path, monkeypatch):
+    worker, _store, _first, _second, _tasks = _setup(tmp_path)
+
+    async def run():
+        release = asyncio.Event()
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        class Pool:
+            contexts = {}
+            refresh_count = 0
+
+            async def refresh(self, *, wait=False):
+                self.refresh_count += 1
+                self.contexts = {"healthy": SimpleNamespace(pages=[])}
+                entered.set()
+                try:
+                    await release.wait()
+                finally:
+                    cancelled.set()
+
+        pool = Pool()
+
+        async def cycle(active_pool):
+            assert entered.is_set()
+            assert "healthy" in active_pool.contexts
+            assert pool.refresh_count == 1
+            assert not cancelled.is_set()
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(worker, "run_once_pool", cycle)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(worker.run_pool_forever(pool), timeout=1)
+        assert cancelled.is_set()
+
+    asyncio.run(run())
 
 
 

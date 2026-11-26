@@ -4,14 +4,18 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
 from playwright_auto.cdpa_commands import ProviderRetryIntent
+from playwright_auto.cdpa_prompts import CONVERSATION_ROUTE_REPAIR_PREFIX, VERIFIED_ROUTE_REPAIR_PREFIX
 from playwright_auto.cdpa_runtime_db import RuntimeDB
-from playwright_auto.role_runtime import Action, RoleController
+from playwright_auto.cdpa_worker import IneffectiveControlError
+from playwright_auto.chatgpt import prompt_digest
+from playwright_auto.role_runtime import Action, Policy, RoleController
 from test_operational_contract import snapshot
 from test_spec003_phase15_runtime import (
     _ObservedClient,
@@ -38,6 +42,131 @@ def _receipt_sha256() -> str:
         default=str,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+@pytest.mark.parametrize("verified", [True, False])
+def test_blank_temporary_turn_retries_only_verified_read_only_repair_generations(tmp_path, verified):
+    edits = []
+
+    class Client(_ObservedClient):
+        async def retry_generation(self, receipt, *, expected_task_id, expected_team, blank_assistant, edit_repair=False):
+            assert blank_assistant == current.messages[-1]
+            edits.append(edit_repair)
+            return await super().retry_generation(receipt, expected_task_id=expected_task_id, expected_team=expected_team)
+
+    db = RuntimeDB(tmp_path / "runtime.sqlite3")
+    db.ensure_schema()
+    client = Client()
+    state, hop, worker, acquired, _ = _fake_environment(client, runtime_db=db)
+    prompt = VERIFIED_ROUTE_REPAIR_PREFIX + "Return JSON." if verified else "Perform role work."
+    receipt = replace(_receipt(), prompt=prompt, prompt_sha256=prompt_digest(prompt))
+    state["conversation_mode"] = "temporary"
+    hop.update(receipt=receipt.to_dict(), kind="route_repair")
+
+    def incomplete_report(*_args):
+        raise IneffectiveControlError("No explicit route in the report")
+
+    worker._recover_verified_report_route = incomplete_report
+    worker._accepted_blank_route_request = lambda *_: True
+    worker._recover_missing_terminal_route = lambda *_args, **_kwargs: False
+    current = snapshot(
+        url=f"https://chatgpt.com/c/{receipt.conversation_id}?temporary-chat=true",
+        messages=_assistant_turn("", actions=("copy", "retry-menu")),
+    )
+    controller = RoleController(Policy(response_stable_seconds=0))
+    try:
+        first, second, third, fourth = [_run(controller, worker, state, hop, acquired, current) for _ in range(4)]
+        assert first.reason == "empty_terminal_observing"
+        assert second.reason == ("provider_retry_clicked" if verified else "empty_terminal_response")
+        if verified:
+            assert third.reason == "empty_terminal_observing"
+        assert fourth.reason == ("provider_retry_reconciliation_required" if verified else "empty_terminal_response")
+        assert len(client.retry_calls) == int(verified)
+        if verified:
+            for attempt in range(2, 6):
+                current = replace(current, messages=(
+                    current.messages[0], replace(current.messages[-1], message_id=f"answer-{attempt}"),
+                ))
+                assert _run(controller, worker, state, hop, acquired, current).reason == "empty_terminal_observing"
+                assert _run(controller, worker, state, hop, acquired, current).reason == "repair_retry_cooldown"
+                with db.connection() as connection:
+                    connection.execute("UPDATE command_queue SET finished_at=?", (_old_retry_seen(),))
+                reason = "provider_retry_clicked" if attempt <= 3 else "repair_edit_resend_clicked"
+                assert _run(controller, worker, state, hop, acquired, current).reason == reason
+            assert edits == [False, False, False, True, True]
+            hop["wait"]["controller_progress_at"] = (
+                datetime.now(timezone.utc) - timedelta(seconds=controller.policy.timeout_seconds + 1)
+            ).isoformat()
+            assert _run(controller, worker, state, hop, acquired, current).reason == "empty_terminal_observing"
+            stale = _run(controller, worker, state, hop, acquired, current)
+            assert stale.action is Action.BLOCK and stale.reason == "provider_retry_unconfirmed"
+            assert len(edits) == 5
+        assert hop["receipt"] == receipt.to_dict()
+    finally:
+        db.close()
+
+
+def test_temporary_independent_turn_keeps_provider_retry():
+    client = _ObservedClient()
+    state, hop, worker, acquired, _ = _fake_environment(client)
+    state.update(task_mode="independent", conversation_mode="temporary", workflow_mode="team")
+    hop["wait"]["retry_seen_at"] = _old_retry_seen()
+    decision = _run(RoleController(), worker, state, hop, acquired, snapshot(retry_visible=True))
+    assert decision.reason == "provider_retry_clicked"
+    assert client.retry_calls == [("user-original", "task-1", "team-1")]
+
+
+def test_temporary_blank_after_provisional_user_id_remount_repairs_immediately():
+    client = _ObservedClient()
+    state, hop, worker, acquired, _ = _fake_environment(client)
+    receipt = replace(_receipt(), user_message_id="DOM:user:0", user_turn_id=None)
+    state["conversation_mode"] = "temporary"
+    hop.update(receipt=receipt.to_dict(), kind="task")
+    messages = _assistant_turn("", actions=("copy", "retry-menu"))
+    turn = "group:assistant:real-user"
+    current = snapshot(
+        url="https://chatgpt.com/c/temporary-test?temporary-chat=true",
+        messages=(replace(messages[0], message_id="real-user", turn_id="group:user:real-user"),
+                  replace(messages[-1], turn_id=turn)),
+    )
+    hop["wait"].update(bound_assistant_message_id=messages[-1].message_id, bound_assistant_turn_id=turn)
+    worker._recover_missing_terminal_route = lambda *_args, **kw: kw["confirmed_empty"]
+    controller = RoleController(Policy(response_stable_seconds=0))
+
+    assert _run(controller, worker, state, hop, acquired, current).reason == "empty_terminal_observing"
+    assert _run(controller, worker, state, hop, acquired, current).reason == "empty_terminal_route_repair"
+    assert hop["receipt"] == receipt.to_dict()
+
+
+@pytest.mark.parametrize("text,permission,reason", [
+    ("REPORT_UNAVAILABLE", False, "route_repair_report_unavailable"),
+    ("I could not determine a route.", False, "route_repair_invalid_response"),
+    ("", True, "route_repair_tool_permission_requested"),
+])
+def test_read_only_repair_blocks_without_queuing_work_or_approving_tools(text, permission, reason):
+    client = _ObservedClient()
+    state, hop, worker, acquired, _ = _fake_environment(client)
+    prompt = CONVERSATION_ROUTE_REPAIR_PREFIX + "Return only the route."
+    receipt = replace(_receipt(), prompt=prompt, prompt_sha256=prompt_digest(prompt))
+    state.update(conversation_mode="temporary", workflow_mode="team")
+    hop.update(kind="route_repair", receipt=receipt.to_dict())
+
+    def invalid_route(*_args):
+        raise ValueError("Invalid route JSON")
+
+    worker._validate_response_candidate = invalid_route
+    current = snapshot(
+        url=f"https://chatgpt.com/c/{receipt.conversation_id}?temporary-chat=true",
+        messages=_assistant_turn(text, actions=("copy", "retry-menu")),
+        mcp_permission_node_count=int(permission),
+        mcp_permission_allow_count=int(permission),
+        mcp_permission_surface_key="repair-tool" if permission else None,
+    )
+    decision = _run(RoleController(Policy(response_stable_seconds=0)), worker, state, hop, acquired, current)
+    assert decision.action == Action.BLOCK
+    assert decision.reason == reason
+    assert state["block_code"] == reason
+    assert "repair" not in state and not client.allow_calls and not client.retry_calls
 
 
 class _CrashAfterRetryClient(_ObservedClient):

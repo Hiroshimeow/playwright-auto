@@ -724,7 +724,10 @@ def test_branch_from_anchor_preserves_rate_limit_without_clearing_draft(tmp_path
     assert context.pages[-1].closed is True
 
 
-def test_acquire_cleans_only_routed_target_before_task_binding(tmp_path, monkeypatch):
+@pytest.mark.parametrize("draft,attachments", [
+    ("operator draft", ()), ("", ("operator.pdf",)), ("", ()),
+])
+def test_acquire_preserves_routed_target_composer(tmp_path, monkeypatch, draft, attachments):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     target = FakePage(
         page_id="recorded-page",
@@ -732,8 +735,9 @@ def test_acquire_cleans_only_routed_target_before_task_binding(tmp_path, monkeyp
         team="new-team",
         task_id="task-1",
     )
-    target.snapshot_value.composer_text = "stale target draft"
-    target.snapshot_value.attachment_markers = ("stale.txt",)
+    target.snapshot_value.composer_text = draft
+    target.snapshot_value.attachment_markers = attachments
+    target.snapshot_value.manual_input_pending = bool(draft or attachments)
     unrelated = FakePage(
         page_id="other-page",
         role="new-team-review",
@@ -751,11 +755,6 @@ def test_acquire_cleans_only_routed_target_before_task_binding(tmp_path, monkeyp
     async def matches(*_args, **_kwargs):
         return [(client, target.snapshot_value)]
 
-    original_clear = client.clear
-    async def ordered_clear(**kwargs):
-        order.append("clear")
-        await original_clear(**kwargs)
-
     original_bind = client.bind_task_identity
     async def ordered_bind(task_id, team):
         assert target.snapshot_value.composer_text == ""
@@ -763,27 +762,25 @@ def test_acquire_cleans_only_routed_target_before_task_binding(tmp_path, monkeyp
         order.append("bind")
         return await original_bind(task_id, team)
 
-    client.clear = ordered_clear
     client.bind_task_identity = ordered_bind
     monkeypatch.setattr(actions, "_matching_clients", matches)
 
-    acquired = asyncio.run(
-        actions.acquire(
-            manifest(
-                physical_role="new-team-plan",
-                page_id="recorded-page",
-                page_url=target.url,
-            ),
-            "PLAN",
-            clean_for_send=True,
-        )
+    state = manifest(
+        physical_role="new-team-plan",
+        page_id="recorded-page",
+        page_url=target.url,
     )
-
-    assert acquired.client is client
-    assert order[:2] == ["clear", "bind"]
-    assert client.clear_calls == [
-        (True, True, round(config.workspace_timeout_seconds * 1000))
-    ]
+    if draft or attachments:
+        with pytest.raises(ManualInputPendingError, match="draft or attachments"):
+            asyncio.run(actions.acquire(state, "PLAN", clean_for_send=True))
+        assert order == []
+    else:
+        acquired = asyncio.run(actions.acquire(state, "PLAN", clean_for_send=True))
+        assert acquired.client is client
+        assert order == ["bind"]
+    assert client.clear_calls == []
+    assert target.snapshot_value.composer_text == draft
+    assert target.snapshot_value.attachment_markers == attachments
     assert target.snapshot_value.page_task_id == "task-1"
     assert target.snapshot_value.page_team == "new-team"
     assert unrelated.snapshot_value.stop_visible is True
@@ -1685,6 +1682,38 @@ def test_recorded_offline_role_requires_controlled_reopen(tmp_path, monkeypatch)
         ("Page.setWebLifecycleState", {"state": "active"})
     ]
     assert actions.browser_context.detached_sessions == 1
+
+
+@pytest.mark.parametrize("saved,redirect", [
+    ("/c/exact-conversation", "/g/g-p-test-project/c/exact-conversation"),
+    ("/g/g-p-test-project/c/exact-conversation", "/g/g-p-test-project/c/exact-conversation"),
+    ("/c/exact-conversation", "/g/g-p-test-project/c/other-conversation"),
+    ("/c/exact-conversation", "/g/g-p-test-project/c/exact-conversation?temporary-chat=true"),
+])
+def test_reopen_checks_conversation_identity_across_project_urls(tmp_path, monkeypatch, saved, redirect):
+    config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
+    monkeypatch.setattr(actions_module, "ChatGPTPage", FakeClient)
+    monkeypatch.setattr(actions_module, "random_delay", lambda *_args, **_kwargs: asyncio.sleep(0))
+    original_goto = FakePage.goto
+
+    async def redirect_to_project(page, url, **kwargs):
+        await original_goto(page, url, **kwargs)
+        page.url = page.snapshot_value.url = "https://chatgpt.com" + redirect
+
+    monkeypatch.setattr(FakePage, "goto", redirect_to_project)
+    context = FakeContext()
+    actions = CDPATabActions(context, config)
+    state = manifest(page_id="closed-page", page_url="https://chatgpt.com" + saved)
+
+    if redirect.endswith("/exact-conversation"):
+        reopened = asyncio.run(actions.reopen(state, "PLAN"))
+        assert reopened.url == "https://chatgpt.com" + redirect
+        assert reopened.page_id == "closed-page"
+        assert not reopened.new_chat
+    else:
+        with pytest.raises(RoleOwnershipError, match="redirected away"):
+            asyncio.run(actions.reopen(state, "PLAN"))
+        assert context.pages[0].is_closed()
 
 
 def test_explicit_restart_discards_only_exact_known_automated_draft(tmp_path, monkeypatch):

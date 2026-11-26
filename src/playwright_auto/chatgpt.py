@@ -27,6 +27,7 @@ from .chatgpt_backend import (
 from .chatgpt_composer import (
     COMPOSER_REPLACE_TEXT_JS as _COMPOSER_REPLACE_TEXT_JS,
     COMPOSER_RESOLVER_JS as _COMPOSER_RESOLVER_JS,
+    COMPOSER_TEXT_JS as _COMPOSER_TEXT_JS,
     replace_owned_composer_text as _replace_owned_composer_text,
 )
 from .chatgpt_errors import (
@@ -37,6 +38,7 @@ from .chatgpt_errors import (
     ConversationTranscriptNotReadyError,
     IncompleteResponseTimeoutError,
     ManualInputPendingError,
+    ModelVerificationError,
     PageOwnershipError,
     RateLimitBlockedError,
     SendRecoveryError,
@@ -53,10 +55,16 @@ from .chatgpt_graph import (
     rendered_user_text_matches,
     visible_text_matches,
 )
-from .chatgpt_response_projection import ACTIVE_CHAT_ROOT_JS, RESPONSE_PROJECTION_JS, RETRY_RESOLVER_JS
+from .chatgpt_response_projection import (
+    ACTIVE_CHAT_ROOT_JS,
+    BLANK_TURN_RETRY_MENU_JS,
+    RESPONSE_PROJECTION_JS,
+    RETRY_RESOLVER_JS,
+)
 from .chatgpt_models import (
     ChatGPTSnapshot,
     ChatGPTState,
+    current_repair_receipt,
     MessageBaseline,
     MessageSnapshot,
     PageBinding,
@@ -1799,7 +1807,7 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
             page_team: pageTeam,
             requires_login: location.hostname === 'auth.openai.com' || Boolean(firstVisible('[data-testid="login-button"]')),
             composer_present: Boolean(composer),
-            composer_text: boundedText(composer, 512),
+            composer_text: (__CDPA_COMPOSER_TEXT__)(composer).replace(/\s+/g, ' ').trim().slice(0, 512),
             composer_ambiguous: Boolean(composerOwner.ambiguous),
             composer_owner_source: composerOwner.source || 'none',
             attachment_count: attachmentCount,
@@ -1834,7 +1842,8 @@ _WAIT_PROBE_INSTALL_SCRIPT = r"""([roleKey, pageIdKey, taskIdKey, teamKey, windo
           };
           return true;
         }""".replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS).replace(
-            '__CDPA_ACTIVE_CHAT_ROOT__', ACTIVE_CHAT_ROOT_JS
+            '__CDPA_COMPOSER_TEXT__', _COMPOSER_TEXT_JS
+        ).replace('__CDPA_ACTIVE_CHAT_ROOT__', ACTIVE_CHAT_ROOT_JS
         ).replace('__CDPA_RESPONSE_PROJECTION__', RESPONSE_PROJECTION_JS
         ).replace('__CDPA_RETRY_RESOLVER__', RETRY_RESOLVER_JS).replace(
             '__CDPA_MCP_PERMISSION_SURFACE__', _MCP_PERMISSION_SURFACE_JS
@@ -2127,6 +2136,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
             const label = String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
             if (label === 'copy') return 'copy';
             if (label === 'regenerate response') return 'regenerate';
+            if (label === 'more actions') return 'retry-menu';
             if (['rate response', 'good response', 'bad response'].includes(label)) return 'feedback';
             return '';
           };
@@ -2263,7 +2273,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
               composer && composer.getAttribute('contenteditable') === 'true' &&
               composer.getAttribute('aria-disabled') !== 'true'
             ),
-            composer_text: text(composer),
+            composer_text: (__CDPA_COMPOSER_TEXT__)(composer).replace(/\s+/g, ' ').trim(),
             composer_ambiguous: Boolean(composerOwner.ambiguous),
             composer_owner_source: composerOwner.source || 'none',
             send_visible: Boolean(send),
@@ -2294,6 +2304,7 @@ async def inspect_chatgpt_page(page: Any) -> ChatGPTSnapshot:
           };
         }
         """.replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS)
+          .replace('__CDPA_COMPOSER_TEXT__', _COMPOSER_TEXT_JS)
           .replace('__CDPA_ACTIVE_CHAT_ROOT__', ACTIVE_CHAT_ROOT_JS)
           .replace('__CDPA_RESPONSE_PROJECTION__', RESPONSE_PROJECTION_JS)
           .replace('__CDPA_RETRY_RESOLVER__', RETRY_RESOLVER_JS)
@@ -3770,6 +3781,12 @@ class ChatGPTPage:
         )
         return snapshot
 
+    async def verify_model_effort(self) -> str | None:
+        """Read the required model effort on the owned tab without changing it."""
+        async with self.mutation_guard():
+            snapshot = await self.assert_ownership()
+            return await self._ensure_selfrepair_model_effort_locked(snapshot, allow_change=False)
+
     async def _ensure_selfrepair_model_effort_locked(
         self, snapshot: ChatGPTSnapshot, *, allow_change: bool = True
     ) -> str | None:
@@ -3793,7 +3810,7 @@ class ChatGPTPage:
             # The compact picker drops the legacy "Thinking effort" prefix.
             # Match the whole label so an unknown option ending in "High" cannot pass.
             match = re.fullmatch(
-                r"(?:Thinking effort (?:[0-9]+(?:\.[0-9]+)* )?)?(Extra High|High|Pro|Medium|Low)",
+                r"(?:Thinking effort )?(?:[0-9]+(?:\.[0-9]+)* )?(Extra High|High|Pro|Medium|Low)",
                 text,
             )
             if match is None:
@@ -3806,41 +3823,50 @@ class ChatGPTPage:
             await record_page_action(self.page, "model_gate", "verified", detail=effort)
             return effort
         if effort != "below_high" or not allow_change:
-            raise UnsafePageStateError(
+            raise ModelVerificationError(
                 "model_verification_blocked: exact task tab does not show High/Extra High/Pro"
             )
         if str(getattr(snapshot, "composer_text", "") or "").strip() or getattr(
             snapshot, "attachment_markers", ()
         ):
-            raise UnsafePageStateError(
+            raise ModelVerificationError(
                 "model_verification_blocked: cannot switch model with a composer draft"
             )
 
         # The supported G6 UI has a visible Power menu and a five-position
         # effort slider. Only the owned page may be changed; reverify after it.
+        stage = "open model picker"
         try:
-            await picker.click()
             power = self.page.locator('[role="menuitem"][aria-label="Power"]')
-            if await power.count() != 1:
-                raise ValueError("Power menu unavailable")
             slider = power.locator('[role="slider"]')
-            if await slider.count() != 1:
-                raise ValueError("Effort slider unavailable")
             for _ in range(3):
+                stage = "open model picker"
+                await picker.click()
+                if await power.count() != 1:
+                    raise ModelVerificationError("model_verification_blocked: Power menu unavailable")
+                if await slider.count() != 1:
+                    await power.press("Escape")
+                    raise ModelVerificationError("model_verification_blocked: Effort slider unavailable")
+                stage = "change effort and close model picker"
                 await power.press("ArrowRight")
+                # On the compact UI the open picker displays only "Thinking effort".
+                await power.press("Escape")
                 await asyncio.sleep(0.25)
                 effort = await read_effort()
-                if effort in {"High", "Extra High", "Pro"}:
+                if effort != "below_high":
                     break
-            else:
-                raise ValueError("High selection not observable")
+            if effort not in {"High", "Extra High", "Pro"}:
+                raise ModelVerificationError("model_verification_blocked: High selection not observable")
+            stage = "verify owned page after model selection"
             after = await self.assert_ownership()
             for name in ("page_id", "page_role", "page_team", "page_task_id"):
                 if getattr(after, name, None) != getattr(snapshot, name, None):
-                    raise ValueError("owned page identity changed during model selection")
+                    raise PageOwnershipError("owned page identity changed during model selection")
+        except (ModelVerificationError, PageOwnershipError, TaskBindingError):
+            raise
         except Exception as exc:
-            raise UnsafePageStateError(
-                "model_verification_blocked: unable to select and verify High"
+            raise ModelVerificationError(
+                f"model_verification_blocked: could not {stage} ({type(exc).__name__})"
             ) from exc
         await record_page_action(self.page, "model_gate", "verified", detail=effort)
         return effort
@@ -4575,6 +4601,8 @@ class ChatGPTPage:
         expected_task_id: str,
         expected_team: str,
         timeout_ms: int | None = None,
+        blank_assistant: MessageSnapshot | None = None,
+        edit_repair: bool = False,
     ) -> dict[str, Any]:
         """Retry one already accepted user turn and prove new transport progress."""
         if self.binding != receipt.binding:
@@ -4583,6 +4611,11 @@ class ChatGPTPage:
         team = str(expected_team or "").strip()
         if not task_id or not team:
             raise ValueError("expected task ID and team are required")
+        if edit_repair:
+            from .cdpa_prompts import READ_ONLY_ROUTE_REPAIR_PREFIXES
+
+            if blank_assistant is None or not receipt.prompt.startswith(READ_ONLY_ROUTE_REPAIR_PREFIXES):
+                raise ValueError("Edit-and-Send requires a completed blank read-only repair")
         timeout = timeout_ms or self.timeout_ms
         async with self.mutation_guard():
             before = await self.assert_ownership()
@@ -4608,54 +4641,60 @@ class ChatGPTPage:
                 str(before.response_activity_structure or ""),
                 int(before.response_activity_length or 0),
             )
-            click_result = await self.page.evaluate(
-                r"""([roleKey, pageIdKey, taskIdKey, teamKey, expectedRole,
-                       expectedPageId, expectedTaskId, expectedTeam]) => {
-                  const visible = (element) => Boolean(
-                    element && (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
-                  );
-                  const owner = (__CDPA_COMPOSER_RESOLVER__)();
-                  if (owner.ambiguous) {
-                    return {clicked: false, reason: 'composer_ambiguous'};
-                  }
-                  const composer = owner.element;
-                  const composerText = (composer?.innerText || '').replace(/\s+/g, ' ').trim();
-                  const composerHost = composer?.closest('form') || composer?.parentElement || null;
-                  const attachments = composerHost ? [...composerHost.querySelectorAll(
-                    '[data-filename], [data-file-name], [data-testid*=attachment], [data-testid*=file]'
-                  )].filter(visible) : [];
-                  if (sessionStorage.getItem(roleKey) !== expectedRole ||
-                      sessionStorage.getItem(pageIdKey) !== expectedPageId ||
-                      sessionStorage.getItem(taskIdKey) !== expectedTaskId ||
-                      sessionStorage.getItem(teamKey) !== expectedTeam) {
-                    return {clicked: false, reason: 'ownership_changed'};
-                  }
-                  if (composerText || attachments.length) {
-                    return {clicked: false, reason: 'composer_conflict'};
-                  }
-                  if ([...document.querySelectorAll('[role="dialog"]:not(#playwright-auto-role-control-v1), [data-testid^="modal-"]')].some(visible)) {
-                    return {clicked: false, reason: 'blocking_dialog'};
-                  }
-                  const retry = [...document.querySelectorAll(
-                    '[data-testid="regenerate-thread-error-button"]'
-                  )].find(visible) || null;
-                  if (!retry || retry.disabled || retry.getAttribute('aria-disabled') === 'true') {
-                    return {clicked: false, reason: 'retry_unavailable'};
-                  }
-                  retry.click();
-                  return {clicked: true, reason: null};
-                }""".replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS),
-                [
-                    ROLE_STORAGE_KEY,
-                    PAGE_ID_STORAGE_KEY,
-                    TASK_ID_STORAGE_KEY,
-                    TEAM_STORAGE_KEY,
-                    receipt.binding.role,
-                    receipt.binding.page_id,
-                    task_id,
-                    team,
-                ],
-            )
+            if blank_assistant is not None:
+                click_result = await self._click_blank_turn_retry_menu(
+                    before, receipt, blank_assistant, task_id, team, timeout,
+                    edit_repair=edit_repair,
+                )
+            else:
+                click_result = await self.page.evaluate(
+                    r"""([roleKey, pageIdKey, taskIdKey, teamKey, expectedRole,
+                           expectedPageId, expectedTaskId, expectedTeam]) => {
+                      const visible = (element) => Boolean(
+                        element && (element.offsetWidth || element.offsetHeight || element.getClientRects().length)
+                      );
+                      const owner = (__CDPA_COMPOSER_RESOLVER__)();
+                      if (owner.ambiguous) {
+                        return {clicked: false, reason: 'composer_ambiguous'};
+                      }
+                      const composer = owner.element;
+                      const composerText = (composer?.innerText || '').replace(/\s+/g, ' ').trim();
+                      const composerHost = composer?.closest('form') || composer?.parentElement || null;
+                      const attachments = composerHost ? [...composerHost.querySelectorAll(
+                        '[data-filename], [data-file-name], [data-testid*=attachment], [data-testid*=file]'
+                      )].filter(visible) : [];
+                      if (sessionStorage.getItem(roleKey) !== expectedRole ||
+                          sessionStorage.getItem(pageIdKey) !== expectedPageId ||
+                          sessionStorage.getItem(taskIdKey) !== expectedTaskId ||
+                          sessionStorage.getItem(teamKey) !== expectedTeam) {
+                        return {clicked: false, reason: 'ownership_changed'};
+                      }
+                      if (composerText || attachments.length) {
+                        return {clicked: false, reason: 'composer_conflict'};
+                      }
+                      if ([...document.querySelectorAll('[role="dialog"]:not(#playwright-auto-role-control-v1), [data-testid^="modal-"]')].some(visible)) {
+                        return {clicked: false, reason: 'blocking_dialog'};
+                      }
+                      const retry = [...document.querySelectorAll(
+                        '[data-testid="regenerate-thread-error-button"]'
+                      )].find(visible) || null;
+                      if (!retry || retry.disabled || retry.getAttribute('aria-disabled') === 'true') {
+                        return {clicked: false, reason: 'retry_unavailable'};
+                      }
+                      retry.click();
+                      return {clicked: true, reason: null};
+                    }""".replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS),
+                    [
+                        ROLE_STORAGE_KEY,
+                        PAGE_ID_STORAGE_KEY,
+                        TASK_ID_STORAGE_KEY,
+                        TEAM_STORAGE_KEY,
+                        receipt.binding.role,
+                        receipt.binding.page_id,
+                        task_id,
+                        team,
+                    ],
+                )
             if not isinstance(click_result, Mapping) or not click_result.get("clicked"):
                 reason = (
                     str(click_result.get("reason") or "retry_unavailable")
@@ -4681,7 +4720,9 @@ class ChatGPTPage:
                     raise ComposerConflictError(
                         "manual draft or attachments appeared after Retry click"
                     )
-                if not receipt_user_message_seen(current.messages, receipt):
+                if not receipt_user_message_seen(current.messages, receipt) and not (
+                    blank_assistant is not None and current_repair_receipt(current.messages, receipt)
+                ):
                     raise SendRecoveryError(
                         "accepted user-turn identity disappeared after Retry click"
                     )
@@ -4698,9 +4739,15 @@ class ChatGPTPage:
                 assistant_progress = bool(assistant_fingerprint) and (
                     assistant_fingerprint != before_assistant_fingerprint
                 )
+                new_repair_generation = (
+                    blank_assistant is not None
+                    and current.messages
+                    and current.messages[-1].role == "assistant"
+                    and current.messages[-1].message_id != blank_assistant.message_id
+                )
                 activity_progress = any(activity) and activity != before_activity
                 transport_active = bool(current.stop_visible)
-                if transport_active or assistant_progress or activity_progress:
+                if transport_active or assistant_progress or activity_progress or new_repair_generation:
                     self.invalidate_wait_cache()
                     return {
                         "progress": True,
@@ -4708,6 +4755,43 @@ class ChatGPTPage:
                     }
                 await asyncio.sleep(0.05)
         raise TimeoutError("Retry generation produced no verified progress")
+
+    async def _click_blank_turn_retry_menu(
+        self, before: ChatGPTSnapshot, receipt: SendReceipt, assistant: MessageSnapshot,
+        task_id: str, team: str, timeout_ms: int,
+        *, edit_repair: bool = False,
+    ) -> dict[str, Any]:
+        current, error = bound_assistant_for_receipt(before.messages, receipt)
+        if (
+            error or current != assistant or assistant.text.strip() or assistant.image_count
+            or not {"copy", "retry-menu"}.issubset(current.actions)
+            or before.stop_visible or before.response_projection_active
+            or before.mcp_permission_node_count or before.mcp_permission_allow_count
+            or any(segment.kind == "tool" for segment in before.response_segments)
+        ):
+            return {"reason": "completed_blank_turn_changed"}
+        script = BLANK_TURN_RETRY_MENU_JS.replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS)
+        args = [
+            [ROLE_STORAGE_KEY, PAGE_ID_STORAGE_KEY, TASK_ID_STORAGE_KEY, TEAM_STORAGE_KEY],
+            [receipt.binding.role, receipt.binding.page_id, task_id, team],
+            before.url, receipt.user_message_id, receipt.user_turn_id,
+            assistant.message_id, assistant.turn_id,
+        ]
+        edit_prompt = receipt.prompt if edit_repair else None
+        result = await self.page.evaluate(script, [*args, None, edit_prompt])
+        if edit_group := result.get("edit_group"):
+            group = self.page.locator(f"[data-turn-key={json.dumps(edit_group)}]")
+            await group.locator('textarea,[contenteditable="true"]').wait_for(state="visible", timeout=timeout_ms)
+            return await self.page.evaluate(script, [*args, edit_group, edit_prompt])
+        trigger_id = result.get("trigger_id")
+        if not trigger_id:
+            return result
+        trigger = self.page.locator(f"[id={json.dumps(trigger_id)}]")
+        await trigger.click(timeout=timeout_ms)
+        result = await self.page.evaluate(script, [*args, trigger_id, None])
+        if not result.get("clicked") and await trigger.get_attribute("aria-expanded", timeout=timeout_ms) == "true":
+            await trigger.press("Escape", timeout=timeout_ms)
+        return result
 
     @staticmethod
     def _adaptive_wait_seconds(poll_ms: int, unchanged_ticks: int) -> float:

@@ -6,6 +6,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from time import time
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
@@ -14,6 +15,7 @@ from .cdpa_config import CDPA_ROLES, declared_repository_from_task, remote_repos
 from .cdpa_dependencies import dependency_parent_ids, dependency_readiness
 from .cdpa_independent import independent_tags, is_independent_task
 from .cdpa_materials import task_context_materials
+from .cdpa_runtime_registry import REPORT_RECHECK_PENDING_MESSAGE, held_report_check
 from .cdpa_safety import sanitize_text, sanitize_value
 from .cdpa_team import (
     dispatch_order_key,
@@ -178,6 +180,7 @@ def _public_hop(hop: Mapping[str, Any]) -> dict[str, Any]:
         "kind": str(hop.get("kind") or "normal"),
         "state": str(hop.get("state") or ""),
         "logical_role": _public_role(hop.get("target_role") or hop.get("physical_role")),
+        "physical_role": hop.get("physical_role"),
         "source_role": _public_role(hop.get("source_role")),
         "route": _public_role(hop.get("route")),
         "turn": hop.get("turn"),
@@ -541,10 +544,16 @@ def _provider_jobs(raw: Mapping[str, Any]) -> list[dict[str, Any]]:
 def _problem(raw: Mapping[str, Any]) -> dict[str, Any] | None:
     status = str(raw.get("status") or "").upper()
     if status == "BLOCKED":
+        message = raw.get("block_reason") or "Task is blocked"
+        if message == REPORT_RECHECK_PENDING_MESSAGE and held_report_check(raw, time()) is None:
+            message = (
+                "The accepted turn did not return a complete result. Automatic checks for the exact report have ended. "
+                "If a valid report becomes available, select Resume to check it again."
+            )
         return {
             "kind": "BLOCKED",
             "code": str(raw.get("block_code") or "blocked"),
-            "message": _public_text(raw.get("block_reason") or "Task is blocked", max_chars=1000),
+            "message": _public_text(message, max_chars=1000),
             "role": raw.get("active_role"),
             "hop_id": raw.get("active_hop_id"),
             "at": str(raw.get("updated_at") or ""),
@@ -651,39 +660,63 @@ def _report_rows(
         if isinstance(report, Mapping)
     ]
     if recover_routed_hops:
-        represented = {
-            (
-                str(report.get("path") or ""),
-                str(report.get("role") or ""),
-                str(report.get("physical_role") or ""),
-                _int_or_zero(report.get("turn")),
-            )
-            for report in source_reports
-        }
+        legacy_solo_result = raw.get("workflow_mode") == "solo" and raw.get("status") == "DONE"
+        represented = {report["hop_id"] for report in source_reports if report.get("hop_id")}
+        legacy_reports = [report for report in source_reports if not report.get("hop_id")]
+        routed_reports = []
         for hop in raw.get("hops") or []:
             if not isinstance(hop, Mapping) or str(hop.get("state") or "") != "routed":
                 continue
             report_path = str(hop.get("report_path") or "").strip()
-            if not report_path:
-                continue
+            if report_path:
+                evidence = {
+                    "path": report_path,
+                    "sha256": hop.get("report_sha256"),
+                    "size": hop.get("report_size"),
+                }
+            else:
+                handoff = hop.get("routed_handoff")
+                if (
+                    not legacy_solo_result
+                    or source_reports
+                    or hop.get("route") != "DONE"
+                    or hop.get("expected_report_path")
+                    or not isinstance(handoff, str)
+                    or not handoff.strip()
+                ):
+                    continue
+                evidence = {"content": handoff}
             role = str(hop.get("target_role") or "")
             physical_role = str(hop.get("physical_role") or "")
             turn = _int_or_zero(hop.get("turn"))
-            key = (report_path, role, physical_role, turn)
-            if key in represented:
-                continue
             timestamps = hop.get("timestamps") if isinstance(hop.get("timestamps"), Mapping) else {}
-            source_reports.append({
+            routed_reports.append({
                 "report_id": f"hop-{hop.get('hop_id')}",
-                "path": report_path,
-                "sha256": hop.get("report_sha256"),
-                "size": hop.get("report_size"),
+                "hop_id": hop.get("hop_id"),
+                **evidence,
                 "role": role,
                 "physical_role": physical_role,
-                "turn": hop.get("turn"),
+                "turn": turn,
                 "created_at": timestamps.get("routed_at"),
             })
-            represented.add(key)
+        # Old index entries have no producing hop. Match only unique saved artifact evidence.
+        fields = ("path", "sha256", "size", "role", "physical_role", "turn")
+        for routed in routed_reports:
+            hop_id = routed["hop_id"]
+            if hop_id in represented:
+                continue
+            if routed.get("path") and routed.get("sha256") and routed.get("size"):
+                matches = [
+                    report for report in legacy_reports
+                    if all(report.get(field) == routed.get(field) for field in fields)
+                ]
+                if len(matches) == 1 and sum(
+                    all(item.get(field) == routed.get(field) for field in fields)
+                    for item in routed_reports
+                ) == 1:
+                    matches[0]["hop_id"] = hop_id
+                    continue
+            source_reports.append(routed)
     for index, report in enumerate(source_reports, start=1):
         if not isinstance(report, Mapping):
             continue
@@ -697,6 +730,7 @@ def _report_rows(
             "material_url": f"/api/report/{task_id}/{report_id}",
             "physical_role": str(report.get("physical_role") or "") or None,
             "role": str(report.get("role") or "") or None,
+            "hop_id": report.get("hop_id"),
             "turn": report.get("turn"),
             "created_at": report.get("created_at") or report.get("at"),
             "summary": _public_text(report.get("summary"), max_chars=1000) or None,
@@ -766,6 +800,29 @@ def _report_rows(
             }
         public.append(public_row)
     return public, private
+
+
+def _linked_handoff_report(
+    locator: Mapping[str, Any], reports: Mapping[str, Mapping[str, Any]],
+) -> str | None:
+    try:
+        route = json.loads(locator.get("content") or "")
+    except (TypeError, ValueError):
+        return None
+    handoff = route.get("handoff") if isinstance(route, dict) else None
+    if not isinstance(handoff, str) or not handoff:
+        return None
+    relative = Path(handoff)
+    if relative.anchor or ".." in relative.parts:
+        return None
+    matches = [
+        report_id
+        for report_id, report in reports.items()
+        if report.get("path") and report.get("repository")
+        and Path(report["repository"], report["path"]) == Path(report["repository"], relative)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
 
 def _independent_response_rows(
     raw: Mapping[str, Any],
@@ -1284,6 +1341,9 @@ def build_task_projection(
             continue
         role_key = str(locator.get("role_key") or raw.get("active_role") or "").strip().upper() or None
         role_record = role_records.get(role_key) if role_key else None
+        linked_report_id = (
+            _linked_handoff_report(locator, report_private) if material_type == "handoff" else None
+        )
         reports.append(
             {
                 "report_id": material_id,
@@ -1308,6 +1368,7 @@ def build_task_projection(
                 "material_type": material_type,
                 "version": locator.get("version"),
                 "content_length": locator.get("content_length"),
+                **({"linked_report_id": linked_report_id} if linked_report_id else {}),
             }
         )
     timeline = _timeline(raw)
@@ -1422,6 +1483,7 @@ def build_task_projection(
         "active_role": raw.get("active_role"),
         "active_hop_id": raw.get("active_hop_id"),
         "active_action": raw.get("active_action"),
+        "conversation_mode": raw.get("conversation_mode"),
         "requested_browser_endpoint_id": (
             None
             if independent is not None
@@ -1664,6 +1726,7 @@ def build_task_projection(
         "roles": roles,
         "active_hop": active_input,
         "active_input": active_input,
+        "pause_reason": _public_text(raw.get("pause_reason"), max_chars=1000) or None,
         "role_inputs": role_inputs,
         "timeline": timeline[:50],
         "timeline_total": len(timeline),

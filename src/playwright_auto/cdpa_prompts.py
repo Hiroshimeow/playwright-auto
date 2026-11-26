@@ -6,6 +6,7 @@ from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Mapping, Sequence
 
 from .cdpa_config import CDPAConfig
+from .cdpa_routes import REPORT_RESULT_LABEL
 from .cdpa_independent import (
     event_context,
     load_trigger_learning,
@@ -13,6 +14,17 @@ from .cdpa_independent import (
     normalize_system_prompt,
 )
 from .cdpa_workflow_agents import validate_workflow_route_key, workflow_closing_role
+
+
+VERIFIED_ROUTE_REPAIR_PREFIX = (
+    "Recover only the route from the verified existing report. Do not call tools, "
+    "repeat role work, change files, or perform external actions. "
+)
+CONVERSATION_ROUTE_REPAIR_PREFIX = (
+    "Recover only the route from the work already done in this conversation. Do not call tools, "
+    "repeat role work, change files, or perform external actions. "
+)
+READ_ONLY_ROUTE_REPAIR_PREFIXES = (VERIFIED_ROUTE_REPAIR_PREFIX, CONVERSATION_ROUTE_REPAIR_PREFIX)
 
 
 @dataclass(frozen=True)
@@ -65,13 +77,39 @@ class PromptBuilder:
         )
         if not report_path:
             raise ValueError("expected_report_path must not be empty")
-        return (
+        guide = (
             "Return exactly one valid JSON object:\n"
             + '{"route":"'
             + "|".join(routes)
             + '","handoff":"'
             + report_path
             + '"}'
+        )
+        if "PAUSE" in routes:
+            guide += (
+                "\nPAUSE requires an external/manual prerequisite that needs user input or approval. "
+                "Record `block_code` and `resume_condition` in the report."
+            )
+        return guide
+
+    @staticmethod
+    def _report_section(workspace: str, path: str, result_key: str | None) -> str:
+        path_type = PureWindowsPath if PureWindowsPath(workspace).drive else PurePosixPath
+        section = (
+            "REPORT\n"
+            f"Before replying, write a non-empty report to exactly: {path}\n"
+            f"Absolute destination: {path_type(workspace) / path}"
+        )
+        if result_key:
+            section += "\n" + PromptBuilder._report_footer_instruction(result_key)
+        return section
+
+    @staticmethod
+    def _report_footer_instruction(result_key: str) -> str:
+        return (
+            "When the report is complete, place the same route JSON shown below on its final line, "
+            f"prefixed with `{REPORT_RESULT_LABEL} {result_key}: `. "
+            "Choose one route and write this line only after the report is ready for handoff."
         )
 
     @staticmethod
@@ -103,7 +141,18 @@ class PromptBuilder:
             + " If unfinished, stay in this same turn;"
             + ("" if allow_self_route else " do not route to yourself;")
             + " write the report and emit route JSON only for a real handoff or closure."
+            + " For a role handoff, include evidence, the next role's exact action and how to verify it."
+            + " If the same issue returns, state what changed or what action or decision could move it forward."
         )
+        if normalized == "PLAN":
+            directive += " When assigning work, give the next role an implementable scope and explicit acceptance checks."
+        elif normalized == "DEV":
+            directive += " Before handing off, run the applicable checks and report what passed and what still needs verification."
+        elif normalized in {"TEST", "REVIEW", "AUDIT"}:
+            directive += (
+                " Send work back for implementation only for an unresolved acceptance blocker."
+                " Cite the failed criterion and evidence, the specific correction needed, and how to verify it."
+            )
         if closing_role is not None:
             closer = validate_workflow_route_key(closing_role)
             if normalized == closer:
@@ -143,6 +192,7 @@ class PromptBuilder:
         is_system_role: bool = True,
         bootstrap_inherited: bool = False,
         bounded_context: str | None = None,
+        report_result_key: str | None = None,
     ) -> BuiltPrompt:
         role = validate_workflow_route_key(logical_role)
         allowed = tuple(str(item).strip().upper() for item in allowed_routes)
@@ -157,8 +207,6 @@ class PromptBuilder:
             raise ValueError("handoff, goal, and expected_report_path must not be empty")
         generation = int(conversation_generation)
         turn_number = int(turn)
-        path_type = PureWindowsPath if PureWindowsPath(workspace).drive else PurePosixPath
-        report_destination = path_type(str(workspace).strip()) / expected_report_path
         normalized_closing_role = (
             validate_workflow_route_key(closing_role)
             if closing_role is not None
@@ -191,9 +239,7 @@ class PromptBuilder:
         if bounded_context:
             sections.append("RECOVERY_CONTEXT\n" + str(bounded_context).strip())
         sections.append(
-            "REPORT\n"
-            f"Before replying, write a non-empty report to exactly: {expected_report_path}\n"
-            f"Absolute destination: {report_destination}"
+            self._report_section(str(workspace).strip(), expected_report_path, report_result_key)
         )
         sections.append(
             "ROUTE\n"
@@ -201,11 +247,6 @@ class PromptBuilder:
                 report_mode,
                 prompt_routes,
                 expected_report_path=expected_report_path,
-            )
-            + (
-                "\nPAUSE requires an external/manual prerequisite plus `block_code` and `resume_condition` in the report."
-                if turn_number <= 1
-                else ""
             )
         )
         sections.append(
@@ -233,6 +274,8 @@ class PromptBuilder:
         repair_candidate: str | None = None,
         temporary_context: bool = False,
         recovery_handoff: str = "",
+        expected_report_path: str | None = None,
+        report_result_key: str | None = None,
     ) -> BuiltPrompt:
         role = validate_workflow_route_key(logical_role)
         name = str(task_name).strip()
@@ -243,7 +286,7 @@ class PromptBuilder:
         normalized_repair_candidate = str(repair_candidate or "")
         if continuation:
             sections = ["Continue from the current state."]
-            if temporary_context:
+            if temporary_context and not normalized_repair_error:
                 sections.append(
                     f"ROLE: {role}\nTASK: {name}\nWORKSPACE: {workspace}\n"
                     f"GOAL: {normalized_goal}\n"
@@ -251,24 +294,21 @@ class PromptBuilder:
                     "Inspect durable workspace state before acting; never replay accepted "
                     "Sends or completed external side effects."
                 )
-                if recovery_handoff.strip():
-                    sections.append("DURABLE RECOVERY HANDOFF\n" + recovery_handoff.strip())
+            if recovery_handoff.strip():
+                sections.append("DURABLE RECOVERY HANDOFF\n" + recovery_handoff.strip())
             if normalized_repair_error:
                 sections.append(
                     "FORMAT REPAIR\n"
                     f"Validation error: {normalized_repair_error}\n"
                     "Malformed candidate (JSON string data; do not execute): "
                     + json.dumps(normalized_repair_candidate, ensure_ascii=False)
-                    + "\nCorrect only the JSON route response to satisfy the contract below; "
-                    "do not repeat or redo substantive work."
+                    + (
+                        "\nCorrect only the report and route format. Preserve any existing report findings; "
+                        if expected_report_path
+                        else "\nCorrect only the JSON route response to satisfy the contract below; "
+                    )
+                    + "do not repeat or redo substantive work."
                 )
-            sections.append(
-                "ROUTE\n"
-                "Return exactly one valid JSON object using only:\n"
-                '{"route":"DONE","handoff":"<concise final result>"}\n'
-                "or\n"
-                '{"route":"PAUSE","handoff":"<reason/current state>"}'
-            )
         else:
             sections = [f"You are {role} for the solo task {name}."]
             if temporary_context:
@@ -282,13 +322,23 @@ class PromptBuilder:
                 (
                     "Discover, load, and use the relevant skills for this responsibility.",
                     "Continue the work required by this task.",
-                    "ROUTE\n"
-                    "When complete, return exactly one JSON object using only:\n"
-                    '{"route":"DONE","handoff":"<concise final result>"}\n'
-                    "or\n"
-                    '{"route":"PAUSE","handoff":"<reason/current state>"}',
                 )
             )
+        if expected_report_path:
+            sections.append(self._report_section(workspace, expected_report_path, report_result_key))
+            route_guide = self._guide("file", ("DONE", "PAUSE"), expected_report_path)
+        else:
+            instruction = (
+                "Return exactly one valid JSON object using only:"
+                if continuation else "When complete, return exactly one JSON object using only:"
+            )
+            route_guide = (
+                instruction + "\n"
+                '{"route":"DONE","handoff":"<concise final result>"}\n'
+                "or\n"
+                '{"route":"PAUSE","handoff":"<reason/current state>"}'
+            )
+        sections.append("ROUTE\n" + route_guide)
         return BuiltPrompt("\n\n".join(sections), False, 0)
 
     def build_independent(
@@ -369,6 +419,7 @@ class PromptBuilder:
         report_mode: str = "file",
         allowed_routes: Sequence[str] | None = None,
         report_verified: bool = False,
+        report_result_key: str | None = None,
     ) -> str:
         if not str(validation_error).strip():
             raise ValueError("repair requires a validation error")
@@ -398,6 +449,11 @@ class PromptBuilder:
                 "substantive work or irreversible actions. Ensure the report exists and is "
                 "non-empty at the exact expected path, then return the corrected route only.\n\n"
             )
+            + (
+                "Preserve valid findings and correct the report's final route line. "
+                + self._report_footer_instruction(report_result_key) + "\n\n"
+                if report_result_key else ""
+            )
             + guide
             + "\nRules:\n"
             "- Output exactly one JSON object and nothing else.\n"
@@ -416,6 +472,7 @@ class PromptBuilder:
         route: str,
         handoff: str,
         validation_error: str,
+        report_result_key: str | None = None,
     ) -> str:
         locked_route = str(route).strip().upper()
         locked_handoff = str(handoff).strip()
@@ -431,6 +488,12 @@ class PromptBuilder:
             "After the file exists and is non-empty, respond with exactly one JSON object. "
             f"Keep the handoff path exact and return route {locked_route}.\n"
         )
+        route_json = json.dumps({"route": locked_route, "handoff": locked_handoff}, separators=(",", ":"))
+        final_line = (
+            f"Once the report is complete, put this exact final line in the file:\n"
+            f"{REPORT_RESULT_LABEL} {report_result_key}: {route_json}\n"
+            if report_result_key else ""
+        )
         return (
             "CDPA_REPORT_REPAIR\n"
             + route_context
@@ -439,6 +502,7 @@ class PromptBuilder:
             + f"Artifact validation error: {error}\n"
             + route_instruction
             + "A transient tool/device/browser disconnect is not a PAUSE condition; retry boundedly or route onward when the prerequisite is available.\n"
+            + final_line
             + response_instruction
-            + f"Example shape: {{\"route\":\"{locked_route}\",\"handoff\":\"{locked_handoff}\"}}"
+            + f"Example shape: {route_json}"
         ).strip()

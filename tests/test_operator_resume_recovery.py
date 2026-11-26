@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -24,11 +25,14 @@ from playwright_auto.chatgpt import (
     MessageSnapshot,
     PageBinding,
     SendReceipt,
+    capture_message_baseline,
+    prompt_digest,
     StableMalformedResponseError,
     UnsafePageStateError,
     capture_message_baseline,
 )
 from playwright_auto.cdpa_runtime_db import RuntimeDB
+from playwright_auto.chatgpt_errors import ModelVerificationError
 from playwright_auto.cdpa_store import utc_now
 from playwright_auto.durable import RequestLedger, RequestStatus
 from playwright_auto.upload import UploadReceipt, collect_file_identities
@@ -41,6 +45,7 @@ from test_cdpa_worker import (
     FakeActions,
     RecordingCDPASendActions,
     RecordingCDPASendClient,
+    _accept_test_hop,
     _backend_graph,
     _bootstrap_graph,
     _prepare_sent_waiting_task,
@@ -93,6 +98,419 @@ def _accepted_snapshot(receipt: SendReceipt, *, response: MessageSnapshot | None
         page_task_id=None,
         page_team=None,
     )
+
+
+@pytest.mark.parametrize(
+    "mode, completion, recovery",
+    [
+        ("persistent", "blank", "repair"),
+        ("temporary", "blank", "repair"),
+        ("temporary", "blank", "repair_malformed"),
+        ("persistent", "timeout", "completion_later"),
+        ("persistent", "timeout", "timeout"),
+        ("persistent", "timeout", "idle"),
+        ("persistent", "timeout", "idle_late_report"),
+        ("persistent", "timeout", "idle_late_after_send"),
+        ("persistent", "timeout", "idle_prepared_draft"),
+        ("persistent", "timeout", "idle_prepared_changed"),
+        ("persistent", "timeout", "idle_prepared_attachment"),
+        ("persistent", "timeout", "idle_prepared_original_attachment"),
+        ("persistent", "timeout", "idle_draft"),
+        ("persistent", "timeout", "idle_active"),
+        ("persistent", "timeout", "idle_retry"),
+        ("persistent", "timeout", "idle_error"),
+        ("persistent", "timeout", "idle_foreign"),
+        ("persistent", "timeout", "idle_duplicate"),
+        ("persistent", "timeout", "idle_page_changed"),
+        ("persistent", "timeout", "idle_unproven_route"),
+        ("persistent", "timeout", "valid_report"),
+        ("temporary", "blank", "valid_report"),
+        ("temporary", "blank", "wrong_nonce"),
+        ("temporary", "blank", "wrong_path"),
+        ("temporary", "blank", "wrong_role"),
+        ("temporary", "blank", "wrong_user"),
+        ("temporary", "blank", "wrong_user_result"),
+        ("persistent", "blank", "wrong_page"),
+        ("persistent", "blank", "ledger_conflict"),
+        ("temporary", "blank", "draft"),
+        ("temporary", "blank", "budget"),
+    ],
+)
+def test_accepted_dev_terminal_recovery_through_worker(tmp_path, monkeypatch, mode, completion, recovery):
+    from test_cdpa_temporary_workflow import TemporaryWorkflowActions
+
+    store, state, worker, path, plan, _, _ = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-dev-terminal", conversation_mode=mode,
+    )
+    plan_path = plan["expected_report_path"]
+    plan_result = json.dumps({"route": "DEV", "handoff": plan_path})
+    (tmp_path / plan_path).write_text(
+        f"# PLAN handoff\n\nCDPA-RESULT {plan['report_result']['key']}: {plan_result}\n", encoding="utf-8",
+    )
+    asyncio.run(worker._waiting(state, plan, None, path))
+    hop = _active_hop(state)
+    assert hop["target_role"] == "DEV"
+    if recovery.startswith("idle"):
+        hop.update(hop_id=19, turn=6, request_id=f"{state['task_id']}-hop19")
+        state.update(active_hop_id=19)
+        state["roles"]["DEV"]["turn"] = 6
+    original_attachment_metadata = None
+    if recovery == "idle_prepared_original_attachment":
+        attachment = tmp_path / "original-task-context.txt"
+        attachment.write_text("Original task context already retained by the role.", encoding="utf-8")
+        original_attachment_metadata = [item.to_dict() for item in collect_file_identities([attachment])]
+        state["attachments"] = original_attachment_metadata
+        # Report-only repair must not reupload task context, even without a legacy upload marker.
+        state["roles"]["DEV"]["attachments_uploaded_generation"] = None
+    prepare = TemporaryWorkflowActions() if mode == "temporary" else FakeActions()
+    asyncio.run(worker._pre_send(state, hop, prepare))
+    receipt, _ = _accept_test_hop(state, hop)
+    original_url = "https://chatgpt.com/c/dev-exact" + ("?temporary-chat=true" if mode == "temporary" else "")
+    hop["conversation_url"] = original_url
+    role = state["roles"]["DEV"]
+    role["page_url"] = original_url
+    worker._start_wait_budget_from_sent(hop)
+    now = datetime.now(timezone.utc)
+    if completion == "timeout":
+        hop["wait"].update(
+            controller_progress_at=(now - timedelta(hours=1)).isoformat(),
+            deadline_at=(now - timedelta(minutes=1)).isoformat(),
+        )
+    original = store.save(path, state)
+    request = Path(hop["ledger_path"])
+    accepted = request.read_bytes()
+    hop_id = hop["hop_id"]
+    request_id = hop["request_id"]
+    report_path = hop["expected_report_path"]
+    client = ready_client(state, "DEV")
+    template = client.assert_ownership.return_value
+    user = MessageSnapshot("user", receipt.user_message_id, receipt.user_turn_id, receipt.prompt, ())
+    assistant = MessageSnapshot(
+        "assistant", "blank-assistant", "blank-turn", "", ("copy",) if completion == "blank" else (),
+    )
+    snapshot = replace(template, url=original_url, messages=(user, assistant))
+    reads = []
+    cleanup = []
+    repair_sends = []
+    composer_writes = []
+
+    async def wait_snapshot(_receipt, **_kwargs):
+        reads.append(_receipt.binding.page_id)
+        return snapshot
+
+    async def assert_ownership():
+        return snapshot
+
+    async def set_text(text):
+        nonlocal snapshot
+        composer_writes.append(text)
+        snapshot = replace(snapshot, composer_text=text)
+
+    async def send_repair(text, *, after_send_click, max_attempts, recovery_reload, **kwargs):
+        nonlocal snapshot
+        assert max_attempts == 1 and not recovery_reload
+        assert kwargs["expected_attachment_count"] == 0
+        assert text != receipt.prompt
+        repair_sends.append(text)
+        after_send_click()
+        repair_receipt = replace(
+            receipt, prompt=text, prompt_sha256=prompt_digest(text),
+            baseline=capture_message_baseline(snapshot.messages),
+            user_message_id="repair-user", user_turn_id="repair-turn",
+        )
+        snapshot = replace(
+            snapshot, composer_text="",
+            messages=(*snapshot.messages, MessageSnapshot("user", "repair-user", "repair-turn", text, ())),
+        )
+        return repair_receipt
+
+    async def temporary_document(_script, create):
+        assert not create, "Recovery must preserve the existing Temporary document"
+        return role.get("temporary_document_id")
+
+    client.wait_snapshot = wait_snapshot
+    client.assert_ownership = assert_ownership
+    client.binding = receipt.binding
+    client.set_text = set_text
+    client.send = send_repair
+    client.page = SimpleNamespace(evaluate=temporary_document)
+    acquired = AcquiredRole(client, receipt.binding.page_id, original_url, False, False)
+
+    class Actions:
+        async def locate_owned(self, _state, target):
+            assert target == "DEV"
+            return acquired
+
+        async def preflight_team(self, *_args):
+            cleanup.append("preflight")
+            return []
+
+    monkeypatch.setattr(worker_module, "CDPATabActions", lambda *_args, **_kwargs: Actions())
+    monkeypatch.setattr(worker.role_controller, "policy", replace(worker.role_controller.policy, response_stable_seconds=0))
+    browser = SimpleNamespace(pages=[])
+    blocked = asyncio.run(worker.advance(path, browser))
+    if completion == "blank":
+        assert _active_hop(blocked)["wait"]["controller_reason"] == "empty_terminal_observing"
+        blocked = asyncio.run(worker.advance(path, browser))
+    expected_code = "empty_terminal_response" if completion == "blank" else "response_terminal_missing"
+    assert blocked["status"] == "BLOCKED"
+    assert blocked["block_code"] == expected_code
+    assert _active_hop(blocked)["wait"]["controller_reason"] == expected_code
+    assert _active_hop(blocked)["request_id"] == request_id
+
+    if recovery in {"valid_report", "wrong_nonce", "wrong_path", "wrong_role"}:
+        key = hop["report_result"]["key"] if recovery != "wrong_nonce" else "other-request"
+        handoff = plan_path if recovery == "wrong_path" else report_path
+        route = "DONE" if recovery == "wrong_role" else "REVIEW"
+        result = json.dumps({"route": route, "handoff": handoff})
+        (tmp_path / report_path).write_text(f"# DEV result\n\nCDPA-RESULT {key}: {result}\n", encoding="utf-8")
+    elif recovery in {"wrong_user", "wrong_user_result"}:
+        other_user = replace(user, message_id="different", turn_id="different")
+        reply = assistant
+        if recovery == "wrong_user_result":
+            (tmp_path / report_path).write_text("# Partial DEV report\n", encoding="utf-8")
+            reply = replace(assistant, text=json.dumps({"route": "REVIEW", "handoff": report_path}))
+        snapshot = replace(snapshot, messages=(user, other_user, reply))
+    elif recovery == "wrong_page":
+        acquired = replace(acquired, page_id="other-page")
+    elif recovery == "draft":
+        snapshot = replace(snapshot, composer_text="operator draft")
+    elif recovery == "ledger_conflict":
+        RequestLedger(request).update(request_id, receipt=replace(receipt, user_message_id="different").to_dict())
+        accepted = request.read_bytes()
+    elif recovery == "budget":
+        blocked["route_repair_count"] = blocked["max_route_repairs"]
+        blocked = store.save(path, blocked)
+    elif recovery == "completion_later":
+        snapshot = replace(snapshot, messages=(user, replace(assistant, actions=("copy",))))
+    elif recovery.startswith("idle"):
+        snapshot = replace(snapshot, state=ChatGPTState.WAITING_PROMPT, send_enabled=False, messages=(user,))
+        if recovery == "idle_draft":
+            snapshot = replace(snapshot, composer_text="operator draft")
+        elif recovery == "idle_active":
+            snapshot = replace(snapshot, stop_visible=True)
+        elif recovery == "idle_retry":
+            snapshot = replace(snapshot, retry_visible=True)
+        elif recovery == "idle_error":
+            snapshot = replace(snapshot, error_texts=("Provider error",))
+        elif recovery == "idle_foreign":
+            snapshot = replace(snapshot, messages=(user, replace(user, message_id="other", turn_id="other")))
+        elif recovery == "idle_duplicate":
+            snapshot = replace(snapshot, messages=(user, user))
+    if mode == "persistent" and recovery in {"repair", "completion_later"}:
+        snapshot = replace(snapshot, state=ChatGPTState.WAITING_PROMPT, send_enabled=False)
+
+    _queue_blocked_resume(store, blocked, code=expected_code, reason=blocked["block_reason"])
+    # A second worker loads the persisted block and Resume. Fake only the provider surface.
+    reloaded = type(worker)(worker.config, store=store)
+    reloaded.role_controller.policy = worker.role_controller.policy
+    reads_before = len(reads)
+    resumed = asyncio.run(reloaded.advance(path, browser))
+    if recovery == "completion_later" and resumed["controls"][-1]["status"] == "recovering":
+        reloaded = type(worker)(worker.config, store=store)
+        reloaded.role_controller.policy = worker.role_controller.policy
+        resumed = asyncio.run(reloaded.advance(path, browser))
+
+    control = resumed["controls"][-1]
+    parent = next(item for item in resumed["hops"] if item["hop_id"] == hop_id)
+    assert parent["receipt"] == receipt.to_dict()
+    assert parent["wait"]["deadline_at"] == _active_hop(blocked)["wait"]["deadline_at"]
+    assert request.read_bytes() == accepted
+    children = [item for item in resumed["hops"] if item["parent_hop_id"] == hop_id]
+    if recovery == "valid_report":
+        assert len(reads) == reads_before
+        assert control["result"]["postcondition"] == "report_route_recovered"
+        assert parent["report_path"] == report_path
+        assert [(child["kind"], child["target_role"]) for child in children] == [("handoff", "REVIEW")]
+        assert sum(item.get("kind") == "report_route_recovered" and item["hop_id"] == hop_id
+                   for item in store.load(path)["route_timeline"]) == 1
+    elif recovery in {
+        "idle", "idle_late_report", "idle_late_after_send", "idle_page_changed", "idle_unproven_route",
+        "idle_prepared_draft", "idle_prepared_changed", "idle_prepared_attachment",
+        "idle_prepared_original_attachment",
+    }:
+        assert control["result"]["postcondition"] == "route_repair_queued"
+        repair, = children
+        assert repair["kind"] == "route_repair" and repair["receipt"] is None
+        assert repair["request_id"] != request_id and repair["physical_role"] == parent["physical_role"]
+        if recovery == "idle_late_report":
+            result = json.dumps({"route": "REVIEW", "handoff": report_path})
+            (tmp_path / report_path).write_text(
+                f"# Late DEV report\n\nCDPA-RESULT {hop['report_result']['key']}: {result}\n",
+                encoding="utf-8",
+            )
+        elif recovery == "idle_page_changed":
+            snapshot = replace(snapshot, messages=(user, replace(user, message_id="other", turn_id="other")))
+        prepared = asyncio.run(reloaded.advance(path, browser))
+        repair = next(item for item in prepared["hops"] if item["hop_id"] == repair["hop_id"])
+        if recovery == "idle_late_report":
+            assert repair["state"] == "abandoned"
+            assert _active_hop(prepared)["target_role"] == "REVIEW"
+            assert sum(item.get("kind") == "report_route_recovered" and item["hop_id"] == 19
+                       for item in prepared["route_timeline"]) == 1
+        elif recovery == "idle_page_changed":
+            assert prepared["block_code"] == "accepted_report_latest_turn_unverified"
+            assert repair["state"] == "pre_send"
+        else:
+            assert repair["state"] == "sending"
+            assert report_path in repair["prompt"]
+            assert receipt.prompt not in repair["prompt"]
+            assert "REPORT_UNAVAILABLE" in repair["prompt"]
+            assert "Do not choose a new route" in repair["prompt"]
+            if recovery.startswith("idle_prepared_"):
+                ledger = RequestLedger(repair["ledger_path"])
+                constructor = worker_module.task_workflow_definitions(
+                    prepared, reloaded.config
+                )["DEV"]["system_prompt"]
+                record = ledger.begin(
+                    role=repair["physical_role"],
+                    prompt=repair["prompt"],
+                    source_context={
+                        "task_id": prepared["task_id"],
+                        "team": prepared["team"],
+                        "hop_id": repair["hop_id"],
+                        "manifest": prepared["manifest_path"],
+                    },
+                    role_prompt_hash=worker_module._sha(str(constructor)),
+                    request_id=repair["request_id"],
+                    render_request_marker=False,
+                )
+                assert record.status is RequestStatus.NEW and record.attempts == 0
+                assert record.files == ()
+                assert reloaded._is_pristine_preboundary_sending_record(prepared, repair, record)
+                parent_record = ledger.peek(request_id).to_dict()
+                draft = record.rendered_prompt
+                if recovery == "idle_prepared_changed":
+                    draft += "\nOperator amendment: preserve this draft."
+                markers = ("operator-note.txt",) if recovery == "idle_prepared_attachment" else ()
+                snapshot = replace(
+                    snapshot, state=ChatGPTState.DRAFT, composer_text=draft,
+                    send_enabled=True, attachment_markers=markers,
+                )
+                writes_before = list(composer_writes)
+                client.clear = AsyncMock(side_effect=AssertionError("Do not clear the prepared or manual draft"))
+                client.upload_files = AsyncMock(side_effect=AssertionError("Report-only repair must not upload files"))
+                result = asyncio.run(reloaded.advance(path, browser))
+                if recovery in {"idle_prepared_draft", "idle_prepared_original_attachment"}:
+                    assert _active_hop(result)["state"] == "sent"
+                    assert repair_sends == [record.rendered_prompt]
+                    sent_record = ledger.peek(repair["request_id"])
+                    assert sent_record.status is RequestStatus.SENT and sent_record.attempts == 1
+                    asyncio.run(reloaded.advance(path, browser))
+                    assert repair_sends == [record.rendered_prompt]
+                    assert ledger.peek(repair["request_id"]).attempts == 1
+                else:
+                    assert result["status"] == "BLOCKED"
+                    assert result["block_code"] == "accepted_report_draft_present"
+                    assert _active_hop(result)["hop_id"] == repair["hop_id"]
+                    assert repair_sends == []
+                    assert ledger.peek(repair["request_id"]).to_dict() == record.to_dict()
+                    assert snapshot.composer_text == draft
+                    assert snapshot.attachment_markers == markers
+                assert composer_writes == writes_before
+                client.clear.assert_not_awaited()
+                client.upload_files.assert_not_awaited()
+                assert ledger.peek(request_id).to_dict() == parent_record
+                if original_attachment_metadata is not None:
+                    persisted = store.load(path)
+                    assert persisted["attachments"] == original_attachment_metadata
+                    assert persisted["roles"]["DEV"]["attachments_uploaded_generation"] is None
+                    assert collect_file_identities([attachment])[0].to_dict() == original_attachment_metadata[0]
+            elif recovery in {"idle_late_after_send", "idle_unproven_route"}:
+                sent = asyncio.run(reloaded.advance(path, browser))
+                assert _active_hop(sent)["state"] == "sent"
+                assert repair_sends == [repair["prompt"]]
+                if recovery == "idle_late_after_send":
+                    result = json.dumps({"route": "REVIEW", "handoff": report_path})
+                    (tmp_path / report_path).write_text(
+                        f"# Late DEV report\n\nCDPA-RESULT {hop['report_result']['key']}: {result}\n",
+                        encoding="utf-8",
+                    )
+                reply = replace(assistant, text=json.dumps({"route": "REVIEW", "handoff": report_path}))
+                snapshot = replace(snapshot, messages=(*snapshot.messages, reply))
+                asyncio.run(reloaded.advance(path, browser))
+                prepared = asyncio.run(reloaded.advance(path, browser))
+                if recovery == "idle_unproven_route":
+                    assert prepared["block_code"] == "route_repair_invalid_response"
+                    assert _active_hop(prepared)["hop_id"] == repair["hop_id"]
+                else:
+                    assert _active_hop(prepared)["target_role"] == "REVIEW"
+                    assert sum(item.get("kind") == "report_route_recovered" and item["hop_id"] == 19
+                               for item in prepared["route_timeline"]) == 1
+                assert repair_sends == [repair["prompt"]]
+            else:
+                assert repair_sends == []
+        assert RequestLedger(request).peek(request_id).receipt == receipt.to_dict()
+    elif recovery in {"repair", "repair_malformed", "completion_later", "wrong_nonce", "wrong_path", "wrong_role"}:
+        assert control["status"] == "applied"
+        assert control["result"]["postcondition"] == "route_repair_queued"
+        assert parent["report_path"] is None
+        assert [(child["kind"], child["target_role"], child["turn"]) for child in children] == [
+            ("route_repair", "DEV", parent["turn"]),
+        ]
+        assert children[0]["request_id"] != request_id and children[0]["receipt"] is None
+        if recovery in {"repair", "repair_malformed"}:
+            repair = children[0]
+            if mode == "persistent":
+                result = json.dumps({"route": "REVIEW", "handoff": report_path})
+                (tmp_path / report_path).write_text(
+                    f"# Late DEV result\n\nCDPA-RESULT {hop['report_result']['key']}: {result}\n", encoding="utf-8",
+                )
+            reloaded = type(worker)(worker.config, store=store)
+            reloaded.role_controller.policy = worker.role_controller.policy
+            after_reload = asyncio.run(reloaded.advance(path, browser))
+            if mode == "persistent":
+                assert _active_hop(after_reload)["target_role"] == "REVIEW"
+                assert next(item for item in after_reload["hops"] if item["hop_id"] == repair["hop_id"])["state"] == "abandoned"
+                assert request.read_bytes() == accepted
+            else:
+                repair = _active_hop(after_reload)
+                assert repair["state"] == "sending"
+                assert repair["expected_report_path"] == report_path
+                assert f"CDPA-RESULT {repair['report_result']['key']}: " in repair["prompt"]
+                assert repair["prompt"] != receipt.prompt
+                repair_receipt, _ = _accept_test_hop(after_reload, repair)
+                reloaded._start_wait_budget_from_sent(repair)
+                reply = replace(assistant, text="I saved the report and chose REVIEW.") if recovery == "repair_malformed" else assistant
+                snapshot = replace(snapshot, messages=(replace(user, text=repair_receipt.prompt), reply))
+                store.save(path, after_reload)
+                repair_block = asyncio.run(reloaded.advance(path, browser))
+                if recovery == "repair":
+                    repair_block = asyncio.run(reloaded.advance(path, browser))
+                assert repair_block["block_code"] == (
+                    "route_repair_invalid_response" if recovery == "repair_malformed" else "empty_terminal_response"
+                )
+                _queue_blocked_resume(store, repair_block, code=repair_block["block_code"], reason=repair_block["block_reason"])
+                repair_resume = asyncio.run(reloaded.advance(path, browser))
+                assert repair_resume["controls"][-1]["status"] == "recovery_required"
+                assert [item["hop_id"] for item in repair_resume["hops"] if item["kind"] == "route_repair"] == [repair["hop_id"]]
+    else:
+        assert resumed["status"] == "BLOCKED"
+        assert control["status"] == "recovery_required"
+        assert control["result"]["next_safe_action"]
+        assert children == []
+        assert parent["report_path"] is None
+        if recovery.startswith("idle"):
+            assert control["result"]["reason_code"] == {
+                "idle_draft": "accepted_report_draft_present",
+                "idle_active": "accepted_report_generation_active",
+                "idle_retry": "accepted_report_retry_present",
+                "idle_error": "accepted_report_page_not_clean",
+                "idle_foreign": "accepted_report_latest_turn_unverified",
+                "idle_duplicate": "accepted_report_latest_turn_unverified",
+            }[recovery]
+        if recovery == "budget":
+            assert "repair exhausted" in resumed["block_reason"]
+            result = json.dumps({"route": "REVIEW", "handoff": report_path})
+            (tmp_path / report_path).write_text(
+                f"# DEV result\n\nCDPA-RESULT {hop['report_result']['key']}: {result}\n", encoding="utf-8",
+            )
+            store.request_resume(path, reason="Recheck completed report")
+            resumed = asyncio.run(reloaded.advance(path, browser))
+            assert resumed["controls"][-1]["result"]["postcondition"] == "report_route_recovered"
+            assert _active_hop(resumed)["target_role"] == "REVIEW"
+            assert request.read_bytes() == accepted
+    assert cleanup == [], "worker must preserve the accepted role's recoverable page on block"
 
 
 @pytest.mark.parametrize("dom_permission", [False, True])
@@ -168,7 +586,7 @@ def test_resume_pending_mcp_permission_hands_back_to_shared_controller(tmp_path:
 
 
 
-def test_resume_missing_terminal_result_block_queues_route_repair_without_timeout_extension(tmp_path: Path):
+def test_legacy_missing_terminal_block_cannot_queue_repair_without_exact_page_ownership(tmp_path: Path):
     store, state, worker, _path, hop, receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-resume-missing-terminal-result"
     )
@@ -176,7 +594,7 @@ def test_resume_missing_terminal_result_block_queues_route_repair_without_timeou
     state["roles"]["PLAN"]["page_url"] = hop["conversation_url"]
     now = datetime.now(timezone.utc)
     hop["wait"].update(
-        controller_progress_at=(now - timedelta(seconds=601)).isoformat(),
+        controller_progress_at=(now - timedelta(seconds=worker.role_controller.policy.timeout_seconds + 1)).isoformat(),
         deadline_at=(now - timedelta(seconds=1)).isoformat(),
         timeout_refreshed=True,
         timeout_status_checked=True,
@@ -212,24 +630,17 @@ def test_resume_missing_terminal_result_block_queues_route_repair_without_timeou
         "status": "recovering",
         "result": {"before": None},
     }
-    original_hop_id = hop["hop_id"]
-    original_request_id = hop["request_id"]
+    deadline = hop["wait"]["deadline_at"]
 
     asyncio.run(worker._recover_resume_waiting(state, hop, control, Actions()))
 
-    original = next(item for item in state["hops"] if item["hop_id"] == original_hop_id)
-    repair = _active_hop(state)
-    assert original["state"] == "routed"
-    assert original["request_id"] == original_request_id
-    assert repair["kind"] == "route_repair"
-    assert repair["target_role"] == "PLAN"
-    assert "terminal result" in repair["validation_error"].lower()
-    assert state["status"] == "RUNNING"
-    assert state["block_code"] is None
-    assert control["status"] == "applied"
-    assert control["result"]["action"] == "queue_route_repair"
-    assert control["result"]["postcondition"] == "route_repair_queued"
-    assert RequestLedger(original["ledger_path"]).get(original_request_id).attempts == 1
+    assert _active_hop(state) is hop and hop["state"] == "waiting"
+    assert hop["wait"]["deadline_at"] == deadline
+    assert state["status"] == "BLOCKED"
+    assert state["block_code"] == "accepted_report_latest_turn_unverified"
+    assert control["status"] == "recovery_required"
+    assert control["result"]["next_safe_action"]
+    assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]).attempts == 1
 
 
 def test_resume_control_stays_recovering_until_verified_postcondition(tmp_path: Path):
@@ -661,6 +1072,128 @@ def test_resume_missing_ledger_after_pre_send_requires_reconciliation(tmp_path: 
     assert control["result"]["outcome"] == "recovery_required"
     assert control["result"]["reason_code"] == "durable_send_provenance_missing"
     assert RequestLedger(hop["ledger_path"]).get(hop["request_id"]) is None
+
+
+@pytest.mark.parametrize("conflict", [
+    None, "intent", "unresolved_writer", "different_page", "new_browser", "missing_previous_prompt",
+    "other_writer", "rendered_previous_prompt", "different_previous_message",
+])
+def test_resume_preintent_binding_mismatch_on_existing_conversation(tmp_path, monkeypatch, conflict):
+    from unittest.mock import AsyncMock
+
+    from playwright_auto.cdpa_conversations import ConversationLeaseError, ConversationWriterLease
+
+    _, state, worker, _, previous, receipt, _ = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-resume-existing-writer", conversation_mode="persistent",
+    )
+    role = state["roles"]["PLAN"]
+    page_id = receipt.binding.page_id
+    conversation_id = "50b179f2-9671-44e3-8497-10905bf3903c"
+    saved_url = f"https://chatgpt.com/c/{conversation_id}"
+    project_url = f"https://chatgpt.com/g/g-p-test/c/{conversation_id}"
+    binding_id = "saved-plan-writer"
+    endpoint = state["browser_endpoint_id"]
+    cdp_url, physical = worker._gate_c_endpoint_evidence(endpoint)
+    observed = dict(
+        endpoint_id=endpoint, endpoint_cdp_url=cdp_url, physical_browser_id=physical,
+        page_target_identity=page_id, conversation_url=saved_url,
+        temporary_chat=False, temporary_document_id=None,
+    )
+    writer = ConversationWriterLease(worker.runtime_db)
+    previous_browser = conflict in {
+        "new_browser", "missing_previous_prompt", "other_writer", "rendered_previous_prompt",
+        "different_previous_message",
+    }
+    writer.bind(
+        binding_id=binding_id, provider_id="chatgpt_web", task_id=state["task_id"],
+        role_key="PLAN", verified_new_chat=previous_browser,
+        **({**observed, "conversation_url": "https://chatgpt.com/"} if previous_browser else observed),
+    )
+    role.update(page_url=project_url, conversation_generation=1, conversation_binding_id=binding_id)
+    previous.update(state="routed", conversation_url=saved_url, conversation_generation=1,
+                    conversation_binding_id=binding_id)
+    hop = worker._append_hop(state, source_role="DEV", target_role="PLAN", handoff="next")
+    hop.update(state="sending", prompt="next prompt", prompt_sha256=worker_module._sha("next prompt"),
+               conversation_generation=1, browser_endpoint_id=endpoint,
+               errors=["CONVERSATION_IDENTITY_MISMATCH: binding evidence changed before browser send"])
+    if conflict in {"intent", "unresolved_writer"}:
+        key = hop["request_id"] if conflict == "intent" else "previous-unconfirmed-request"
+        writer.record_send_intent(
+            writer.acquire(binding_id), idempotency_key=f"browser-send:{key}",
+            text=hop["prompt"], baseline_last_user_message_id="u1", baseline_user_turn_count=1,
+        )
+    if previous_browser:
+        accepted, _ = writer.record_send_intent(
+            writer.acquire(binding_id), idempotency_key=f"browser-send:{previous['request_id']}",
+            text=receipt.prompt, baseline_last_user_message_id=None, baseline_user_turn_count=0,
+        )
+        accepted = writer.transition_attempt(accepted["attempt_id"], "accepted")
+        monkeypatch.setattr(worker, "_gate_c_endpoint_evidence", lambda _endpoint: (cdp_url, "new-browser"))
+    if conflict == "other_writer":
+        writer.bind(
+            binding_id="other-writer", provider_id="chatgpt_web", task_id="other-task",
+            role_key="DEV", verified_new_chat=False,
+            **{**observed, "physical_browser_id": "new-browser", "page_target_identity": "other-page"},
+        )
+        writer.acquire("other-writer")
+    with pytest.raises(ConversationLeaseError, match="binding evidence changed"):
+        writer.validate_binding(binding_id, {**observed, "physical_browser_id": "different-browser"})
+
+    client = ready_client(state, "PLAN")
+    observed_page = "foreign-page" if conflict == "different_page" else page_id
+    rendered_prompt = receipt.prompt
+    if conflict in {"rendered_previous_prompt", "different_previous_message"}:
+        rendered_prompt = rendered_prompt.replace("`", "") + " Show less"
+    snapshot = replace(
+        asyncio.run(client.assert_ownership()), page_id=observed_page, url=project_url,
+        messages=() if conflict == "missing_previous_prompt" else (
+            MessageSnapshot(
+                "user", "other-user" if conflict == "different_previous_message" else "u1",
+                "t1", rendered_prompt, (),
+            ),
+        ),
+    )
+    client.wait_until_clean_ready = AsyncMock(return_value=snapshot)
+    actions = SimpleNamespace(reopen=AsyncMock(return_value=AcquiredRole(
+        client=client, page_id=observed_page, url=project_url, created=True, new_chat=False,
+    )))
+    control = {"action": "resume", "role": "PLAN", "status": "recovering"}
+    ledger = Path(hop["ledger_path"])
+    before = ledger.read_bytes()
+
+    asyncio.run(worker._recover_resume_control(state, control, actions))
+
+    assert ledger.read_bytes() == before
+    assert hop["state"] == "sending"
+    if conflict not in {None, "new_browser", "rendered_previous_prompt"}:
+        assert control["status"] == "recovery_required"
+        assert state["status"] == "BLOCKED"
+        assert writer.get_binding(binding_id)["binding_status"] == "blocked"
+        if conflict == "intent":
+            actions.reopen.assert_not_awaited()
+        if conflict == "other_writer":
+            assert writer.get_binding("other-writer")["binding_status"] == "active"
+    else:
+        assert control["status"] == "applied"
+        assert control["result"]["postcondition"] == "ownership_reacquired_before_send"
+        assert state["status"] == "RUNNING"
+        restored = writer.get_binding(role["conversation_binding_id"])
+        assert restored["binding_status"] == "idle"
+        assert hop.get("send_attempt_id") is None
+        if previous_browser:
+            assert restored["physical_browser_id"] == "new-browser"
+            assert restored["canonical_conversation_id"] == conversation_id
+            assert restored["binding_id"] != binding_id
+            assert writer.get_binding(binding_id)["binding_status"] == "sealed"
+            assert previous["conversation_binding_id"] == binding_id
+            saved_attempt = worker.runtime_db.get_command(accepted["attempt_id"])
+            assert saved_attempt["payload"]["send_attempt"] == accepted
+            # The worker can retry if the writer transaction committed first.
+            assert writer.restore_persistent_writer(
+                binding_id, {**observed, "physical_browser_id": "new-browser", "conversation_url": project_url},
+                saved_url=saved_url,
+            ) == restored["binding_id"]
+            assert writer.acquire(restored["binding_id"])["owner_binding_id"] == restored["binding_id"]
 
 
 def test_workflow_create_rejects_split_browser_endpoints(tmp_path: Path):
@@ -1574,6 +2107,41 @@ def test_resume_unresolved_native_branch_falls_back_to_role_restart_before_block
     assert record.accepted_at is None
 
 
+@pytest.mark.parametrize("model_ready", [False, True])
+def test_resume_checks_model_before_declaring_a_blocked_request_ready(tmp_path: Path, model_ready):
+    store, state, worker, path, hop, ledger, _ = _prepare_pristine_new_sending_record(
+        tmp_path, task_id="task-resume-model-gate",
+    )
+    state["controls"] = []
+    state = _queue_blocked_resume(store, state, code="model_verification_blocked")
+    request_id = hop["request_id"]
+    record_before = ledger.get(request_id)
+    role = state["roles"]["PLAN"]
+    client = SimpleNamespace(verify_model_effort=AsyncMock(
+        return_value="High",
+        side_effect=None if model_ready else ModelVerificationError("Picker remains unavailable"),
+    ))
+    actions = FakeActions()
+    actions.locate_owned = AsyncMock(return_value=AcquiredRole(
+        client=client, page_id=role["page_id"], url=role["page_url"], created=False, new_chat=False,
+    ))
+
+    assert asyncio.run(worker._apply_control(state, actions, path)) is True
+    control = state["controls"][-1]
+    asyncio.run(worker._recover_resume_control(state, control, actions))
+
+    client.verify_model_effort.assert_awaited_once()
+    assert ledger.get(request_id) == record_before
+    assert _active_hop(state)["request_id"] == request_id
+    if model_ready:
+        assert control["status"] == "applied"
+        assert state["status"] == "RUNNING"
+    else:
+        assert control["status"] == "recovery_required"
+        assert state["block_code"] == "model_verification_blocked"
+        assert state["status"] == "BLOCKED"
+
+
 def test_resume_reacquires_lost_bootstrap_role_for_pristine_new_request(tmp_path: Path):
     store, state, worker, path, hop, ledger, donor = _prepare_pristine_new_sending_record(
         tmp_path, task_id="task-resume-pristine-new"
@@ -2171,6 +2739,14 @@ def test_preboundary_classifier_rejects_nonpristine_and_crossed_records(tmp_path
             "mime_type": "text/plain",
         }
     ]
+    assert worker._is_pristine_preboundary_sending_record(state, hop, pristine) is False
+    role = state["roles"][hop["target_role"]]
+    generation = int(role.get("conversation_generation") or 0)
+    role["attachments_uploaded_generation"] = generation
+    assert worker._is_pristine_preboundary_sending_record(state, hop, pristine) is True
+    role["attachments_uploaded_generation"] = generation + 1
+    assert worker._is_pristine_preboundary_sending_record(state, hop, pristine) is False
+    role["attachments_uploaded_generation"] = None
     assert worker._is_pristine_preboundary_sending_record(state, hop, pristine) is False
     state["attachments"] = []
     assert worker._is_pristine_preboundary_sending_record(state, hop, pristine) is True
@@ -3884,13 +4460,15 @@ def _guard_blocked_state(tmp_path: Path, *, task_id: str):
     _config, store, state, worker = setup_task(tmp_path, task_id=task_id, self_route_policy={"mode": "bounded", "max_self_routes": 32}, max_routes=32)
     from test_cdpa_worker import _accept_self_route_guard_decision
 
-    source = None
+    worker._execution_budget(state)["limit"] = 12
     for _ in range(12):
         source = _accept_self_route_guard_decision(worker, state, "PLAN")
-        if state["status"] == "BLOCKED":
-            break
-    assert source is not None
-    assert state["block_code"] == "autonomous_execution_budget_exhausted"
+    # Model the old block after the durable route commit, before child allocation.
+    child = state["hops"].pop()
+    assert child["parent_hop_id"] == source["hop_id"]
+    state["execution_budget"]["charged_hop_ids"].remove(child["hop_id"])
+    worker._block(state, "Former execution cap reached.", code="autonomous_execution_budget_exhausted", retryable=False)
+    state["active_hop_id"] = source["hop_id"]
     assert state["execution_budget"]["charged_hop_ids"] == list(range(1, 13))
     store.save(state["manifest_path"], state)
     return store, state, worker, Path(state["manifest_path"]), source
@@ -4053,7 +4631,7 @@ def test_successful_operator_resume_from_paused_rearms_self_route_streak(tmp_pat
     assert _active_hop(state)["hop_id"] == active["hop_id"] + 1
 
 
-def test_operator_resume_from_budget_exhaustion_starts_a_fresh_epoch(tmp_path: Path):
+def test_operator_resume_from_historical_budget_continues_past_counts(tmp_path: Path):
     from test_cdpa_worker import _accept_self_route_guard_decision
 
     store, state, worker, path, _source = _guard_blocked_state(
@@ -4072,11 +4650,12 @@ def test_operator_resume_from_budget_exhaustion_starts_a_fresh_epoch(tmp_path: P
     assert state["execution_budget"]["epoch"] == 2
     assert state["execution_budget"]["charged_hop_ids"] == [13]
 
-    for _ in range(3):
+    for _ in range(13):
         _accept_self_route_guard_decision(worker, state, "PLAN")
 
     assert state["status"] == "RUNNING"
-    assert state["execution_budget"]["charged_hop_ids"] == [13, 14, 15, 16]
+    assert state["route_seq"] == 25
+    assert _active_hop(state)["hop_id"] == 26
 
 
 def test_unrelated_blocked_resume_does_not_reset_self_route_streak(tmp_path: Path):

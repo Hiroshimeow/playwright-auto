@@ -197,6 +197,22 @@ def test_solo_prompt_initial_and_continuation_are_minimal(tmp_path: Path):
     )
 
 
+@pytest.mark.parametrize("continuation", [False, True])
+def test_file_backed_solo_prompt_reserves_pause_for_an_external_prerequisite(tmp_path, continuation):
+    config, _store = make_store(tmp_path)
+    prompt = PromptBuilder(config).build_solo(
+        task_name="Solo review",
+        logical_role="REVIEW",
+        goal="Check the patch",
+        workspace=str(tmp_path),
+        continuation=continuation,
+        expected_report_path=".plan/solo/review.md",
+    ).text
+
+    assert "PAUSE requires an external/manual prerequisite" in prompt
+    assert "`block_code` and `resume_condition` in the report" in prompt
+
+
 def test_cdpa_quick_cli_defaults_to_solo_dev_9202_and_preserves_full_prompt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -241,6 +257,37 @@ def test_cdpa_quick_cli_rejects_conflicting_inputs_and_preserves_legacy():
     assert cli_module.main(["-p", "x", "--goal", "other"]) == 2
     assert cli_module.main(["-p", "x", "--conversation-url", "https://chatgpt.com/c/abc"]) == 2
     assert cli_module.main(["-m", "solo"]) == 2
+
+
+@pytest.mark.parametrize("solo", [False, True])
+def test_cdpa_cli_submits_complete_utf8_task_file_with_exact_workflow_options(tmp_path, monkeypatch, solo):
+    config, _store = make_store(tmp_path)
+    task_file = tmp_path / "review prompt.txt"
+    task = "Review hiện trạng\r\nCheck A & B | C.\r\nRecord the verdict."
+    task_file.write_bytes(task.encode("utf-8-sig"))
+    payloads = []
+    monkeypatch.setattr(cli_module, "load_cdpa_config", lambda *args, **kwargs: config)
+    monkeypatch.setattr(
+        cli_module, "_post",
+        lambda _config, path, payload, **kwargs: payloads.append((path, payload)) or {"status": "queued"},
+    )
+
+    assert cli_module.main([
+        "--task-file", str(task_file), "--team", "review-file", "--solo" if solo else "--roles", "REVIEW",
+        "--repository", str(tmp_path), "--browser", "9212", "--temp",
+    ]) == 0
+    [(path, payload)] = payloads
+    assert path == "/api/tasks"
+    assert payload["task"] == task
+    assert payload["requested_team"] == "review-file"
+    if solo:
+        assert payload["role"] == "REVIEW"
+        assert payload["goal"] == task
+    else:
+        assert payload["roles"] == ["REVIEW"]
+    assert payload["repository"] == str(tmp_path.resolve())
+    assert payload["browser_endpoint_id"] == "9212"
+    assert payload["temporary"] is True
 
 
 @pytest.mark.parametrize("handoff", ["Implemented and verified focused tests.", "INLINE"])
@@ -757,10 +804,44 @@ def test_solo_route_repair_prompt_carries_exact_error_and_candidate_without_goal
     assert repair["validation_error"] in repair["prompt"]
     assert json.dumps(malformed) in repair["prompt"]
     assert "DO_NOT_REPEAT_SUBSTANTIVE_GOAL" not in repair["prompt"]
-    assert repair["expected_report_path"] is None
+    assert repair["expected_report_path"] == original["expected_report_path"]
+    assert repair["report_result"]["key"] != original["report_result"]["key"]
+    assert f'CDPA-RESULT {repair["report_result"]["key"]}: ' in repair["prompt"]
     assert "correct only" in repair["prompt"].lower()
-    assert '"route":"DONE"' in repair["prompt"]
-    assert '"route":"PAUSE"' in repair["prompt"]
+    assert '"route":"DONE|PAUSE"' in repair["prompt"]
+
+
+def test_solo_exact_route_with_missing_report_uses_report_repair(tmp_path: Path):
+    config, store = make_store(tmp_path)
+    state = store.create_task(
+        "Solo report proof",
+        task_id="solo-report-required",
+        workflow_mode="solo",
+        roles=("DEV",),
+        browser_endpoint_id="9222",
+    )
+    worker = CDPAWorker(config, store=store)
+    hop = active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    expected = hop["expected_report_path"]
+    response = json.dumps({"route": "DONE", "handoff": expected})
+    hop.update(state="responded", response=response)
+
+    worker._responded(state, hop)
+
+    repair = active_hop(state)
+    assert repair["kind"] == "report_repair"
+    assert repair["locked_route"] == "DONE"
+    asyncio.run(worker._pre_send(state, repair, FakeActions()))
+    assert repair["expected_report_path"] == expected
+    assert "Repair only the report contract" in repair["prompt"]
+    (tmp_path / expected).write_text("# Recovered report\n", encoding="utf-8")
+    repair.update(state="responded", response=response)
+
+    worker._responded(state, repair)
+
+    assert state["status"] == "DONE"
+    assert state["reports"][0]["path"] == expected
 
 
 def test_solo_route_repair_actual_send_persists_exact_repair_prompt_once(tmp_path: Path):
@@ -954,7 +1035,11 @@ def test_cli_submit_task_adds_solo_fields_without_changing_team_payload(
     assert payloads[1]["conversation_url"].startswith("https://chatgpt.com/c/")
 
 
-def test_solo_pause_resume_reuses_concise_handoff_and_same_role(tmp_path: Path):
+@pytest.mark.parametrize("manual_draft", ["", "Operator draft"])
+def test_solo_pause_resume_reuses_concise_handoff_and_same_role(tmp_path: Path, manual_draft):
+    from dataclasses import replace
+    from test_cdpa_worker import ready_client
+
     config, store = make_store(tmp_path)
     state = store.create_task(
         "Solo paused audit",
@@ -987,6 +1072,25 @@ def test_solo_pause_resume_reuses_concise_handoff_and_same_role(tmp_path: Path):
     assert resumed["source_role"] == "AUDIT"
     assert resumed["handoff"] == "Waiting for an external artifact."
     assert "PLAN" not in state["roles"]
+
+    class OwnedActions(FakeActions):
+        async def locate_owned(self, state, role):
+            client = ready_client(state, role)
+            snapshot = replace(client.assert_ownership.return_value, composer_text=manual_draft)
+            client.assert_ownership.return_value = snapshot
+            return AcquiredRole(client, snapshot.page_id, snapshot.url, False, False)
+
+        async def acquire(self, *_args, **_kwargs):
+            pytest.fail("Solo Resume must preserve the existing composer")
+
+    asyncio.run(worker._pre_send(state, resumed, OwnedActions()))
+
+    if manual_draft:
+        assert resumed["state"] == "pre_send"
+        assert resumed["wait"]["manual_draft_present"] is True
+    else:
+        assert resumed["state"] == "sending"
+        assert "Waiting for an external artifact." in resumed["prompt"]
 
 
 def test_solo_new_chat_uses_initial_prompt_once_and_persists_canonical_url(
@@ -1431,6 +1535,6 @@ def test_create_task_ui_exposes_team_and_solo_without_is_running():
     assert 'data-create-section="team-repository" data-team-only' in html
     assert 'data-solo-browser-slot' in html
     assert "roots.soloBrowserSlot.append(roots.browserEndpointField)" in app
-    assert '/assets/app.js?v=20260925-live-sse-v1' in html
+    assert '/assets/app.js?v=cdpa-accepted-report-v1' in html
     assert "is_running" not in html.casefold()
     assert "is_running" not in app.casefold()

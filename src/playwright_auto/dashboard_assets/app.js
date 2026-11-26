@@ -5,11 +5,11 @@ import {
   state, commit, subscribe, commandKey, persistViewState,
   detailCacheGet, detailCachePut, detailCacheInvalidate, pruneDetailCache,
 } from "./store.js?v=20260914-goal2-ops-v1";
-import {renderBoard, refreshElapsed} from "./views/board.js?v=20260915-operator-ux-v1";
+import {renderBoard, refreshElapsed} from "./views/board.js?v=cdpa-recovery-controls-v2";
 import {renderBrowserManager, renderBrowserScope, syncCreateBrowserOptions, creationUsesTemporary} from "./views/browsers.js?v=20260915-endpoint-all-v1";
-import {installSelectionResume, refreshTimelineTimes, renderTaskDetail} from "./views/task_detail.js?v=20260925-live-sse-v1";
+import {installSelectionResume, refreshTimelineTimes, renderTaskDetail, reportBody} from "./views/task_detail.js?v=cdpa-accepted-report-v1";
 import {renderHistory} from "./views/history.js";
-import {renderNotify, renderNotifyReport} from "./views/notify.js?v=20260925-live-sse-v1";
+import {renderNotify, renderNotifyReport} from "./views/notify.js?v=cdpa-accepted-report-v1";
 import {renderRuntime} from "./views/runtime.js?v=20260906-listen-controls-v1";
 import {
   applyReuseRoleSelection, renderCreateActions, renderResume, renderWorkflowAgentOptions,
@@ -592,6 +592,32 @@ function renderAgents(current) {
   if (selected && !roots.agentSelect.value) resetAgentEditor();
 }
 
+async function readReportBody(report, endpoint) {
+  try {
+    const materialBacked = endpoint === report.material_url;
+    const response = await fetch(endpoint, {
+      headers: {Accept: materialBacked ? "application/json" : "text/markdown"},
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!materialBacked) return {status: "ready", body: await response.text()};
+    const payload = await response.json();
+    const metadata = [
+      payload.source_kind,
+      payload.material_type,
+      payload.version,
+      Number.isFinite(Number(payload.content_length)) ? `${Number(payload.content_length).toLocaleString()} bytes` : null,
+      payload.truncated ? "truncated" : null,
+    ].filter(Boolean).join(" · ");
+    const errorText = payload.error
+      ? `${payload.error.code || "MATERIAL_ERROR"}: ${payload.error.message || "Material content is unavailable."}`
+      : null;
+    const body = payload.content || errorText || "Material content is unavailable for bounded inline display.";
+    return {status: "ready", body: metadata ? `${metadata}\n\n${body}` : body};
+  } catch (error) {
+    return {status: "error", error: error.message};
+  }
+}
+
 async function loadReports(detail) {
   const reports = [
     ...(detail?.reports || []),
@@ -602,35 +628,7 @@ async function loadReports(detail) {
     const endpoint = report.material_url || report.url;
     if (!endpoint || !cacheKey || reportBodies.has(cacheKey)) return;
     reportBodies.set(cacheKey, {status: "loading"});
-    try {
-      const materialBacked = Boolean(report.material_url);
-      const response = await fetch(endpoint, {
-        headers: {Accept: materialBacked ? "application/json" : "text/markdown"},
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      if (materialBacked) {
-        const payload = await response.json();
-        const metadata = [
-          payload.source_kind,
-          payload.material_type,
-          payload.version,
-          Number.isFinite(Number(payload.content_length)) ? `${Number(payload.content_length).toLocaleString()} bytes` : null,
-          payload.truncated ? "truncated" : null,
-        ].filter(Boolean).join(" · ");
-        const errorText = payload.error
-          ? `${payload.error.code || "MATERIAL_ERROR"}: ${payload.error.message || "Material content is unavailable."}`
-          : null;
-        const body = payload.content || errorText || "Material content is unavailable for bounded inline display.";
-        reportBodies.set(cacheKey, {
-          status: "ready",
-          body: metadata ? `${metadata}\n\n${body}` : body,
-        });
-      } else {
-        reportBodies.set(cacheKey, {status: "ready", body: await response.text()});
-      }
-    } catch (error) {
-      reportBodies.set(cacheKey, {status: "error", error: error.message});
-    }
+    reportBodies.set(cacheKey, await readReportBody(report, endpoint));
     if (state.selectedDetail?.task_id === detail?.task_id) {
       commit(current => { current.agentReportsRevision += 1; });
     }
@@ -1284,7 +1282,13 @@ async function pollCommands() {
           "independent_settings",
         ].includes(command.kind)) await fetchAgents();
         if (response.data.status === "applied" && state.selectedTaskId === command.taskId) {
-          await loadTaskDetail(command.taskId, {force: true});
+          const replacement = command.kind === "restart_team" ? response.data.result?.task_id : null;
+          if (replacement) {
+            selectTask(replacement);
+            await loadTaskDetail(replacement);
+          } else {
+            await loadTaskDetail(command.taskId, {force: true});
+          }
         }
       }
     } catch (error) {
@@ -1336,8 +1340,11 @@ function pushOverlay(name) {
   history.pushState({...history.state, [OVERLAY_STATE]: name}, "");
 }
 
+let notifyReportRequest = null;
+
 function openDrawer(view) {
   if (!state.drawer) pushOverlay("drawer");
+  notifyReportRequest = null;
   if (view === "notify") delete roots.secondaryContent.dataset.secondaryView;
   commit(current => {
     current.drawer = view;
@@ -1573,6 +1580,51 @@ roots.detail.addEventListener("click", async event => {
   if (control) {
     const taskId = control.dataset.taskId;
     const detail = state.selectedDetail;
+    if (control.dataset.control === "restart_role" && control.dataset.disabledReason) {
+      toast(control.dataset.disabledReason);
+      return;
+    }
+    if (control.dataset.control === "restart_team"
+      && !window.confirm("Stop this team and start a fresh replacement with the same goal and setup?")) return;
+    if (control.dataset.control === "increase_route_limits") {
+      const minimum = Number(control.dataset.minimumLimit);
+      const answer = window.prompt(`Enter a new limit of at least ${minimum}.`, String(minimum));
+      if (answer === null) return;
+      const limit = Number(answer);
+      if (!Number.isSafeInteger(limit) || limit < minimum) {
+        toast(`Enter a whole number of at least ${minimum}.`);
+        return;
+      }
+      queueCommand({
+        kind: "increase_route_limits",
+        taskId,
+        endpoint: `/api/tasks/${encodeURIComponent(taskId)}/controls`,
+        body: {
+          action: "increase_route_limits",
+          expected_task_version: Number(control.dataset.version),
+          [control.dataset.limitField]: limit,
+        },
+        label: `${control.textContent} · ${detail?.team || taskId}`,
+      });
+      return;
+    }
+    if (control.dataset.control === "change_role_url") {
+      const url = window.prompt(`ChatGPT conversation URL for ${control.dataset.role}`, control.dataset.currentUrl);
+      if (!url?.trim()) return;
+      queueCommand({
+        kind: "change_role_url",
+        taskId,
+        endpoint: `/api/tasks/${encodeURIComponent(taskId)}/controls`,
+        body: {
+          action: "change_role_url",
+          role: control.dataset.role,
+          conversation_url: url.trim(),
+          expected_task_version: Number(control.dataset.version),
+        },
+        label: `Change URL · ${control.dataset.role}`,
+      });
+      return;
+    }
     const isReset = control.dataset.control === "reset";
     queueCommand({
       kind: control.dataset.control,
@@ -1584,7 +1636,7 @@ roots.detail.addEventListener("click", async event => {
         action: control.dataset.control,
         role: selectedRole(state),
         expected_task_version: Number(control.dataset.version),
-        confirmed: ["stop", "clear_team", "archive_worktree"].includes(control.dataset.control),
+        confirmed: ["stop", "restart_team", "clear_team", "archive_worktree"].includes(control.dataset.control),
       },
       label: `${control.textContent} · ${detail?.team || taskId}`,
     });
@@ -1593,10 +1645,19 @@ roots.detail.addEventListener("click", async event => {
 });
 
 async function openNotifyReport(taskId) {
+  const request = Symbol();
+  notifyReportRequest = request;
   const detail = await loadTaskDetail(taskId);
-  if (!detail || state.drawer !== "notify") return;
-  await loadReports(detail);
-  if (state.drawer === "notify") renderNotifyReport(roots.secondaryContent, detail, reportBodies);
+  if (!detail || state.drawer !== "notify" || notifyReportRequest !== request) return;
+  const bodies = new Map();
+  const report = renderNotifyReport(roots.secondaryContent, detail, bodies);
+  const url = report?.url || report?.material_url;
+  if (!url || ["unavailable", "remote_unmirrored"].includes(report.availability)) return;
+  const body = roots.secondaryContent.querySelector("[data-notify-report-body]");
+  bodies.set(url, await readReportBody(report, url));
+  if (state.drawer === "notify" && notifyReportRequest === request) {
+    body.textContent = reportBody(report, bodies);
+  }
 }
 
 roots.secondaryContent.addEventListener("click", async event => {
@@ -1605,6 +1666,7 @@ roots.secondaryContent.addEventListener("click", async event => {
     return;
   }
   if (event.target.closest("[data-notify-back]")) {
+    notifyReportRequest = null;
     delete roots.secondaryContent.dataset.secondaryView;
     renderNotify(roots.secondaryContent, state);
     return;
@@ -1622,6 +1684,7 @@ roots.secondaryContent.addEventListener("click", async event => {
       ? detailCacheGet(taskId, summary.version, summary.projection_sha256)
       : null;
     selectTask(taskId, cached);
+    if (task.hasAttribute("data-notify-open-task")) closeDrawer();
     if (!cached) loadTaskDetail(taskId);
   }
   if (event.target.closest("[data-load-history]")) loadHistory(true);

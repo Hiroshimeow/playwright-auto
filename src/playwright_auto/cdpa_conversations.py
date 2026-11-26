@@ -60,6 +60,8 @@ def canonical_conversation(url: str) -> str:
             "conversation URL is not an exact ChatGPT conversation",
         )
     pieces = [piece for piece in parsed.path.split("/") if piece]
+    if len(pieces) == 4 and pieces[0] == "g" and pieces[1].startswith("g-p-"):
+        pieces = pieces[2:]
     if len(pieces) != 2 or pieces[0] != "c" or not pieces[1]:
         raise ConversationLeaseError(
             "CONVERSATION_IDENTITY_MISMATCH",
@@ -996,37 +998,30 @@ class ConversationWriterLease:
             connection.commit()
             return self._binding_projection(binding)
 
+    @staticmethod
+    def _binding_matches(binding: Mapping[str, Any], observed: Mapping[str, Any]) -> bool:
+        fields = (
+            "endpoint_id", "endpoint_cdp_url", "physical_browser_id",
+            "page_target_identity", "temporary_chat", "temporary_document_id",
+        )
+        if any(observed.get(field) != binding.get(field) for field in fields):
+            return False
+        expected = binding.get("canonical_conversation_id")
+        if not expected:
+            return True
+        try:
+            return canonical_conversation(str(observed.get("conversation_url") or "")) == expected
+        except ValueError:
+            return False
+
     def validate_binding(
         self, binding_id: str, observed: Mapping[str, Any]
     ) -> dict[str, Any]:
-        mismatch = False
         with self.db.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             state, version = self._load_state(connection)
             binding = self._binding_or_error(state, binding_id)
-            for field in (
-                "endpoint_id",
-                "endpoint_cdp_url",
-                "physical_browser_id",
-                "page_target_identity",
-                "temporary_chat",
-                "temporary_document_id",
-            ):
-                if observed.get(field) != binding.get(field):
-                    mismatch = True
-                    break
-            if not mismatch and binding.get("canonical_conversation_id"):
-                try:
-                    observed_id = canonical_conversation(
-                        str(observed.get("conversation_url") or "")
-                    )
-                except ConversationLeaseError:
-                    mismatch = True
-                else:
-                    mismatch = (
-                        observed_id != binding.get("canonical_conversation_id")
-                    )
-            if mismatch:
+            if not self._binding_matches(binding, observed):
                 binding["binding_status"] = "blocked"
                 binding["reconciliation_only"] = bool(
                     self._attempts_for_binding(connection, binding_id)
@@ -1041,6 +1036,83 @@ class ConversationWriterLease:
             "CONVERSATION_IDENTITY_MISMATCH",
             "binding evidence changed before browser send",
         )
+
+    def restore_persistent_writer(
+        self, binding_id: str, observed: Mapping[str, Any], *, saved_url: str,
+    ) -> str:
+        """Reconcile the saved owner before admitting another Send."""
+        conversation = canonical_conversation(saved_url)
+        with self.db.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            state, version = self._load_state(connection)
+            binding = self._binding_or_error(state, binding_id)
+            physical_id = str(observed.get("physical_browser_id") or "")
+            expected = {
+                **binding, "physical_browser_id": physical_id, "canonical_conversation_id": conversation,
+            }
+            if (
+                not physical_id or binding.get("temporary_chat")
+                or binding.get("canonical_conversation_id") not in {None, conversation}
+                or not self._binding_matches(expected, observed)
+            ):
+                raise ConversationLeaseError(
+                    "CONVERSATION_IDENTITY_MISMATCH", "The saved writer does not match the exact live role",
+                )
+            provider = str(binding["provider_id"])
+            page_id = str(binding["page_target_identity"])
+            writer_key = self._canonical_key(provider, conversation)
+            page_key = self._page_key(provider, physical_id, page_id)
+            same_binding = self._binding_matches(binding, observed) and bool(binding["canonical_conversation_id"])
+            restored_id = binding_id if same_binding else _digest("reopened", binding_id, physical_id, conversation)
+            if binding.get("binding_status") == "sealed":
+                existing = state["bindings"].get(restored_id)
+                if (
+                    existing and existing.get("restored_from_binding_id") == binding_id
+                    and existing.get("binding_status") == "idle"
+                    and not existing.get("pending_writer_identity_key")
+                    and writer_key not in state["quarantine"] and writer_key not in state["leases"]
+                    and state["page_claims"].get(page_key) == restored_id
+                    and self._binding_matches(existing, observed)
+                ):
+                    connection.commit()
+                    return restored_id
+            if (
+                binding.get("binding_status") not in {"blocked", "idle"}
+                or (not same_binding and restored_id in state["bindings"])
+                or state["page_claims"].get(page_key) not in {None, binding_id}
+                or binding.get("pending_writer_identity_key")
+                or any(attempt.get("state") not in _TERMINAL_ATTEMPT_STATES
+                       for attempt in self._attempts_for_binding(connection, binding_id))
+            ):
+                raise ConversationLeaseError("WRITER_LEASE_BUSY", "Writer evidence still needs reconciliation")
+            for key in {str(binding["writer_identity_key"]), writer_key}:
+                quarantine = state["quarantine"].get(key)
+                if isinstance(quarantine, dict):
+                    raise self._quarantine_error(quarantine)
+                lease = state["leases"].get(key)
+                if lease and (lease.get("owner_binding_id") != binding_id or lease.get("state") == "reserved_async_wait"):
+                    raise ConversationLeaseError("WRITER_LEASE_BUSY", "The conversation has another writer lease")
+            self._release_binding_leases(state, binding)
+            now = _utc_now()
+            if not same_binding:
+                self._release_page_claim(state, binding)
+                binding.update(binding_status="sealed", updated_at=now)
+                expected.update(
+                    binding_id=restored_id, restored_from_binding_id=binding_id,
+                    page_binding_id=_digest("page", provider, physical_id, page_id),
+                    conversation_url=observed["conversation_url"], writer_identity_key=writer_key,
+                    provisional_writer_identity_key=None, lease_epoch=None, verified_new_chat=False,
+                    created_at=now,
+                )
+                for field in ("dom_projection", "dom_projection_version", "dom_projection_updated_at"):
+                    expected.pop(field, None)
+                binding = expected
+                state["bindings"][restored_id] = binding
+            state["page_claims"][page_key] = restored_id
+            binding.update(binding_status="idle", reconciliation_only=False, updated_at=now)
+            self._store_state(connection, state, version)
+            connection.commit()
+            return restored_id
 
     def rekey(self, binding_id: str, conversation_url: str) -> dict[str, Any]:
         current = self.get_binding(binding_id)

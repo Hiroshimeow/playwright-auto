@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -263,8 +264,41 @@ def test_projection_recovers_historical_routed_reports_and_deduplicates_indexed_
     ]
     assert projection.detail["reports"][0]["created_at"] == "2026-07-25T00:01:00+00:00"
     assert projection.detail["reports"][1]["created_at"] == "2026-07-25T00:02:30+00:00"
+    assert [report["hop_id"] for report in projection.detail["reports"]] == [1, 2]
     assert projection.private["reports"]["hop-2"]["sha256"] == hashlib.sha256(dev_body).hexdigest()
     assert projection.private["reports"]["hop-2"]["size"] == len(dev_body)
+
+
+def test_projection_serves_a_completed_legacy_solo_result_as_a_report(tmp_path: Path):
+    raw = raw_task(tmp_path)
+    result = "Review complete.\n\nOne acceptance check failed."
+    raw.update(status="DONE", workflow_mode="solo", active_hop_id=None, active_role=None)
+    raw["reports"] = []
+    raw["hops"] = [{
+        "hop_id": 1,
+        "state": "routed",
+        "route": "DONE",
+        "target_role": "DEV",
+        "physical_role": "alpha-dev",
+        "turn": 1,
+        "expected_report_path": None,
+        "routed_handoff": result,
+        "response": json.dumps({"route": "DONE", "handoff": result}),
+    }]
+
+    projection = build_task_projection(raw, tasks=[raw])
+
+    report, = projection.detail["reports"]
+    assert report["role"] == "DEV"
+    assert report["turn"] == 1
+    assert report["availability"] == "available"
+    assert report["url"] == "/api/reports/task-a/hop-1"
+    api = SimpleNamespace(db=SimpleNamespace(get_task_private=lambda _task_id: projection.private))
+    assert DashboardAPI.report_bytes(api, "task-a", "hop-1", maintenance=False) == result.encode()
+    assert DashboardAPI.report_material(api, "task-a", "hop-1")["content"] == result
+
+    raw["hops"][0]["expected_report_path"] = ".plan/alpha/alpha-dev_turn1_task-a.md"
+    assert build_task_projection(raw, tasks=[raw]).detail["reports"] == []
 
 
 def test_projection_exposes_only_canonical_chat_url_even_when_it_matches_private_page_url(tmp_path: Path):
@@ -793,12 +827,50 @@ def test_projection_rewrites_waiting_dependency_ids_to_team_names(tmp_path: Path
     )
 
 
+def test_projection_reports_when_automatic_report_checks_have_ended(tmp_path: Path):
+    raw = raw_task(tmp_path)
+    now = datetime.now(timezone.utc)
+    blocked_at = now - timedelta(minutes=29, seconds=20)
+    raw.update(
+        status="BLOCKED",
+        blocked_at=blocked_at.isoformat(),
+        block_code="empty_terminal_response",
+        block_reason=(
+            "The accepted turn did not return a complete result. CDPA will recheck the exact report "
+            "and continue if it verifies a route."
+        ),
+    )
+    hop = raw["hops"][-1]
+    hop["receipt"] = {"user_message_id": "accepted-message"}
+    hop["report_result"] = {"checked_at": (blocked_at + timedelta(minutes=10)).isoformat()}
+
+    pending = build_task_projection(raw, tasks=[raw]).detail["primary_problem"]
+    assert pending["message"] == raw["block_reason"]
+
+    hop["report_result"]["checked_at"] = (blocked_at + timedelta(minutes=29)).isoformat()
+    finished = build_task_projection(raw, tasks=[raw]).detail["primary_problem"]
+    assert finished["code"] == pending["code"]
+    assert "Automatic checks for the exact report have ended" in finished["message"]
+    assert "select Resume" in finished["message"]
+
+    raw["blocked_at"] = (now - timedelta(minutes=31)).isoformat()
+    hop["report_result"]["checked_at"] = (blocked_at + timedelta(minutes=10)).isoformat()
+    expired = build_task_projection(raw, tasks=[raw]).detail["primary_problem"]
+    assert expired["message"] == finished["message"]
+
+    raw["block_reason"] = "The exact tab still needs verification."
+    specific = build_task_projection(raw, tasks=[raw]).detail["primary_problem"]
+    assert specific["message"] == raw["block_reason"]
+
+
 def test_projection_summary_is_compact_and_deterministic(tmp_path: Path):
     raw = raw_task(tmp_path)
+    raw["conversation_mode"] = "temporary"
     first = build_task_projection(raw, tasks=[raw])
     second = build_task_projection(raw, tasks=[raw])
 
     assert first == second
+    assert first.summary["conversation_mode"] == "temporary"
     assert len(json.dumps(first.summary, separators=(",", ":")).encode()) <= 4096
     assert set(first.summary) <= {
         "task_id", "parent_task_id", "team", "status", "v11_lifecycle", "column", "surface", "active_role",
@@ -807,7 +879,7 @@ def test_projection_summary_is_compact_and_deterministic(tmp_path: Path):
         "running_since", "active_role_running_elapsed_seconds", "active_role_running_since",
         "elapsed_end_at",
         "availability", "primary_problem", "waiting_reason", "block_code",
-        "stop_reason", "lifecycle_kind", "lifecycle_label",
+        "stop_reason", "lifecycle_kind", "lifecycle_label", "conversation_mode",
         "queue_position", "queue_length", "queue_reason", "queue_since", "waiting_order", "roles", "requested_browser_endpoint_id", "required_browser_endpoint_id", "browser_endpoint_ids", "has_reports", "task_title",
         "submitted_roles", "initial_roles", "reachable_roles", "start_role", "closing_role", "route_seq", "max_routes", "max_route_repairs",
         "browser_control", "async_continuation",
@@ -1068,11 +1140,13 @@ def test_projection_keeps_requested_endpoint_when_active_role_runs_elsewhere(tmp
 
 def test_projection_exposes_sanitized_expected_report_for_active_hop(tmp_path: Path):
     raw = raw_task(tmp_path)
+    raw["hops"][1]["physical_role"] = "alpha-dev"
     raw["hops"][1]["expected_report_path"] = ".plan/alpha/alpha-dev_turn2_task-a.md"
 
     projection = build_task_projection(raw, tasks=[raw])
 
     assert projection.detail["active_hop"]["expected_report"] == "alpha-dev_turn2_task-a.md"
+    assert projection.detail["active_hop"]["physical_role"] == "alpha-dev"
     assert projection.detail["active_input"]["expected_report"] == "alpha-dev_turn2_task-a.md"
     assert projection.detail["role_inputs"]["DEV"]["expected_report"] == "alpha-dev_turn2_task-a.md"
 

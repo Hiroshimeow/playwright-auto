@@ -642,8 +642,10 @@ def test_create_repository_inference_is_header_bounded_and_strict(tmp_path: Path
     )
     assert embedded_target["repository"] == str(repo_b.resolve())
 
+    remote_drive = "Z:" if tmp_path.drive.casefold() != "z:" else "Y:"
+    remote_repository = rf"{remote_drive}\python_project\Screens-Trans-Chatbot"
     remote = api.normalize_create(
-        {"task": r"Screens task. Target repository E:\python_project\Screens-Trans-Chatbot, use @mcp-thinkbook only."}
+        {"task": f"Screens task. Target repository {remote_repository}, use @mcp-thinkbook only."}
     )
     assert remote["repository"] == str(tmp_path.resolve())
 

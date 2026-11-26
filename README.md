@@ -207,6 +207,10 @@ TEST or AUDIT are opt-in when a runtime, restart, browser, destructive, environm
 
 A Team Task may select a role subset with `--roles` (for example `--roles DEV,REVIEW`). The first selected role in canonical order (`PLAN, DEV, TEST, REVIEW, AUDIT`) starts; a team without PLAN runs `DEV -> REVIEW -> DONE`, and REVIEW is then the only role that may route `DONE`. A team must include PLAN or REVIEW.
 
+Team Tasks start with a default budget of 100 role transitions. A verified Resume renews the route budget and preserves lifetime route counters and Send history. Existing tasks use their saved route contract when the role prompts change. New submissions capture the updated prompts.
+
+Use a UTF-8 task file for multiline prompts through the Windows launcher, for example `cdpa --task-file ".\review prompt.txt" --roles REVIEW --team my-review`. With `--solo`, the file also supplies the goal unless you set `--goal` explicitly.
+
 Repository work uses HCUW as the durable engineering frame:
 
 1. Load `AGENTS.md`, `.agents/README.md`, and `.agents/rules/project.md` once; use `.hcu/profile.md` only when HCUW compatibility metadata is needed.

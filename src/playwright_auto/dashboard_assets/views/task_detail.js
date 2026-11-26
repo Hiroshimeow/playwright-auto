@@ -66,9 +66,14 @@ function reportSort(a, b) {
 }
 
 function roleInput(detail, role) {
-  return detail.role_inputs?.[role]
-    || (detail.active_role === role ? detail.active_input : null)
-    || null;
+  if (detail.active_role === role) {
+    const active = detail.active_hop || detail.active_input;
+    if (detail.active_hop_id != null && active?.hop_id !== detail.active_hop_id) {
+      return {hop_id: detail.active_hop_id};
+    }
+    if (active) return active;
+  }
+  return detail.role_inputs?.[role] || null;
 }
 
 function missingReportReason(detail, role, input = roleInput(detail, role)) {
@@ -82,7 +87,14 @@ function missingReportReason(detail, role, input = roleInput(detail, role)) {
   return `No validated ${role} report has been recorded yet.`;
 }
 
+export function reportMatchesHop(report, hop) {
+  return hop?.hop_id != null && Boolean(hop.physical_role)
+    && report?.hop_id === hop.hop_id && report.physical_role === hop.physical_role
+    && report.material_type !== "handoff" && report.source_kind !== "route_json";
+}
+
 function reportForInput(reports, input) {
+  if (input?.hop_id != null) return reports.find(report => reportMatchesHop(report, input)) || null;
   if (!input?.expected_report) return reports[0] || null;
   const turn = Number(input.turn);
   if (!Number.isFinite(turn) || turn <= 0) return null;
@@ -104,12 +116,13 @@ export function workflowReportModel(detail = {}, selectedRole = null, selectedRe
   })).filter(report => report._logicalRole && logicalRoles.has(report._logicalRole));
 
   const roleModels = roles.filter(role =>
-    Number(role.turn || 0) > 0 || reports.some(report => report._logicalRole === role.logical_role)
+    Number(role.turn || 0) > 0 || roleInput(detail, role.logical_role)?.hop_id != null
+      || reports.some(report => report._logicalRole === role.logical_role)
   ).map(role => {
     const roleReports = reports.filter(report => report._logicalRole === role.logical_role).sort(reportSort);
     const input = roleInput(detail, role.logical_role);
     const current = reportForInput(roleReports, input);
-    const expectedMissing = Boolean(input?.expected_report) && current === null;
+    const expectedMissing = Boolean(input?.expected_report || input?.hop_id != null) && current === null;
     return {
       role: role.logical_role,
       physicalRole: role.physical_role,
@@ -129,12 +142,12 @@ export function workflowReportModel(detail = {}, selectedRole = null, selectedRe
   const selectedRoleModel = roleModels.find(item => item.role === selectedRole)
     || roleModels.find(item => item.role === detail.active_role)
     || null;
-  const planModel = roleModels.find(item => item.role === "PLAN") || null;
+  const closingModel = roleModels.find(item => item.role === (detail.closing_role || "PLAN")) || null;
   const selectedExpectedMissing = Boolean(
     !explicit && detail.status !== "DONE" && selectedRoleModel?.expectedMissing
   );
   const selectedReport = explicit || (detail.status === "DONE"
-    ? planModel?.current || planModel?.latest || newest
+    ? closingModel?.current || closingModel?.latest || newest
     : selectedExpectedMissing
       ? null
       : selectedRoleModel?.current || newest);
@@ -328,6 +341,12 @@ function rolesSection(detail, selectedRole, endpoints = []) {
       urlArea.append(url, actions);
     } else {
       urlArea.append(el("span", item.unallocated ? "No tab allocated" : "No conversation URL yet", "muted role-url-empty"));
+    }
+    if (detail.conversation_mode !== "temporary" && ["BLOCKED", "PAUSED", "INBOX"].includes(detail.status)) {
+      const change = button("change_role_url", "Change URL", detail);
+      change.dataset.role = role.logical_role;
+      change.dataset.currentUrl = role.chat_url || "";
+      urlArea.append(change);
     }
     row.append(urlArea);
     roleList.append(row);
@@ -1067,26 +1086,31 @@ function browserControlSection(detail) {
   return section;
 }
 
+function workflowControlButton(detail, action, label) {
+  const eligibility = detail.control_eligibility?.[action] || {
+    eligible: false,
+    reason: "Control eligibility is unavailable; refresh task state.",
+  };
+  const replaced = action === "restart_team" && Boolean(detail.replacement_task_id);
+  return button(action, label, detail, {
+    disabled: replaced || (action !== "restart_role" && eligibility.eligible !== true),
+    reason: replaced ? "This team already has a replacement." : eligibility.reason || null,
+  });
+}
+
 function workflowOverview(detail, timeline, selectedRole, endpoints) {
   const fragment = document.createDocumentFragment();
   const operations = operationalStateSection(detail, endpoints);
   const controls = el("div", null, "control-grid");
   if (detail.status === "RUNNING") controls.append(changeGoalButton(detail));
   for (const [action, label] of [
-    ["pause", "Pause"], ["resume", "Resume"], ["retry", "Retry hop"],
-    ["restart_role", "Restart role"], ["new_chat", "New chat"],
+    ["pause", "Pause"], ["retry", "Retry hop"],
+    ["new_chat", "New chat"],
     ["open_tab", "Open tab"], ["route_plan", "Route PLAN"],
     ["stop", "Stop"], ["clear_team", "Clear team"],
     ["archive_worktree", "Archive worktree"],
   ]) {
-    const eligibility = detail.control_eligibility?.[action] || {
-      eligible: false,
-      reason: "Control eligibility is unavailable; refresh task state.",
-    };
-    controls.append(button(action, label, detail, {
-      disabled: eligibility.eligible !== true,
-      reason: eligibility.reason || null,
-    }));
+    controls.append(workflowControlButton(detail, action, label));
   }
   operations.append(controls);
   fragment.append(operations);
@@ -1139,6 +1163,29 @@ function workflowOverview(detail, timeline, selectedRole, endpoints) {
   return fragment;
 }
 
+function workflowRecoveryControls(detail) {
+  const fragment = document.createDocumentFragment();
+  const controls = el("div", null, "control-grid");
+  if (detail.control_eligibility?.increase_route_limits?.eligible
+      && detail.control_eligibility?.resume?.eligible === false) {
+    const used = detail.route_repair_count;
+    const limit = detail.max_route_repairs;
+    const recovery = workflowControlButton(detail, "increase_route_limits", "Increase repair limit");
+    recovery.dataset.limitField = "max_route_repairs";
+    recovery.dataset.minimumLimit = String(Math.max(used, limit) + 1);
+    fragment.append(el("p", `Route repairs used: ${used}/${limit}. Increase the limit, then select Resume.`,
+      "operational-state-reason"));
+    controls.append(recovery);
+  }
+  controls.append(
+    workflowControlButton(detail, "resume", "Resume"),
+    workflowControlButton(detail, "restart_role", "Restart role"),
+    workflowControlButton(detail, "restart_team", "Restart team"),
+  );
+  fragment.append(controls);
+  return fragment;
+}
+
 function build(detail, timeline, selectedRole, selectedTab, selectedReportUrl, reportBodies, liveState, endpoints) {
   const fragment = document.createDocumentFragment();
   const agent = detail.task_mode === "independent" ? (detail.agent || {}) : null;
@@ -1154,7 +1201,7 @@ function build(detail, timeline, selectedRole, selectedTab, selectedReportUrl, r
 
   if (!agent) {
     const tab = ["overview", "live", "reports"].includes(selectedTab) ? selectedTab : "overview";
-    fragment.append(workflowTabs(detail, tab));
+    fragment.append(workflowRecoveryControls(detail), workflowTabs(detail, tab));
     const panel = el("div", null, "independent-tab-panel");
     panel.setAttribute("role", "tabpanel");
     panel.append(tab === "reports"

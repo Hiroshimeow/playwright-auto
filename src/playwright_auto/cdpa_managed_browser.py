@@ -145,7 +145,8 @@ def _profile_in_use(profile: Path) -> bool:
         return False
     if os.name == 'nt':
         command = "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' OR Name='chromium.exe' OR Name='msedge.exe' OR Name='thorium.exe'\" | Select-Object -ExpandProperty CommandLine | ConvertTo-Json -Compress"
-        result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', command],
+        powershell = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
+        result = subprocess.run([str(powershell), '-NoProfile', '-NonInteractive', '-Command', command],
                                 capture_output=True, text=True, timeout=8, check=True)
         rows = json.loads(result.stdout.strip() or '[]')
         commands = [rows] if isinstance(rows, str) else rows or []

@@ -13,9 +13,11 @@ import webbrowser
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from .cdpa_config import CDPAConfig, load_cdpa_config
+from .cdpa_identity import validate_task_id
 from .cdpa_runtime_db import RuntimeDB
 
 
@@ -45,6 +47,8 @@ def _read_json(url: str, *, timeout: float) -> Mapping[str, Any]:
     try:
         with urlopen(Request(url, method="GET"), timeout=timeout) as response:
             body = response.read()
+    except HTTPError as exc:
+        raise RuntimeError(f"CDPA API returned HTTP {exc.code} ({exc.reason}) at {url}") from exc
     except URLError as exc:
         raise RuntimeError(f"endpoint is unavailable at {url}: {exc.reason}") from exc
     value = json.loads(body.decode("utf-8"))
@@ -721,11 +725,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Fresh context; bootstrap is temporarily disabled. Dependencies remain global across endpoints. Supported dashboard/API "
             "controls include Resume, Change goal, Route PLAN, Retry for structured retryable blocks, Pause, Stop, "
             "Restart role, New chat, Open tab, and Clear team. Run `cdpa` or `cdpa start` for the runtime and `cdpa ui` "
-            "to reopen the dashboard."
+            "to reopen the dashboard. Use `cdpa status --task TASK_ID` or `cdpa stop --task TASK_ID` "
+            "for exact-task operations."
         ),
     )
     parser.add_argument("task", nargs="?", help="complete task text; omit to resume --team")
-    parser.add_argument("--task", dest="task_option", help="complete task text (explicit form)")
+    task_input = parser.add_mutually_exclusive_group()
+    task_input.add_argument("--task", dest="task_option", help="complete task text (explicit form)")
+    task_input.add_argument("--task-file", type=Path, metavar="FILE", help="read complete task text from a UTF-8 file")
     parser.add_argument("--new", dest="new_roles", help="comma-separated roles reset lazily once")
     parser.add_argument("--new-all", action="store_true", help="reset every selected role lazily once")
     parser.add_argument("--team", default=None, help="new-task team base or exact team to resume")
@@ -800,6 +807,60 @@ def _runtime_parser(command: str) -> argparse.ArgumentParser:
     return parser
 
 
+def _run_task_cli(command: str, raw: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(prog=f"cdpa {command}")
+    parser.add_argument("--task", required=True, metavar="TASK_ID")
+    parser.add_argument("--config", default=None)
+    parser.add_argument("--control-repository", "--repository", default=".", help="CDPA control repository")
+    args = parser.parse_args(raw)
+    task_id = validate_task_id(args.task)
+    config = load_cdpa_config(args.config, repository_root=Path(args.control_repository).expanduser().resolve())
+    base = _api_base_url(config)
+    path = f"/api/tasks/{quote(task_id, safe='')}"
+    state = _read_json(base + path, timeout=5)
+    if command == "status":
+        status = state["status"]
+        hop = state.get("active_hop") or {}
+        problem = state.get("primary_problem") or {}
+        print(f"task_id={task_id}")
+        print(f"status={status}")
+        print(f"active_role={state.get('active_role') or '-'}")
+        print(f"active_hop_id={state.get('active_hop_id') or '-'}")
+        if hop.get("state"):
+            print(f"hop_state={hop['state']}")
+        if status == "INBOX":
+            print(f"queue_reason={state.get('queue_reason') or 'Queued for worker admission'}")
+        if status == "BLOCKED":
+            print(f"block_code={state.get('block_code') or problem.get('code') or 'blocked'}")
+            if problem.get("message"):
+                print(f"block_reason={problem['message']}")
+        if any(c.get("action") == "stop_at_boundary" and c.get("status") == "requested"
+               for c in state.get("controls") or ()):
+            print("stop_requested=yes")
+        return 0
+
+    action = "stop_at_boundary"
+    eligibility = (state.get("control_eligibility") or {}).get(action)
+    if not eligibility or not eligibility.get("eligible"):
+        raise ValueError((eligibility or {}).get("reason") or "Safe Stop is unavailable for this task or worker version.")
+    receipt = _post(config, path + "/controls", {"action": action}, idempotency_key=str(uuid.uuid4()))
+    command_id = receipt["command_id"]
+    print(f"task_id={task_id}")
+    print(f"command_id={command_id}", flush=True)
+    # Report fast rejections and queued/paused transitions without waiting out a running hop.
+    deadline = time.monotonic() + 2.0
+    while receipt["status"] in {"queued", "running"} and time.monotonic() < deadline:
+        time.sleep(0.2)
+        receipt = _read_json(f"{base}/api/commands/{quote(command_id, safe='')}", timeout=2)
+    if receipt["status"] in {"failed", "recovery_required"}:
+        raise RuntimeError(receipt.get("error") or "Safe Stop was not applied.")
+    if receipt["status"] == "applied":
+        print("status=STOPPED")
+    else:
+        print("status=stop_requested (pending a safe hop boundary)")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     try:
@@ -818,8 +879,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if raw[0] == "independent":
             return _run_independent_cli(raw[1:])
+        if raw[0] in {"status", "stop"}:
+            return _run_task_cli(raw[0], raw[1:])
 
         args = build_parser().parse_args(raw)
+        if args.task_file is not None:
+            if args.task is not None or args.quick_prompt is not None:
+                raise ValueError("--task-file cannot be combined with positional task text or -p")
+            try:
+                args.task_option = args.task_file.expanduser().read_bytes().decode("utf-8-sig")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"--task-file must contain UTF-8 text: {args.task_file}") from exc
+            if not args.task_option.strip():
+                raise ValueError("--task-file requires non-empty task text")
+            if args.solo and args.goal is None:
+                args.goal = args.task_option
         if args.quick_prompt is not None:
             prompt = args.quick_prompt.strip()
             if not prompt:

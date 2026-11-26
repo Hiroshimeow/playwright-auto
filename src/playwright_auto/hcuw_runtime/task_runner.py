@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 from ..cdpa_commands import teamtask_trigger_idempotency_key
 from ..cdpa_config import load_cdpa_config
 from ..cdpa_provider_runtime import ProviderRuntimeError, select_provider, select_work_owner
-from ..cdpa_role_policy import RolePolicyError, RolePolicyResult, build_role_policy
+from ..cdpa_role_policy import DEFAULT_MAX_ROUTES, RolePolicyError, RolePolicyResult, build_role_policy
 from ..cdpa_workflow_agents import (
     WorkflowAgentCatalog,
     semantic_routes_from_workflow_definitions,
@@ -287,7 +287,7 @@ class RuntimeTaskRunner:
                 semantic_routes=semantic_routes,
                 start_role=payload.get("start_role"),
                 closing_role=payload.get("closing_role"),
-                max_routes=payload.get("max_routes", 8),
+                max_routes=payload.get("max_routes", DEFAULT_MAX_ROUTES),
                 max_route_repairs=payload.get("max_route_repairs", default_repairs),
                 self_route_policy=payload.get("self_route_policy", "forbidden"),
             )

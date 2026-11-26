@@ -2,11 +2,8 @@ from __future__ import annotations
 
 import copy
 
-import pytest
-
 from playwright_auto.cdpa_role_policy import build_role_policy
 from playwright_auto.cdpa_route_contract import (
-    RoutePolicyError,
     apply_valid_route_transition,
     build_route_contract,
 )
@@ -31,7 +28,6 @@ def _contract(policy, *, current="DEV", route_seq=0, repairs=0, counts=None, sem
         closing_role=policy.closing_role,
         semantic_routes=policy.semantic_routes if semantic is None else semantic,
         route_contract_id=policy.route_contract_id,
-        max_routes=policy.max_routes,
         route_seq=route_seq,
         max_route_repairs=policy.max_route_repairs,
         repair_count=repairs,
@@ -49,13 +45,13 @@ def test_t016_one_contract_drives_semantic_prose_and_closed_enum() -> None:
     assert all(destination in contract.allowed_routes for destination in contract.semantic_routes.values())
 
 
-def test_t016_contract_drift_blocks_before_send() -> None:
+def test_route_builder_keeps_saved_contract_id_without_rehashing_configuration() -> None:
     policy = _policy()
     changed = copy.deepcopy(policy.semantic_routes)
     changed["DEV"]["new"] = "REVIEW"
-    with pytest.raises(RoutePolicyError) as error:
-        _contract(policy, semantic=changed)
-    assert error.value.code == "ROUTE_CONTRACT_DRIFT"
+    contract = _contract(policy, semantic=changed)
+    assert contract.route_contract_id == policy.route_contract_id
+    assert contract.semantic_routes["new"] == "REVIEW"
 
 
 def test_t017_only_closing_role_gets_done_and_non_closing_done_returns_to_closer() -> None:
@@ -80,20 +76,19 @@ def test_t018_bounded_self_route_appears_only_while_bound_remains() -> None:
     assert last.allowed_routes == ("PAUSE", "DONE")
 
 
-def test_t019_route_budget_blocks_non_closer_before_send_and_closer_done_only() -> None:
+def test_t019_historical_route_count_does_not_change_either_roles_contract() -> None:
     policy = build_role_policy(
         ["A", "B"],
         semantic_routes={"A": {"to_b": "B"}, "B": {"to_a": "A"}},
         closing_role="A",
         max_routes=1,
     )
-    with pytest.raises(RoutePolicyError) as error:
-        _contract(policy, current="B", route_seq=1)
-    assert error.value.code == "ROUTE_BUDGET_EXHAUSTED"
-
-    closer = _contract(policy, current="A", route_seq=1)
-    assert closer.budget_exhausted is True
-    assert closer.allowed_routes == ("DONE",)
+    other = _contract(policy, current="B", route_seq=20)
+    assert other.allowed_routes == ("A", "PAUSE")
+    assert other.semantic_routes == {"to_a": "A"}
+    closer = _contract(policy, current="A", route_seq=20)
+    assert closer.allowed_routes == ("B", "PAUSE", "DONE")
+    assert closer.semantic_routes == {"to_b": "B"}
 
 
 def test_t014_route_transition_materialization_is_one_idempotent_state_operation() -> None:

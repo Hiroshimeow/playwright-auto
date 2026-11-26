@@ -7,7 +7,6 @@ from .cdpa_role_policy import (
     canonicalize_role_key,
     normalize_self_route_policy,
     normalize_semantic_routes,
-    semantic_route_contract_id,
 )
 
 
@@ -26,13 +25,11 @@ class RouteContract:
     allowed_routes: tuple[str, ...]
     semantic_routes: dict[str, str]
     route_contract_id: str
-    max_routes: int
     route_seq: int
     max_route_repairs: int
     repair_count: int
     self_route_policy: dict[str, Any]
     self_route_counts: dict[str, int]
-    budget_exhausted: bool = False
 
     def prompt_route_lines(self) -> tuple[str, ...]:
         lines = tuple(
@@ -48,24 +45,6 @@ def _nonnegative_int(value: Any, *, field: str) -> int:
     return value
 
 
-def _positive_int(value: Any, *, field: str) -> int:
-    parsed = _nonnegative_int(value, field=field)
-    if parsed < 1:
-        raise RoutePolicyError("ROUTE_CONTRACT_INVALID", f"{field} must be positive")
-    return parsed
-
-
-def _budget_exhausted(consumed: int, limit: int) -> bool:
-    return consumed >= limit
-
-
-def route_budget_exhausted(state: Mapping[str, Any]) -> bool:
-    """Return whether the task has consumed its configured role-transition budget."""
-    consumed = _nonnegative_int(state.get("route_seq", 0), field="route_seq")
-    limit = _positive_int(state.get("max_routes"), field="max_routes")
-    return _budget_exhausted(consumed, limit)
-
-
 def route_repair_budget_exhausted(state: Mapping[str, Any]) -> bool:
     """Return whether the active role turn has consumed its route-repair budget."""
     consumed = _nonnegative_int(
@@ -74,7 +53,7 @@ def route_repair_budget_exhausted(state: Mapping[str, Any]) -> bool:
     limit = _nonnegative_int(
         state.get("max_route_repairs", 0), field="max_route_repairs"
     )
-    return _budget_exhausted(consumed, limit)
+    return consumed >= limit
 
 
 def build_route_contract(
@@ -84,7 +63,6 @@ def build_route_contract(
     closing_role: Any,
     semantic_routes: Any,
     route_contract_id: Any,
-    max_routes: Any,
     route_seq: Any,
     max_route_repairs: Any,
     repair_count: Any = 0,
@@ -105,13 +83,6 @@ def build_route_contract(
         raise RoutePolicyError(
             "ROUTE_CONTRACT_INVALID", "current_role and closing_role must be reachable"
         )
-    expected_contract_id = semantic_route_contract_id(semantic)
-    if str(route_contract_id or "") != expected_contract_id:
-        raise RoutePolicyError(
-            "ROUTE_CONTRACT_DRIFT",
-            "semantic route configuration changed after task creation",
-        )
-    route_limit = _positive_int(max_routes, field="max_routes")
     sequence = _nonnegative_int(route_seq, field="route_seq")
     repair_limit = _nonnegative_int(max_route_repairs, field="max_route_repairs")
     repairs = _nonnegative_int(repair_count, field="repair_count")
@@ -125,23 +96,13 @@ def build_route_contract(
             raise RoutePolicyError("ROUTE_CONTRACT_INVALID", "self_route_counts contains unreachable role")
         counts[role] = _nonnegative_int(raw_count, field=f"self_route_counts[{role}]")
 
-    budget_exhausted = _budget_exhausted(sequence, route_limit)
-    if budget_exhausted and current != closing:
-        raise RoutePolicyError(
-            "ROUTE_BUDGET_EXHAUSTED",
-            "route budget is exhausted before the next non-closing role Send",
-        )
-
-    if budget_exhausted:
-        allowed = ("DONE",)
-    else:
-        allowed_list = [role for role in reachable if role != current]
-        if self_policy["mode"] == "bounded" and counts[current] < self_policy["max_self_routes"]:
-            allowed_list.append(current)
-        allowed_list.append("PAUSE")
-        if current == closing:
-            allowed_list.append("DONE")
-        allowed = tuple(dict.fromkeys(allowed_list))
+    allowed_list = [role for role in reachable if role != current]
+    if self_policy["mode"] == "bounded" and counts[current] < self_policy["max_self_routes"]:
+        allowed_list.append(current)
+    allowed_list.append("PAUSE")
+    if current == closing:
+        allowed_list.append("DONE")
+    allowed = tuple(allowed_list)
 
     current_semantic: dict[str, str] = {}
     for outcome, destination in semantic.get(current, {}).items():
@@ -151,8 +112,6 @@ def build_route_contract(
                 "ROUTE_CONTRACT_INVALID", "forbidden semantic self-route reached prompt generation"
             )
         if mapped not in allowed:
-            if budget_exhausted and current == closing:
-                continue
             if (
                 mapped == current
                 and self_policy["mode"] == "bounded"
@@ -171,14 +130,12 @@ def build_route_contract(
         closing_role=closing,
         allowed_routes=allowed,
         semantic_routes=current_semantic,
-        route_contract_id=expected_contract_id,
-        max_routes=route_limit,
+        route_contract_id=str(route_contract_id or ""),
         route_seq=sequence,
         max_route_repairs=repair_limit,
         repair_count=repairs,
         self_route_policy=self_policy,
         self_route_counts=counts,
-        budget_exhausted=budget_exhausted,
     )
 
 

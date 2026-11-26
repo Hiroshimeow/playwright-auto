@@ -1,4 +1,7 @@
 import asyncio
+from itertools import count
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -536,10 +539,13 @@ def test_page_health_distinguishes_auth_and_empty_snapshot(monkeypatch):
 
 def test_post_reload_same_complete_snapshot_needs_second_sample(monkeypatch):
     page = SequencePage([conversation("same recovered answer")])
-    install_sequence(monkeypatch, page)
+    client = bind(page)
+    client.wait_snapshot = AsyncMock(side_effect=lambda _receipt: page.next_snapshot())
+    ticks = count()
+    monkeypatch.setattr(chatgpt, "time", SimpleNamespace(monotonic=lambda: next(ticks) / 1000))
 
     result = asyncio.run(
-        bind(page).wait_for_response(
+        client.wait_for_response(
             receipt(accepted_via="post_reload:exact_user_message"),
             timeout_ms=20,
             stable_ms=0,

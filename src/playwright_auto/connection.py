@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import ipaddress
@@ -93,7 +94,7 @@ async def connect(url: str) -> tuple[Playwright, Browser]:
             no_defaults=True,
             timeout=10_000,
         )
-    except Exception:
+    except (Exception, asyncio.CancelledError):
         await playwright.stop()
         raise
     return playwright, browser

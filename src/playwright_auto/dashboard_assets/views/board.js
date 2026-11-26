@@ -178,7 +178,9 @@ export function deriveOperationalTruth(task = {}, runtime = null, now = Date.now
     unknownReason ||= "Semantic activity freshness is unknown.";
   } else if (now - activityAt > staleAfter * 1000) {
     reasons.push("Semantic activity is stale.");
-    recovery.push("automatic F5 recovery is due under the response-stall policy");
+    if (task.conversation_mode !== "temporary") {
+      recovery.push("automatic F5 recovery is due under the response-stall policy");
+    }
   }
 
   const state = reasons.length ? "degraded" : unknownReason ? "unknown" : "healthy";

@@ -52,6 +52,7 @@ from playwright_auto.chatgpt import (
     prompt_digest,
 )
 from playwright_auto.durable import RequestLedger, RequestStatus
+from playwright_auto.file_lock import exclusive_file_lock
 
 from test_cdpa_core import (
     install_cycle_isolation_graph,
@@ -273,6 +274,8 @@ def setup_task(
     bootstrap=None,
     self_route_policy=None,
     max_routes=None,
+    conversation_mode=None,
+    workflow_mode="team",
 ):
     config = load_cdpa_config(write_config(tmp_path), repository_root=tmp_path)
     store = TaskStore(config)
@@ -284,6 +287,9 @@ def setup_task(
         roles=roles,
         repository=repository,
         bootstrap=bootstrap,
+        conversation_mode=conversation_mode,
+        workflow_mode=workflow_mode,
+        browser_endpoint_id="9222" if workflow_mode == "solo" else None,
         **({"self_route_policy": self_route_policy} if self_route_policy is not None else {}),
         **({"max_routes": max_routes} if max_routes is not None else {}),
     )
@@ -314,6 +320,23 @@ def _persist_removed_endpoint_cleanup(store, state):
         "last_error_at": None,
     }
     return store.save(path, state)
+
+
+def test_hydrate_only_cannot_replace_a_live_worker_projection(tmp_path: Path):
+    _, _, task, worker = setup_task(tmp_path)
+    worker.runtime_db.ensure_schema()
+    live_worker = {"pid": 413, "runtime_ready": True, "command_loop_ready": True}
+    worker.runtime_db.put_snapshot("worker", live_worker)
+    before = worker.runtime_db.get_snapshot("worker")
+    command = ["--repository", str(tmp_path), "--config", str(tmp_path / "cdpa.yaml"), "--hydrate-only"]
+
+    with exclusive_file_lock(tmp_path / ".runtime" / "worker-scheduler.lock"):
+        assert worker_module.main(command) == 1
+        assert worker.runtime_db.get_snapshot("worker") == before
+        assert worker.runtime_db.get_task_detail(task["task_id"]) is None
+
+    assert worker_module.main(command) == 0
+    assert worker.runtime_db.get_task_detail(task["task_id"]) is not None
 
 
 def test_worker_scheduler_lease_serializes_spawned_worker_lifetimes_and_crash_handoffs(tmp_path: Path):
@@ -1816,6 +1839,26 @@ def test_reused_cdpa_role_waits_for_hydrated_history_before_send(tmp_path: Path)
     assert len(client.send_calls) == 1
 
 
+@pytest.mark.parametrize("draft,attachments", [("operator draft", ()), ("", ("operator.pdf",))])
+def test_normal_workflow_send_preserves_late_operator_input(tmp_path, draft, attachments):
+    from dataclasses import replace
+
+    _, _, state, worker = setup_task(tmp_path)
+    hop = _active_hop(state)
+    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    client = RecordingCDPASendClient(task_id=state["task_id"], team=state["team"])
+    client.current = replace(client.current, composer_text=draft, attachment_markers=attachments)
+
+    asyncio.run(worker._sending(state, hop, RecordingCDPASendActions(client)))
+
+    request = RequestLedger(hop["ledger_path"]).get(hop["request_id"])
+    assert request.status is RequestStatus.NEW and request.attempts == 0
+    assert hop["wait"]["manual_draft_present"] is True
+    assert client.current.composer_text == draft
+    assert client.current.attachment_markers == attachments
+    assert client.set_calls == client.send_calls == []
+
+
 def test_reused_cdpa_role_persistent_empty_history_blocks_retryably_preboundary(
     tmp_path: Path,
 ):
@@ -1996,7 +2039,7 @@ def test_gate_a_report_repair_rejects_default_forbidden_self_route(tmp_path: Pat
     assert route_repair["target_role"] == "PLAN"
 
 
-def test_gate_a_report_repair_budget_exhausted_closer_allows_done_only(tmp_path: Path):
+def test_gate_a_report_repair_can_route_past_historical_cap(tmp_path: Path):
     _store, state, worker, _path, hop, _receipt, _sent_at = _prepare_sent_waiting_task(
         tmp_path, task_id="task-report-repair-budget"
     )
@@ -2009,16 +2052,19 @@ def test_gate_a_report_repair_budget_exhausted_closer_allows_done_only(tmp_path:
     state["route_seq"] = state["max_routes"]
     contract = worker._frozen_route_contract(state, "PLAN")
     assert contract is not None
-    assert contract.allowed_routes == ("DONE",)
+    assert {"DEV", "PAUSE", "DONE"} <= set(contract.allowed_routes)
 
+    asyncio.run(worker._pre_send(state, repair, FakeActions()))
+    (tmp_path / handoff).write_text("# Repaired report\n", encoding="utf-8")
     repair["response"] = json.dumps({"route": "DEV", "handoff": handoff})
     repair["state"] = "responded"
     worker._responded(state, repair)
 
-    assert state["status"] == "BLOCKED"
-    assert state["block_code"] == "ROUTE_BUDGET_EXHAUSTED"
+    assert state["status"] == "RUNNING"
+    assert state["block_code"] is None
     assert state["route_repair_count"] == 0
-    assert state["route_seq"] == state["max_routes"]
+    assert state["route_seq"] == state["max_routes"] + 1
+    assert _active_hop(state)["target_role"] == "DEV"
 
 
 def test_empty_local_file_report_enters_report_repair_without_advancing(tmp_path: Path):
@@ -2166,6 +2212,19 @@ def test_malformed_response_creates_same_turn_guide_only_repair(tmp_path: Path):
     assert "Output exactly one JSON object and nothing else." in repair["prompt"]
     assert "Constructor for PLAN" not in repair["prompt"]
     assert repair["handoff"] == "route repair"
+    key = repair["report_result"]["key"]
+    assert key != hop["report_result"]["key"]
+    assert f"CDPA-RESULT {key}: " in repair["prompt"]
+    _accept_test_hop(state, repair)
+    expected = repair["expected_report_path"]
+    footer = json.dumps({"route": "PAUSE", "handoff": expected})
+    (tmp_path / expected).write_text(
+        f"# Account authorization required\n\nCDPA-RESULT {key}: {footer}\n",
+        encoding="utf-8",
+    )
+    assert worker._poll_running_report_result(state, repair)
+    assert repair["route"] == "PAUSE"
+    assert state["status"] == "PAUSED"
 
 
 
@@ -3121,12 +3180,17 @@ def _prepare_sent_waiting_task(
     task_id: str,
     report_mode: str = "file",
     repository=None,
+    conversation_mode=None,
+    solo=False,
 ):
     _, store, state, worker = setup_task(
         tmp_path,
         task_id=task_id,
         report_mode=report_mode,
         repository=repository,
+        conversation_mode=conversation_mode,
+        workflow_mode="solo" if solo else "team",
+        roles=("REVIEW",) if solo else None,
     )
     from dataclasses import replace
     worker.config = replace(
@@ -3134,13 +3198,29 @@ def _prepare_sent_waiting_task(
     )
     path = Path(state["manifest_path"])
     hop = _active_hop(state)
-    asyncio.run(worker._pre_send(state, hop, FakeActions()))
+    if conversation_mode == "temporary":
+        from test_cdpa_temporary_workflow import TemporaryWorkflowActions
+
+        actions = TemporaryWorkflowActions()
+    else:
+        actions = FakeActions()
+    asyncio.run(worker._pre_send(state, hop, actions))
+    receipt, sent_at = _accept_test_hop(state, hop)
+    worker._start_wait_budget_from_sent(hop)
+    state = store.save(path, state)
+    hop = _active_hop(state)
+    return store, state, worker, path, hop, receipt, sent_at
+
+
+def _accept_test_hop(state, hop):
+    physical_role = hop["physical_role"]
+    page_id = f"page-{physical_role}"
     prompt = hop["prompt"]
     baseline = MessageBaseline(frozenset(), frozenset(), frozenset(), frozenset())
     receipt = SendReceipt(
         prompt=prompt,
         prompt_sha256=prompt_digest(prompt),
-        binding=PageBinding("page-alpha-plan", "alpha-plan"),
+        binding=PageBinding(page_id, physical_role),
         baseline=baseline,
         attempts=1,
         accepted_via="user_message_identity",
@@ -3150,7 +3230,7 @@ def _prepare_sent_waiting_task(
     )
     ledger = RequestLedger(hop["ledger_path"])
     record = ledger.begin(
-        role="alpha-plan",
+        role=physical_role,
         prompt=prompt,
         request_id=hop["request_id"],
         render_request_marker=False,
@@ -3172,11 +3252,445 @@ def _prepare_sent_waiting_task(
     hop["receipt"] = receipt.to_dict()
     hop["state"] = "waiting"
     hop["timestamps"]["sent_at"] = sent_at.isoformat()
-    worker._start_wait_budget_from_sent(hop)
-    state["roles"]["PLAN"]["page_id"] = "page-alpha-plan"
+    state["roles"][hop["target_role"]]["page_id"] = page_id
+    return receipt, sent_at
+
+
+@pytest.mark.parametrize("verified", [True, False])
+@pytest.mark.parametrize("solo", [False, True])
+def test_waiting_routes_from_the_exact_report_without_reading_the_browser(tmp_path, verified, solo):
+    _, state, worker, path, hop, _, _ = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-file-result", solo=solo,
+    )
+    expected = hop["expected_report_path"]
+    result_key = hop["report_result"]["key"]
+    assert f"CDPA-RESULT {result_key}: " in hop["prompt"]
+    report = tmp_path / expected
+    route = json.dumps({"route": "DONE" if solo else "DEV", "handoff": expected})
+    marker_id = result_key if verified else "different-request"
+    report.write_text(f"# Verified result\n\nCDPA-RESULT {marker_id}: {route}\n", encoding="utf-8")
+    ledger = Path(hop["ledger_path"])
+    before = ledger.read_bytes()
+
+    class Actions:
+        async def locate_owned(self, *_args):
+            if verified:
+                pytest.fail("valid report must route without observing the browser")
+            return None
+
+    if verified:
+        asyncio.run(worker._waiting(state, hop, Actions(), path))
+        if solo:
+            assert state["status"] == "DONE"
+            assert state["active_hop_id"] is None
+            assert state["reports"][0]["path"] == expected
+        else:
+            assert _active_hop(state)["target_role"] == "DEV"
+        assert state["route_timeline"][-1]["kind"] == "report_route_recovered"
+    else:
+        assert worker._poll_running_report_result(state, hop) is False
+        assert _active_hop(state) is hop
+    assert ledger.read_bytes() == before
+
+
+@pytest.mark.parametrize("solo", [False, True])
+@pytest.mark.parametrize("locked_route_matches", [False, True])
+def test_report_repair_recovers_only_the_locked_route_without_a_browser_response(
+    tmp_path, solo, locked_route_matches,
+):
+    _, state, worker, path, hop, _, _ = _prepare_sent_waiting_task(
+        tmp_path, task_id="file-result-after-report-repair", solo=solo,
+    )
+    expected = hop["expected_report_path"]
+    route = "DONE" if solo else "DEV"
+    hop.update(state="responded", response=json.dumps({"route": route, "handoff": expected}))
+    worker._responded(state, hop)
+    repair = _active_hop(state)
+    assert repair["kind"] == "report_repair"
+    asyncio.run(worker._pre_send(state, repair, FakeActions()))
+    key = repair["report_result"]["key"]
+    assert f"CDPA-RESULT {key}: " in repair["prompt"]
+    _accept_test_hop(state, repair)
+    ledger = Path(repair["ledger_path"])
+    accepted = ledger.read_bytes()
+
+    report = tmp_path / expected
+    footer = json.dumps({"route": route if locked_route_matches else "PAUSE", "handoff": expected})
+    report.write_text(f"# Repaired report\n\nCDPA-RESULT {key}: {footer}\n", encoding="utf-8")
+
+    class NoBrowser:
+        async def locate_owned(self, *_args):
+            pytest.fail("the completed report must route without observing the browser")
+
+    if locked_route_matches:
+        asyncio.run(worker._waiting(state, repair, NoBrowser(), path))
+        assert repair["route"] == route
+        assert state["reports"][0]["path"] == expected
+        assert state["route_timeline"][-1]["kind"] == "report_route_recovered"
+        if solo:
+            assert state["status"] == "DONE"
+        else:
+            assert _active_hop(state)["target_role"] == "DEV"
+    else:
+        assert not worker._poll_running_report_result(state, repair)
+        assert _active_hop(state) is repair
+        assert state["reports"] == []
+    assert ledger.read_bytes() == accepted
+
+
+@pytest.mark.parametrize("solo", [False, True])
+@pytest.mark.parametrize("checkpoint", ["pre_send", "sending"])
+@pytest.mark.parametrize("repair_kind", ["route_repair", "report_repair"])
+def test_report_arriving_after_repair_is_queued_routes_without_sending_repair(
+    tmp_path, solo, checkpoint, repair_kind,
+):
+    _, state, worker, _, hop, _, _ = _prepare_sent_waiting_task(
+        tmp_path, task_id="late-report-before-repair", solo=solo,
+    )
+    expected = hop["expected_report_path"]
+    route = "DONE" if solo else "DEV"
+    footer = json.dumps({"route": route, "handoff": expected})
+    hop.update(state="responded", response=footer if repair_kind == "report_repair" else "I finished the work.")
+    worker._responded(state, hop)
+    repair = _active_hop(state)
+    assert repair["kind"] == repair_kind
+    if checkpoint == "sending":
+        asyncio.run(worker._pre_send(state, repair, FakeActions()))
+        assert repair["state"] == "sending"
+    assert RequestLedger(hop["ledger_path"]).peek(hop["request_id"]).status is RequestStatus.COMPLETED
+    key = hop["report_result"]["key"]
+    (tmp_path / expected).write_text(
+        f"# Verified work\n\nCDPA-RESULT {key}: {footer}\n", encoding="utf-8",
+    )
+    ledger = Path(hop["ledger_path"])
+    accepted_ledger = ledger.read_bytes()
+
+    class NoBrowser:
+        def __getattr__(self, name):
+            if name in {"locate_owned", "acquire", "fresh_chat"}:
+                pytest.fail("late report should be verified before inspecting the browser")
+            raise AttributeError(name)
+
+    advance = worker._sending if checkpoint == "sending" else worker._pre_send
+    asyncio.run(advance(state, repair, NoBrowser()))
+
+    assert repair["state"] == "abandoned"
+    hop = next(item for item in state["hops"] if item["hop_id"] == repair["parent_hop_id"])
+    assert hop["route"] == route and hop["report_path"] == expected
+    assert ledger.read_bytes() == accepted_ledger
+    if solo:
+        assert state["status"] == "DONE"
+    else:
+        assert _active_hop(state)["target_role"] == "DEV"
+        assert _active_hop(state)["parent_hop_id"] == hop["hop_id"]
+
+
+def test_solo_report_pause_resume_references_verified_report_without_replaying_send(tmp_path):
+    store, state, worker, path, hop, _, _ = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-solo-report-pause", solo=True,
+    )
+    expected = hop["expected_report_path"]
+    route = json.dumps({"route": "PAUSE", "handoff": expected})
+    (tmp_path / expected).write_text(
+        f"# Awaiting the input\n\nCDPA-RESULT {hop['report_result']['key']}: {route}\n",
+        encoding="utf-8",
+    )
+    ledger = Path(hop["ledger_path"])
+    before = ledger.read_bytes()
+    assert worker._poll_running_report_result(state, hop, force=True)
+    assert state["status"] == "PAUSED"
+    store.save(path, state)
+    state = store.resume_team(state["team"])
+    asyncio.run(worker._apply_control(state, FakeActions(), path))
+    child = _active_hop(state)
+    asyncio.run(worker._pre_send(state, child, FakeActions()))
+    assert child["kind"] == "solo_resume"
+    assert child["request_id"] != hop["request_id"]
+    assert f"DURABLE RECOVERY HANDOFF\n{expected}" in child["prompt"]
+    assert child["expected_report_path"] != expected
+    assert ledger.read_bytes() == before
+
+
+def test_report_footer_does_not_route_async_wait_as_a_workflow_role(tmp_path):
+    _, state, worker, _, hop, _, _ = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-report-wait",
+    )
+    state["async_continuations"] = {
+        "confirmed-example": {
+            "role_key": hop["target_role"], "hop_id": hop["hop_id"], "state": "spawn_confirmed",
+        },
+    }
+    assert "WAIT" in worker._frozen_route_contract(state, hop["target_role"]).allowed_routes
+    expected = hop["expected_report_path"]
+    result = json.dumps({"route": "WAIT", "handoff": expected})
+    (tmp_path / expected).write_text(
+        f"# Result\n\nCDPA-RESULT {hop['report_result']['key']}: {result}\n", encoding="utf-8",
+    )
+
+    assert not worker._poll_running_report_result(state, hop, force=True)
+    assert state["status"] == "RUNNING"
+    assert _active_hop(state) is hop
+    assert hop["state"] == "waiting"
+
+
+@pytest.mark.parametrize("solo", [False, True])
+def test_resume_checks_a_new_report_before_touching_the_saved_tab(tmp_path, solo):
+    _, state, worker, _, hop, _, _ = _prepare_sent_waiting_task(
+        tmp_path, task_id="resume-new-report", solo=solo,
+    )
+    expected = hop["expected_report_path"]
+    route = "DONE" if solo else "DEV"
+    result = json.dumps({"route": route, "handoff": expected})
+    (tmp_path / expected).write_text(
+        f"# Completed\n\nCDPA-RESULT {hop['report_result']['key']}: {result}\n", encoding="utf-8",
+    )
+    ledger = Path(hop["ledger_path"])
+    before = ledger.read_bytes()
+    control = {
+        "action": "resume", "status": "recovering", "origin": "operator",
+        "result": {"before": {"status": "BLOCKED", "block_code": "empty_terminal_response"}},
+    }
+    assert not hop["report_result"].get("late_route")
+
+    class Actions:
+        async def locate_owned(self, *_args):
+            pytest.fail("Resume must consume the verified report before inspecting the browser")
+
+    asyncio.run(worker._recover_resume_waiting(state, hop, control, Actions()))
+
+    assert control["status"] == "applied"
+    assert control["result"]["postcondition"] == "report_route_recovered"
+    assert hop["route"] == route
+    assert state["status"] == ("DONE" if solo else "RUNNING")
+    assert ledger.read_bytes() == before
+
+
+@pytest.mark.parametrize("status,block_code", [
+    ("BLOCKED", "empty_terminal_response"),
+    ("BLOCKED", "accepted_conversation_identity_unresolved"),
+    ("BLOCKED", "CONVERSATION_IDENTITY_MISMATCH"),
+    ("BLOCKED", "authentication_required"),
+    ("PAUSED", None),
+    ("STOPPED", None),
+])
+@pytest.mark.parametrize("solo", [False, True])
+def test_late_report_routes_only_when_it_resolves_the_block(tmp_path, status, block_code, solo):
+    store, state, worker, path, hop, _, _ = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-late-file-result", solo=solo,
+    )
+    held_at = (datetime.now(timezone.utc) - timedelta(minutes=4)).isoformat()
+    state["status"] = status
+    if status == "BLOCKED":
+        state["block_code"] = block_code
+        state = store.save(path, state)
+        state["blocked_at"] = held_at
+    elif status == "PAUSED":
+        state["controls"].append({
+            "action": "pause", "status": "applied", "requested_at": held_at, "control_id": 1,
+        })
+    else:
+        state.update(stopped_at=held_at, terminal_state=status, active_hop_id=None, active_role=None)
+        state["cleanup"]["active_hop_id"] = hop["hop_id"]
     state = store.save(path, state)
+    expected = hop["expected_report_path"]
+    result_key = hop["report_result"]["key"]
+    target = "DONE" if solo else "DEV"
+    route = json.dumps({"route": target, "handoff": expected})
+    (tmp_path / expected).write_text(
+        f"# Completed after hold\n\nCDPA-RESULT {result_key}: {route}\n", encoding="utf-8",
+    )
+    ledger = Path(hop["ledger_path"])
+    before = ledger.read_bytes()
+
+    saved = asyncio.run(worker._observe_due_report(path))
+
+    assert saved["reports"][-1]["path"] == expected
+    assert ledger.read_bytes() == before
+    if block_code in {"empty_terminal_response", "accepted_conversation_identity_unresolved"}:
+        assert saved["status"] == ("DONE" if solo else "RUNNING")
+        assert saved["block_code"] is None
+        if solo:
+            assert saved["active_hop_id"] is None
+        else:
+            assert _active_hop(saved)["target_role"] == target
+            assert "route_budget_start_seq" not in saved
+            assert saved["route_seq"] == state["route_seq"] + 1
+        assert saved["route_timeline"][-1]["kind"] == "report_route_recovered"
+        return
+    assert saved["status"] == status
+    assert "route_budget_start_seq" not in saved
+    assert saved["active_hop_id"] == state["active_hop_id"]
+    assert len(saved["hops"]) == len(state["hops"])
+    assert saved["hops"][-1]["report_result"]["late_route"] == target
+    if status == "PAUSED":
+        queued = store.resume_team(state["team"])
+        control = queued["controls"][-1]
+        resumed = asyncio.run(worker.advance(
+            path, None, scheduling_tasks=[queued],
+            expected_endpointless_control=(control["control_id"], "resume"),
+        ))
+        assert resumed["controls"][-1]["result"]["postcondition"] == "report_route_recovered"
+        if solo:
+            assert resumed["status"] == "DONE"
+        else:
+            assert _active_hop(resumed)["target_role"] == target
+        assert ledger.read_bytes() == before
+
+
+@pytest.mark.parametrize("conversation_url,reopenable", [
+    ("https://chatgpt.com/c/local-chatgpt%3Auncommitted", False),
+    ("https://chatgpt.com/", False),
+    ("https://chatgpt.com/c/6b027a2b-1764-83ee-b054-41aa35832c8a", True),
+])
+def test_blocked_persistent_turn_releases_tabs_only_with_a_reopenable_hop(
+    tmp_path, conversation_url, reopenable,
+):
+    _, state, worker, _, hop, _, _ = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-persistent-blocked-tab",
+    )
+    state.update(status="BLOCKED", block_code="role_offline")
+    hop["conversation_url"] = conversation_url
+    actions = SimpleNamespace(
+        preflight_team=AsyncMock(return_value=[object()]),
+        close_team=AsyncMock(),
+    )
+
+    asyncio.run(worker._release_blocked_workflow_tabs(state, actions))
+
+    assert actions.preflight_team.await_count == int(reopenable)
+    assert actions.close_team.await_count == int(reopenable)
+
+
+def test_accepted_persistent_turn_missing_terminal_keeps_reopenable_tab(tmp_path):
+    _, state, worker, _, hop, _, _ = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-persistent-missing-terminal-tab",
+    )
+    state.update(status="BLOCKED", block_code="response_terminal_missing")
+    hop["conversation_url"] = "https://chatgpt.com/c/6b027a2b-1764-83ee-b054-41aa35832c8a"
+    actions = SimpleNamespace(
+        preflight_team=AsyncMock(return_value=[object()]),
+        close_team=AsyncMock(),
+    )
+
+    asyncio.run(worker._release_blocked_workflow_tabs(state, actions))
+
+    actions.preflight_team.assert_not_awaited()
+    actions.close_team.assert_not_awaited()
+
+
+def test_model_verification_block_keeps_the_persistent_role_tab_for_recovery(tmp_path):
+    _, _, state, worker = setup_task(tmp_path, conversation_mode="persistent")
+    role = state["active_role"]
+    state["roles"][role].update(page_id="model-review-page", page_url="https://chatgpt.com/")
+    _active_hop(state)["state"] = "sending"
+    state.update(status="BLOCKED", block_code="model_verification_blocked")
+    actions = SimpleNamespace(
+        preflight_team=AsyncMock(return_value=[object()]),
+        close_team=AsyncMock(),
+    )
+
+    asyncio.run(worker._release_blocked_workflow_tabs(state, actions))
+
+    actions.preflight_team.assert_not_awaited()
+    actions.close_team.assert_not_awaited()
+    assert state["roles"][role]["page_id"] == "model-review-page"
+
+
+def test_route_budget_recovery_keeps_the_persistent_role_conversation(tmp_path):
+    _, _, state, worker = setup_task(tmp_path, conversation_mode="persistent")
+    role = state["roles"]["REVIEW"]
+    url = "https://chatgpt.com/c/50b179f2-9671-44e3-8497-10905bf3903c"
+    role.update(page_id="review-page", page_url=url, conversation_generation=1)
     hop = _active_hop(state)
-    return store, state, worker, path, hop, receipt, sent_at
+    hop.update(kind="handoff", source_role="DEV", target_role="REVIEW",
+               physical_role=role["physical_role"], turn=4)
+    state.update(context_policy="fresh", active_role="REVIEW", route_seq=8, max_routes=8)
+    actions = FakeActions()
+    actions.locate_owned = AsyncMock(return_value=None)
+    client = ready_client(state, "REVIEW")
+    client.wait_until_clean_ready = AsyncMock()
+    actions.reopen = AsyncMock(return_value=AcquiredRole(
+        client=client, page_id="review-page", url=url, created=True, new_chat=False,
+    ))
+
+    state.update(status="BLOCKED", block_code="ROUTE_BUDGET_EXHAUSTED")
+    asyncio.run(worker._release_blocked_workflow_tabs(state, actions))
+    assert actions.preflight_calls == actions.closed_teams == 0
+
+    state.update(status="RUNNING", block_code=None)
+    asyncio.run(worker._pre_send(state, hop, actions))
+
+    actions.reopen.assert_awaited_once()
+    client.wait_until_clean_ready.assert_awaited_once()
+    assert actions.fresh_calls == []
+    assert hop["state"] == "sending"
+    assert role["page_url"] == url
+    assert role["conversation_generation"] == 1
+    assert state["route_seq"] == state["max_routes"] == 8
+
+
+def test_change_role_url_is_durable_and_does_not_touch_send_evidence(tmp_path):
+    _, store, state, worker = setup_task(tmp_path)
+    path = Path(state["manifest_path"])
+    hop = _active_hop(state)
+    state.update(status="BLOCKED", block_code="CONVERSATION_IDENTITY_MISMATCH")
+    state["roles"]["PLAN"].update(
+        page_url="https://chatgpt.com/", page_id="old-page", conversation_binding_id="stale-writer",
+    )
+    state = store.save(path, state)
+    url = "https://chatgpt.com/c/6b02625d-4600-83e8-8d7a-a037cee06738"
+    state = store.request_control(path, "change_role_url", role="PLAN", conversation_url=url)
+    control = state["controls"][-1]
+    saved = asyncio.run(worker.advance(
+        path, None, scheduling_tasks=[state],
+        expected_endpointless_control=(control["control_id"], "change_role_url"),
+    ))
+    assert saved["controls"][-1]["status"] == "applied"
+    assert saved["roles"]["PLAN"]["page_url"] == url
+    assert saved["roles"]["PLAN"]["online"] is False
+    assert "conversation_binding_id" not in saved["roles"]["PLAN"]
+    assert _active_hop(saved)["request_id"] == hop["request_id"]
+    assert not Path(hop["ledger_path"]).exists()
+
+
+def test_new_persistent_chat_drops_previous_generation_writer_reference(tmp_path):
+    _, _, state, worker = setup_task(tmp_path)
+    role = state["roles"]["PLAN"]
+    role.update(conversation_generation=3, conversation_binding_id="old-writer")
+    worker._record_acquired(state, "PLAN", AcquiredRole(
+        client=ready_client(state, "PLAN"), page_id="new", url="https://chatgpt.com/",
+        created=True, new_chat=True,
+    ))
+    assert role["conversation_generation"] == 4
+    assert "conversation_binding_id" not in role
+
+
+@pytest.mark.parametrize("mode", ["persistent", "temporary"])
+def test_resume_legacy_format_repair_uses_exact_report_before_browser(tmp_path, monkeypatch, mode):
+    store, state, worker, path, hop, _, _ = _prepare_sent_waiting_task(
+        tmp_path, task_id="task-legacy-file-resume", conversation_mode=mode,
+    )
+    state.update(status="BLOCKED", block_code="response_terminal_missing")
+    hop.update(kind="route_repair")
+    hop.pop("report_result")
+    expected = hop["expected_report_path"]
+    (tmp_path / expected).write_text(
+        "# Existing report\n\nWork and validation evidence.\n\n**Next role: DEV.** Continue implementation.\n",
+        encoding="utf-8",
+    )
+    ledger = Path(hop["ledger_path"])
+    before = ledger.read_bytes()
+    state = store.save(path, state)
+
+    async def forbidden_browser_lookup(*_args, **_kwargs):
+        pytest.fail("the verified report should recover before browser acquisition")
+
+    monkeypatch.setattr(worker, "_owned_or_block", forbidden_browser_lookup)
+    queued = store.resume_team(state["team"])
+    resumed = asyncio.run(worker.advance(path, None, scheduling_tasks=[queued]))
+    assert resumed["controls"][-1]["result"]["postcondition"] == "report_route_recovered"
+    assert _active_hop(resumed)["target_role"] == "DEV"
+    assert ledger.read_bytes() == before
 
 
 def _enable_backend_wait_identity(store, state, path, hop, receipt, *, conversation_id="conversation-1"):
@@ -5002,7 +5516,7 @@ def test_heartbeat_stays_current_while_refresh_scheduling_blocks(
     config, store, state, worker = setup_task(
         tmp_path, task_id="task-heartbeat-scheduling-block"
     )
-    worker.config = replace(config, heartbeat_seconds=0.01, worker_stale_seconds=0.04)
+    worker.config = replace(config, heartbeat_seconds=0.01)
     worker.hydrate_runtime()
     worker._publish_heartbeat(force=True)
     manifest_path = Path(state["manifest_path"])
@@ -5033,22 +5547,27 @@ def test_heartbeat_stays_current_while_refresh_scheduling_blocks(
         assert tasks is not None
         assert state is not None
         refresh_started.set()
-        assert release_refresh.wait(timeout=1.0)
+        try:
+            assert release_refresh.wait(timeout=5.0)
+        finally:
+            refresh_started.clear()
         return dict(state), False
 
     monkeypatch.setattr(store, "refresh_scheduling", slow_refresh)
     api = DashboardAPI(worker.config)
 
-    def observe_and_release() -> None:
-        assert refresh_started.wait(timeout=1.0)
-        time.sleep(0.06)
-        observed_health.append(api.worker_health())
-        release_refresh.set()
+    publish = worker._publish_heartbeat
+
+    def publish_and_observe(**kwargs) -> None:
+        publish(**kwargs)
+        if refresh_started.is_set() and not release_refresh.is_set():
+            observed_health.append(api.worker_health())
+            release_refresh.set()
+
+    monkeypatch.setattr(worker, "_publish_heartbeat", publish_and_observe)
 
     async def scenario():
         heartbeat_task = asyncio.create_task(worker._heartbeat_loop())
-        observer = threading.Thread(target=observe_and_release)
-        observer.start()
         try:
             await worker.advance(
                 manifest_path,
@@ -5058,7 +5577,6 @@ def test_heartbeat_stays_current_while_refresh_scheduling_blocks(
         finally:
             heartbeat_task.cancel()
             await asyncio.gather(heartbeat_task, return_exceptions=True)
-            observer.join(timeout=1.0)
 
     try:
         asyncio.run(scenario())
@@ -6605,7 +7123,7 @@ def test_alternating_dev_review_loop_does_not_force_context_rotation(tmp_path: P
 
 
 def test_legacy_manifest_lazily_initializes_budget_from_existing_hop_ids(tmp_path: Path):
-    _, _, state, worker = setup_task(tmp_path, task_id="task-legacy-budget-migration")
+    _, _, state, worker = setup_task(tmp_path, task_id="task-legacy-budget-migration", max_routes=8)
     state.pop("execution_budget", None)
     state["hops"] = [
         {"hop_id": 1, "kind": "handoff"},

@@ -11,7 +11,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs, urlsplit
 
+from ..cdpa_independent import is_independent_task
+from ..cdpa_prompts import READ_ONLY_ROUTE_REPAIR_PREFIXES
 from ..cdpa_response import begin_refresh, finish_refresh, parse_time
+from ..chatgpt_models import current_repair_receipt
 from . import allow, response, timeout
 from .model import Action, Context, Decision, Policy
 from .signals import RoleSignals, SignalIdentity, record_cycle, record_signal_error
@@ -33,6 +36,10 @@ class RoleController:
         network_status: str | None = None, network_response: Any = None,
         now: datetime | None = None, signals: RoleSignals | None = None,
         reconcile: Callable[[Any], dict[str, Any]] | None = None,
+        allow_provider_retry: bool = True,
+        allow_tool_permission: bool = True,
+        expects_report_result: bool = False,
+        exact_accepted_turn: bool = False,
     ) -> Decision:
         if signals is None:
             signals = RoleSignals.from_sources(
@@ -78,9 +85,11 @@ class RoleController:
             wait.pop("refresh_ready_at", None)
 
         if phase == "waiting":
+            previous_assistant_id = wait.get("bound_assistant_message_id")
+            previous_assistant_turn = wait.get("bound_assistant_turn_id")
             # Exact rendered U->A binding owns the operation. LISTEN is
             # supplemental and may only update the already-bound assistant.
-            response.observe(ctx, receipt, validate)
+            response.observe(ctx, receipt, validate, exact_turn=exact_accepted_turn)
             timeout.observe_connection_interruption(ctx)
             binding_error = str(wait.get("response_binding_error") or "")
             if binding_error:
@@ -101,6 +110,8 @@ class RoleController:
             # No accepted-turn owner is available to approve this old surface.
             # Explicitly pause instead of waiting forever or clicking blindly.
             return self._remember(ctx, Decision(Action.BLOCK, "pre_send_permission_unowned"))
+        if ctx.permission_present and not allow_tool_permission:
+            return self._remember(ctx, Decision(Action.BLOCK, "route_repair_tool_permission_requested"))
         if ctx.permission_present and (
             int(getattr(snapshot, "mcp_permission_allow_count", 0) or 0) > 1
             or int(getattr(snapshot, "mcp_permission_node_count", 0) or 0) > 1
@@ -148,7 +159,10 @@ class RoleController:
             return self._remember(ctx, Decision(Action.COOLDOWN, "profile_rate_limit"))
 
         blocking_dialogs = dialogs
-        if phase == "waiting" and parse_qs(urlsplit(str(getattr(snapshot, "url", ""))).query).get("temporary-chat") == ["true"]:
+        temporary_chat = phase == "waiting" and parse_qs(
+            urlsplit(str(getattr(snapshot, "url", "") or "")).query
+        ).get("temporary-chat") == ["true"]
+        if temporary_chat:
             blocking_dialogs = tuple(
                 value for value in dialogs if " ".join(value.split()) != _TEMPORARY_SAVE_OFFER
             )
@@ -161,19 +175,26 @@ class RoleController:
             retry_turn = response.accepted_turn_key(receipt)
             retry_reconciliation_pending = (
                 isinstance(retry_record, Mapping)
+                and not retry_record.get("failed_generation")
                 and str(retry_record.get("accepted_user_turn") or "") == retry_turn
                 and str(retry_record.get("intent_status") or "") == "recovery_required"
             )
             # A durable ambiguous Retry action is reconciliation-only. Normal
             # response/terminal handling above still wins, and permission handling
             # below remains available when the retried response asks for Allow.
+            timeout.observe(ctx)
             if retry_reconciliation_pending and not ctx.permission_present:
+                terminal_timeout = timeout.handle(ctx)
+                if (
+                    terminal_timeout is not None and terminal_timeout.action is Action.BLOCK
+                    and str(getattr(receipt, "prompt", "")).startswith(READ_ONLY_ROUTE_REPAIR_PREFIXES)
+                ):
+                    return self._remember(ctx, Decision(Action.BLOCK, "provider_retry_unconfirmed"))
                 return self._remember(
                     ctx, Decision(Action.WAIT, "provider_retry_reconciliation_required")
                 )
-            timeout.observe(ctx)
             # Stop means the response is still active; only Stop-free Retry is eligible.
-            if retry_visible and not stop_visible:
+            if allow_provider_retry and retry_visible and not stop_visible:
                 retry_seen_at = parse_time(wait.get("retry_seen_at"))
                 turn_key = response.accepted_turn_key(receipt)
                 already_retried = (
@@ -194,6 +215,32 @@ class RoleController:
                     return self._remember(ctx, Decision(Action.RETRY, "retry_visible_stable"))
             else:
                 wait.pop("retry_seen_at", None)
+
+            observed_receipt = (
+                current_repair_receipt(snapshot.messages, receipt)
+                if receipt is not None and not allow_tool_permission else receipt
+            )
+            empty_terminal = (
+                response.completed_empty_assistant(
+                    snapshot, observed_receipt, bound_message_id=previous_assistant_id,
+                    bound_turn_id=previous_assistant_turn,
+                )
+                if (temporary_chat or expects_report_result)
+                and not ctx.transport_active and (not retry_visible or not allow_provider_retry) and not error_texts
+                and not getattr(snapshot, "connection_interrupted_visible", False)
+                and ctx.composer_ready and not ctx.draft_present and ctx.candidate is None
+                else None
+            )
+            if empty_terminal is not None:
+                identity = [empty_terminal.message_id, empty_terminal.turn_id]
+                observed = wait.get("empty_terminal_seen") or {}
+                since = parse_time(observed.get("since")) if observed.get("identity") == identity else None
+                if since is None:
+                    wait["empty_terminal_seen"] = {"identity": identity, "since": ctx.now.isoformat()}
+                elif (ctx.now - since).total_seconds() >= ctx.policy.response_stable_seconds:
+                    return self._remember(ctx, Decision(Action.BLOCK, "empty_terminal_response", empty_terminal))
+                return self._remember(ctx, Decision(Action.WAIT, "empty_terminal_observing"))
+            wait.pop("empty_terminal_seen", None)
 
         # The rendered response can be truncated while the web stream is
         # interrupted. Never repair a partial route just because Stop vanished.
@@ -225,6 +272,7 @@ class RoleController:
             retry_record = wait.get("provider_retry")
             if (
                 isinstance(retry_record, Mapping)
+                and not retry_record.get("failed_generation")
                 and str(retry_record.get("accepted_user_turn") or "")
                 == response.accepted_turn_key(receipt)
                 and str(retry_record.get("intent_status") or "") == "recovery_required"
@@ -356,13 +404,23 @@ class RoleController:
         self, worker: Any, state: dict[str, Any], hop: dict[str, Any],
         acquired: Any, actions: Any, *, snapshot: Any = None,
         phase: str = "waiting", wait_ms: int = 5_000,
+        recover_missing_terminal: bool = False,
     ) -> Decision:
         from ..chatgpt import MessageSnapshot, RateLimitBlockedError, SendReceipt
         from ..cdpa_routes import RouteContractError
+        from ..cdpa_runtime_registry import REPORT_RECOVERABLE_BLOCK_CODES, REPORT_RECHECK_PENDING_MESSAGE
+        from ..cdpa_worker import _is_read_only_route_repair
 
         client = acquired.client
         wait = hop.setdefault("wait", {})
         receipt = SendReceipt.from_dict(hop["receipt"]) if hop.get("receipt") else None
+        expects_report_result = phase == "waiting" and isinstance(hop.get("report_result"), Mapping)
+        persistent_report_resume = (
+            recover_missing_terminal and expects_report_result
+            and state.get("conversation_mode") != "temporary"
+            and state.get("workflow_mode", "team") == "team"
+            and hop.get("kind") not in {"route_repair", "report_repair"}
+        )
         if phase == "waiting" and receipt is not None:
             self._hydrate_provider_retry_intent(worker, state, hop, receipt)
         install = getattr(client, "install_page_observer", None)
@@ -374,7 +432,8 @@ class RoleController:
                 await wait_for_signal(timeout_ms=wait_ms)
                 wait_ms = 0
             if receipt is not None:
-                snapshot = await client.wait_snapshot(receipt, probe_wait_ms=wait_ms)
+                kwargs = {"force_full": True} if persistent_report_resume else {}
+                snapshot = await client.wait_snapshot(receipt, probe_wait_ms=wait_ms, **kwargs)
             else:
                 snapshot = await client.assert_ownership()
         read = getattr(client, "page_observation", None)
@@ -384,6 +443,17 @@ class RoleController:
         )
         permission = signals.permission
         previous = (wait.get("controller_decision"), wait.get("controller_reason"))
+        temporary_team = (
+            state.get("conversation_mode") == "temporary"
+            and not is_independent_task(state)
+            and str(state.get("workflow_mode") or "team").lower() == "team"
+        )
+        read_only_repair = _is_read_only_route_repair(hop)
+        idle_report_repair = phase == "waiting" and worker._idle_report_repair_parent(state, hop) is not None
+        safe_repair_retry = (
+            read_only_repair and not wait.get("mcp_allow_last")
+            and not any(segment.kind == "tool" for segment in getattr(snapshot, "response_segments", ()))
+        )
         decision = self.decide(
             snapshot,
             wait,
@@ -395,15 +465,101 @@ class RoleController:
             ),
             phase=phase,
             signals=signals,
+            allow_provider_retry=not (temporary_team or expects_report_result or recover_missing_terminal or idle_report_repair),
+            allow_tool_permission=not read_only_repair,
+            expects_report_result=expects_report_result,
+            exact_accepted_turn=recover_missing_terminal or idle_report_repair,
             reconcile=(
                 (lambda candidate: worker._terminal_route_evidence(state, hop, candidate))
-                if phase == "waiting"
+                if phase == "waiting" and not idle_report_repair
                 else None
             ),
         )
+        if persistent_report_resume:
+            if worker._poll_running_report_result(state, hop, force=True):
+                return Decision(Action.ACCEPT, "verified_report_result")
+            if decision.action is Action.ACCEPT:
+                try:
+                    evidence = worker._terminal_route_evidence(state, hop, decision.response)
+                    report_sha256 = evidence.get("report_sha256")
+                    if report_sha256 and report_sha256 == hop["report_result"].get("prior_sha256"):
+                        raise ValueError("the report is unchanged from before Send")
+                except (ValueError, OSError):
+                    worker._block(
+                        state, "The accepted reply has no verified exact report. Recover the report, then Resume.",
+                        code="accepted_report_repair_unavailable",
+                    )
+                    return Decision(Action.BLOCK, "accepted_report_repair_unavailable")
+            elif decision.reason == "result_stability":
+                return decision
+            else:
+                if not worker._check_idle_report_repair(state, hop, acquired, snapshot):
+                    return Decision(Action.BLOCK, state["block_code"])
+                if decision.reason == "empty_terminal_observing":
+                    return decision
+                wait.update(controller_decision=Action.REPAIR.value, controller_reason="idle_accepted_report_repair")
+                if worker._repair_report_without_response(state, hop, allow_missing=True):
+                    if hop.get("report_path"):
+                        return Decision(Action.ACCEPT, "verified_report_result")
+                    if state.get("status") != "BLOCKED":
+                        return Decision(Action.REPAIR, "idle_accepted_report_repair")
+                if state.get("status") != "BLOCKED":
+                    worker._block(
+                        state, "The exact report cannot be reconciled safely. Recover its verified result, then Resume.",
+                        code="accepted_report_repair_unavailable",
+                    )
+                return Decision(Action.BLOCK, state["block_code"])
+        if idle_report_repair:
+            if worker._use_parent_report_for_repair(state, hop):
+                return Decision(Action.ACCEPT, "verified_report_result")
+            if decision.action in {Action.COOLDOWN, Action.REFRESH, Action.RETRY, Action.STATUS}:
+                decision = Decision(Action.BLOCK, "route_repair_report_unavailable")
+                wait.update(controller_decision=decision.action.value, controller_reason=decision.reason)
+        bounded_repair_reply = (
+            decision.action in {Action.ACCEPT, Action.REPAIR}
+            and expects_report_result and hop.get("kind") == "route_repair"
+            and worker._empty_terminal_repair_parent(state, hop) is not None
+        )
+        if expects_report_result and (
+            bounded_repair_reply or decision.action is Action.REPAIR
+            or decision.reason in REPORT_RECOVERABLE_BLOCK_CODES | {"ui_error"}
+        ):
+            if worker._poll_running_report_result(state, hop, force=True):
+                return Decision(Action.ACCEPT, "verified_report_result")
+            if bounded_repair_reply:
+                decision = Decision(Action.BLOCK, "route_repair_invalid_response")
+                wait.update(controller_decision=decision.action.value, controller_reason=decision.reason)
+            if decision.reason == "empty_terminal_response":
+                allow_missing = (
+                    recover_missing_terminal
+                    and str(state.get("workflow_mode") or "team").lower() == "team"
+                    and not getattr(snapshot, "retry_visible", False)
+                )
+                if (not recover_missing_terminal or allow_missing) and worker._repair_report_without_response(
+                    state, hop, allow_missing=allow_missing,
+                ):
+                    if hop.get("report_path"):
+                        return Decision(Action.ACCEPT, "verified_report_result")
+                    if allow_missing and state.get("status") == "BLOCKED":
+                        return decision
+                    reason = "empty_terminal_report_repair" if allow_missing else "invalid_report_result"
+                    wait.update(controller_decision=Action.REPAIR.value, controller_reason=reason)
+                    return Decision(Action.REPAIR, reason)
+        if decision.reason == "empty_terminal_response" and temporary_team and not expects_report_result:
+            # A format repair can itself finish blank. Start blank recovery
+            # with a read-only prompt before regenerating any repair turn.
+            if not read_only_repair and worker._recover_missing_terminal_route(
+                state, hop, confirmed_empty=True,
+            ):
+                decision = Decision(Action.REPAIR, "empty_terminal_route_repair")
+            elif safe_repair_retry and worker._accepted_blank_route_request(state, hop):
+                decision = self._next_repair_recovery(worker, state, hop, decision.response)
+            wait.update(controller_decision=decision.action.value, controller_reason=decision.reason)
         if (
             state.get("conversation_mode") == "temporary"
             and decision.reason == "response_terminal_missing"
+            and not read_only_repair
+            and not expects_report_result
             and any(
                 message.role == "assistant"
                 and message.message_id == wait.get("bound_assistant_message_id")
@@ -421,6 +577,14 @@ class RoleController:
             # existing repair limit) without modifying the accepted receipt.
             decision = Decision(Action.REPAIR, "missing_terminal_route_repair")
             wait.update(controller_decision=decision.action.value, controller_reason=decision.reason)
+        if read_only_repair and decision.reason == "malformed_result":
+            reason = (
+                "route_repair_report_unavailable"
+                if decision.response.text.strip() == "REPORT_UNAVAILABLE"
+                else "route_repair_invalid_response"
+            )
+            decision = Decision(Action.BLOCK, reason)
+            wait.update(controller_decision=decision.action.value, controller_reason=decision.reason)
         identity = SignalIdentity.from_snapshot(
             snapshot,
             request_id=str(hop.get("request_id") or "") or None,
@@ -437,7 +601,7 @@ class RoleController:
             previous_decision=previous,
             decision=decision,
         )
-        if decision.reason == "missing_terminal_route_repair":
+        if decision.reason in {"missing_terminal_route_repair", "empty_terminal_route_repair"}:
             return decision
         state["active_action"] = "wait_response" if phase == "waiting" else "queued"
         if decision.action is Action.REFRESH and state.get("conversation_mode") == "temporary":
@@ -460,7 +624,34 @@ class RoleController:
                 state["active_action"] = "wait_" + decision.reason
             return decision
         if decision.action is Action.BLOCK:
-            worker._block(state, decision.reason, code=decision.reason, retryable=True)
+            if expects_report_result and decision.reason in REPORT_RECOVERABLE_BLOCK_CODES:
+                worker._block(
+                    state,
+                    REPORT_RECHECK_PENDING_MESSAGE,
+                    code=decision.reason,
+                )
+            elif decision.reason == "empty_terminal_response":
+                worker._block(
+                    state,
+                    "ChatGPT completed the accepted turn without an answer. The Temporary tab is preserved. "
+                    "Inspect the saved report and Resume from the existing conversation.",
+                    code=decision.reason,
+                )
+            elif decision.reason in {"route_repair_report_unavailable", "route_repair_invalid_response"}:
+                worker._block(
+                    state,
+                    "The repair returned no verified route. Recover its exact report, then Resume.",
+                    code=decision.reason,
+                )
+            elif decision.reason == "route_repair_tool_permission_requested":
+                worker._block(
+                    state, "The read-only repair requested a tool. Decline the request on the saved tab, then Resume.",
+                    code=decision.reason,
+                )
+            elif decision.reason == "provider_retry_unconfirmed":
+                worker._block(state, "Retry was dispatched but its outcome is unconfirmed. Inspect the saved turn, then Resume.", code=decision.reason)
+            else:
+                worker._block(state, decision.reason, code=decision.reason, retryable=True)
             return decision
         if decision.action is Action.COOLDOWN:
             await worker._enter_rate_limit_cooldown(state, actions, RateLimitBlockedError("Too many requests"))
@@ -483,29 +674,14 @@ class RoleController:
                     record_control_event(state, "mcp_allow", wait.get("mcp_allow_last"))
             return result
         if decision.action is Action.RETRY:
-            return await self._provider_retry(worker, client, state, hop, receipt, snapshot)
+            return await self._provider_retry(
+                worker, client, state, hop, receipt, snapshot,
+                blank_assistant=decision.response,
+                edit_repair=decision.reason == "empty_terminal_edit_resend",
+            )
         if decision.action is Action.STATUS:
             wait["timeout_status_checked"] = True
             wait["timeout_status"] = await worker._one_shot_stream_status(actions, receipt) if receipt else None
-            return decision
-        if decision.action is Action.REPAIR and decision.reason != "malformed_result":
-            if decision.reason == "state_repair":
-                worker._queue_format_repair(
-                    state,
-                    hop,
-                    None,
-                    RouteContractError(
-                        "accepted execution produced no terminal result; recover the route "
-                        "from the existing workspace/report state without replaying the Send"
-                    ),
-                )
-                return decision
-            worker._block(
-                state,
-                "Provider stream failure requires operator recovery without replaying the accepted Send.",
-                code=decision.reason,
-                retryable=True,
-            )
             return decision
         if decision.action is Action.REPAIR:
             worker._queue_format_repair(
@@ -731,8 +907,27 @@ class RoleController:
             clear()
         return Decision(Action.ALLOW, "mcp_allow_ready")
 
+    def _next_repair_recovery(self, worker, state, hop, assistant) -> Decision:
+        # The durable action ledger survives a crash between a click and saving the hop.
+        attempts = worker.runtime_db.provider_retry_intents(state["task_id"], hop["request_id"])
+        if attempts:
+            last = attempts[-1]
+            failed = last["payload"].get("failed_generation")
+            if failed == assistant.message_id or (last["status"] == "recovery_required" and not failed):
+                progress = parse_time(hop["wait"].get("controller_progress_at"))
+                if progress and (datetime.now(timezone.utc) - progress).total_seconds() >= self.policy.timeout_seconds:
+                    return Decision(Action.BLOCK, "provider_retry_unconfirmed")
+                return Decision(Action.WAIT, "provider_retry_reconciliation_required")
+            started = parse_time(last["finished_at"] or last["created_at"])
+            if started is not None and (datetime.now(timezone.utc) - started).total_seconds() < 20:
+                return Decision(Action.WAIT, "repair_retry_cooldown")
+        retries = sum(row["payload"].get("recovery_action", "retry") == "retry" for row in attempts)
+        reason = "empty_terminal_retry_menu" if retries < 3 else "empty_terminal_edit_resend"
+        return Decision(Action.RETRY, reason, assistant)
+
     async def _provider_retry(
         self, worker, client, state: dict[str, Any], hop: dict[str, Any], receipt: Any, snapshot: Any,
+        *, blank_assistant: Any = None, edit_repair: bool = False,
     ) -> Decision:
         """Invoke provider Retry once for the exact accepted turn; never resend the prompt."""
         from ..chatgpt import (
@@ -743,6 +938,11 @@ class RoleController:
         wait = hop.setdefault("wait", {})
         state["active_action"] = "wait_response"
         turn_key = response.accepted_turn_key(receipt)
+        observed_receipt = receipt
+        if blank_assistant is not None:
+            observed_receipt = current_repair_receipt(snapshot.messages, receipt)
+            if observed_receipt is None:
+                return Decision(Action.WAIT, "repair_prompt_identity_unconfirmed")
         now = datetime.now(timezone.utc).isoformat()
         if (
             str(getattr(snapshot, "composer_text", "") or "").strip()
@@ -763,6 +963,8 @@ class RoleController:
             hop=hop,
             receipt=receipt,
             accepted_user_turn=turn_key,
+            failed_generation=blank_assistant.message_id if blank_assistant is not None else None,
+            action="edit_resend" if edit_repair else "retry",
         )
         command, intent_created = worker.runtime_db.reserve_action_intent(
             command_id=intent.command_id,
@@ -779,8 +981,11 @@ class RoleController:
             "result": "pending" if intent_created else str(command.get("status") or "recovery_required"),
             "original_prompt_resent": False,
         }
+        if blank_assistant is not None:
+            record.update(failed_generation=blank_assistant.message_id, recovery_action=intent.payload["recovery_action"])
         wait["provider_retry"] = record
         wait.pop("retry_seen_at", None)
+        wait.pop("empty_terminal_seen", None)
         if not intent_created:
             decision = Decision(
                 Action.WAIT,
@@ -793,12 +998,16 @@ class RoleController:
             wait["controller_reason"] = decision.reason
             return decision
 
-        decision = Decision(Action.WAIT, "provider_retry_clicked")
+        decision = Decision(Action.WAIT, "repair_edit_resend_clicked" if edit_repair else "provider_retry_clicked")
         try:
+            retry_options = {"blank_assistant": blank_assistant} if blank_assistant is not None else {}
+            if edit_repair:
+                retry_options["edit_repair"] = True
             outcome = await client.retry_generation(
-                receipt,
+                observed_receipt,
                 expected_task_id=str(state["task_id"]),
                 expected_team=str(state["team"]),
+                **retry_options,
             )
         except (PageOwnershipError, TaskBindingError) as exc:
             # These exception types can occur on either side of retry.click().
@@ -831,6 +1040,7 @@ class RoleController:
             )
             decision = Decision(Action.WAIT, "provider_retry_reconciliation_required")
         else:
+            wait["controller_progress_at"] = datetime.now(timezone.utc).isoformat()
             record.update(
                 result="progress",
                 transport_active=bool((outcome or {}).get("transport_active")),

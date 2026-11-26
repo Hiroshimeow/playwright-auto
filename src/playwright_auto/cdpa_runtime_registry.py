@@ -12,6 +12,27 @@ from .cdpa_team import dispatch_order_key, is_active_team_owner
 TERMINAL = frozenset({"DONE", "STOPPED"})
 ACTIVE_HOP_STATES = frozenset({"pre_send", "sending", "sent", "waiting", "responded", "routed"})
 MINIMUM_DEADLINE_SECONDS = 0.5
+ACTIVE_REPORT_CHECK_SECONDS = 15
+_HELD_REPORT_CHECK_SECONDS = (180, 600, 1740)
+REPORT_RECHECK_PENDING_MESSAGE = (
+    "The accepted turn did not return a complete result. CDPA will recheck the exact report "
+    "and continue if it verifies a route."
+)
+MISSING_TERMINAL_RESULT_BLOCK_CODES = frozenset({
+    "empty_terminal_response",
+    "response_terminal_missing",
+    "response_without_terminal_result",
+    "accepted_report_draft_present",
+    "accepted_report_generation_active",
+    "accepted_report_latest_turn_unverified",
+    "accepted_report_page_not_clean",
+    "accepted_report_retry_present",
+    "accepted_report_repair_unavailable",
+})
+REPORT_RECOVERABLE_BLOCK_CODES = MISSING_TERMINAL_RESULT_BLOCK_CODES | {
+    "accepted_conversation_identity_unresolved",
+    "route_repair_invalid_response",
+}
 
 
 def _timestamp(value: object) -> float | None:
@@ -33,6 +54,99 @@ def _active_hop_state(state: Mapping[str, Any]) -> str:
         if isinstance(hop, Mapping) and hop.get("hop_id") == active:
             return str(hop.get("state") or "")
     return ""
+
+
+def _latest_applied_pause_id(state: Mapping[str, Any]) -> int:
+    if state.get("status") != "PAUSED":
+        return 0
+    return max((
+        item["control_id"] for item in state.get("controls") or []
+        if isinstance(item, Mapping) and isinstance(item.get("control_id"), int)
+        and item.get("action") == "pause" and item.get("status") == "applied"
+    ), default=0)
+
+
+def pause_superseding_recovering_resume(state: Mapping[str, Any]) -> int | None:
+    pause_id = _latest_applied_pause_id(state)
+    if pause_id and any(
+        isinstance(item, Mapping) and isinstance(item.get("control_id"), int)
+        and item["control_id"] < pause_id
+        and item.get("action") == "resume" and item.get("status") == "recovering"
+        for item in state.get("controls") or []
+    ):
+        return pause_id
+    return None
+
+
+def next_recovering_resume_control(state: Mapping[str, Any]) -> dict[str, Any] | None:
+    if str(state.get("status") or "").upper() in TERMINAL:
+        return None
+    pause_id = _latest_applied_pause_id(state)
+    return next(
+        (
+            item for item in reversed(state.get("controls") or [])
+            if isinstance(item, dict)
+            and item.get("action") == "resume"
+            and item.get("status") == "recovering"
+            and (not pause_id or (isinstance(item.get("control_id"), int) and item["control_id"] > pause_id))
+        ),
+        None,
+    )
+
+
+def held_report_check(state: Mapping[str, Any], now: float) -> tuple[int, float] | None:
+    status = state.get("status")
+    active_id = state.get("active_hop_id")
+    if status == "STOPPED":
+        active_id = (state.get("cleanup") or {}).get("active_hop_id")
+        held_at = _timestamp(state.get("stopped_at"))
+    elif status == "BLOCKED":
+        held_at = _timestamp(state.get("blocked_at"))
+    elif status == "PAUSED":
+        control = next(
+            (item for item in reversed(state.get("controls") or [])
+             if item.get("action") == "pause" and item.get("status") == "applied"),
+            {},
+        )
+        held_at = _timestamp(control.get("applied_at") or control.get("requested_at"))
+    else:
+        return None
+    if held_at is None or now > held_at + 1800:
+        return None
+    for hop in state.get("hops") or []:
+        if hop.get("hop_id") != active_id:
+            continue
+        observation = hop.get("report_result")
+        if not isinstance(observation, Mapping) or not hop.get("receipt") or hop.get("report_path"):
+            return None
+        checked_at = _timestamp(observation.get("checked_at"))
+        remaining = [
+            held_at + seconds for seconds in _HELD_REPORT_CHECK_SECONDS
+            if checked_at is None or checked_at < held_at + seconds
+        ]
+        if remaining:
+            # If the worker was offline, coalesce overdue checks instead of bursting.
+            return int(active_id), max((due for due in remaining if due <= now), default=remaining[0])
+    return None
+
+
+def active_report_check(state: Mapping[str, Any]) -> tuple[int, float] | None:
+    if state.get("status") != "RUNNING" and (
+        state.get("status") != "WAITING" or (state.get("waiting") or {}).get("reason") != "browser_pool"
+    ):
+        return None
+    active_id = state.get("active_hop_id")
+    for hop in state.get("hops") or []:
+        if hop.get("hop_id") != active_id:
+            continue
+        observation = hop.get("report_result")
+        if (
+            hop.get("state") == "waiting" and hop.get("receipt") and not hop.get("response")
+            and not hop.get("report_path") and isinstance(observation, Mapping)
+        ):
+            checked_at = _timestamp(observation.get("checked_at"))
+            return int(active_id), 0.0 if checked_at is None else checked_at + ACTIVE_REPORT_CHECK_SECONDS
+    return None
 
 
 @dataclass
@@ -120,31 +234,38 @@ class CDPARuntimeRegistry:
         if task_id in self.immutable_task_ids:
             return None
         controls = state.get("controls") if isinstance(state.get("controls"), list) else []
-        if any(
-            isinstance(item, Mapping) and item.get("status") == "requested"
-            for item in controls
+        if (
+            next_recovering_resume_control(state) is not None
+            or pause_superseding_recovering_resume(state) is not None
+            or any(isinstance(item, Mapping) and item.get("status") == "requested" for item in controls)
         ):
             return now + MINIMUM_DEADLINE_SECONDS
         cleanup = state.get("cleanup") if isinstance(state.get("cleanup"), Mapping) else {}
         cleanup_state = str(cleanup.get("state") or "ACTIVE").upper()
+        report_check = held_report_check(state, now)
+        report_due = max(report_check[1], now + MINIMUM_DEADLINE_SECONDS) if report_check else None
         if bool(cleanup.get("retry_suppressed")):
-            return None
+            return report_due
         cleanup_retry_at = _timestamp(cleanup.get("next_retry_at"))
         if cleanup.get("next_retry_at") is not None and cleanup_retry_at is not None:
-            return max(cleanup_retry_at, now + MINIMUM_DEADLINE_SECONDS)
+            cleanup_due = max(cleanup_retry_at, now + MINIMUM_DEADLINE_SECONDS)
+            return min(cleanup_due, report_due) if report_due is not None else cleanup_due
         if cleanup_state == "CLEARING":
             return now + MINIMUM_DEADLINE_SECONDS
         status = str(state.get("status") or "INBOX").upper()
         if status in TERMINAL:
             if cleanup_state in {"CLEARED", "STOP_RELEASED"}:
-                return None
+                return report_due
             base = _timestamp(
                 state.get("completed_at")
                 or state.get("stopped_at")
                 or state.get("updated_at")
             )
             deadline = (base if base is not None else now) + self.cleanup_idle_seconds
-            return max(deadline, now + MINIMUM_DEADLINE_SECONDS)
+            cleanup_due = max(deadline, now + MINIMUM_DEADLINE_SECONDS)
+            return min(cleanup_due, report_due) if report_due is not None else cleanup_due
+        if report_due is not None:
+            return report_due
         if status == "WAITING" and (state.get("waiting") or {}).get("reason") == "browser_pool":
             return now + MINIMUM_DEADLINE_SECONDS
         if is_independent_task(state):
@@ -251,13 +372,13 @@ class CDPARuntimeRegistry:
         affected.update(previous_immutable ^ self.immutable_task_ids)
         reschedule_at = 0.0 if now is None else now
         for affected_id in affected:
-            affected_state = self.tasks_by_id.get(affected_id)
-            if affected_state is None:
-                self._due_at.pop(affected_id, None)
-                continue
-            deadline = self._deadline(affected_id, affected_state, reschedule_at)
-            if deadline is None:
-                self._due_at.pop(affected_id, None)
-            else:
-                self._due_at[affected_id] = deadline
+            self.reschedule_task(affected_id, now=reschedule_at)
         return affected
+
+    def reschedule_task(self, task_id: str, *, now: float) -> None:
+        state = self.tasks_by_id.get(task_id)
+        deadline = self._deadline(task_id, state, now) if state is not None else None
+        if deadline is None:
+            self._due_at.pop(task_id, None)
+        else:
+            self._due_at[task_id] = deadline

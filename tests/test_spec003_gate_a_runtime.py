@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import copy
+from types import SimpleNamespace
 
 import pytest
 
+from playwright_auto import cdpa_worker
 from playwright_auto.cdpa_commands import workflow_control_eligibility
 from playwright_auto.cdpa_config import load_cdpa_config
 from playwright_auto.cdpa_projection import build_task_projection
@@ -12,8 +15,9 @@ from playwright_auto.cdpa_route_contract import apply_valid_route_transition, bu
 from playwright_auto.cdpa_routes import RouteContractError, expected_report_relative
 from playwright_auto.cdpa_runtime_db import IdempotencyConflict, RuntimeDB
 from playwright_auto.cdpa_store import TaskStore
-from playwright_auto.cdpa_worker import CDPAWorker
+from playwright_auto.cdpa_worker import CDPAWorker, _active_hop
 from test_cdpa_core import write_config
+from test_cdpa_worker import FakeActions
 
 
 def _store(tmp_path):
@@ -106,6 +110,26 @@ def test_t009_durable_store_accepts_unregistered_custom_roles_with_generic_snaps
     assert contract.allowed_routes == ("CUSTOM_DEV", "PAUSE", "DONE")
 
 
+def test_team_uses_saved_route_contract_after_builtin_prompt_update(tmp_path) -> None:
+    store = _store(tmp_path)
+    state = store.create_task("preserve routes", roles=("PLAN", "DEV"))
+    initial = CDPAWorker(store.config, store=store)._gate_a_route_contract(state, "PLAN")
+
+    path = store.config.constructor_paths["PLAN"]
+    path.write_text(path.read_text(encoding="utf-8") + "\nRoute to DEV when implementation is needed.\n", encoding="utf-8")
+
+    updated = CDPAWorker(store.config, store=store)._gate_a_route_contract(state, "PLAN")
+    assert updated == initial
+    next_task = store.create_task("use updated prompt", roles=("PLAN", "DEV"))
+    assert "Route to DEV when implementation is needed." in next_task["workflow_agents"]["PLAN"]["system_prompt"]
+
+
+def test_new_team_keeps_default_route_metadata_and_async_wake_allowance(tmp_path) -> None:
+    state = _store(tmp_path).create_task("larger team", roles=("PLAN", "DEV"))
+    assert state["max_routes"] == 100
+    assert CDPAWorker._execution_budget(state)["limit"] >= 101
+
+
 def test_t016_route_repair_limit_control_is_atomic_replay_safe_and_resume_separate(tmp_path) -> None:
     store = _store(tmp_path)
     state = store.create_task(
@@ -142,14 +166,20 @@ def test_t016_route_repair_limit_control_is_atomic_replay_safe_and_resume_separa
             "route_repair_count",
         )
     }
-    with pytest.raises(ValueError, match="requires max_routes and/or max_route_repairs"):
+    with pytest.raises(ValueError, match="requires max_route_repairs"):
         store.request_control(blocked["manifest_path"], "increase_route_limits")
     with pytest.raises(ValueError, match="strictly above"):
         store.request_control(
             blocked["manifest_path"],
             "increase_route_limits",
-            max_routes=blocked["max_routes"] + 5,
             max_route_repairs=blocked["max_route_repairs"],
+        )
+    with pytest.raises(ValueError, match="historical metadata"):
+        store.request_control(
+            blocked["manifest_path"],
+            "increase_route_limits",
+            max_routes=4,
+            max_route_repairs=2,
         )
     unchanged = store.load(blocked["manifest_path"])
     assert {key: unchanged.get(key) for key in baseline} == baseline
@@ -212,7 +242,6 @@ def test_t018_self_route_counters_are_task_lifetime_and_budgeted() -> None:
         closing_role=policy.closing_role,
         semantic_routes=policy.semantic_routes,
         route_contract_id=policy.route_contract_id,
-        max_routes=policy.max_routes,
         route_seq=state["route_seq"],
         max_route_repairs=policy.max_route_repairs,
         self_route_policy=policy.self_route_policy,
@@ -222,7 +251,8 @@ def test_t018_self_route_counters_are_task_lifetime_and_budgeted() -> None:
     assert contract.allowed_routes == ("PAUSE", "DONE")
 
 
-def test_t019_route_budget_limit_control_preserves_counters_and_resume_requires_raise(tmp_path) -> None:
+@pytest.mark.parametrize("status", ["BLOCKED", "PAUSED"])
+def test_t019_historical_route_budget_block_resumes_without_changing_limits(tmp_path, status) -> None:
     store = _store(tmp_path)
     state = store.create_task(
         "route budget",
@@ -238,17 +268,18 @@ def test_t019_route_budget_limit_control_preserves_counters_and_resume_requires_
         current["route_seq"] = 1
         current["self_route_counts"]["DEV"] = 1
         current["route_repair_count"] = 1
-        current["status"] = "BLOCKED"
-        current["kanban_column"] = "BLOCKED"
+        current["status"] = status
+        current["kanban_column"] = status
         current["block_code"] = "ROUTE_BUDGET_EXHAUSTED"
         current["block_retryable"] = False
         current["block_reason"] = "route budget exhausted"
-        current["active_action"] = "blocked"
+        current["active_action"] = status.lower()
         return current
 
     blocked = store.update(state["manifest_path"], exhaust)
     assert workflow_control_eligibility(blocked, "retry")["eligible"] is False
-    assert workflow_control_eligibility(blocked, "resume")["eligible"] is False
+    assert workflow_control_eligibility(blocked, "resume")["eligible"] is True
+    assert workflow_control_eligibility(blocked, "increase_route_limits")["eligible"] is False
 
     snapshot = {
         key: copy.deepcopy(blocked.get(key))
@@ -260,37 +291,123 @@ def test_t019_route_budget_limit_control_preserves_counters_and_resume_requires_
             "route_repair_count",
         )
     }
-    with pytest.raises(ValueError, match="strictly above"):
+    with pytest.raises(ValueError, match="historical metadata"):
         store.request_control(
             blocked["manifest_path"],
             "increase_route_limits",
-            max_routes=1,
+            max_routes=2,
             max_route_repairs=3,
         )
     unchanged = store.load(blocked["manifest_path"])
     assert {key: unchanged.get(key) for key in snapshot} == snapshot
 
-    raised = store.request_control(
-        blocked["manifest_path"],
-        "increase_route_limits",
-        max_routes=2,
-        external_command_id="cmd-raise-route-limit",
-    )
-    assert raised["max_routes"] == 2
-    assert raised["route_seq"] == 1
-    assert raised["self_route_counts"]["DEV"] == 1
-    assert raised["route_repair_count"] == 1
-    assert workflow_control_eligibility(raised, "resume")["eligible"] is True
-
     resumed = store.request_control(
         blocked["manifest_path"],
         "resume",
-        reason="continue after route limit increase",
+        reason="continue past historical route cap",
         external_command_id="cmd-resume-route",
     )
-    assert resumed["route_seq"] == 1
-    assert resumed["self_route_counts"]["DEV"] == 1
+    assert {key: resumed.get(key) for key in snapshot} == snapshot
     assert resumed["route_repair_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("origin", "verified", "manually_paused"),
+    [
+        ("operator", True, False),
+        ("scheduler", True, False),
+        ("operator", False, False),
+        ("operator", True, True),
+    ],
+)
+def test_resume_past_historical_cap_verifies_progress_and_preserves_route_metadata(
+    tmp_path, origin, verified, manually_paused, monkeypatch,
+) -> None:
+    store = _store(tmp_path)
+    worker = CDPAWorker(store.config, store=store)
+    state = store.create_task(
+        "resume a long team", roles=("PLAN", "DEV"), start_role="DEV", max_routes=8,
+    )
+    assert worker._prepare_execution_endpoint(state, str(state["browser_endpoint_id"]))
+    state["route_seq"] = 8
+    state["self_route_counts"]["DEV"] = 1
+    budget = worker._execution_budget(state)
+    budget.update(limit=12, charged_hop_ids=list(range(1, 13)))
+    state = store.save(state["manifest_path"], state)
+    blocked = _set_block(store, state, code="ROUTE_BUDGET_EXHAUSTED")
+    if manually_paused:
+        worker._apply_pause_transition(blocked, {"reason": "Operator pause"})
+        blocked = store.save(blocked["manifest_path"], blocked)
+    queued = store.request_resume(blocked["manifest_path"])
+    queued["controls"][-1]["origin"] = origin
+    queued = store.save(queued["manifest_path"], queued)
+    actions = FakeActions()
+
+    assert asyncio.run(worker._apply_control(queued, actions, queued["manifest_path"]))
+    control = queued["controls"][-1]
+    assert control["status"] == "recovering"
+    assert queued["kanban_column"] == "WORKING"
+    assert queued["max_routes"] == 8
+    assert "route_budget_start_seq" not in queued
+
+    path = queued["manifest_path"]
+    fresh_store = TaskStore(store.config)
+    fresh_worker = CDPAWorker(store.config, store=fresh_store)
+    monkeypatch.setattr(cdpa_worker, "CDPATabActions", lambda *_args, **_kwargs: actions)
+    if not verified:
+        async def unavailable(*_args, **_kwargs):
+            raise RuntimeError("Owned tab could not be attached.")
+
+        monkeypatch.setattr(actions, "acquire", unavailable)
+    asyncio.run(fresh_worker.advance(
+        path, SimpleNamespace(pages=[]), endpoint_id=queued["browser_endpoint_id"],
+    ))
+
+    queued = fresh_store.load(path)
+    control = queued["controls"][-1]
+    assert _active_hop(queued)["request_id"] == _active_hop(blocked)["request_id"]
+    assert queued["route_seq"] == 8
+    assert queued["self_route_counts"]["DEV"] == 1
+    if not verified:
+        assert control["status"] == "failed", control["result"]
+        assert queued["max_routes"] == 8
+        assert "route_budget_start_seq" not in queued
+        assert queued["execution_budget"] == budget
+        return
+
+    assert control["status"] == "applied", control["result"]["reason"]
+    assert queued["max_routes"] == 8
+    assert "route_budget_start_seq" not in queued
+    budget = queued["execution_budget"]
+    assert len(budget["charged_hop_ids"]) == 12
+    assert budget["limit"] - len(budget["charged_hop_ids"]) >= 100
+
+
+def test_resume_preserves_presend_block_reason_without_unrelated_recovery_advice(
+    tmp_path, monkeypatch,
+) -> None:
+    store = _store(tmp_path)
+    worker = CDPAWorker(store.config, store=store)
+    state = store.create_task("verify pre-send Resume failure", roles=("PLAN", "DEV"))
+    state = _set_block(store, state, code="ROUTE_CONTRACT_INVALID")
+    state = store.request_resume(state["manifest_path"])
+    actions = FakeActions()
+
+    async def invalid_route(current, hop, actions):
+        worker._block(
+            current, "Semantic route destination is unavailable",
+            code="ROUTE_CONTRACT_INVALID", retryable=False,
+        )
+
+    monkeypatch.setattr(worker, "_pre_send", invalid_route)
+    assert asyncio.run(worker._apply_control(state, actions))
+    control = state["controls"][-1]
+    asyncio.run(worker._recover_resume_control(state, control, actions))
+
+    assert control["status"] == "recovery_required"
+    assert control["result"]["reason_code"] == "ROUTE_CONTRACT_INVALID"
+    assert control["result"]["reason"] == "Semantic route destination is unavailable"
+    assert control["result"]["next_safe_action"] is None
 
 
 def test_t016_worker_route_repair_exhausts_per_turn_without_retryable_block(tmp_path) -> None:

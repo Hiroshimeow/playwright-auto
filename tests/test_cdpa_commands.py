@@ -86,9 +86,9 @@ def test_workflow_control_matrix_projects_positive_and_negative_durable_admissio
     matrix = workflow_control_matrix(current)
 
     assert tuple(matrix) == (
-        "pause", "resume", "retry", "restart_role", "new_chat",
-        "open_tab", "route_plan", "release_required_browser_endpoint",
-        "stop", "clear_team", "archive_worktree", "increase_route_limits",
+        "pause", "resume", "retry", "restart_role", "restart_team", "new_chat",
+        "open_tab", "change_role_url", "reconcile_presend_acquisition", "route_plan", "release_required_browser_endpoint",
+        "stop", "stop_at_boundary", "clear_team", "archive_worktree", "increase_route_limits",
     )
     assert matrix["pause"]["eligible"] is True
     assert matrix["resume"]["eligible"] is True
@@ -97,6 +97,7 @@ def test_workflow_control_matrix_projects_positive_and_negative_durable_admissio
     assert "Send boundary" in matrix["restart_role"]["reason"]
     assert matrix["new_chat"]["eligible"] is False
     assert matrix["open_tab"]["eligible"] is True
+    assert matrix["reconcile_presend_acquisition"]["eligible"] is False
     assert matrix["route_plan"]["eligible"] is False
     assert matrix["stop"]["eligible"] is True
     assert matrix["clear_team"]["eligible"] is True

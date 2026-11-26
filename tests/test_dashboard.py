@@ -503,6 +503,106 @@ def test_notify_report_fallback_uses_chronologically_latest_cross_role_report():
     }
 
 
+def test_notify_uses_linked_report_and_explains_blocked_stopped_and_paused_tasks():
+    module = (ASSET_ROOT / "views" / "notify.js").resolve().as_uri()
+    script = f"""
+      import {{notifyReportModel, renderNotifyReport}} from {json.dumps(module)};
+      import assert from 'node:assert/strict';
+      class Node {{
+        dataset = {{}};
+        children = [];
+        textContent = '';
+        setAttribute() {{}}
+        append(...children) {{ this.children.push(...children); }}
+        replaceChildren(n) {{ this.children = [n]; }}
+        get text() {{ return this.textContent + this.children.map(c => c.text).join(' '); }}
+      }}
+      globalThis.document = {{createElement: () => new Node()}};
+      const root = new Node();
+      const bodies = new Map([['/plan1', {{status: 'ready', body: '# Actual Markdown'}}]]);
+      const detail = {{
+        status: 'DONE', team: 'alpha', closing_role: 'PLAN',
+        roles: [{{logical_role: 'PLAN', physical_role: 'alpha-plan'}}],
+        reports: [
+          {{report_id: '17', role: 'PLAN', turn: 1, url: '/plan1'}},
+          {{report_id: '22', role: 'PLAN', turn: 2, url: '/plan2'}},
+          {{report_id: 'handoff-hop-1', role: 'PLAN', turn: 2, material_type: 'handoff',
+            linked_report_id: '17', material_url: '/handoff', content: '{{"route":"DEV"}}'}},
+        ],
+      }};
+      renderNotifyReport(root, detail, bodies);
+      assert.match(root.text, /Actual Markdown/);
+      assert.doesNotMatch(root.text, /"route"/);
+      const unlinked = {{...detail, reports: detail.reports.map(r => ({{...r, linked_report_id: undefined}}))}};
+      assert.equal(notifyReportModel(unlinked).selectedReport.url, '/plan2');
+
+      renderNotifyReport(root, {{...detail, status: 'BLOCKED', active_role: 'DEV',
+        primary_problem: {{kind: 'BLOCKED', code: 'draft_pending', message: 'Operator draft prevents Send.'}},
+        controls: [{{status: 'recovery_required', result: {{reason_code: 'draft_pending',
+          next_safe_action: 'Save your draft, then Resume.'}}}}],
+      }}, bodies);
+      assert.match(root.text, /Operator draft prevents Send./);
+      assert.match(root.text, /draft_pending/);
+      assert.match(root.text, /Save your draft, then Resume./);
+      renderNotifyReport(root, {{...detail, status: 'BLOCKED', active_role: 'PLAN',
+        primary_problem: {{code: 'response_terminal_missing', message: 'The report is missing.'}},
+        active_input: {{turn: 2, expected_report: 'plan2.md'}},
+        reports: [{{report_id: '22', role: 'PLAN', turn: 2, availability: 'unavailable'}}],
+      }}, bodies);
+      assert.doesNotMatch(root.text, /Saved report/);
+      assert.match(root.text, /Report is unavailable on this dashboard host/);
+      renderNotifyReport(root, {{...detail, status: 'STOPPED', stop_reason: 'Stopped by operator.',
+        cleanup: {{last_error: 'Stop has no exact owned page evidence'}}}}, bodies);
+      assert.match(root.text, /Stopped by operator./);
+      assert.match(root.text, /Stop has no exact owned page evidence/);
+      renderNotifyReport(root, {{...detail, status: 'PAUSED', pause_reason: 'Waiting for approval.'}}, bodies);
+      assert.match(root.text, /Waiting for approval./);
+      renderNotifyReport(root, {{...detail, status: 'PAUSED', active_role: 'PLAN',
+        active_hop: {{hop_id: 2, state: 'routed', turn: 2, logical_role: 'PLAN',
+          physical_role: 'alpha-plan', expected_report: 'plan2.md'}},
+        reports: [{{report_id: '22', hop_id: 2, role: 'PLAN', physical_role: 'alpha-plan',
+          turn: 2, path: 'plan2.md', url: '/plan2'}}],
+      }}, new Map([['/plan2', {{status: 'ready', body: 'resume_condition: Connect the exact tab.'}}]]));
+      assert.doesNotMatch(root.text, /No pause reason was recorded/);
+      assert.doesNotMatch(root.text, /Saved report/);
+      assert.match(root.text, /Connect the exact tab./);
+    """
+    __import__("subprocess").run(["node", "--input-type=module", "-e", script], check=True)
+
+
+def test_notify_selects_actual_output_of_exact_hop_and_physical_role():
+    module = (ASSET_ROOT / "views" / "notify.js").resolve().as_uri()
+    script = f"""
+      import {{notifyReportModel}} from {json.dumps(module)};
+      import assert from 'node:assert/strict';
+      const hop = {{hop_id: 19, logical_role: 'DEV', physical_role: 'snaparc-dev-new',
+        turn: 6, expected_report: 'snaparc-dev-new_turn6.md'}};
+      const oldOutput = {{report_id: 'old', role: 'DEV', turn: 6, url: '/hop9',
+        hop_id: 9, physical_role: 'snaparc-dev-old'}};
+      const inbound = {{...oldOutput, report_id: 'inbound', hop_id: 19,
+        physical_role: hop.physical_role, material_type: 'handoff', linked_report_id: 'old'}};
+      const wrongPhysical = {{...oldOutput, report_id: 'wrong', hop_id: 19}};
+      const detail = {{
+        status: 'BLOCKED', active_role: 'DEV', active_hop_id: 19, active_hop: hop, active_input: hop,
+        role_inputs: {{DEV: {{...hop, hop_id: 9, physical_role: 'snaparc-dev-old'}}}},
+        roles: [{{logical_role: 'DEV', physical_role: hop.physical_role, turn: 6}}],
+        reports: [oldOutput, inbound, wrongPhysical],
+      }};
+      const missing = notifyReportModel(detail);
+      assert.equal(missing.selectedReport, null);
+      assert.equal(missing.selectedExpectedMissing, true);
+      assert.match(missing.selectedMissingReason, /snaparc-dev-new_turn6.md/);
+      assert.equal(notifyReportModel({{...detail, active_hop: null,
+        active_input: detail.role_inputs.DEV}}).selectedReport, null);
+
+      const actual = {{...oldOutput, report_id: 'actual', url: '/hop19',
+        hop_id: 19, physical_role: hop.physical_role}};
+      assert.equal(notifyReportModel({{...detail, reports: [actual, ...detail.reports]}})
+        .selectedReport?.url, '/hop19');
+    """
+    __import__("subprocess").run(["node", "--input-type=module", "-e", script], check=True)
+
+
 def test_notify_frontend_contract_reuses_secondary_report_path_and_preserves_history():
     html = DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
     app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
@@ -519,7 +619,7 @@ def test_notify_frontend_contract_reuses_secondary_report_path_and_preserves_his
     assert 'if (current.drawer === "history") renderHistory(roots.secondaryContent, current);' in app
     assert 'if (current.drawer === "notify") renderNotify(roots.secondaryContent, current);' in app
     assert 'if (view === "notify") delete roots.secondaryContent.dataset.secondaryView;' in app
-    cache_key = "20260925-live-sse-v1"
+    cache_key = "cdpa-accepted-report-v1"
     assert f'/assets/app.js?v={cache_key}' in html
     assert f'./views/task_detail.js?v={cache_key}' in app
     assert f'./views/notify.js?v={cache_key}' in app
@@ -534,7 +634,8 @@ def test_notify_frontend_contract_reuses_secondary_report_path_and_preserves_his
     assert 'event.target.closest("[data-notify-task-id]")' in app
     notify_open = app.split("async function openNotifyReport", 1)[1].split("\n}", 1)[0]
     assert "loadTaskDetail(taskId)" in notify_open
-    assert "loadReports(detail)" in notify_open
+    assert "readReportBody(report, url)" in notify_open
+    assert "report?.url || report?.material_url" in notify_open
     assert "selectTask(" not in notify_open
     assert 'kind: "reload_catalog"' not in app
     done = css.split('.notify-row[data-status="DONE"] {', 1)[1].split("}", 1)[0]
@@ -809,13 +910,15 @@ def test_runtime_uses_fixed_hybrid_observation_without_mode_help():
 
 
 def test_workflow_controls_fail_closed_from_projected_eligibility_with_reason_tooltips():
+    app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
     detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
-    workflow = detail.split("function workflowOverview", 1)[1].split("function build", 1)[0]
+    workflow = detail.split("function workflowControlButton", 1)[1].split("function workflowOverview", 1)[0]
 
     assert "detail.control_eligibility?.[action]" in workflow
     assert "eligible: false" in workflow
-    assert "disabled: eligibility.eligible !== true" in workflow
-    assert "reason: eligibility.reason || null" in workflow
+    assert 'action !== "restart_role" && eligibility.eligible !== true' in workflow
+    assert 'control.dataset.control === "restart_role" && control.dataset.disabledReason' in app
+    assert "eligibility.reason || null" in workflow
     assert "node.title = String(reason)" in detail
     assert "node.dataset.disabledReason = String(reason)" in detail
 
@@ -826,7 +929,84 @@ def test_worktree_archive_control_is_operator_visible_and_requires_confirmation(
     workflow = detail.split("function workflowOverview", 1)[1].split("function build", 1)[0]
 
     assert '["archive_worktree", "Archive worktree"]' in workflow
-    assert '["stop", "clear_team", "archive_worktree"].includes(control.dataset.control)' in app
+    assert '["stop", "restart_team", "clear_team", "archive_worktree"].includes(control.dataset.control)' in app
+    assert 'window.confirm("Stop this team and start a fresh replacement with the same goal and setup?")' in app
+
+
+def test_route_limit_recovery_is_visible_and_uses_the_versioned_control():
+    detail = (ASSET_ROOT / "views" / "task_detail.js").read_text(encoding="utf-8")
+    app = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
+    workflow = detail.split("function workflowRecoveryControls", 1)[1].split("function build", 1)[0]
+
+    assert "detail.control_eligibility?.increase_route_limits?.eligible" in workflow
+    assert '"max_routes"' not in workflow and '"max_route_repairs"' in workflow
+    assert "Increase repair limit" in workflow and "Resume" in workflow
+    control = app.split('control.dataset.control === "increase_route_limits"', 1)[1].split("return;", 2)[-1]
+    assert 'kind: "increase_route_limits"' in control
+    assert "expected_task_version: Number(control.dataset.version)" in control
+    assert "[control.dataset.limitField]: limit" in control
+
+
+def test_route_repair_recovery_stays_visible_on_every_workflow_tab(tmp_path):
+    from playwright.sync_api import sync_playwright
+
+    server, thread = start_frontend(tmp_path, api_port=65530)
+    try:
+        with sync_playwright() as playwright:
+            if not Path(playwright.chromium.executable_path).is_file():
+                __import__("pytest").skip("Playwright Chromium is unavailable")
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.goto(f"http://127.0.0.1:{server.server_address[1]}/health")
+                page.evaluate("""async () => {
+                  const {renderTaskDetail} = await import('/assets/views/task_detail.js');
+                  const {renderNotifyReport} = await import('/assets/views/notify.js');
+                  const root = document.createElement('div');
+                  root.id = 'workflow';
+                  const notify = document.createElement('div');
+                  notify.id = 'notify';
+                  document.body.replaceChildren(root, notify);
+                  const detail = {
+                    task_id: 'budget-task', team: 'budget-team', version: 1,
+                    status: 'BLOCKED', active_role: 'REVIEW',
+                    block_code: 'ROUTE_VALIDATION_EXHAUSTED',
+                    route_repair_count: 2, max_route_repairs: 2,
+                    control_eligibility: {
+                      resume: {eligible: false}, increase_route_limits: {eligible: true},
+                    },
+                  };
+                  window.render = (tab, raised = false) => {
+                    if (raised) {
+                      detail.max_route_repairs = 3;
+                      detail.version = 2;
+                      detail.control_eligibility.resume.eligible = true;
+                    }
+                    renderTaskDetail(root, detail, [], 'REVIEW', 'budget-task',
+                      'ready', null, tab);
+                  };
+                  renderNotifyReport(notify, detail, new Map());
+                }""")
+                controls = page.locator("#workflow")
+                resume = controls.get_by_role("button", name="Resume", exact=True)
+                increase = controls.get_by_role("button", name="Increase repair limit")
+                for tab in ("overview", "live", "reports"):
+                    page.evaluate("tab => window.render(tab)", tab)
+                    assert resume.is_visible() and resume.is_disabled()
+                    assert increase.is_visible() and increase.is_enabled()
+                    assert increase.get_attribute("data-minimum-limit") == "3"
+                    assert controls.get_by_text("Route repairs used: 2/2", exact=False).is_visible()
+                page.evaluate("window.render('reports', true)")
+                assert resume.is_visible() and resume.is_enabled()
+                assert increase.count() == 0
+                open_task = page.locator("#notify").get_by_role("button", name="Open task")
+                assert open_task.get_attribute("data-task-id") == "budget-task"
+            finally:
+                browser.close()
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
 
 
 def test_task_controls_render_inside_operational_state_before_task_prompt():
@@ -1109,8 +1289,8 @@ def test_board_lane_materialization_keeps_commands_after_operational_lanes():
     assert "if (firstMaterialization) root.scrollLeft = 0;" in board
 
     # board.js and its importing entrypoint both get fresh cache identities.
-    assert './views/board.js?v=20260915-operator-ux-v1' in app
-    assert '/assets/app.js?v=20260925-live-sse-v1' in html
+    assert './views/board.js?v=cdpa-recovery-controls-v2' in app
+    assert '/assets/app.js?v=cdpa-accepted-report-v1' in html
 
 
 def test_dashboard_compact_layout_contract_keeps_operational_content_visible():
@@ -1118,7 +1298,7 @@ def test_dashboard_compact_layout_contract_keeps_operational_content_visible():
     css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
 
     # CSS byte changes must publish under a new cache identity.
-    assert '/assets/dashboard.css?v=20260925-live-sse-v1' in html
+    assert '/assets/dashboard.css?v=cdpa-recovery-controls-v2' in html
 
     # Endpoint scope is one compact equal-height topology; required operational
     # fields must not be hidden behind a fixed maximum card height.
@@ -1145,9 +1325,9 @@ def test_dashboard_dense_operator_layout_contract():
     css = (ASSET_ROOT / "dashboard.css").read_text(encoding="utf-8")
 
     # Published frontend bytes use a fresh cache identity through the changed import graph.
-    assert '/assets/dashboard.css?v=20260925-live-sse-v1' in html
-    assert '/assets/app.js?v=20260925-live-sse-v1' in html
-    assert './views/board.js?v=20260915-operator-ux-v1' in app
+    assert '/assets/dashboard.css?v=cdpa-recovery-controls-v2' in html
+    assert '/assets/app.js?v=cdpa-accepted-report-v1' in html
+    assert './views/board.js?v=cdpa-recovery-controls-v2' in app
     assert './views/browsers.js?v=20260915-endpoint-all-v1' in app
 
     # Endpoint controls are compact: state + CDP share a row and load gets visual priority.
@@ -1312,8 +1492,9 @@ def test_health_dashboard_report_model_does_not_show_prior_turn_as_current():
         status: "RUNNING", active_role: "DEV", active_hop_id: 3,
         roles: [{{logical_role: "DEV", physical_role: "alpha-dev"}}],
         role_inputs: {{DEV: {{logical_role: "DEV", turn: 2, expected_report: "alpha-dev_turn2_task-a.md"}}}},
-        active_input: {{logical_role: "DEV", turn: 2, expected_report: "alpha-dev_turn2_task-a.md"}},
-        reports: [{{role: "DEV", physical_role: "alpha-dev", turn: 1, url: "/dev-turn1"}}],
+        active_hop: {{hop_id: 3, physical_role: "alpha-dev", expected_report: "alpha-dev_turn2_task-a.md"}},
+        active_input: {{hop_id: 3, logical_role: "DEV", physical_role: "alpha-dev", turn: 2, expected_report: "alpha-dev_turn2_task-a.md"}},
+        reports: [{{hop_id: 1, role: "DEV", physical_role: "alpha-dev", turn: 1, url: "/dev-turn1"}}],
       }};
       const model = workflowReportModel(detail, "DEV");
       console.log(JSON.stringify({{

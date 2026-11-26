@@ -58,7 +58,7 @@ from .cdpa_independent import (
     validate_trigger_settings,
 )
 from .cdpa_provider_runtime import ProviderRuntimeError, select_provider
-from .cdpa_role_policy import RolePolicyError, build_role_policy, normalize_role_list
+from .cdpa_role_policy import DEFAULT_MAX_ROUTES, RolePolicyError, build_role_policy, normalize_role_list
 from .cdpa_routes import effective_report_mode, normalize_report_mode
 from .cdpa_safety import sanitize_text
 from .cdpa_store_common import TERMINAL, _validate_task_id, slugify, utc_now
@@ -3192,7 +3192,7 @@ class TaskStore(IndependentAgentStoreMixin):
         route_targets: Sequence[str] = (),
         closing_role: str | None = None,
         provider_id: str = "chatgpt_web",
-        max_routes: int = 8,
+        max_routes: int = DEFAULT_MAX_ROUTES,
         max_route_repairs: int | None = None,
         self_route_policy: Any = "forbidden",
         new_roles: Sequence[str] = (),
@@ -4987,6 +4987,7 @@ class TaskStore(IndependentAgentStoreMixin):
         incident_id: str | None = None,
         source_task_id: str | None = None,
         source_event_key: str | None = None,
+        restart_team: bool = False,
     ) -> dict[str, Any]:
         target_id = _validate_task_id(target_task_id)
         recovery_instruction = str(replacement_task).strip()
@@ -5123,7 +5124,7 @@ class TaskStore(IndependentAgentStoreMixin):
                         "replacement target must be STOPPED or BLOCKED"
                     )
                 cleanup = target_state.get("cleanup")
-                if isinstance(cleanup, Mapping) and str(
+                if not restart_team and isinstance(cleanup, Mapping) and str(
                     cleanup.get("state") or ""
                 ).upper() in {"CLEARING", "CLEARED"}:
                     raise ValueError(
@@ -5134,9 +5135,13 @@ class TaskStore(IndependentAgentStoreMixin):
                         "reuse_team requires a STOPPED replacement target"
                     )
 
-                task_text = replacement_continuation_text(
-                    target_state, recovery_instruction
-                )
+                continuation = replacement_continuation_text(target_state, recovery_instruction)
+                if restart_team:
+                    if target_status != "STOPPED" or str(target_state.get("workflow_mode") or "team") != "team" or is_independent_task(target_state):
+                        raise ValueError("Restart team requires a stopped Team Task")
+                    if any(item.get("replaces_task_id") == target_id for item in manifests):
+                        raise ValueError("The team already has a replacement")
+                task_text = effective_task_goal(target_state) if restart_team else continuation
                 known_ids = {str(item["task_id"]) for item in manifests}
                 replacement_id = generate_task_id(task_text)
                 while replacement_id in known_ids:
@@ -5202,7 +5207,7 @@ class TaskStore(IndependentAgentStoreMixin):
 
                 now = utc_now()
                 repository_path = Path(target_state["repository"]).expanduser().resolve()
-                report_mode = "file"
+                report_mode = str((target_state.get("options") or {}).get("report_mode") or "file") if restart_team else "file"
                 target_definitions = task_workflow_definitions(target_state, self.config)
                 inherited_initial_roles = tuple(
                     target_state.get("initial_roles") or tuple(target_definitions)
@@ -5242,7 +5247,7 @@ class TaskStore(IndependentAgentStoreMixin):
                         else {}
                     ),
                     provider_id=str(target_state.get("provider_id") or "chatgpt_web"),
-                    max_routes=int(target_state.get("max_routes") or 8),
+                    max_routes=int(target_state.get("max_routes") or DEFAULT_MAX_ROUTES),
                     max_route_repairs=(
                         int(target_state["max_route_repairs"])
                         if "max_route_repairs" in target_state
@@ -5259,14 +5264,14 @@ class TaskStore(IndependentAgentStoreMixin):
                     normalized_dependencies=dependencies,
                     normalized_replaces=target_id,
                     normalized_incident=incident,
-                    normalized_attachments=(),
+                    normalized_attachments=tuple(target_state.get("attachments") or ()) if restart_team else (),
                     readiness=readiness,
                     queue_reuse=False,
                     queue_blocked_by=None,
                     now=now,
                     normalized_bootstrap=(
                         target_state.get("bootstrap")
-                        if isinstance(target_state.get("bootstrap"), Mapping)
+                        if not restart_team and isinstance(target_state.get("bootstrap"), Mapping)
                         else None
                     ),
                     browser_endpoint_id=self.endpoint_id_for(target_state),
@@ -5276,11 +5281,14 @@ class TaskStore(IndependentAgentStoreMixin):
                     ),
                     conversation_mode=str(target_state.get("conversation_mode") or "persistent"),
                     context_policy=(
-                        str(target_state.get("context_policy"))
+                        "fresh" if restart_team else str(target_state.get("context_policy"))
                         if target_state.get("context_policy") in {"fresh", "bootstrap"}
                         else None
                     ),
+                    initial_role=str(target_state.get("start_role") or inherited_initial_roles[0]) if restart_team else None,
                 )
+                if restart_team:
+                    replacement_state["hops"][0]["handoff"] = continuation
                 replacement_state["dependency_events"].append(
                     {
                         "at": now,
@@ -6305,37 +6313,24 @@ class TaskStore(IndependentAgentStoreMixin):
         max_route_repairs: int | None = None,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
-        if max_routes is None and max_route_repairs is None:
-            raise ValueError("increase_route_limits requires max_routes and/or max_route_repairs")
-
         def mutate(state: dict[str, Any]) -> dict[str, Any]:
             if external_command_id in state.get("applied_command_ids", []):
                 return state
+            if max_routes is not None:
+                raise ValueError("max_routes is historical metadata. Resume the task to continue past the former cap.")
+            if max_route_repairs is None:
+                raise ValueError("increase_route_limits requires max_route_repairs")
             eligibility = workflow_control_eligibility(state, "increase_route_limits")
             if not eligibility["eligible"]:
                 raise ValueError(str(eligibility["reason"] or "route-limit increase is not eligible"))
-            proposed: dict[str, int] = {}
-            checks = (
-                ("max_routes", max_routes, int(state.get("route_seq") or 0)),
-                (
-                    "max_route_repairs",
-                    max_route_repairs,
-                    int(state.get("route_repair_count") or 0),
-                ),
-            )
-            for field, value, consumed in checks:
-                if value is None:
-                    continue
-                if isinstance(value, bool) or not isinstance(value, int):
-                    raise ValueError(f"{field} must be an integer")
-                current = int(state.get(field) or 0)
-                if value <= current or value <= consumed:
-                    raise ValueError(
-                        f"{field} must be strictly above current limit {current} and consumed count {consumed}"
-                    )
-                proposed[field] = value
-            if not proposed:
-                raise ValueError("increase_route_limits requires a non-empty valid payload")
+            if isinstance(max_route_repairs, bool) or not isinstance(max_route_repairs, int):
+                raise ValueError("max_route_repairs must be an integer")
+            consumed = int(state.get("route_repair_count") or 0)
+            current = int(state.get("max_route_repairs") or 0)
+            if max_route_repairs <= max(current, consumed):
+                raise ValueError(
+                    f"max_route_repairs must be strictly above current limit {current} and consumed count {consumed}"
+                )
             before = {
                 "max_routes": int(state.get("max_routes") or 0),
                 "max_route_repairs": int(state.get("max_route_repairs") or 0),
@@ -6343,13 +6338,13 @@ class TaskStore(IndependentAgentStoreMixin):
                 "route_repair_count": int(state.get("route_repair_count") or 0),
                 "self_route_counts": dict(state.get("self_route_counts") or {}),
             }
-            state.update(proposed)
+            state["max_route_repairs"] = max_route_repairs
             state.setdefault("controls", []).append(
                 {
                     "control_id": len(state.get("controls") or []) + 1,
                     "action": "increase_route_limits",
                     "role": str(state.get("active_role") or "").upper() or None,
-                    "reason": "route limits increased",
+                    "reason": "route-repair limit increased",
                     "confirmed": True,
                     "origin": "operator",
                     "command": None,
@@ -6361,8 +6356,7 @@ class TaskStore(IndependentAgentStoreMixin):
                         "before": before,
                         "after": {
                             **before,
-                            "max_routes": int(state.get("max_routes") or 0),
-                            "max_route_repairs": int(state.get("max_route_repairs") or 0),
+                            "max_route_repairs": max_route_repairs,
                         },
                     },
                     "external_command_id": str(external_command_id).strip()
@@ -6385,9 +6379,10 @@ class TaskStore(IndependentAgentStoreMixin):
         confirmed: bool = False,
         max_routes: int | None = None,
         max_route_repairs: int | None = None,
+        conversation_url: str | None = None,
         external_command_id: str | None = None,
     ) -> dict[str, Any]:
-        allowed = {"pause", "resume", "retry", "stop", "reset", "restart_role", "open_tab", "reconcile_presend_acquisition", "close_tab", "new_chat", "route_plan", "release_required_browser_endpoint", "clear_team", "archive_worktree", "increase_route_limits"}
+        allowed = {"pause", "resume", "retry", "stop", "stop_at_boundary", "reset", "restart_role", "open_tab", "change_role_url", "reconcile_presend_acquisition", "close_tab", "new_chat", "route_plan", "release_required_browser_endpoint", "clear_team", "archive_worktree", "increase_route_limits"}
         action = str(action).strip().lower()
         if action not in allowed:
             raise ValueError(f"unsupported control action {action!r}")
@@ -6410,11 +6405,13 @@ class TaskStore(IndependentAgentStoreMixin):
             )
 
         def mutate(state: dict[str, Any]) -> dict[str, Any]:
+            if action == "change_role_url" and (is_independent_task(state) or not role or not conversation_url):
+                raise ValueError("Change URL requires a workflow role and a conversation URL")
             if is_independent_task(state) and action == "release_required_browser_endpoint":
                 raise ValueError(
                     "Required browser endpoint release is available only for workflow tasks"
                 )
-            if is_independent_task(state) and action == "stop":
+            if is_independent_task(state) and action in {"stop", "stop_at_boundary"}:
                 raise ValueError("independent agents use Reset; Stop is not supported")
             if not is_independent_task(state) and action == "reset":
                 raise ValueError("Reset is available only for independent agents")
@@ -6428,7 +6425,7 @@ class TaskStore(IndependentAgentStoreMixin):
                     raise ValueError(f"unsupported control role {role!r}")
             if external_command_id in state.get("applied_command_ids", []):
                 return state
-            self._queue_control(
+            control = self._queue_control(
                 state,
                 action,
                 role=role,
@@ -6437,6 +6434,8 @@ class TaskStore(IndependentAgentStoreMixin):
                 origin="operator",
                 external_command_id=external_command_id,
             )
+            if action == "change_role_url":
+                control["conversation_url"] = conversation_url
             self._record_external_command(state, external_command_id)
             return state
 
