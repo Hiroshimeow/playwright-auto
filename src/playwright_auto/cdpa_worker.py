@@ -4312,10 +4312,29 @@ class CDPAWorker:
             return  # Preserve owned provider context for inspection; diagnosis must not close it.
         if state.get("block_code") == "model_verification_blocked":
             return  # The operator needs this exact tab to select the required model.
+        block_code = state.get("block_code")
+        if block_code in _PRE_SEND_FAILURE_BLOCK_CODES or block_code in {
+            "ASYNC_WAKE_IDENTITY_MISMATCH",
+            "pre_send_request_recovery_required",
+            "preboundary_acquisition_recovery_required",
+            "preboundary_context_unrecoverable",
+            "durable_send_provenance_missing",
+            "accepted_send_receipt_missing",
+            "accepted_send_provenance_unverified",
+            "accepted_conversation_identity_unresolved",
+            "resume_recovery_failed",
+            "resume_progress_unverified",
+        }:
+            # The page may be the only surviving identity/provenance evidence,
+            # even before RequestLedger.begin. Cleanup must not erase it.
+            return
         try:
             hop = _active_hop(state)
         except Exception:
             hop = None
+        recovery = hop.get("preboundary_recovery") if isinstance(hop, Mapping) else None
+        if isinstance(recovery, Mapping) and recovery.get("phase") == "recovery_required":
+            return  # Legacy generic blocks must retain the exact acquisition evidence.
         if isinstance(hop, Mapping) and self._idle_report_repair_parent(state, hop):
             return  # Preserve the accepted page for a queued or blocked report reconciliation.
         if (
