@@ -5124,6 +5124,8 @@ class TaskStore(IndependentAgentStoreMixin):
                         "replacement target must be STOPPED or BLOCKED"
                     )
                 cleanup = target_state.get("cleanup")
+                if isinstance(cleanup, Mapping) and cleanup.get("phase") == "writer_stop_pending":
+                    raise ValueError("replacement requires completed Stop writer cleanup")
                 if not restart_team and isinstance(cleanup, Mapping) and str(
                     cleanup.get("state") or ""
                 ).upper() in {"CLEARING", "CLEARED"}:

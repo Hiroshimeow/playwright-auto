@@ -13387,6 +13387,58 @@ class CDPAWorker:
 
     def _finish_team_restart(self, state: Mapping[str, Any], command_id: str) -> None:
         try:
+            if (state.get("cleanup") or {}).get("phase") == "writer_stop_pending":
+                command = self.runtime_db.get_command(command_id)
+                payload = (command or {}).get("payload") or {}
+                if (
+                    not command or command.get("kind") != "task_control"
+                    or command.get("task_id") != state.get("task_id")
+                    or payload.get("action") != "restart_team"
+                    or payload.get("confirmed") is not True
+                ):
+                    raise ValueError("Restart waiting for Stop requires its exact admitted command")
+
+                def link_restart(current: dict[str, Any]) -> dict[str, Any]:
+                    cleanup = current.get("cleanup") or {}
+                    if cleanup.get("phase") != "writer_stop_pending":
+                        return current
+                    stop = next((
+                        item for item in current.get("controls") or []
+                        if item.get("control_id") == cleanup.get("stop_control_id")
+                        and item.get("action") in {"stop", "stop_at_boundary"}
+                        and item.get("status") == "applied"
+                    ), None)
+                    if current.get("status") != "STOPPED" or stop is None:
+                        raise ValueError("Pending writer cleanup lacks its exact applied Stop")
+                    if stop.get("external_command_id") == command_id:
+                        return current
+                    entry = {
+                        "command_id": command_id,
+                        "action": "restart_team",
+                        "task_id": current["task_id"],
+                        "stop_control_id": stop["control_id"],
+                        "reason": payload.get("reason") or "Restart team requested by operator",
+                        "confirmed": True,
+                        "role": str(payload.get("role") or "").strip().upper() or None,
+                        "expected_task_version": command.get("expected_task_version"),
+                    }
+                    linked = stop.setdefault("external_commands", [])
+                    existing = next((
+                        item for item in linked if item.get("command_id") == command_id
+                    ), None)
+                    if existing is not None and existing != entry:
+                        raise ValueError("Restart command provenance differs from its Stop waiter")
+                    if existing is None:
+                        linked.append(entry)
+                    self.store._record_external_command(current, command_id)
+                    return current
+
+                waiting = self.store.update(state["manifest_path"], link_restart)
+                if waiting != state:
+                    self._publish_command_state(waiting)
+                state = waiting
+                if (state.get("cleanup") or {}).get("phase") == "writer_stop_pending":
+                    return
             bundle = self.store.replace_task_and_rewire(
                 str(state["task_id"]),
                 "Operator restarted this team. Check the predecessor's reports and request evidence before "
@@ -13443,8 +13495,17 @@ class CDPAWorker:
                 if command is None or command.get("status") not in {"queued", "running"}:
                     continue
                 if status == "applied":
-                    if command["payload"].get("action") == "restart_team" and control.get("action") == "stop":
-                        self._finish_team_restart(state, command_id)
+                    if command["payload"].get("action") == "restart_team" and control.get("action") in {"stop", "stop_at_boundary"}:
+                        try:
+                            restart_state = self._command_replay_state(command)
+                            if restart_state is None or restart_state.get("task_id") != state.get("task_id"):
+                                raise RuntimeError("Restart command provenance does not own this Stop")
+                        except Exception as exc:
+                            self.runtime_db.require_command_recovery(
+                                command_id, error=sanitize_text(str(exc), max_chars=1000),
+                            )
+                            continue
+                        self._finish_team_restart(restart_state, command_id)
                         continue
                     self.runtime_db.finish_command(
                         command_id,
@@ -15216,6 +15277,36 @@ class CDPAWorker:
             "resume" if kind == "resume_team" else str(payload.get("action") or "")
         )
         expected_reason = payload.get("reason")
+        restart_waiter = next((
+            item for item in control.get("external_commands") or []
+            if isinstance(item, Mapping) and item.get("command_id") == command_id
+            and item.get("action") == "restart_team"
+        ), None)
+        if expected_action == "restart_team" and restart_waiter is not None:
+            cleanup = state.get("cleanup") or {}
+            pending = cleanup.get("state") == "CLEARING" and cleanup.get("phase") == "writer_stop_pending"
+            released = (
+                cleanup.get("state") == "STOP_RELEASED" and cleanup.get("phase") == "writer_released"
+                and (control.get("result") or {}).get("writer_cleanup_pending") is False
+            )
+            expected_waiter = {
+                "command_id": command_id, "action": "restart_team",
+                "task_id": state["task_id"], "stop_control_id": control.get("control_id"),
+                "reason": expected_reason or "Restart team requested by operator",
+                "confirmed": True,
+                "role": str(payload.get("role") or "").strip().upper() or None,
+                "expected_task_version": command.get("expected_task_version"),
+            }
+            if (
+                kind != "task_control" or payload.get("confirmed") is not True
+                or task_id != state.get("task_id") or state.get("status") != "STOPPED"
+                or control.get("action") not in {"stop", "stop_at_boundary"}
+                or control.get("status") != "applied"
+                or cleanup.get("stop_control_id") != control.get("control_id")
+                or not (pending or released) or dict(restart_waiter) != expected_waiter
+            ):
+                raise RuntimeError("Restart command provenance lacks its exact pending or released Stop")
+            return state
         if kind == "resume_team":
             expected_reason = expected_reason or "exact-team resume"
             if str(state.get("team") or "") != str(payload.get("team") or ""):
