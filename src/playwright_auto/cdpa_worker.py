@@ -2811,6 +2811,7 @@ class CDPAWorker:
         *,
         admitted: list[bool] | None = None,
         require_accepted_page: bool = False,
+        recover_lost_temporary: bool = False,
     ) -> AcquiredRole | None:
         try:
             hop, expected_conversation, expected_page_id, _ = (
@@ -2832,11 +2833,28 @@ class CDPAWorker:
             if page_owner and not await self._same_accepted_page(
                 state, role, page_owner, acquired
             ):
-                if (
-                    require_accepted_page and acquired is None
-                    and self._recover_missing_terminal_route(state, hop)
-                ):
-                    return None  # Legacy turns can still recover from an exact existing report.
+                if require_accepted_page and acquired is None:
+                    if self._recover_missing_terminal_route(state, hop):
+                        return None  # An exact existing report takes precedence over a new execution.
+                    if (
+                        recover_lost_temporary
+                        and temporary
+                        and state.get("status") == "RUNNING"
+                        and not state.get("attachments")
+                        and state["roles"][role].get("attachments_uploaded_generation") is None
+                        and self._accepted_blank_route_request(state, hop)
+                    ):
+                        durable = RequestLedger(str(hop["ledger_path"])).peek(str(hop["request_id"]))
+                        if durable is not None and not durable.files and durable.upload_receipt is None:
+                            endpoint = self._execution_endpoint_id(state, role) or self.store.endpoint_id_for(state)
+                            # Operator Resume may continue lost work in a new execution;
+                            # the accepted request and its receipt stay unchanged.
+                            if self._prepare_cross_endpoint_recovery(
+                                state, endpoint,
+                                reason="Operator Resume of an accepted Temporary turn whose page was lost",
+                                force_new_generation=True,
+                            ):
+                                return None
                 self._block_accepted_page_unavailable(state)
                 return None
             receipt_payload = hop.get("receipt")
@@ -4524,6 +4542,7 @@ class CDPAWorker:
         *,
         scheduling_tasks: Sequence[Mapping[str, Any]] | None = None,
         persisted_result: list[bool] | None = None,
+        existing_open_tab_only: bool = False,
     ) -> bool:
         control = _next_requested_control(state)
         if control is None:
@@ -4550,6 +4569,8 @@ class CDPAWorker:
         result: Any = None
         command: WorkerCommand | None = None
         try:
+            if existing_open_tab_only and (action != "open_tab" or is_independent_task(state)):
+                raise IneffectiveControlError("Existing-page diagnosis is restricted to workflow Open Tab.")
             if action in {"open_tab", "close_tab", "new_chat", "restart_role"}:
                 actions = self._control_actions(state, role, actions)
             command_value = control.get("command")
@@ -5334,8 +5355,33 @@ class CDPAWorker:
                     expected_conversation = durable_conversation
                     expected_binding_page_id = str(role_record.get("page_id") or "").strip() or None
 
+                if existing_open_tab_only:
+                    recorded_page_id = str(role_record.get("page_id") or "").strip()
+                    if not recorded_page_id or (
+                        expected_binding_page_id is not None
+                        and expected_binding_page_id != recorded_page_id
+                    ):
+                        raise IneffectiveControlError(
+                            "OPEN_ROLE_TAB requires the exact recorded page while provider readiness is unavailable."
+                        )
+                    expected_binding_page_id = recorded_page_id
+
                 async def acquire_open_tab() -> AcquiredRole:
                     nonlocal blocked_role_recovery
+                    if existing_open_tab_only:
+                        if existing_open_tab is None:
+                            raise IneffectiveControlError(
+                                "OPEN_ROLE_TAB exact owned page is unavailable; restore provider access and the recorded tab."
+                            )
+                        if str(existing_open_tab.page_id) != expected_binding_page_id or (
+                            expected_conversation
+                            and conversation_identity(existing_open_tab.url) != expected_conversation
+                        ):
+                            raise IneffectiveControlError(
+                                "OPEN_ROLE_TAB exact page or conversation identity changed; no replacement tab was opened."
+                            )
+                        await actions.open_tab(existing_open_tab)
+                        return existing_open_tab
                     if blocked_role_recovery and receiptless_observed_recovery:
                         hop["state"] = "pre_send"
                         hop.pop("observed_existing_response", None)
@@ -5386,7 +5432,8 @@ class CDPAWorker:
                 if acquired is None:
                     recovered = False
                 else:
-                    await self._dismiss_known_rate_limit_on_existing(acquired)
+                    if not existing_open_tab_only:
+                        await self._dismiss_known_rate_limit_on_existing(acquired)
                     recovered = (
                         blocked_role_recovery
                         or preboundary_acquisition_recovery
@@ -6539,6 +6586,50 @@ class CDPAWorker:
             }
         return acquired
 
+    @staticmethod
+    def _operator_solo_resume_reason(
+        state: Mapping[str, Any], hop: Mapping[str, Any],
+    ) -> str | None:
+        """Read operator context only from the applied control that created this hop."""
+        if state.get("workflow_mode") != "solo" or hop.get("kind") != "solo_resume":
+            return None
+        role = str(hop.get("target_role") or "").strip().upper()
+        for control in reversed(state.get("controls") or []):
+            if not isinstance(control, Mapping):
+                continue
+            if control.get("action") != "resume" or control.get("status") != "applied":
+                continue
+            command = control.get("command")
+            command = command if isinstance(command, Mapping) else {}
+            # Legacy TaskStore.request_resume controls omit origin; the applied
+            # role-PAUSE transition already verified operator authority.
+            origins = (control.get("origin"), command.get("origin"))
+            if any(str(origin).strip().lower() != "operator" for origin in origins if origin):
+                continue
+            if str(control.get("role") or role).strip().upper() != role:
+                continue
+            result = control.get("result")
+            if (
+                not isinstance(result, Mapping)
+                or result.get("outcome") != "continued"
+                or result.get("action") not in {"release_role_pause", "resume_solo_role"}
+                or result.get("postcondition") != "child_hop_appended"
+            ):
+                continue
+            after = result.get("after")
+            after = after if isinstance(after, Mapping) else {}
+            child_ids = (result.get("child_hop_id"), after.get("active_hop_id"))
+            if not any(value is not None for value in child_ids):
+                continue
+            if any(value != hop.get("hop_id") for value in child_ids if value is not None):
+                continue
+            if after.get("active_request_id") not in {None, hop.get("request_id")}:
+                continue
+            if after.get("active_role") not in {None, role}:
+                continue
+            return sanitize_text(control.get("reason") or "", max_chars=4000).strip()
+        return None
+
     async def _pre_send(
         self,
         state: dict[str, Any],
@@ -6988,6 +7079,7 @@ class CDPAWorker:
                 goal=task_goal_for_hop(state, int(hop["hop_id"])),
                 workspace=str(state["repository"]),
                 continuation=continuation,
+                operator_resume_reason=self._operator_solo_resume_reason(state, hop),
                 repair_error=repair_error,
                 repair_candidate=repair_candidate,
                 temporary_context=state.get("conversation_mode") == "temporary",
@@ -10521,7 +10613,10 @@ class CDPAWorker:
         before = self._resume_before(control) or {}
         prior_block = before.get("block_code") or state.get("block_code")
         missing_terminal_result = (
-            prior_block in MISSING_TERMINAL_RESULT_BLOCK_CODES
+            (
+                prior_block in MISSING_TERMINAL_RESULT_BLOCK_CODES
+                or (hop.get("wait") or {}).get("controller_reason") in MISSING_TERMINAL_RESULT_BLOCK_CODES
+            )
             and _report_mode(state) == "file"
             and not is_independent_task(state)
         )
@@ -10544,10 +10639,20 @@ class CDPAWorker:
                 )
                 return
         if missing_terminal_result and not self._accepted_blank_route_request(state, hop):
+            missing_report_contract = not hop.get("expected_report_path")
             self._require_resume_recovery(
                 state, control, action="none", reason_code="accepted_send_provenance_unverified",
-                reason="The original accepted request does not match its durable Send evidence.",
-                next_safe_action="Reconcile the exact manifest and Send ledger before Resume. Do not resend.",
+                reason=(
+                    "The accepted turn has no recorded expected report path; its original report contract cannot be verified."
+                    if missing_report_contract
+                    else "The original accepted request does not match its durable Send evidence."
+                ),
+                next_safe_action=(
+                    "Restore the original report contract from retained evidence before Resume. "
+                    "Do not infer it from a later goal revision or resend accepted work."
+                    if missing_report_contract
+                    else "Reconcile the exact manifest and Send ledger before Resume. Do not resend."
+                ),
             )
             return
         self._start_wait_budget_from_sent(hop)
@@ -10562,6 +10667,11 @@ class CDPAWorker:
         admitted: list[bool] = []
         acquired = await self._owned_or_block(
             state, role, actions, admitted=admitted, require_accepted_page=missing_terminal_result,
+            recover_lost_temporary=(
+                operator_resume
+                and control.get("status") == "recovering"
+                and before.get("status") == "BLOCKED"
+            ),
         )
         if state.get("active_hop_id") != hop.get("hop_id") and state.get("status") != "BLOCKED":
             self._finish_resume_control(
@@ -10889,6 +10999,16 @@ class CDPAWorker:
                 next_safe_action="Resolve the manual composer or attachments before Resume.",
             )
             return
+        except ProviderChallengeError as exc:
+            self._require_resume_recovery(
+                state,
+                control,
+                action="restart_role_fallback",
+                reason_code="provider_challenge",
+                reason=sanitize_exception(exc),
+                next_safe_action="Complete provider verification in the same browser, then Resume.",
+            )
+            return
         except Exception as exc:
             new_chat = getattr(actions, "new_chat", None)
             if not callable(new_chat):
@@ -10911,6 +11031,16 @@ class CDPAWorker:
                     reason_code="manual_composer_conflict",
                     reason=sanitize_exception(nested),
                     next_safe_action="Resolve the manual composer or attachments before Resume.",
+                )
+                return
+            except ProviderChallengeError as nested:
+                self._require_resume_recovery(
+                    state,
+                    control,
+                    action="new_chat_fallback",
+                    reason_code="provider_challenge",
+                    reason=sanitize_exception(nested),
+                    next_safe_action="Complete provider verification in the same browser, then Resume.",
                 )
                 return
             except Exception as nested:
@@ -11611,6 +11741,16 @@ class CDPAWorker:
                         next_safe_action="Resolve the manual composer or attachments before Resume.",
                     )
                     return
+                except ProviderChallengeError as exc:
+                    self._require_resume_recovery(
+                        state,
+                        control,
+                        action="reacquire_preboundary_role",
+                        reason_code="provider_challenge",
+                        reason=sanitize_exception(exc),
+                        next_safe_action="Complete provider verification in the same browser, then Resume.",
+                    )
+                    return
                 except Exception as exc:
                     self._require_resume_recovery(
                         state,
@@ -11806,6 +11946,16 @@ class CDPAWorker:
                 reason_code="manual_composer_conflict",
                 reason=sanitize_exception(exc),
                 next_safe_action="Preserve the composer; do not open another replacement tab.",
+            )
+            return
+        except ProviderChallengeError as exc:
+            self._require_resume_recovery(
+                state,
+                control,
+                action="reacquire_sending_role",
+                reason_code="provider_challenge",
+                reason=sanitize_exception(exc),
+                next_safe_action="Complete provider verification in the same browser, then Resume.",
             )
             return
         except Exception as exc:
@@ -13316,6 +13466,7 @@ class CDPAWorker:
         endpoint_id: str | None = None,
         expected_endpointless_control: tuple[int, str] | None = None,
         repair_resume_dispatch: tuple[EndpointPool, int] | None = None,
+        expected_existing_open_tab_control: int | None = None,
     ) -> dict[str, Any] | None:
         path = Path(manifest_path).resolve()
         try:
@@ -13420,6 +13571,22 @@ class CDPAWorker:
                         or str(pending_control.get("action") or "") != expected_action
                         or not _control_can_run_endpointless(state, pending_control)
                     ):
+                        return state
+                if expected_existing_open_tab_control is not None:
+                    pending_control = _next_requested_control(state)
+                    control_role = str(
+                        (pending_control or {}).get("role") or state.get("active_role") or "PLAN"
+                    ).upper()
+                    if (
+                        pending_control is None
+                        or pending_control.get("control_id") != expected_existing_open_tab_control
+                        or pending_control.get("action") != "open_tab"
+                        or is_independent_task(state)
+                        or endpoint_id != self._execution_endpoint_id(state, control_role)
+                    ):
+                        return state
+                    selected_record = self.store.endpoints.get(endpoint_id)
+                    if selected_record["draining"] or selected_record["removed"]:
                         return state
                 recovering_resume_present = next_recovering_resume_control(state) is not None
                 requested_control = _next_requested_control(state) is not None
@@ -13558,12 +13725,17 @@ class CDPAWorker:
                         control_role,
                         endpoint_id=control_endpoint_id,
                     )
+                control_options = (
+                    {"existing_open_tab_only": True}
+                    if expected_existing_open_tab_control is not None else {}
+                )
                 if await self._apply_control(
                     state,
                     actions,
                     path,
                     scheduling_tasks=scheduling_tasks,
                     persisted_result=persisted_control,
+                    **control_options,
                 ):
                     applied_control = next(
                         (
@@ -16947,6 +17119,7 @@ class CDPAWorker:
                     selected_context = browser_context
                     endpointless_control: tuple[int, str] | None = None
                     repair_resume_dispatch = None
+                    existing_open_tab_control = None
                     if superseding_pause is not None:
                         endpointless_control = (superseding_pause, "pause")
                         selected_endpoint = None
@@ -17080,6 +17253,29 @@ class CDPAWorker:
                         ):
                             # Receiving/reconciling an existing request is not a new allocation.
                             selected_endpoint = previous_endpoint
+                        if (
+                            pending_control is not None
+                            and pending_control.get("action") == "open_tab"
+                            and independent is None
+                            and previous is not None
+                            and not previous["chatgpt_ready"]
+                        ):
+                            # Open Tab is also the recovery/diagnosis surface. Keep
+                            # it on the connected home endpoint, without granting
+                            # allocation or Send merely because a control is queued.
+                            selected_endpoint = None
+                            pending_id = pending_control.get("control_id")
+                            if (
+                                isinstance(pending_id, int)
+                                and not control_affinity_conflict
+                                and control_affinity == previous_endpoint
+                                and previous_endpoint in contexts
+                                and previous["health"] == "online"
+                                and not previous["draining"] and not previous["removed"]
+                                and not previous["cooldown"] and previous["available_slots"] > 0
+                            ):
+                                selected_endpoint = previous_endpoint
+                                existing_open_tab_control = pending_id
                         if selected_endpoint is not None and isinstance(control_id, int):
                             repair_resume_dispatch = (endpoint_pool, control_id)
                         if pending_control is not None:
@@ -17119,6 +17315,8 @@ class CDPAWorker:
                         kwargs["expected_endpointless_control"] = endpointless_control
                     if repair_resume_dispatch is not None:
                         kwargs["repair_resume_dispatch"] = repair_resume_dispatch
+                    if existing_open_tab_control is not None:
+                        kwargs["expected_existing_open_tab_control"] = existing_open_tab_control
                     if task_id in self._execution_leases:
                         continue
                     canonical_status = str(state.get("status") or "").upper()

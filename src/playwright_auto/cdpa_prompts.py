@@ -274,6 +274,7 @@ class PromptBuilder:
         repair_candidate: str | None = None,
         temporary_context: bool = False,
         recovery_handoff: str = "",
+        operator_resume_reason: str | None = None,
         expected_report_path: str | None = None,
         report_result_key: str | None = None,
     ) -> BuiltPrompt:
@@ -294,6 +295,23 @@ class PromptBuilder:
                     "Inspect durable workspace state before acting; never replay accepted "
                     "Sends or completed external side effects."
                 )
+            if operator_resume_reason is not None and not normalized_repair_error:
+                if normalized_goal and not temporary_context:
+                    sections.append(f"GOAL: {normalized_goal}")
+                resume_context = (
+                    "OPERATOR RESUME FOR THIS TURN\n"
+                    "The operator explicitly resumed this task. This is a new substantive work turn. "
+                    "Earlier report-only and format-repair restrictions applied only to those repair turns. "
+                    "Continue unfinished work under the current goal and its existing scope and approvals. "
+                    "Use the durable handoff as evidence of completed work and remaining work; "
+                    "never replay accepted Sends or completed external side effects. "
+                    "An earlier PAUSE or report-only lock is not itself a new prerequisite. "
+                    "Use PAUSE only if a real external or manual prerequisite remains, and record "
+                    "the exact blocker and resume condition in the report."
+                )
+                if str(operator_resume_reason).strip():
+                    resume_context += "\nOperator reason: " + str(operator_resume_reason).strip()
+                sections.append(resume_context)
             if recovery_handoff.strip():
                 sections.append("DURABLE RECOVERY HANDOFF\n" + recovery_handoff.strip())
             if normalized_repair_error:

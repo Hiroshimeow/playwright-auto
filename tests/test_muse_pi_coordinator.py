@@ -12,7 +12,7 @@ import muse_pi_coordinator as pi
 class MusePiCoordinatorTests(unittest.TestCase):
     def test_engineering_model(self):
         result = pi.command("engineering", "Inspect a bounded real bug and write a focused test.")
-        self.assertIn("cliproxy-2080/gpt-6.1-sol", result)
+        self.assertIn("cliproxy-2080/gpt-6.2-sol", result)
         self.assertIn("high", result)
 
     def test_monitoring_model(self):
@@ -22,7 +22,7 @@ class MusePiCoordinatorTests(unittest.TestCase):
 
     def test_review_model(self):
         result = pi.command("review", "Independently critique this existing repair and recommend exact tests.")
-        self.assertIn("cliproxy-2080/gpt-6.1-sol", result)
+        self.assertIn("cliproxy-2080/gpt-6.2-sol", result)
 
     def test_unknown_kind(self):
         with self.assertRaises(ValueError):
