@@ -143,6 +143,8 @@ class PromptBuilder:
             + " write the report and emit route JSON only for a real handoff or closure."
             + " For a role handoff, include evidence, the next role's exact action and how to verify it."
             + " If the same issue returns, state what changed or what action or decision could move it forward."
+            + " route_seq counts past role transitions; max_routes is historical metadata, not an enforced cap."
+            + " Do not hand off or stop solely because these counts meet."
         )
         if normalized == "PLAN":
             directive += " When assigning work, give the next role an implementable scope and explicit acceptance checks."

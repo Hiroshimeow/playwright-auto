@@ -12251,6 +12251,69 @@ class CDPAWorker:
         )
         return True
 
+    async def _wait_for_saved_writer_transcript(
+        self, state: Mapping[str, Any], role: str, acquired: AcquiredRole,
+        snapshot: Any, prior: Any,
+    ) -> Any:
+        """Observe exact accepted history without mutating a reopened page."""
+        from .cdpa_conversations import ConversationLeaseError
+
+        record = state["roles"][role]
+        conversation = _recoverable_conversation_identity(record.get("page_url"))
+        previous_user_id = prior.receipt.get("user_message_id")
+        deadline = time.monotonic() + min(5.0, max(0.0, self.config.workspace_timeout_seconds))
+        delay_next_read = False
+        while True:
+            if (
+                snapshot.page_id != record.get("page_id")
+                or snapshot.page_role != record.get("physical_role")
+                or snapshot.page_task_id != state["task_id"]
+                or snapshot.page_team != state["team"]
+                or _recoverable_conversation_identity(snapshot.url) != conversation
+            ):
+                raise ConversationLeaseError(
+                    "CONVERSATION_IDENTITY_MISMATCH",
+                    "The reopened page ownership changed while waiting for accepted history",
+                )
+            try:
+                ChatGPTPage._assert_interaction_safe(snapshot, require_composer=False)
+                if snapshot.manual_input_pending or snapshot.choice_prompt_pending:
+                    raise UnsafePageStateError("The reopened page requires operator input")
+            except ChatGPTAutomationError as exc:
+                raise ConversationLeaseError(
+                    "CONVERSATION_IDENTITY_MISMATCH", str(exc),
+                ) from exc
+            if snapshot.composer_present and snapshot.composer_editable and any(
+                message.role == "user"
+                and (
+                    message.message_id == previous_user_id
+                    and rendered_user_text_matches(message.text, prior.rendered_prompt)
+                    if previous_user_id
+                    else visible_text_matches(message.text, prior.rendered_prompt)
+                )
+                for message in snapshot.messages
+            ):
+                return snapshot
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if delay_next_read:
+                await asyncio.sleep(min(0.1, remaining))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+            try:
+                snapshot = await asyncio.wait_for(acquired.client.snapshot(), timeout=remaining)
+                if time.monotonic() >= deadline:
+                    break
+            except (TimeoutError, PlaywrightTimeoutError):
+                break
+            delay_next_read = True
+        raise ConversationLeaseError(
+            "CONVERSATION_IDENTITY_MISMATCH",
+            "The reopened page does not show the previous accepted prompt",
+        )
+
     async def _recover_preintent_writer_mismatch(
         self, state: dict[str, Any], hop: dict[str, Any], control: dict[str, Any],
         actions: CDPATabActions, ledger: RequestLedger,
@@ -12313,23 +12376,13 @@ class CDPAWorker:
                 or acquired.new_chat or acquired.page_id != page_id or snapshot.page_id != page_id
             ):
                 raise ConversationLeaseError("CONVERSATION_IDENTITY_MISMATCH", "The saved writer has a different owner")
-            previous_user_id = prior.receipt.get("user_message_id")
-            if (
-                (binding.get("physical_browser_id") != physical_id or not binding.get("canonical_conversation_id"))
-                and not any(
-                    message.role == "user"
-                    and (
-                        message.message_id == previous_user_id
-                        and rendered_user_text_matches(message.text, prior.rendered_prompt)
-                        if previous_user_id
-                        else visible_text_matches(message.text, prior.rendered_prompt)
+            if binding.get("physical_browser_id") != physical_id or not binding.get("canonical_conversation_id"):
+                snapshot = await self._wait_for_saved_writer_transcript(state, role, acquired, snapshot, prior)
+                if self._gate_c_endpoint_evidence(endpoint_id) != (cdp_url, physical_id):
+                    raise ConversationLeaseError(
+                        "CONVERSATION_IDENTITY_MISMATCH",
+                        "The physical browser changed while waiting for accepted history",
                     )
-                    for message in snapshot.messages
-                )
-            ):
-                raise ConversationLeaseError(
-                    "CONVERSATION_IDENTITY_MISMATCH", "The reopened page does not show the previous accepted prompt",
-                )
             restored_binding_id = writer.restore_persistent_writer(binding_id, {
                 "endpoint_id": endpoint_id, "endpoint_cdp_url": cdp_url,
                 "physical_browser_id": physical_id, "page_target_identity": snapshot.page_id,

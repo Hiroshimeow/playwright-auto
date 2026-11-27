@@ -1154,6 +1154,7 @@ def test_resume_preintent_binding_mismatch_on_existing_conversation(tmp_path, mo
         ),
     )
     client.wait_until_clean_ready = AsyncMock(return_value=snapshot)
+    client.snapshot = AsyncMock(return_value=snapshot)
     actions = SimpleNamespace(reopen=AsyncMock(return_value=AcquiredRole(
         client=client, page_id=observed_page, url=project_url, created=True, new_chat=False,
     )))

@@ -1272,6 +1272,42 @@ def _v11_lifecycle(raw: Mapping[str, Any], status: str) -> dict[str, str | None]
     return {"state": state, "reason_code": reason, "terminal_outcome": outcome}
 
 
+def _execution_budget_projection(raw: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Expose saved accounting without initializing or renewing the worker's budget."""
+    budget = raw.get("execution_budget")
+    if not isinstance(budget, Mapping):
+        return None
+    epoch, limit, charged = (
+        budget.get("epoch"), budget.get("limit"), budget.get("charged_hop_ids")
+    )
+    if (
+        not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 1
+        or not isinstance(limit, int) or isinstance(limit, bool) or limit < 1
+        or not isinstance(charged, list)
+        or any(
+            not isinstance(item, int) or isinstance(item, bool) or item < 1
+            for item in charged
+        )
+        or len(set(charged)) != len(charged)
+    ):
+        return None
+    # Normal Team handoffs are not capped; the worker checks this budget for
+    # Solo/Independent executions and registered async wakes.
+    enforced_for = ["async_wake"]
+    if raw.get("workflow_mode") == "solo" or is_independent_task(raw):
+        enforced_for.insert(0, "role_execution")
+    used = len(charged)
+    return {
+        "epoch": epoch,
+        "limit": limit,
+        "unit": "charged_hops",
+        "charged_hops": used,
+        "remaining_hops": max(0, limit - used),
+        "limit_reached": used >= limit,
+        "enforced_for": enforced_for,
+    }
+
+
 def build_task_projection(
     raw: Mapping[str, Any],
     *,
@@ -1537,6 +1573,8 @@ def build_task_projection(
         "closing_role": str(raw.get("closing_role") or "") or None,
         "route_seq": int(raw.get("route_seq") or 0),
         "max_routes": int(raw.get("max_routes") or 0) if "max_routes" in raw else None,
+        "max_routes_is_historical": True,
+        "execution_budget": _execution_budget_projection(raw),
         "max_route_repairs": (
             int(raw.get("max_route_repairs") or 0)
             if "max_route_repairs" in raw

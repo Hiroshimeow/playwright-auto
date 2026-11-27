@@ -77,6 +77,12 @@ This preserves task ID, endpoint, active hop, request ledger, conversation owner
 
 There is no public `--reuse-team` flow.
 
+### Execution accounting
+
+Task list/detail projections expose `execution_budget` from the saved worker state: `epoch`, `limit`, `charged_hops`, `remaining_hops`, `limit_reached`, and `enforced_for`. The unit is charged hops, including repair and async-wake hops, not role transitions or the largest hop ID. An explicit budget renewal starts a new epoch; counts from previous epochs are not charged again. A missing or invalid saved budget is exposed as `null`; reading the API never creates or renews one.
+
+`route_seq` counts past role transitions. `max_routes` remains historical metadata for compatibility, with `max_routes_is_historical=true`; comparing these values does not establish exhaustion. Normal Team handoffs continue beyond both historical route counts and the execution-budget count. The worker applies the saved budget to Solo/Independent role executions and registered async wakes, as identified by `enforced_for`. `limit_reached` reports accounting, not a new control-eligibility decision; use the task status, primary problem, and supported controls for recovery. Roles must choose handoffs and DONE from actual work and acceptance evidence, not from these historical counters.
+
 ## Browser placement
 
 ### One workflow team, one endpoint
