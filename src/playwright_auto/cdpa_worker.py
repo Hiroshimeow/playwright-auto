@@ -3443,13 +3443,15 @@ class CDPAWorker:
 
         def record_result(current: dict[str, Any]) -> dict[str, Any]:
             current_cleanup = current["cleanup"]
-            current_cleanup["released_bindings"] = sorted(set(current_cleanup.get("released_bindings") or []) | set(released))
+            previous_released = set(current_cleanup.get("released_bindings") or [])
+            newly_released = set(released) - previous_released
+            current_cleanup["released_bindings"] = sorted(previous_released | set(released))
             if errors:
+                # A newly sealed binding is progress; rediscovering retained release
+                # evidence must not restart retries of the same unsafe condition.
+                if newly_released:
+                    self._reset_cleanup_retry_gate(current_cleanup)
                 self._record_cleanup_failure(current, RuntimeError("; ".join(errors)))
-                # Stop remains applied. Existing bounded retry delays, without permanent suppression.
-                if current_cleanup.get("retry_suppressed"):
-                    current_cleanup["retry_suppressed"] = False
-                    current_cleanup["next_retry_at"] = (datetime.now(timezone.utc) + timedelta(seconds=_CLEANUP_RETRY_DELAYS_SECONDS[-1])).isoformat()
             else:
                 self._reset_cleanup_retry_gate(current_cleanup)
                 clear_control = self._cleanup_control(current, current_cleanup)

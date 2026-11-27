@@ -201,6 +201,8 @@ Use the dashboard/API controls instead of editing runtime manifests:
 
 Controls are processed by the durable worker state machine. Team Restart waits for verified writer release from the exact applied Stop before creating one replacement. Stop being applied while writer cleanup remains pending is insufficient. A durable Restart waiter preserves its original command, role, reason and confirmation across reload.
 
+Stop writer cleanup uses the shared retry limit: the first two identical failures wait 30 and 120 seconds, and the third suspends automatic retries. A genuinely new verified binding release resets the repeated-failure streak. A retry hold retains `CLEARING` / `writer_stop_pending`, all unresolved writer authority and the Restart gate. It does not report cleanup complete. Existing recovery controls retain their admission checks; writer maintenance can finish release only after its full proof and coverage checks pass.
+
 For a persistent conversation recovered before Send, the worker proves the previous accepted user ID and full rendered prompt on the saved page. If ChatGPT has collapsed that exact user message, recovery may expand its uniquely identified "Show more" view once under the page mutation guard. It then requires full text equality and unchanged task, role, page, conversation and physical browser within the remaining recovery deadline. A prefix match alone never authorizes writer restoration or Send.
 
 ### Stopped writer maintenance
