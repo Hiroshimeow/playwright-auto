@@ -1,0 +1,1589 @@
+{
+  "schema": "native_tail_fixture_v1",
+  "bases": {
+    "dev-0": {
+      "evidence": {
+        "schema": "chatgpt_virtual_tail_v1",
+        "observed_at": 1795768672.911,
+        "document_ready_state": "complete",
+        "document_url": "https://chatgpt.com/c/fixture-session_id-4",
+        "storage_readable": true,
+        "owner": {
+          "page_id": "fixture-page_id-0",
+          "page_task_id": "fixture-page_task_id-1",
+          "page_team": "fixture-page_team-2",
+          "page_role": "fixture-page_team-2-dev"
+        },
+        "counts": {
+          "live_main": 1,
+          "transcript": 1,
+          "scroller": 1,
+          "native_groups": 4,
+          "user_units": 1
+        },
+        "reading": "measured",
+        "topology": {
+          "exact_active_main": true,
+          "transcript_inside_scroller": true,
+          "canvas_inside_transcript": true,
+          "contents_is_direct_transcript_child": true,
+          "canvas_only_mounted_list": true,
+          "mounted_list_only_turn_wrappers": true,
+          "tail_wrapper_is_last_list_child": true,
+          "tail_group_is_unique_in_wrapper": true,
+          "trailing_spacer_zero": true,
+          "canvas_known_style": true,
+          "list_known_style": true,
+          "last_group_rendered": true,
+          "last_user_rendered": true
+        },
+        "geometry": {
+          "canvas": {
+            "top": -6056,
+            "bottom": 851,
+            "height": 6907,
+            "width": 768
+          },
+          "list": {
+            "top": -2189,
+            "bottom": 851,
+            "height": 3040,
+            "width": 768
+          },
+          "wrapper": {
+            "top": 113,
+            "bottom": 851,
+            "height": 738,
+            "width": 768
+          },
+          "scroller": {
+            "top": 0,
+            "bottom": 911,
+            "height": 911,
+            "width": 1868
+          },
+          "mounted_margin_top": 3867
+        },
+        "last_group_key": "fixture-message-12",
+        "last_user_message_ids": [
+          "fixture-message-12"
+        ],
+        "loaders": [],
+        "busy_container": false
+      },
+      "snapshot": {
+        "url": "https://chatgpt.com/c/fixture-session_id-4",
+        "session_id": "fixture-session_id-4",
+        "page_id": "fixture-page_id-0",
+        "page_task_id": "fixture-page_task_id-1",
+        "page_team": "fixture-page_team-2",
+        "page_role": "fixture-page_team-2-dev",
+        "state": "waiting_prompt",
+        "stop_visible": false,
+        "response_activity_turn_id": null,
+        "response_projection_active": false,
+        "requires_login": false,
+        "composer_present": true,
+        "composer_editable": true,
+        "composer_ambiguous": false,
+        "messages": [
+          {
+            "role": "user",
+            "message_id": "fixture-message-5",
+            "turn_id": "group:user:fixture-message-5"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-6",
+            "turn_id": "group:assistant:fixture-message-5"
+          },
+          {
+            "role": "user",
+            "message_id": "fixture-message-7",
+            "turn_id": "group:user:fixture-message-7"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-8",
+            "turn_id": "group:assistant:fixture-message-7"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-9",
+            "turn_id": "group:assistant:fixture-message-7"
+          },
+          {
+            "role": "user",
+            "message_id": "fixture-message-10",
+            "turn_id": "group:user:fixture-message-10"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-11",
+            "turn_id": "group:assistant:fixture-message-10"
+          },
+          {
+            "role": "user",
+            "message_id": "fixture-message-12",
+            "turn_id": "group:user:fixture-message-12"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-13",
+            "turn_id": "group:assistant:fixture-message-12"
+          }
+        ],
+        "composer_text_length": 0,
+        "blocking_dialog_count": 0,
+        "error_count": 0
+      },
+      "expected": "fixture-message-12"
+    },
+    "dev-1": {
+      "evidence": {
+        "schema": "chatgpt_virtual_tail_v1",
+        "observed_at": 1795768673.125,
+        "document_ready_state": "complete",
+        "document_url": "https://chatgpt.com/c/fixture-session_id-4",
+        "storage_readable": true,
+        "owner": {
+          "page_id": "fixture-page_id-0",
+          "page_task_id": "fixture-page_task_id-1",
+          "page_team": "fixture-page_team-2",
+          "page_role": "fixture-page_team-2-dev"
+        },
+        "counts": {
+          "live_main": 1,
+          "transcript": 1,
+          "scroller": 1,
+          "native_groups": 4,
+          "user_units": 1
+        },
+        "reading": "measured",
+        "topology": {
+          "exact_active_main": true,
+          "transcript_inside_scroller": true,
+          "canvas_inside_transcript": true,
+          "contents_is_direct_transcript_child": true,
+          "canvas_only_mounted_list": true,
+          "mounted_list_only_turn_wrappers": true,
+          "tail_wrapper_is_last_list_child": true,
+          "tail_group_is_unique_in_wrapper": true,
+          "trailing_spacer_zero": true,
+          "canvas_known_style": true,
+          "list_known_style": true,
+          "last_group_rendered": true,
+          "last_user_rendered": true
+        },
+        "geometry": {
+          "canvas": {
+            "top": -6056,
+            "bottom": 851,
+            "height": 6907,
+            "width": 768
+          },
+          "list": {
+            "top": -2189,
+            "bottom": 851,
+            "height": 3040,
+            "width": 768
+          },
+          "wrapper": {
+            "top": 113,
+            "bottom": 851,
+            "height": 738,
+            "width": 768
+          },
+          "scroller": {
+            "top": 0,
+            "bottom": 911,
+            "height": 911,
+            "width": 1868
+          },
+          "mounted_margin_top": 3867
+        },
+        "last_group_key": "fixture-message-12",
+        "last_user_message_ids": [
+          "fixture-message-12"
+        ],
+        "loaders": [],
+        "busy_container": false
+      },
+      "snapshot": {
+        "url": "https://chatgpt.com/c/fixture-session_id-4",
+        "session_id": "fixture-session_id-4",
+        "page_id": "fixture-page_id-0",
+        "page_task_id": "fixture-page_task_id-1",
+        "page_team": "fixture-page_team-2",
+        "page_role": "fixture-page_team-2-dev",
+        "state": "waiting_prompt",
+        "stop_visible": false,
+        "response_activity_turn_id": null,
+        "response_projection_active": false,
+        "requires_login": false,
+        "composer_present": true,
+        "composer_editable": true,
+        "composer_ambiguous": false,
+        "messages": [
+          {
+            "role": "user",
+            "message_id": "fixture-message-5",
+            "turn_id": "group:user:fixture-message-5"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-6",
+            "turn_id": "group:assistant:fixture-message-5"
+          },
+          {
+            "role": "user",
+            "message_id": "fixture-message-7",
+            "turn_id": "group:user:fixture-message-7"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-8",
+            "turn_id": "group:assistant:fixture-message-7"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-9",
+            "turn_id": "group:assistant:fixture-message-7"
+          },
+          {
+            "role": "user",
+            "message_id": "fixture-message-10",
+            "turn_id": "group:user:fixture-message-10"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-11",
+            "turn_id": "group:assistant:fixture-message-10"
+          },
+          {
+            "role": "user",
+            "message_id": "fixture-message-12",
+            "turn_id": "group:user:fixture-message-12"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-13",
+            "turn_id": "group:assistant:fixture-message-12"
+          }
+        ],
+        "composer_text_length": 0,
+        "blocking_dialog_count": 0,
+        "error_count": 0
+      },
+      "expected": "fixture-message-12"
+    },
+    "plan-0": {
+      "evidence": {
+        "schema": "chatgpt_virtual_tail_v1",
+        "observed_at": 1795768740.454,
+        "document_ready_state": "complete",
+        "document_url": "https://chatgpt.com/g/g-p-6b07b98a9fe48191985184f93ebd98f7-snaparc-float-notes/c/fixture-session_id-16",
+        "storage_readable": true,
+        "owner": {
+          "page_id": "fixture-page_id-14",
+          "page_task_id": "fixture-page_task_id-1",
+          "page_team": "fixture-page_team-2",
+          "page_role": "fixture-page_team-2-plan"
+        },
+        "counts": {
+          "live_main": 1,
+          "transcript": 1,
+          "scroller": 1,
+          "native_groups": 4,
+          "user_units": 1
+        },
+        "reading": "measured",
+        "topology": {
+          "exact_active_main": true,
+          "transcript_inside_scroller": true,
+          "canvas_inside_transcript": true,
+          "contents_is_direct_transcript_child": true,
+          "canvas_only_mounted_list": true,
+          "mounted_list_only_turn_wrappers": true,
+          "tail_wrapper_is_last_list_child": true,
+          "tail_group_is_unique_in_wrapper": true,
+          "trailing_spacer_zero": true,
+          "canvas_known_style": true,
+          "list_known_style": true,
+          "last_group_rendered": true,
+          "last_user_rendered": true
+        },
+        "geometry": {
+          "canvas": {
+            "top": -5342,
+            "bottom": 815,
+            "height": 6157,
+            "width": 768
+          },
+          "list": {
+            "top": -2227,
+            "bottom": 815,
+            "height": 3042,
+            "width": 768
+          },
+          "wrapper": {
+            "top": 77,
+            "bottom": 815,
+            "height": 738,
+            "width": 768
+          },
+          "scroller": {
+            "top": 0,
+            "bottom": 911,
+            "height": 911,
+            "width": 1868
+          },
+          "mounted_margin_top": 3115
+        },
+        "last_group_key": "fixture-message-25",
+        "last_user_message_ids": [
+          "fixture-message-25"
+        ],
+        "loaders": [
+          {
+            "kind": "older_head",
+            "inside_first_transcript_child": true,
+            "dom_before_canvas": true,
+            "exact_older_label": true,
+            "exact_head_structure": true,
+            "inside_canvas": false,
+            "head_label_sha256": "913a378e70f6ee66434d8358526e077ad4e0d86e386f881f08eefa58f0257210",
+            "head_bottom": -5348,
+            "canvas_top": -5342
+          }
+        ],
+        "busy_container": false
+      },
+      "snapshot": {
+        "url": "https://chatgpt.com/g/g-p-6b07b98a9fe48191985184f93ebd98f7-snaparc-float-notes/c/fixture-session_id-16",
+        "session_id": "fixture-session_id-16",
+        "page_id": "fixture-page_id-14",
+        "page_task_id": "fixture-page_task_id-1",
+        "page_team": "fixture-page_team-2",
+        "page_role": "fixture-page_team-2-plan",
+        "state": "waiting_prompt",
+        "stop_visible": false,
+        "response_activity_turn_id": null,
+        "response_projection_active": false,
+        "requires_login": false,
+        "composer_present": true,
+        "composer_editable": true,
+        "composer_ambiguous": false,
+        "messages": [
+          {
+            "role": "user",
+            "message_id": "fixture-message-17",
+            "turn_id": "group:user:fixture-message-17"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-18",
+            "turn_id": "group:assistant:fixture-message-17"
+          },
+          {
+            "role": "user",
+            "message_id": "fixture-message-19",
+            "turn_id": "group:user:fixture-message-19"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-20",
+            "turn_id": "group:assistant:fixture-message-19"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-21",
+            "turn_id": "group:assistant:fixture-message-19"
+          },
+          {
+            "role": "user",
+            "message_id": "fixture-message-22",
+            "turn_id": "group:user:fixture-message-22"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-23",
+            "turn_id": "group:assistant:fixture-message-22"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-24",
+            "turn_id": "group:assistant:fixture-message-22"
+          },
+          {
+            "role": "user",
+            "message_id": "fixture-message-25",
+            "turn_id": "group:user:fixture-message-25"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-26",
+            "turn_id": "group:assistant:fixture-message-25"
+          }
+        ],
+        "composer_text_length": 0,
+        "blocking_dialog_count": 0,
+        "error_count": 0
+      },
+      "expected": "fixture-message-25"
+    },
+    "plan-1": {
+      "evidence": {
+        "schema": "chatgpt_virtual_tail_v1",
+        "observed_at": 1795768740.688,
+        "document_ready_state": "complete",
+        "document_url": "https://chatgpt.com/g/g-p-6b07b98a9fe48191985184f93ebd98f7-snaparc-float-notes/c/fixture-session_id-16",
+        "storage_readable": true,
+        "owner": {
+          "page_id": "fixture-page_id-14",
+          "page_task_id": "fixture-page_task_id-1",
+          "page_team": "fixture-page_team-2",
+          "page_role": "fixture-page_team-2-plan"
+        },
+        "counts": {
+          "live_main": 1,
+          "transcript": 1,
+          "scroller": 1,
+          "native_groups": 4,
+          "user_units": 1
+        },
+        "reading": "measured",
+        "topology": {
+          "exact_active_main": true,
+          "transcript_inside_scroller": true,
+          "canvas_inside_transcript": true,
+          "contents_is_direct_transcript_child": true,
+          "canvas_only_mounted_list": true,
+          "mounted_list_only_turn_wrappers": true,
+          "tail_wrapper_is_last_list_child": true,
+          "tail_group_is_unique_in_wrapper": true,
+          "trailing_spacer_zero": true,
+          "canvas_known_style": true,
+          "list_known_style": true,
+          "last_group_rendered": true,
+          "last_user_rendered": true
+        },
+        "geometry": {
+          "canvas": {
+            "top": -5342,
+            "bottom": 815,
+            "height": 6157,
+            "width": 768
+          },
+          "list": {
+            "top": -2227,
+            "bottom": 815,
+            "height": 3042,
+            "width": 768
+          },
+          "wrapper": {
+            "top": 77,
+            "bottom": 815,
+            "height": 738,
+            "width": 768
+          },
+          "scroller": {
+            "top": 0,
+            "bottom": 911,
+            "height": 911,
+            "width": 1868
+          },
+          "mounted_margin_top": 3115
+        },
+        "last_group_key": "fixture-message-25",
+        "last_user_message_ids": [
+          "fixture-message-25"
+        ],
+        "loaders": [
+          {
+            "kind": "older_head",
+            "inside_first_transcript_child": true,
+            "dom_before_canvas": true,
+            "exact_older_label": true,
+            "exact_head_structure": true,
+            "inside_canvas": false,
+            "head_label_sha256": "913a378e70f6ee66434d8358526e077ad4e0d86e386f881f08eefa58f0257210",
+            "head_bottom": -5348,
+            "canvas_top": -5342
+          }
+        ],
+        "busy_container": false
+      },
+      "snapshot": {
+        "url": "https://chatgpt.com/g/g-p-6b07b98a9fe48191985184f93ebd98f7-snaparc-float-notes/c/fixture-session_id-16",
+        "session_id": "fixture-session_id-16",
+        "page_id": "fixture-page_id-14",
+        "page_task_id": "fixture-page_task_id-1",
+        "page_team": "fixture-page_team-2",
+        "page_role": "fixture-page_team-2-plan",
+        "state": "waiting_prompt",
+        "stop_visible": false,
+        "response_activity_turn_id": null,
+        "response_projection_active": false,
+        "requires_login": false,
+        "composer_present": true,
+        "composer_editable": true,
+        "composer_ambiguous": false,
+        "messages": [
+          {
+            "role": "user",
+            "message_id": "fixture-message-17",
+            "turn_id": "group:user:fixture-message-17"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-18",
+            "turn_id": "group:assistant:fixture-message-17"
+          },
+          {
+            "role": "user",
+            "message_id": "fixture-message-19",
+            "turn_id": "group:user:fixture-message-19"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-20",
+            "turn_id": "group:assistant:fixture-message-19"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-21",
+            "turn_id": "group:assistant:fixture-message-19"
+          },
+          {
+            "role": "user",
+            "message_id": "fixture-message-22",
+            "turn_id": "group:user:fixture-message-22"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-23",
+            "turn_id": "group:assistant:fixture-message-22"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-24",
+            "turn_id": "group:assistant:fixture-message-22"
+          },
+          {
+            "role": "user",
+            "message_id": "fixture-message-25",
+            "turn_id": "group:user:fixture-message-25"
+          },
+          {
+            "role": "assistant",
+            "message_id": "fixture-message-26",
+            "turn_id": "group:assistant:fixture-message-25"
+          }
+        ],
+        "composer_text_length": 0,
+        "blocking_dialog_count": 0,
+        "error_count": 0
+      },
+      "expected": "fixture-message-25"
+    }
+  },
+  "cases": [
+    {
+      "name": "ambiguous-live_main",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "counts",
+            "live_main"
+          ],
+          "value": 2
+        }
+      ],
+      "verified": false,
+      "reason": "ambiguous_tail_owner"
+    },
+    {
+      "name": "ambiguous-transcript",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "counts",
+            "transcript"
+          ],
+          "value": 2
+        }
+      ],
+      "verified": false,
+      "reason": "ambiguous_tail_owner"
+    },
+    {
+      "name": "ambiguous-scroller",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "counts",
+            "scroller"
+          ],
+          "value": 2
+        }
+      ],
+      "verified": false,
+      "reason": "ambiguous_tail_owner"
+    },
+    {
+      "name": "ambiguous-user_units",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "counts",
+            "user_units"
+          ],
+          "value": 2
+        }
+      ],
+      "verified": false,
+      "reason": "ambiguous_tail_owner"
+    },
+    {
+      "name": "count-bool-is-not-one",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "counts",
+            "live_main"
+          ],
+          "value": true
+        }
+      ],
+      "verified": false,
+      "reason": "ambiguous_tail_owner"
+    },
+    {
+      "name": "no-turns",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "counts",
+            "native_groups"
+          ],
+          "value": 0
+        }
+      ],
+      "verified": false,
+      "reason": "no_native_tail"
+    },
+    {
+      "name": "unknown-schema",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "schema"
+          ],
+          "value": "future-layout"
+        }
+      ],
+      "verified": false,
+      "reason": "unknown_tail_schema"
+    },
+    {
+      "name": "document-loading",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "document_ready_state"
+          ],
+          "value": "loading"
+        }
+      ],
+      "verified": false,
+      "reason": "document_not_ready"
+    },
+    {
+      "name": "storage-denied",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "storage_readable"
+          ],
+          "value": false
+        }
+      ],
+      "verified": false,
+      "reason": "document_not_ready"
+    },
+    {
+      "name": "layout-unmeasured",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "reading"
+          ],
+          "value": "pending"
+        }
+      ],
+      "verified": false,
+      "reason": "layout_not_measured"
+    },
+    {
+      "name": "different-document",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "document_url"
+          ],
+          "value": "https://chatgpt.com/c/foreign"
+        }
+      ],
+      "verified": false,
+      "reason": "tail_snapshot_identity_changed"
+    },
+    {
+      "name": "owner-changed-page_id",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "owner",
+            "page_id"
+          ],
+          "value": "foreign"
+        }
+      ],
+      "verified": false,
+      "reason": "tail_snapshot_identity_changed"
+    },
+    {
+      "name": "owner-changed-page_task_id",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "owner",
+            "page_task_id"
+          ],
+          "value": "foreign"
+        }
+      ],
+      "verified": false,
+      "reason": "tail_snapshot_identity_changed"
+    },
+    {
+      "name": "owner-changed-page_team",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "owner",
+            "page_team"
+          ],
+          "value": "foreign"
+        }
+      ],
+      "verified": false,
+      "reason": "tail_snapshot_identity_changed"
+    },
+    {
+      "name": "owner-changed-page_role",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "owner",
+            "page_role"
+          ],
+          "value": "foreign"
+        }
+      ],
+      "verified": false,
+      "reason": "tail_snapshot_identity_changed"
+    },
+    {
+      "name": "topology-contents_is_direct_transcript_child",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "topology",
+            "contents_is_direct_transcript_child"
+          ],
+          "value": false
+        }
+      ],
+      "verified": false,
+      "reason": "unknown_tail_topology"
+    },
+    {
+      "name": "topology-canvas_only_mounted_list",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "topology",
+            "canvas_only_mounted_list"
+          ],
+          "value": false
+        }
+      ],
+      "verified": false,
+      "reason": "unknown_tail_topology"
+    },
+    {
+      "name": "topology-mounted_list_only_turn_wrappers",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "topology",
+            "mounted_list_only_turn_wrappers"
+          ],
+          "value": false
+        }
+      ],
+      "verified": false,
+      "reason": "unknown_tail_topology"
+    },
+    {
+      "name": "topology-tail_wrapper_is_last_list_child",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "topology",
+            "tail_wrapper_is_last_list_child"
+          ],
+          "value": false
+        }
+      ],
+      "verified": false,
+      "reason": "unknown_tail_topology"
+    },
+    {
+      "name": "topology-tail_group_is_unique_in_wrapper",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "topology",
+            "tail_group_is_unique_in_wrapper"
+          ],
+          "value": false
+        }
+      ],
+      "verified": false,
+      "reason": "unknown_tail_topology"
+    },
+    {
+      "name": "topology-trailing_spacer_zero",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "topology",
+            "trailing_spacer_zero"
+          ],
+          "value": false
+        }
+      ],
+      "verified": false,
+      "reason": "unknown_tail_topology"
+    },
+    {
+      "name": "topology-canvas_known_style",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "topology",
+            "canvas_known_style"
+          ],
+          "value": false
+        }
+      ],
+      "verified": false,
+      "reason": "unknown_tail_topology"
+    },
+    {
+      "name": "topology-list_known_style",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "topology",
+            "list_known_style"
+          ],
+          "value": false
+        }
+      ],
+      "verified": false,
+      "reason": "unknown_tail_topology"
+    },
+    {
+      "name": "topology-last_group_rendered",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "topology",
+            "last_group_rendered"
+          ],
+          "value": false
+        }
+      ],
+      "verified": false,
+      "reason": "unknown_tail_topology"
+    },
+    {
+      "name": "topology-last_user_rendered",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "topology",
+            "last_user_rendered"
+          ],
+          "value": false
+        }
+      ],
+      "verified": false,
+      "reason": "unknown_tail_topology"
+    },
+    {
+      "name": "trailing-unmounted-extent",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "geometry",
+            "canvas",
+            "bottom"
+          ],
+          "value": 951
+        }
+      ],
+      "verified": false,
+      "reason": "unmounted_or_trailing_tail"
+    },
+    {
+      "name": "last-wrapper-not-list-end",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "geometry",
+            "wrapper",
+            "bottom"
+          ],
+          "value": 700
+        }
+      ],
+      "verified": false,
+      "reason": "unmounted_or_trailing_tail"
+    },
+    {
+      "name": "virtualizer-height-incomplete",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "geometry",
+            "canvas",
+            "height"
+          ],
+          "value": 9999
+        }
+      ],
+      "verified": false,
+      "reason": "virtualizer_extent_incomplete"
+    },
+    {
+      "name": "negative-head-offset",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "geometry",
+            "mounted_margin_top"
+          ],
+          "value": -10
+        }
+      ],
+      "verified": false,
+      "reason": "unknown_virtualized_head_extent"
+    },
+    {
+      "name": "tail-not-in-current-viewport",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "geometry",
+            "scroller",
+            "bottom"
+          ],
+          "value": 800
+        }
+      ],
+      "verified": false,
+      "reason": "tail_outside_current_view"
+    },
+    {
+      "name": "missing-geometry",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "geometry",
+            "canvas",
+            "bottom"
+          ],
+          "value": null
+        }
+      ],
+      "verified": false,
+      "reason": "invalid_tail_geometry"
+    },
+    {
+      "name": "invalid-geometry-type",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "geometry",
+            "canvas"
+          ],
+          "value": "unknown"
+        }
+      ],
+      "verified": false,
+      "reason": "invalid_tail_geometry"
+    },
+    {
+      "name": "zero-height",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "geometry",
+            "wrapper",
+            "height"
+          ],
+          "value": 0
+        }
+      ],
+      "verified": false,
+      "reason": "tail_not_rendered"
+    },
+    {
+      "name": "wrong-dom-last-user",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "last_user_message_ids"
+          ],
+          "value": [
+            "foreign"
+          ]
+        }
+      ],
+      "verified": false,
+      "reason": "latest_accepted_user_not_at_native_tail"
+    },
+    {
+      "name": "wrong-dom-last-group",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "last_group_key"
+          ],
+          "value": "foreign"
+        }
+      ],
+      "verified": false,
+      "reason": "latest_accepted_user_not_at_native_tail"
+    },
+    {
+      "name": "wrong-accepted-id",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "expected"
+          ],
+          "value": "foreign"
+        }
+      ],
+      "verified": false,
+      "reason": "latest_accepted_user_not_at_native_tail"
+    },
+    {
+      "name": "later-unknown-native-user",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "snapshot",
+            "messages"
+          ],
+          "value": [
+            {
+              "role": "user",
+              "message_id": "fixture-message-5",
+              "turn_id": "group:user:fixture-message-5",
+              "text_length": 1940,
+              "text_sha256": "200e9f24a95095f6109a90e7943dfa5072392578de0d8728e9e5b73d8fbf186f"
+            },
+            {
+              "role": "assistant",
+              "message_id": "fixture-message-6",
+              "turn_id": "group:assistant:fixture-message-5",
+              "text_length": 143,
+              "text_sha256": "283122ea8ea5056742ec42104282f23b04e1d6acb9b4fc20d9bddb4f05393c74"
+            },
+            {
+              "role": "user",
+              "message_id": "fixture-message-7",
+              "turn_id": "group:user:fixture-message-7",
+              "text_length": 2094,
+              "text_sha256": "eca09ac08bf3f98efbd2d96905b613feb8893d908751659e21d6cc1bdf0779b1"
+            },
+            {
+              "role": "assistant",
+              "message_id": "fixture-message-8",
+              "turn_id": "group:assistant:fixture-message-7",
+              "text_length": 193,
+              "text_sha256": "f80ab4e9f1b71ce0fa9c2a275b27f1ecf3c27e5573599661b6480403a4dcb296"
+            },
+            {
+              "role": "assistant",
+              "message_id": "fixture-message-9",
+              "turn_id": "group:assistant:fixture-message-7",
+              "text_length": 143,
+              "text_sha256": "503547ed228ce3df47f608d70c36696875c2f3f038fff6d53d7e1ecedf76f0e8"
+            },
+            {
+              "role": "user",
+              "message_id": "fixture-message-10",
+              "turn_id": "group:user:fixture-message-10",
+              "text_length": 1992,
+              "text_sha256": "b8becb2b4642b46b2a2dd2270be1e55749efb1175ba47f8c7c55ac3e7d34eacb"
+            },
+            {
+              "role": "assistant",
+              "message_id": "fixture-message-11",
+              "turn_id": "group:assistant:fixture-message-10",
+              "text_length": 143,
+              "text_sha256": "503547ed228ce3df47f608d70c36696875c2f3f038fff6d53d7e1ecedf76f0e8"
+            },
+            {
+              "role": "user",
+              "message_id": "fixture-message-12",
+              "turn_id": "group:user:fixture-message-12",
+              "text_length": 2094,
+              "text_sha256": "f4a1b62391931ac070eda3e1034da64569e0d13faae9e03cdd4af1e5d06cbfa1"
+            },
+            {
+              "role": "assistant",
+              "message_id": "fixture-message-13",
+              "turn_id": "group:assistant:fixture-message-12",
+              "text_length": 143,
+              "text_sha256": "0125846ab71912c099756f41a6b0e3055e4aa6fd6f2fd9af251280f12be2c609"
+            },
+            {
+              "role": "user",
+              "message_id": "foreign"
+            }
+          ]
+        }
+      ],
+      "verified": false,
+      "reason": "latest_accepted_user_not_at_native_tail"
+    },
+    {
+      "name": "malformed-native-message",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "snapshot",
+            "messages"
+          ],
+          "value": [
+            null
+          ]
+        }
+      ],
+      "verified": false,
+      "reason": "native_messages_unknown"
+    },
+    {
+      "name": "unknown-loading-state",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "loaders"
+          ],
+          "value": null
+        }
+      ],
+      "verified": false,
+      "reason": "loading_state_unknown"
+    },
+    {
+      "name": "unknown-loader",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "loaders"
+          ],
+          "value": [
+            {
+              "kind": "unknown"
+            }
+          ]
+        }
+      ],
+      "verified": false,
+      "reason": "unclassified_or_tail_loading_marker"
+    },
+    {
+      "name": "older-head-marker-inside_first_transcript_child",
+      "base": "plan-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "loaders",
+            0,
+            "inside_first_transcript_child"
+          ],
+          "value": false
+        }
+      ],
+      "verified": false,
+      "reason": "unclassified_or_tail_loading_marker"
+    },
+    {
+      "name": "older-head-marker-dom_before_canvas",
+      "base": "plan-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "loaders",
+            0,
+            "dom_before_canvas"
+          ],
+          "value": false
+        }
+      ],
+      "verified": false,
+      "reason": "unclassified_or_tail_loading_marker"
+    },
+    {
+      "name": "older-head-marker-exact_older_label",
+      "base": "plan-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "loaders",
+            0,
+            "exact_older_label"
+          ],
+          "value": false
+        }
+      ],
+      "verified": false,
+      "reason": "unclassified_or_tail_loading_marker"
+    },
+    {
+      "name": "older-head-marker-exact_head_structure",
+      "base": "plan-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "loaders",
+            0,
+            "exact_head_structure"
+          ],
+          "value": false
+        }
+      ],
+      "verified": false,
+      "reason": "unclassified_or_tail_loading_marker"
+    },
+    {
+      "name": "older-head-marker-inside_canvas",
+      "base": "plan-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "loaders",
+            0,
+            "inside_canvas"
+          ],
+          "value": true
+        }
+      ],
+      "verified": false,
+      "reason": "unclassified_or_tail_loading_marker"
+    },
+    {
+      "name": "older-head-marker-head_label_sha256",
+      "base": "plan-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "loaders",
+            0,
+            "head_label_sha256"
+          ],
+          "value": "changed"
+        }
+      ],
+      "verified": false,
+      "reason": "unclassified_or_tail_loading_marker"
+    },
+    {
+      "name": "older-head-marker-head_bottom",
+      "base": "plan-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "loaders",
+            0,
+            "head_bottom"
+          ],
+          "value": 9999
+        }
+      ],
+      "verified": false,
+      "reason": "unclassified_or_tail_loading_marker"
+    },
+    {
+      "name": "busy-transcript",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "busy_container"
+          ],
+          "value": true
+        }
+      ],
+      "verified": false,
+      "reason": "transcript_busy"
+    },
+    {
+      "name": "active-response-state",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "snapshot",
+            "state"
+          ],
+          "value": "responding"
+        }
+      ],
+      "verified": false,
+      "reason": "response_not_positively_idle"
+    },
+    {
+      "name": "active-response-stop_visible",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "snapshot",
+            "stop_visible"
+          ],
+          "value": true
+        }
+      ],
+      "verified": false,
+      "reason": "response_not_positively_idle"
+    },
+    {
+      "name": "active-response-response_activity_turn_id",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "snapshot",
+            "response_activity_turn_id"
+          ],
+          "value": "active-turn"
+        }
+      ],
+      "verified": false,
+      "reason": "response_not_positively_idle"
+    },
+    {
+      "name": "active-response-response_projection_active",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "snapshot",
+            "response_projection_active"
+          ],
+          "value": true
+        }
+      ],
+      "verified": false,
+      "reason": "response_not_positively_idle"
+    },
+    {
+      "name": "real-observation-dev-0",
+      "base": "dev-0",
+      "changes": [],
+      "verified": true
+    },
+    {
+      "name": "real-observation-dev-1",
+      "base": "dev-1",
+      "changes": [],
+      "verified": true
+    },
+    {
+      "name": "real-observation-plan-0",
+      "base": "plan-0",
+      "changes": [],
+      "verified": true
+    },
+    {
+      "name": "real-observation-plan-1",
+      "base": "plan-1",
+      "changes": [],
+      "verified": true
+    },
+    {
+      "name": "unbound-diagnostic-keeps-tail-proof",
+      "base": "dev-0",
+      "changes": [
+        {
+          "path": [
+            "evidence",
+            "owner",
+            "page_id"
+          ],
+          "value": null
+        },
+        {
+          "path": [
+            "snapshot",
+            "page_id"
+          ],
+          "value": null
+        },
+        {
+          "path": [
+            "evidence",
+            "owner",
+            "page_task_id"
+          ],
+          "value": null
+        },
+        {
+          "path": [
+            "snapshot",
+            "page_task_id"
+          ],
+          "value": null
+        },
+        {
+          "path": [
+            "evidence",
+            "owner",
+            "page_team"
+          ],
+          "value": null
+        },
+        {
+          "path": [
+            "snapshot",
+            "page_team"
+          ],
+          "value": null
+        },
+        {
+          "path": [
+            "evidence",
+            "owner",
+            "page_role"
+          ],
+          "value": null
+        },
+        {
+          "path": [
+            "snapshot",
+            "page_role"
+          ],
+          "value": null
+        }
+      ],
+      "verified": true
+    }
+  ],
+  "note": "Only IDs/hashes/structure from authorized read-only current task observations. This fixture is not writer-release authority.",
+  "provenance": "Sanitized observed native DOM topology and geometry; synthetic identities and no account text."
+}

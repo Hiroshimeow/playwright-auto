@@ -2787,6 +2787,41 @@ class TaskStore(IndependentAgentStoreMixin):
         with exclusive_file_lock(lock, blocking=blocking):
             yield
 
+    @contextmanager
+    def stopped_writer_evidence_guard(
+        self, path: str | Path
+    ) -> Iterator[tuple[dict[str, Any], bool, dict[str, Any]]]:
+        """Hold existing owner locks for a stopped writer's final read; never save."""
+        from .durable import RequestLedger
+
+        target = Path(path).expanduser().resolve()
+        if not target.is_relative_to(self.root.resolve()):
+            raise ValueError("maintenance manifest is outside the task store")
+        with exclusive_file_lock(self.allocation_lock):
+            with exclusive_file_lock(self._lock_path(target)):
+                current = self._load_current_manifest_unlocked(target)
+                if current.get("status") != "STOPPED" or current.get("active_hop_id") is not None:
+                    raise ValueError("writer maintenance requires a stopped task without an active hop")
+                catalog = self._load_catalog_unlocked(reconcile=False)
+                entry = catalog.get("entries", {}).get(self._catalog_key(target))
+                if not isinstance(entry, Mapping) or entry.get("task_id") != current.get("task_id"):
+                    raise ValueError("maintenance task catalog identity is unknown")
+                immutable = bool(entry.get("replaced_by_task_id"))
+                ledger = RequestLedger(target.with_name("requests.json"))
+                if ledger.path.parent != target.parent:
+                    raise ValueError("maintenance ledger is outside the exact task directory")
+                with exclusive_file_lock(ledger.lock_path):
+                    # RequestLedger._locked() is a writer, even for reads. Do not
+                    # use it or synthesize a missing ledger for immutable history.
+                    raw = json.loads(read_shared_text(ledger.path, encoding="utf-8"))
+                    if (
+                        not isinstance(raw, Mapping)
+                        or raw.get("version") != RequestLedger.VERSION
+                        or not isinstance(raw.get("records"), dict)
+                    ):
+                        raise ValueError("maintenance request ledger is unknown or malformed")
+                    yield current, immutable, dict(raw["records"])
+
     def _initial_task_state(
         self,
         *,

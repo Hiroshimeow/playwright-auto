@@ -3341,6 +3341,7 @@ class CDPAWorker:
         manifest_path: Path,
         *,
         force_retry: bool = False,
+        release_only: bool = False,
     ) -> bool:
         """Non-destructive Stop maintenance; never infer Send or turn completion."""
         from .cdpa_conversations import ConversationWriterLease, canonical_conversation
@@ -3373,6 +3374,10 @@ class CDPAWorker:
             for role in state.get("roles", {}):
                 if role not in covered_roles and self._stop_role_needs_owned_page(state, role):
                     targets.append((role, None))
+            if release_only and targets:
+                # Maintenance may finalize an already released owner only. A
+                # concurrent/uncovered binding must never trigger browser actions.
+                return False
             for role, binding in targets:
                 endpoint = str((binding or {}).get("endpoint_id") or self._execution_endpoint_id(state, role) or self.store.endpoint_id_for(state))
                 already_held = asyncio.current_task() in self._endpoint_admission_holds
@@ -12251,11 +12256,79 @@ class CDPAWorker:
         )
         return True
 
+    async def _expand_saved_writer_transcript(
+        self, state: Mapping[str, Any], role: str, acquired: AcquiredRole,
+        prior: Any, *, deadline: float,
+    ) -> Any:
+        """Expand one exact accepted message view within the recovery deadline."""
+        from .cdpa_conversations import ConversationLeaseError, canonical_conversation
+        from .chatgpt_transcript_view import SavedTranscriptViewError, expand_saved_user_message
+
+        record = state["roles"][role]
+        endpoint_id = self._execution_endpoint_id(state, role)
+        endpoint = self._gate_c_endpoint_evidence(endpoint_id)
+        canonical = canonical_conversation(record.get("page_url"))
+        session = None
+
+        async def perform() -> Any:
+            nonlocal session
+            session = await acquired.client.page.context.new_cdp_session(acquired.client.page)
+            target = (await session.send("Target.getTargetInfo")).get("targetInfo") or {}
+            target_id = target.get("targetId")
+            if (
+                not isinstance(target_id, str) or not target_id
+                or target.get("type") != "page"
+                or not canonical or canonical_conversation(target.get("url")) != canonical
+            ):
+                raise SavedTranscriptViewError("The accepted-message target cannot be pinned")
+
+            async def identity_guard() -> None:
+                if self._gate_c_endpoint_evidence(endpoint_id) != endpoint:
+                    raise SavedTranscriptViewError("The accepted-message browser changed")
+                current = (await session.send("Target.getTargetInfo")).get("targetInfo") or {}
+                if (
+                    current.get("targetId") != target_id or current.get("type") != "page"
+                    or canonical_conversation(current.get("url")) != canonical
+                ):
+                    raise SavedTranscriptViewError("The accepted-message target changed")
+
+            return await expand_saved_user_message(
+                acquired.client,
+                expected_user_id=prior.receipt["user_message_id"],
+                expected_prompt=prior.rendered_prompt,
+                expected_owner={
+                    "page_id": record["page_id"], "page_role": record["physical_role"],
+                    "page_task_id": state["task_id"], "page_team": state["team"],
+                },
+                canonical=canonical, identity_guard=identity_guard,
+                timeout_seconds=max(0.0, deadline - time.monotonic()),
+            )
+
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            return await asyncio.wait_for(perform(), timeout=remaining)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise ConversationLeaseError(
+                "CONVERSATION_IDENTITY_MISMATCH",
+                f"The accepted-message view could not be verified ({type(exc).__name__})",
+            ) from exc
+        finally:
+            if session is not None:
+                try:
+                    await asyncio.wait_for(session.detach(), timeout=0.5)
+                except Exception:
+                    pass
+
+
     async def _wait_for_saved_writer_transcript(
         self, state: Mapping[str, Any], role: str, acquired: AcquiredRole,
         snapshot: Any, prior: Any,
     ) -> Any:
-        """Observe exact accepted history without mutating a reopened page."""
+        """Prove accepted history, revealing one exact saved user view if needed."""
         from .cdpa_conversations import ConversationLeaseError
 
         record = state["roles"][role]
@@ -12263,6 +12336,7 @@ class CDPAWorker:
         previous_user_id = prior.receipt.get("user_message_id")
         deadline = time.monotonic() + min(5.0, max(0.0, self.config.workspace_timeout_seconds))
         delay_next_read = False
+        expansion_attempted = False
         while True:
             if (
                 snapshot.page_id != record.get("page_id")
@@ -12297,6 +12371,27 @@ class CDPAWorker:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
+            if (
+                not expansion_attempted and previous_user_id
+                and not str(previous_user_id).startswith("DOM:")
+                and any(
+                    message.role == "user" and message.message_id == previous_user_id
+                    and " ".join(str(message.text).split()).endswith(" Show more")
+                    for message in snapshot.messages
+                )
+            ):
+                expansion_attempted = True
+                expanded = await self._expand_saved_writer_transcript(
+                    state, role, acquired, prior, deadline=deadline,
+                )
+                if time.monotonic() >= deadline:
+                    break
+                if expanded is not None:
+                    snapshot = expanded
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
             if delay_next_read:
                 await asyncio.sleep(min(0.1, remaining))
                 remaining = deadline - time.monotonic()
@@ -14825,12 +14920,14 @@ class CDPAWorker:
                 ):
                     projection_context.append(task)
             waiting_order = build_waiting_order(runtime_tasks)
+            maintenance_evidence = self._writer_maintenance_evidence(runtime_tasks)
             projections = [
                 build_task_projection(
                     task,
                     tasks=projection_context,
                     waiting_order=waiting_order,
                     repository_allowed_roots=self.config.repository_allowed_roots,
+                    writer_maintenance_evidence=maintenance_evidence,
                 )
                 for task in runtime_tasks
             ]
@@ -15083,6 +15180,7 @@ class CDPAWorker:
                     raise ValueError("command state is missing task_id")
                 self._startup_command_states[task_id] = snapshot
                 waiting_order = build_waiting_order([snapshot])
+                maintenance_evidence = self._writer_maintenance_evidence([snapshot])
                 self.runtime_db.upsert_task_projections(
                     [
                         build_task_projection(
@@ -15093,6 +15191,7 @@ class CDPAWorker:
                             browser_connected=(self._browser_projection or {}).get("connected"),
                             endpoint_connected=(self._browser_projection or {}).get("endpoint_connected"),
                             repository_allowed_roots=self.config.repository_allowed_roots,
+                            writer_maintenance_evidence=maintenance_evidence,
                         )
                     ]
                 )
@@ -15334,6 +15433,252 @@ class CDPAWorker:
                 raise RuntimeError("control command provenance has different confirmation")
         return state
 
+
+    def _writer_maintenance_owner(self) -> Any:
+        from .cdpa_conversations import ConversationWriterLease
+
+        owner = getattr(self, "_writer_maintenance_lease_owner", None)
+        if owner is None or owner.db is not self.runtime_db:
+            owner = ConversationWriterLease(self.runtime_db)
+            self._writer_maintenance_lease_owner = owner
+        return owner
+
+    def _writer_maintenance_evidence(
+        self, tasks: Sequence[Mapping[str, Any]],
+    ) -> Mapping[str, Any] | None:
+        from .cdpa_conversations import ConversationLeaseError
+
+        if not any(task.get("status") == "STOPPED" for task in tasks):
+            return None
+        try:
+            return self._writer_maintenance_owner().stopped_writer_maintenance_evidence()
+        except ConversationLeaseError:
+            # Unknown authority must remain pending; never present it as empty.
+            return None
+
+    def _check_stopped_writer_runtime(self) -> None:
+        from .cdpa_conversations import ConversationLeaseError
+
+        if (
+            self.runtime_degraded or not self._runtime_ready
+            or self._refresh_source_drift(force=True).get("drifted")
+        ):
+            raise ConversationLeaseError(
+                "STOPPED_WRITER_PROOF_REQUIRED",
+                "writer maintenance requires a healthy, loaded worker without source drift",
+            )
+
+    async def _stopped_writer_endpoint(
+        self, payload: Mapping[str, Any], *, expected_context: Any = None,
+    ) -> Any:
+        from .cdpa_conversations import ConversationLeaseError
+
+        endpoint_id = str(payload.get("endpoint_id") or "")
+        pool = self._endpoint_pool
+        context = pool.contexts.get(endpoint_id) if pool is not None else None
+        if context is None or (expected_context is not None and context is not expected_context):
+            raise ConversationLeaseError(
+                "STOPPED_WRITER_PROOF_REQUIRED", "the pinned endpoint attachment is unavailable or changed",
+            )
+        browser = getattr(context, "browser", None)
+        if browser is None or not browser.is_connected():
+            raise ConversationLeaseError("STOPPED_WRITER_PROOF_REQUIRED", "the pinned browser disconnected")
+        cdp_url, physical = self._gate_c_endpoint_evidence(endpoint_id)
+        if (
+            cdp_url != payload.get("endpoint_cdp_url")
+            or physical != payload.get("physical_browser_id")
+            or not physical.startswith("devtools:")
+        ):
+            raise ConversationLeaseError(
+                "STOPPED_WRITER_PROOF_REQUIRED", "the registered physical browser identity changed",
+            )
+        # Refresh only /json/version through the existing bounded read-only probe.
+        # Do not invoke auth acquisition, pool refresh, connect, or fresh-page probes.
+        version = await pool.version_probe(cdp_url)
+        if pool._physical_identity(version, cdp_url) != physical:
+            raise ConversationLeaseError(
+                "STOPPED_WRITER_PROOF_REQUIRED", "the live physical browser differs from the pinned command",
+            )
+        if pool.contexts.get(endpoint_id) is not context or not browser.is_connected():
+            raise ConversationLeaseError("STOPPED_WRITER_PROOF_REQUIRED", "the browser attachment changed during observation")
+        return context
+
+    async def _stopped_writer_target(
+        self, context: Any, payload: Mapping[str, Any], binding: Mapping[str, Any],
+        *, expected_page: Any = None,
+    ) -> Any:
+        from .cdpa_conversations import ConversationLeaseError, canonical_conversation
+
+        target_id = str(payload.get("target_id") or "")
+        canonical = binding.get("canonical_conversation_id")
+        browser = context.browser
+        session = await browser.new_browser_cdp_session()
+        try:
+            info = (await session.send("Target.getTargetInfo", {"targetId": target_id})).get("targetInfo") or {}
+        finally:
+            try:
+                await asyncio.wait_for(session.detach(), timeout=0.5)
+            except Exception:
+                pass  # Detach cannot trap cancellation or the held admission lock.
+        if (
+            info.get("targetId") != target_id or info.get("type") != "page"
+            or canonical_conversation(str(info.get("url") or "")) != canonical
+        ):
+            raise ConversationLeaseError("STOPPED_WRITER_PROOF_REQUIRED", "the exact diagnostic target identity does not match")
+        matches = []
+        for page in tuple(context.pages):
+            if page.is_closed():
+                continue
+            try:
+                if canonical_conversation(str(page.url)) != canonical:
+                    continue
+            except (ConversationLeaseError, ValueError):
+                continue
+            child = await context.new_cdp_session(page)
+            try:
+                candidate = (await child.send("Target.getTargetInfo")).get("targetInfo") or {}
+            finally:
+                try:
+                    await asyncio.wait_for(child.detach(), timeout=0.5)
+                except Exception:
+                    pass  # Detach cannot trap cancellation or the held admission lock.
+            if candidate.get("targetId") == target_id:
+                if candidate.get("type") != "page" or canonical_conversation(str(candidate.get("url") or "")) != canonical:
+                    raise ConversationLeaseError("STOPPED_WRITER_PROOF_REQUIRED", "diagnostic target changed while attaching")
+                matches.append(page)
+        if len(matches) != 1 or (expected_page is not None and matches[0] is not expected_page):
+            raise ConversationLeaseError("STOPPED_WRITER_PROOF_REQUIRED", "the pinned diagnostic page is absent or ambiguous")
+        return matches[0]
+
+    async def _observe_stopped_writer_target(
+        self, page: Any, payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        from .chatgpt_history_tail import collect_stopped_writer_observation
+
+        return await collect_stopped_writer_observation(
+            page,
+            endpoint_id=str(payload["endpoint_id"]),
+            endpoint_cdp_url=str(payload["endpoint_cdp_url"]),
+            physical_browser_id=str(payload["physical_browser_id"]),
+            target_id=str(payload["target_id"]),
+        )
+
+    async def _complete_stopped_writer_reconciliation(
+        self, command_id: str,
+    ) -> dict[str, Any]:
+        from .cdpa_conversations import ConversationLeaseError
+        from .cdpa_projection import _writer_maintenance_projection
+
+        owner = self._writer_maintenance_owner()
+        sealed = False
+        saved: dict[str, Any] | None = None
+        try:
+            self._check_stopped_writer_runtime()
+            command = self.runtime_db.get_command(command_id)
+            payload = command["payload"]
+            task_id = str(command.get("task_id") or "")
+            current = self._command_task_state(task_id)
+            if current is None:
+                raise ConversationLeaseError("STOPPED_WRITER_PROOF_REQUIRED", "the stopped task is unavailable")
+            path = Path(str(current["manifest_path"]))
+            # The ordinary task execution lock prevents any controller run for this
+            # stopped owner while evidence is collected. No task body is resumed.
+            with self.store.task_run_lock(path, blocking=False):
+                observation_deadline = time.monotonic() + 45.0
+                async with asyncio.timeout(45.0):
+                    with self.store.stopped_writer_evidence_guard(path) as (state, immutable, records):
+                        binding = owner.get_binding(str(payload.get("binding_id") or ""))
+                        cleanup = state.get("cleanup") or {}
+                        stops = [item for item in state.get("controls") or []
+                                 if item.get("control_id") == payload.get("stop_control_id")]
+                        stop = stops[0] if len(stops) == 1 else {}
+                        if (
+                            command.get("kind") != "reconcile_stopped_writer"
+                            or command.get("status") != "running"
+                            or type(command.get("expected_task_version")) is not int
+                            or command["expected_task_version"] != self.runtime_db.get_task_version(task_id)
+                            or state.get("task_id") != task_id
+                            or state.get("conversation_mode") != "persistent"
+                            or cleanup.get("state") != "CLEARING"
+                            or cleanup.get("phase") != "writer_stop_pending"
+                            or cleanup.get("stop_control_id") != payload.get("stop_control_id")
+                            or stop.get("action") != "stop" or stop.get("status") != "applied"
+                            or stop.get("command_state") != "APPLIED"
+                            or stop.get("confirmed") is not True or stop.get("origin") != "operator"
+                            or not stop.get("external_command_id")
+                            or (stop.get("command") or {}).get("task_id") != task_id
+                            or (stop.get("result") or {}).get("writer_cleanup_pending") is not True
+                            or binding.get("task_id") != task_id
+                            or binding.get("binding_status") not in {"active", "blocked", "idle"}
+                            or binding.get("provider_id") != "chatgpt_web"
+                            or binding.get("temporary_chat") is not False
+                            or any(binding.get(key) != payload.get(key) for key in ("endpoint_id", "endpoint_cdp_url"))
+                        ):
+                            raise ConversationLeaseError("STOPPED_WRITER_PROOF_REQUIRED", "the original stopped writer admission no longer matches")
+                        initial_task = owner._stopped_writer_digest(state)
+                        initial_ledger = owner._stopped_writer_digest(records)
+                    await self._acquire_endpoint_admission(
+                        state, str(binding["role_key"]), endpoint_id=str(payload["endpoint_id"]),
+                    )
+                    try:
+                        context = await self._stopped_writer_endpoint(payload)
+                        page = await self._stopped_writer_target(context, payload, binding)
+                        observations = [await self._observe_stopped_writer_target(page, payload)]
+                        await asyncio.sleep(0.2)
+                        observations.append(await self._observe_stopped_writer_target(page, payload))
+                        await self._stopped_writer_endpoint(payload, expected_context=context)
+                        await self._stopped_writer_target(context, payload, binding, expected_page=page)
+                        self._check_stopped_writer_runtime()
+                        if time.monotonic() >= observation_deadline:
+                            raise TimeoutError("stopped writer observation exceeded its bounded deadline")
+                        # No await occurs between the final target check and this
+                        # locked owner transaction. Its clock rejects stale proof.
+                        with self.store.stopped_writer_evidence_guard(path) as (latest, latest_immutable, latest_records):
+                            if time.monotonic() >= observation_deadline:
+                                raise TimeoutError("stopped writer evidence lock exceeded the observation deadline")
+                            if (
+                                latest_immutable is not immutable
+                                or owner._stopped_writer_digest(latest) != initial_task
+                                or owner._stopped_writer_digest(latest_records) != initial_ledger
+                            ):
+                                raise ConversationLeaseError("STOPPED_WRITER_PROOF_REQUIRED", "manifest, Stop, catalog identity, or accepted ledger changed during observation")
+                            result = owner.seal_stopped_writer(
+                                command_id, task=latest, immutable_task=latest_immutable,
+                                request_records=latest_records, observations=observations,
+                            )
+                            sealed = True
+                            saved = dict(latest)
+                        # Only the original command may bridge a crash after seal.
+                        # Its durable owner proof remains available if this fails.
+                        self.runtime_db.finish_command(command_id, result=result)
+                        self._publish_command_state(saved)
+                        if not immutable:
+                            evidence = owner.stopped_writer_maintenance_evidence()
+                            coverage = _writer_maintenance_projection(saved, evidence) or {}
+                            if coverage.get("released") is True:
+                                # This existing Stop owner is explicitly forbidden
+                                # from acquiring/stopping any newly appeared target.
+                                await self._continue_stop_writer_cleanup(
+                                    saved, CDPATabActions(context, self.config), path,
+                                    force_retry=True, release_only=True,
+                                )
+                                self._publish_command_state(saved)
+                                self._sync_control_commands(saved)
+                    finally:
+                        self._release_endpoint_admission()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if sealed:
+                # Release is already durable; do not convert it to a false failure.
+                # A finish gap is recovered by exact-command replay after reload.
+                if saved is not None:
+                    self._publish_command_state(saved)
+            else:
+                self.runtime_db.require_command_recovery(
+                    command_id, error=sanitize_text(f"{type(exc).__name__}: {exc}", max_chars=2000),
+                )
+        return self.runtime_db.get_command(command_id)
 
     def _schedule_async_browser_command(
         self,
@@ -16149,6 +16494,23 @@ class CDPAWorker:
         command_id = str(command["command_id"])
         task_id = str(command.get("task_id") or "") or None
         try:
+            if command.get("kind") == "reconcile_stopped_writer":
+                try:
+                    self._check_stopped_writer_runtime()
+                    replay = self._writer_maintenance_owner().replay_stopped_writer_release(command_id)
+                except Exception as exc:
+                    self.runtime_db.require_command_recovery(
+                        command_id, error=sanitize_text(f"{type(exc).__name__}: {exc}", max_chars=2000),
+                    )
+                    return self.runtime_db.get_command(command_id)
+                if replay is not None:
+                    # Exact sealed-command replay completes audit only. It cannot
+                    # mutate a historical manifest or inspect/operate a browser.
+                    self.runtime_db.finish_command(command_id, result=replay)
+                    current = self._command_task_state(str(replay["task_id"]))
+                    if current is not None:
+                        self._publish_command_state(current)
+                    return self.runtime_db.get_command(command_id)
             try:
                 replay_state = self._command_replay_state(command)
             except Exception as exc:
@@ -16198,6 +16560,10 @@ class CDPAWorker:
                         f"{len(catalog.get('errors') or [])} discovery errors"
                     )
                 result = {"catalog": catalog}
+            elif kind == "reconcile_stopped_writer":
+                return self._schedule_async_browser_command(
+                    command_id, lambda: self._complete_stopped_writer_reconciliation(command_id),
+                )
             elif kind == "direct_chat_bind":
                 return self._schedule_async_browser_command(
                     command_id,
@@ -16750,6 +17116,7 @@ class CDPAWorker:
                     "provider_dispatch",
                     "async_continuation_register",
                     "async_continuation_complete",
+                    "reconcile_stopped_writer",
                 )
             )
             if rejected is None:
@@ -16802,6 +17169,7 @@ class CDPAWorker:
             "browser_endpoint_remove",
             "browser_endpoint_start",
             "browser_endpoint_stop",
+            "reconcile_stopped_writer",
         )
         if self._browser_cycle_active:
             allowed = browser_safe_commands
@@ -16836,6 +17204,7 @@ class CDPAWorker:
             return
         tasks = list(self.registry.tasks_by_id.values())
         waiting_order = build_waiting_order(tasks)
+        maintenance_evidence = self._writer_maintenance_evidence(tasks)
         self.runtime_db.upsert_task_projections(
             [
                 build_task_projection(
@@ -16846,6 +17215,7 @@ class CDPAWorker:
                     browser_connected=normalized.get("connected"),
                     endpoint_connected=normalized.get("endpoint_connected"),
                     repository_allowed_roots=self.config.repository_allowed_roots,
+                    writer_maintenance_evidence=maintenance_evidence,
                 )
                 for task in tasks
             ]
@@ -16979,6 +17349,7 @@ class CDPAWorker:
             return
         tasks = list(self.registry.tasks_by_id.values())
         waiting_order = build_waiting_order(tasks)
+        maintenance_evidence = self._writer_maintenance_evidence(tasks)
         projection_ids = set(task_ids)
         projection_ids.update(
             str(task.get("task_id") or "")
@@ -16994,6 +17365,7 @@ class CDPAWorker:
                 browser_connected=(self._browser_projection or {}).get("connected"),
                 endpoint_connected=(self._browser_projection or {}).get("endpoint_connected"),
                 repository_allowed_roots=self.config.repository_allowed_roots,
+                writer_maintenance_evidence=maintenance_evidence,
             )
             for task_id in sorted(projection_ids)
             if task_id in self.registry.tasks_by_id

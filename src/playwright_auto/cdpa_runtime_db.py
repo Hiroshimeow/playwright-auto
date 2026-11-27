@@ -45,6 +45,7 @@ COMMAND_KINDS = frozenset(
         "direct_chat_bind",
         "direct_chat_message",
         "direct_chat_close",
+    "reconcile_stopped_writer",
         "reload_catalog",
     }
 )
@@ -464,11 +465,15 @@ class RuntimeDB:
             raise RuntimeDBError(f"{label} is not an object")
         return parsed
 
-    def get_task_version(self, task_id: str) -> int | None:
-        with self.connection() as connection:
-            row = connection.execute(
-                "SELECT version FROM task_projection WHERE task_id=?", (task_id,)
-            ).fetchone()
+    def get_task_version(
+        self, task_id: str, *, connection: sqlite3.Connection | None = None
+    ) -> int | None:
+        if connection is None:
+            with self.connection() as current:
+                return self.get_task_version(task_id, connection=current)
+        row = connection.execute(
+            "SELECT version FROM task_projection WHERE task_id=?", (task_id,)
+        ).fetchone()
         return int(row[0]) if row is not None else None
 
     def get_task_detail(self, task_id: str) -> dict[str, Any] | None:

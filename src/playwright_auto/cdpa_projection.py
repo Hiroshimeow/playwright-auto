@@ -1308,6 +1308,179 @@ def _execution_budget_projection(raw: Mapping[str, Any]) -> dict[str, Any] | Non
     }
 
 
+def _writer_maintenance_digest(value: Any) -> str:
+    body = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _stopped_writer_binding_state(
+    binding: Mapping[str, Any], evidence: Mapping[str, Any], stop_ids: set[int],
+) -> tuple[str, str | None]:
+    # Import lazily: the conversation owner imports RuntimeDB, whose projection
+    # type is defined in this module. Reuse its terminal attempt vocabulary.
+    from .cdpa_conversations import _TERMINAL_ATTEMPT_STATES
+
+    identifier = binding.get("binding_id")
+    if (binding.get("binding_status") != "sealed"
+            or not all(isinstance(evidence.get(key), Mapping) for key in
+                       ("leases", "page_claims", "quarantine", "attempts_by_binding", "commands_by_id"))):
+        return "pending", None
+    attempts = evidence["attempts_by_binding"].get(identifier)
+    if (not isinstance(attempts, (list, tuple))
+            or any(not isinstance(item, Mapping) or item.get("owner_binding_id") != identifier
+                   or item.get("state") not in _TERMINAL_ATTEMPT_STATES for item in attempts)
+            or any(isinstance(lease, Mapping) and lease.get("owner_binding_id") == identifier
+                   for lease in evidence["leases"].values())
+            or identifier in evidence["page_claims"].values()):
+        return "pending", None
+    keys = {binding.get("writer_identity_key"), binding.get("provisional_writer_identity_key")} - {None, ""}
+    if (not keys or any(key in evidence["quarantine"] for key in keys)
+            or any(isinstance(value, Mapping) and identifier in
+                   {value.get("binding_id"), value.get("owner_binding_id")}
+                   for value in evidence["quarantine"].values())):
+        return "pending", None
+    for key in keys:
+        if key not in evidence["leases"]:
+            continue
+        lease = evidence["leases"][key]
+        if (not isinstance(lease, Mapping) or not isinstance(lease.get("owner_binding_id"), str)
+                or not lease["owner_binding_id"].strip()):
+            return "pending", None
+    if "stopped_writer_release" not in binding:
+        return "already_released", "existing_owner"
+    proof = binding.get("stopped_writer_release")
+    if not isinstance(proof, Mapping):
+        return "pending", None
+    command = evidence["commands_by_id"].get(proof.get("command_id"))
+    if not isinstance(command, Mapping):
+        return "pending", None
+    payload = command.get("payload")
+    if not isinstance(payload, Mapping):
+        return "pending", None
+    try:
+        valid = (
+            proof.get("kind") == "stopped_controller_writer_release"
+            and type(proof.get("immutable_history")) is bool
+            and type(proof.get("observed_at")) in {int, float}
+            and 0 < proof["observed_at"] < float("inf")
+            and all(isinstance(proof.get(key), str) and bool(proof[key].strip()) for key in
+                    ("latest_request_id", "latest_user_message_id", "canonical_conversation_id",
+                     "role_key", "target_id", "physical_browser_id"))
+            and all(isinstance(proof.get(key), str) and re.fullmatch(r"[0-9a-f]{64}", proof[key])
+                    for key in ("command_sha256", "task_sha256", "binding_sha256", "attempts_sha256",
+                                "ledger_sha256", "observations_sha256", "evidence_sha256"))
+            and proof.get("attempts_sha256") == _writer_maintenance_digest(
+                sorted(attempts, key=lambda item: str(item.get("attempt_id")))
+            )
+            and proof.get("binding_id") == identifier
+            and proof.get("task_id") == binding.get("task_id")
+            and proof.get("role_key") == binding.get("role_key")
+            and proof.get("canonical_conversation_id") == binding.get("canonical_conversation_id")
+            and proof.get("stop_control_id") in stop_ids
+            and command.get("command_id") == proof.get("command_id")
+            and command.get("kind") == "reconcile_stopped_writer"
+            and command.get("task_id") == binding.get("task_id")
+            and isinstance(command.get("idempotency_key"), str) and bool(command["idempotency_key"])
+            and type(command.get("expected_task_version")) is int and command["expected_task_version"] > 0
+            and set(payload) == {"binding_id", "stop_control_id", "endpoint_id", "endpoint_cdp_url",
+                                 "physical_browser_id", "target_id"}
+            and payload.get("binding_id") == identifier
+            and payload.get("stop_control_id") == proof.get("stop_control_id")
+            and payload.get("endpoint_id") == binding.get("endpoint_id")
+            and payload.get("endpoint_cdp_url") == binding.get("endpoint_cdp_url")
+            and payload.get("target_id") == proof.get("target_id")
+            and payload.get("physical_browser_id") == proof.get("physical_browser_id")
+            and proof.get("command_sha256") == _writer_maintenance_digest({
+                key: command.get(key) for key in
+                ("command_id", "kind", "task_id", "idempotency_key", "expected_task_version", "payload")
+            })
+            and proof.get("evidence_sha256") == _writer_maintenance_digest({
+                key: value for key, value in proof.items() if key != "evidence_sha256"
+            })
+        )
+    except (TypeError, ValueError):
+        valid = False
+    if not valid:
+        return "pending", None
+    if command.get("status") in {"queued", "running"}:
+        return "pending_audit", "maintenance"
+    result = command.get("result")
+    if (command.get("status") != "applied" or not isinstance(result, Mapping)
+            or result.get("controller_writer_released") is not True
+            or result.get("task_id") != binding.get("task_id") or result.get("binding_id") != identifier
+            or result.get("proof") != proof):
+        return "pending", None
+    return "released", "maintenance"
+
+
+def _writer_maintenance_projection(
+    raw: Mapping[str, Any], evidence: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if raw.get("status") != "STOPPED":
+        return None
+    evidence = evidence if isinstance(evidence, Mapping) else {}
+    values = evidence.get("bindings") or []
+    bindings = {value["binding_id"]: value for value in values
+                if isinstance(value, Mapping) and isinstance(value.get("binding_id"), str)
+                and value.get("task_id") == raw.get("task_id")}
+    cleanup = raw.get("cleanup") or {}
+    if cleanup.get("phase") != "writer_stop_pending" and not any(
+        value.get("stopped_writer_release") for value in bindings.values()
+    ):
+        return None
+    roles = raw.get("roles") or {}
+    required = set(bindings)
+    uncovered: set[str] = set()
+    for hop in raw.get("hops") or []:
+        if not isinstance(hop, Mapping):
+            uncovered.add("unknown")
+            continue
+        role = str(hop.get("target_role") or "")
+        if not role:
+            uncovered.add("unknown")
+            continue
+        identifier = hop.get("conversation_binding_id")
+        record = roles.get(role) or {}
+        if not identifier and hop.get("conversation_generation") is not None:
+            if hop.get("conversation_generation") == record.get("conversation_generation"):
+                identifier = record.get("conversation_binding_id")
+        if not identifier:
+            uncovered.add(role)
+        else:
+            required.add(identifier)
+            if identifier not in bindings or bindings[identifier].get("role_key") != role:
+                uncovered.add(role)
+    for role, record in roles.items():
+        if not isinstance(record, Mapping) or not _int_or_zero(record.get("turn")):
+            continue
+        identifier = record.get("conversation_binding_id")
+        if not identifier:
+            uncovered.add(str(role))
+        else:
+            required.add(identifier)
+            if identifier not in bindings or bindings[identifier].get("role_key") != role:
+                uncovered.add(str(role))
+    stop_ids = {item["control_id"] for item in raw.get("controls") or []
+                if isinstance(item, Mapping) and type(item.get("control_id")) is int
+                and item.get("action") == "stop" and item.get("status") == "applied"
+                and item.get("confirmed") is True and item.get("origin") == "operator"}
+    rows = []
+    for identifier in sorted(required):
+        binding = bindings.get(identifier)
+        state, source = _stopped_writer_binding_state(binding, evidence, stop_ids) if binding else ("pending", None)
+        rows.append({"binding_id": identifier, "role": (binding or {}).get("role_key"),
+                     "state": state, "source": source})
+    released = sum(row["state"] in {"released", "already_released"} for row in rows)
+    complete = bool(rows) and not uncovered and released == len(rows)
+    return {
+        "state": "released" if complete else "partial" if released else "pending",
+        "released": complete, "required_bindings": len(rows), "released_bindings": released,
+        "pending_audit_bindings": sum(row["state"] == "pending_audit" for row in rows),
+        "uncovered_roles": sorted(uncovered), "bindings": rows,
+        "scope": "controller_writer_authority",
+    }
+
+
 def build_task_projection(
     raw: Mapping[str, Any],
     *,
@@ -1317,6 +1490,7 @@ def build_task_projection(
     browser_connected: bool | None = None,
     endpoint_connected: Mapping[str, bool] | None = None,
     repository_allowed_roots: Sequence[str | Path] = (),
+    writer_maintenance_evidence: Mapping[str, Any] | None = None,
 ) -> TaskProjection:
     task_id = str(raw.get("task_id") or "")
     team = str(raw.get("team") or "")
@@ -1587,6 +1761,9 @@ def build_task_projection(
         "parent_task_id": str(raw.get("parent_task_id") or "") or None,
         "version": 0,
     }
+    maintenance = _writer_maintenance_projection(raw, writer_maintenance_evidence)
+    if maintenance is not None:
+        summary["writer_maintenance"] = maintenance
     if status == "WAITING" and independent is None:
         order_map = (
             build_waiting_order(tasks) if waiting_order is None else waiting_order

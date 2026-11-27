@@ -1241,6 +1241,60 @@ class DashboardAPI:
             )
         return expected
 
+    @staticmethod
+    def normalize_stopped_writer_maintenance(
+        payload: Mapping[str, Any], expected_task_version: int | None,
+    ) -> dict[str, Any]:
+        fields = {"binding_id", "stop_control_id", "endpoint_id", "endpoint_cdp_url",
+                  "physical_browser_id", "target_id"}
+        if set(payload) != fields:
+            raise APIError(400, "invalid_request", "writer maintenance accepts only exact binding, Stop and target pins")
+        if type(expected_task_version) is not int or expected_task_version <= 0:
+            raise APIError(400, "invalid_request", "writer maintenance requires a positive integer expected_task_version")
+        if type(payload["stop_control_id"]) is not int or payload["stop_control_id"] <= 0:
+            raise APIError(400, "invalid_request", "stop_control_id must be a positive integer")
+        for field in fields - {"stop_control_id"}:
+            value = payload[field]
+            if not isinstance(value, str) or not value.strip() or len(value) > 2048:
+                raise APIError(400, "invalid_request", f"{field} must be a non-empty bounded string")
+        return {field: value.strip() if isinstance(value, str) else value for field, value in payload.items()}
+
+    def _check_stopped_writer_admission(
+        self, task_id: str, payload: Mapping[str, Any], expected_task_version: int,
+    ) -> None:
+        detail = self.db.get_task_detail(task_id)
+        if detail is None:
+            raise APIError(404, "task_not_found", "task does not exist")
+        if detail.get("version") != expected_task_version:
+            raise APIError(409, "stale_task_version", "task version changed before writer maintenance admission")
+        cleanup = detail.get("cleanup") or {}
+        controls = [item for item in detail.get("controls", [])
+                    if isinstance(item, Mapping) and item.get("control_id") == payload["stop_control_id"]]
+        if (detail.get("status") != "STOPPED" or "active_hop_id" not in detail
+                or detail["active_hop_id"] is not None or detail.get("conversation_mode") != "persistent"
+                or cleanup.get("state") != "CLEARING" or cleanup.get("phase") != "writer_stop_pending"
+                or cleanup.get("stop_control_id") != payload["stop_control_id"] or len(controls) != 1):
+            raise APIError(409, "stopped_writer_maintenance_ineligible", "the exact stopped writer hold is required")
+        stop = controls[0]
+        if (stop.get("action") != "stop" or stop.get("status") != "applied"
+                or stop.get("command_state") != "APPLIED" or stop.get("confirmed") is not True
+                or stop.get("origin") != "operator" or not stop.get("external_command_id")
+                or (stop.get("command") or {}).get("task_id") != task_id
+                or (stop.get("result") or {}).get("writer_cleanup_pending") is not True):
+            raise APIError(409, "stopped_writer_maintenance_ineligible", "the confirmed applied operator Stop is required")
+        snapshot = self.db.get_snapshot("conversation_runtime")
+        bindings = (snapshot or {}).get("payload", {}).get("bindings") or {}
+        binding = bindings.get(payload["binding_id"]) or {}
+        if (binding.get("task_id") != task_id or binding.get("binding_id") != payload["binding_id"]
+                or binding.get("binding_status") not in {"active", "blocked", "idle"}
+                or binding.get("provider_id") != "chatgpt_web" or binding.get("temporary_chat") is not False
+                or binding.get("endpoint_id") != payload["endpoint_id"]
+                or binding.get("endpoint_cdp_url") != payload["endpoint_cdp_url"]
+                or not binding.get("role_key") or stop.get("role") not in {None, binding.get("role_key")}):
+            raise APIError(409, "stopped_writer_maintenance_ineligible", "the original task binding and endpoint are required")
+        # Projection admission is preliminary. The worker rechecks authoritative
+        # task/Stop/version and collects fresh evidence before any seal transaction.
+
     def enqueue(
         self,
         *,
@@ -1256,6 +1310,9 @@ class DashboardAPI:
         if len(key) > 200:
             raise APIError(400, "invalid_idempotency_key", "Idempotency-Key is too long")
         normalized_payload = dict(payload)
+        if kind == "reconcile_stopped_writer":
+            task_id = validate_task_id(str(task_id or ""))
+            normalized_payload = self.normalize_stopped_writer_maintenance(payload, expected_task_version)
         if kind == "create_task" and task_id is None:
             task_id = generate_idempotent_task_id(
                 str(normalized_payload.get("task") or ""), key
@@ -1272,6 +1329,8 @@ class DashboardAPI:
             if not same:
                 raise APIError(409, "idempotency_conflict", "Idempotency-Key belongs to another request")
             return self._fail_stale_resume(existing)
+        if kind == "reconcile_stopped_writer":
+            self._check_stopped_writer_admission(task_id, normalized_payload, expected_task_version)
         command_id = f"cmd-{uuid.uuid4()}"
         try:
             command = self.db.enqueue_command(
@@ -2343,6 +2402,13 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                         task_id=task_id,
                         expected_task_version=expected,
                         payload={"parent_task_id": parent_task_id},
+                    )
+                elif len(parts) == 4 and parts[:2] == ["api", "tasks"] and parts[3] == "writer-maintenance":
+                    task_id = validate_task_id(parts[2])
+                    command = app.enqueue(
+                        idempotency_key=key, kind="reconcile_stopped_writer", task_id=task_id,
+                        expected_task_version=raw.get("expected_task_version"),
+                        payload={name: value for name, value in raw.items() if name != "expected_task_version"},
                     )
                 elif len(parts) == 4 and parts[:2] == ["api", "tasks"] and parts[3] == "goal":
                     task_id = validate_task_id(parts[2])

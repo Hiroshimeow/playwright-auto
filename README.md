@@ -199,7 +199,23 @@ Use the dashboard/API controls instead of editing runtime manifests:
 - Stop
 - Clear Team
 
-Controls are processed by the durable worker state machine.
+Controls are processed by the durable worker state machine. Team Restart waits for verified writer release from the exact applied Stop before creating one replacement. Stop being applied while writer cleanup remains pending is insufficient. A durable Restart waiter preserves its original command, role, reason and confirmation across reload.
+
+For a persistent conversation recovered before Send, the worker proves the previous accepted user ID and full rendered prompt on the saved page. If ChatGPT has collapsed that exact user message, recovery may expand its uniquely identified "Show more" view once under the page mutation guard. It then requires full text equality and unchanged task, role, page, conversation and physical browser within the remaining recovery deadline. A prefix match alone never authorizes writer restoration or Send.
+
+### Stopped writer maintenance
+
+`POST /api/tasks/{task_id}/writer-maintenance` reconciles one controller writer of a STOPPED persistent task with an applied, confirmed operator Stop and `writer_stop_pending` cleanup. Supply an `Idempotency-Key` header and these body fields:
+
+- `expected_task_version`: the current positive task projection version.
+- `binding_id` and `stop_control_id`: the original writer and applied Stop.
+- `endpoint_id`, `endpoint_cdp_url`, `physical_browser_id`, `target_id`: the pinned endpoint and an already-existing diagnostic page for the exact saved persistent conversation.
+
+The worker collects browser evidence itself; requests cannot supply proof flags or snapshots. The maintenance operation does not create, navigate, refresh, close, type, click, Stop or Send on a page. It requires two fresh observations, a positively established current transcript tail, exact accepted user and prompt provenance, a clean composer and explicit idle evidence. Unknown, collapsed or incomplete history, a challenge, ownership drift or an unreconciled Send retains the hold.
+
+The task owner rechecks the manifest and ledger under its existing locks. The conversation owner rechecks the command, binding, attempts, leases and claims in one transaction before releasing that binding's authority. A crash after release can complete only the same command with the exact stored proof; a new command cannot inherit it.
+
+The public `writer_maintenance` projection reports pending, partial or released controller authority, with pending command audit and uncovered roles shown separately. Existing verified owner releases and maintenance releases retain their distinct origins. For immutable predecessors, the original Stop/cleanup manifest and request ledger remain unchanged. For current tasks, the existing Stop owner can record release after all writer coverage is complete; the waiting Restart then continues. Writer release does not assert that assistant work or the task is DONE.
 
 ## Workflow and HCUW
 
@@ -213,7 +229,7 @@ TEST or AUDIT are opt-in when a runtime, restart, browser, destructive, environm
 
 A Team Task may select a role subset with `--roles` (for example `--roles DEV,REVIEW`). The first selected role in canonical order (`PLAN, DEV, TEST, REVIEW, AUDIT`) starts; a team without PLAN runs `DEV -> REVIEW -> DONE`, and REVIEW is then the only role that may route `DONE`. A team must include PLAN or REVIEW.
 
-Team Tasks start with a default budget of 100 role transitions. A verified Resume renews the route budget and preserves lifetime route counters and Send history. Existing tasks use their saved route contract when the role prompts change. New submissions capture the updated prompts.
+The default execution budget is 100 charged hops. Inspect the saved execution_budget and its enforced_for scope: normal Team handoffs are not capped by historical max_routes or route_seq. A verified Resume follows the existing budget renewal policy and preserves lifetime counters and Send history. Existing tasks use their saved route contract when the role prompts change. New submissions capture the updated prompts.
 
 Use a UTF-8 task file for multiline prompts through the Windows launcher, for example `cdpa --task-file ".\review prompt.txt" --roles REVIEW --team my-review`. With `--solo`, the file also supplies the goal unless you set `--goal` explicitly.
 

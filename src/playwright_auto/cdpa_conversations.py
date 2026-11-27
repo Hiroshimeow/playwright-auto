@@ -7,6 +7,7 @@ from typing import Any, Mapping
 from urllib.parse import unquote, urlparse
 
 from .cdpa_runtime_db import IdempotencyConflict, RuntimeDB
+from .chatgpt_graph import rendered_user_text_matches
 
 
 _STATE_NAME = "conversation_runtime"
@@ -142,6 +143,327 @@ def _default_state() -> dict[str, Any]:
         "lease_epochs": {},
         "quarantine": {},
     }
+
+
+def validate_stopped_writer_proof(
+    *,
+    command: Mapping[str, Any],
+    task: Mapping[str, Any],
+    task_version: int,
+    immutable_task: bool,
+    runtime_state: Mapping[str, Any],
+    attempts: list[Mapping[str, Any]],
+    request_records: Mapping[str, Mapping[str, Any]],
+    observations: list[Mapping[str, Any]],
+    now_epoch: float,
+) -> dict[str, Any]:
+    """Validate evidence for releasing one stopped controller writer; never mutate.
+
+    Inputs must come from the command/task/runtime owners and a read-only collector
+    attached only to the command's pre-existing diagnostic target. Two stable
+    snapshots prove agreement of the observed transcript, not full history loading.
+    The collector must separately establish the current history tail; unknown is
+    deliberately insufficient. This proof says nothing about assistant work DONE.
+    A future seal owner must revalidate these inputs under its transaction/locks.
+    """
+    import math
+
+    from .durable import normalize_prompt
+    from .chatgpt_history_tail import validate_native_history_tail
+
+    def require(condition: bool, detail: str) -> None:
+        if not condition:
+            raise ConversationLeaseError("STOPPED_WRITER_PROOF_REQUIRED", detail)
+
+    def sha(value: Any) -> str:
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def text(value: Any) -> bool:
+        return isinstance(value, str) and bool(value.strip())
+
+    payload = command.get("payload")
+    require(isinstance(payload, Mapping), "maintenance command payload is missing")
+    require(
+        all(isinstance(runtime_state.get(key), Mapping)
+            for key in ("bindings", "leases", "page_claims", "quarantine")),
+        "runtime writer authority containers are unknown",
+    )
+    require(
+        command.get("kind") == "reconcile_stopped_writer"
+        and command.get("status") == "running"
+        and text(command.get("command_id"))
+        and text(command.get("idempotency_key"))
+        and type(task_version) is int
+        and task_version > 0
+        and type(command.get("expected_task_version")) is int
+        and command["expected_task_version"] == task_version,
+        "command authority or original expected version does not match",
+    )
+    task_id = task.get("task_id")
+    require(
+        type(immutable_task) is bool
+        and text(task_id)
+        and command.get("task_id") == task_id
+        and task.get("status") == "STOPPED"
+        and task.get("active_hop_id") is None
+        and task.get("conversation_mode") == "persistent",
+        "only a stopped persistent task without an active hop is eligible",
+    )
+    cleanup = task.get("cleanup") or {}
+    controls = [
+        control for control in task.get("controls", [])
+        if control.get("control_id") == payload.get("stop_control_id")
+    ]
+    require(
+        len(controls) == 1
+        and cleanup.get("state") == "CLEARING"
+        and cleanup.get("phase") == "writer_stop_pending"
+        and cleanup.get("stop_control_id") == payload.get("stop_control_id"),
+        "the exact historical Stop hold is required",
+    )
+    stop = controls[0]
+    require(
+        stop.get("action") == "stop"
+        and stop.get("status") == "applied"
+        and stop.get("command_state") == "APPLIED"
+        and stop.get("confirmed") is True
+        and stop.get("origin") == "operator"
+        and text(stop.get("external_command_id"))
+        and (stop.get("command") or {}).get("task_id") == task_id
+        and (stop.get("result") or {}).get("writer_cleanup_pending") is True,
+        "the original confirmed operator Stop is not applied",
+    )
+    binding_id = payload.get("binding_id")
+    binding = (runtime_state.get("bindings") or {}).get(binding_id) or {}
+    role_key = binding.get("role_key")
+    role = (task.get("roles") or {}).get(role_key) or {}
+    require(
+        text(binding_id)
+        and binding.get("binding_id") == binding_id
+        and binding.get("task_id") == task_id
+        and binding.get("binding_status") in {"active", "blocked", "idle"}
+        and binding.get("provider_id") == "chatgpt_web"
+        and binding.get("temporary_chat") is False
+        and not binding.get("pending_identity")
+        and role.get("conversation_binding_id") == binding_id
+        and role.get("page_id") == binding.get("page_target_identity")
+        and text(role.get("physical_role"))
+        and text(task.get("team"))
+        and stop.get("role") in {None, role_key},
+        "persistent task-bound writer ownership does not match",
+    )
+    canonical = binding.get("canonical_conversation_id")
+    require(
+        text(canonical)
+        and binding.get("writer_identity_key") == ConversationWriterLease._canonical_key("chatgpt_web", canonical)
+        and type(binding.get("lease_epoch")) is int and binding["lease_epoch"] > 0,
+        "saved canonical writer identity or lease epoch is missing",
+    )
+    for url in (binding.get("conversation_url"), role.get("page_url")):
+        require(canonical_conversation(url) == canonical, "saved canonical conversation changed")
+    for field in ("endpoint_id", "endpoint_cdp_url"):
+        require(text(payload.get(field)) and payload[field] == binding.get(field), "endpoint/profile changed")
+    require(
+        role.get("browser_endpoint_id") == binding.get("endpoint_id")
+        and text(payload.get("physical_browser_id"))
+        and text(payload.get("target_id")),
+        "the exact existing diagnostic target must be pinned",
+    )
+    leases = runtime_state.get("leases") or {}
+    for key in (binding.get("writer_identity_key"), binding.get("provisional_writer_identity_key")):
+        if key:
+            require(key not in (runtime_state.get("quarantine") or {}), "writer identity is quarantined")
+            require(
+                key not in leases or (
+                    isinstance(leases[key], Mapping)
+                    and leases[key].get("owner_binding_id") == binding_id
+                ),
+                "writer lease has another or unknown owner",
+            )
+    require(
+        bool(attempts)
+        and all(attempt.get("owner_binding_id") == binding_id and attempt.get("state") in _TERMINAL_ATTEMPT_STATES for attempt in attempts),
+        "all SendAttempts must belong to this binding and be terminal",
+    )
+    role_hops = [hop for hop in task.get("hops", []) if hop.get("target_role") == role_key]
+    require(bool(role_hops) and all(type(hop.get("hop_id")) is int for hop in role_hops), "role execution history is unknown")
+    latest = max(role_hops, key=lambda hop: hop["hop_id"])
+    require(
+        latest.get("physical_role") == role.get("physical_role")
+        and latest.get("conversation_binding_id") == binding_id
+        and latest.get("conversation_generation") == role.get("conversation_generation")
+        and canonical_conversation(latest.get("conversation_url")) == canonical,
+        "latest role execution belongs to another conversation/generation",
+    )
+    accepted: dict[str, str] = {}
+    accounted_attempts: dict[str, str] = {}
+    latest_record = None
+    for request_id, record in request_records.items():
+        if record.get("role") != role["physical_role"]:
+            continue
+        require(record.get("status") in {"sent", "completed"}, "role has unresolved ledger evidence")
+        receipt = record.get("receipt") or {}
+        saved_binding = {"page_id": role["page_id"], "role": role["physical_role"]}
+        if record.get("binding") != saved_binding:
+            continue
+        matching = [hop for hop in role_hops if hop.get("request_id") == request_id]
+        require(
+            len(matching) == 1
+            and record.get("request_id") == request_id
+            and (record.get("source_context") or {}).get("task_id") == task_id
+            and (record.get("source_context") or {}).get("team") == task["team"]
+            and (record.get("source_context") or {}).get("hop_id") == matching[0]["hop_id"]
+            and matching[0].get("receipt") == receipt
+            and receipt.get("binding") == saved_binding,
+            "accepted ledger/hop provenance differs",
+        )
+        user_id, prompt = receipt.get("user_message_id"), record.get("rendered_prompt")
+        require(
+            text(user_id) and not user_id.startswith("DOM:")
+            and text(prompt) and receipt.get("prompt") == prompt
+            and receipt.get("prompt_sha256") == hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            and receipt.get("conversation_id") in {None, canonical}
+            and receipt.get("session_id_before") in {None, canonical}
+            and user_id not in accepted,
+            "accepted user ID/text is absent, ambiguous, or belongs to another conversation",
+        )
+        saved_hop = matching[0]
+        raw_prompt = saved_hop.get("prompt")
+        require(
+            text(raw_prompt)
+            and saved_hop.get("prompt_sha256") == hashlib.sha256(raw_prompt.encode("utf-8")).hexdigest()
+            and normalize_prompt(raw_prompt) == record.get("prompt") == prompt
+            and saved_hop.get("rendered_prompt_sha256") == receipt["prompt_sha256"],
+            "raw hop and normalized accepted receipt do not share durable provenance",
+        )
+        send_attempt_id = saved_hop.get("send_attempt_id")
+        require(
+            text(send_attempt_id) and send_attempt_id not in accounted_attempts,
+            "accepted ledger request has no unique SendAttempt identity",
+        )
+        accounted_attempts[send_attempt_id] = saved_hop["prompt_sha256"]
+        accepted[user_id] = prompt
+        if request_id == latest.get("request_id"):
+            latest_record = record
+    require(latest_record is not None, "latest role request has no matching accepted ledger record")
+    require(
+        all(text(attempt.get("attempt_id")) for attempt in attempts)
+        and len({attempt["attempt_id"] for attempt in attempts}) == len(attempts)
+        and {
+            attempt["attempt_id"]: attempt.get("text_hash") for attempt in attempts
+            if attempt["state"] in {"accepted", "reconciled_accepted"}
+        } == accounted_attempts,
+        "accepted SendAttempts and saved ledger/hop receipts are not fully reconciled",
+    )
+    receipt = latest_record["receipt"]
+    latest_attempts = [attempt for attempt in attempts if attempt.get("attempt_id") == latest.get("send_attempt_id")]
+    require(
+        len(latest_attempts) == 1
+        and latest_attempts[0].get("state") in {"accepted", "reconciled_accepted"}
+        and latest_attempts[0].get("text_hash") == latest["prompt_sha256"]
+        and latest_attempts[0].get("lease_epoch") == binding["lease_epoch"],
+        "latest accepted SendAttempt does not match its receipt",
+    )
+    require(len(observations) == 2, "two distinct current observations are required")
+    times = [observation.get("observed_at") for observation in observations]
+    require(
+        all(type(value) in {int, float} and math.isfinite(value) and value > 0 for value in times)
+        and times[0] < times[1] <= now_epoch
+        and 0 <= now_epoch - times[0] <= 5,
+        "observation timing is missing, stale, or out of order",
+    )
+    signatures = []
+    for observation in observations:
+        require(
+            all(observation.get(field) == payload[field] for field in ("endpoint_id", "endpoint_cdp_url", "physical_browser_id", "target_id")),
+            "diagnostic target or physical browser changed",
+        )
+        require(
+            observation.get("document_ready_state") == "complete"
+            and observation.get("storage_readable") is True
+            and observation.get("provider_challenge") is False,
+            "readiness or current history tail is unknown",
+        )
+        snapshot = observation.get("snapshot") or {}
+        tail = validate_native_history_tail(
+            observation.get("history_tail"), snapshot,
+            latest_accepted_user_id=receipt["user_message_id"],
+        )
+        require(tail.get("verified") is True, "current history tail is unknown or does not match its native snapshot")
+        require(
+            canonical_conversation(snapshot.get("url")) == canonical
+            and snapshot.get("session_id") == canonical,
+            "diagnostic canonical conversation does not match",
+        )
+        owner = tuple(snapshot.get(key) for key in ("page_id", "page_task_id", "page_team", "page_role"))
+        require(
+            all(value in {None, ""} for value in owner)
+            or owner == (role["page_id"], task_id, task["team"], role["physical_role"]),
+            "diagnostic target is bound to another or incomplete owner",
+        )
+        if snapshot.get("page_id"):
+            page_key = ConversationWriterLease._page_key("chatgpt_web", payload["physical_browser_id"], snapshot["page_id"])
+            require((runtime_state.get("page_claims") or {}).get(page_key) in {None, binding_id}, "diagnostic page is claimed by another binding")
+        require(
+            snapshot.get("state") == "waiting_prompt"
+            and snapshot.get("requires_login") is False
+            and snapshot.get("composer_present") is True
+            and snapshot.get("composer_editable") is True
+            and snapshot.get("composer_ambiguous") is False
+            and isinstance(snapshot.get("composer_text"), str)
+            and not snapshot["composer_text"].strip()
+            and all(snapshot.get(key) in ([], ()) for key in ("attachment_markers", "blocking_dialogs", "error_texts", "choice_prompt_labels"))
+            and snapshot.get("retry_visible") is False
+            and snapshot.get("mcp_provider_risk") is False
+            and snapshot.get("connection_interrupted_visible") is False
+            and snapshot.get("mcp_permission_allow_count") == 0
+            and snapshot.get("mcp_permission_node_count") == 0,
+            "diagnostic page is not positively ready and clean",
+        )
+        require(
+            snapshot.get("stop_visible") is False
+            and "response_activity_turn_id" in snapshot
+            and snapshot["response_activity_turn_id"] in {None, ""}
+            and snapshot.get("response_projection_active") is False,
+            "positive idle evidence is missing",
+        )
+        messages = snapshot.get("messages")
+        require(isinstance(messages, (list, tuple)), "observed transcript is unknown")
+        users = [message for message in messages if message.get("role") == "user"]
+        ids = [message.get("message_id") for message in users]
+        require(
+            bool(users)
+            and len(set(ids)) == len(ids)
+            and ids[-1] == receipt["user_message_id"]
+            and all(user_id in accepted for user_id in ids)
+            and all(rendered_user_text_matches(message.get("text"), accepted[message["message_id"]]) for message in users),
+            "observed users do not exactly match the accepted ledger through its latest user",
+        )
+        signatures.append(sha(messages))
+    require(signatures[0] == signatures[1], "observed transcript is still changing")
+    proof = {
+        "kind": "stopped_controller_writer_release",
+        "immutable_history": immutable_task,
+        "command_id": command["command_id"],
+        "binding_id": binding_id,
+        "task_id": task_id,
+        "role_key": role_key,
+        "stop_control_id": stop["control_id"],
+        "target_id": payload["target_id"],
+        "physical_browser_id": payload["physical_browser_id"],
+        "canonical_conversation_id": canonical,
+        "latest_request_id": latest["request_id"],
+        "latest_user_message_id": receipt["user_message_id"],
+        "observed_at": times[1],
+        "command_sha256": sha({key: command.get(key) for key in ("command_id", "kind", "task_id", "idempotency_key", "expected_task_version", "payload")}),
+        "task_sha256": sha(task),
+        "binding_sha256": sha(binding),
+        "attempts_sha256": sha(sorted(attempts, key=lambda item: str(item.get("attempt_id")))),
+        "ledger_sha256": sha(request_records),
+        "observations_sha256": sha(observations),
+    }
+    return {**proof, "evidence_sha256": sha(proof)}
 
 
 class ConversationWriterLease:
@@ -967,6 +1289,229 @@ class ConversationWriterLease:
                 and lease.get("owner_binding_id") == binding_id
             ):
                 state["leases"].pop(key, None)
+
+    @staticmethod
+    def _load_stopped_writer_state(connection: Any) -> tuple[dict[str, Any], int]:
+        """Read maintenance authority without normalizing unknown containers."""
+        row = connection.execute(
+            "SELECT version, payload_json FROM runtime_snapshot WHERE name=?",
+            (_STATE_NAME,),
+        ).fetchone()
+        try:
+            state = json.loads(row["payload_json"]) if row is not None else None
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ConversationLeaseError(
+                "STOPPED_WRITER_PROOF_REQUIRED", "stored writer authority is malformed",
+            ) from exc
+        if (
+            not isinstance(state, dict)
+            or any(not isinstance(state.get(key), dict)
+                   for key in ("bindings", "leases", "page_claims", "lease_epochs", "quarantine"))
+            or any(not isinstance(binding, dict) or binding.get("binding_id") != key
+                   for key, binding in state["bindings"].items())
+            or any(not isinstance(lease, dict)
+                   or not isinstance(lease.get("owner_binding_id"), str)
+                   or not lease["owner_binding_id"].strip()
+                   for lease in state["leases"].values())
+            or any(not isinstance(owner, str) or not owner.strip()
+                   for owner in state["page_claims"].values())
+            or any(not isinstance(record, dict) for record in state["quarantine"].values())
+        ):
+            raise ConversationLeaseError(
+                "STOPPED_WRITER_PROOF_REQUIRED", "stored writer authority is incomplete or has unknown owners",
+            )
+        return state, int(row["version"])
+
+    def _stopped_writer_attempts(
+        self, connection: Any, state: Mapping[str, Any],
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Keep command-row provenance with each raw SendAttempt during maintenance."""
+        result: dict[str, list[dict[str, Any]]] = {
+            binding_id: [] for binding_id in state["bindings"]
+        }
+        rows = connection.execute(
+            "SELECT * FROM command_queue WHERE kind='browser_send'"
+        ).fetchall()
+        for row in rows:
+            try:
+                command = self.db._command_row(row)
+                payload = command.get("payload")
+                attempt = payload.get("send_attempt") if isinstance(payload, Mapping) else None
+                owner_id = attempt.get("owner_binding_id") if isinstance(attempt, dict) else None
+                binding = state["bindings"].get(owner_id) if isinstance(owner_id, str) else None
+                key = command.get("idempotency_key")
+                terminal = isinstance(attempt, dict) and attempt.get("state") in _TERMINAL_ATTEMPT_STATES
+                valid = (
+                    isinstance(attempt, dict) and isinstance(binding, Mapping)
+                    and command.get("command_id") == attempt.get("attempt_id")
+                    and isinstance(key, str) and bool(key.strip())
+                    and attempt.get("attempt_id") == _digest("send", key)
+                    and command.get("task_id") == binding.get("task_id")
+                    and command.get("expected_task_version") is None
+                    and attempt.get("state") in _ATTEMPT_TRANSITIONS
+                    and command.get("status") == ("applied" if terminal else "recovery_required")
+                    and bool(command.get("finished_at")) is terminal
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ConversationLeaseError(
+                    "STOPPED_WRITER_PROOF_REQUIRED", "SendAttempt command provenance is malformed",
+                ) from exc
+            if not valid:
+                raise ConversationLeaseError(
+                    "STOPPED_WRITER_PROOF_REQUIRED", "SendAttempt command identity, task owner, or terminal status does not match",
+                )
+            result[str(owner_id)].append(dict(attempt))
+        return result
+
+    @staticmethod
+    def _stopped_writer_digest(value: Any) -> str:
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _stopped_writer_command(self, connection: Any, command_id: str) -> dict[str, Any]:
+        row = connection.execute(
+            "SELECT * FROM command_queue WHERE command_id=?", (command_id,)
+        ).fetchone()
+        if row is None:
+            raise ConversationLeaseError("STOPPED_WRITER_PROOF_REQUIRED", "maintenance command is missing")
+        command = self.db._command_row(row)
+        if command["kind"] != "reconcile_stopped_writer" or not command.get("task_id"):
+            raise ConversationLeaseError("STOPPED_WRITER_PROOF_REQUIRED", "command is not task-bound writer maintenance")
+        return command
+
+    def _stopped_writer_replay_result(
+        self, state: Mapping[str, Any], binding: Mapping[str, Any],
+        command: Mapping[str, Any], attempts: list[Mapping[str, Any]],
+    ) -> dict[str, Any] | None:
+        if binding.get("binding_status") != "sealed":
+            return None
+        proof = binding.get("stopped_writer_release")
+        payload = command["payload"]
+        digest = self._stopped_writer_digest
+        expected_command = digest({key: command.get(key) for key in (
+            "command_id", "kind", "task_id", "idempotency_key", "expected_task_version", "payload"
+        )})
+        keys = {binding.get("writer_identity_key"), binding.get("provisional_writer_identity_key")} - {None, ""}
+        if (
+            not isinstance(proof, Mapping)
+            or proof.get("kind") != "stopped_controller_writer_release"
+            or proof.get("command_id") != command.get("command_id")
+            or proof.get("command_sha256") != expected_command
+            or proof.get("evidence_sha256") != digest({key: value for key, value in proof.items() if key != "evidence_sha256"})
+            or proof.get("binding_id") != binding.get("binding_id")
+            or proof.get("binding_id") != payload.get("binding_id")
+            or proof.get("task_id") != binding.get("task_id")
+            or proof.get("task_id") != command.get("task_id")
+            or proof.get("role_key") != binding.get("role_key")
+            or proof.get("canonical_conversation_id") != binding.get("canonical_conversation_id")
+            or proof.get("physical_browser_id") != payload.get("physical_browser_id")
+            or proof.get("target_id") != payload.get("target_id")
+            or proof.get("stop_control_id") != payload.get("stop_control_id")
+            or payload.get("endpoint_id") != binding.get("endpoint_id")
+            or payload.get("endpoint_cdp_url") != binding.get("endpoint_cdp_url")
+            or proof.get("attempts_sha256") != digest(sorted(attempts, key=lambda item: str(item.get("attempt_id"))))
+            or any(attempt.get("state") not in _TERMINAL_ATTEMPT_STATES for attempt in attempts)
+            or any(lease.get("owner_binding_id") == binding["binding_id"] for lease in state["leases"].values())
+            or binding["binding_id"] in state["page_claims"].values()
+            or keys.intersection(state["quarantine"])
+        ):
+            raise ConversationLeaseError(
+                "STOPPED_WRITER_PROOF_REQUIRED",
+                "sealed binding does not carry this exact command's unchanged release proof",
+            )
+        return {
+            "controller_writer_released": True, "task_id": binding["task_id"],
+            "binding_id": binding["binding_id"], "proof": dict(proof), "reconciled": True,
+        }
+
+    def replay_stopped_writer_release(self, command_id: str) -> dict[str, Any] | None:
+        """Recognize only this command's committed seal; never refresh browser proof."""
+        with self.db.connection() as connection:
+            connection.execute("BEGIN")
+            command = self._stopped_writer_command(connection, command_id)
+            state, _ = self._load_stopped_writer_state(connection)
+            binding = self._binding_or_error(state, str(command["payload"].get("binding_id") or ""))
+            result = self._stopped_writer_replay_result(
+                state, binding, command, self._stopped_writer_attempts(connection, state)[binding["binding_id"]]
+            )
+            connection.commit()
+            return result
+
+    def seal_stopped_writer(
+        self, command_id: str, *, task: Mapping[str, Any], immutable_task: bool,
+        request_records: Mapping[str, Mapping[str, Any]], observations: list[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Seal one stopped task writer from locked task/ledger and fresh target evidence.
+
+        The caller holds the existing task/manifest/ledger read locks and endpoint
+        admission. This owner re-reads command/version/binding/attempts together.
+        It does not complete the command or alter any task/accepted request.
+        """
+        with self.db.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            command = self._stopped_writer_command(connection, command_id)
+            state, version = self._load_stopped_writer_state(connection)
+            binding_id = str(command["payload"].get("binding_id") or "")
+            binding = self._binding_or_error(state, binding_id)
+            attempts = self._stopped_writer_attempts(connection, state)[binding_id]
+            replay = self._stopped_writer_replay_result(state, binding, command, attempts)
+            if replay is not None:
+                connection.commit()
+                return replay
+            if command.get("status") != "running" or binding.get("stopped_writer_release") is not None:
+                raise ConversationLeaseError("STOPPED_WRITER_PROOF_REQUIRED", "maintenance is not the current running command")
+            proof = validate_stopped_writer_proof(
+                command=command, task=task,
+                task_version=self.db.get_task_version(str(command["task_id"]), connection=connection),
+                immutable_task=immutable_task, runtime_state=state, attempts=attempts,
+                request_records=request_records, observations=observations,
+                now_epoch=datetime.now(timezone.utc).timestamp(),
+            )
+            allowed_leases = {binding.get("writer_identity_key"), binding.get("provisional_writer_identity_key")} - {None, ""}
+            page_key = self._page_key(
+                binding["provider_id"], binding["physical_browser_id"], binding["page_target_identity"]
+            )
+            if (
+                any(key not in allowed_leases and lease.get("owner_binding_id") == binding_id for key, lease in state["leases"].items())
+                or any(key != page_key and owner == binding_id for key, owner in state["page_claims"].items())
+                or state["page_claims"].get(page_key) not in {None, binding_id}
+            ):
+                raise ConversationLeaseError("STOPPED_WRITER_PROOF_REQUIRED", "binding has unexplained page or writer claims")
+            self._release_binding_leases(state, binding)
+            self._release_page_claim(state, binding)
+            binding["binding_status"] = "sealed"
+            binding["stopped_writer_release"] = proof
+            binding["updated_at"] = _utc_now()
+            self._store_state(connection, state, version)
+            connection.commit()
+            return {
+                "controller_writer_released": True, "task_id": binding["task_id"],
+                "binding_id": binding_id, "proof": proof,
+            }
+
+    def stopped_writer_maintenance_evidence(self) -> dict[str, Any]:
+        """Return one coherent, read-only owner snapshot for maintenance projection."""
+        with self.db.connection() as connection:
+            connection.execute("BEGIN")
+            state, _ = self._load_stopped_writer_state(connection)
+            commands: dict[str, Any] = {}
+            attempts = self._stopped_writer_attempts(connection, state)
+            rows = connection.execute(
+                "SELECT * FROM command_queue WHERE kind='reconcile_stopped_writer'"
+            ).fetchall()
+            for row in rows:
+                command = self.db._command_row(row)
+                commands[command["command_id"]] = command
+            result = {
+                "bindings": [dict(binding) for binding in state["bindings"].values()],
+                "commands_by_id": commands, "attempts_by_binding": {
+                    binding_id: attempts.get(binding_id, []) for binding_id in state["bindings"]
+                },
+                "leases": state["leases"], "page_claims": state["page_claims"],
+                "quarantine": state["quarantine"],
+            }
+            connection.commit()
+            return result
 
     def close_binding(
         self, binding_id: str, *, abandon: bool = False
