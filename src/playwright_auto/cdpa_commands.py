@@ -9,6 +9,7 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 
 from .cdpa_route_contract import route_repair_budget_exhausted
+from .cdpa_routes import is_provider_content_notice
 
 COMMAND_ORIGINS = frozenset({"operator", "independent_agent", "worker", "repair_task"})
 COMMAND_STATES = frozenset(
@@ -787,6 +788,8 @@ def workflow_control_eligibility(
         if status == "WAITING" and str(state.get("waiting_code") or "") == "async_callback":
             return no("Resume cannot bypass a registered async callback; the callback wakes the same role.")
         if status in {"BLOCKED", "PAUSED"} and block_code == "ROUTE_VALIDATION_EXHAUSTED":
+            if hop and hop.get("state") == "responded" and is_provider_content_notice(hop.get("response")):
+                return yes()  # Reclassify retained terminal evidence without a new Send.
             if route_repair_budget_exhausted(state) and not exhausted_blank_route_recovery(
                 state, hop or {},
             ):
@@ -798,6 +801,8 @@ def workflow_control_eligibility(
         return yes()
 
     if normalized_action == "increase_route_limits":
+        if hop and hop.get("state") == "responded" and is_provider_content_notice(hop.get("response")):
+            return no("A provider content restriction cannot be repaired by raising the format-repair budget; Resume can reconcile the saved diagnosis only.")
         if status not in {"BLOCKED", "PAUSED"} or block_code != "ROUTE_VALIDATION_EXHAUSTED":
             return no(
                 "The route-repair limit may be increased only for a route-validation exhaustion block."

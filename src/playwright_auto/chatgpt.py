@@ -907,12 +907,14 @@ async def click_send_button(
           if (initialPageStateConflict) return initialPageStateConflict;
 
           const findComposer = () => (__CDPA_COMPOSER_RESOLVER__)().element;
+          const composerText = (element) =>
+            (__CDPA_COMPOSER_TEXT__)(element).replace(/\s+/g, ' ').trim();
           const composer = findComposer();
-          if (!composer || (expectedPrompt !== null && text(composer) !== expectedPrompt)) {
+          if (!composer || (expectedPrompt !== null && composerText(composer) !== expectedPrompt)) {
             return {
               ok: false,
               method: 'composer_conflict',
-              actual_prompt: composer ? text(composer) : null,
+              actual_prompt: composer ? composerText(composer) : null,
             };
           }
           const root = composer?.closest('form') || composer?.closest('[data-testid="composer"]') || document;
@@ -1110,13 +1112,13 @@ async def click_send_button(
             if (pageStateConflict) return pageStateConflict;
             const currentComposer = findComposer();
             if (!currentComposer || (
-                expectedPrompt !== null && text(currentComposer) !== expectedPrompt
+                expectedPrompt !== null && composerText(currentComposer) !== expectedPrompt
             )) {
               return {
                 ok: false,
                 method: 'composer_conflict',
                 reason: 'composer_changed_during_click_dispatch',
-                actual_prompt: currentComposer ? text(currentComposer) : null,
+                actual_prompt: currentComposer ? composerText(currentComposer) : null,
               };
             }
             const currentRoot = currentComposer.closest('form') ||
@@ -1175,7 +1177,8 @@ async def click_send_button(
           }
           if (dispatchConflict) return dispatchConflict;
           return {ok: true, method: 'dom_click'};
-        }""".replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS),
+        }""".replace('__CDPA_COMPOSER_RESOLVER__', _COMPOSER_RESOLVER_JS)
+        .replace('__CDPA_COMPOSER_TEXT__', _COMPOSER_TEXT_JS),
         [
             normalized_prompt,
             list(expected_names) if expected_names is not None else None,

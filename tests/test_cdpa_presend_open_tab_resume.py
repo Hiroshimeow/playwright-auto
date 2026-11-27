@@ -77,7 +77,9 @@ def _resume_no_progress(state, worker, actions):
     worker._acquire_endpoint_admission = admit
     asyncio.run(worker._recover_resume_control(state, control, actions))
     assert state["status"] == "BLOCKED"
-    assert state["block_code"] == "resume_progress_unverified"
+    assert state["block_code"] == "preboundary_acquisition_recovery_required"
+    assert control["result"]["reason_code"] == "preboundary_acquisition_recovery_required"
+    assert "Open Tab" in control["result"]["next_safe_action"]
     assert _active_hop(state)["preboundary_recovery"]["phase"] == "recovery_required"
     assert state["hops"][0]["receipt"]["user_message_id"] == "previously-accepted-user"
 
@@ -90,7 +92,7 @@ def _open(state, worker, actions):
     return asyncio.run(worker._apply_control(state, actions))
 
 
-def test_open_tab_reconciles_acquisition_marker_after_resume_replaces_block_code(tmp_path):
+def test_open_tab_reconciles_acquisition_marker_after_resume_preserves_block_code(tmp_path):
     state, worker, actions, request_id = _scenario(tmp_path)
     _resume_no_progress(state, worker, actions)
     assert actions.acquire_calls == 1
@@ -129,3 +131,15 @@ def test_open_tab_does_not_clear_marker_without_exact_provenance(tmp_path, chang
     assert state["status"] == "BLOCKED"
     assert hop["preboundary_recovery"]["phase"] == "recovery_required"
     assert actions.acquire_calls == 1
+
+
+def test_presend_recovery_hold_is_idempotent_and_never_reacquires(tmp_path):
+    from copy import deepcopy
+
+    state, worker, actions, request_id = _scenario(tmp_path)
+    _resume_no_progress(state, worker, actions)
+    before = deepcopy(state)
+    asyncio.run(worker._pre_send(state, _active_hop(state), actions))
+    assert state == before
+    assert actions.acquire_calls == 1
+    assert _active_hop(state)["request_id"] == request_id

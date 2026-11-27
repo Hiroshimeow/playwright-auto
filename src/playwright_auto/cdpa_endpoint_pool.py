@@ -77,7 +77,11 @@ async def probe_cdp_version(address: str) -> Mapping[str, Any]:
 
 
 async def probe_chatgpt_auth(context: Any) -> Mapping[str, Any]:
+    from .workspace import CLOUDFLARE_CHALLENGE_DOM
+
+    saw_chatgpt_page = False
     saw_login_required = False
+    saw_provider_challenge = False
     for page in tuple(getattr(context, "pages", ()) or ()):
         try:
             if (urlsplit(str(getattr(page, "url", ""))).hostname or "").lower() not in {
@@ -85,6 +89,7 @@ async def probe_chatgpt_auth(context: Any) -> Mapping[str, Any]:
                 "www.chatgpt.com",
             }:
                 continue
+            saw_chatgpt_page = True
             snapshot = await ChatGPTPage(page, timeout_ms=5_000).snapshot()
         except Exception:
             continue
@@ -93,10 +98,21 @@ async def probe_chatgpt_auth(context: Any) -> Mapping[str, Any]:
             continue
         if snapshot.composer_present and snapshot.composer_editable:
             return {"auth_state": "authenticated", "chatgpt_ready": True}
+        try:
+            # Reuse positive challenge evidence on this already inspected surface.
+            # A title or an unavailable snapshot alone must not diagnose a challenge.
+            saw_provider_challenge |= (await asyncio.wait_for(
+                page.evaluate(CLOUDFLARE_CHALLENGE_DOM), timeout=2.0,
+            )) is True
+        except Exception:
+            pass  # Unreadable evidence still leaves this existing page unready.
+    if saw_provider_challenge:
+        return {"auth_state": "provider_challenge", "chatgpt_ready": False}
     if saw_login_required:
         return {"auth_state": "login_required", "chatgpt_ready": False}
     # No existing ChatGPT page is not proof of logout. Allocation may open one.
-    return {"auth_state": "unknown", "chatgpt_ready": True}
+    # Existing unusable pages, however, are not positive readiness evidence.
+    return {"auth_state": "unknown", "chatgpt_ready": not saw_chatgpt_page}
 
 
 @dataclass

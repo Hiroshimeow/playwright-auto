@@ -61,7 +61,7 @@ _COMPOSER_BODY = (
 )
 
 
-async def _with_composer(check):
+async def _with_composer(check, *, expected_sends=0):
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
             executable_path="/snap/bin/chromium" if Path("/snap/bin/chromium").is_file() else None,
@@ -96,7 +96,7 @@ async def _with_composer(check):
             }""")
             await check(page, client)
             assert await page.evaluate("({edits:window.nativeEdits,sends:window.sends})") == {
-                "edits": 0, "sends": 0,
+                "edits": 0, "sends": expected_sends,
             }
         finally:
             await browser.close()
@@ -155,5 +155,66 @@ def test_structured_composer_read_keeps_atomic_owner_checks(change):
         with pytest.raises(chatgpt.ComposerConflictError, match="focus was stolen|multiple eligible"):
             await chatgpt_composer.replace_owned_composer_text(page, _COMPOSER_PROMPT, timeout_ms=1000)
         assert await page.locator("#prompt-textarea").evaluate_all("(nodes) => nodes.map(n => n.innerHTML)") == before
+
+    asyncio.run(_with_composer(check))
+
+
+async def _click_owned_fixture(page, client):
+    assert client.binding is not None
+    return await chatgpt.click_send_button(
+        page,
+        expected_url=page.url,
+        expected_page_id=client.binding.page_id,
+        expected_role="composer-test",
+        expected_task_id="composer-task",
+        expected_team="composer-team",
+        expected_prompt=_COMPOSER_PROMPT,
+        expected_attachment_names=(),
+    )
+
+
+def test_atomic_send_accepts_unchanged_url_chip_prompt_once():
+    async def check(page, client):
+        before = await page.locator("#prompt-textarea").inner_html()
+        assert not chatgpt.visible_text_matches(
+            await page.locator("#prompt-textarea").inner_text(), _COMPOSER_PROMPT
+        )
+        assert await _click_owned_fixture(page, client) == "dom_click"
+        assert await page.locator("#prompt-textarea").inner_html() == before
+
+    asyncio.run(_with_composer(check, expected_sends=1))
+
+
+@pytest.mark.parametrize("change", ["url_space", "manual_draft"])
+@pytest.mark.parametrize("boundary", ["before_click", "during_dispatch"])
+def test_atomic_send_preserves_real_draft_changes(change, boundary):
+    async def check(page, client):
+        await page.evaluate("""([change, boundary]) => {
+            window.changeDraft = () => {
+                const composer = document.getElementById('prompt-textarea');
+                if (change === 'url_space') {
+                    composer.querySelector('.url-label').lastChild.nodeValue =
+                        'https://example.invalid/a b';
+                } else {
+                    composer.textContent = 'My unsaved operator draft';
+                }
+                window.changedDraft = composer.innerHTML;
+            };
+            if (boundary === 'before_click') {
+                window.changeDraft();
+            } else {
+                document.addEventListener('click', event => {
+                    if (event.target.matches('[data-testid="send-button"]')) {
+                        window.changeDraft();
+                    }
+                }, {capture: true, once: true});
+            }
+        }""", [change, boundary])
+        with pytest.raises(chatgpt.ComposerConflictError, match="atomic send boundary"):
+            await _click_owned_fixture(page, client)
+        assert await page.evaluate("typeof window.changedDraft === 'string'")
+        assert await page.locator("#prompt-textarea").inner_html() == await page.evaluate(
+            "window.changedDraft"
+        )
 
     asyncio.run(_with_composer(check))

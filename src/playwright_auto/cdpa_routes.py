@@ -24,6 +24,23 @@ class RouteContractError(ValueError):
     pass
 
 
+def is_provider_content_notice(response: Any) -> bool:
+    """Recognize the observed terminal provider UI envelope, never quoted report text."""
+    text = str(response or "")
+    if len(text) > 2048:
+        return False
+    compact = " ".join(text.replace("\u2019", "'").split()).casefold()
+    notice = (
+        "this content can't be shown "
+        "this content was flagged for possible cybersecurity risk."
+    )
+    suffix = (
+        " you may be eligible for daybreak blue, which reduces refusals for authorized "
+        "defensive work on supported models. other safeguards still apply. learn more"
+    )
+    return compact in {notice, notice + suffix}
+
+
 class InlineReportMaterializationError(RouteContractError):
     pass
 

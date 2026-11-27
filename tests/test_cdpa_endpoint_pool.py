@@ -313,6 +313,104 @@ def test_auth_probe_uses_existing_chatgpt_page_without_creating_one(monkeypatch)
     assert result == {"auth_state": "authenticated", "chatgpt_ready": True}
 
 
+@pytest.mark.parametrize(
+    ("surface", "expected_auth"),
+    [
+        ("unready", "unknown"),
+        ("snapshot_failed", "unknown"),
+        ("challenge", "provider_challenge"),
+        ("challenge_probe_failed", "unknown"),
+        ("title_only", "unknown"),
+        ("login", "login_required"),
+    ],
+)
+def test_auth_probe_existing_unusable_surface_is_not_ready(monkeypatch, surface, expected_auth):
+    from types import SimpleNamespace
+
+    import playwright_auto.cdpa_endpoint_pool as module
+    from playwright_auto.workspace import CLOUDFLARE_CHALLENGE_DOM
+
+    class Page:
+        url = "https://chatgpt.com/c/exact-owned-conversation"
+        title = "Just a moment..."
+
+        async def evaluate(self, expression):
+            assert expression == CLOUDFLARE_CHALLENGE_DOM
+            if surface == "challenge_probe_failed":
+                raise RuntimeError("navigation changed the inspected document")
+            return surface == "challenge"
+
+    page = Page()
+
+    class Client:
+        def __init__(self, actual_page, timeout_ms):
+            assert actual_page is page
+
+        async def snapshot(self):
+            if surface == "snapshot_failed":
+                raise RuntimeError("snapshot unavailable")
+            return SimpleNamespace(
+                requires_login=surface == "login",
+                composer_present=False,
+                composer_editable=False,
+            )
+
+    monkeypatch.setattr(module, "ChatGPTPage", Client)
+    # This context deliberately offers no create/close/navigation operations.
+    result = asyncio.run(module.probe_chatgpt_auth(SimpleNamespace(pages=[page])))
+    assert result == {"auth_state": expected_auth, "chatgpt_ready": False}
+
+
+@pytest.mark.parametrize("urls", [[], ["https://example.test/unrelated"]])
+def test_auth_probe_without_chatgpt_surface_keeps_fresh_allocation_possible(monkeypatch, urls):
+    from types import SimpleNamespace
+
+    import playwright_auto.cdpa_endpoint_pool as module
+
+    def forbidden_inspection(*_args, **_kwargs):
+        raise AssertionError("unrelated pages must not be inspected")
+
+    monkeypatch.setattr(module, "ChatGPTPage", forbidden_inspection)
+    context = SimpleNamespace(pages=[SimpleNamespace(url=url) for url in urls])
+    assert asyncio.run(module.probe_chatgpt_auth(context)) == {
+        "auth_state": "unknown", "chatgpt_ready": True,
+    }
+
+
+def test_auth_probe_usable_authenticated_surface_wins_over_stale_challenge(monkeypatch):
+    from types import SimpleNamespace
+
+    import playwright_auto.cdpa_endpoint_pool as module
+    from playwright_auto.workspace import CLOUDFLARE_CHALLENGE_DOM
+
+    class Page:
+        def __init__(self, name):
+            self.url = f"https://chatgpt.com/c/{name}"
+            self.usable = name == "usable"
+
+        async def evaluate(self, expression):
+            assert expression == CLOUDFLARE_CHALLENGE_DOM
+            assert not self.usable
+            return True
+
+    class Client:
+        def __init__(self, page, timeout_ms):
+            self.page = page
+
+        async def snapshot(self):
+            return SimpleNamespace(
+                requires_login=False,
+                composer_present=self.page.usable,
+                composer_editable=self.page.usable,
+            )
+
+    monkeypatch.setattr(module, "ChatGPTPage", Client)
+    context = SimpleNamespace(pages=[Page("old-challenge"), Page("usable")])
+    assert asyncio.run(module.probe_chatgpt_auth(context)) == {
+        "auth_state": "authenticated", "chatgpt_ready": True,
+    }
+
+
 def test_same_address_physical_identity_change_reattaches_only_changed_endpoint(tmp_path):
     async def run():
         pool, _registry, first, second, connections, now = make_pool(tmp_path)

@@ -122,6 +122,7 @@ from .cdpa_route_contract import (
     route_repair_budget_exhausted,
 )
 from .cdpa_routes import (
+    is_provider_content_notice,
     InlineReportMaterializationError,
     ReportEvidence,
     RouteContractError,
@@ -4289,8 +4290,8 @@ class CDPAWorker:
             return  # Resume may need any of the team's ephemeral documents.
         if state.get("block_code") == "ROUTE_BUDGET_EXHAUSTED":
             return  # Preserve the exact role context for Resume of a historical cap block.
-        if state.get("block_code") == "provider_challenge":
-            return  # The failed unbound acquisition already closed itself; preserve owned tabs.
+        if state.get("block_code") in {"provider_challenge", "provider_content_restricted"}:
+            return  # Preserve owned provider context for inspection; diagnosis must not close it.
         if state.get("block_code") == "model_verification_blocked":
             return  # The operator needs this exact tab to select the required model.
         try:
@@ -6556,7 +6557,15 @@ class CDPAWorker:
         if retry_at is not None:
             hop.setdefault("wait", {}).pop("pre_send_retry_at", None)
         if (hop.get("preboundary_recovery") or {}).get("phase") == "recovery_required":
-            # Acquisition did not return a binding; never implicitly allocate again.
+            # Resume clears the generic block, but cannot erase the acquisition
+            # hold or authorize another allocation without exact reconciliation.
+            self._block(
+                state,
+                "Pre-Send acquisition still requires exact owned-page reconciliation "
+                "before another acquisition or Send.",
+                code="preboundary_acquisition_recovery_required",
+                retryable=False,
+            )
             return
         await self._admission_preflight(state, actions)
         self._normalize_legacy_pre_send_report_mode(state, hop)
@@ -9422,6 +9431,16 @@ class CDPAWorker:
             )
             return
         self._complete_request_response(hop)
+        if is_provider_content_notice(hop.get("response")):
+            self._block(
+                state,
+                "The provider withheld this response under its content safeguards. "
+                "The accepted request and response are preserved; another format-repair "
+                "prompt cannot resolve this restriction.",
+                code="provider_content_restricted",
+                retryable=False,
+            )
+            return
         validation_error = sanitize_text(error, max_chars=2000)
         hop["validation_error"] = validation_error
         if decision is not None:
@@ -12621,6 +12640,12 @@ class CDPAWorker:
                 )
                 return
             ownership_token = upload_receipt.ownership_token
+        # Consume the one-shot continuation before invoking Send. A lost
+        # acknowledgement or cancellation must not leave the old non-acceptance
+        # error as authority for another Send, even on the same owned page.
+        record = ledger.update(
+            record.request_id, error=_SENDING_CONTINUATION_STARTED
+        )
         try:
             async def resume_send() -> Any:
                 return await acquired.client.send(
@@ -12636,27 +12661,25 @@ class CDPAWorker:
                 )
 
             receipt = await self._run_automated_send(resume_send)
-        except RateLimitBlockedError as exc:
-            await self._enter_rate_limit_cooldown(state, actions, exc)
+        except Exception as exc:
+            ledger.update(
+                record.request_id,
+                error=f"{_SENDING_CONTINUATION_STARTED}: {sanitize_exception(exc)}",
+            )
+            if isinstance(exc, RateLimitBlockedError):
+                await self._enter_rate_limit_cooldown(state, actions, exc)
+            reason_code = "send_acceptance_ambiguous"
+            if isinstance(exc, ComposerConflictError):
+                reason_code = "manual_composer_conflict"
+            elif isinstance(exc, (PageOwnershipError, TaskBindingError)):
+                reason_code = "ownership_conflict"
             self._require_resume_recovery(
                 state,
                 control,
                 action="accept_owned_draft",
-                reason_code="send_acceptance_ambiguous",
+                reason_code=reason_code,
                 reason=sanitize_exception(exc),
                 next_safe_action="Inspect durable/backend provenance; do not send again.",
-            )
-            return
-        except (ComposerConflictError, PageOwnershipError, TaskBindingError) as exc:
-            self._require_resume_recovery(
-                state,
-                control,
-                action="accept_owned_draft",
-                reason_code="manual_composer_conflict"
-                if isinstance(exc, ComposerConflictError)
-                else "ownership_conflict",
-                reason=sanitize_exception(exc),
-                next_safe_action="Restore exact ownership and draft evidence before Resume.",
             )
             return
         if (
@@ -12717,6 +12740,14 @@ class CDPAWorker:
                         reason=str(
                             state.get("block_reason")
                             or "Resume did not advance the active pre-send hop."
+                        ),
+                        next_safe_action=(
+                            "Use Open Tab for the active role to reconcile its recorded binding; "
+                            "if unbound, inspect historical acquisition provenance and use "
+                            "acquisition reconciliation only when eligible. "
+                            "Preserve the same request and accepted turns."
+                            if state.get("block_code") == "preboundary_acquisition_recovery_required"
+                            else None
                         ),
                     )
                     return
@@ -12857,6 +12888,17 @@ class CDPAWorker:
                 before_status = str(state.get("status") or "")
                 before_block = str(state.get("block_code") or "")
                 self._responded(state, hop)
+                if state.get("block_code") == "provider_content_restricted":
+                    self._require_resume_recovery(
+                        state, control, action="consume_response",
+                        reason_code="provider_content_restricted",
+                        reason=str(state.get("block_reason") or "Provider content restriction."),
+                        next_safe_action=(
+                            "Inspect the preserved provider notice. No new Send, alternate "
+                            "prompt or format-repair escalation is authorized by this recovery."
+                        ),
+                    )
+                    return
                 progressed = (
                     state.get("active_hop_id") != before_hop_id
                     or str(state.get("status") or "") != before_status
